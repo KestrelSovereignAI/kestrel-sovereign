@@ -84,7 +84,18 @@ async def get_agents(request: Request):
                 agent_card = await agent.get_agent_card()
                 card_dict = agent_card.model_dump()
                 card_dict["id"] = agent.agent_id
-                card_dict["name"] = name
+                # ``name`` (from the card) is the agent's live/effective DISPLAY
+                # name — resolve_effective_name reflects a volatile-mode rename
+                # that intentionally skips the durable node write, so keep it so
+                # host discovery advertises the live name (#2672 review P2).
+                # Overwriting it with the AgentManager key (the prior bug) hid
+                # every session rename behind the immutable registration name.
+                # Expose that stable key separately as ``routing_name`` for the
+                # UI / peers that build ``/api/agents/{key}/…`` paths — those MUST
+                # use the manager key, never the (mutable) display name.
+                card_dict["routing_name"] = name
+                if not (isinstance(card_dict.get("name"), str) and card_dict["name"].strip()):
+                    card_dict["name"] = name
                 card_dict["status"] = "online"
                 card_dict["is_demo"] = _is_demo(agent)
                 agents_list.append(card_dict)
@@ -93,6 +104,7 @@ async def get_agents(request: Request):
                 agents_list.append({
                     "id": agent.agent_id,
                     "name": name,
+                    "routing_name": name,
                     "status": "error",
                     "is_demo": _is_demo(agent),
                 })
@@ -299,8 +311,10 @@ async def get_identity(request: Request):
         avatar_hash = agent_node.properties.get("avatar_hash") if agent_node else None
         avatar_url = f"/api/files/{avatar_hash}" if avatar_hash else None
 
-        # Get agent name and description from node properties
-        agent_name = agent_node.properties.get("name") if agent_node else None
+        # Get agent name and description from node properties. Prefer the live
+        # session name so a volatile-mode rename (which skips the durable node
+        # write) is reflected here rather than the stale stored name (#2672 P2).
+        agent_name = agent.resolve_effective_name(agent_node)
         description = agent_node.properties.get("description") if agent_node else None
 
         # Fall back to agent_metadata table for description
@@ -408,7 +422,15 @@ async def update_identity(request: Request, response: Response, body: UpdateIden
                 rename_outcome = await rename_agent_core(agent, body.name)
             except ValueError as e:
                 raise HTTPException(status_code=422, detail=str(e))
-            if not rename_outcome.any_written:
+            if rename_outcome.skipped_privacy:
+                # Volatile privacy mode: the name applies to the live session only
+                # and was intentionally not persisted. That is NOT a successful
+                # durable update, so report it as partial (207) rather than 200 /
+                # ``success: true`` (#2672 P1).
+                response.status_code = 207
+                partial_update = True
+                updated_fields.append("name_skipped_privacy")
+            elif not rename_outcome.any_written:
                 raise HTTPException(
                     status_code=500,
                     detail={
@@ -416,26 +438,54 @@ async def update_identity(request: Request, response: Response, body: UpdateIden
                         "rename_outcome": rename_outcome.to_dict(),
                     },
                 )
-            if rename_outcome.success:
+            elif rename_outcome.success:
                 updated_fields.append("name")
             else:
                 response.status_code = 207
                 partial_update = True
                 updated_fields.append("name_partial")
 
+        description_skipped_privacy = False
         if body.description is not None:
-            from kestrel_sovereign.bootstrap.service import persist_agent_description
+            from kestrel_sovereign.bootstrap.service import (
+                PersistOutcome,
+                persist_agent_description,
+            )
+            from kestrel_sovereign.storage.privacy_wrapper import (
+                _resolve_transition_lock,
+            )
             # persist_agent_description does not swallow write failures, so a
             # failed metadata write or a failed update of an existing graph
             # node propagates here and becomes a 500 (handled below) — the
             # operator never sees a false success with stale data behind it.
-            await persist_agent_description(
+            # It returns an explicit PersistOutcome (#2672 review P2): a volatile
+            # privacy mode SKIPS the durable write, so we must NOT report the
+            # description as updated — that was the false-success bug.
+            #
+            # Pass the agent's privacy-transition lock so the mode check and the
+            # durable write are serialized against a concurrent set_privacy_mode
+            # (#2672 review P1 race) — this HTTP path holds no conversation lock.
+            desc_outcome = await persist_agent_description(
                 agent._raw_storage.db,
                 agent.storage,
                 agent.agent_id,
                 body.description,
+                transition_lock=_resolve_transition_lock(agent),
             )
-            updated_fields.append("description")
+            if desc_outcome is PersistOutcome.PERSISTED:
+                updated_fields.append("description")
+            elif desc_outcome is PersistOutcome.SKIPPED_PRIVACY:
+                # Honestly surface that the description was intentionally not
+                # persisted in a volatile privacy mode, rather than claiming a
+                # successful update behind a returned stale/None value. A skipped
+                # write is NOT a successful update, so it must not report HTTP 200
+                # /``success: true`` — treat it as a partial/skipped result (207)
+                # exactly like a partial rename, so a client reading the success
+                # field never mistakes the skip for a confirmed change (#2672 P2).
+                description_skipped_privacy = True
+                partial_update = True
+                response.status_code = 207
+                updated_fields.append("description_skipped_privacy")
 
         # Return updated identity
         try:
@@ -451,11 +501,20 @@ async def update_identity(request: Request, response: Response, body: UpdateIden
             "success": not partial_update,
             "updated_fields": updated_fields,
             "did": agent.agent_id,
-            "name": agent_node.properties.get("name") if agent_node else getattr(agent, "_agent_name", None),
+            # Prefer the live session name: a volatile rename updates the
+            # in-memory name but intentionally skips the durable node, so
+            # re-reading the node here would advertise the OLD name alongside a
+            # 207 that says the rename applied to the session (#2672 review P2).
+            "name": agent.resolve_effective_name(agent_node),
             "description": agent_node.properties.get("description") if agent_node else None,
             "avatar_hash": avatar_hash,
             "avatar_url": f"/api/files/{avatar_hash}" if avatar_hash else None,
         }
+        if description_skipped_privacy:
+            # The returned ``description`` above is the unchanged stored value, not
+            # the requested one — flag the deliberate volatile-mode skip so the
+            # caller doesn't read the echoed value as a confirmation (#2672 P2).
+            payload["description_skipped_privacy"] = True
         if rename_outcome is not None:
             payload["rename_outcome"] = rename_outcome.to_dict()
         return payload

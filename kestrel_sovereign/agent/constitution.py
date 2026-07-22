@@ -20,6 +20,9 @@ from datetime import datetime, timezone
 # disables provider embeddings. Importing the submodule directly breaks
 # that cycle (see #1792).
 from kestrel_sovereign.storage.async_graph_store import GraphNode
+from kestrel_sovereign.storage.privacy_wrapper import (
+    acquire_control_plane_capability,
+)
 
 
 class ConstitutionMixin:
@@ -146,7 +149,7 @@ class ConstitutionMixin:
             )
 
         try:
-            await self.storage.add_node(agent_node)
+            await self.storage.add_node(agent_node, capability=acquire_control_plane_capability())
         except Exception:
             logging.exception(
                 "ensure_doctrine_bundle_anchored: agent_node persist failed"
@@ -1146,7 +1149,7 @@ class ConstitutionMixin:
         if not agent_node:
             return False, "Agent identity node not found; cannot anchor overlay."
         agent_node.properties[self.OVERLAY_HASH_PROPERTY] = overlay_sha
-        await self.storage.add_node(agent_node)  # upsert
+        await self.storage.add_node(agent_node, capability=acquire_control_plane_capability())  # upsert
         self.constitution_overlay_verified = True
         logging.info("Anchored constitution overlay hash %s", overlay_sha[:16])
         return True, f"Anchored constitution overlay. Hash: {overlay_sha[:16]}..."
@@ -1602,7 +1605,10 @@ class ConstitutionMixin:
                         "verification": verification.reason,
                     },
                 )
-                await self.storage.add_node(artifact_node)
+                await self.storage.add_node(
+                    artifact_node,
+                    capability=acquire_control_plane_capability(),
+                )
 
                 # Maintain the governance document node + governed_by edge
                 # for the new anchor so the periodic integrity audit's edge
@@ -1641,7 +1647,7 @@ class ConstitutionMixin:
                     "authorization": authorization or "unspecified",
                     "expected_hash_prefix": expected_hash,
                 }
-                await self.storage.add_node(agent_node)
+                await self.storage.add_node(agent_node, capability=acquire_control_plane_capability())
         except Exception as e:
             return (
                 f"Error: Reanchor failed mid-write and was rolled back; "
@@ -1743,7 +1749,7 @@ class ConstitutionMixin:
                     # edge proof (#2463) holds for a lazily-anchored legacy agent.
                     await self._anchor_constitution_governance(constitution_hash)
                     agent_node.properties["constitution_hash"] = constitution_hash
-                    await self.storage.add_node(agent_node)
+                    await self.storage.add_node(agent_node, capability=acquire_control_plane_capability())
                 logging.info(f"Anchored constitution with hash: {constitution_hash}")
             except Exception as e:
                 return f"Error: Failed to anchor constitution: {e}"
@@ -1789,6 +1795,31 @@ class ConstitutionMixin:
         except Exception as e:
             return f"Error: Could not retrieve constitution for hash {constitution_hash}. Reason: {e}"
 
+    async def _persist_governance_receipt_node(self, agent_node: GraphNode) -> None:
+        """Persist a fresh first-party governance receipt on the agent node.
+
+        The genesis-audit receipt is free-text (audit verdict/reasoning) that no
+        per-field check can prove content-free and — being generated fresh at
+        first cognition — cannot be carried along, so the privacy wrapper (the
+        FEATURE-facing surface) refuses it in a volatile mode by design (#2672
+        review P1). The genesis audit is nonetheless a constitutional lifecycle
+        boundary that MUST persist regardless of privacy mode to gate cognition,
+        so it is written to the RAW store — the same low-level store inception
+        uses for the initial agent node — the smallest explicit source-of-truth
+        path (#2672 review finding P3). In a persistent mode the raw store and the
+        wrapper are behaviorally identical (the wrapper is a pure pass-through),
+        so this changes nothing outside volatile modes. Falls back to the wrapper
+        WITH the control-plane capability only when no raw store is wired
+        (degraded/test paths).
+        """
+        raw = getattr(self, "_raw_storage", None)
+        if raw is not None and hasattr(raw, "add_node"):
+            await raw.add_node(agent_node)
+        else:
+            await self.storage.add_node(
+                agent_node, capability=acquire_control_plane_capability()
+            )
+
     async def _persist_genesis_audit_completion(
         self,
         agent_node: GraphNode,
@@ -1803,7 +1834,7 @@ class ConstitutionMixin:
         )
 
         async def _write() -> None:
-            await self.storage.add_node(agent_node)
+            await self._persist_governance_receipt_node(agent_node)
             await self.privacy_agent.add_conversation(
                 role="system",
                 content=content,
@@ -1842,7 +1873,7 @@ class ConstitutionMixin:
         existing["last_error"] = code
         existing["audited"] = False
         agent_node.properties["genesis_audit"] = existing
-        await self.storage.add_node(agent_node)
+        await self._persist_governance_receipt_node(agent_node)
 
     async def perform_genesis_audit(
         self,
@@ -1899,7 +1930,7 @@ class ConstitutionMixin:
                     }
                 )
                 agent_node.properties["genesis_audit"] = existing
-                await self.storage.add_node(agent_node)
+                await self._persist_governance_receipt_node(agent_node)
             if status not in (
                 GENESIS_AUDIT_PENDING,
                 GENESIS_AUDIT_PASSED,
@@ -2006,7 +2037,7 @@ class ConstitutionMixin:
                 provenance="runtime:migrated_legacy_identity",
             )
             agent_node.properties["genesis_audit"] = record
-            await self.storage.add_node(agent_node)
+            await self._persist_governance_receipt_node(agent_node)
 
         if not isinstance(record, dict):
             raise GenesisAuditError("Genesis audit state is malformed.")

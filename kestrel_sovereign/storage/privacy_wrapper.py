@@ -14,10 +14,14 @@ This is a defense-in-depth measure - even if application code forgets to
 check privacy mode, the storage layer will enforce it.
 """
 
+import asyncio
+import contextvars
 import json
 import logging
+import re
+import sys
 import warnings
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 
 from kestrel_sovereign.storage.session_grouping import summarize_sessions
 from typing import Dict, List, Optional, Any, Tuple, TYPE_CHECKING, Union
@@ -35,6 +39,10 @@ from kestrel_sovereign.storage.conversation_ids import coerce_persistent_message
 from kestrel_sovereign.storage.async_conversation_store import (
     _escape_like_session_value,
     search_session_summaries,
+)
+from kestrel_sovereign.storage.async_graph_store import NodeSwapResult
+from kestrel_sovereign.storage.agent_resource_store import (
+    SOUL_MARKDOWN_RESOURCE_TYPE,
 )
 
 # Lazy import to avoid circular dependency with features.privacy
@@ -100,6 +108,1046 @@ class OperationType(Enum):
     READ = "read"
     WRITE = "write"
     DELETE = "delete"
+
+
+# ── Cross-task reentry token for the privacy-transition lock (#2672 review P1) ──
+#
+# Same-task reentry (below) fixes the ANTHROPIC path, where a durable-identity
+# write dispatched inline runs on the SAME asyncio task that holds the turn's
+# transition lock. It does NOT fix the CODEX app-server path: the long-lived
+# app-server dispatches each ``item/tool/call`` handler on its own reader-spawned
+# task (``agent/orchestrator_engine.py`` — the reader loop spawns a per-call
+# task), NOT the turn task. That handler task calls ``execute_named_tool`` →
+# ``rename_agent_core`` (or description / discovery history / user name / SOUL),
+# which re-acquires the SAME lock. By task identity it is a DIFFERENT task, so it
+# would block waiting for the turn task to release — while the turn task is itself
+# blocked awaiting the app-server's tool response. That is a deadlock.
+#
+# The fix, per the review: give inline tool callbacks a private, captured
+# per-turn ownership token that permits re-entry into the lock for THAT specific
+# active turn. The executor captures the owning turn's token on the turn task
+# (where the lock is held — see ``ReentrantTransitionLock.current_reentry_token``)
+# and re-presents it via ``bind_transition_lock_reentry`` around the tool call.
+# The lock then admits that one turn's nested write cross-task, while a genuinely
+# concurrent ``set_privacy_mode`` from an UNRELATED task (which captured no token)
+# still serializes — cross-turn exclusion, the only exclusion the #2672
+# check-then-write race needs, is preserved.
+#
+# The token authorizes re-entry but does NOT wave the reentrant write straight
+# through: because the app-server can dispatch MULTIPLE inline tools of one turn
+# concurrently — each on its own reader task, all carrying the SAME token — the
+# lock funnels cross-task reentrants through a per-span reentry mutex
+# (``_reentry_lock``) so two durable identity writes cannot interleave. See the
+# ``ReentrantTransitionLock`` docstring and ``__aenter__`` for the serialization.
+_transition_lock_reentry_token: "contextvars.ContextVar[Optional[object]]" = (
+    contextvars.ContextVar("kestrel_transition_lock_reentry_token", default=None)
+)
+
+
+@contextmanager
+def bind_transition_lock_reentry(token: Optional[object]):
+    """Re-present a captured transition-lock reentry token on the current task.
+
+    Companion to :meth:`ReentrantTransitionLock.current_reentry_token`. An
+    inline-tool executor built inside a streamed turn captures that turn's token
+    (on the turn task, which holds the lock) and wraps the actual tool call in
+    ``with bind_transition_lock_reentry(token):`` so a nested durable-identity
+    write (rename / description / discovery history / user name / SOUL) dispatched
+    on the codex app-server's SEPARATE reader task can re-enter the lock its
+    OWNING turn holds instead of deadlocking (#2672 review P1). The token is the
+    identity of ONE held span on ONE lock instance, so it authorizes re-entry into
+    that span only — a different lock (another agent) or a later span sees no
+    match. Binding ``None`` is a no-op (the anthropic path runs the tool on the
+    turn task, where reentry is by task identity), preserving prior behaviour.
+    """
+    if token is None:
+        yield
+        return
+    reset = _transition_lock_reentry_token.set(token)
+    try:
+        yield
+    finally:
+        _transition_lock_reentry_token.reset(reset)
+
+
+def current_bound_reentry_token() -> Optional[object]:
+    """Return the transition-lock reentry token currently BOUND on this task, or ``None``.
+
+    Companion to :func:`bind_transition_lock_reentry`. Where
+    :meth:`ReentrantTransitionLock.current_reentry_token` reads the token off the
+    LOCK (meaningful only on the task that OWNS the lock), this reads it off the
+    CONTEXTVAR — i.e. whatever a surrounding :func:`bind_transition_lock_reentry`
+    put there. This is what a NESTED inline executor needs (#2672 review P1
+    follow-up): the feature-subagent inline executor is BUILT on the parent inline
+    executor's reader task, INSIDE that executor's ``bind_transition_lock_reentry``
+    scope, so the owning turn's token is visible here even though this task does not
+    own the lock. The nested executor captures it and re-presents it around its OWN
+    cross-task tool dispatch, so a durable-identity write invoked by a subagent
+    re-enters the owning turn's span instead of deadlocking. Returns ``None`` when no
+    reentry token is bound (the anthropic path, or a subagent not nested under a held
+    turn lock) — so an unrelated background task, which captured no token, still
+    serializes.
+    """
+    return _transition_lock_reentry_token.get()
+
+
+class ReentrantTransitionLock:
+    """Task-reentrant async lock for the privacy-transition boundary (#2672 P1).
+
+    ``asyncio.Lock`` is NOT reentrant. A streamed turn holds the privacy-transition
+    lock across the ENTIRE turn — including feature/tool execution
+    (``agent/streaming.py`` acquires it before dispatching tools) — so a durable
+    identity write invoked as a tool WITHIN that turn (rename / description /
+    discovery history / user name / SOUL) that re-acquires the SAME lock would wait
+    forever on a lock its own turn already holds, hanging the stream. This lock
+    admits such a nested write via TWO scoped-to-the-held-span signals:
+
+      * SAME-TASK reentry — the task that acquired the lock re-acquires it. This
+        covers the anthropic path, where the inline write runs on the turn task
+        itself. A nested acquire returns immediately and bumps a depth counter;
+        only the OUTERMOST acquire releases to other tasks.
+
+      * CROSS-TASK reentry via a captured token — the codex app-server dispatches
+        each inline tool on its own reader-spawned task, NOT the turn task, so
+        same-task reentry cannot help it and it would DEADLOCK (the tool waits on
+        the lock the turn holds; the turn waits on the app-server's tool result).
+        The inline executor captures this span's token on the turn task (via
+        :meth:`current_reentry_token`) and re-presents it via
+        :func:`bind_transition_lock_reentry`; a caller carrying THIS span's token
+        re-enters cross-task — but through a SEPARATE per-span reentry mutex, not
+        by bypassing the lock outright. That mutex serializes the app-server's
+        concurrent reader tasks against each other: all inline tools of one turn
+        share the same token, so two durable identity writes (e.g. two
+        ``rename_agent`` calls) that would otherwise interleave their
+        metadata/graph/memory/SOUL writes are forced one-at-a-time, the second
+        blocked until the first's critical section completes (#2672 review P1).
+        The mutex is distinct from the base lock the turn owner holds, so the
+        cross-task write still never deadlocks; a nested write on the SAME reader
+        task re-enters the mutex by task identity.
+
+    Cross-turn exclusion is unchanged — a writer in task A and a concurrent
+    ``set_privacy_mode`` in task B (which captured no token) still serialize —
+    which is the only exclusion the #2672 check-then-write race needs. Both reentry
+    signals are scoped to the ONE currently-held span (the token is a fresh object
+    identity minted on the outermost acquire and cleared on the outermost release),
+    so a stale token from a prior span never re-enters a later one. Exposes the
+    ``asyncio.Lock``-compatible surface (``locked()`` + async context manager) the
+    call sites use.
+
+    CANCELLATION DRAIN (#2672 review P1). A cross-task reentry admitted via the
+    token is an ACTIVE LEASE on the outer span, not merely a hold of the reentry
+    mutex: the codex app-server runs each inline tool on a DETACHED reader task, so
+    if the owning turn is cancelled/disconnected while such a reader is mid
+    durable-write, the naive release would clear the token and free ``_lock``
+    immediately — and a concurrent privacy transition could then acquire ``_lock``
+    and flip to a volatile mode while the already-admitted NORMAL-mode write is
+    still persisting. To prevent that, the outermost owner exit first INVALIDATES
+    the token (rejecting any new reentry) and then WAITS for every active
+    token-bearing writer to finish before releasing ``_lock`` — cancellation-safely,
+    re-raising the turn's own cancellation only after the base lock is released. A
+    reader that is itself cancelled unblocks the drain via the same idle signal, so
+    the drain always terminates.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._owner: Optional["asyncio.Task"] = None
+        self._depth = 0
+        # Fresh identity per HELD span, minted on the outermost acquire and
+        # cleared on the outermost release. Handed to inline tool callbacks that
+        # run on a foreign task so they can re-enter THIS span cross-task; a token
+        # from a prior span never matches a later span's fresh identity.
+        self._token: Optional[object] = None
+        # Serializes CROSS-TASK token reentries within a span (#2672 review P1).
+        # The codex app-server dispatches every inline tool RPC of one turn on
+        # its OWN reader-spawned task, and all of them carry the SAME span token.
+        # Admitting them purely on token match (the prior bug) let two durable
+        # identity writes — e.g. two ``rename_agent`` calls in one turn — run
+        # their metadata/graph/memory/SOUL writes concurrently and interleave,
+        # leaving the durable identity sources inconsistent. Cross-task
+        # reentrants therefore acquire THIS mutex — distinct from the base
+        # ``_lock`` the turn owner holds, so there is no deadlock — which makes
+        # the second reentrant write wait for the first to complete. The owner's
+        # own (same-task) reentry never touches it; a single task cannot run two
+        # critical sections at once, so a depth bump is already exclusive there.
+        self._reentry_lock = asyncio.Lock()
+        # The reader task currently inside the reentry mutex, plus its nesting
+        # depth — so a nested durable write on that SAME reader task re-enters by
+        # task identity instead of self-deadlocking on the non-reentrant mutex.
+        self._reentry_owner: Optional["asyncio.Task"] = None
+        self._reentry_depth = 0
+        # Set when NO cross-task reentrant writer holds this span, cleared while one
+        # is active. The outermost owner AWAITS this before releasing ``_lock`` so a
+        # detached reader task's ALREADY-ADMITTED durable write completes INSIDE the
+        # owner's lock span even when the owning turn is cancelled/disconnected
+        # mid-flight (#2672 review P1 cancellation). Without the drain, the owner's
+        # ``__aexit__`` would clear the token and release ``_lock`` the instant the
+        # turn is cancelled — while the codex app-server's detached tool task is
+        # still persisting — and a concurrent ``set_privacy_mode`` could then
+        # acquire ``_lock`` and flip to a volatile mode under that in-flight
+        # NORMAL-mode write. Starts set (no reentrant writer at construction).
+        self._reentry_idle = asyncio.Event()
+        self._reentry_idle.set()
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+    def current_reentry_token(self) -> Optional[object]:
+        """The token that permits cross-task re-entry into the CURRENTLY-held span.
+
+        Returns the active span's token ONLY when the current task owns the lock —
+        i.e. when called on the turn task at the point the inline-tool executor
+        closure is built (``_make_inline_tool_executor`` runs inside the streamed
+        turn's ``async with transition_lock``). The executor captures this and
+        re-presents it via :func:`bind_transition_lock_reentry` when its tool runs
+        on the codex app-server's separate reader task, so a nested durable-identity
+        write re-enters the lock instead of deadlocking (#2672 review P1). Returns
+        ``None`` when the current task does not own the lock — there is no span to
+        authorize re-entry into, so an unrelated caller gets no token and still
+        serializes.
+        """
+        task = asyncio.current_task()
+        if task is not None and self._owner is task and self._token is not None:
+            return self._token
+        return None
+
+    def _token_matches_current_span(self) -> bool:
+        """Whether the current task carries THIS span's cross-task reentry token."""
+        token = _transition_lock_reentry_token.get()
+        return token is not None and self._token is not None and token is self._token
+
+    async def __aenter__(self) -> "ReentrantTransitionLock":
+        task = asyncio.current_task()
+        # (1) Same-task reentry by the span owner (the anthropic inline path runs
+        #     the write on the turn task itself; also any nested acquire). A single
+        #     task cannot run two critical sections at once, so a depth bump is
+        #     both sufficient and exclusive — no reentry mutex needed.
+        if task is not None and self._owner is task:
+            self._depth += 1
+            return self
+        # (2) Cross-task reentry by a reader task that ALREADY holds the reentry
+        #     mutex — a nested durable write on that SAME reader task. Reentrant by
+        #     task identity so it can't self-deadlock on the non-reentrant mutex.
+        if task is not None and self._reentry_owner is task:
+            self._reentry_depth += 1
+            return self
+        # (3) First cross-task reentry via a captured span token (the codex
+        #     app-server's per-tool reader task). Multiple inline tools in ONE turn
+        #     all carry the SAME span token; serialize concurrent token-bearers on
+        #     the per-span reentry mutex so the second durable identity write cannot
+        #     enter until the first's critical section completes — while STILL
+        #     bypassing the base lock the turn owner holds, so there is no deadlock
+        #     (#2672 review P1). The owner never reaches here: branch (1) caught it.
+        if self._token_matches_current_span():
+            await self._reentry_lock.acquire()
+            # Re-validate after awaiting: the owning span may have ended while we
+            # waited (owner released the base lock, token now stale). If so this is
+            # no longer a reentry — release the mutex and fall through to a normal
+            # acquire so a genuinely-after-span write serializes as its own turn.
+            if self._token_matches_current_span():
+                self._reentry_owner = task
+                self._reentry_depth = 1
+                # A cross-task reentrant writer is now ACTIVE in this span: mark the
+                # span non-idle so the owner's outermost exit drains it before
+                # releasing ``_lock`` (#2672 review P1 cancellation).
+                self._reentry_idle.clear()
+                return self
+            self._reentry_lock.release()
+        # (4) Normal acquire — an unrelated task (cross-turn), or the stale-token
+        #     fallthrough above. This is the cross-turn exclusion the #2672
+        #     check-then-write race depends on, unchanged.
+        await self._lock.acquire()
+        self._owner = asyncio.current_task()
+        self._token = object()
+        self._depth = 1
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        task = asyncio.current_task()
+        # Unwind a cross-task reentry frame (reader task holding the reentry mutex)
+        # before the base-lock frame — the two are always distinct tasks, so task
+        # identity disambiguates which frame this ``__aexit__`` pairs with.
+        if self._reentry_owner is not None and self._reentry_owner is task:
+            self._reentry_depth -= 1
+            if self._reentry_depth <= 0:
+                self._reentry_depth = 0
+                self._reentry_owner = None
+                self._reentry_lock.release()
+                # This cross-task reentrant write has finished its critical
+                # section; signal any owner blocked in the drain that it may now
+                # release the base lock (#2672 review P1 cancellation).
+                self._reentry_idle.set()
+            return False
+        self._depth -= 1
+        if self._depth <= 0:
+            self._depth = 0
+            self._owner = None
+            # (a) Invalidate the span token FIRST so no NEW cross-task reentry is
+            #     admitted past this point — a foreign task presenting the now-stale
+            #     token re-validates in ``__aenter__`` branch (3) and falls through
+            #     to a normal acquire, blocking on ``_lock`` until we release it.
+            self._token = None
+            # (b) DRAIN any ALREADY-admitted cross-task reentrant writer before
+            #     releasing the base lock. On the normal path the reader's write has
+            #     already completed (the app-server returned its tool result, which
+            #     is what unblocked this turn), so the event is set and this is a
+            #     no-op. On the cancellation path a detached reader may still be mid
+            #     durable-write; hold ``_lock`` until it finishes (or is itself
+            #     cancelled — its ``__aexit__`` sets the event either way) so a
+            #     concurrent privacy transition cannot flip the mode under it
+            #     (#2672 review P1 cancellation).
+            pending_cancel = await self._drain_active_reentrant()
+            self._lock.release()
+            # Re-raise a cancellation that arrived DURING the drain only after the
+            # lock is safely released, so the owning turn's cancellation still
+            # propagates but never at the cost of skipping the drain.
+            if pending_cancel is not None:
+                raise pending_cancel
+        return False
+
+    async def _drain_active_reentrant(self) -> Optional[BaseException]:
+        """Block until no cross-task reentrant writer holds this span.
+
+        Called by the outermost owner exit AFTER the span token is invalidated and
+        BEFORE ``_lock`` is released. Returns immediately on the normal path (the
+        detached reader's write already finished, so ``_reentry_idle`` is set). On
+        the cancellation path a detached codex app-server tool task may still be mid
+        durable-write; wait for it to signal idle — its own ``__aexit__`` sets the
+        event when its critical section completes OR when the reader task is itself
+        cancelled, so the drain always terminates. The wait is SHIELDED so cancelling
+        the owning turn cannot skip the drain (and cannot busy-spin under repeated
+        cancellation — the shielded waiter keeps the reader schedulable); a caught
+        cancellation is returned for the caller to re-raise AFTER releasing the base
+        lock (#2672 review P1 cancellation).
+        """
+        if self._reentry_idle.is_set():
+            return None
+        cancelled: Optional[BaseException] = None
+        waiter = asyncio.ensure_future(self._reentry_idle.wait())
+        try:
+            while not self._reentry_idle.is_set():
+                try:
+                    await asyncio.shield(waiter)
+                except asyncio.CancelledError as exc:
+                    cancelled = exc
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+        return cancelled
+
+
+@asynccontextmanager
+async def optional_transition_lock(lock):
+    """Hold ``lock`` for the block if provided, else run unguarded (#2672 review P1).
+
+    ``lock`` is the agent's privacy-transition lock
+    (``KestrelAgent._privacy_transition_lock``), the same mutex a privacy-mode
+    transition holds while it flips the mode across every state holder. A direct
+    durable user-content writer (rename, description, discovery history, user name,
+    SOUL) that checks the privacy mode and THEN ``await``s its persistence must
+    hold this lock across BOTH steps, or a transition can land the mode change in
+    the ``await`` gap — the writer passes the NORMAL-mode check, the mode flips to
+    EPHEMERAL, and the write persists anyway. Holding the lock makes the writer and
+    the transition mutually exclusive, so the writer either completes fully before
+    the flip or re-checks the mode after it and skips. ``None`` (raw storage /
+    offline CLI paths with no running agent) runs unguarded, preserving prior
+    behaviour.
+    """
+    if lock is None:
+        yield
+    else:
+        async with lock:
+            yield
+
+
+def _resolve_transition_lock(holder):
+    """Best-effort resolve an agent's privacy-transition lock, or ``None``.
+
+    Accepts an object exposing ``_get_privacy_transition_lock()`` (the agent) or a
+    plain lock. Returns ``None`` when neither is available (test/CLI shapes), so
+    the writer runs unguarded rather than failing.
+    """
+    if holder is None:
+        return None
+    getter = getattr(holder, "_get_privacy_transition_lock", None)
+    if callable(getter):
+        try:
+            return getter()
+        except Exception:  # noqa: BLE001 - never let lock resolution block a write
+            return None
+    # Already a lock (has async context-manager protocol).
+    if hasattr(holder, "__aenter__"):
+        return holder
+    return None
+
+
+# ── Privacy-aware graph write policy (#2672) ─────────────────────────────────
+#
+# The knowledge graph is durable storage. In a volatile privacy mode —
+# EPHEMERAL ("leave no trace"), ISOLATED ("session buffer only"), and
+# DEIDENTIFIED (fail-closed until the Safe Harbor pipeline lands): every mode
+# whose policy disallows persistent writes — a durable graph write is a real
+# privacy leak. Facts, todos, decisions, concepts, and consolidated episodes
+# are all derived from user conversation input. The pre-#2672 wrapper waved
+# every graph write through as "structural, not PII", which let those
+# user-derived nodes reach the backend directly, *outside* the #1760
+# post-response gate, and let feature code bypass enforcement entirely by
+# reaching through the raw ``.graph`` / ``.graph_store`` surfaces.
+#
+# A prior revision admitted a small allowlist by node-type/key/label plus a
+# generic "is this value content-free-shaped?" check, and used a boolean
+# ``control_plane=True`` marker for the value-bearing types. The third Terra
+# review rejected both halves:
+#
+#   * P1 — a generic "short single-line string" check treats any secret under
+#     ~512 chars as content-free, so a secret fits inside a ``hash`` / ``type`` /
+#     ``source_path`` field. Shape-of-a-string is not semantics-of-a-field.
+#   * P2 — ``control_plane=True`` is a publicly forgeable boolean on a public
+#     method signature: ANY feature/tool passes it to self-authorize.
+#
+# The policy is now a TWO-tier default-deny where each tier closes one finding:
+#
+#   1. Content-free structural types — ``document`` (constitution byte-anchor)
+#      and ``audit_anchor`` (tamper-evidence receipt), plus the ``governed_by``
+#      governance edge. Their fields are hashes / counts / timestamps / an enum
+#      literal BY CONSTRUCTION, so they are admitted on the ordinary (untrusted)
+#      path — but every field is now validated by a PER-FIELD SEMANTIC validator
+#      (a ``hash`` must be hex of a hash's length, a ``*_at`` must parse as an
+#      ISO-8601 timestamp, an ``entries_count`` must be a non-negative int, a
+#      ``type`` must be a known literal, ``document.hash`` must equal the node's
+#      own content-hash id). A short secret is not a 64-hex digest, not a
+#      timestamp, not an int, not the literal ``"Constitution"`` — so it fails
+#      closed in EVERY field (finding P1). Labels are pinned to exact literals /
+#      a fixed regex.
+#
+#   2. The ``agent`` control-plane identity node (DID, constitution / doctrine
+#      anchors, genesis audit, bootstrap + lifecycle state). It carries the
+#      control-plane CAPABILITY marker (``acquire_control_plane_capability()`` —
+#      see below). Its content-free fields are per-field validated, and — the
+#      load-bearing part — its FREE-TEXT fields (``name`` / ``description`` /
+#      ``expected_duration`` identity text AND the governance-receipt blobs
+#      ``genesis_audit`` / ``genesis_audit_history`` / ``emancipation_contract`` /
+#      ``constitution_reanchor`` / ``doctrine_bundle_reanchor``) are admitted in a
+#      volatile mode ONLY when CARRIED ALONG UNCHANGED from the stored node (or the
+#      CAS ``expected`` snapshot). That CONTENT check, not the capability, is what
+#      closes the free-text leak the review reproduced.
+#
+#      ``constitution_amendment_artifact`` (the signed reanchor receipt) is NOT a
+#      tier-2 type: it is ALWAYS a fresh node (its id is its own content hash), so
+#      its free-text ``source_path`` / ``signer`` / ``verification`` could never be
+#      carried along — admitting it would be exactly the fresh-free-text channel
+#      the review reproduced. It is default-denied. No boot path needs it (see
+#      finding P3 below).
+#
+# IMPORTANT — the capability is same-process defense-in-depth, NOT an unforgeable
+# authorization boundary. The third Terra review proved the earlier "unforgeable"
+# claim false: the governance writers are mixin methods ON THE AGENT, and feature
+# code holds the agent, so ANY in-process signal the writers use (caller-frame
+# provenance, a held token, a module singleton) is reachable/forgeable by feature
+# code running in the same interpreter — a feature can ``exec`` a helper into a
+# real trusted module's ``__dict__`` and obtain the token. The privacy guarantee
+# therefore CANNOT rest on caller identity; it rests on CONTENT (per-field
+# validation + the carried-along free-text boundary). The genuinely hard boundary
+# for untrusted feature code is the separate-process isolated feature runtime
+# (``features/isolated_runtime.py``); the capability only keeps FIRST-PARTY
+# governance code from accidentally tripping the gate and documents intent.
+#
+# The two user-derived surfaces the review told us NOT to blanket-trust —
+# ``agent.description`` (free text) and ``feature_config.config`` (an arbitrary
+# settings dict) — are gated at their SINGLE SOURCE OF TRUTH:
+# ``bootstrap.service.persist_agent_description`` and ``Feature.persist_config``
+# skip their durable writes entirely in a volatile mode. ``feature_config`` is
+# therefore NOT in the allowlist at all, and ``agent.description`` reaching the
+# node directly is refused by the carried-along boundary above unless unchanged
+# (finding P3).
+#
+# Finding P3 — preserve volatile boot/governance through the SMALLEST EXPLICIT
+# source-of-truth path, never a wrapper free-text channel. The one governance
+# receipt that MUST persist fresh in a volatile mode is the first-cognition
+# GENESIS AUDIT receipt (it gates cognition and runs regardless of privacy mode).
+# It cannot be carried along (it is, by definition, fresh), so admitting it via
+# this wrapper would reopen the free-text channel. Instead the genesis-audit
+# writers persist it to the RAW store directly
+# (``ConstitutionMixin._governance_graph_store`` → ``agent._raw_storage``), the
+# same low-level store inception uses for the initial agent node — a first-party,
+# content-addressed governance write that never traverses the feature-facing
+# wrapper. The other governance ceremonies do not need a fresh wrapper free-text
+# write: ``mark_stale_bootstrap`` / the doctrine BOOT anchor copy the node and
+# mutate only content-free state (free-text carried unchanged → admitted); the
+# runtime ``!reanchor-constitution`` command is blocked earlier by the volatile
+# ``store_file`` gate; a runtime doctrine reanchor's fresh ``doctrine_bundle_reanchor``
+# receipt fails closed in a volatile mode (a governance ceremony that mutates
+# durable state belongs in a persistent mode). NORMAL / PUBLIC / ANONYMOUS are
+# unaffected (the wrapper never governs a persistent-write mode).
+#
+# Residual (documented, not hidden): closing the free-text wrapper channel does
+# NOT close the raw store — an in-process feature can still reach
+# ``agent._raw_storage`` and write arbitrary nodes/free-text there, exactly like
+# the genesis-audit writer does. That is the SAME residual as the raw-store note
+# below and requires process isolation to close; this fix only guarantees the
+# SANCTIONED wrapper surface is no longer a free-text channel.
+#
+# The SAME residual covers the ungoverned raw store, ``agent._raw_storage`` (and
+# its ``.db``), which every in-process feature can reach off the agent object. It
+# is a privileged, first-party control-plane handle — the store BELOW this wrapper
+# that core paths use to persist identity/anchor state regardless of privacy mode
+# — NOT part of the feature-facing storage API. This wrapper is the governed API
+# surface for the SANCTIONED path (features persist via ``agent.storage``); it is
+# not, and cannot be, an in-process sandbox, because first-party code sharing this
+# interpreter can already reach anything (the capability-forgery note above is the
+# same point). What this wrapper DOES guarantee is that the sanctioned surface has
+# no accidental leak: ``.graph`` / ``.graph_store`` return a governing proxy that
+# refuses the raw ``db`` handle and any un-allowlisted attribute (#2672 review P1),
+# so ``storage.graph.db`` / ``storage.graph.<write>`` cannot slip a write past the
+# boundary. The hard boundary against UNTRUSTED extension code is process
+# isolation (``features/isolated_runtime.py``), which never receives ``_raw_storage``.
+#
+# Everything else — user-derived types, unknown types (now including
+# ``constitution_amendment_artifact``), payload-bearing structural edges, and a
+# fresh/changed free-text field — fails closed with a ``PrivacyViolationError``
+# the tool caller can see. NORMAL / PUBLIC / ANONYMOUS (any mode that allows
+# persistent writes) is unaffected.
+#
+# The ``agent`` key set is the COMPLETE governance vocabulary the production
+# writers set (inception_service, agent/constitution, agent/doctrine_bundle,
+# bootstrap/service, features/bootstrap, graduate_service, kestrel_agent,
+# setup/constitution_reanchor, setup/overlay_anchor). A field missing here makes
+# a born-volatile agent fail closed on a legitimate governance write, so a NEW
+# governance field must be added consciously with a validator. Adding a type,
+# key, or trusted module REQUIRES a test proving the written node carries no user
+# content (see ``tests/unit/test_privacy_graph_boundary.py``).
+
+
+# ── Control-plane write capability — same-process defense-in-depth (#2672) ────
+#
+# HONESTY NOTE (corrects an earlier false claim). A prior revision presented this
+# capability as an "unforgeable" authorization boundary issued by caller-frame
+# module-dict provenance. The third Terra review proved that false: any in-process
+# code can ``import`` a trusted module and ``exec`` a helper into its real
+# ``__dict__``; that helper's frame then has the exact ``f_globals`` identity the
+# issuer checks, so it obtains the genuine token. There is NO same-interpreter
+# provenance (module-dict identity, ``__name__``, a code-object check) and NO
+# held/module token that feature code cannot reach, because the governance writers
+# are mixin methods on the agent and features hold the agent.
+#
+# So this capability is NOT relied on for the privacy guarantee. The guarantee is
+# CONTENT-based: per-field semantic validation for content-free fields, and the
+# carried-along free-text boundary (``_StructuralNodeShape.free_text_carry_along``)
+# for the ``agent`` node's user-derived free-text — a fresh/changed ``description`` is
+# refused even to a caller holding a genuine (forged) capability. The capability
+# is kept only as a coarse type gate and to document which writes are governance;
+# ``acquire_control_plane_capability()`` still verifies module-dict provenance so
+# a stray non-governance import can't casually pass it, but that is convenience,
+# not security. The hard boundary for untrusted feature code is process isolation
+# (``features/isolated_runtime.py``). This is stated plainly so no future reader
+# mistakes the capability for an authorization boundary again.
+#
+#   * The sole instance is closure-private (no importable module attribute), and
+#     the wrapper accepts it by object IDENTITY (``is``) — a boolean, a lookalike,
+#     or a fresh ``_ControlPlaneCapability()`` are refused. This stops ACCIDENTAL
+#     passes and trivially-forged markers, not a determined in-process attacker.
+
+
+class _ControlPlaneCapability:
+    """Marker that a durable graph write is a first-party governance write.
+
+    Same-process defense-in-depth, NOT an authorization boundary (see the header
+    HONESTY NOTE). The sole instance is closure-private and the wrapper checks it
+    by ``is`` identity, so a boolean or a fresh ``_ControlPlaneCapability()`` won't
+    stand in — this stops accidental/trivially-forged passes, not a determined
+    in-process attacker. The privacy guarantee is carried by content validation
+    and the carried-along identity boundary, not by this marker.
+    """
+
+    __slots__ = ()
+
+
+# Fully-qualified module names whose namespace may obtain the control-plane
+# marker. Each is a first-party governance / identity / bootstrap writer. The
+# ``__dict__``-identity check below only distinguishes a casual import from a
+# genuine governance write — it is NOT tamper-proof (any in-process code can
+# ``exec`` into these modules' dicts; see the header note), which is exactly why
+# the privacy guarantee does not rest on it. Adding a module REQUIRES tracing its
+# write's input to a governance/identity source of truth and a test.
+_TRUSTED_CONTROL_PLANE_MODULES = frozenset({
+    "kestrel_sovereign.agent.constitution",
+    "kestrel_sovereign.agent.doctrine_bundle",
+    "kestrel_sovereign.bootstrap.service",
+    "kestrel_sovereign.features.bootstrap.feature",
+    "kestrel_sovereign.kestrel_agent",
+})
+
+
+def _build_control_plane_gate():
+    """Build the ``(acquire, has)`` pair over a closure-private capability marker.
+
+    The instance is closure-private (bound to no importable module attribute) so
+    it can't be casually imported. This is defense-in-depth, not a hard boundary —
+    a determined in-process caller can still obtain it (see the header note), which
+    is why the privacy guarantee rests on content validation and the carried-along
+    identity boundary instead.
+    """
+    _singleton = _ControlPlaneCapability()
+
+    def acquire_control_plane_capability() -> "_ControlPlaneCapability":
+        """Return the control-plane graph-write marker to a first-party writer.
+
+        Verifies MODULE-DICT provenance: the immediate caller's ``f_globals`` must
+        BE the ``__dict__`` of a module in :data:`_TRUSTED_CONTROL_PLANE_MODULES`.
+        This distinguishes a genuine governance write from a casual import; it is
+        NOT tamper-proof (in-process code can ``exec`` into those dicts), so it is
+        defense-in-depth, not authorization — the privacy guarantee is enforced by
+        content validation and the carried-along identity boundary regardless of
+        who holds this marker (#2672 review P1). Call it inline at the write site.
+        """
+        try:
+            caller_globals = sys._getframe(1).f_globals
+        except Exception:  # pragma: no cover - frame access should always work
+            caller_globals = None
+        if caller_globals is not None:
+            for module_name in _TRUSTED_CONTROL_PLANE_MODULES:
+                module = sys.modules.get(module_name)
+                if module is not None and module.__dict__ is caller_globals:
+                    return _singleton
+        raise PrivacyViolationError(
+            "Control-plane graph-write marker refused: it is returned only to code "
+            "running in the namespace of a first-party governance/identity/"
+            "bootstrap module. This is a defense-in-depth convenience, not an "
+            "authorization boundary — the privacy guarantee is enforced by content "
+            "validation and the carried-along identity boundary regardless (#2672)."
+        )
+
+    def _has_control_plane_capability(capability: Any) -> bool:
+        """Whether ``capability`` is the one true control-plane token (by identity)."""
+        return capability is _singleton
+
+    return acquire_control_plane_capability, _has_control_plane_capability
+
+
+acquire_control_plane_capability, _has_control_plane_capability = _build_control_plane_gate()
+
+
+# ── Per-field semantic validators (#2672 review P1) ──────────────────────────
+#
+# Each validator answers "is this value a valid, content-free instance of THIS
+# field's semantic class?" — not the old "is it a short string?". A short secret
+# is not a hash, not a timestamp, not a non-negative int, not a known enum
+# literal, so it fails closed in every content-free field surface.
+
+# A hash digest as written by ``store_file`` (SHA-256 → 64 lowercase hex) and by
+# the identity/audit writers; the range tolerates other digest widths without
+# admitting free text.
+_HEX_HASH_RE = re.compile(r"^[0-9a-fA-F]{32,128}$")
+# A short structural enum/token: a bootstrap state, a document ``type``, an
+# artifact ``type`` — alphanumerics with ``_ . -`` only, no spaces, bounded.
+_ENUM_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}$")
+# An identity token: DID / agent_id / test cycle id — allows the ``:`` and ``%``
+# a DID method carries, single-line, bounded.
+_ID_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:%#\-]{0,255}$")
+
+_MAX_IDENTITY_TEXT = 100_000  # name / description (capability-gated identity)
+_MAX_BOUNDED_TEXT = 8_192     # a bounded free-form receipt/path/reason string
+_MAX_PATH = 4_096
+
+
+def _is_hex_hash(value: Any) -> bool:
+    return isinstance(value, str) and bool(_HEX_HASH_RE.fullmatch(value))
+
+
+def _is_hex_hash_or_none(value: Any) -> bool:
+    return value is None or _is_hex_hash(value)
+
+
+def _is_iso_timestamp(value: Any) -> bool:
+    """True if ``value`` parses as an ISO-8601 / SQLite-datetime timestamp.
+
+    Accepts the ISO form the identity writers emit (``datetime.isoformat()``,
+    optionally ``Z``-terminated) and the ``YYYY-MM-DD HH:MM:SS`` shape SQLite
+    writes. A free-text secret does not parse, so it fails closed.
+    """
+    if not isinstance(value, str) or not value or len(value) > 64 or "\n" in value:
+        return False
+    from datetime import datetime
+    candidate = value.strip()
+    normalized = candidate[:-1] + "+00:00" if candidate.endswith("Z") else candidate
+    try:
+        datetime.fromisoformat(normalized)
+        return True
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            datetime.strptime(candidate, fmt)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _is_iso_timestamp_or_none(value: Any) -> bool:
+    return value is None or _is_iso_timestamp(value)
+
+
+def _is_count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _is_enum_token(value: Any) -> bool:
+    return isinstance(value, str) and bool(_ENUM_TOKEN_RE.fullmatch(value))
+
+
+def _is_enum_token_or_none(value: Any) -> bool:
+    return value is None or _is_enum_token(value)
+
+
+def _is_bool(value: Any) -> bool:
+    return isinstance(value, bool)
+
+
+def _is_id_token(value: Any) -> bool:
+    return isinstance(value, str) and bool(_ID_TOKEN_RE.fullmatch(value))
+
+
+def _is_id_token_or_none(value: Any) -> bool:
+    return value is None or _is_id_token(value)
+
+
+def _is_numeric_str_or_none(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    if not isinstance(value, str) or not value or len(value) > 64:
+        return False
+    try:
+        float(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _is_bounded_text_or_none(value: Any) -> bool:
+    """A bounded, single-line free-form string (or None).
+
+    Used for the agent node's ``expected_duration`` operator free-text. It CANNOT
+    be proven content-free by shape, which is exactly why it is a
+    ``free_text_carry_along`` field (admitted in a volatile mode only carried along
+    unchanged) — this check only bounds length / rejects multi-line blobs as
+    defense-in-depth.
+    """
+    if value is None:
+        return True
+    return isinstance(value, str) and len(value) <= _MAX_BOUNDED_TEXT and "\n" not in value
+
+
+#: An opaque, provider-issued credential hash — e.g. the OpenRouter child-key
+#: hash the host-owned ``payer_resolver`` writes to the agent node so
+#: ``retirement_service`` can revoke the remote key. It is CONTENT-FREE billing
+#: metadata (a credential handle), not user text: a bounded, single-line token
+#: from the character class hash encodings use (hex plus ``: . _ -`` separators).
+#: Whitespace, newlines, and oversized values are refused so it cannot become a
+#: smuggling channel (defense-in-depth on the capability-gated ``agent`` node).
+_CREDENTIAL_HASH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._\-]{7,255}$")
+
+
+def _is_credential_hash_or_none(value: Any) -> bool:
+    return value is None or (
+        isinstance(value, str) and bool(_CREDENTIAL_HASH_RE.fullmatch(value))
+    )
+
+
+def _is_identity_text_or_none(value: Any) -> bool:
+    """A bounded identity string (agent name / description / label).
+
+    User-derived, so accepted only on the capability-gated ``agent`` node whose
+    single introducer (``persist_agent_description``) is separately source-gated
+    in volatile modes — this validator only bounds length and rejects non-strings
+    / structured smuggling, it is not the trust boundary (#2672 review P3).
+    """
+    return value is None or (isinstance(value, str) and len(value) <= _MAX_IDENTITY_TEXT)
+
+
+def _is_path_list_or_none(value: Any) -> bool:
+    if value is None:
+        return True
+    if not isinstance(value, (list, tuple)):
+        return False
+    return all(
+        isinstance(item, str) and len(item) <= _MAX_PATH and "\n" not in item
+        for item in value
+    )
+
+
+def _is_governance_receipt(value: Any, _depth: int = 0) -> bool:
+    """A bounded, shallow governance-receipt container (or scalar / None).
+
+    The ``genesis_audit`` / ``emancipation_contract`` / ``*_reanchor`` fields are
+    structured receipts (hashes, timestamps, statuses, provenance strings, signed
+    contracts) written only by trusted governance code on the capability-gated
+    ``agent`` node. This bounds their shape (no oversized blob, no deep nesting)
+    as defense-in-depth; the capability is the trust boundary.
+    """
+    if value is None or isinstance(value, (bool, int, float)):
+        return True
+    if isinstance(value, str):
+        return len(value) <= _MAX_BOUNDED_TEXT
+    if _depth >= 6:
+        return False
+    if isinstance(value, (list, tuple)):
+        return all(_is_governance_receipt(item, _depth + 1) for item in value)
+    if isinstance(value, dict):
+        return all(
+            isinstance(key, str) and len(key) <= 128
+            and _is_governance_receipt(val, _depth + 1)
+            for key, val in value.items()
+        )
+    return False
+
+
+@dataclass(frozen=True)
+class _StructuralNodeShape:
+    """The canonical shape of one allowlisted structural node type.
+
+    ``field_validators`` maps every permitted property key to its per-field
+    semantic validator (the allowed key set is exactly its keys). ``requires_capability``
+    marks the ``agent`` control-plane identity node, which carries the
+    control-plane capability marker in a volatile mode (a same-process
+    defense-in-depth signal, not an authorization boundary — see the header
+    note); content-free types leave it ``False`` and are admitted on the ordinary
+    path purely on strict per-field validation.
+
+    ``free_text_carry_along`` names the node's user-derived / free-text fields
+    (identity free-text AND the governance-receipt blobs). No per-field regex can
+    prove these content-free, so in a volatile mode they are admitted ONLY when
+    CARRIED ALONG UNCHANGED from the stored node (or the CAS ``expected``
+    snapshot). A FRESH or CHANGED free-text value is refused even to a caller
+    holding the (same-process, forgeable) capability — that CONTENT boundary, not
+    the capability, is the load-bearing privacy gate, and it is what closes the
+    reproduced free-text forgery leak (#2672 review P1). A genuinely-fresh
+    governance receipt (e.g. the genesis-audit receipt at first cognition) is
+    therefore NOT written through this wrapper in a volatile mode; it goes to the
+    RAW store as the smallest explicit source-of-truth path (see the header note
+    and ``ConstitutionMixin._governance_graph_store``).
+
+    ``hash_equals_node_id``, when set, names a property that must equal the node's
+    own id (the content hash) — closing the "arbitrary hex in a hash field"
+    channel for the constitution ``document`` node.
+    """
+    field_validators: Dict[str, Any]
+    label_literals: Optional[frozenset] = None
+    label_regex: Optional[Any] = None  # compiled ``re.Pattern`` or None
+    requires_capability: bool = False
+    hash_equals_node_id: Optional[str] = None
+    free_text_carry_along: frozenset = frozenset()
+
+    @property
+    def keys(self) -> frozenset:
+        return frozenset(self.field_validators)
+
+    @property
+    def label_content_free(self) -> bool:
+        """Whether this type's LABEL is validated content-free by shape.
+
+        ``True`` when the label is pinned to a literal set or a strict regex
+        (``document`` / ``audit_anchor``): such a label cannot carry user text,
+        so it is admitted on content alone. ``False`` when the label is an
+        identity-derived free-text string (the ``agent`` node's name) that no
+        regex can prove content-free — that label is a top-level free-text field
+        and, exactly like the free-text PROPERTIES, is admitted in a volatile
+        mode ONLY carried along UNCHANGED from the stored node. This split is the
+        per-type label audit the P1 review demanded: EVERY allowlisted type is
+        either content-free-labeled or free-text-carried, so no shape can smuggle
+        durable user text through ``GraphNode.label`` (#2672 review P1).
+        """
+        return self.label_literals is not None or self.label_regex is not None
+
+
+_STRUCTURAL_NODE_SHAPES: Dict[str, _StructuralNodeShape] = {
+    # Control-plane identity node — CAPABILITY REQUIRED in volatile modes.
+    # Accretes governance/lifecycle metadata over the agent's life. Every
+    # content-free governance field is per-field validated (defense-in-depth);
+    # the user-derived identity fields ``name`` / ``description`` / label are
+    # accepted only because (a) the capability restricts writers to first-party
+    # governance code and (b) the ONLY writer that introduces a new
+    # ``description`` (``persist_agent_description``) is source-gated to skip in
+    # volatile modes, so on this node ``description`` is a carried-along value,
+    # never freshly-introduced content (#2672 review P3). The key set is the
+    # complete production governance vocabulary; a NEW field must be added here
+    # consciously with a validator or a volatile-mode agent fails closed on it.
+    "agent": _StructuralNodeShape(
+        field_validators={
+            "agent_id": _is_id_token,
+            "did": _is_id_token,
+            "created_at": _is_iso_timestamp,
+            "constitution_hash": _is_hex_hash,
+            "constitution_overlay_hash": _is_hex_hash_or_none,
+            "initialBalance": _is_numeric_str_or_none,
+            "name": _is_identity_text_or_none,
+            "description": _is_identity_text_or_none,
+            # ``avatar_hash`` is the ``store_file`` content hash of the avatar
+            # image (hex), never free text — validate it as a hash so it cannot be
+            # a smuggling channel on the ordinary path (the image bytes themselves
+            # are blocked by the volatile-mode ``store_file`` gate) (#2672 review P1).
+            "avatar_hash": _is_hex_hash_or_none,
+            "bootstrap_state": _is_enum_token_or_none,
+            "bootstrap_status": _is_enum_token_or_none,
+            "bootstrap_stale_at": _is_iso_timestamp_or_none,
+            "bootstrap_pending_age_seconds": _is_count,
+            "genesis_audit": _is_governance_receipt,
+            # ``supersede_genesis_audit`` archives the prior receipt here on every
+            # signed reanchor, so a volatile-mode reanchor writes this property on
+            # the agent node — it MUST be a canonical governance field or the
+            # reanchor's agent-node write fails closed and the whole ceremony rolls
+            # back (#2672 review: volatile reanchor after audit history).
+            "genesis_audit_history": _is_governance_receipt,
+            "emancipation_contract": _is_governance_receipt,
+            "constitution_reanchor": _is_governance_receipt,
+            "doctrine_bundle_hash": _is_hex_hash_or_none,
+            "doctrine_bundle_files": _is_path_list_or_none,
+            "doctrine_bundle_anchored_at": _is_iso_timestamp_or_none,
+            "doctrine_bundle_reanchor": _is_governance_receipt,
+            "doctrine_anchored_paths": _is_path_list_or_none,
+            "graduated_at": _is_iso_timestamp_or_none,
+            # ``openrouter_key_hash`` is the provider-issued hash of the agent's
+            # delegated OpenRouter child key, persisted onto the agent node by the
+            # host-owned ``payer_resolver`` so ``retirement_service`` can revoke
+            # the remote key at teardown. It is content-free billing/control-plane
+            # metadata (a credential handle, never user content), so it is a
+            # canonical ``agent`` field validated as an opaque credential hash.
+            # WITHOUT it, any agent that already carries the field fails a full
+            # agent-node governance upsert closed once volatile — breaking
+            # doctrine/bootstrap/audit persistence for delegated-OpenRouter agents
+            # (#2672 review P2).
+            "openrouter_key_hash": _is_credential_hash_or_none,
+            "is_test_instance": _is_bool,
+            "test_cycle_id": _is_id_token_or_none,
+            # ``expected_duration`` is operator free text ("1 hour", "unspecified").
+            "expected_duration": _is_bounded_text_or_none,
+            "is_demo": _is_bool,
+        },
+        requires_capability=True,
+        # Every user-derived / free-text field on the agent node. In a volatile
+        # mode each is admitted ONLY carried along UNCHANGED from the stored node
+        # (the CONTENT boundary that closes the free-text forgery leak, #2672
+        # review P1): identity free-text (name / description / expected_duration)
+        # AND the governance-receipt blobs (genesis audit, emancipation contract,
+        # constitution / doctrine reanchor provenance), none of which a per-field
+        # regex can prove content-free. A governance write that copies the node
+        # and mutates only content-free state (mark-stale, doctrine boot-anchor)
+        # carries these unchanged and passes; a genuinely-fresh receipt (the
+        # first-cognition genesis audit) is written to the RAW store instead, so
+        # it never needs a fresh free-text admit here.
+        free_text_carry_along=frozenset({
+            "name",
+            "description",
+            "expected_duration",
+            "genesis_audit",
+            "genesis_audit_history",
+            "emancipation_contract",
+            "constitution_reanchor",
+            "doctrine_bundle_reanchor",
+        }),
+        # label = the agent's own name, or ``f"Agent {did}"`` — identity.
+    ),
+    # Content-free constitution byte-anchor — ORDINARY PATH, strict per-field.
+    # ``hash`` must equal the node id (both are the constitution content hash),
+    # ``type`` must be the literal ``"Constitution"``, ``created_at`` an ISO
+    # timestamp — no field can carry a secret.
+    "document": _StructuralNodeShape(
+        field_validators={
+            "hash": _is_hex_hash,
+            "type": lambda v: v == "Constitution",
+            "created_at": _is_iso_timestamp,
+        },
+        label_literals=frozenset({"KESTREL_CONSTITUTION"}),
+        hash_equals_node_id="hash",
+    ),
+    # NOTE: ``constitution_amendment_artifact`` (the signed constitution-reanchor
+    # receipt) is DELIBERATELY NOT allowlisted here. Its ``source_path`` /
+    # ``signer`` / ``verification`` are free-form governance strings no per-field
+    # regex can prove content-free, and — unlike the ``agent`` node's free-text —
+    # the artifact is ALWAYS a fresh node (its id is its own content hash, so
+    # there is never a stored value to carry along). Admitting it in a volatile
+    # mode is therefore an unavoidable fresh-free-text channel, which the third
+    # Terra review reproduced (a forged capability persisted arbitrary text in
+    # ``source_path`` during EPHEMERAL). It is default-denied instead. No boot
+    # path needs it: the runtime ``!reanchor-constitution`` command is already
+    # blocked earlier by the volatile-mode ``store_file`` gate, and the offline
+    # setup reanchor writes the artifact through the RAW store, outside this
+    # wrapper (#2672 review P1).
+    #
+    # Content-free tamper-evidence anchor — ORDINARY PATH, strict per-field.
+    # ``storage_ref`` is a ``store_file`` content hash (hex) or None, never text.
+    "audit_anchor": _StructuralNodeShape(
+        field_validators={
+            "anchor_hash": _is_hex_hash,
+            "storage_ref": _is_hex_hash_or_none,
+            "entries_count": _is_count,
+            "first_entry_at": _is_iso_timestamp_or_none,
+            "last_entry_at": _is_iso_timestamp_or_none,
+            "created_at": _is_iso_timestamp,
+        },
+        label_regex=re.compile(r"^Audit Anchor \(\d+ entries\)$"),
+    ),
+}
+
+# Derived from the shape table so the two can never drift out of sync.
+STRUCTURAL_GRAPH_NODE_TYPES = frozenset(_STRUCTURAL_NODE_SHAPES)
+
+# The structural node types the control-plane capability marks (they carry
+# free-text fields not provable content-free by shape). Now just the ``agent``
+# identity node — ``constitution_amendment_artifact`` was dropped from the
+# allowlist entirely (it is always fresh free-text). See the carried-along content
+# boundary below and the header note on why the capability is same-process
+# defense-in-depth rather than an unforgeable authorization boundary (#2672).
+CONTROL_PLANE_ONLY_NODE_TYPES = frozenset(
+    node_type
+    for node_type, shape in _STRUCTURAL_NODE_SHAPES.items()
+    if shape.requires_capability
+)
+
+# ── Carried-along free-text boundary (#2672 review P1 — the load-bearing gate) ──
+#
+# The reproduced review leak was: a feature obtains the (same-process, forgeable)
+# capability and persists FRESH free-text — an ``agent.description``, or arbitrary
+# text in ``constitution_amendment_artifact.source_path`` — in EPHEMERAL. Caller
+# identity cannot stop this: the governance writers ARE mixin methods on the
+# agent, and feature code holds the agent, so any in-process token/provenance the
+# writers use is reachable by feature code too (the true boundary for untrusted
+# code is the separate-process isolated feature runtime).
+#
+# So the free-text leak is closed by CONTENT, independent of the capability: a
+# control-plane node's free-text fields (declared per-type in
+# ``_StructuralNodeShape.free_text_carry_along``) may be admitted in a volatile
+# mode ONLY when CARRIED ALONG UNCHANGED from the stored node (or the CAS
+# ``expected`` snapshot). A governance write that copies the existing node and
+# mutates only content-free state (mark-stale, doctrine boot-anchor) keeps these
+# equal and passes; a FRESH or CHANGED value is refused REGARDLESS of any
+# capability. Because that means a genuinely-fresh governance receipt cannot be
+# admitted here, the writers that MUST persist one in a volatile mode (the
+# first-cognition genesis audit) write to the RAW store instead — the smallest
+# explicit source-of-truth path (#2672 review finding P3). ``avatar_hash`` and the
+# other hashes/timestamps/counts are NOT carry-along fields because they are
+# validated content-free by shape; ``constitution_amendment_artifact`` is not
+# allowlisted at all because it is always fresh (see the note above its former
+# entry).
+
+
+def _free_text_carry_along_fields(node_type) -> frozenset:
+    """The declared free-text carry-along fields for a node type (empty if none)."""
+    shape = _STRUCTURAL_NODE_SHAPES.get(node_type)
+    return shape.free_text_carry_along if shape is not None else frozenset()
+
+# The only structural edge that must survive a volatile-mode write is the
+# governance binding ``agent --governed_by--> constitution``, written during the
+# startup constitution audit regardless of the agent's configured mode. Every
+# content edge (knows / records_action / records_decision / concept
+# co-occurrence / memory / todo links) fails closed.
+STRUCTURAL_GRAPH_EDGE_LABELS = frozenset({
+    "governed_by",
+})
 
 
 @dataclass
@@ -631,42 +1679,488 @@ class PrivacyEnforcingStorage:
             return self._session_files[content_hash]
         return await self._storage.retrieve_file(content_hash)
     
-    # === Graph Storage (Pass-through - structural, not PII-sensitive) ===
+    # === Graph Storage (privacy-governed durable writes — #2672) ===
+    #
+    # The knowledge graph is durable storage, so its writes are governed by the
+    # same privacy contract as conversation history. In a volatile privacy mode
+    # (EPHEMERAL / ISOLATED / DEIDENTIFIED — every mode whose policy disallows
+    # persistent writes) node, edge, and compare-and-swap writes default-deny.
+    # Only these reach the backend: (1) content-free structural types
+    # (``document`` / ``audit_anchor`` and the ``governed_by`` edge), validated by
+    # strict per-field semantic validators so no user text can ride in a ``hash`` /
+    # ``type`` / ``*_at`` field; and (2) the ``agent`` control-plane identity node,
+    # whose content-free fields are per-field validated, and whose free-text fields
+    # (identity text + governance receipts) are admitted ONLY carried along
+    # unchanged (``_enforce_free_text_carry_along``) — the CONTENT check that
+    # actually closes the free-text leak, independent of the (same-process,
+    # defense-in-depth) capability marker. ``constitution_amendment_artifact`` is
+    # no longer admitted at all (it is always fresh free-text). Everything else —
+    # user-derived and unknown writes, a fresh/changed free-text field — raises
+    # ``PrivacyViolationError`` so the tool caller sees the rejection instead of a
+    # silent "success". Reads and deletes are never gated. NORMAL / PUBLIC /
+    # ANONYMOUS pass through unchanged.
 
-    async def add_node(self, node) -> None:
-        """
-        Add a graph node.
+    @property
+    def _graph_writes_governed(self) -> bool:
+        """True when durable graph writes must be privacy-governed.
 
-        Graph operations are allowed even in EPHEMERAL mode because they are
-        structural metadata (agent nodes, edges) rather than user content.
-        The privacy protection focuses on conversation history and file storage.
+        Governed in every mode whose policy disallows persistent writes —
+        EPHEMERAL, ISOLATED, and DEIDENTIFIED. NORMAL / PUBLIC / ANONYMOUS
+        (persistent-write modes) pass through unchanged, preserving the
+        pre-#2672 durable-mode behaviour. ISOLATED is governed too: unlike
+        conversation history it has no in-memory graph buffer, so a durable
+        graph write there is a real leak, not a session-local write.
         """
-        # Graph operations bypass privacy check - they're structural, not PII
+        return not self._policy.allow_persistent_write
+
+    def allows_persistent_writes(self) -> bool:
+        """Whether durable, user-derived writes are permitted in the current mode.
+
+        ``True`` in persistent modes (NORMAL / PUBLIC / ANONYMOUS); ``False`` in
+        the volatile modes (EPHEMERAL / ISOLATED / DEIDENTIFIED) whose contract
+        forbids persisting user-derived content. The memory consolidator consults
+        this before persisting a durable episode summary, so manual / scheduled
+        consolidation cannot leak a user-derived episode into ``memory_episodes``
+        while the agent is volatile (#2672).
+        """
+        return self._policy.allow_persistent_write
+
+    def _assert_graph_node_write_allowed(
+        self, node, operation: str, *, validate_label: bool = True,
+        capability: Any = None,
+    ) -> None:
+        """Fail closed on a durable graph node write in a volatile mode.
+
+        Two admit tiers, each closing one Terra finding:
+
+        * Content-free structural types (``document`` / ``audit_anchor``) are
+          admitted on the ordinary (untrusted) path, but every property is
+          validated by its per-field SEMANTIC validator (a ``hash`` must be hex of
+          a digest's length, a ``*_at`` must parse as a timestamp, an
+          ``entries_count`` must be a non-negative int, a ``type`` must be the
+          expected literal, ``document.hash`` must equal the node's own id). A
+          short secret is none of those, so it fails closed in every field
+          (finding P1) — this replaces the old "any short single-line string is
+          content-free" check.
+        * The ``agent`` control-plane node carries free-text fields no per-field
+          regex can prove content-free. ``capability`` is a same-process
+          defense-in-depth marker (see the header note), NOT an authorization
+          boundary — it is checked here so an absent/obviously-forged marker is
+          refused, but the ACTUAL privacy gate for the ``agent`` node is the
+          carried-along free-text boundary applied by the async callers
+          (:meth:`_enforce_free_text_carry_along` / the CAS ``expected`` check),
+          which refuses a fresh/changed free-text field even to a caller holding a
+          genuine marker. Its content-free fields are per-field validated.
+
+        In every case the node must match its type's COMPLETE canonical shape —
+        a known ``node_type``, property keys drawn only from that type's key set,
+        and (when ``validate_label``) a label matching that type's rule. Unknown
+        types, unrecognized keys, and non-canonical labels all raise.
+
+        ``validate_label`` is ``False`` on a compare-and-swap *update*, where the
+        primitive writes only ``properties`` and leaves the stored label
+        untouched, so ``new_node.label`` is never persisted and must not be
+        judged.
+        """
+        if not self._graph_writes_governed:
+            return
+        node_type = getattr(node, "node_type", None)
+        shape = _STRUCTURAL_NODE_SHAPES.get(node_type)
+        if shape is None:
+            raise PrivacyViolationError(
+                f"Graph write '{operation}' blocked: node_type={node_type!r} is "
+                f"not a content-free structural type, and durable graph writes "
+                f"are disabled in the current privacy config "
+                f"(storage={self._privacy_config.storage}). User-derived and "
+                f"unknown graph nodes are default-denied in volatile privacy "
+                f"modes (#2672)."
+            )
+        if shape.requires_capability and not _has_control_plane_capability(capability):
+            raise PrivacyViolationError(
+                f"Graph write '{operation}' blocked: node_type={node_type!r} is a "
+                f"control-plane node (it carries identity / governance state no "
+                f"per-field check can prove content-free), so a durable write to it "
+                f"in the current privacy config (storage={self._privacy_config.storage}) "
+                f"must carry the control-plane capability marker. That marker is "
+                f"same-process defense-in-depth; the ACTUAL identity-content gate is "
+                f"the carried-along boundary applied by the async caller (#2672)."
+            )
+        properties = getattr(node, "properties", None) or {}
+        if not isinstance(properties, dict):
+            raise PrivacyViolationError(
+                f"Graph write '{operation}' blocked: {node_type!r} node "
+                f"properties must be a mapping of content-free fields, got "
+                f"{type(properties).__name__} (#2672)."
+            )
+        extra_keys = set(properties) - shape.keys
+        if extra_keys:
+            raise PrivacyViolationError(
+                f"Graph write '{operation}' blocked: {node_type!r} node carries "
+                f"non-canonical propert{'y' if len(extra_keys) == 1 else 'ies'} "
+                f"{sorted(extra_keys)!r}. A structural node may hold only its "
+                f"content-free identity/governance fields in the current privacy "
+                f"config (storage={self._privacy_config.storage}); any other key "
+                f"could carry user content and is default-denied (#2672)."
+            )
+        # Per-field semantic validation. For content-free types this is the
+        # primary guard (finding P1); for control-plane types it is
+        # defense-in-depth behind the capability. A field whose value fails its
+        # semantic validator fails the whole write closed.
+        for key, value in properties.items():
+            validator = shape.field_validators.get(key)
+            if validator is None or not validator(value):
+                raise PrivacyViolationError(
+                    f"Graph write '{operation}' blocked: {node_type!r} node "
+                    f"property {key!r} is not a valid content-free value for its "
+                    f"field (expected a hash / timestamp / count / enum / bounded "
+                    f"identity as the field's semantics require). A free-text or "
+                    f"otherwise-shaped value could carry user content and is "
+                    f"default-denied in the current privacy config "
+                    f"(storage={self._privacy_config.storage}) (#2672)."
+                )
+        if shape.hash_equals_node_id is not None:
+            # The hash field must equal the node's own content-hash id, so a
+            # caller cannot use an otherwise-valid 64-hex field as a channel for
+            # 32 arbitrary bytes — the value is pinned to the id (#2672 P1).
+            pinned = shape.hash_equals_node_id
+            if properties.get(pinned) != getattr(node, "node_id", None):
+                raise PrivacyViolationError(
+                    f"Graph write '{operation}' blocked: {node_type!r} node "
+                    f"property {pinned!r} must equal the node's own content-hash "
+                    f"id; a hash field that is not the node's own id could carry "
+                    f"arbitrary bytes and is default-denied (#2672)."
+                )
+        if validate_label:
+            self._assert_structural_label_allowed(
+                node_type, getattr(node, "label", None), shape, operation
+            )
+
+    def _assert_structural_label_allowed(
+        self, node_type, label, shape: "_StructuralNodeShape", operation: str
+    ) -> None:
+        """Fail closed unless a structural node's label matches its type's rule."""
+        if not shape.label_content_free:
+            # Identity-derived label (the agent's own name): agent state, not
+            # conversation content, but STILL user-derived free-text that no regex
+            # can prove content-free. The load-bearing gate for it is the
+            # carried-along boundary applied by the async caller
+            # (:meth:`_enforce_free_text_carry_along` /
+            # :meth:`_governed_compare_and_swap`), which admits it only UNCHANGED
+            # from the stored trusted label — the same treatment as the free-text
+            # properties (#2672 review P1). Here we only enforce the shape: it must
+            # be a plain string, never a structured payload smuggling content.
+            if label is not None and not isinstance(label, str):
+                raise PrivacyViolationError(
+                    f"Graph write '{operation}' blocked: {node_type!r} node label "
+                    f"must be a string identity, got {type(label).__name__} "
+                    f"(#2672)."
+                )
+            return
+        if isinstance(label, str):
+            if shape.label_literals is not None and label in shape.label_literals:
+                return
+            if shape.label_regex is not None and shape.label_regex.match(label):
+                return
+        raise PrivacyViolationError(
+            f"Graph write '{operation}' blocked: {node_type!r} node label "
+            f"{label!r} is not the canonical content-free label for this "
+            f"structural type. A non-canonical label could carry user content "
+            f"and is default-denied in the current privacy config "
+            f"(storage={self._privacy_config.storage}) (#2672)."
+        )
+
+    def _free_text_carry_violation(
+        self, node_type, new_props, stored_props
+    ) -> Optional[str]:
+        """First free-text field on a control-plane write that is freshly
+        introduced or changed vs. the stored/expected node, or ``None``.
+
+        This is the CONTENT boundary that actually closes the free-text leak
+        (#2672 review P1): in a volatile mode a node type's declared free-text
+        fields (identity free-text AND governance-receipt blobs) are admitted only
+        carried along unchanged, so a fresh/changed value is refused whether or not
+        the caller presents the (same-process, defense-in-depth) capability.
+        """
+        stored_props = stored_props or {}
+        for field in _free_text_carry_along_fields(node_type):
+            if field in new_props and new_props.get(field) != stored_props.get(field):
+                return field
+        return None
+
+    def _raise_free_text_carry(self, node_type, field, operation) -> None:
+        raise PrivacyViolationError(
+            f"Graph write '{operation}' blocked: {node_type!r} node property "
+            f"{field!r} is user-derived free-text (identity text or a governance "
+            f"receipt) being introduced or changed (its value differs from the "
+            f"stored node). In the current privacy config "
+            f"(storage={self._privacy_config.storage}) a control-plane node admits "
+            f"its free-text fields ONLY carried along UNCHANGED — rename / "
+            f"description edits skip their durable writes while volatile, and a "
+            f"genuinely-fresh governance receipt is written to the raw store, so a "
+            f"fresh/changed value here is user content and is default-denied "
+            f"REGARDLESS of any control-plane capability (#2672)."
+        )
+
+    @staticmethod
+    def _label_is_free_text(node_type) -> bool:
+        """Whether a structural type's LABEL is identity-derived free-text.
+
+        ``True`` only for a control-plane node whose label is the agent's own
+        name (no literal/regex proves it content-free); such a label is a
+        top-level free-text field guarded by carry-along (#2672 review P1).
+        """
+        shape = _STRUCTURAL_NODE_SHAPES.get(node_type)
+        return shape is not None and not shape.label_content_free
+
+    @staticmethod
+    def _is_content_free_identity_label(node) -> bool:
+        """Whether ``node``'s label is the DID-derived ``Agent {node_id}`` form.
+
+        That form is fully determined by the node's own id, so it carries NO user
+        text and is content-free by construction — admitted even on a fresh create
+        with no stored label to carry from. This is exactly what the born-agent
+        boot path writes when it first materialises the identity node in a volatile
+        mode, and it is the ONLY fresh identity label a volatile-mode create admits
+        (a real user-authored name is refused) (#2672 review P1)."""
+        label = getattr(node, "label", None)
+        node_id = getattr(node, "node_id", None)
+        return isinstance(node_id, str) and label == f"Agent {node_id}"
+
+    def _label_carry_violation(self, node, stored) -> bool:
+        """True when an identity-labeled control-plane node's LABEL would introduce
+        or MUTATE durable user text vs. the stored node.
+
+        The top-level label is the agent's name — user-derived free-text exactly
+        like ``properties['name']``. ``add_node`` is a whole-row upsert, so on an
+        EXISTING node any label other than the stored one is a durable mutation:
+        ``None`` would CLEAR the stored name and the DID-derived ``Agent {node_id}``
+        form would OVERWRITE a stored user name. So the admitted set depends on
+        whether a stored row exists (#2672 review P2):
+
+        * Existing node (``stored is not None``) — carry-along means EXACTLY the
+          stored label, nothing else. Require ``new_label == stored_label`` (which
+          also permits ``None`` only when the stored label is itself ``None``).
+        * Fresh create (``stored is None``) — no trusted label to carry, so admit
+          only a label that carries no user text: ``None`` (writes nothing) or the
+          content-free DID-derived ``Agent {node_id}`` form. Any other non-null
+          label is fresh user content and is refused.
+        """
+        new_label = getattr(node, "label", None)
+        if stored is not None:
+            # Carry-along on an existing node = identical to the stored label only.
+            return new_label != getattr(stored, "label", None)
+        # Fresh create: no stored label to carry from.
+        if new_label is None or self._is_content_free_identity_label(node):
+            return False
+        return True
+
+    def _raise_label_carry(self, node_type, operation) -> None:
+        raise PrivacyViolationError(
+            f"Graph write '{operation}' blocked: {node_type!r} node label is "
+            f"user-derived identity free-text being introduced or changed (it "
+            f"differs from the stored node's label). In the current privacy config "
+            f"(storage={self._privacy_config.storage}) a control-plane node admits "
+            f"its identity label ONLY carried along UNCHANGED — a volatile rename "
+            f"updates the live session name but skips the durable node — so a "
+            f"fresh/changed label is user content and is default-denied REGARDLESS "
+            f"of any control-plane capability, closing the label smuggling channel "
+            f"(#2672 review P1)."
+        )
+
+    async def _enforce_free_text_carry_along(self, node, store, operation) -> None:
+        """Read the stored node and refuse a fresh/changed free-text field — in a
+        property OR in the top-level LABEL — on a control-plane write in a volatile
+        mode. No-op otherwise.
+
+        The stored read is only reached when the write actually carries one of the
+        guarded free-text properties OR targets a free-text-labeled control-plane
+        type, so ordinary content-free governance writes on content-free-labeled
+        types pay nothing.
+        """
+        if not self._graph_writes_governed:
+            return
+        node_type = getattr(node, "node_type", None)
+        carry_fields = _free_text_carry_along_fields(node_type)
+        props = getattr(node, "properties", None) or {}
+        has_prop_carry = bool(carry_fields) and any(f in props for f in carry_fields)
+        label_free_text = self._label_is_free_text(node_type)
+        if not has_prop_carry and not label_free_text:
+            return
+        stored = await store.get_node(getattr(node, "node_id", None))
+        stored_props = (getattr(stored, "properties", None) or {}) if stored else {}
+        field = self._free_text_carry_violation(node_type, props, stored_props)
+        if field is not None:
+            self._raise_free_text_carry(node_type, field, operation)
+        # The label is a top-level free-text field on the identity-labeled agent
+        # node — guard it with the same carried-along boundary as the properties,
+        # or a forged capability could persist arbitrary durable user text through
+        # ``GraphNode.label`` while the property gate looked closed (#2672 P1).
+        if label_free_text and self._label_carry_violation(node, stored):
+            self._raise_label_carry(node_type, operation)
+
+    def _assert_graph_edge_write_allowed(
+        self, label, operation: str, properties: Optional[Dict] = None,
+        *, capability: Any = None,
+    ) -> None:
+        """Fail closed on a durable graph edge write in a volatile mode.
+
+        Allows only the structural governance relationship(s), AND only as a pure
+        binding: a structural edge must carry no properties, so user content
+        cannot ride in the edge payload. Every content edge, and any structural
+        edge with a non-empty payload, raises ``PrivacyViolationError``.
+        ``governed_by`` is a content-free binding admitted on the ordinary path;
+        ``capability`` is accepted for call-site uniformity but the edge allowlist
+        does not depend on it.
+        """
+        if not self._graph_writes_governed:
+            return
+        if label not in STRUCTURAL_GRAPH_EDGE_LABELS:
+            raise PrivacyViolationError(
+                f"Graph write '{operation}' blocked: edge label={label!r} is not "
+                f"a content-free structural relationship, and durable graph "
+                f"writes are disabled in the current privacy config "
+                f"(storage={self._privacy_config.storage}). User-derived and "
+                f"unknown graph edges are default-denied in volatile privacy "
+                f"modes (#2672)."
+            )
+        if properties:
+            raise PrivacyViolationError(
+                f"Graph write '{operation}' blocked: structural edge {label!r} "
+                f"must be a pure binding with no properties, but got keys "
+                f"{sorted(properties)!r}. An edge payload could carry user "
+                f"content and is default-denied in volatile privacy modes "
+                f"(#2672)."
+            )
+
+    async def _governed_compare_and_swap(
+        self, store, node_id, expected, new_node, operation: str,
+        *, capability: Any = None,
+    ):
+        """Shared, TOCTOU-free CAS governance for the wrapper and the ``.graph``
+        proxy.
+
+        In a durable-write mode this is a straight passthrough. In a volatile
+        mode it (1) validates ``new_node`` against the structural canonical
+        shape — the label only on a compare-and-create, since a swap never
+        writes it, and gated by ``capability`` for the control-plane types —
+        and (2) pins the operation to that exact node type via the primitive's
+        ``allowed_node_types`` predicate. That pin is what stops the
+        relabel exploit: a swap ignores ``new_node.node_type`` and writes
+        ``properties`` onto whatever row exists, so authorizing on
+        ``new_node.node_type`` alone would let a caller rewrite an existing
+        user-derived node (e.g. a ``concept``) under a spoofed structural type.
+        The storage layer instead refuses the swap unless the STORED row is of
+        the validated structural type, atomically, without a wrapper pre-read.
+        """
+        if not self._graph_writes_governed:
+            return await store.compare_and_swap_node(node_id, expected, new_node)
+        self._assert_graph_node_write_allowed(
+            new_node, operation, validate_label=(expected is None),
+            capability=capability,
+        )
+        # Carried-along free-text boundary, atomically: compare the new node's
+        # free-text fields against the caller's ``expected`` snapshot (no extra
+        # read — the atomic CAS itself fails if ``expected`` is a lie). A
+        # compare-and-create (``expected is None``) means fresh free-text → refused.
+        new_type = getattr(new_node, "node_type", None)
+        if _free_text_carry_along_fields(new_type):
+            field = self._free_text_carry_violation(
+                new_type, getattr(new_node, "properties", None) or {}, expected or {}
+            )
+            if field is not None:
+                self._raise_free_text_carry(new_type, field, operation)
+        # A swap NEVER writes ``label`` (the primitive is properties-only), so the
+        # label carry-along only bites on a compare-and-CREATE (``expected is
+        # None``), where the full node — including a fresh label — WOULD be
+        # inserted. With no stored trusted label to carry from, only the
+        # content-free ``Agent {node_id}`` form is admitted; a fresh user-authored
+        # label is refused, closing the label smuggling channel on the CAS path too
+        # (#2672 P1).
+        if (
+            expected is None
+            and self._label_is_free_text(new_type)
+            and self._label_carry_violation(new_node, None)
+        ):
+            self._raise_label_carry(new_type, operation)
+        result = await store.compare_and_swap_node(
+            node_id,
+            expected,
+            new_node,
+            allowed_node_types=frozenset({getattr(new_node, "node_type", None)}),
+        )
+        if result == NodeSwapResult.TYPE_NOT_ALLOWED:
+            node_type = getattr(new_node, "node_type", None)
+            raise PrivacyViolationError(
+                f"Graph write '{operation}' blocked: the existing node at "
+                f"{node_id!r} is not a {node_type!r} structural node, so a "
+                f"durable properties swap onto it is a user-derived write and is "
+                f"default-denied in the current privacy config "
+                f"(storage={self._privacy_config.storage}). CAS cannot relabel a "
+                f"user-derived node as structural to smuggle content through "
+                f"(#2672)."
+            )
+        return result
+
+    async def add_node(self, node, *, capability: Any = None) -> None:
+        """Add a graph node, governed by the volatile-mode write policy.
+
+        In a durable-write mode this is a straight pass-through. In a volatile
+        mode it default-denies: only content-free structural nodes (strict
+        per-field validation) are admitted, and the ``agent`` control-plane node
+        carries the ``capability`` marker. The load-bearing privacy check for the
+        ``agent`` node is the
+        carried-along free-text boundary applied here after the structural check
+        (:meth:`_enforce_free_text_carry_along`), which refuses a fresh/changed
+        free-text field regardless of the marker. User-derived (facts, concepts,
+        todos, decisions, episodes), unknown types, non-canonical fields, and fresh
+        free-text content raise ``PrivacyViolationError`` before any row is
+        written.
+
+        ``capability`` is the same-process defense-in-depth marker from
+        :func:`acquire_control_plane_capability` (NOT an authorization boundary —
+        see the module header note); the privacy guarantee does not depend on it.
+        """
+        self._assert_graph_node_write_allowed(
+            node, "add_node", capability=capability
+        )
+        await self._enforce_free_text_carry_along(node, self._storage, "add_node")
         await self._storage.add_node(node)
 
-    async def compare_and_swap_node(self, node_id, expected, new_node):
-        """Atomically compare-and-swap a graph node.
+    async def compare_and_swap_node(
+        self, node_id, expected, new_node, *, capability: Any = None
+    ):
+        """Atomically compare-and-swap a graph node, governed by the policy.
 
-        Structural, not PII-sensitive — same rationale as :meth:`add_node`.
-        This MUST stay a single passthrough: the whole point of the primitive
-        is that the check and the write are one atomic unit, so the wrapper
-        cannot decompose it into ``get_node`` + ``add_node`` (that would
-        reintroduce exactly the TOCTOU race the caller is trying to close).
+        The write intent is governed *before* delegating — the primitive itself
+        stays a single atomic passthrough. The wrapper never decomposes it into
+        ``get_node`` + ``add_node``: that would reintroduce exactly the TOCTOU
+        race the caller is trying to close. See :meth:`_governed_compare_and_swap`.
         """
-        return await self._storage.compare_and_swap_node(
-            node_id, expected, new_node
+        return await self._governed_compare_and_swap(
+            self._storage, node_id, expected, new_node, "compare_and_swap_node",
+            capability=capability,
         )
 
     async def get_node(self, node_id: str):
-        """Get a graph node."""
+        """Get a graph node. Read — never privacy-gated."""
         return await self._storage.get_node(node_id)
-    
-    async def add_edge(self, source_id: str, target_id: str, label: str, properties: Optional[Dict] = None):
-        """Add a graph edge. Structural, not PII-sensitive."""
+
+    async def add_edge(self, source_id: str, target_id: str, label: str, properties: Optional[Dict] = None,
+                        *, capability: Any = None):
+        """Add a graph edge, governed by the volatile-mode write policy.
+
+        In a volatile mode only structural governance edges (``governed_by``),
+        carrying no properties, are admitted; content edges and payload-bearing
+        edges raise ``PrivacyViolationError``. ``capability`` is accepted for
+        call-site uniformity with the node writers.
+        """
+        self._assert_graph_edge_write_allowed(
+            label, "add_edge", properties, capability=capability
+        )
         await self._storage.add_edge(source_id, target_id, label, properties)
 
     async def delete_edge(self, source_id: str, target_id: str, label: str) -> None:
-        """Remove a graph edge. Structural, not PII-sensitive."""
+        """Remove a graph edge. Delete — never privacy-gated (removal is not a leak)."""
         await self._storage.delete_edge(source_id, target_id, label)
 
     @asynccontextmanager
@@ -693,10 +2187,39 @@ class PrivacyEnforcingStorage:
         """Get incoming edges to a node."""
         return await self._storage.get_edges_to(node_id)
 
-    # === Private Agent Identity Resources ===
+    # === Private Agent Identity Resources (privacy-governed durable writes) ===
+    #
+    # A private identity resource (the SOUL body most notably) is user-derived
+    # identity content: ``create_version`` writes the encrypted body into
+    # ``agent_identity_resources`` AND records a durable ``agent_identity_resource``
+    # graph node + ``has_private_identity_resource`` edge on the RAW store (bypassing
+    # the graph proxy). So in a volatile privacy mode these writes are a real leak
+    # and must default-deny — this is the storage-layer backstop; the SOUL callers
+    # (``save_soul_md`` / startup seed promotion / rename) also skip at their source
+    # so the raise only fires on an un-gated path (#2672 review P1). Reads pass
+    # through unchanged.
+
+    def _assert_private_resource_write_allowed(
+        self, operation: str, resource_type: Optional[str]
+    ) -> None:
+        """Fail closed on a durable private identity-resource write while volatile."""
+        if not self._graph_writes_governed:
+            return
+        raise PrivacyViolationError(
+            f"Private identity-resource write '{operation}' "
+            f"(resource_type={resource_type!r}) blocked: the encrypted resource "
+            f"body and its durable graph reference are user-derived identity "
+            f"content, default-denied in the current privacy config "
+            f"(storage={self._privacy_config.storage}). The SOUL and other private "
+            f"resources are not persisted in volatile privacy modes (#2672)."
+        )
 
     async def create_agent_resource_version(self, *args, **kwargs):
-        """Create a private identity-resource version."""
+        """Create a private identity-resource version, governed by the write policy."""
+        resource_type = kwargs.get("resource_type") or (args[0] if args else None)
+        self._assert_private_resource_write_allowed(
+            "create_agent_resource_version", resource_type
+        )
         return await self._storage.create_agent_resource_version(*args, **kwargs)
 
     async def get_current_agent_resource(self, *args, **kwargs):
@@ -709,6 +2232,9 @@ class PrivacyEnforcingStorage:
 
     async def promote_soul_seed(self, *args, **kwargs):
         """Promote local SOUL.md seed/cache content into canonical storage."""
+        self._assert_private_resource_write_allowed(
+            "promote_soul_seed", SOUL_MARKDOWN_RESOURCE_TYPE
+        )
         return await self._storage.promote_soul_seed(*args, **kwargs)
 
     # === RAG Storage ===
@@ -1734,13 +3260,23 @@ class PrivacyEnforcingStorage:
 
     @property
     def graph_store(self):
-        """Access to graph store."""
-        return self._storage.graph
+        """Privacy-governing view of the graph store (#2672).
+
+        Returns a proxy that applies the SAME volatile-mode graph-write policy
+        as this wrapper's own :meth:`add_node` / :meth:`add_edge` /
+        :meth:`compare_and_swap_node` — so feature code reaching through
+        ``.graph_store`` can no longer bypass privacy enforcement (pre-#2672
+        this returned the raw store). Reads, deletes, and ``bind_agent`` forward
+        straight through; the raw ``db`` handle and any other un-allowlisted
+        attribute fail closed so the proxy cannot be used to reach an ungoverned
+        write path (#2672 review P1).
+        """
+        return _PrivacyGoverningGraphStore(self, self._storage.graph)
 
     @property
     def graph(self):
-        """Access to graph store (alias for graph_store)."""
-        return self._storage.graph
+        """Privacy-governing view of the graph store (alias for graph_store)."""
+        return _PrivacyGoverningGraphStore(self, self._storage.graph)
 
     @property
     def conversation(self):
@@ -1769,6 +3305,118 @@ class PrivacyEnforcingStorage:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
 
+
+
+class _PrivacyGoverningGraphStore:
+    """Privacy-governing view over the underlying ``AsyncGraphStore`` (#2672).
+
+    Returned by :attr:`PrivacyEnforcingStorage.graph` /
+    :attr:`~PrivacyEnforcingStorage.graph_store` so that feature code reaching
+    through those surfaces is subject to the SAME default-deny graph-write
+    policy as the wrapper's own ``add_node`` / ``add_edge`` /
+    ``compare_and_swap_node`` methods — closing the bypass where ``.graph``
+    returned the raw store.
+
+    The four write entry points are governed methods ON this proxy. Everything
+    else is handled by :meth:`__getattr__`, which forwards ONLY a fixed allowlist
+    of non-write surfaces (reads, deletes, ``bind_agent``, read-only metadata) and
+    FAILS CLOSED on anything else. In particular it refuses the raw ``db`` handle
+    (and any other connection/backend handle) so ``storage.graph.db.execute(...)``
+    can no longer smuggle an ungoverned SQL write past the boundary, and a future
+    write method added to ``AsyncGraphStore`` is refused by default rather than
+    silently forwarded ungoverned (#2672 review P1).
+    """
+
+    __slots__ = ("_wrapper", "_store")
+
+    #: Non-write attributes safe to forward to the wrapped ``AsyncGraphStore``.
+    #: Reads, removals (a delete is not a durable user-content WRITE — it takes
+    #: content away, which volatile modes never forbid), agent-scope binding, and
+    #: read-only metadata. The four durable WRITE entry points are governed
+    #: methods on this proxy and never reach ``__getattr__``. Any name NOT here —
+    #: notably the raw ``db`` handle and any newly-added write method — fails
+    #: closed (#2672 review P1). Extending this set REQUIRES confirming the target
+    #: cannot perform a durable user-content graph write.
+    _FORWARDED_ATTRS = frozenset({
+        "get_node",
+        "get_nodes_by_type",
+        "query_nodes_by_type_and_property",
+        "get_edges",
+        "delete_node",
+        "delete_edge",
+        "purge_agent_nodes",
+        "bind_agent",
+        "agent_id",
+    })
+
+    def __init__(self, wrapper: "PrivacyEnforcingStorage", store) -> None:
+        object.__setattr__(self, "_wrapper", wrapper)
+        object.__setattr__(self, "_store", store)
+
+    async def add_node(self, node, *, capability: Any = None) -> None:
+        self._wrapper._assert_graph_node_write_allowed(
+            node, "graph.add_node", capability=capability
+        )
+        await self._wrapper._enforce_free_text_carry_along(
+            node, self._store, "graph.add_node"
+        )
+        return await self._store.add_node(node)
+
+    async def compare_and_swap_node(
+        self, node_id, expected, new_node, *, capability: Any = None
+    ):
+        # Govern the write intent without decomposing the atomic primitive: the
+        # shared helper validates new_node's structural shape and pins the swap
+        # to the stored node's type via the primitive's allowed_node_types
+        # predicate, then delegates the single atomic CAS on THIS store.
+        return await self._wrapper._governed_compare_and_swap(
+            self._store, node_id, expected, new_node,
+            "graph.compare_and_swap_node", capability=capability,
+        )
+
+    async def add_edge(self, source_id, target_id, label, properties=None,
+                       *, capability: Any = None):
+        self._wrapper._assert_graph_edge_write_allowed(
+            label, "graph.add_edge", properties, capability=capability
+        )
+        return await self._store.add_edge(source_id, target_id, label, properties)
+
+    async def add_trusted_cross_agent_edge(
+        self, source_id, target_id, label, properties=None,
+        *, capability: Any = None,
+    ):
+        self._wrapper._assert_graph_edge_write_allowed(
+            label, "graph.add_trusted_cross_agent_edge", properties,
+            capability=capability,
+        )
+        return await self._store.add_trusted_cross_agent_edge(
+            source_id, target_id, label, properties
+        )
+
+    def __getattr__(self, name):
+        # Reached for any attribute not defined on this proxy (i.e. anything but
+        # the four governed writers). Forward ONLY the allowlisted non-write
+        # surface; fail closed on everything else so a caller cannot reach the raw
+        # ``db`` handle — or any un-vetted / future write method — and bypass the
+        # volatile-mode graph-write policy through the ``.graph`` surface
+        # (#2672 review P1).
+        if name in _PrivacyGoverningGraphStore._FORWARDED_ATTRS:
+            return getattr(self._store, name)
+        if name.startswith("__") and name.endswith("__"):
+            # Let normal Python attribute/dunder probing (copy, hasattr on
+            # dunders, etc.) behave as "absent" rather than raising a privacy
+            # error the interpreter would surface in confusing places.
+            raise AttributeError(name)
+        raise PrivacyViolationError(
+            f"Graph proxy refuses to forward {name!r}: the privacy-governing "
+            f"graph view exposes only its four governed writers (add_node / "
+            f"add_edge / compare_and_swap_node / add_trusted_cross_agent_edge) "
+            f"plus a fixed allowlist of reads/deletes/bind_agent. Raw handles "
+            f"such as 'db' and any other attribute are refused so a caller cannot "
+            f"bypass the volatile-mode graph-write policy through the '.graph' "
+            f"surface. Use the raw store deliberately if an ungoverned write is "
+            f"truly intended (#2672)."
+        )
 
 
 def wrap_storage_with_privacy(storage, privacy_mode: Union[PrivacyMode, PrivacyConfig, str]) -> PrivacyEnforcingStorage:

@@ -201,6 +201,26 @@ test('default adapter maps /api/agents fields and resolves avatar_hash', async (
     assert.equal(adapter.mode, 'multi_agent', 'adapter.mode mirrors the response');
 });
 
+test('default adapter routes by routing_name but displays the live name (#2672 P2)', async () => {
+    // A session (volatile-mode) rename updates the card's display `name` while
+    // the AgentManager registration key `routing_name` is unchanged. The list
+    // item must ROUTE by the routing key (name = routing_name) and DISPLAY the
+    // live name (displayName = card name), so `/api/agents/{key}/…` stays valid
+    // while the visible card shows the rename.
+    const api = {
+        getAgents: async () => ({
+            mode: 'multi_agent',
+            agents: [{ name: 'RenamedLive', routing_name: 'Emma', status: 'online', is_demo: false }],
+        }),
+    };
+    const adapter = createDefaultAgentAdapter(api);
+    const items = await adapter.listAgents();
+    assert.equal(items.length, 1);
+    assert.equal(items[0].name, 'Emma', 'routing/selection identity is the manager key');
+    assert.equal(items[0].id, 'Emma', 'id falls back to the routing key, not the display name');
+    assert.equal(items[0].displayName, 'RenamedLive', 'the visible name is the live rename');
+});
+
 test('source-contract: identity.js drives mountAgentListPane, no hand-rolled agent loop', () => {
     const src = readFileSync(
         resolve(here, '../../kestrel_sovereign/static/js/identity.js'),

@@ -114,15 +114,26 @@ def resolve_agent_privacy_config(agent: Any) -> Optional[Any]:
 
 
 def hides_persisted_user_content(agent: Any) -> bool:
-    """True when persisted user-authored content must not be read or written."""
+    """True when persisted user-authored content must not be read or written.
+
+    Covers every volatile privacy mode whose policy forbids durable persistence:
+    EPHEMERAL (``is_ephemeral``), ISOLATED (``uses_temp_storage``), AND
+    DEIDENTIFIED (``requires_deidentification`` — fail-closed until the Safe
+    Harbor pipeline lands). Omitting the DEIDENTIFIED check let the Save feature
+    write user content to ``saved_items`` while volatile, inconsistent with the
+    graph wrapper and consolidator gates that do cover it (#2672 live-path
+    bypass).
+    """
     config = resolve_agent_privacy_config(agent)
     if config is None:
         return False
     is_ephemeral = getattr(config, "is_ephemeral", None)
     uses_temp_storage = getattr(config, "uses_temp_storage", None)
+    requires_deidentification = getattr(config, "requires_deidentification", None)
     return bool(
         (callable(is_ephemeral) and is_ephemeral())
         or (callable(uses_temp_storage) and uses_temp_storage())
+        or (callable(requires_deidentification) and requires_deidentification())
     )
 
 

@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from kestrel_sovereign.storage import AsyncStorage, PrivacyEnforcingStorage
+from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock
 from kestrel_sovereign.security.encryption import DecryptionError
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.llm.adapter import LLMResponse
@@ -564,7 +565,21 @@ class KestrelAgent(
         self._db_backend = db_backend or os.environ.get("KESTREL_DB_BACKEND", "sqlite")
         self._database_url = database_url or os.environ.get("KESTREL_DATABASE_URL")
 
-        # Storage will be initialized asynchronously
+        # Storage will be initialized asynchronously.
+        #
+        # PRIVACY BOUNDARY (#2672). ``self.storage`` is the privacy-governing
+        # boundary — its graph writes default-deny user-derived content in
+        # volatile modes. ``self._raw_storage`` is the UNGOVERNED store beneath
+        # it: a privileged, first-party control-plane handle used by core paths
+        # that must persist regardless of conversational privacy mode (identity
+        # node, constitution/doctrine anchors), each of which carries its own
+        # explicit volatile-mode gate. It is deliberately NOT part of the
+        # feature-facing storage API; in-tree/entry-point features are first-party
+        # code sharing this interpreter (they can already reach anything), so the
+        # privacy wrapper is a governed API surface for the SANCTIONED path
+        # (persist via ``self.agent.storage``), NOT an in-process sandbox. The
+        # hard boundary against untrusted extension code is process isolation
+        # (``features/isolated_runtime.py``), which never receives this object.
         self._raw_storage = None
         self.storage = None
 
@@ -665,7 +680,11 @@ class KestrelAgent(
         # restart coordinator can age out stale markers (#1558).
         self._active_request_started_at: dict[str, float] = {}
         self._cancelled_requests: set = set()
-        self._privacy_transition_lock = asyncio.Lock()
+        # Task-reentrant so a durable-identity write (rename / description /
+        # discovery / user-name / SOUL) invoked as a TOOL inside a streamed turn
+        # — which already holds this lock across the whole turn — re-enters
+        # instead of self-deadlocking on its own task's lock (#2672 review P1).
+        self._privacy_transition_lock = ReentrantTransitionLock()
         # A data-destructive privacy transition (e.g. PUBLIC → EPHEMERAL) staged
         # awaiting explicit confirmation via confirm_privacy_transition. None when
         # no transition is pending. Guarded by _privacy_transition_lock.
@@ -1029,6 +1048,24 @@ class KestrelAgent(
             logging.warning("SOUL.md seed read failed during promotion: %s", exc)
             return
         if not content.strip():
+            return
+        # Privacy boundary (#2672 review P1): promoting a disk SOUL seed writes the
+        # user-derived body into the encrypted resource table AND a durable graph
+        # reference. In a volatile privacy mode, skip the promotion and load the
+        # seed in-session only — nothing durable is created.
+        from kestrel_sovereign.features.storage_access import (
+            hides_persisted_user_content,
+        )
+        if hides_persisted_user_content(self):
+            logging.info(
+                "SOUL.md seed not promoted — durable identity-resource writes are "
+                "disabled in the current privacy mode; loading it in-session only "
+                "(#2672)"
+            )
+            try:
+                self.context_builder._load_soul_md()
+            except Exception as exc:
+                logging.warning("In-session SOUL.md seed load failed: %s", exc)
             return
         try:
             await self.storage.promote_soul_seed(
@@ -1804,13 +1841,20 @@ class KestrelAgent(
             logging.info(f"Agent node retrieved: {agent_node is not None}")
             if agent_node is None:
                 from kestrel_sovereign.storage import GraphNode
+                from kestrel_sovereign.storage.privacy_wrapper import (
+                    acquire_control_plane_capability,
+                )
                 agent_node = GraphNode(
                     node_id=self.agent_id,
                     node_type="agent",
                     label=f"Agent {self.agent_id}",
                     properties={"initialBalance": "100.0"}
                 )
-                await self.storage.add_node(agent_node)
+                # Trusted control-plane write: agent identity node. The capability
+                # admits the durable identity write in a volatile mode (#2672).
+                await self.storage.add_node(
+                    agent_node, capability=acquire_control_plane_capability()
+                )
                 logging.info("Agent node created")
 
             # A missing durable row or an audit older than 24 hours must be
@@ -1956,7 +2000,12 @@ class KestrelAgent(
             logging.info("Creating MemorySystem")
             self.memory_system = MemorySystem(
                 storage=self._raw_storage,
-                agent_id=self.agent_id
+                agent_id=self.agent_id,
+                # Route durable memory graph writes through the privacy-governing
+                # facade and gate the consolidator's direct memory_episodes write,
+                # so manual / scheduled consolidation can't leak user-derived
+                # memory in a volatile privacy mode (#2672).
+                privacy_storage=self.storage,
             )
             await self.memory_system.initialize()
             # Use MemorySystem's consolidator — it has graph_store for KG episode writing
@@ -2013,6 +2062,10 @@ class KestrelAgent(
                 agent_data_path=agent_data_dir,
                 storage=self.storage,
                 capabilities=sorted(self.features.keys()) if getattr(self, "features", None) else None,
+                # Serialize the bootstrap service's direct user-content writes
+                # (discovery history, user name, SOUL, description) against
+                # concurrent privacy-mode transitions (#2672 review P1 race).
+                privacy_transition_lock=self._get_privacy_transition_lock(),
             )
             logging.info("BootstrapService initialized")
             from kestrel_sovereign.lifecycle_checks import warn_stale_bootstrap_pending
@@ -2217,11 +2270,16 @@ class KestrelAgent(
             return None
         return privacy_agent.privacy_config
 
-    def _get_privacy_transition_lock(self) -> asyncio.Lock:
-        """Return the lock that serializes privacy transitions with active streams."""
+    def _get_privacy_transition_lock(self) -> ReentrantTransitionLock:
+        """Return the lock that serializes privacy transitions with active streams.
+
+        Task-reentrant (#2672 review P1): a streamed turn holds it across the whole
+        turn, so a durable-identity write dispatched as a tool inside that turn must
+        be able to re-enter its own task's lock rather than deadlock on it.
+        """
         lock = getattr(self, "_privacy_transition_lock", None)
         if lock is None:
-            lock = asyncio.Lock()
+            lock = ReentrantTransitionLock()
             self._privacy_transition_lock = lock
         return lock
     
@@ -4342,6 +4400,33 @@ Expected Duration: {expected_duration}
     # - is_request_cancelled
     # - _cleanup_cancelled_request
 
+    def resolve_effective_name(
+        self, agent_node: Any = None, *, default: Optional[str] = None
+    ) -> Optional[str]:
+        """The name the agent currently answers to for this session.
+
+        The live in-memory ``_agent_name`` is the session source of truth: every
+        rename updates it, INCLUDING a volatile-mode rename that intentionally
+        skips the durable graph/metadata writes (#2672 review P2). The stored
+        ``agent`` graph node therefore lags the live name after a volatile
+        rename, so prefer the live name and only fall back to the stored node,
+        then ``default``.
+
+        Centralizes effective-identity resolution so the PATCH /api/identity
+        response, GET /api/identity, and the A2A agent card all report the same
+        (live) name — instead of the endpoint and card disagreeing after a
+        volatile rename by re-reading the stale durable node (#2672 review P2).
+        """
+        live = getattr(self, "_agent_name", None)
+        if isinstance(live, str) and live.strip():
+            return live
+        if agent_node is not None:
+            props = getattr(agent_node, "properties", None) or {}
+            name = props.get("name")
+            if isinstance(name, str) and name.strip():
+                return name
+        return default
+
     async def get_agent_card(self) -> "AgentCard":
         """
         Generate an AgentCard for this agent (for A2A discovery).
@@ -4353,14 +4438,19 @@ Expected Duration: {expected_duration}
         agent_name = "Kestrel Agent"
         agent_description = "Constitutional AI Agent with sovereign memory"
 
+        agent_node = None
         if self.storage:
             try:
                 agent_node = await self.storage.get_node(self.agent_id)
                 if agent_node and agent_node.properties:
-                    agent_name = agent_node.properties.get("name", agent_name)
                     agent_description = agent_node.properties.get("description", agent_description)
             except Exception as e:
                 logging.warning(f"Could not load agent node for card generation: {e}")
+
+        # Prefer the live session name so a volatile-mode rename (which skips the
+        # durable node write) is reflected on the card instead of the stale stored
+        # name (#2672 review P2).
+        agent_name = self.resolve_effective_name(agent_node, default=agent_name)
 
         # Build base URL - in production this would be the agent's public URL
         # For now, use localhost

@@ -308,7 +308,9 @@ class _Storage:
     async def get_node(self, node_id):
         return self.node if node_id == self.node.node_id else None
 
-    async def add_node(self, node):
+    async def add_node(self, node, *, capability=None):
+        # Accepts the control-plane ``capability`` kwarg the bootstrap
+        # stale-state writer now passes, mirroring the real envelope (#2672).
         self.saved = node
         self.node = node
 

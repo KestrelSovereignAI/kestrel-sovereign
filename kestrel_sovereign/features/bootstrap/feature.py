@@ -26,6 +26,11 @@ from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.bootstrap import BootstrapState
+from kestrel_sovereign.storage.privacy_wrapper import (
+    acquire_control_plane_capability,
+    optional_transition_lock,
+    _resolve_transition_lock,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +48,11 @@ class RenameOutcome:
     memory_updated: bool
     soul_md_updated: bool
     error: Optional[str] = None
+    # A new agent name is user-derived identity input. In a volatile privacy mode
+    # ("leave no trace" / session-only) rename persists NOTHING durable and only
+    # updates the live in-memory name; this flag says so explicitly so callers
+    # report a deliberate skip rather than a failure or a false success (#2672 P1).
+    skipped_privacy: bool = False
 
     @property
     def any_written(self) -> bool:
@@ -60,11 +70,18 @@ class RenameOutcome:
             "graph_updated": self.graph_updated,
             "memory_updated": self.memory_updated,
             "soul_md_updated": self.soul_md_updated,
+            "skipped_privacy": self.skipped_privacy,
             "error": self.error,
         }
 
 
 def _rename_confirmation(old_name: str, new_name: str, outcome: RenameOutcome) -> str:
+    if outcome.skipped_privacy:
+        return (
+            f"Now going by '{new_name}' for this session (was '{old_name}'). "
+            "The current privacy mode leaves no durable trace, so the name was "
+            "NOT saved to metadata, the graph, or SOUL.md — it reverts on restart."
+        )
     result = f"Renamed from '{old_name}' to '{new_name}'."
     if outcome.soul_md_updated:
         result += " SOUL.md updated."
@@ -123,6 +140,50 @@ async def rename_agent_core(agent, new_name: str) -> RenameOutcome:
 
     old_name = getattr(agent, '_agent_name', 'Unknown')
 
+    # Serialize the privacy check and every durable rename write under the agent's
+    # privacy-transition lock so a concurrent ``set_privacy_mode`` cannot flip the
+    # mode into an ``await`` gap between the check and the writes and persist the
+    # new name after the mode became volatile (#2672 review P1 race). ``None`` on
+    # test/CLI shapes with no running agent → unguarded.
+    async with optional_transition_lock(_resolve_transition_lock(agent)):
+        return await _rename_agent_core_locked(agent, old_name, new_name)
+
+
+async def _rename_agent_core_locked(agent, old_name: str, new_name: str) -> RenameOutcome:
+    """The rename check-and-write body, run under the privacy-transition lock.
+
+    Split from :func:`rename_agent_core` so the privacy check and every durable
+    write happen inside a single held lock (#2672 review P1 race). ``old_name`` and
+    the validated ``new_name`` are passed in; the caller owns the lock.
+    """
+    # Privacy boundary (#2672 review P1): the new name is user-derived identity
+    # input. In a volatile privacy mode, persist NOTHING durable — not the
+    # ``agent_metadata`` row (the direct write that bypassed the graph boundary),
+    # not the ``agent`` graph node, not SOUL.md. Gate BEFORE any side effect and
+    # update only the live in-memory name so the running session reflects it, then
+    # report an explicit skipped outcome (never a partial/false success). This is
+    # the same source-of-truth gating used by ``persist_agent_description`` and
+    # ``save_soul_md``.
+    from kestrel_sovereign.features.storage_access import (
+        hides_persisted_user_content,
+    )
+    if hides_persisted_user_content(agent):
+        agent._agent_name = new_name
+        if hasattr(agent, 'bootstrap_service') and agent.bootstrap_service:
+            agent.bootstrap_service.agent_name = new_name
+        logger.info(
+            "Agent rename not persisted — durable identity writes are disabled "
+            "in the current privacy mode (#2672); in-memory name updated only."
+        )
+        return RenameOutcome(
+            success=False,
+            db_row_written=False,
+            graph_updated=False,
+            memory_updated=True,
+            soul_md_updated=False,
+            skipped_privacy=True,
+        )
+
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
 
@@ -159,7 +220,13 @@ async def rename_agent_core(agent, new_name: str) -> RenameOutcome:
             updated_node.properties = dict(agent_node.properties)
             updated_node.properties["name"] = new_name
             updated_node.label = new_name
-            await agent.storage.add_node(updated_node)
+            # Trusted control-plane write: the agent identity node. Rename is an
+            # explicit operator identity action, so the capability admits it in a
+            # volatile mode (the durable ``agent_metadata`` name row above is the
+            # matching identity write) (#2672).
+            await agent.storage.add_node(
+                updated_node, capability=acquire_control_plane_capability()
+            )
             graph_updated = True
     except Exception as e:
         logger.error(f"Agent rename failed after metadata write: {e}", exc_info=True)
@@ -246,6 +313,21 @@ async def _update_soul_name(agent, old_name: str, new_name: str) -> bool:
             updated = True
 
     if updated:
+        # Privacy boundary (#2672 review P1): the renamed SOUL body is user-derived
+        # content. In a volatile privacy mode, do NOT rewrite it to disk or promote
+        # it into the encrypted resource table / durable graph — leave no trace.
+        # The in-memory agent name was already updated by the caller; the on-disk /
+        # canonical SOUL simply isn't persisted while volatile.
+        from kestrel_sovereign.features.storage_access import (
+            hides_persisted_user_content,
+        )
+        if hides_persisted_user_content(agent):
+            logger.info(
+                "SOUL.md name not persisted on rename — durable SOUL writes are "
+                "disabled in the current privacy mode (#2672)"
+            )
+            return False
+
         soul_path.write_text(content, encoding="utf-8")
         storage = getattr(agent, "storage", None)
         if storage and hasattr(storage, "promote_soul_seed"):
@@ -1129,6 +1211,17 @@ class BootstrapFeature(Feature):
             "soul_updated": outcome.soul_md_updated,
             "rename_outcome": outcome.to_dict(),
         }
+        if outcome.skipped_privacy:
+            # Not a failure and not a durable rename — the in-memory name changed
+            # but nothing was persisted, by privacy design (#2672 P1).
+            return ToolResult.partial(
+                confirmation=_rename_confirmation(old_name, new_name.strip(), outcome),
+                error=(
+                    "Name not persisted in the current privacy mode; it applies to "
+                    "this session only and reverts on restart."
+                ),
+                data=data,
+            )
         if not outcome.any_written:
             return ToolResult.failed(
                 f"Failed to rename: {outcome.error or 'no rename stores were updated'}",

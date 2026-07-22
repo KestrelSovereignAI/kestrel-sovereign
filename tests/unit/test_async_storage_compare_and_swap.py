@@ -42,8 +42,38 @@ from kestrel_sovereign.storage.async_graph_store import (
     NodeSwapResult,
 )
 from kestrel_sovereign.storage.async_storage import AsyncStorage
-from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+from kestrel_sovereign.storage.privacy_wrapper import (
+    PrivacyEnforcingStorage,
+    PrivacyViolationError,
+    acquire_control_plane_capability,
+)
 from kestrel_sovereign.privacy import PrivacyMode
+
+
+def _control_plane_capability():
+    """Obtain the real control-plane capability via a genuine trusted-module call.
+
+    The token is closure-private (no importable singleton — #2672 review P2); the
+    only legitimate way to get it is a call whose caller frame IS a trusted
+    module's namespace, so bind a throwaway probe into that module's ``__dict__``.
+    """
+    import importlib
+
+    module = importlib.import_module("kestrel_sovereign.bootstrap.service")
+    namespace = module.__dict__
+    exec("def __cp_probe():\n    return acquire_control_plane_capability()", namespace)
+    try:
+        return namespace["__cp_probe"]()
+    finally:
+        namespace.pop("__cp_probe", None)
+
+
+_CONTROL_PLANE_CAPABILITY = _control_plane_capability()
+
+# A realistic 64-hex SHA-256 digest — the per-field validators (#2672 review P1)
+# require content-free structural fields to be hash / timestamp / enum shaped.
+_HEX = "0123456789abcdef" * 4
+_HEX2 = "fedcba9876543210" * 4
 
 
 def _nid(prefix: str = "cas") -> str:
@@ -441,17 +471,75 @@ class TestFacadeAndPrivacyWrapper:
         finally:
             await storage.close()
 
-    async def test_privacy_wrapper_works_in_ephemeral_mode(self, tmp_path):
-        """Graph CAS is structural metadata, not PII — allowed in EPHEMERAL just
-        like add_node (which the wrapper explicitly permits)."""
+    async def test_privacy_wrapper_governs_graph_cas_in_ephemeral_mode(self, tmp_path):
+        """CAS is privacy-governed in EPHEMERAL (#2672), without decomposing the
+        atomic primitive.
+
+        A durable graph write is not "structural, not PII". Two tiers: a
+        user-derived / unknown node CAS is default-denied and writes no row; a
+        content-free structural type (here ``document``) is admitted on the
+        ordinary path with strict per-field validation and lands atomically; and
+        the ``agent`` control-plane type is admitted through the unforgeable
+        control-plane capability, but only as a SWAP of an existing node whose
+        identity label is carried along unchanged (a compare-and-create with a
+        fresh free-text label is refused by the label carry-along boundary —
+        #2672 review P1). In every case the governance inspects ``new_node`` up
+        front and then delegates the single atomic CAS — it never becomes
+        get_node + add_node.
+        """
         storage = await AsyncStorage.create_sqlite(str(tmp_path / "eph.db"))
         wrapped = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
         try:
-            nid = _nid("eph")
+            # Unknown/user-derived node type → fail closed, no durable row.
+            blocked = _nid("eph-blocked")
+            with pytest.raises(PrivacyViolationError):
+                await wrapped.compare_and_swap_node(
+                    blocked, None, _node(blocked, {"status": "fresh"})
+                )
+            assert await storage.get_node(blocked) is None
+
+            # Content-free structural type → admitted on the ordinary path. The
+            # document ``hash`` must be a real digest AND equal the node id.
+            allowed = _HEX
             result = await wrapped.compare_and_swap_node(
-                nid, None, _node(nid, {"status": "fresh"})
+                allowed,
+                None,
+                _node(
+                    allowed,
+                    {"hash": allowed, "type": "Constitution",
+                     "created_at": "2026-01-01T00:00:00+00:00"},
+                    label="KESTREL_CONSTITUTION",
+                    node_type="document",
+                ),
             )
             assert result == NodeSwapResult.SWAPPED
+            assert (await storage.get_node(allowed)) is not None
+
+            # Control-plane ``agent`` type → the realistic CAS is a properties SWAP
+            # of the inception-written node, carrying the identity label along. It
+            # is denied without the capability, admitted only when the caller
+            # presents the unforgeable control-plane capability.
+            cp = _nid("agent")
+            base_props = {
+                "constitution_hash": _HEX,
+                "created_at": "2026-01-01T00:00:00+00:00",
+            }
+            # Seed the inception-written agent node directly (raw store).
+            await storage.add_node(_node(
+                cp, dict(base_props), label="Kestrel", node_type="agent",
+            ))
+            swapped_props = {**base_props, "bootstrap_state": "complete"}
+            cp_node = _node(cp, swapped_props, label="Kestrel", node_type="agent")
+
+            with pytest.raises(PrivacyViolationError):
+                await wrapped.compare_and_swap_node(cp, base_props, cp_node)
+            assert (await storage.get_node(cp)).properties.get("bootstrap_state") != "complete"
+
+            result = await wrapped.compare_and_swap_node(
+                cp, base_props, cp_node, capability=_CONTROL_PLANE_CAPABILITY
+            )
+            assert result == NodeSwapResult.SWAPPED
+            assert (await storage.get_node(cp)).properties["bootstrap_state"] == "complete"
         finally:
             await storage.close()
 
