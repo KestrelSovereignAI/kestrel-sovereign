@@ -2,7 +2,7 @@
 
 By the end of this guide you will have a running Kestrel agent with all three sovereignty pillars active:
 - A cryptographic DID identity (yours, portable, no platform owns it)
-- An encrypted memory store that persists across sessions
+- A persistent memory store that survives across sessions — conversations and file blobs encrypt at rest when you set `KESTREL_DATA_KEY` (see [Encryption at rest](#encryption-at-rest))
 - A constitutional governance layer enforced above the LLM
 
 **Time:** ~30 minutes (most of that is downloading Ollama + the model)
@@ -64,9 +64,9 @@ uv run kestrel setup
 ```
 
 The wizard:
-1. Generates `.env` with a fresh `KESTREL_DATA_KEY` (Fernet) for encrypted memory
+1. Generates `.env` with a fresh `KESTREL_DATA_KEY` (Fernet) that encrypts conversation history and file blobs at rest (see [Encryption at rest](#encryption-at-rest))
 2. Writes `[llm]` into `kestrel.toml` with the providers you choose
-3. Runs the **Inception Service**: generates a secp256k1 keypair, derives a cryptographic DID, creates the encrypted SQLite store at `./agent_data/<name>/`, anchors the Kestrel Constitution as the agent's first memory, and runs a genesis integrity audit
+3. Runs the **Inception Service**: generates a secp256k1 keypair, derives a cryptographic DID, creates the SQLite store at `./agent_data/<name>/`, anchors the Kestrel Constitution as the agent's first memory, and runs a genesis integrity audit
 4. Registers the new agent in `multi_agent.toml` and prints a readiness report
 
 Skip the prompts and accept Ollama defaults:
@@ -150,17 +150,38 @@ uv run kestrel status
 
 ## Privacy Modes
 
-Kestrel has five privacy levels that control what your agent stores. The default is `NORMAL` (full encrypted persistence).
+Kestrel has five privacy levels that control what your agent stores. The default is `NORMAL` (full persistence). Privacy modes govern *what* is stored, not *how* it is encrypted — see [Encryption at rest](#encryption-at-rest) for the at-rest coverage matrix.
 
 | Mode | What it means |
 |------|--------------|
-| `NORMAL` (default) | Full memory, full history, encrypted at rest |
+| `NORMAL` (default) | Full memory, full history; conversations and file blobs encrypt at rest when `KESTREL_DATA_KEY` is set |
 | `ANONYMOUS` | Stored but stripped of identifying information |
 | `ISOLATED` | Remembers within this session only — not across sessions |
 | `EPHEMERAL` | Nothing stored — true off-the-record mode |
 | `PUBLIC` | Stored with sharing enabled |
 
 See [docs/architecture/PRIVACY_MODES.md](docs/architecture/PRIVACY_MODES.md) for the full reference.
+
+---
+
+## Encryption at rest
+
+`KESTREL_DATA_KEY` is **application-layer** encryption, not whole-database encryption. When it is set, Kestrel encrypts conversation history, file blobs, identity private keys, and agent-resource bodies. Saved-item and RAG document-chunk bodies are plaintext columns with no at-rest encryption today — application-layer coverage is tracked in [#2677](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2677). Whole-DB SQLCipher is **not wired** in this release, so `KESTREL_DB_KEY` does not encrypt anything today.
+
+| Data at rest | Encrypted at rest today? |
+|---|---|
+| Conversation-history rows | Yes, when `KESTREL_DATA_KEY` is set (Fernet, app-layer) |
+| Stored file blobs | Yes, when `KESTREL_DATA_KEY` is set (Fernet, app-layer) |
+| Agent identity private keys | Yes, when `KESTREL_DATA_KEY` is set (`SecureKeyStorage`, AES-256-GCM) |
+| Agent-resource bodies (e.g. SOUL) | Yes, when `KESTREL_DATA_KEY` is set (`AgentResourceStore`, Fernet) |
+| Saved-item bodies (`saved_items.content`) | No — plaintext column; app-layer coverage tracked in [#2677](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2677) |
+| RAG document-chunk bodies (`document_chunks.content`) | No — plaintext column; same gap ([#2677](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2677)) |
+| Embeddings (vectors) | No — numeric vectors, not reversible ciphertext |
+| Remote backups (IPFS/Filecoin export) | Yes, by default — derived from `KESTREL_DATA_KEY` (export fails if unset) |
+| Local export (`storage_tier="local"`) | No — written unencrypted |
+| Whole database file (SQLCipher) | No — not wired; `KESTREL_DB_KEY` is not read by the runtime |
+
+Directory and file permissions (`0700` / `0600`) are access control, not encryption. See the [README encryption section](README.md#-encryption-at-rest) for the full runbook.
 
 ---
 
