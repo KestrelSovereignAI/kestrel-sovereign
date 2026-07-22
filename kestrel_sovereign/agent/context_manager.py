@@ -14,15 +14,28 @@ replacing scattered context retrieval throughout the codebase.
 Refactored to serve as an orchestration layer that delegates to specialized managers.
 """
 
-import json
 import logging
 import os
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple, TYPE_CHECKING
 
 from .context_builder import ContextBuilder
+from .context_stages import (
+    ContextAssembly,
+    SectionDestination,
+    SectionResult,
+    build_episode_section,
+    build_memory_section,
+    build_rag_section,
+    build_reflection_guidance_block,
+    compute_lumpy_anchor,
+    compute_pruned_span,
+    emit_content_for_msg,
+    finalize_section,
+    microcompact_tool_results,
+    EPHEMERAL_NOTICE,
+)
 from .token_counter import TokenCounter, get_token_counter
 from .token_budget import TokenBudget, create_budget, DegradedModeError
 from .conversation_manager import ConversationManager
@@ -427,7 +440,11 @@ class ContextManager:
         Returns:
             ContextResult with assembled context and metadata
         """
-        warnings: List[str] = []
+        # One typed state object per call — never a shared instance — so
+        # concurrent COGNITION dispatches cannot cross-contaminate counters
+        # or results. Per-task injection tracking is published via the
+        # ContextVar only on the successful path at the end of this method.
+        assembly = ContextAssembly()
 
         # Resolve constitutional awareness once. Prompt adaptation is stable
         # top-level context; mutable StateOfMind fields travel as append-only
@@ -457,32 +474,13 @@ class ContextManager:
             history = await self.conversation_manager.get_conversation_history()
         message_count = len(history)
 
-        # Measure the non-borrowable mandatory governance floor for the
-        # #1309 elastic budget (Emma 2026-05-20). When the floor cannot
-        # fit, the elastic budget raises DegradedModeError; surface
-        # this as a degraded-mode ContextResult so the caller does not
-        # issue the LLM call under a false "normal" status. The guard
-        # below is narrow: it only swallows ``TypeError`` from test
-        # stubs that mock the token counter (MagicMock returns when
-        # casted to int blow up here, not in production). Any other
-        # exception — including ``ValueError`` indicating a real
-        # measurement error — propagates so a broken measurement path
-        # is loud, not silent. Codex round 1 #4.
-        raw_mandatory = self.context_builder.measure_mandatory_system_tokens(
-            constitution=constitution,
-            state_of_mind=None,
-            prompt_adaptation=prompt_adaptation,
+        # Measure the non-borrowable mandatory governance floor and build the
+        # #1309 elastic budget (Emma 2026-05-20). A floor that cannot fit
+        # raises DegradedModeError → surface a degraded-mode ContextResult so
+        # the caller does not issue the LLM call under a false "normal" status.
+        mandatory_system_tokens = self._measure_mandatory_system_tokens(
+            constitution, prompt_adaptation
         )
-        try:
-            mandatory_system_tokens = int(raw_mandatory)
-        except TypeError:
-            logger.error(
-                "measure_mandatory_system_tokens returned non-numeric (type=%s); "
-                "treating mandatory floor as 0 — production token counters always "
-                "return int, so this signals a test-stub or broken counter wiring",
-                type(raw_mandatory).__name__,
-            )
-            mandatory_system_tokens = 0
         try:
             budget = create_budget(
                 self.model,
@@ -496,225 +494,69 @@ class ContextManager:
                 "MUST surface this and refuse the LLM call",
                 e,
             )
-            warnings.append(
+            assembly.warnings.append(
                 f"DEGRADED MODE: mandatory governance floor ({e.mandatory_system_tokens} "
                 f"tokens) does not fit context budget ({e.total_budget} tokens) "
                 f"for model {e.model!r}. The LLM call MUST NOT proceed — surface "
                 "this to the operator."
             )
-            return ContextResult(
-                system_prompt="",
-                messages=[],
-                total_tokens=0,
-                budget_summary={"mode": "degraded", "reason": str(e)},
-                warnings=warnings,
-                degraded_mode=True,
+            return self._degraded_result(
+                assembly,
+                reason=str(e),
                 mandatory_system_tokens=mandatory_system_tokens,
                 state_of_mind=state_of_mind,
             )
 
-        # 1. Build system prompt. When the caller sets
-        # `system_prompt_budget_bytes` (a per-source registration knob
-        # threaded through by the SignalDispatcher), route to the
-        # priority-aware tracking assembler so the budget actually
-        # takes effect. The legacy build_system_prompt is byte-stable
-        # for the cache path; the tracking variant intentionally has
-        # different bytes (different fence convention) so it's only
-        # used when the source explicitly opts in via budget.
-        #
-        # Codex round-12 P2: the addendum (canary directive) must
-        # count toward the budget. Reserve its bytes BEFORE the
-        # assembler truncates so the final assembled prompt
-        # (assembler output + joiner + addendum) fits within the cap.
-        # Codex round-17 P2: route to the tracking assembler when
-        # EITHER a budget is set OR anchored doctrine is supplied
-        # (the legacy build_system_prompt has no anchored_doctrine
-        # parameter). Otherwise full-injection sources without a
-        # budget would silently fall back to the legacy path that
-        # ignores doctrine.
-        injected_clauses_for_audit: Optional[List[str]] = None
-        dropped_clauses_for_audit: Optional[List[str]] = None
-        if system_prompt_budget_bytes is not None or anchored_doctrine:
-            # Effective budget: when caller set a budget, reserve
-            # addendum bytes from it (codex round-12); when no
-            # budget is set but anchored_doctrine triggered this
-            # path (codex round-17), pass None to the assembler so
-            # it doesn't truncate.
-            effective_budget: Optional[int]
-            if system_prompt_budget_bytes is None:
-                effective_budget = None
-            else:
-                reserved = 0
-                if system_prompt_addendum:
-                    reserved = (
-                        len(system_prompt_addendum.encode("utf-8")) + 2
-                    )  # 2 bytes for the "\n\n" joiner
-                effective_budget = max(
-                    1, system_prompt_budget_bytes - reserved
-                )
-            tracking_result = self.context_builder.build_system_prompt_with_tracking(
-                constitution=constitution,
-                include_briefing=include_briefing,
-                prompt_adaptation=prompt_adaptation,
-                state_of_mind=None,
-                budget_bytes=effective_budget,
-                anchored_doctrine=anchored_doctrine,
-            )
-            system_prompt = tracking_result.prompt
-            # Surface tracking back to the caller so the dispatcher
-            # can populate signal_log.injected_clauses_json /
-            # dropped_clauses_json (codex round-13 P2 fix).
-            injected_clauses_for_audit = list(tracking_result.injected_clauses)
-            dropped_clauses_for_audit = list(tracking_result.dropped_clauses)
-            if system_prompt_addendum:
-                system_prompt = f"{system_prompt}\n\n{system_prompt_addendum}"
-        else:
-            system_prompt = self.context_builder.build_system_prompt(
-                constitution=constitution,
-                include_briefing=include_briefing,
-                prompt_adaptation=prompt_adaptation,
-                state_of_mind=None,
-                system_prompt_addendum=system_prompt_addendum,
-            )
-        system_tokens = self.counter.count(system_prompt)
-        # System is mandatory governance content: we have already
-        # committed to sending it. Record usage; if accounting cannot
-        # absorb it (system_tokens > local + elastic pool), bump the
-        # allocation to match what we're actually sending and log
-        # loudly. Better to over-report system usage than to send
-        # bytes we don't account for (codex round 1 #1).
-        if not budget.use("system", system_tokens):
-            allocation = budget.allocations.get("system")
-            if allocation is not None:
-                allocation.budget = max(allocation.budget, system_tokens)
-                allocation.used = system_tokens
-            warnings.append(
-                f"system content ({system_tokens} tokens) exceeded its slice "
-                "plus elastic pool; budget accounting forced to match the "
-                "bytes already committed for this turn"
-            )
-            logger.warning(
-                "system slice over budget by %s tokens — forcing allocation "
-                "to match what is being sent (no silent drift)",
-                system_tokens
-                - (budget.allocations.get("system").budget if allocation else 0),
-            )
+        # 1. Assemble the stable system prefix (constitution/identity/doctrine)
+        # and record its usage. Kept separate from the per-turn dynamic user
+        # context by construction (ContextAssembly). The tracking assembler is
+        # used when a per-source byte budget is set OR anchored doctrine is
+        # supplied; otherwise the byte-stable legacy assembler.
+        (
+            assembly.system_prompt,
+            assembly.injected_clauses,
+            assembly.dropped_clauses,
+        ) = self._assemble_system_prompt(
+            constitution=constitution,
+            include_briefing=include_briefing,
+            prompt_adaptation=prompt_adaptation,
+            system_prompt_addendum=system_prompt_addendum,
+            system_prompt_budget_bytes=system_prompt_budget_bytes,
+            anchored_doctrine=anchored_doctrine,
+        )
+        self._record_system_usage(assembly, budget)
 
-        # Track what we include
-        episode_count = 0
-        memory_count = 0
-        rag_chunks = 0
-        # Per-turn retrieved context (memories + RAG). Kept OUT of system_prompt
-        # so the system prefix stays stable across turns and prompt caches hit.
-        dynamic_blocks: List[str] = []
+        # 1b. Reflection guidance (into the system prompt, budget-gated).
+        self._apply_reflection_guidance(
+            assembly,
+            budget,
+            reflection_guidance,
+            system_prompt_budget_bytes=system_prompt_budget_bytes,
+        )
 
-        # 1b. Inject reflection guidance into system prompt
-        if reflection_guidance:
-            guidance_text = "\n--- ACTIVE REFLECTION GUIDANCE ---\n"
-            guidance_text += "Based on self-reflection, keep these insights in mind:\n"
-            for item in reflection_guidance:
-                guidance_text += f"- {item}\n"
-            guidance_text += "--- END GUIDANCE ---"
-            # Codex round-15 P2: when a per-source budget is in
-            # effect, the late append of reflection guidance must
-            # NOT push the total over the cap. Skip the append if
-            # there's no room — the budget contract takes precedence
-            # over reflection guidance (operator can raise the cap
-            # to admit it back).
-            if system_prompt_budget_bytes is not None:
-                projected = (
-                    len(system_prompt.encode("utf-8"))
-                    + 2  # "\n\n" joiner
-                    + len(guidance_text.encode("utf-8"))
-                )
-                if projected > system_prompt_budget_bytes:
-                    logger.warning(
-                        "Skipping reflection guidance for budgeted "
-                        "dispatch (would push prompt %d over cap %d)",
-                        projected,
-                        system_prompt_budget_bytes,
-                    )
-                else:
-                    guidance_tokens = self.counter.count(guidance_text)
-                    budget.use("system", guidance_tokens)
-                    system_prompt = f"{system_prompt}\n\n{guidance_text}"
-                    logger.info(f"Injected {len(reflection_guidance)} reflection guidance items into prompt")
-            else:
-                guidance_tokens = self.counter.count(guidance_text)
-                budget.use("system", guidance_tokens)
-                system_prompt = f"{system_prompt}\n\n{guidance_text}"
-                logger.info(f"Injected {len(reflection_guidance)} reflection guidance items into prompt")
-
-        # 1c. Microcompact: clear stale tool results (zero-cost, no LLM)
+        # 1c. Microcompact: clear stale tool results (zero-cost, no LLM).
         microcompact_savings = self._microcompact_tool_results(history)
         if microcompact_savings > 0:
-            logger.info(f"Microcompact cleared {microcompact_savings} stale tool results")
-
-        # Finalize the system slice: any unused budget above the
-        # mandatory floor flows into the elastic pool so later sections
-        # (episodes, memories, RAG, history) can borrow it. The
-        # mandatory floor is preserved — never returned to the pool.
-        if hasattr(budget, "mark_section_finalized"):
-            budget.mark_section_finalized("system")
-
-        # 2. Add episodes for long conversations.
-        # Use the get/format split (#1308) so episode_count is an
-        # accurate ``len(episodes)`` instead of the legacy
-        # ``"**".count() // 2`` heuristic — the formatted block contains
-        # bold markers for emotional-arc lines and other ``**``-bearing
-        # substrings that made the heuristic over- and under-count
-        # depending on episode content.
-        if message_count >= self.EPISODE_THRESHOLD_MESSAGES and self.consolidator:
-            episodes = await self.context_builder.get_episodes_for_context(
-                max_tokens=budget.episodes,
-                max_episodes=5,
+            logger.info(
+                f"Microcompact cleared {microcompact_savings} stale tool results"
             )
-            episode_context = self.context_builder.format_episodes_for_context(episodes)
-            if episode_context:
-                # Codex round-15 P2: same budget guard as reflection
-                # guidance. Skip episode append if it would push the
-                # final prompt over the per-source cap.
-                if system_prompt_budget_bytes is not None:
-                    projected = (
-                        len(system_prompt.encode("utf-8"))
-                        + 2
-                        + len(episode_context.encode("utf-8"))
-                    )
-                    if projected > system_prompt_budget_bytes:
-                        logger.warning(
-                            "Skipping episode context for budgeted "
-                            "dispatch (would push prompt %d over cap %d)",
-                            projected,
-                            system_prompt_budget_bytes,
-                        )
-                        episode_context = None
 
-                if episode_context:
-                    episode_tokens = self.counter.count(episode_context)
-                    # Only append episodes when the budget can absorb
-                    # them — otherwise the block is dropped to preserve
-                    # the accounting invariant (codex round 1 #1).
-                    # The selector inside ``get_episodes_for_context``
-                    # already capped by ``budget.episodes``; this is a
-                    # defensive check against pool exhaustion.
-                    if budget.use("episodes", episode_tokens, items=len(episodes)):
-                        system_prompt = f"{system_prompt}\n\n{episode_context}"
-                        episode_count = len(episodes)
-                        logger.debug(f"Added {episode_count} episodes to context")
-                    else:
-                        warnings.append(
-                            f"episode block ({episode_tokens} tokens) skipped — "
-                            "exceeded episodes slice plus elastic pool"
-                        )
-                        logger.warning(
-                            "episode block skipped: %s tokens did not fit episodes "
-                            "slice plus pool",
-                            episode_tokens,
-                        )
-        # Episodes finalized — release any unused episode budget into
-        # the elastic pool for later sections.
-        if hasattr(budget, "mark_section_finalized"):
-            budget.mark_section_finalized("episodes")
+        # Finalize the system slice: any unused budget above the mandatory
+        # floor flows into the elastic pool so later sections (episodes,
+        # memories, RAG, history) can borrow it. The mandatory floor is
+        # preserved — never returned to the pool.
+        finalize_section(budget, "system")
+
+        # 2. Episodes for long conversations (into the system prompt). The
+        # get/format split (#1308) yields an accurate ``len(episodes)`` count.
+        episode_result = await self._produce_episodes(
+            assembly,
+            budget,
+            message_count,
+            system_prompt_budget_bytes=system_prompt_budget_bytes,
+        )
+        self._commit_episodes(assembly, budget, episode_result)
+        finalize_section(budget, "episodes")
 
         # Active TodoFeature rollups are injected via the always-on operational
         # pre-turn block — ``preturn_state._active_todo_section`` (#1907) — so
@@ -737,107 +579,462 @@ class ContextManager:
                 "skipping memory + RAG retrieval (#1404)"
             )
 
-        # 3. Retrieve emotionally-weighted memories (placed in dynamic user
-        # context, not system, so the system prefix stays cacheable).
-        if include_memories and self.memory_retriever and not trivial_turn:
-            try:
-                memories = await self.memory_manager.retrieve_memories(
-                    query=query,
-                    max_tokens=budget.memories,
-                    counter=self.counter,
-                    emotional_context=emotional_context,
-                    min_score=retrieval_cfg["memory_min_score"],
-                    min_relevance=retrieval_cfg["memory_min_relevance"],
-                    read_only=True,
-                    return_details=True,
-                )
-                if memories:
-                    from kestrel_sovereign.agent.memory_manager import RetrievedMemoryBlock
-
-                    memory_text = (
-                        memories.text
-                        if isinstance(memories, RetrievedMemoryBlock)
-                        else memories
-                    )
-                    memory_tokens = self.counter.count(memory_text)
-                    if budget.can_fit("memories", memory_tokens):
-                        budget.use("memories", memory_tokens)
-                        dynamic_blocks.append(f"<memories>\n{memory_text}\n</memories>")
-                        memory_count = memory_text.count("[Memory")
-                        if isinstance(memories, RetrievedMemoryBlock):
-                            await self.memory_retriever.record_accesses(
-                                memories.message_ids, self.agent_id
-                            )
-                        logger.debug(f"Added {memory_count} memories to dynamic context")
-            except Exception as e:
-                logger.warning(f"Memory retrieval failed: {e}")
-                warnings.append(f"Memory retrieval unavailable: {e}")
-        # Memories finalized — release slack into the elastic pool.
-        if hasattr(budget, "mark_section_finalized"):
-            budget.mark_section_finalized("memories")
-
-        # 4. Retrieve RAG context (placed in dynamic user context, not system).
-        if include_rag and not trivial_turn:
-            try:
-                rag_context = await self.context_builder.retrieve_context(
-                    query, min_score=retrieval_cfg["rag_min_score"],
-                )
-                if rag_context:
-                    rag_tokens = self.counter.count(rag_context)
-                    if budget.can_fit("rag", rag_tokens):
-                        budget.use("rag", rag_tokens)
-                        dynamic_blocks.append(
-                            "<documents>\n"
-                            f"{rag_context}\n"
-                            "</documents>"
-                        )
-                        rag_chunks = rag_context.count("[Document") or rag_context.count("Source:")
-                        logger.debug(f"Added {rag_chunks} RAG chunks to dynamic context")
-            except Exception as e:
-                logger.warning(f"RAG retrieval failed: {e}")
-                warnings.append(f"Document search unavailable: {e}")
-        # RAG finalized — release slack into the pool so the history
-        # slice (the section the silent-prune correctness hole hurts
-        # most until C ships) can borrow it.
-        if hasattr(budget, "mark_section_finalized"):
-            budget.mark_section_finalized("rag")
-
-        # Assemble the per-turn retrieved-context block. Empty string when
-        # nothing was retrieved — caller can use this as-is in a format()
-        # without producing dangling wrapper tags.
-        if dynamic_blocks:
-            dynamic_user_context = (
-                "<retrieved_context>\n"
-                + "\n".join(dynamic_blocks)
-                + "\n</retrieved_context>"
+        # 3. Emotionally-weighted memories (into dynamic user context, not
+        # system, so the system prefix stays cacheable). Access rehearsal is
+        # recorded only after the block is actually inserted.
+        memory_result = await self._produce_memories(
+            budget,
+            query,
+            emotional_context,
+            retrieval_cfg,
+            include_memories=include_memories,
+            trivial_turn=trivial_turn,
+        )
+        self._commit_dynamic_section(assembly, budget, memory_result)
+        # Access rehearsal is recorded only after the block is actually
+        # inserted, and only for structured memory blocks (matching the
+        # legacy ``isinstance(memories, RetrievedMemoryBlock)`` gate).
+        if (
+            memory_result is not None
+            and memory_result.committed
+            and memory_result.is_memory_block
+        ):
+            await self.memory_retriever.record_accesses(
+                memory_result.message_ids, self.agent_id
             )
-        else:
-            dynamic_user_context = ""
+        finalize_section(budget, "memories")
 
-        # 5. Format conversation history with remaining budget. When the
-        # elastic budget (#1309) is in use, history sizes against its
-        # *effective* ceiling (own remaining + pool) so released slack
-        # from finalized sections actually grows the conversation slice
-        # — codex round 1 #2 caught the previous version capping at the
-        # static ``budget.history`` and never asking for the slack.
+        # 4. RAG documents (into dynamic user context, not system).
+        rag_result = await self._produce_rag(
+            budget,
+            query,
+            retrieval_cfg,
+            include_rag=include_rag,
+            trivial_turn=trivial_turn,
+        )
+        self._commit_dynamic_section(assembly, budget, rag_result)
+        finalize_section(budget, "rag")
+
+        # 5. Format conversation history with the remaining (elastic) budget,
+        # lumpy-anchored for a cache-stable prefix, then reconciled to fit.
+        self._apply_history(assembly, budget, history)
+
+        # === C / #1311: durable salvage of pruned spans ===
+        # No model-visible prune may return before its durable salvage
+        # evidence commits. This is the single fail-closed finalization
+        # boundary: a salvage write failure — or an unreachable store while
+        # the feature flag is on — drops into degraded mode rather than
+        # silently letting bytes leave the model view (Emma 2026-05-20).
+        degraded = await self._finalize_salvage(
+            assembly,
+            history,
+            mandatory_system_tokens=mandatory_system_tokens,
+            state_of_mind=state_of_mind,
+        )
+        if degraded is not None:
+            return degraded
+
+        logger.info(
+            f"Context built: {budget.total_used}/{budget.total_budget} tokens "
+            f"({len(assembly.formatted_history)} msgs, {assembly.episode_count} episodes, "
+            f"{assembly.memory_count} memories, {assembly.rag_chunks} docs)"
+        )
+
+        # Codex round-14 P2: publish per-task tracking via ContextVar
+        # so concurrent COGNITION dispatches don't race on a shared
+        # agent attribute. Dispatcher reads via
+        # `get_current_injection_tracking()` after process_input.
+        _INJECTION_TRACKING_VAR.set(
+            (assembly.injected_clauses, assembly.dropped_clauses)
+        )
+
+        return ContextResult(
+            system_prompt=assembly.system_prompt,
+            messages=assembly.formatted_history,
+            total_tokens=budget.total_used,
+            budget_summary=budget.get_summary(),
+            episode_count=assembly.episode_count,
+            memory_count=assembly.memory_count,
+            rag_chunks=assembly.rag_chunks,
+            warnings=assembly.warnings,
+            dynamic_user_context=assembly.dynamic_user_context,
+            injected_clauses=assembly.injected_clauses,
+            dropped_clauses=assembly.dropped_clauses,
+            degraded_mode=False,
+            mandatory_system_tokens=mandatory_system_tokens,
+            state_of_mind=state_of_mind,
+        )
+
+    # ------------------------------------------------------------------
+    # build_context stages — each produces/commits one section. Content
+    # vocabulary is shared with the measurement path via ``context_stages``;
+    # the elastic finalization boundary is applied by the orchestrator, not
+    # by these stages (they never call ``mark_section_finalized``).
+    # ------------------------------------------------------------------
+
+    def _measure_mandatory_system_tokens(
+        self, constitution: str, prompt_adaptation: Any
+    ) -> int:
+        """Measure the non-borrowable mandatory governance floor (#1309).
+
+        The narrow ``TypeError`` guard only swallows test stubs that mock
+        the token counter (a MagicMock casted to int blows up here, not in
+        production). Any other exception — including a real ``ValueError``
+        measurement error — propagates so a broken path is loud, not silent
+        (codex round 1 #4).
+        """
+        raw_mandatory = self.context_builder.measure_mandatory_system_tokens(
+            constitution=constitution,
+            state_of_mind=None,
+            prompt_adaptation=prompt_adaptation,
+        )
+        try:
+            return int(raw_mandatory)
+        except TypeError:
+            logger.error(
+                "measure_mandatory_system_tokens returned non-numeric (type=%s); "
+                "treating mandatory floor as 0 — production token counters always "
+                "return int, so this signals a test-stub or broken counter wiring",
+                type(raw_mandatory).__name__,
+            )
+            return 0
+
+    def _assemble_system_prompt(
+        self,
+        *,
+        constitution: str,
+        include_briefing: bool,
+        prompt_adaptation: Any,
+        system_prompt_addendum: Optional[str],
+        system_prompt_budget_bytes: Optional[int],
+        anchored_doctrine: Optional["OrderedDict[str, str]"],
+    ) -> Tuple[str, Optional[List[str]], Optional[List[str]]]:
+        """Assemble the stable system prefix and optional injection tracking.
+
+        Routes to the priority-aware tracking assembler when the caller sets
+        a per-source byte budget OR supplies anchored doctrine (the legacy
+        ``build_system_prompt`` has no ``anchored_doctrine`` parameter);
+        otherwise uses the byte-stable legacy assembler so the cache prefix
+        stays identical for legacy callers. When budgeting, the addendum's
+        bytes are reserved BEFORE the assembler truncates (codex round-12 P2)
+        so the final ``assembler output + joiner + addendum`` fits the cap.
+
+        Returns ``(system_prompt, injected_clauses, dropped_clauses)``; the
+        clause lists are ``None`` for the legacy path.
+        """
+        injected_clauses: Optional[List[str]] = None
+        dropped_clauses: Optional[List[str]] = None
+        if system_prompt_budget_bytes is not None or anchored_doctrine:
+            effective_budget: Optional[int]
+            if system_prompt_budget_bytes is None:
+                # anchored_doctrine triggered this path with no budget
+                # (codex round-17 P2): pass None so nothing truncates.
+                effective_budget = None
+            else:
+                reserved = 0
+                if system_prompt_addendum:
+                    reserved = (
+                        len(system_prompt_addendum.encode("utf-8")) + 2
+                    )  # 2 bytes for the "\n\n" joiner
+                effective_budget = max(1, system_prompt_budget_bytes - reserved)
+            tracking_result = self.context_builder.build_system_prompt_with_tracking(
+                constitution=constitution,
+                include_briefing=include_briefing,
+                prompt_adaptation=prompt_adaptation,
+                state_of_mind=None,
+                budget_bytes=effective_budget,
+                anchored_doctrine=anchored_doctrine,
+            )
+            system_prompt = tracking_result.prompt
+            injected_clauses = list(tracking_result.injected_clauses)
+            dropped_clauses = list(tracking_result.dropped_clauses)
+            if system_prompt_addendum:
+                system_prompt = f"{system_prompt}\n\n{system_prompt_addendum}"
+        else:
+            system_prompt = self.context_builder.build_system_prompt(
+                constitution=constitution,
+                include_briefing=include_briefing,
+                prompt_adaptation=prompt_adaptation,
+                state_of_mind=None,
+                system_prompt_addendum=system_prompt_addendum,
+            )
+        return system_prompt, injected_clauses, dropped_clauses
+
+    def _record_system_usage(
+        self, assembly: ContextAssembly, budget: TokenBudget
+    ) -> None:
+        """Record the (mandatory) system content against the budget.
+
+        We have already committed to sending the system prompt; if accounting
+        cannot absorb it, bump the allocation to match the bytes being sent
+        and warn loudly rather than let usage drift silently (codex round 1
+        #1).
+        """
+        system_tokens = self.counter.count(assembly.system_prompt)
+        if not budget.use("system", system_tokens):
+            allocation = budget.allocations.get("system")
+            if allocation is not None:
+                allocation.budget = max(allocation.budget, system_tokens)
+                allocation.used = system_tokens
+            assembly.warnings.append(
+                f"system content ({system_tokens} tokens) exceeded its slice "
+                "plus elastic pool; budget accounting forced to match the "
+                "bytes already committed for this turn"
+            )
+            logger.warning(
+                "system slice over budget by %s tokens — forcing allocation "
+                "to match what is being sent (no silent drift)",
+                system_tokens
+                - (budget.allocations.get("system").budget if allocation else 0),
+            )
+
+    def _apply_reflection_guidance(
+        self,
+        assembly: ContextAssembly,
+        budget: TokenBudget,
+        reflection_guidance: Optional[List[str]],
+        *,
+        system_prompt_budget_bytes: Optional[int],
+    ) -> None:
+        """Append reflection guidance to the system prompt (budget-gated).
+
+        When a per-source byte budget is in effect the late append must not
+        push the total over the cap — the budget contract takes precedence
+        over reflection guidance (codex round-15 P2).
+        """
+        if not reflection_guidance:
+            return
+        guidance_text = build_reflection_guidance_block(reflection_guidance)
+        if system_prompt_budget_bytes is not None:
+            projected = (
+                len(assembly.system_prompt.encode("utf-8"))
+                + 2  # "\n\n" joiner
+                + len(guidance_text.encode("utf-8"))
+            )
+            if projected > system_prompt_budget_bytes:
+                logger.warning(
+                    "Skipping reflection guidance for budgeted "
+                    "dispatch (would push prompt %d over cap %d)",
+                    projected,
+                    system_prompt_budget_bytes,
+                )
+                return
+        guidance_tokens = self.counter.count(guidance_text)
+        budget.use("system", guidance_tokens)
+        assembly.system_prompt = f"{assembly.system_prompt}\n\n{guidance_text}"
+        logger.info(
+            f"Injected {len(reflection_guidance)} reflection guidance items into prompt"
+        )
+
+    async def _produce_episodes(
+        self,
+        assembly: ContextAssembly,
+        budget: TokenBudget,
+        message_count: int,
+        *,
+        system_prompt_budget_bytes: Optional[int],
+    ) -> Optional[SectionResult]:
+        """Retrieve + format episode summaries for long conversations.
+
+        Applies the per-source byte-budget projection guard before proposing
+        the append (codex round-15 P2); budget acceptance is decided by the
+        commit step. Returns ``None`` when episodes don't apply or are guarded
+        out.
+        """
+        if not (
+            message_count >= self.EPISODE_THRESHOLD_MESSAGES and self.consolidator
+        ):
+            return None
+        episodes = await self.context_builder.get_episodes_for_context(
+            max_tokens=budget.episodes,
+            max_episodes=5,
+        )
+        episode_context = self.context_builder.format_episodes_for_context(episodes)
+        if not episode_context:
+            return None
+        if system_prompt_budget_bytes is not None:
+            projected = (
+                len(assembly.system_prompt.encode("utf-8"))
+                + 2
+                + len(episode_context.encode("utf-8"))
+            )
+            if projected > system_prompt_budget_bytes:
+                logger.warning(
+                    "Skipping episode context for budgeted "
+                    "dispatch (would push prompt %d over cap %d)",
+                    projected,
+                    system_prompt_budget_bytes,
+                )
+                return None
+        # Shared with ``measure_context_breakdown`` via ``context_stages``
+        # so the two assemblers cannot disagree on the episode block's
+        # token cost or ``len(episodes)`` count.
+        return build_episode_section(
+            episode_context, len(episodes), self.counter.count
+        )
+
+    def _commit_episodes(
+        self,
+        assembly: ContextAssembly,
+        budget: TokenBudget,
+        result: Optional[SectionResult],
+    ) -> None:
+        """Append the episode block when the budget can absorb it.
+
+        The selector inside ``get_episodes_for_context`` already capped by
+        ``budget.episodes``; the ``budget.use`` gate here is a defensive
+        check against pool exhaustion (codex round 1 #1).
+        """
+        if result is None:
+            return
+        if budget.use(result.name, result.tokens, items=result.items):
+            assembly.system_prompt = (
+                f"{assembly.system_prompt}\n\n{result.append_text}"
+            )
+            assembly.episode_count = result.items
+            result.committed = True
+            logger.debug(f"Added {assembly.episode_count} episodes to context")
+        else:
+            assembly.warnings.append(
+                f"episode block ({result.tokens} tokens) skipped — "
+                "exceeded episodes slice plus elastic pool"
+            )
+            logger.warning(
+                "episode block skipped: %s tokens did not fit episodes "
+                "slice plus pool",
+                result.tokens,
+            )
+
+    async def _produce_memories(
+        self,
+        budget: TokenBudget,
+        query: str,
+        emotional_context: Optional[Dict[str, Any]],
+        retrieval_cfg: Dict[str, float],
+        *,
+        include_memories: bool,
+        trivial_turn: bool,
+    ) -> Optional[SectionResult]:
+        """Retrieve emotionally-weighted memories for dynamic user context."""
+        if not (include_memories and self.memory_retriever and not trivial_turn):
+            return None
+        try:
+            memories = await self.memory_manager.retrieve_memories(
+                query=query,
+                max_tokens=budget.memories,
+                counter=self.counter,
+                emotional_context=emotional_context,
+                min_score=retrieval_cfg["memory_min_score"],
+                min_relevance=retrieval_cfg["memory_min_relevance"],
+                read_only=True,
+                return_details=True,
+            )
+        except Exception as e:
+            logger.warning(f"Memory retrieval failed: {e}")
+            return SectionResult(
+                name="memories",
+                destination=SectionDestination.DYNAMIC,
+                warning=f"Memory retrieval unavailable: {e}",
+            )
+        if not memories:
+            return None
+        from kestrel_sovereign.agent.memory_manager import RetrievedMemoryBlock
+
+        is_block = isinstance(memories, RetrievedMemoryBlock)
+        memory_text = memories.text if is_block else memories
+        # Shared with ``measure_context_breakdown`` via ``context_stages``
+        # so the raw-block token cost, ``[Memory]`` count, and ``<memories>``
+        # wrapping are single-sourced across the two assemblers.
+        return build_memory_section(
+            memory_text,
+            self.counter.count,
+            message_ids=tuple(memories.message_ids) if is_block else (),
+            is_memory_block=is_block,
+        )
+
+    async def _produce_rag(
+        self,
+        budget: TokenBudget,
+        query: str,
+        retrieval_cfg: Dict[str, float],
+        *,
+        include_rag: bool,
+        trivial_turn: bool,
+    ) -> Optional[SectionResult]:
+        """Retrieve RAG documents for dynamic user context."""
+        if not (include_rag and not trivial_turn):
+            return None
+        try:
+            rag_context = await self.context_builder.retrieve_context(
+                query, min_score=retrieval_cfg["rag_min_score"],
+            )
+        except Exception as e:
+            logger.warning(f"RAG retrieval failed: {e}")
+            return SectionResult(
+                name="rag",
+                destination=SectionDestination.DYNAMIC,
+                warning=f"Document search unavailable: {e}",
+            )
+        if not rag_context:
+            return None
+        # Shared with ``measure_context_breakdown`` via ``context_stages``
+        # so the raw-block token cost, chunk count, and ``<documents>``
+        # wrapping are single-sourced across the two assemblers.
+        return build_rag_section(rag_context, self.counter.count)
+
+    def _commit_dynamic_section(
+        self,
+        assembly: ContextAssembly,
+        budget: TokenBudget,
+        result: Optional[SectionResult],
+    ) -> None:
+        """Commit a DYNAMIC section into the retrieved-context block.
+
+        Budget is charged on the RAW block cost (existing semantics) while
+        the WRAPPED block is what lands in dynamic user context. A retrieval
+        error surfaces as a warning and contributes nothing.
+        """
+        if result is None:
+            return
+        if result.warning:
+            assembly.warnings.append(result.warning)
+            return
+        if budget.can_fit(result.name, result.tokens):
+            budget.use(result.name, result.tokens)
+            assembly.dynamic_blocks.append(result.dynamic_block)
+            if result.name == "memories":
+                assembly.memory_count = result.items
+                logger.debug(
+                    f"Added {assembly.memory_count} memories to dynamic context"
+                )
+            elif result.name == "rag":
+                assembly.rag_chunks = result.items
+                logger.debug(
+                    f"Added {assembly.rag_chunks} RAG chunks to dynamic context"
+                )
+            result.committed = True
+
+    def _apply_history(
+        self,
+        assembly: ContextAssembly,
+        budget: TokenBudget,
+        history: List[Dict],
+    ) -> None:
+        """Anchor, format, and budget-reconcile the conversation history.
+
+        Sizes against the elastic *effective* ceiling (own remaining + pool)
+        so released slack from finalized sections grows the slice (codex
+        round 1 #2). The lumpy anchor (#1430) uses the STATIC ``budget.history``
+        ceiling so per-turn RAG/memory/episode slack variance doesn't disturb
+        the anchor position (codex round 2 P2), keeping the ``messages[-2]`` /
+        ``messages[-4]`` cache markers byte-stable. Then it pre-trims
+        wrap-overhead overshoot (codex round 2 P1) and applies the lumpy prune
+        safety net.
+        """
         if hasattr(budget, "effective_budget"):
             history_max_tokens = budget.effective_budget("history")
         else:
             history_max_tokens = budget.history
-        # Lumpy anchor (#1430): pre-slice history so the prefix we send
-        # is byte-stable across multiple turns of growth. Without this,
-        # ``format_conversation_history`` re-anchors from the newest
-        # end every turn once total history exceeds ``max_tokens``,
-        # shifting the bytes at ``messages[-2]`` / ``messages[-4]`` and
-        # invalidating Anthropic's position-indexed cache markers on
-        # every request.
-        #
-        # The anchor uses the STATIC ``budget.history`` ceiling, not
-        # the elastic effective ceiling, so per-turn variance in
-        # RAG/memory/episodes slack doesn't disturb the anchor
-        # position (codex round 2 P2). Format still gets the elastic
-        # ceiling for ``max_tokens``, so when slack is available the
-        # anchored slice fits comfortably with no further trimming.
         anchor = self._lumpy_anchor(history, budget.history)
         anchored_history = history[anchor:] if anchor > 0 else history
         if anchor > 0:
@@ -853,15 +1050,11 @@ class ContextManager:
         )
         history_tokens = self.counter.count_messages(formatted_history)
         if not budget.use("history", history_tokens, items=len(formatted_history)):
-            # ``format_conversation_history`` overshot ``max_tokens``
-            # (wrap-overhead is added after its own per-message budget
-            # check at context_builder.py:462-468). The legacy
-            # post-budget prune later in this function compares
-            # ``total_used`` to ``total_budget``, but
-            # ``ElasticTokenBudget.use`` returns False *without*
-            # recording usage, so the legacy prune never sees the
-            # rejected bytes. Trim oldest until the byte cost fits the
-            # effective ceiling, then re-record (codex round 2 P1).
+            # ``format_conversation_history`` overshot ``max_tokens`` because
+            # wrap-overhead is added after its own per-message budget check,
+            # and ``ElasticTokenBudget.use`` returns False WITHOUT recording,
+            # so the legacy post-budget prune never sees the rejected bytes.
+            # Trim oldest until the byte cost fits, then re-record.
             target = history_max_tokens
             while formatted_history and history_tokens > target:
                 dropped = formatted_history.pop(0)
@@ -869,7 +1062,7 @@ class ContextManager:
                     self.counter.count(dropped.get("content", "") or "") + 4
                 )
                 history_tokens -= dropped_tokens
-            warnings.append(
+            assembly.warnings.append(
                 f"history wrap-overhead overshot ceiling — pre-trimmed to "
                 f"{len(formatted_history)} messages ({history_tokens} tokens)"
             )
@@ -878,179 +1071,140 @@ class ContextManager:
                 history_tokens,
                 len(formatted_history),
             )
-            # Re-record the trimmed cost so budget accounting is honest.
             budget.use("history", history_tokens, items=len(formatted_history))
 
         # Check if we had to truncate significantly
         if len(formatted_history) < len(history) * 0.5:
-            warnings.append(
+            assembly.warnings.append(
                 f"History truncated: {len(formatted_history)}/{len(history)} messages"
             )
 
-        # Pre-send budget enforcement: if total exceeds budget, drop
-        # oldest history down to ``PRUNE_TARGET_FRAC`` of the budget
-        # rather than just-enough-to-fit. See ``_lumpy_prune_history``.
+        # Pre-send budget enforcement: if total exceeds budget, drop oldest
+        # history down to ``PRUNE_TARGET_FRAC`` of the budget rather than
+        # just-enough-to-fit. See ``_lumpy_prune_history``.
         if budget.total_used > budget.total_budget and len(formatted_history) > 1:
             pruned_tokens = self._lumpy_prune_history(formatted_history, budget)
             if pruned_tokens > 0:
-                warnings.append(
+                assembly.warnings.append(
                     f"Auto-pruned {pruned_tokens} tokens from history to fit budget"
                 )
+        assembly.formatted_history = formatted_history
 
-        # === C / #1311: durable salvage of pruned spans ===
-        # Any messages that were in the raw history but did not survive
-        # the prune pipeline (format_conversation_history's per-message
-        # budget, pre-trim from B, or the legacy post-budget overflow
-        # guard) are about to leave the model-visible slice. Emma's
-        # invariant: no model-visible pruning without a sync durable
-        # artifact. If the feature flag is enabled, write a salvage
-        # marker BEFORE returning the ContextResult — the LLM call
-        # downstream will not see these bytes, so the salvage must
-        # commit first. Sync write failure is fail-closed (Emma 2026-05-20
-        # hardening): we drop into degraded-mode rather than silently
-        # proceed.
-        if (
+    async def _finalize_salvage(
+        self,
+        assembly: ContextAssembly,
+        history: List[Dict],
+        *,
+        mandatory_system_tokens: int,
+        state_of_mind: Any,
+    ) -> Optional[ContextResult]:
+        """Durably salvage pruned spans before any model-visible return.
+
+        This is C / #1311's fail-closed boundary. Any messages that did not
+        survive the prune pipeline are about to leave the model-visible
+        slice; Emma's invariant is that no model-visible pruning happens
+        without a sync durable artifact. Returns a degraded ContextResult
+        (which the caller MUST return) when the feature flag is on but the
+        store is unreachable, or when the sync salvage write fails. Returns
+        ``None`` on the normal path, recording a salvage note.
+        """
+        if not (
             is_durable_salvage_enabled()
-            and len(formatted_history) < len(history)
+            and len(assembly.formatted_history) < len(history)
         ):
-            dropped_count = len(history) - len(formatted_history)
-            dropped = history[:dropped_count]
-            dropped_ids = [m["id"] for m in dropped if m.get("id") is not None]
-            if dropped_ids:
-                token_estimate = sum(
-                    self.counter.count(m.get("content", "") or "")
-                    + 4  # _MESSAGE_OVERHEAD; mirrors estimate_effective_history_tokens
-                    for m in dropped
-                )
-                # Derive session_id from the dropped messages' own
-                # metadata when present (rows written by add_conversation
-                # carry it). Falls back to None for legacy un-tagged
-                # rows; the salvage row stores it for non-leakage on
-                # the popup query path (#713).
-                salvage_session_id: Optional[str] = None
-                for m in dropped:
-                    meta = m.get("metadata")
-                    if isinstance(meta, dict):
-                        sid = meta.get("session_id")
-                        if sid:
-                            salvage_session_id = sid
-                            break
-                conv_store = (
-                    self.conversation_manager._get_conversation_store()
-                    if hasattr(self.conversation_manager, "_get_conversation_store")
-                    else None
-                )
-                if conv_store is None:
-                    # Feature flag is on (we got into this branch),
-                    # but no conv_store is available. We cannot write
-                    # a durable record — fail closed rather than
-                    # silently let bytes leave the model view
-                    # without one (codex round 1 #7).
-                    logger.error(
-                        "DEGRADED MODE: durable salvage feature flag "
-                        "is ON but no conversation store is reachable; "
-                        "the LLM call MUST NOT proceed"
-                    )
-                    warnings.append(
-                        "DEGRADED MODE: durable salvage feature flag "
-                        "is enabled but the conversation store is not "
-                        "reachable. The LLM call MUST NOT proceed."
-                    )
-                    return ContextResult(
-                        system_prompt="",
-                        messages=[],
-                        total_tokens=0,
-                        budget_summary={
-                            "mode": "degraded",
-                            "reason": "salvage-conv-store-unavailable",
-                        },
-                        warnings=warnings,
-                        degraded_mode=True,
-                        mandatory_system_tokens=mandatory_system_tokens,
-                        state_of_mind=state_of_mind,
-                    )
-                if conv_store is not None:
-                    try:
-                        pending = await get_pending_count(
-                            conv_store, session_id=salvage_session_id
-                        )
-                        salvage = await salvage_messages(
-                            conv_store=conv_store,
-                            original_messages=dropped,
-                            reason=SalvageReason.AUTO_PRUNE_POSTBUDGET,
-                            model=self.model,
-                            session_id=salvage_session_id,
-                            token_estimate=token_estimate,
-                            pending_count=pending,
-                        )
-                        worker = getattr(self, "salvage_worker", None)
-                        if (
-                            worker is not None
-                            and not salvage.pointer_only_terminal
-                        ):
-                            worker.schedule_summary(salvage.salvage_id)
-                        warnings.append(
-                            f"context-salvage: {len(dropped_ids)} messages "
-                            f"folded into salvage marker {salvage.salvage_id} "
-                            f"({'pointer-only-terminal' if salvage.pointer_only_terminal else 'pointer-only — async summary scheduled'})"
-                        )
-                    except SalvageWriteError as e:
-                        # Fail closed (Emma 2026-05-20 hardening): the
-                        # bytes would leave the model view without a
-                        # durable record, which violates C's invariant.
-                        # Surface the failure and return a degraded
-                        # ContextResult rather than issue the LLM call.
-                        logger.error(
-                            "DEGRADED MODE: salvage write failed (%s); "
-                            "LLM call MUST NOT proceed",
-                            e,
-                        )
-                        warnings.append(
-                            f"DEGRADED MODE: durable salvage write failed "
-                            f"({e}). The LLM call MUST NOT proceed — "
-                            "see logs and consider !context restore."
-                        )
-                        return ContextResult(
-                            system_prompt="",
-                            messages=[],
-                            total_tokens=0,
-                            budget_summary={
-                                "mode": "degraded",
-                                "reason": f"salvage-write-failed: {e}",
-                            },
-                            warnings=warnings,
-                            degraded_mode=True,
-                            mandatory_system_tokens=mandatory_system_tokens,
-                            state_of_mind=state_of_mind,
-                        )
-
-        logger.info(
-            f"Context built: {budget.total_used}/{budget.total_budget} tokens "
-            f"({len(formatted_history)} msgs, {episode_count} episodes, "
-            f"{memory_count} memories, {rag_chunks} docs)"
+            return None
+        span = compute_pruned_span(
+            history, assembly.formatted_history, self.counter.count
         )
-
-        # Codex round-14 P2: publish per-task tracking via ContextVar
-        # so concurrent COGNITION dispatches don't race on a shared
-        # agent attribute. Dispatcher reads via
-        # `get_current_injection_tracking()` after process_input.
-        _INJECTION_TRACKING_VAR.set(
-            (injected_clauses_for_audit, dropped_clauses_for_audit)
+        if span is None:
+            return None
+        conv_store = (
+            self.conversation_manager._get_conversation_store()
+            if hasattr(self.conversation_manager, "_get_conversation_store")
+            else None
         )
+        if conv_store is None:
+            # Feature flag is on but no conv_store is available — fail closed
+            # rather than silently let bytes leave the model view without a
+            # durable record (codex round 1 #7).
+            logger.error(
+                "DEGRADED MODE: durable salvage feature flag "
+                "is ON but no conversation store is reachable; "
+                "the LLM call MUST NOT proceed"
+            )
+            assembly.warnings.append(
+                "DEGRADED MODE: durable salvage feature flag "
+                "is enabled but the conversation store is not "
+                "reachable. The LLM call MUST NOT proceed."
+            )
+            return self._degraded_result(
+                assembly,
+                reason="salvage-conv-store-unavailable",
+                mandatory_system_tokens=mandatory_system_tokens,
+                state_of_mind=state_of_mind,
+            )
+        try:
+            pending = await get_pending_count(
+                conv_store, session_id=span.session_id
+            )
+            salvage = await salvage_messages(
+                conv_store=conv_store,
+                original_messages=span.dropped_messages,
+                reason=SalvageReason.AUTO_PRUNE_POSTBUDGET,
+                model=self.model,
+                session_id=span.session_id,
+                token_estimate=span.token_estimate,
+                pending_count=pending,
+            )
+            worker = getattr(self, "salvage_worker", None)
+            if worker is not None and not salvage.pointer_only_terminal:
+                worker.schedule_summary(salvage.salvage_id)
+            assembly.warnings.append(
+                f"context-salvage: {len(span.dropped_ids)} messages "
+                f"folded into salvage marker {salvage.salvage_id} "
+                f"({'pointer-only-terminal' if salvage.pointer_only_terminal else 'pointer-only — async summary scheduled'})"
+            )
+        except SalvageWriteError as e:
+            # Fail closed (Emma 2026-05-20 hardening): the bytes would leave
+            # the model view without a durable record, violating C's invariant.
+            logger.error(
+                "DEGRADED MODE: salvage write failed (%s); "
+                "LLM call MUST NOT proceed",
+                e,
+            )
+            assembly.warnings.append(
+                f"DEGRADED MODE: durable salvage write failed "
+                f"({e}). The LLM call MUST NOT proceed — "
+                "see logs and consider !context restore."
+            )
+            return self._degraded_result(
+                assembly,
+                reason=f"salvage-write-failed: {e}",
+                mandatory_system_tokens=mandatory_system_tokens,
+                state_of_mind=state_of_mind,
+            )
+        return None
 
+    def _degraded_result(
+        self,
+        assembly: ContextAssembly,
+        *,
+        reason: str,
+        mandatory_system_tokens: int,
+        state_of_mind: Any,
+    ) -> ContextResult:
+        """Build the empty, degraded-mode ContextResult (fail-closed).
+
+        Mirrors the degraded shape used by both the mandatory-floor and the
+        salvage fail-closed paths so the caller cannot drift them apart.
+        """
         return ContextResult(
-            system_prompt=system_prompt,
-            messages=formatted_history,
-            total_tokens=budget.total_used,
-            budget_summary=budget.get_summary(),
-            episode_count=episode_count,
-            memory_count=memory_count,
-            rag_chunks=rag_chunks,
-            warnings=warnings,
-            dynamic_user_context=dynamic_user_context,
-            injected_clauses=injected_clauses_for_audit,
-            dropped_clauses=dropped_clauses_for_audit,
-            degraded_mode=False,
+            system_prompt="",
+            messages=[],
+            total_tokens=0,
+            budget_summary={"mode": "degraded", "reason": reason},
+            warnings=assembly.warnings,
+            degraded_mode=True,
             mandatory_system_tokens=mandatory_system_tokens,
             state_of_mind=state_of_mind,
         )
@@ -1090,13 +1244,10 @@ class ContextManager:
         # The EPHEMERAL MODE notice is fixed text appended after the
         # budget-aware assembly. Codex round-13 P2 caught that we
         # must reserve its bytes too, otherwise the notice can push
-        # the final prompt over the configured budget.
-        ephemeral_notice = (
-            "--- EPHEMERAL MODE ACTIVE ---\n"
-            "This conversation is not being recorded. "
-            "No history or memories are available.\n"
-            "--- END NOTICE ---"
-        )
+        # the final prompt over the configured budget. Shared with the
+        # append below via the ``EPHEMERAL_NOTICE`` constant so the
+        # reserved and appended bytes cannot drift.
+        ephemeral_notice = EPHEMERAL_NOTICE
 
         ephemeral_tracking = None
         injected_clauses_for_audit: Optional[List[str]] = None
@@ -1142,13 +1293,7 @@ class ContextManager:
 
         # Append the ephemeral notice (already accounted for in the
         # reserved budget above when budget_bytes was set).
-        system_prompt = (
-            f"{system_prompt}\n\n"
-            "--- EPHEMERAL MODE ACTIVE ---\n"
-            "This conversation is not being recorded. "
-            "No history or memories are available.\n"
-            "--- END NOTICE ---"
-        )
+        system_prompt = f"{system_prompt}\n\n{EPHEMERAL_NOTICE}"
 
         tokens = self.counter.count(system_prompt)
 
@@ -1304,33 +1449,16 @@ class ContextManager:
 
     @staticmethod
     def _emit_content_for_msg(msg: Dict[str, Any]) -> str:
-        """Mirror the emit-byte selection in
-        ``ContextBuilder.format_conversation_history`` so the anchor
-        counts the SAME bytes the LLM will see.
+        """Select the emit bytes for a message (see
+        :func:`context_stages.emit_content_for_msg`).
 
-        Without this, the anchor can over-estimate fit for ``sent_form``
-        user/system rows (whose ``rendered_content`` may be larger than raw
-        ``content``) and let the formatter fall into its just-enough
-        skip path — recreating the per-turn cache churn the anchor is
-        supposed to prevent (codex round 2 P1).
+        Mirrors ``ContextBuilder.format_conversation_history`` so the anchor
+        counts the SAME bytes the LLM will see. Retained as a method for the
+        lumpy-anchor tests that call it directly.
         """
         from kestrel_sovereign.security.input_guardrails import wrap_user_input
 
-        role = msg.get("role", "user")
-        if role not in ("user", "assistant", "system"):
-            role = "user" if role == "human" else "assistant"
-        raw = msg.get("content", "") or ""
-        rendered = msg.get("rendered_content")
-        meta = msg.get("metadata") or {}
-        if (
-            role in ("user", "system")
-            and meta.get("sent_form")
-            and rendered is not None
-        ):
-            return rendered
-        if role == "user" and not meta.get("sent_form"):
-            return wrap_user_input(raw)
-        return rendered if rendered is not None else raw
+        return emit_content_for_msg(msg, wrap_user_input)
 
     def _lumpy_anchor(
         self,
@@ -1338,45 +1466,22 @@ class ContextManager:
         max_tokens: int,
     ) -> int:
         """Compute the oldest-message index to KEEP for a cache-stable
-        history window.
-
-        When the full history fits the ceiling, returns 0 (include all).
-        When it doesn't, advances the anchor in chunks of
-        ``(1 - PRUNE_TARGET_FRAC) * max_tokens`` so the anchor stays put
-        across multiple turns of growth before jumping forward. That
-        hysteresis is the whole point: the prefix at ``messages[-2]`` /
-        ``messages[-4]`` is byte-stable across the turns between anchor
-        jumps, so Anthropic's position-indexed cache markers compound
-        (see ``project_anthropic_cache_markers.md``).
+        history window (see :func:`context_stages.compute_lumpy_anchor`).
 
         Counts use ``_emit_content_for_msg`` to match the bytes
         ``format_conversation_history`` will emit (including sent-form
-        rendered content and ``wrap_user_input`` expansion). Otherwise
-        the formatter's just-enough skip path can run inside the
-        anchored slice and undo the hysteresis.
+        rendered content and ``wrap_user_input`` expansion) so the
+        formatter's just-enough skip path can't run inside the anchored
+        slice and undo the hysteresis.
         """
-        if not history or max_tokens <= 0:
-            return 0
-        msg_tokens = [
-            self.counter.count(self._emit_content_for_msg(m)) + 4 for m in history
-        ]
-        total = sum(msg_tokens)
-        if total <= max_tokens:
-            return 0
-        chunk = max(1, int(max_tokens * (1.0 - self.PRUNE_TARGET_FRAC)))
-        overage = total - max_tokens
-        # Round drop UP to the next chunk boundary so the anchor only
-        # advances in lumpy steps. Between steps, overage growth within
-        # a chunk's worth of tokens leaves the anchor untouched.
-        import math
-        chunks = max(1, math.ceil(overage / chunk))
-        target_drop = chunks * chunk
-        dropped = 0
-        anchor = 0
-        while anchor < len(history) - 1 and dropped < target_drop:
-            dropped += msg_tokens[anchor]
-            anchor += 1
-        return anchor
+        return compute_lumpy_anchor(
+            history,
+            max_tokens,
+            prune_target_frac=self.PRUNE_TARGET_FRAC,
+            count_msg_tokens=lambda m: self.counter.count(
+                self._emit_content_for_msg(m)
+            ),
+        )
 
     def _lumpy_prune_history(
         self,
@@ -1424,85 +1529,11 @@ class ContextManager:
     MICROCOMPACT_KEEP_RECENT = int(os.environ.get("KESTREL_MICROCOMPACT_KEEP_RECENT", "5"))
 
     def _microcompact_tool_results(self, history: List[Dict]) -> int:
+        """Clear stale tool-result content from conversation history in place.
+
+        Delegates to :func:`context_stages.microcompact_tool_results`;
+        retained as a method so callers/tests can reach it via the
+        ``ContextManager`` instance with its ``MICROCOMPACT_KEEP_RECENT``
+        policy.
         """
-        Clear stale tool result content from conversation history.
-
-        Replaces old tool result content with JSON markers while preserving
-        tool_call_id pairing (required by LLM APIs). The most recent N
-        tool results are kept intact.
-
-        This runs BEFORE format_conversation_history() normalizes roles,
-        so role="tool" is still identifiable.
-
-        Args:
-            history: Conversation history (mutated in place)
-
-        Returns:
-            Number of tool results cleared
-        """
-        keep_recent = self.MICROCOMPACT_KEEP_RECENT
-        if keep_recent < 1:
-            keep_recent = 1
-
-        # Collect indices of tool result messages (preserving order)
-        tool_indices = []
-        for i, msg in enumerate(history):
-            if msg.get("role") != "tool":
-                continue
-            # Skip protected or already excluded messages
-            meta = msg.get("metadata") or {}
-            if isinstance(meta, str):
-                try:
-                    meta = json.loads(meta)
-                except (json.JSONDecodeError, TypeError):
-                    # Can't read protection flags — assume protected, skip
-                    continue
-            if meta.get("context_priority") == "protected":
-                continue
-            if meta.get("excluded_from_context"):
-                continue
-            if meta.get("decay_protected"):
-                continue
-            tool_indices.append(i)
-
-        if len(tool_indices) <= keep_recent:
-            return 0
-
-        # Keep the last N, clear the rest
-        to_clear = tool_indices[:-keep_recent]
-        cleared = 0
-        now = datetime.now(timezone.utc).isoformat()
-
-        for idx in to_clear:
-            msg = history[idx]
-            content = msg.get("content", "")
-
-            # Already cleared?
-            if isinstance(content, str) and content.startswith('{"cleared":'):
-                continue
-
-            # Build informative marker
-            tool_name = ""
-            summary = ""
-            meta = msg.get("metadata") or {}
-            if isinstance(meta, str):
-                try:
-                    meta = json.loads(meta)
-                except (json.JSONDecodeError, TypeError):
-                    meta = {}
-            tool_name = meta.get("tool_name", "")
-
-            # Extract summary from content (first 100 chars of the result)
-            if isinstance(content, str):
-                summary = content[:100].replace('"', '\\"')
-
-            marker = json.dumps({
-                "cleared": True,
-                "tool_name": tool_name,
-                "summary": summary,
-                "cleared_at": now,
-            })
-            msg["content"] = marker
-            cleared += 1
-
-        return cleared
+        return microcompact_tool_results(history, self.MICROCOMPACT_KEEP_RECENT)

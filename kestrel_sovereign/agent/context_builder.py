@@ -19,6 +19,14 @@ from typing import Awaitable, Callable, List, Dict, Optional, Any, Tuple, TYPE_C
 
 from .token_counter import TokenCounter, get_token_counter
 from .token_budget import TokenBudget, AdaptiveTokenBudget, create_budget, RESPONSE_RESERVE
+from .context_stages import (
+    RETRIEVED_CONTEXT_EMPTY_ENVELOPE,
+    assemble_dynamic_user_context,
+    build_episode_section,
+    build_memory_section,
+    build_rag_section,
+    build_reflection_guidance_block,
+)
 from kestrel_sovereign.security.input_guardrails import wrap_user_input
 
 
@@ -1255,12 +1263,10 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
         assembled_system = "\n\n".join(p for _, parts in groups for p in parts)
         system_tokens = self.counter.count(assembled_system)
         if reflection_guidance:
-            guidance_block = (
-                "\n--- ACTIVE REFLECTION GUIDANCE ---\n"
-                + "Based on self-reflection, keep these insights in mind:\n"
-                + "".join(f"- {item}\n" for item in reflection_guidance)
-                + "--- END GUIDANCE ---"
-            )
+            # Shared with ``ContextManager.build_context`` via
+            # ``context_stages`` so the reflection block cannot drift
+            # between the measurement and production assemblers.
+            guidance_block = build_reflection_guidance_block(reflection_guidance)
             guidance_tokens = self.counter.count(guidance_block)
             # Production appends with "\n\n". Recompute system_tokens
             # from the final assembled bytes so the invariant
@@ -1294,6 +1300,9 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
         budget.use("history", history_tokens, items=len(formatted_history))
 
         # ----- episodes (real count, production threshold) -----
+        # Section produced via the shared ``context_stages`` builder so the
+        # measurement path and ``ContextManager.build_context`` cannot drift
+        # on the episode block's token cost or ``len(episodes)`` count.
         episodes_list: List[Dict[str, Any]] = []
         episodes_tokens = 0
         if effective_msg_count >= EPISODE_THRESHOLD_MESSAGES and self.consolidator:
@@ -1302,8 +1311,13 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
             )
             episode_block = self.format_episodes_for_context(episodes_list)
             if episode_block:
-                episodes_tokens = self.counter.count(episode_block)
-                budget.use("episodes", episodes_tokens, items=len(episodes_list))
+                episode_section = build_episode_section(
+                    episode_block, len(episodes_list), self.counter.count
+                )
+                episodes_tokens = episode_section.tokens
+                budget.use(
+                    "episodes", episode_section.tokens, items=episode_section.items
+                )
 
         # ----- memories: gate on RAW (production semantics), report
         # inner-wrapper tokens for the per-section figure. The outer
@@ -1317,6 +1331,7 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
         memories_count = 0
         memories_excluded = False
         memory_block: Optional[str] = None
+        memory_dynamic_block: Optional[str] = None
         if memory_retriever is not None:
             try:
                 memory_block = await memory_retriever(query, budget.memories)
@@ -1324,13 +1339,17 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
                 memory_block = None
                 notes.append(f"memory retrieval failed during measurement: {e}")
             if memory_block:
-                memories_count = memory_block.count("[Memory")
-                raw_tokens = self.counter.count(memory_block)
-                if budget.can_fit("memories", raw_tokens):
-                    budget.use("memories", raw_tokens, items=memories_count)
-                    memories_tokens = self.counter.count(
-                        f"<memories>\n{memory_block}\n</memories>"
+                # Produced via the shared ``context_stages`` builder: raw-block
+                # gate input, ``[Memory]`` count, and ``<memories>`` wrapping are
+                # single-sourced with production's ``_produce_memories``.
+                memory_section = build_memory_section(memory_block, self.counter.count)
+                memories_count = memory_section.items
+                if budget.can_fit("memories", memory_section.tokens):
+                    budget.use(
+                        "memories", memory_section.tokens, items=memory_section.items
                     )
+                    memory_dynamic_block = memory_section.dynamic_block
+                    memories_tokens = self.counter.count(memory_dynamic_block)
                 else:
                     memories_excluded = True
                     memory_block = None
@@ -1347,6 +1366,7 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
         rag_chunks = 0
         rag_excluded = False
         rag_context: Optional[str] = None
+        rag_dynamic_block: Optional[str] = None
         if include_rag:
             try:
                 rag_context = await self.retrieve_context(query)
@@ -1354,15 +1374,15 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
                 rag_context = None
                 notes.append(f"rag retrieval failed during measurement: {e}")
             if rag_context:
-                rag_chunks = rag_context.count("[Document") or rag_context.count(
-                    "Source:"
-                )
-                raw_tokens = self.counter.count(rag_context)
-                if budget.can_fit("rag", raw_tokens):
-                    budget.use("rag", raw_tokens, items=rag_chunks)
-                    rag_tokens = self.counter.count(
-                        f"<documents>\n{rag_context}\n</documents>"
-                    )
+                # Shared ``context_stages`` builder — same raw-block gate input,
+                # chunk count, and ``<documents>`` wrapping as production's
+                # ``_produce_rag``.
+                rag_section = build_rag_section(rag_context, self.counter.count)
+                rag_chunks = rag_section.items
+                if budget.can_fit("rag", rag_section.tokens):
+                    budget.use("rag", rag_section.tokens, items=rag_section.items)
+                    rag_dynamic_block = rag_section.dynamic_block
+                    rag_tokens = self.counter.count(rag_dynamic_block)
                 else:
                     rag_excluded = True
                     rag_context = None
@@ -1382,7 +1402,7 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
         dynamic_blocks_present = bool(memory_block) or bool(rag_context)
         if dynamic_blocks_present:
             dynamic_context_overhead = self.counter.count(
-                "<retrieved_context>\n\n</retrieved_context>"
+                RETRIEVED_CONTEXT_EMPTY_ENVELOPE
             )
         else:
             dynamic_context_overhead = 0
@@ -1469,16 +1489,15 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
         # ``_artifacts`` only when they need to re-use the assembled
         # text (``build_full_context`` does, for example, to share the
         # measurement path).
+        # Reuse the EXACT wrapped bytes the shared section builders produced
+        # (and that we measured above) rather than re-wrapping — the artifact
+        # and the per-section figure can never disagree.
         dynamic_blocks: List[str] = []
-        if memory_block:
-            dynamic_blocks.append(f"<memories>\n{memory_block}\n</memories>")
-        if rag_context:
-            dynamic_blocks.append(f"<documents>\n{rag_context}\n</documents>")
-        dynamic_user_context = (
-            "<retrieved_context>\n" + "\n".join(dynamic_blocks) + "\n</retrieved_context>"
-            if dynamic_blocks
-            else ""
-        )
+        if memory_dynamic_block:
+            dynamic_blocks.append(memory_dynamic_block)
+        if rag_dynamic_block:
+            dynamic_blocks.append(rag_dynamic_block)
+        dynamic_user_context = assemble_dynamic_user_context(dynamic_blocks)
         episode_block_for_artifacts = self.format_episodes_for_context(episodes_list)
         artifacts_system_prompt = assembled_system
         if episode_block_for_artifacts:
