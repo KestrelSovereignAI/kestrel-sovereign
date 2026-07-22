@@ -575,8 +575,9 @@ def test_start_skips_when_disabled(tmp_path, monkeypatch):
 
 
 def test_adopt_existing_healthy_phoenix(tmp_path, monkeypatch):
-    """A hard-killed host leaks a still-serving child; the successor ADOPTS it
-    instead of spawning a second child into the held port (#2589)."""
+    """A hard-killed host leaks a still-serving child whose PID is still recorded
+    in the PRIVATE pidfile; the successor ADOPTS it (a verified private-store
+    child) instead of spawning a second child into the held port (#2589/#2690)."""
     _StubPopen.instances.clear()
     monkeypatch.setattr(ps, "phoenix_enabled", lambda: True)
     monkeypatch.setattr(ps, "supports_host_root_path", lambda: True)
@@ -584,7 +585,7 @@ def test_adopt_existing_healthy_phoenix(tmp_path, monkeypatch):
     # A healthy Phoenix already holds the port, owned by PID 9999.
     monkeypatch.setattr(ps.PhoenixSupervisor, "is_healthy", lambda self, **k: True)
     monkeypatch.setattr(
-        ps.PhoenixSupervisor, "_pids_listening_on_port", lambda self: [9999]
+        ps.PhoenixSupervisor, "_port_listener_pids", lambda self: [9999]
     )
     monkeypatch.setattr(
         ps.PhoenixSupervisor, "_pid_alive", staticmethod(lambda pid: bool(pid))
@@ -592,6 +593,8 @@ def test_adopt_existing_healthy_phoenix(tmp_path, monkeypatch):
 
     sup = ps.PhoenixSupervisor(working_dir=tmp_path / "phx", port=6006)
     sup._root_path_override = None
+    sup.working_dir.mkdir(parents=True, exist_ok=True)
+    sup.pid_file.write_text("9999")  # prior boot recorded this child as private
 
     assert sup.start(wait_for_health=False) is True
     # Adopted, not spawned — no subprocess launched.
@@ -600,20 +603,23 @@ def test_adopt_existing_healthy_phoenix(tmp_path, monkeypatch):
     assert sup.process is None
     # Tracked as running via the adopted PID (liveness), reachable via the port.
     assert sup.running is True
-    # Pidfile now points at the adopted process so the NEXT successor can reap it.
+    # Pidfile still points at the adopted process so the NEXT successor can reap it.
     assert sup.pid_file.read_text() == "9999"
 
 
-def test_adopt_reaps_split_brain_zombie(tmp_path, monkeypatch):
-    """Port served by the real listener (100) while the pidfile names a different
-    live PID (200) — the zombie that lost the race. Adopt 100, reap 200 (#2589)."""
+def test_adopt_reaps_listener_not_matching_private_pidfile(tmp_path, monkeypatch):
+    """#2690 tightens #2589: the port listener (100) does NOT match the PRIVATE
+    pidfile (200). A listener whose PID we did not record is not trustworthy to
+    adopt (it could be a legacy-store Phoenix, an external process, or a reused
+    PID), so reap the untrusted listener AND the stale pidfile PID, then spawn a
+    fresh private-store child — never adopt an unverifiable trace store."""
     _StubPopen.instances.clear()
     monkeypatch.setattr(ps, "phoenix_enabled", lambda: True)
     monkeypatch.setattr(ps, "supports_host_root_path", lambda: True)
     monkeypatch.setattr(ps.subprocess, "Popen", _StubPopen)
     monkeypatch.setattr(ps.PhoenixSupervisor, "is_healthy", lambda self, **k: True)
     monkeypatch.setattr(
-        ps.PhoenixSupervisor, "_pids_listening_on_port", lambda self: [100]
+        ps.PhoenixSupervisor, "_port_listener_pids", lambda self: [100]
     )
     monkeypatch.setattr(
         ps.PhoenixSupervisor, "_pid_alive", staticmethod(lambda pid: pid in (100, 200))
@@ -628,13 +634,14 @@ def test_adopt_reaps_split_brain_zombie(tmp_path, monkeypatch):
     sup = ps.PhoenixSupervisor(working_dir=tmp_path / "phx", port=6006)
     sup._root_path_override = None
     sup.working_dir.mkdir(parents=True, exist_ok=True)
-    sup.pid_file.write_text("200")
+    sup.pid_file.write_text("200")  # pidfile names a different PID than the listener
 
     assert sup.start(wait_for_health=False) is True
-    assert sup._adopted_pid == 100
-    assert reaped == [200]  # the zombie was reaped
-    assert _StubPopen.instances == []  # no second child spawned
-    assert sup.pid_file.read_text() == "100"
+    assert sup._adopted_pid is None  # never adopted
+    # Both the untrusted listener and the stale pidfile PID reaped.
+    assert sorted(reaped) == [100, 200]
+    assert len(_StubPopen.instances) == 1  # then a fresh private-store child spawned
+    assert sup.pid_file.read_text() == "4321"
 
 
 def test_reap_stale_child_then_spawn(tmp_path, monkeypatch):
@@ -692,6 +699,322 @@ def test_running_and_stop_track_adopted_pid(tmp_path, monkeypatch):
     assert reaped == [777]
     assert sup._adopted_pid is None
     assert not sup.pid_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# Legacy-store custody vs adopt-or-reap (#2690)
+# ---------------------------------------------------------------------------
+
+
+def _legacy_home(tmp_path, monkeypatch, *, legacy_pid=None):
+    """A default-resolver supervisor with a legacy project store on disk.
+
+    ``KESTREL_HOME`` doubles as the project dir, so the legacy store resolves
+    to ``<home>/phoenix`` and the private store to ``<home>/host-data/phoenix``.
+    """
+    home = tmp_path / "kestrel-home"
+    legacy = home / "phoenix"
+    legacy.mkdir(parents=True)
+    (legacy / "phoenix.db").write_text("legacy-history")
+    if legacy_pid is not None:
+        (legacy / "phoenix.pid").write_text(str(legacy_pid))
+    monkeypatch.setenv("KESTREL_HOME", str(home))
+    monkeypatch.delenv(ps.PHOENIX_WORKING_DIR_ENV, raising=False)
+    return home, legacy
+
+
+def test_reconcile_reaps_live_legacy_store_phoenix(tmp_path, monkeypatch):
+    """The listener PID matches the LEGACY pidfile → reap it before migration."""
+    _legacy_home(tmp_path, monkeypatch, legacy_pid=13579)
+    monkeypatch.setattr(ps.PhoenixSupervisor, "is_healthy", lambda self, **k: True)
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_port_listener_pids", lambda self: [13579]
+    )
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_pid_alive", staticmethod(lambda pid: pid == 13579)
+    )
+    reaped: list = []
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_terminate_pid", lambda self, pid, **k: reaped.append(pid)
+    )
+
+    ps.PhoenixSupervisor().reconcile_storage_conflict()
+    assert reaped == [13579]
+
+
+def test_reconcile_reaps_unidentified_squatter(tmp_path, monkeypatch):
+    """Listener matches NEITHER pidfile (legacy left no pidfile) → reap
+    conservatively rather than adopt an unidentifiable squatter."""
+    _legacy_home(tmp_path, monkeypatch, legacy_pid=None)
+    monkeypatch.setattr(ps.PhoenixSupervisor, "is_healthy", lambda self, **k: True)
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_port_listener_pids", lambda self: [24680]
+    )
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_pid_alive", staticmethod(lambda pid: pid == 24680)
+    )
+    reaped: list = []
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_terminate_pid", lambda self, pid, **k: reaped.append(pid)
+    )
+
+    ps.PhoenixSupervisor().reconcile_storage_conflict()
+    assert reaped == [24680]
+
+
+def test_reconcile_leaves_private_store_child(tmp_path, monkeypatch):
+    """Listener matches the PRIVATE pidfile → adoptable, never reaped."""
+    _legacy_home(tmp_path, monkeypatch, legacy_pid=13579)
+    sup = ps.PhoenixSupervisor()
+    sup.working_dir.mkdir(parents=True, exist_ok=True)
+    sup.pid_file.write_text("55555")  # a private-store child holds the port
+
+    monkeypatch.setattr(ps.PhoenixSupervisor, "is_healthy", lambda self, **k: True)
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_port_listener_pids", lambda self: [55555]
+    )
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_pid_alive", staticmethod(lambda pid: pid == 55555)
+    )
+    reaped: list = []
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_terminate_pid", lambda self, pid, **k: reaped.append(pid)
+    )
+
+    sup.reconcile_storage_conflict()
+    assert reaped == []
+
+
+def test_reconcile_noop_when_port_not_serving(tmp_path, monkeypatch):
+    """Idempotence: nothing serving the port → no reap (the reap already ran)."""
+    _legacy_home(tmp_path, monkeypatch, legacy_pid=13579)
+    monkeypatch.setattr(ps.PhoenixSupervisor, "is_healthy", lambda self, **k: False)
+    reaped: list = []
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_terminate_pid", lambda self, pid, **k: reaped.append(pid)
+    )
+
+    ps.PhoenixSupervisor().reconcile_storage_conflict()
+    assert reaped == []
+
+
+def test_reconcile_noop_for_explicit_working_dir(tmp_path, monkeypatch):
+    """An explicit KESTREL_PHOENIX_WORKING_DIR never migrates → never reaps."""
+    monkeypatch.setenv(ps.PHOENIX_WORKING_DIR_ENV, str(tmp_path / "dedicated"))
+    monkeypatch.setattr(ps.PhoenixSupervisor, "is_healthy", lambda self, **k: True)
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_port_listener_pids", lambda self: [999]
+    )
+    reaped: list = []
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_terminate_pid", lambda self, pid, **k: reaped.append(pid)
+    )
+
+    ps.PhoenixSupervisor().reconcile_storage_conflict()
+    assert reaped == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX migration contract")
+def test_start_reaps_live_legacy_then_migrates_then_spawns(tmp_path, monkeypatch):
+    """Acceptance (#2690): a live legacy-store Phoenix holding the port is
+    reaped, the legacy store is migrated to private host-data, and a fresh
+    private-store child is spawned (not the divergent legacy Phoenix adopted)."""
+    _StubPopen.instances.clear()
+    home, legacy = _legacy_home(tmp_path, monkeypatch, legacy_pid=31337)
+    monkeypatch.setattr(ps, "phoenix_enabled", lambda: True)
+    monkeypatch.setattr(ps, "supports_host_root_path", lambda: True)
+    monkeypatch.setattr(ps.subprocess, "Popen", _StubPopen)
+
+    live = {31337}
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_pid_alive", staticmethod(lambda pid: pid in live)
+    )
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "is_healthy", lambda self, **k: 31337 in live
+    )
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor,
+        "_port_listener_pids",
+        lambda self: [31337] if 31337 in live else [],
+    )
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_terminate_pid", lambda self, pid, **k: live.discard(pid)
+    )
+
+    sup = ps.PhoenixSupervisor()
+    sup._root_path_override = None
+
+    assert sup.start(wait_for_health=False) is True
+    # Legacy Phoenix reaped.
+    assert 31337 not in live
+    # Legacy store migrated to the private host-data directory (history kept).
+    assert not legacy.exists()
+    assert sup.working_dir == (home / "host-data" / "phoenix").resolve()
+    assert (sup.working_dir / "phoenix.db").read_text() == "legacy-history"
+    # A fresh private-store child was spawned, not the legacy Phoenix adopted.
+    assert len(_StubPopen.instances) == 1
+    assert sup._adopted_pid is None
+    assert sup.pid_file.read_text() == "4321"
+
+
+def test_repeat_boot_adopts_private_store_child(tmp_path, monkeypatch):
+    """Acceptance (#2690): the repeat boot (legacy already gone, a healthy
+    private-store child on the port) ADOPTS the private-store child."""
+    _StubPopen.instances.clear()
+    home = tmp_path / "kestrel-home"
+    home.mkdir()
+    monkeypatch.setenv("KESTREL_HOME", str(home))
+    monkeypatch.delenv(ps.PHOENIX_WORKING_DIR_ENV, raising=False)
+    monkeypatch.setattr(ps, "phoenix_enabled", lambda: True)
+    monkeypatch.setattr(ps, "supports_host_root_path", lambda: True)
+    monkeypatch.setattr(ps.subprocess, "Popen", _StubPopen)
+
+    sup = ps.PhoenixSupervisor()  # default resolver, no legacy store present
+    sup._root_path_override = None
+    sup.working_dir.mkdir(parents=True, exist_ok=True)
+    sup.pid_file.write_text("8080")  # private-store child from the prior boot
+
+    monkeypatch.setattr(ps.PhoenixSupervisor, "is_healthy", lambda self, **k: True)
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_port_listener_pids", lambda self: [8080]
+    )
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_pid_alive", staticmethod(lambda pid: pid == 8080)
+    )
+
+    assert sup.start(wait_for_health=False) is True
+    assert _StubPopen.instances == []  # adopted, not spawned
+    assert sup._adopted_pid == 8080
+    assert sup.pid_file.read_text() == "8080"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX PID contract")
+def test_adopt_or_reap_never_adopts_legacy_store_phoenix(tmp_path, monkeypatch):
+    """Backstop: even reached directly, adopt-or-reap reaps (never adopts) a
+    Phoenix whose PID matches the legacy pidfile (#2690)."""
+    _legacy_home(tmp_path, monkeypatch, legacy_pid=42042)
+    monkeypatch.setattr(ps.PhoenixSupervisor, "is_healthy", lambda self, **k: True)
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_port_listener_pids", lambda self: [42042]
+    )
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_pid_alive", staticmethod(lambda pid: pid == 42042)
+    )
+    reaped: list = []
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_terminate_pid", lambda self, pid, **k: reaped.append(pid)
+    )
+
+    sup = ps.PhoenixSupervisor()
+    sup.working_dir.mkdir(parents=True, exist_ok=True)
+    adopted = sup._adopt_or_reap()
+    assert adopted is False  # not adopted → caller spawns a private-store child
+    assert reaped == [42042]
+    assert sup._adopted_pid is None
+
+
+def test_adopt_or_reap_reaps_unknown_listener_after_legacy_migrated(
+    tmp_path, monkeypatch,
+):
+    """P1 (#2690): once the legacy store has migrated away, ``reconcile`` no-ops
+    and adopt-or-reap is the sole custody gate. A healthy listener whose PID does
+    NOT match the private pidfile is an UNKNOWN squatter — reap it and spawn a
+    fresh private child, never mislabel it as private and later stop it."""
+    home = tmp_path / "kestrel-home"
+    home.mkdir()  # NO legacy store present (already migrated on a prior boot)
+    monkeypatch.setenv("KESTREL_HOME", str(home))
+    monkeypatch.delenv(ps.PHOENIX_WORKING_DIR_ENV, raising=False)
+    monkeypatch.setattr(ps.PhoenixSupervisor, "is_healthy", lambda self, **k: True)
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_port_listener_pids", lambda self: [4444]
+    )
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_pid_alive", staticmethod(lambda pid: pid == 4444)
+    )
+    reaped: list = []
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_terminate_pid", lambda self, pid, **k: reaped.append(pid)
+    )
+
+    sup = ps.PhoenixSupervisor()  # default resolver, no legacy, no private pidfile
+    sup.working_dir.mkdir(parents=True, exist_ok=True)
+
+    # reconcile is a no-op (no legacy store) — the port owner is unknown.
+    sup.reconcile_storage_conflict()
+    assert reaped == []
+
+    assert sup._adopt_or_reap() is False  # not adopted → caller spawns fresh
+    assert reaped == [4444]  # the unknown squatter reaped instead of adopted
+    assert sup._adopted_pid is None
+    assert not sup.pid_file.exists()
+
+
+def test_adopt_or_reap_fails_closed_when_owner_unidentifiable(tmp_path, monkeypatch):
+    """P1/P2 (#2690): the port is healthy but no owning PID can be identified
+    (no psutil/lsof, or another user's process). Custody fails CLOSED — a pidfile
+    PID is never treated as proof of ownership, so the unverifiable store is not
+    adopted."""
+    monkeypatch.setattr(ps.PhoenixSupervisor, "is_healthy", lambda self, **k: True)
+    monkeypatch.setattr(ps.PhoenixSupervisor, "_port_listener_pids", lambda self: [])
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_pid_alive", staticmethod(lambda pid: bool(pid))
+    )
+
+    sup = ps.PhoenixSupervisor(working_dir=tmp_path / "phx", port=6006)
+    sup.working_dir.mkdir(parents=True, exist_ok=True)
+    sup.pid_file.write_text("7777")  # a live pidfile PID is NOT proof of ownership
+
+    with pytest.raises(ps.PhoenixStorageError, match="cannot be identified"):
+        sup._adopt_or_reap()
+
+
+def test_port_listener_pids_uses_process_manager_not_pidfile(tmp_path, monkeypatch):
+    """P2 (#2690): listener discovery goes through the cross-platform
+    ``ProcessManager.find_pids_on_port`` (psutil → netstat/lsof) and NEVER
+    substitutes a pidfile PID as proof of port ownership."""
+    from kestrel_sovereign.multi_agent.process_manager import ProcessManager
+
+    sup = ps.PhoenixSupervisor(working_dir=tmp_path / "phx", port=6006)
+    sup.working_dir.mkdir(parents=True, exist_ok=True)
+    sup.pid_file.write_text("9999")  # a live pidfile PID that does NOT own the port
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_pid_alive", staticmethod(lambda pid: True)
+    )
+
+    # No process actually listening on the port → nothing returned (the pidfile
+    # PID is NOT used as a fallback, as the pre-fix code did).
+    monkeypatch.setattr(
+        ProcessManager, "find_pids_on_port", staticmethod(lambda port: [])
+    )
+    assert sup._port_listener_pids() == []
+
+    # When ProcessManager finds a real listener for our port, it IS returned.
+    seen: list = []
+
+    def _find(port):
+        seen.append(port)
+        return [1234]
+
+    monkeypatch.setattr(ProcessManager, "find_pids_on_port", staticmethod(_find))
+    assert sup._port_listener_pids() == [1234]
+    assert seen == [6006]  # queried our configured Phoenix port
+
+
+def test_reconcile_fails_closed_when_owner_unidentifiable(tmp_path, monkeypatch):
+    """P2 (#2690): a legacy store is present and the port is healthy, but no
+    listener PID can be identified. Reconcile fails CLOSED rather than letting the
+    migration proceed and adopt-or-reap adopt an unidentifiable listener."""
+    _legacy_home(tmp_path, monkeypatch, legacy_pid=None)
+    monkeypatch.setattr(ps.PhoenixSupervisor, "is_healthy", lambda self, **k: True)
+    monkeypatch.setattr(ps.PhoenixSupervisor, "_port_listener_pids", lambda self: [])
+    reaped: list = []
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_terminate_pid", lambda self, pid, **k: reaped.append(pid)
+    )
+
+    with pytest.raises(ps.PhoenixStorageError, match="cannot be identified"):
+        ps.PhoenixSupervisor().reconcile_storage_conflict()
+    assert reaped == []  # nothing reaped — the legacy store is left untouched
 
 
 # ---------------------------------------------------------------------------
@@ -871,6 +1194,7 @@ def _client_with_state(phoenix_state, monkeypatch):
     monkeypatch.setattr(app.state, "agent_manager", None, raising=False)
     monkeypatch.setattr(app.state, "startup_error", None, raising=False)
     monkeypatch.setattr(app.state, "phoenix", phoenix_state, raising=False)
+    monkeypatch.setattr(app.state, "phoenix_disabled_reason", None, raising=False)
     return app
 
 
@@ -1005,3 +1329,185 @@ def test_mint_then_proxy_with_embed_cookie(tmp_path, monkeypatch):
         r = client.get("/phoenix/")
         assert r.status_code == 200
         assert b"phoenix-ui" in r.content
+
+
+# ---------------------------------------------------------------------------
+# Tracing status surfaced on /health/detailed (#2690)
+# ---------------------------------------------------------------------------
+
+
+def test_health_detailed_surfaces_tracing_disabled_reason(monkeypatch):
+    """A supervision-setup failure records app.state.phoenix_disabled_reason,
+    which the authenticated /health/detailed surfaces so an off boot is not
+    silent (#2690)."""
+    monkeypatch.setenv("KESTREL_API_KEY", "test-key-123")
+    app = _client_with_state(None, monkeypatch)  # tracing disabled
+    monkeypatch.setattr(
+        app.state,
+        "phoenix_disabled_reason",
+        "private trace-store custody could not be established: legacy store live",
+        raising=False,
+    )
+    with TestClient(app) as client:
+        r = client.get("/health/detailed", headers={"X-API-Key": "test-key-123"})
+    assert r.status_code == 200
+    tracing = r.json()["tracing"]
+    assert tracing["enabled"] is False
+    assert tracing["reachable"] is False
+    assert "custody could not be established" in tracing["disabled_reason"]
+
+
+def test_health_detailed_reports_tracing_enabled_when_reachable(tmp_path, monkeypatch):
+    """A tracked supervisor whose Phoenix answers the port reports
+    enabled + reachable with no disabled reason (#2690)."""
+    monkeypatch.setenv("KESTREL_API_KEY", "test-key-123")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200)
+
+    sup = _running_supervisor(
+        tmp_path, root_path="/phoenix", transport=httpx.MockTransport(handler)
+    )
+    app = _client_with_state(sup, monkeypatch)
+    with TestClient(app) as client:
+        r = client.get("/health/detailed", headers={"X-API-Key": "test-key-123"})
+    assert r.status_code == 200
+    tracing = r.json()["tracing"]
+    assert tracing["enabled"] is True
+    assert tracing["reachable"] is True
+    assert tracing["disabled_reason"] is None
+
+
+def test_health_detailed_clears_stale_reason_when_reachable(tmp_path, monkeypatch):
+    """A disabled_reason left by a transient startup stall is cleared once
+    Phoenix answers the port again — health reflects live state (#2690)."""
+    monkeypatch.setenv("KESTREL_API_KEY", "test-key-123")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200)
+
+    sup = _running_supervisor(
+        tmp_path, root_path="/phoenix", transport=httpx.MockTransport(handler)
+    )
+    app = _client_with_state(sup, monkeypatch)
+    monkeypatch.setattr(
+        app.state,
+        "phoenix_disabled_reason",
+        "Phoenix did not become reachable within 180s",
+        raising=False,
+    )
+    with TestClient(app) as client:
+        r = client.get("/health/detailed", headers={"X-API-Key": "test-key-123"})
+    assert r.status_code == 200
+    tracing = r.json()["tracing"]
+    assert tracing["reachable"] is True
+    assert tracing["disabled_reason"] is None
+    # app.state was actually reconciled, not just the response body.
+    assert getattr(app.state, "phoenix_disabled_reason") is None
+
+
+# ---------------------------------------------------------------------------
+# Background startup failures are not silent in health (#2690)
+# ---------------------------------------------------------------------------
+
+
+def _fake_app_state():
+    import types
+
+    return types.SimpleNamespace(
+        state=types.SimpleNamespace(phoenix=object(), phoenix_disabled_reason=None)
+    )
+
+
+@pytest.mark.asyncio
+async def test_background_startup_surfaces_start_false(monkeypatch):
+    """P3 (#2690): a terminal ``start() -> False`` (custody / port ownership /
+    spawn failure) records a disabled reason so /health/detailed is not silent."""
+    from kestrel_sovereign import server as srv
+
+    app = _fake_app_state()
+
+    class _Sup:
+        def start(self, *, wait_for_health=True):
+            return False
+
+    await srv._supervise_phoenix_startup(app, _Sup())
+
+    assert app.state.phoenix_disabled_reason is not None
+    assert "start failed" in app.state.phoenix_disabled_reason
+    # Supervisor reference retained so a slow child can recover / shutdown reaps it.
+    assert app.state.phoenix is not None
+
+
+@pytest.mark.asyncio
+async def test_background_startup_surfaces_task_exception(monkeypatch):
+    """P3 (#2690): an unexpected error in the background supervisor records a
+    disabled reason rather than only logging a warning."""
+    from kestrel_sovereign import server as srv
+
+    app = _fake_app_state()
+
+    class _Sup:
+        def start(self, *, wait_for_health=True):
+            raise RuntimeError("boom")
+
+    await srv._supervise_phoenix_startup(app, _Sup())
+
+    assert app.state.phoenix_disabled_reason is not None
+    assert "boom" in app.state.phoenix_disabled_reason
+
+
+@pytest.mark.asyncio
+async def test_background_startup_surfaces_budget_expiry(monkeypatch):
+    """P3 (#2690): when the retry budget expires without Phoenix ever becoming
+    reachable, a disabled reason is recorded (was only a WARNING before)."""
+    from kestrel_sovereign import server as srv
+
+    monkeypatch.setattr(srv, "_PHOENIX_STARTUP_BUDGET_SECONDS", 0.0)
+    app = _fake_app_state()
+
+    class _Sup:
+        def start(self, *, wait_for_health=True):
+            return True
+
+        @property
+        def running(self):
+            return True
+
+        async def is_reachable(self, timeout=2.0):
+            return False
+
+    await srv._supervise_phoenix_startup(app, _Sup())
+
+    assert app.state.phoenix_disabled_reason is not None
+    assert "did not become reachable" in app.state.phoenix_disabled_reason
+
+
+@pytest.mark.asyncio
+async def test_background_startup_clears_reason_on_recovery(monkeypatch):
+    """A slow Phoenix that becomes reachable within budget clears any earlier
+    transient disabled reason (#2690)."""
+    from kestrel_sovereign import server as srv
+
+    import types
+
+    app = types.SimpleNamespace(
+        state=types.SimpleNamespace(
+            phoenix=object(), phoenix_disabled_reason="stale from a prior stall"
+        )
+    )
+
+    class _Sup:
+        def start(self, *, wait_for_health=True):
+            return True
+
+        @property
+        def running(self):
+            return True
+
+        async def is_reachable(self, timeout=2.0):
+            return True
+
+    await srv._supervise_phoenix_startup(app, _Sup())
+
+    assert app.state.phoenix_disabled_reason is None
