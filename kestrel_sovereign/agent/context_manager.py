@@ -599,9 +599,23 @@ class ContextManager:
             and memory_result.committed
             and memory_result.is_memory_block
         ):
-            await self.memory_retriever.record_accesses(
-                memory_result.message_ids, self.agent_id
-            )
+            # Access rehearsal is non-critical bookkeeping: the memory block
+            # is already committed to the dynamic context above, so a failure
+            # here must not fail the whole build. The legacy broad
+            # memory-retrieval handler swallowed this (the ``record_accesses``
+            # await lived inside its ``try/except``); the #2523 decomposition
+            # moved the await out here, dropping that guard. Restore
+            # warn-and-continue around the bookkeeping only — retrieval, budget,
+            # and salvage failure contracts are untouched.
+            try:
+                await self.memory_retriever.record_accesses(
+                    memory_result.message_ids, self.agent_id
+                )
+            except Exception as e:
+                logger.warning(f"Memory access bookkeeping failed: {e}")
+                assembly.warnings.append(
+                    f"Memory access bookkeeping unavailable: {e}"
+                )
         finalize_section(budget, "memories")
 
         # 4. RAG documents (into dynamic user context, not system).
