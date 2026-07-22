@@ -2421,6 +2421,8 @@ class OrchestratorEngineMixin:
         request_id: Optional[str] = None,
         images: Optional[list] = None,
         invocation_context=None,
+        buffer_audit: bool = False,
+        strict_timeout_state: Optional[dict] = None,
     ):
         """
         Streaming version of _handle_orchestrator_response.
@@ -2428,6 +2430,30 @@ class OrchestratorEngineMixin:
         Executes tool calls synchronously, then streams the final LLM response.
         Tool execution cannot be streamed (we need complete results), but the
         final text response streams token-by-token.
+
+        ``buffer_audit`` (#2674 finding 1): True when an enforcing (strict /
+        fail-closed) POST_RESPONSE audit is withholding this turn's visible
+        output pending the verdict. The outer streaming loop suppresses the
+        BYTES this generator yields, but a follow-up ``ToolCallStarted`` in a
+        multi-tool continuation ALSO fires an out-of-band ``revising`` SSE event
+        on the parallel notifications channel — which the outer loop cannot
+        retract. Under buffering we therefore suppress BOTH that SSE event and
+        the in-band revise sentinel here, exactly as the first-level handler in
+        ``agent/streaming.py`` does: the strict client never received the
+        pre-tool prose (nothing to retract), and both signals carry
+        response-derived tool id/name the audit has not yet approved. Warn /
+        no-audit turns (``buffer_audit`` False) keep emitting both unchanged.
+
+        ``strict_timeout_state`` (#2674 finding 2): a per-turn mutable dict the
+        outer buffered loop passes in so a continuation TIMEOUT under an
+        enforcing audit can be signalled without a sentinel. In advisory mode a
+        follow-up-LLM timeout renders as an ``❌`` error tool card (a tool
+        sentinel). Under ``buffer_audit`` the buffering gate STRIPS that sentinel,
+        so the audit would see empty text, persist empty content, and the client
+        would get a silent empty 200. Instead we set ``timed_out`` here and emit
+        NO sentinel / protected text; the outer loop discards the withheld
+        continuation and substitutes a deterministic safe block that is audited,
+        persisted, and released like any other buffered turn.
 
         Yields:
             Text chunks as they arrive from the LLM
@@ -2690,12 +2716,22 @@ class OrchestratorEngineMixin:
                             # bubble. Without this, a follow-up tool
                             # call's pre-tool prose stays on screen
                             # unverified (codex P1 on PR #1346).
-                            await self._emit_revising_event(
-                                item,
-                                session_id=session_id,
-                                request_id=request_id,
-                            )
-                            yield _build_revise_sentinel(item)
+                            #
+                            # #2674 finding 1: suppress BOTH signals under an
+                            # enforcing (buffered) audit. The out-of-band SSE
+                            # event rides the parallel notifications channel
+                            # OUTSIDE the buffered chat stream, so firing it would
+                            # leak unaudited (possibly-to-be-denied) tool metadata
+                            # past the fail-closed gate; the outer loop can
+                            # suppress the yielded sentinel bytes but never the
+                            # already-delivered SSE event.
+                            if not buffer_audit:
+                                await self._emit_revising_event(
+                                    item,
+                                    session_id=session_id,
+                                    request_id=request_id,
+                                )
+                                yield _build_revise_sentinel(item)
                         elif isinstance(item, LLMResponse):
                             response = item
             except TimeoutError:
@@ -2717,6 +2753,19 @@ class OrchestratorEngineMixin:
                 _timeout_detail = (
                     f"timeout after {int(_call_timeout)}s"
                 )
+                if buffer_audit:
+                    # #2674 finding 2: strict / fail-closed audit. The tool
+                    # sentinel below is stripped by the buffering gate, so
+                    # emitting it (and appending the tool_event, which the
+                    # buffered persist drops anyway) would leave the audit with
+                    # empty text → empty persisted content → a silent empty 200.
+                    # Signal the outer loop instead so it replaces the withheld
+                    # continuation with a deterministic safe block. Emit NO
+                    # sentinel, NO tool_event, and — critically — NO protected /
+                    # partial text or raw error detail here.
+                    if strict_timeout_state is not None:
+                        strict_timeout_state['timed_out'] = True
+                    return
                 if tool_events is not None:
                     tool_events.append({
                         'type': 'error', 'tool': 'llm', 'error': _timeout_detail,

@@ -21,12 +21,29 @@ from kestrel_sovereign.logging_config import correlation_id_var, session_id_var
 
 @dataclass(frozen=True, slots=True)
 class LLMInvocationContext:
-    """Correlation identity captured once for one logical LLM invocation."""
+    """Correlation identity captured once for one logical LLM invocation.
+
+    ``redact_content`` (#2674 finding 3) is a per-invocation, immutable
+    content-redaction flag threaded through this same boundary. When an
+    *enforcing* (strict / fail-closed) POST_RESPONSE audit governs the turn,
+    the assistant prose is withheld from the user until the audit verdict —
+    but the raw provider prompt/response would otherwise land in durable
+    ``llm_calls`` telemetry (``user_prompt`` / ``response_preview``) and the
+    OpenTelemetry LLM span (``input.value`` / ``output.value``) BEFORE that
+    verdict, surviving even a DENY. The audit's own provider call is the same
+    hazard: its ``user_prompt`` IS the withheld assistant prose. Setting this
+    on the frozen context for those calls makes the telemetry sinks blank the
+    prompt/response content while preserving every content-free field (usage,
+    timing, provider, model, error classification). It rides the frozen
+    context — never global/ambient state — so a concurrent or background LLM
+    call on the same service is unaffected.
+    """
 
     session_id: Optional[str] = None
     companion_id: Optional[str] = None
     user_id: Optional[str] = None
     correlation_id: Optional[str] = None
+    redact_content: bool = False
 
 
 _EMPTY_INVOCATION_CONTEXT = LLMInvocationContext()
@@ -209,4 +226,8 @@ def resolve_invocation_context(
             ambient.correlation_id,
             correlation_id_var.get(),
         ),
+        # #2674 finding 3: redaction is a fail-safe flag — OR it across the
+        # merged sources so a resolve step can never silently drop a caller's
+        # request to withhold prompt/response content from telemetry.
+        redact_content=bool(explicit.redact_content or ambient.redact_content),
     )

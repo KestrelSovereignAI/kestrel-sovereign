@@ -15,6 +15,7 @@ import asyncio
 import inspect
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import replace
 from kestrel_sovereign.kestrel_config.constants import STORAGE_CACHE_TTL_SECONDS
 from typing import Awaitable, Callable, List, Dict, Any, Optional, Union, Type, TYPE_CHECKING
 
@@ -96,6 +97,81 @@ async def _wait_for_close_result(result: Any) -> None:
     """Await asynchronous close results while accepting synchronous close APIs."""
     if inspect.isawaitable(result):
         await asyncio.wait_for(asyncio.shield(result), timeout=CLIENT_CLOSE_TIMEOUT)
+
+
+def _redacted_content_marker(text: Any) -> str:
+    """Length-tagged placeholder for prompt/response text withheld from
+    telemetry under an enforcing response audit (#2674 finding 3).
+
+    Keeps a content-FREE size hint (useful for spotting truncation / empty
+    turns) without exposing a single character of the withheld prose. Used for
+    both durable ``llm_calls`` columns and the OpenTelemetry LLM span values so
+    the two sinks redact identically.
+    """
+    try:
+        n = len(text) if text is not None else 0
+    except TypeError:
+        n = 0
+    return f"[redacted: {n} chars withheld pending response audit]"
+
+
+def _redact_tool_calls_content(
+    tool_calls: Optional[List[Dict[str, Any]]],
+) -> Optional[List[Dict[str, Any]]]:
+    """Blank model-generated tool-call ARGUMENTS for durable telemetry (#2674 finding 4).
+
+    ``tool_calls`` is response-derived model output whose ``arguments`` can echo
+    the withheld assistant prose. Under an enforcing response audit the durable
+    ``llm_calls`` row must not carry that raw content before (or, on a DENY, ever
+    after) the verdict. Keep each call's ``name`` — a safe classification of which
+    tools the model invoked — and replace ``arguments`` with a content-free
+    marker; drop no entries so the count/shape stays intact. ``None`` / empty
+    passes through unchanged.
+    """
+    if not tool_calls:
+        return tool_calls
+    redacted: List[Dict[str, Any]] = []
+    for call in tool_calls:
+        if isinstance(call, dict):
+            safe = {k: v for k, v in call.items() if k not in ("arguments", "input")}
+            if "arguments" in call:
+                safe["arguments"] = _redacted_content_marker(call.get("arguments"))
+            if "input" in call:
+                safe["input"] = _redacted_content_marker(call.get("input"))
+            redacted.append(safe)
+        else:
+            redacted.append({"arguments": _redacted_content_marker(call)})
+    return redacted
+
+
+def _safe_error_label(error: Any) -> str:
+    """Content-free label for an exception: its class name (#2674 finding 4).
+
+    Provider/adapter exception *messages* routinely embed the prompt or the
+    response body, so under an enforcing audit only the exception *class* — a
+    safe category the operator can still triage on — may reach durable telemetry
+    or an exported span. A plain string (no ``__class__`` beyond ``str``) yields
+    ``"str"``; ``None`` yields ``""``.
+    """
+    if error is None:
+        return ""
+    if isinstance(error, BaseException):
+        return type(error).__name__
+    return type(error).__name__
+
+
+def _redact_error_content(error_message: Optional[str]) -> Optional[str]:
+    """Reduce a stored ``error_message`` string to a content-free class marker.
+
+    The failure paths pass ``str(error)`` as ``error_message`` (already a string
+    by the time it reaches ``_log_llm_call``), so the original class is gone; tag
+    it as redacted with its length so truncation/empty is still visible without
+    exposing a character of the possibly prompt/response-bearing text. ``None``
+    passes through so a successful call still records no error.
+    """
+    if error_message is None:
+        return None
+    return f"[redacted error: {len(error_message)} chars withheld pending response audit]"
 
 
 def _client_timeout_seconds(timeout: Any) -> Optional[float]:
@@ -573,12 +649,17 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             return result.content
         return result if isinstance(result, str) else str(result)
 
-    def _annotate_and_return(self, span, result: Any) -> Any:
+    def _annotate_and_return(self, span, result: Any, *, redact: bool = False) -> Any:
         """Stamp the served model / response onto ``span`` and pass ``result`` through.
 
         The served route/model (post-fallback) is only known once the call
         returns; it is read from the just-stamped response identity. Guarded so
         annotation can never alter the value returned to the caller.
+
+        ``redact`` (#2674 finding 3): under an enforcing response audit the
+        assistant prose is withheld pending the verdict, so ``output.value``
+        must carry a content-free marker instead of the real response — while
+        the content-free token attributes (from ``response``) are preserved.
         """
         try:
             if span is not None and span.is_recording():
@@ -587,9 +668,14 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                     served_model = (self.get_last_response_identity() or {}).get("model")
                 except Exception:  # noqa: BLE001 - identity read is best-effort
                     served_model = None
+                output_text = (
+                    _redacted_content_marker(self._llm_span_output_text(result))
+                    if redact
+                    else self._llm_span_output_text(result)
+                )
                 telemetry.annotate_llm_response_span(
                     span,
-                    output_text=self._llm_span_output_text(result),
+                    output_text=output_text,
                     model_name=served_model,
                     response=result if isinstance(result, LLMResponse) else None,
                 )
@@ -606,8 +692,13 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         user_prompt: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
         model_override: Optional[str] = None,
+        redact: bool = False,
     ):
         """Open the single OpenInference LLM span for one public entry call.
+
+        ``redact`` (#2674 finding 3): under an enforcing response audit the
+        prompt content is withheld pending the verdict, so ``input.value``
+        carries a content-free marker instead of the serialized prompt/messages.
 
         Centralizes the cheap tracing guard + prompt serialization + span open
         shared by every public completion entry (``get_response``,
@@ -619,15 +710,20 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         skipped entirely when no exporter is configured, so an unset OTLP
         endpoint costs only the guard.
         """
-        span_input = (
-            telemetry.serialize_llm_input(
+        if not telemetry.llm_tracing_enabled():
+            span_input = None
+        elif redact:
+            # #2674 finding 3: contentless input marker — never serialize the
+            # withheld prompt into the exported span.
+            span_input = _redacted_content_marker(
+                user_prompt if user_prompt is not None else (messages or "")
+            )
+        else:
+            span_input = telemetry.serialize_llm_input(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 messages=messages,
             )
-            if telemetry.llm_tracing_enabled()
-            else None
-        )
         with telemetry.llm_span(
             f"llm.{method}",
             input_value=span_input,
@@ -3268,6 +3364,12 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             correlation_id=(
                 resolved.correlation_id or session_context.correlation_id
             ),
+            # #2674 finding 3: preserve the content-redaction flag across the
+            # cross-task session merge — dropping it here would re-expose the
+            # withheld prompt/response in telemetry on the #2569 recovery path.
+            redact_content=bool(
+                resolved.redact_content or session_context.redact_content
+            ),
         )
 
     @staticmethod
@@ -3627,7 +3729,39 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             if invocation_context is not None
             else self._resolve_invocation_context()
         )
+        # #2674 finding 3: under an enforcing (strict) response audit the turn's
+        # assistant prose is WITHHELD from the user pending the verdict, so its
+        # raw prompt/response must not land in DURABLE ``llm_calls`` telemetry
+        # before (or, on a DENY, ever after) that verdict. Blank the two
+        # content columns to a length-tagged marker while preserving every
+        # content-free field — usage, timing, provider, model, cost, error. The
+        # audit provider call carries the same flag because its ``user_prompt``
+        # IS the withheld prose. Advisory / no-audit turns leave this False and
+        # keep the full preview unchanged.
         record_metadata = dict(metadata or {})
+        if getattr(context, "redact_content", False):
+            if user_prompt is not None:
+                user_prompt = _redacted_content_marker(user_prompt)
+            if response is not None:
+                response = _redacted_content_marker(response)
+            # #2674 finding 4: ``tool_calls`` and ``error_message`` are the two
+            # remaining content-bearing columns on the same durable ``llm_calls``
+            # row. ``tool_calls`` is RESPONSE-DERIVED model output — the model's
+            # own tool arguments, which can echo the withheld prose verbatim — so
+            # under an enforcing audit they must not persist raw before (or, on a
+            # DENY, ever after) the verdict. ``error_message`` is ``str(error)``,
+            # and provider/adapter exceptions routinely embed the prompt or the
+            # response body (the endpoint-leak reproductions prove they are
+            # untrusted). Redact BOTH: keep each tool's NAME (a safe classification
+            # of which tools ran) but blank its arguments, and reduce the error to
+            # its exception class/category. Every content-free field — usage,
+            # timing, provider, model, cost — is preserved untouched. This is
+            # provider RESPONSE telemetry (the ``llm_calls`` row); the separate
+            # operator tool-DISPATCH audit (``log_tool_call``) records that a tool
+            # actually executed and is a distinct trust boundary left intact.
+            tool_calls = _redact_tool_calls_content(tool_calls)
+            error_message = _redact_error_content(error_message)
+            record_metadata.setdefault("content_redacted", True)
         if context.correlation_id:
             record_metadata.setdefault("correlation_id", context.correlation_id)
         if cost is not None:
@@ -3990,10 +4124,24 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         self,
         text_to_audit: str,
         invocation_context: Optional[LLMInvocationContext] = None,
+        *,
+        redact_content: bool = False,
     ) -> Dict[str, Any]:
-        """Get a structured audit response from the normal provider chain."""
+        """Get a structured audit response from the normal provider chain.
+
+        ``redact_content`` (#2674 finding 3): the audit's provider call carries
+        the assistant prose as its ``user_prompt`` — under an *enforcing*
+        (strict) audit that prose is being WITHHELD from the user pending this
+        very verdict, so its own provider telemetry must not durably record it.
+        The ResponseAuditHook passes ``redact_content=self.fail_closed`` so the
+        strict path redacts and the advisory path is unchanged. Threaded on the
+        frozen per-call context — never global state — so a concurrent call is
+        unaffected.
+        """
         self._check_policy()
         invocation_context = self._resolve_invocation_context(invocation_context)
+        if redact_content and not invocation_context.redact_content:
+            invocation_context = replace(invocation_context, redact_content=True)
         if not self.providers:
             return {"risk_level": 1, "reasoning": "Audit skipped - no providers available.", "audited": False}
 
@@ -4202,11 +4350,13 @@ No other text or formatting.
 
         self._check_policy()
         frozen_context = self._resolve_invocation_context(invocation_context)
+        _redact = frozen_context.redact_content
         with self._llm_request_span(
             "get_response",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             model_override=model_override,
+            redact=_redact,
         ) as span:
             result = await self._get_response_frozen(
                 system_prompt=system_prompt,
@@ -4219,7 +4369,7 @@ No other text or formatting.
                 cancel_token=cancel_token,
                 invocation_context=frozen_context,
             )
-            return self._annotate_and_return(span, result)
+            return self._annotate_and_return(span, result, redact=_redact)
 
     async def _get_response_frozen(
         self,
@@ -4333,7 +4483,16 @@ No other text or formatting.
                 errors[provider['name']] = e
                 # Record the failed attempt as an event on the one
                 # logical-request span (opened by the public entry method).
-                telemetry.record_llm_attempt_failure(provider["name"], e)
+                # #2674 finding 4: thread the per-invocation redaction flag so an
+                # enforcing-audit turn records only the exception class, never the
+                # raw provider error text (which can embed the withheld prompt /
+                # response body). Bound to THIS context, never global state.
+                telemetry.record_llm_attempt_failure(
+                    provider["name"], e,
+                    redact_content=getattr(
+                        invocation_context, "redact_content", False
+                    ),
+                )
 
                 if self._configured_routes_exhausted(
                     available_providers, provider_index, configured_vendors
@@ -4402,11 +4561,13 @@ No other text or formatting.
             logger.info(f"Getting response from model: {model_id}")
             messages = messages_for(provider_for_model["adapter"], user_prompt=user_prompt, system_prompt=system_prompt)
 
+            _redact = invocation_context.redact_content
             with self._llm_request_span(
                 "get_response_with_model",
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 model_override=model_id,
+                redact=_redact,
             ) as span:
                 response = await self._run_provider_attempt(
                     provider_for_model["adapter"].get_response(
@@ -4423,7 +4584,7 @@ No other text or formatting.
                     user_prompt=user_prompt,
                 )
                 logger.info(f"Success from {model_id}")
-                return self._annotate_and_return(span, response)
+                return self._annotate_and_return(span, response, redact=_redact)
 
         except (openai.APIError, openai.APIConnectionError, openai.RateLimitError, openai.AuthenticationError) as e:
             logger.error(f"Model {model_id} API error: {e}", exc_info=True)
@@ -4542,11 +4703,13 @@ No other text or formatting.
         """
         self._check_policy()
         invocation_context = self._resolve_invocation_context(invocation_context)
+        _redact = invocation_context.redact_content
         with self._llm_request_span(
             "generate",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             model_override=model_override,
+            redact=_redact,
         ) as span:
             # Try remote GPU first when active AND routing isn't pinned.
             # A persisted mandate or vendor-prefixed model_override must
@@ -4581,10 +4744,10 @@ No other text or formatting.
                         force_local_only=force_local_only,
                     )
                     if tools is not None or response_format is not None:
-                        return self._annotate_and_return(span, response)
+                        return self._annotate_and_return(span, response, redact=_redact)
                     if isinstance(response, LLMResponse):
-                        return self._annotate_and_return(span, response.content or "")
-                    return self._annotate_and_return(span, response)
+                        return self._annotate_and_return(span, response.content or "", redact=_redact)
+                    return self._annotate_and_return(span, response, redact=_redact)
                 except (openai.APIError, openai.APIConnectionError, openai.RateLimitError, openai.AuthenticationError) as exc:
                     self._last_remote_error = str(exc)
                     logger.warning(f"Remote GPU API error: {exc}, falling back to providers", exc_info=True)
@@ -4614,7 +4777,7 @@ No other text or formatting.
                 cancel_token=cancel_token,
                 invocation_context=invocation_context,
             )
-            return self._annotate_and_return(span, result)
+            return self._annotate_and_return(span, result, redact=_redact)
 
     async def generate_with_messages(
         self,
@@ -4656,6 +4819,7 @@ No other text or formatting.
             "generate_with_messages",
             messages=messages,
             model_override=model_override,
+            redact=invocation_context.redact_content,
         ) as span:
             return await self._generate_with_messages_inner(
                 span,
@@ -4694,6 +4858,10 @@ No other text or formatting.
         (:func:`telemetry.record_llm_attempt_failure`), and each successful
         return is annotated with the served model + response text.
         """
+        # #2674 finding 3: content-redaction rides the frozen context; blank the
+        # span's output.value under an enforcing audit (input.value was already
+        # blanked when the span opened).
+        _redact = invocation_context.redact_content
         # Try remote GPU first when active AND routing isn't pinned — #734.
         if (
             self._backend == BackendType.REMOTE_GPU
@@ -4722,10 +4890,10 @@ No other text or formatting.
                     force_local_only=force_local_only,
                 )
                 if tools is not None or response_format is not None:
-                    return self._annotate_and_return(span, response)
+                    return self._annotate_and_return(span, response, redact=_redact)
                 if isinstance(response, LLMResponse):
-                    return self._annotate_and_return(span, response.content or "")
-                return self._annotate_and_return(span, response)
+                    return self._annotate_and_return(span, response.content or "", redact=_redact)
+                return self._annotate_and_return(span, response, redact=_redact)
             except (openai.APIError, openai.APIConnectionError, openai.RateLimitError, openai.AuthenticationError) as exc:
                 self._last_remote_error = str(exc)
                 logger.warning(f"Remote GPU API error: {exc}, falling back", exc_info=True)
@@ -4894,10 +5062,10 @@ No other text or formatting.
                     force_local_only=force_local_only,
                 )
                 if tools is not None or response_format is not None:
-                    return self._annotate_and_return(span, response)
+                    return self._annotate_and_return(span, response, redact=_redact)
                 if isinstance(response, LLMResponse):
-                    return self._annotate_and_return(span, response.content or "")
-                return self._annotate_and_return(span, response)
+                    return self._annotate_and_return(span, response.content or "", redact=_redact)
+                return self._annotate_and_return(span, response, redact=_redact)
             except openai.BadRequestError as e:
                 # 400 = request problem (context too big, bad format, etc.)
                 # Don't fall back — the request itself is broken, not the provider.

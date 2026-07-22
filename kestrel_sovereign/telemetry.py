@@ -439,7 +439,7 @@ def annotate_llm_response_span(
         logger.debug("Failed to annotate LLM span", exc_info=True)
 
 
-def record_llm_attempt_failure(provider_name, error) -> None:
+def record_llm_attempt_failure(provider_name, error, *, redact_content: bool = False) -> None:
     """Record a failed provider attempt as an event on the current LLM span.
 
     Per-provider fallback attempts are retries of ONE logical LLM request, not
@@ -447,6 +447,15 @@ def record_llm_attempt_failure(provider_name, error) -> None:
     request span (the entry method's ``llm_span``, which is the current OTel
     span here) rather than their own spans. Cheap no-op when tracing is off or
     no span is recording; never raises.
+
+    ``redact_content`` (#2674 finding 4): under an enforcing response audit the
+    turn's prompt/response is withheld pending the verdict, and a provider
+    exception's ``str()`` routinely embeds that prompt or the response body. The
+    caller threads the per-invocation context's redaction flag here (never global
+    state, so concurrent turns are isolated); when set, the event carries only the
+    exception CLASS name — a safe category the operator can still triage on —
+    instead of the raw error text. The provider name is always safe classification
+    and is preserved in both modes.
     """
     if not _OTEL_AVAILABLE:
         return
@@ -454,11 +463,15 @@ def record_llm_attempt_failure(provider_name, error) -> None:
         span = trace.get_current_span()
         if span is None or not span.is_recording():
             return
+        if redact_content:
+            error_attr = type(error).__name__ if error is not None else ""
+        else:
+            error_attr = truncate_for_span(str(error)) or ""
         span.add_event(
             "llm.attempt_failed",
             attributes={
                 "llm.provider": str(provider_name) if provider_name else "",
-                "error": truncate_for_span(str(error)) or "",
+                "error": error_attr,
             },
         )
     except Exception:  # pragma: no cover - events must never break the call

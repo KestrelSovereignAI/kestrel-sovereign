@@ -375,6 +375,25 @@ async def stream_agent_response(request: Request):
             effective_session_id = session_id  # fall back; never block the stream
 
         async def generate():
+            # Shared stop notice for the in-loop cancel check AND the post-loop
+            # fallback (#2674). A strict (fail-closed) response audit that is
+            # stopped before dispatch WITHHOLDS every chunk and returns cleanly,
+            # so the generator is empty and the in-loop check below never runs —
+            # without the post-loop emit the client would get a silent, empty 200
+            # instead of the standard "Request stopped" body.
+            stop_notice = (
+                "\n\n---\n⏹️ **Request stopped**\n\n"
+                "Type `!continue` to resume from where I left off, or start a new message."
+            )
+            stop_notice_emitted = False
+            # #2674 P2: track whether the turn ever surfaced a user-visible
+            # response chunk. The post-loop fallback below must fire ONLY for a
+            # genuinely empty stream (strict cancel-before-dispatch withholds
+            # every chunk). If any chunk reached the client, the response is
+            # complete — a cancellation that becomes visible AFTER the final
+            # chunk but BEFORE this async generator exits must not retroactively
+            # append "Request stopped" to an already-delivered answer.
+            response_chunk_yielded = False
             try:
                 from kestrel_sovereign.agent.streaming import strip_revise_sentinels
                 async for chunk in agent.process_input_streaming(
@@ -388,7 +407,8 @@ async def stream_agent_response(request: Request):
                 ):
                     # Check if request was cancelled
                     if agent.is_request_cancelled(request_id):
-                        yield "\n\n---\n⏹️ **Request stopped**\n\nType `!continue` to resume from where I left off, or start a new message."
+                        yield stop_notice
+                        stop_notice_emitted = True
                         break
                     # Wave 5E: strip the in-band revise sentinel before
                     # publishing to TTS subscribers — voice/TTS speaks
@@ -399,27 +419,49 @@ async def stream_agent_response(request: Request):
                     tts_chunk = strip_revise_sentinels(chunk)
                     if tts_chunk:
                         await stream_tap.publish(request_id, tts_chunk)
+                    response_chunk_yielded = True
                     yield chunk
+                # #2674: a strict-audit turn cancelled before dispatch withholds
+                # every chunk and returns cleanly, so the loop body above never
+                # ran and the in-loop notice never fired. Surface the standard
+                # stop notice once here when the request was cancelled and the
+                # stream produced NO output. Gating on ``response_chunk_yielded``
+                # closes the P2 race: a normal/incremental or strict-approved
+                # turn that already delivered its final chunk must not be labeled
+                # stopped just because cancellation landed after that chunk but
+                # before this generator exited. A break already set
+                # ``stop_notice_emitted``, so a normal in-loop cancel won't
+                # double-emit either.
+                if (
+                    not stop_notice_emitted
+                    and not response_chunk_yielded
+                    and agent.is_request_cancelled(request_id)
+                ):
+                    yield stop_notice
+                    stop_notice_emitted = True
             except Exception as e:
-                logger.error(f"Streaming error: {e}", exc_info=True)
-                # Surface the real error to the user instead of a generic
-                # "something went wrong". Especially important for mandate
-                # failures (LLMStreamingError) where the user needs to see
-                # WHICH route broke and why so they can fix it (pick a
-                # different model, refresh OAuth, etc.) — NOT silently get
-                # an answer from a fallback model.
-                from kestrel_sovereign.llm.streaming import LLMStreamingError
-                if isinstance(e, LLMStreamingError):
-                    route = e.provider or "unknown route"
-                    yield (
-                        f"\n\n---\n⚠️ **Model route `{route}` failed.**\n\n"
-                        f"Error: `{e.underlying or e}`\n\n"
-                        "No fallback response was generated — you selected this route "
-                        "explicitly. To recover, pick a different model/route from the "
-                        "dropdown, or fix the underlying issue (auth token, quota, etc.)."
-                    )
-                else:
-                    yield f"\n\n---\n⚠️ **Error generating response:** `{e}`"
+                # #2674 findings 4 & 6: log the FULL error (class + message +
+                # trace) to the operator log with the request id for triage — a
+                # separate trust boundary from the user stream.
+                logger.error(
+                    "Streaming error (request %s): %s",
+                    request_id, e, exc_info=True,
+                )
+                # #2674 findings 3 & 4: emit the user-visible error through the
+                # ONE shared safe boundary used by /api/bridge/stream too, so the
+                # two transports cannot drift. It NEVER reflects ``str(e)``,
+                # ``underlying``, or ``provider`` — an adapter that raises after
+                # yielding partial prose can carry withheld response content or an
+                # injected marker, and ``LLMStreamingError.provider`` is an
+                # unvalidated free string (finding 4: it leaked
+                # ROUTE_FIELD_UNBOUNDED_MARKER__WITHHELD_TEXT). A route failure
+                # still gets the no-blind-fallback / recovery guidance via a
+                # CONSTANT "your selected model route" label; the failing route
+                # and full error stay operator-log only.
+                from kestrel_sovereign.llm.streaming_errors import (
+                    agent_stream_error_block,
+                )
+                yield agent_stream_error_block(e)
             finally:
                 # Signal stream completion for TTS consumers
                 await stream_tap.finish(request_id)

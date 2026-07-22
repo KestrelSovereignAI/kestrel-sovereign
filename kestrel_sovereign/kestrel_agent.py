@@ -5,7 +5,7 @@ import asyncio
 import hashlib
 import inspect
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _replace_dataclass
 from datetime import datetime
 from kestrel_sovereign.storage import AsyncStorage, PrivacyEnforcingStorage
 from kestrel_sovereign.storage.privacy_wrapper import (
@@ -46,7 +46,9 @@ from kestrel_sovereign.agent.constitution import ConstitutionMixin
 from kestrel_sovereign.agent.streaming import (
     StreamingMixin,
     resolve_turn_invocation_context,
+    _snapshot_post_response_hooks,
 )
+from kestrel_sovereign.hooks.manager import _hook_is_enforcing
 from kestrel_sovereign.agent.backup import BackupMixin
 from kestrel_sovereign.agent.sleep import SleepMixin
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin, ContextStats
@@ -58,7 +60,7 @@ from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.signals import OrderedLockManager
 from kestrel_sovereign.storage.memory_system import MemorySystem
 from kestrel_sovereign.hooks import HooksManager, evaluate_blocking_decision
-from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
+from kestrel_sdk.hooks.base import HookEvent, HookInput
 from kestrel_sovereign.bootstrap import BootstrapService, BootstrapState
 from kestrel_sovereign.security.input_guardrails import (
     wrap_user_input,
@@ -3839,6 +3841,37 @@ Expected Duration: {expected_duration}
         # Prompt injection detection (log-only, does not block)
         check_prompt_injection(user_input)
 
+        # #2674 finding 2: snapshot the enabled POST_RESPONSE hook set at TRUE
+        # turn start — BEFORE USER_PROMPT_SUBMIT — the same way the streaming path
+        # does (agent/streaming.py). The completion audit below runs EXACTLY this
+        # set (pinned to its turn-start modes) via ``_fire_post_response_hook``, so
+        # a tool that registers / enables / disables a POST_RESPONSE hook mid-turn
+        # cannot change what enforces on THIS turn (the transition takes effect
+        # next turn). Capturing BEFORE USER_PROMPT_SUBMIT closes the fail-open a
+        # post-hook capture left: a USER_PROMPT hook that unregisters / disables
+        # the strict audit could otherwise turn the gate OFF for the very turn it
+        # was pinned at start of. The turn-lifecycle lock serializes turns, so
+        # nothing else mutates the registry between here and the audit. The
+        # streaming ``!continue`` / command-fall-through delegation re-enters this
+        # method and snapshots here — one snapshot per path, no double capture.
+        audit_hook_snapshot = _snapshot_post_response_hooks(self.hooks_manager)
+        # #2674 findings 4 & 5: derive the enforcing (fail-closed) flag from the
+        # SAME turn-start snapshot the completion audit runs, so the non-streaming
+        # path gates its raw side channels (durable observability preview below,
+        # the STOP hook's tool payload) exactly as the streaming ``buffer_audit``
+        # does. Independent of the eventual verdict — an enforcing audit buffers
+        # the turn whether it ends ALLOW, MODIFY, ASK, or DENY.
+        #
+        # #2674 finding 1: read the enforcement flag CAPTURED in the snapshot at
+        # true turn start (before USER_PROMPT_SUBMIT), NOT a fresh live read — the
+        # same lockstep guarantee the streaming ``buffer_audit`` relies on, so a
+        # USER_PROMPT mode flip cannot desync this gate from the pinned completion
+        # verdict. (This computation already precedes USER_PROMPT_SUBMIT, but
+        # sourcing it from the snapshot makes the invariant structural.)
+        audit_enforcing = any(
+            enforcing for _h, _mode, enforcing in audit_hook_snapshot
+        )
+
         # Fire USER_PROMPT_SUBMIT hook
         if self.hooks_manager:
             hook_input = HookInput(
@@ -4156,6 +4189,17 @@ Expected Duration: {expected_duration}
         resolved_context = resolve_turn_invocation_context(
             self.llm_service, invocation_context, session_id
         )
+        # #2674 finding 3: under an enforcing (fail-closed) POST_RESPONSE audit
+        # the assistant prose is withheld pending the verdict, so the main
+        # provider call's raw prompt/response must not land in durable llm_calls
+        # telemetry or the OTel LLM span before that verdict (and, on DENY,
+        # never). Carry the content-redaction flag on the FROZEN per-turn context
+        # (never global state); it also covers the follow-up tool-synthesis calls
+        # in ``_handle_orchestrator_response`` that reuse ``resolved_context``.
+        if audit_enforcing and isinstance(resolved_context, LLMInvocationContext):
+            resolved_context = _replace_dataclass(
+                resolved_context, redact_content=True
+            )
         response = await self.llm_service.generate_with_messages(
             messages=messages,
             force_local_only=force_local_only,
@@ -4195,13 +4239,26 @@ Expected Duration: {expected_duration}
                     metadata={"arguments": tc.arguments}
                 )
         elif isinstance(response, LLMResponse) and response.content and "!" in response.content:
-            # LLM output text commands instead of using function calling
+            # LLM output text commands instead of using function calling.
+            # #2674 finding 5: ``content_preview`` copies the raw assistant
+            # response verbatim into DURABLE observability — before the
+            # POST_RESPONSE verdict exists. Under an enforcing (fail-closed) audit
+            # the whole turn is withheld pending that verdict, so writing an
+            # unaudited preview here would leak exactly what the buffer withholds
+            # (and survive even a DENY). Redact the preview to a content-free
+            # diagnostic in that mode; advisory / no-audit turns keep the preview
+            # (the operator diagnostic for "model ignored function calling").
+            content_preview = (
+                f"[redacted: {len(response.content)} chars withheld pending audit]"
+                if audit_enforcing
+                else response.content[:200]
+            )
             await self.observability_store.log_error(
                 agent_name=self.did,
                 error_type="tool_calling_ignored",
                 error_message="LLM output contains '!' but no tool_calls - model may be ignoring function calling",
                 metadata={
-                    "content_preview": response.content[:200] if response.content else None,
+                    "content_preview": content_preview,
                     "model": effective_model,
                     "tools_passed": len(feature_tools) if feature_tools else 0,
                 }
@@ -4226,18 +4283,25 @@ Expected Duration: {expected_duration}
             invocation_context=resolved_context,
         )
 
-        # Fire POST_RESPONSE hooks (e.g., response audit)
-        if self.hooks_manager and self.hooks_manager.get_enabled_hooks(HookEvent.POST_RESPONSE):
-            hook_input = HookInput(
-                session_id=session_id or "",
-                hook_event_name=HookEvent.POST_RESPONSE.value,
-                response_text=response_text,
-            )
-            hook_output = await self.hooks_manager.execute_hooks(HookEvent.POST_RESPONSE, hook_input)
-            if hook_output.permission_decision == PermissionDecision.DENY:
-                response_text = f"[Response blocked by audit: {hook_output.permission_reason}]"
-            elif hook_output.updated_input and "response_text" in hook_output.updated_input:
-                response_text = hook_output.updated_input["response_text"]
+        # Fire POST_RESPONSE hooks (e.g., response audit). #2674: route through
+        # the SHARED, fail-closed ``_fire_post_response_hook`` — the same gate
+        # the streaming path uses — instead of the open-coded DENY-only check
+        # this replaced. That old check honored DENY but let ASK / provider
+        # failure / timeout fall THROUGH to the raw text (fail-OPEN): an
+        # enforcing approval hook returning ASK released unaudited output. It
+        # also read the LIVE registry at fire time, so a tool that enabled /
+        # disabled / registered a POST_RESPONSE hook mid-turn changed what
+        # enforced. ``_fire_post_response_hook`` blocks on DENY *and* ASK (via
+        # ``evaluate_blocking_decision``) and runs the turn-start
+        # ``audit_hook_snapshot`` pinned to its turn-start modes, so this path —
+        # and the streaming ``!continue`` / fall-through delegation that reaches
+        # it — obeys the identical fail-closed + snapshot contract. The returned
+        # ``_PostResponseText`` carries an explicit ``denied`` verdict the
+        # streaming command wrapper reads to decide whether to release parts.
+        response_text = await self._fire_post_response_hook(
+            response_text, session_id,
+            hook_snapshot=audit_hook_snapshot,
+        )
 
         # Store agent response (linked to session for resumed conversations)
         await self._persist_assistant_conversation(
@@ -4276,13 +4340,28 @@ Expected Duration: {expected_duration}
                 if stop_tool_results
                 else None
             )
+            # #2674 finding 4: mirror the streaming path's STOP-payload nulling.
+            # A STOP hook is an ARBITRARY subscriber (e.g. the reflection
+            # ``on_stop`` handler) that may persist or emit its HookInput. Under
+            # an enforcing (fail-closed) POST_RESPONSE audit ``tool_calls`` /
+            # ``tool_results`` carry raw, unaudited tool envelopes — ids,
+            # arguments, full result payloads incl. tool exception strings — the
+            # audit never saw and, on a DENY, explicitly rejected. ``response_text``
+            # is already the reviewed release (block message on DENY). Null BOTH
+            # on every verdict so the non-streaming / ``!continue`` path leaks
+            # nothing through the STOP side channel that the streaming path drops.
+            # Advisory / no-audit turns keep the full STOP payload.
+            stop_hook_tool_calls = None if audit_enforcing else stop_tool_calls
+            stop_hook_tool_results = (
+                None if audit_enforcing else (stop_tool_results or None)
+            )
             hook_input = HookInput(
                 session_id=session_id or "",
                 hook_event_name=HookEvent.STOP.value,
                 user_message=user_input,
                 response_text=response_text,
-                tool_calls=stop_tool_calls,
-                tool_results=stop_tool_results or None,
+                tool_calls=stop_hook_tool_calls,
+                tool_results=stop_hook_tool_results,
             )
             await self.hooks_manager.execute_hooks_parallel(
                 HookEvent.STOP, hook_input

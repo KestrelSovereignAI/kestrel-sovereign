@@ -658,12 +658,27 @@ class CommandHandler:
             if context_stats is not None:
                 context_stats.reset()
 
+            # #2674 finding 4: ``!compact`` is a memory-MAINTENANCE command, not
+            # an assistant turn — its result returns BEFORE the POST_RESPONSE
+            # response audit (see ``process_input``: a truthy command result is
+            # returned directly, bypassing the audit fire). Compaction summarizes
+            # already-seen conversation into an INTERNAL memory marker; that
+            # internal LLM computation is correctly outside response-audit scope.
+            # But the raw LLM ``summary_preview`` was echoed VERBATIM into this
+            # user-visible result, so under a strict audit an unaudited slice of
+            # model-generated prose reached the user through the command channel.
+            # Surface a DETERMINISTIC status instead — matching the parallel
+            # ``!context compact`` tool, which persists the summary internally and
+            # returns only a fixed confirmation. The summary itself is preserved
+            # (persisted as the compaction marker); it is simply no longer leaked
+            # as unaudited assistant prose.
             return (
                 f"✅ Session compacted\n"
                 f"  Messages compacted: {result['messages_compacted']}\n"
                 f"  Messages preserved: {result['messages_preserved']}\n"
-                f"  Tokens saved: {result['tokens_saved']:,} ({result['tokens_before']:,} → {result['tokens_after']:,})\n"
-                f"  Summary preview: {result['summary_preview']}"
+                f"  Tokens saved: {result['tokens_saved']:,} "
+                f"({result['tokens_before']:,} → {result['tokens_after']:,})\n"
+                f"  Summary stored to the compaction marker."
             )
         else:
             return f"ℹ️ {result.get('reason', 'Compaction not performed')}"

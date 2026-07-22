@@ -13,6 +13,7 @@ import logging
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock
 
+from kestrel_sdk.hooks.base import HookOutput
 from kestrel_sovereign.privacy import PrivacyMode
 
 logger = logging.getLogger(__name__)
@@ -98,11 +99,57 @@ class MockHooksManager:
         if hook in self.registered_hooks:
             self.registered_hooks.remove(hook)
 
+    def get_enabled_hooks(self, event) -> List[Any]:
+        """Enabled hooks for ``event``, priority-ordered — parity with the real
+        ``HooksManager.get_enabled_hooks`` (#2674).
+
+        The streaming path snapshots the POST_RESPONSE hook set at turn start
+        through this method (``_snapshot_post_response_hooks``). Without it, that
+        helper's broad ``except`` swallowed the ``AttributeError`` and returned an
+        EMPTY snapshot, silently disabling every post-response hook in any
+        streaming test built on ``MockAgent``. Filter by the hook's ``events``
+        membership and ``enabled`` flag exactly as the real manager indexes
+        ``_hooks[event]``, then sort by priority.
+        """
+        matching = [
+            h for h in self.registered_hooks
+            if getattr(h, "enabled", True) and event in getattr(h, "events", [])
+        ]
+        return sorted(matching, key=lambda h: getattr(h, "priority", 100))
+
     async def execute_hooks(self, event, input_data=None, **kwargs):
-        """Record hook execution and return ALLOW."""
+        """Record hook execution and return a real ALLOW ``HookOutput``.
+
+        The real manager returns a ``HookOutput`` whose ``permission_decision``
+        the streaming/dispatch paths read directly; the old
+        ``MagicMock(decision="ALLOW")`` matched neither field, so any code reading
+        ``permission_decision`` saw an auto-created attribute rather than a true
+        ALLOW (#2674)."""
         self.executed_hooks.append({"event": event, "input": input_data, **kwargs})
-        # Return a mock ALLOW result
-        return MagicMock(decision="ALLOW", blocked=False)
+        return HookOutput.allow()
+
+    async def execute_hooks_snapshot(self, event, input_data=None, hooks=None, **kwargs):
+        """Record snapshot-pinned execution and return a real ALLOW ``HookOutput``
+        (#2674 parity with the real ``HooksManager.execute_hooks_snapshot``).
+
+        ``**kwargs`` absorbs ``enforcement_overrides`` (#2674 P0-1) so the
+        captured-enforcement contract passes through the mock unchanged."""
+        self.executed_hooks.append(
+            {"event": event, "input": input_data, "snapshot": hooks, **kwargs}
+        )
+        return HookOutput.allow()
+
+    async def execute_post_response_observers(
+        self, event, input_data=None, hooks=None, **kwargs,
+    ):
+        """Record post-gate observer execution and return ALLOW (#2674 parity
+        with the real ``HooksManager.execute_post_response_observers``). Present
+        so a gate+observer ``_fire_post_response_hook`` fire over this mock does
+        not ``AttributeError``. ``**kwargs`` absorbs ``enforcement_overrides``."""
+        self.executed_hooks.append(
+            {"event": event, "input": input_data, "observers": hooks, **kwargs}
+        )
+        return HookOutput.allow()
 
 
 class MockPrivacyAgent:

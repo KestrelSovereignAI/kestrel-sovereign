@@ -100,10 +100,10 @@ class ResponseAuditHook(Hook):
             else 0
         )
 
-        if not response_text or len(response_text.strip()) < 20:
-            # Short responses skip the LLM audit (it has no signal to
-            # work with), but they still honor a deterministic
-            # narration violation.
+        stripped = response_text.strip()
+        if len(stripped) < 20:
+            # Short responses always honor a deterministic narration
+            # violation, regardless of mode or length.
             if narration_risk > 0:
                 self.audit_count += 1
                 self.last_risk_level = narration_risk
@@ -115,10 +115,29 @@ class ResponseAuditHook(Hook):
                     risk_level=narration_risk,
                     reasoning=narration_verdict.reasoning,
                 )
-            return HookOutput.allow("Response too short to audit")
+            # #2674 finding 1: in STRICT (enforcing / fail-closed) mode a short
+            # but NON-EMPTY response must still be genuinely audited. The old
+            # length short-circuit ALLOWed it with no provider judgment, so a
+            # short secret (a leaked "sk-..." token, a one-line credential)
+            # buffered by the strict streaming path was released UNREVIEWED —
+            # exactly the fail-open the buffer exists to prevent. Only an empty
+            # / whitespace-only response has nothing to review and is released
+            # in every mode. Advisory (warn / other) modes keep the efficiency
+            # short-circuit for short non-empty responses unchanged.
+            if not stripped or self.mode != "strict":
+                return HookOutput.allow("Response too short to audit")
+            # strict + short non-empty → fall through to the provider audit
+            # below, which fails closed on a provider outage / un-run audit.
 
         try:
-            audit_result = await self.agent.llm_service.get_audit_response(response_text)
+            # #2674 finding 3: in strict (enforcing / fail-closed) mode the
+            # response is WITHHELD from the user pending THIS verdict, so the
+            # audit provider call — whose ``user_prompt`` IS the withheld prose —
+            # must redact its own durable telemetry. ``fail_closed`` is True iff
+            # ``mode == "strict"``, so advisory (warn) audits keep full telemetry.
+            audit_result = await self.agent.llm_service.get_audit_response(
+                response_text, redact_content=self.fail_closed,
+            )
         except Exception as e:
             logger.warning(f"Response audit failed: {e}")
             # Even with the LLM audit unavailable, a clean-cut
@@ -250,7 +269,24 @@ class ResponseAuditHook(Hook):
             return []
 
     async def _notify_audit_anchor(self, risk_level: int, reasoning: str):
-        """Notify AuditAnchorFeature for tamper-proof logging on elevated risk."""
+        """Notify AuditAnchorFeature for tamper-proof logging on elevated risk.
+
+        #2674 finding 5: ``reasoning`` is the audit LLM's (or the provider
+        exception's) free text, and it can QUOTE the assistant response verbatim
+        ("the reply says '<secret>' which…"). AuditAnchorFeature is a DURABLE,
+        arbitrary feature consumer — a tamper-proof anchor that persists whatever
+        ``message`` it receives. In strict (fail-closed / enforcing) mode the very
+        response those quotes come from is WITHHELD from the user pending this
+        verdict, so anchoring the raw reasoning would durably persist — before,
+        and even after a DENY — exactly the content the buffer exists to withhold.
+        Under strict mode send the anchor only the content-free risk/category
+        metadata (``is_valid`` + a fixed classification), never the reasoning; the
+        actionable risk verdict is preserved so the tamper-proof trail still
+        records THAT an elevated-risk audit fired. Advisory (warn / other) modes
+        are not fail-closed and keep the full reasoning for the anchor. The
+        operator ``logger`` is a separate, already-defended diagnostic boundary
+        and still carries the full reasoning.
+        """
         if risk_level < 2:
             return
         try:
@@ -262,9 +298,15 @@ class ResponseAuditHook(Hook):
             else:
                 anchor = None
             if anchor and hasattr(anchor, "on_audit_complete"):
+                anchor_message = (
+                    f"[response audit risk {risk_level}; reasoning withheld "
+                    f"under strict fail-closed audit]"
+                    if self.fail_closed
+                    else reasoning
+                )
                 await anchor.on_audit_complete({
                     "is_valid": risk_level < self.risk_threshold,
-                    "message": reasoning,
+                    "message": anchor_message,
                     "source": "response_audit",
                 })
         except Exception as e:

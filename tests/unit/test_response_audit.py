@@ -151,16 +151,73 @@ class TestResponseAuditHook:
         assert "Potentially misleading" in modified_text
 
     @pytest.mark.asyncio
-    async def test_hook_skip_short_response(self):
-        """Responses shorter than 20 characters should be skipped."""
+    async def test_hook_skip_short_response_advisory_only(self):
+        """ADVISORY (warn) mode keeps the efficiency short-circuit: a short
+        response with no narration violation skips the LLM audit and allows."""
         agent = _make_agent()
-        hook = ResponseAuditHook(agent=agent, mode="strict", risk_threshold=3)
+        hook = ResponseAuditHook(agent=agent, mode="warn", risk_threshold=3)
 
         output = await hook.execute(_make_hook_input("Short"))
 
         assert output.permission_decision == PermissionDecision.ALLOW
         assert "too short" in output.permission_reason
-        # get_audit_response should NOT have been called
+        # get_audit_response should NOT have been called in advisory mode
+        agent.llm_service.get_audit_response.assert_not_called()
+        assert hook.audit_count == 0
+
+    @pytest.mark.asyncio
+    async def test_hook_strict_audits_short_nonempty_response(self):
+        """#2674 finding 1: in STRICT (fail-closed) mode a short but NON-EMPTY
+        response is GENUINELY audited — the provider is called rather than
+        short-circuited to a blind ALLOW. A short secret buffered by the strict
+        streaming path must not be released unreviewed."""
+        agent = _make_agent({"risk_level": 1, "reasoning": "clean"})
+        hook = ResponseAuditHook(agent=agent, mode="strict", risk_threshold=3)
+
+        output = await hook.execute(_make_hook_input("sk-secret-123"))
+
+        # The provider audit ran (this short text was NOT skipped) and passed.
+        agent.llm_service.get_audit_response.assert_called_once()
+        assert hook.audit_count == 1
+        assert output.permission_decision == PermissionDecision.ALLOW
+
+    @pytest.mark.asyncio
+    async def test_hook_strict_short_high_risk_denies(self):
+        """#2674 finding 1: a short response the provider flags high-risk in
+        strict mode DENIES — the short-circuit no longer lets it through."""
+        agent = _make_agent({"risk_level": 3, "reasoning": "leaked credential"})
+        hook = ResponseAuditHook(agent=agent, mode="strict", risk_threshold=3)
+
+        output = await hook.execute(_make_hook_input("sk-secret-123"))
+
+        agent.llm_service.get_audit_response.assert_called_once()
+        assert output.permission_decision == PermissionDecision.DENY
+
+    @pytest.mark.asyncio
+    async def test_hook_strict_short_audit_outage_fails_closed(self):
+        """#2674 finding 1: a short response in strict mode whose provider audit
+        is UNAVAILABLE fails CLOSED (DENY) — not a blind short-circuit ALLOW."""
+        agent = _make_agent()
+        agent.llm_service.get_audit_response = AsyncMock(
+            side_effect=RuntimeError("no providers")
+        )
+        hook = ResponseAuditHook(agent=agent, mode="strict", risk_threshold=3)
+
+        output = await hook.execute(_make_hook_input("sk-secret-123"))
+
+        assert output.permission_decision == PermissionDecision.DENY
+
+    @pytest.mark.asyncio
+    async def test_hook_strict_empty_response_allows_without_audit(self):
+        """An empty / whitespace-only response has nothing to review, so it is
+        released without a provider call even in strict mode (no leak possible)."""
+        agent = _make_agent()
+        hook = ResponseAuditHook(agent=agent, mode="strict", risk_threshold=3)
+
+        output = await hook.execute(_make_hook_input("   "))
+
+        assert output.permission_decision == PermissionDecision.ALLOW
+        assert "too short" in output.permission_reason
         agent.llm_service.get_audit_response.assert_not_called()
         assert hook.audit_count == 0
 
@@ -231,6 +288,53 @@ class TestResponseAuditHook:
         await hook.execute(_make_hook_input())
 
         mock_anchor.on_audit_complete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_strict_anchor_notification_withholds_reasoning(self):
+        """#2674 finding 5: in STRICT (fail-closed) mode the audit reasoning can
+        quote the assistant response (which is WITHHELD from the user pending this
+        verdict). AuditAnchorFeature is a DURABLE consumer, so under strict the
+        anchor must receive only content-free risk/category metadata — never the
+        reasoning that may embed the withheld prose."""
+        agent = _make_agent({
+            "risk_level": 4,
+            "reasoning": "the reply leaks the API key SECRET_TOKEN_abc123",
+            "audited": True,
+        })
+        mock_anchor = MagicMock()
+        mock_anchor.on_audit_complete = AsyncMock()
+        agent.features = {"AuditAnchorFeature": mock_anchor}
+        hook = ResponseAuditHook(agent=agent, mode="strict", risk_threshold=3)
+
+        await hook.execute(_make_hook_input())
+
+        mock_anchor.on_audit_complete.assert_called_once()
+        payload = mock_anchor.on_audit_complete.call_args[0][0]
+        # No withheld content reaches the durable anchor.
+        assert "SECRET_TOKEN_abc123" not in payload["message"]
+        # The actionable risk verdict is still recorded.
+        assert "4" in payload["message"]
+        assert payload["is_valid"] is False
+        assert payload["source"] == "response_audit"
+
+    @pytest.mark.asyncio
+    async def test_warn_anchor_notification_keeps_reasoning(self):
+        """Advisory (warn) mode is not fail-closed — its response was already
+        shown to the user — so the anchor keeps the full reasoning unchanged."""
+        agent = _make_agent({
+            "risk_level": 4,
+            "reasoning": "flagged phrase FULL_DETAIL_HERE",
+            "audited": True,
+        })
+        mock_anchor = MagicMock()
+        mock_anchor.on_audit_complete = AsyncMock()
+        agent.features = {"AuditAnchorFeature": mock_anchor}
+        hook = ResponseAuditHook(agent=agent, mode="warn", risk_threshold=3)
+
+        await hook.execute(_make_hook_input())
+
+        payload = mock_anchor.on_audit_complete.call_args[0][0]
+        assert "FULL_DETAIL_HERE" in payload["message"]
 
 
 # =========================================================================
