@@ -189,6 +189,18 @@ class WaitRegistry:
         self._providers[kind] = provider
         logger.debug("registered wait provider kind=%s (%s)", kind, type(provider).__name__)
 
+    def unregister(self, kind: str) -> bool:
+        """Remove the provider registered under ``kind``. Returns True if present.
+
+        The deliberate inverse of :meth:`register`, used by feature teardown /
+        boot rollback so a feature that registered a ``task:`` / ``talon:`` wait
+        provider in ``post_all_features_loaded`` does not leave it stranded in
+        the registry when the feature is disabled or a later boot phase fails
+        (kestrel-sovereign#2522). Idempotent: unregistering an absent kind is a
+        benign ``False``.
+        """
+        return self._providers.pop(kind, None) is not None
+
     def get(self, kind: str) -> Optional[Waitable]:
         return self._providers.get(kind)
 

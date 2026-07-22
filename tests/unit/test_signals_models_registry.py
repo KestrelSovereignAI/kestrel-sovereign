@@ -358,6 +358,32 @@ def test_register_rejects_non_boolean_prompt_override_opt_in():
         reg.register(source)
 
 
+def test_allow_prompt_override_is_a_contract_axis():
+    """``allow_prompt_override`` is validated at registration AND governs a real
+    dispatch decision (whether a signal's ``prompt_template_override`` is
+    honored), so two otherwise-identical registrations that differ only in that
+    flag must be a contract MISMATCH — not silently equated (#2522 P1). The
+    signature omitted it, so the two compared equivalent."""
+    base_kwargs = _valid_cognition_reg("prompt_override_axis").__dict__
+    opted_in = SourceRegistrationWithPromptOverride(
+        **base_kwargs, allow_prompt_override=True
+    )
+    opted_out = SourceRegistrationWithPromptOverride(
+        **base_kwargs, allow_prompt_override=False
+    )
+    # Same everything but the override opt-in → NOT contract-equivalent.
+    assert not SourceRegistry.contract_equivalent(opted_in, opted_out)
+    # A plain SourceRegistration (no attribute) matches the default-False form,
+    # so the getattr() fallback keeps the base contract stable.
+    plain = _valid_cognition_reg("prompt_override_axis")
+    assert SourceRegistry.contract_equivalent(plain, opted_out)
+    # An identical opted-in rebuild stays equivalent.
+    opted_in_again = SourceRegistrationWithPromptOverride(
+        **base_kwargs, allow_prompt_override=True
+    )
+    assert SourceRegistry.contract_equivalent(opted_in, opted_in_again)
+
+
 # ---------------------------------------------------------------------------
 # Constitutional injection — kestrel-sovereign#1137 chunk 1D
 # ---------------------------------------------------------------------------

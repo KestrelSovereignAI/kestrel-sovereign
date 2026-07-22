@@ -568,7 +568,8 @@ class TalonCoordinatorFeature(Feature):
         """
         registry = getattr(agent, "wait_registry", None)
         if registry is not None:
-            registry.register(TalonWaitable(self), replace=True)
+            # Record ownership so base shutdown()/boot rollback unregisters it.
+            self._register_wait_provider(registry, TalonWaitable(self), replace=True)
 
         # One-time migration of legacy talon_monitor dedup state into the
         # generic reconciler ledger. Pre-Wave-2 jobs.json rows carry

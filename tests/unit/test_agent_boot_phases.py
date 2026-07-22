@@ -82,6 +82,9 @@ def _boot_mocks():
         task_manager = AsyncMock()
         task_manager.initialize = AsyncMock()
         task_manager.register_agent = MagicMock()
+        # unregister_agent is synchronous on the real TaskManager; make the mock
+        # sync too so feature teardown doesn't leave an un-awaited coroutine.
+        task_manager.unregister_agent = MagicMock()
         task_manager.close = AsyncMock()
         MockTaskManager.return_value = task_manager
 
@@ -364,6 +367,115 @@ async def test_feature_owned_signal_sources_absent_after_rollback(tmp_path):
             assert (
                 _SourceRegisteringFeature.FAKE_SOURCE not in agent.signal_registry
             )
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+async def test_feature_hooks_and_wait_providers_absent_after_rollback(tmp_path):
+    """A LATER phase failure rolls back a feature's hooks AND wait providers —
+    not just its ``shutdown()`` (#2522).
+
+    A feature registers a hook (via ``get_hooks()``, auto-registered in
+    ``_register_feature``) and a ``Waitable`` provider (in
+    ``post_all_features_loaded``). The old boot rollback called only
+    ``feature.shutdown()``, so the hook and the ``task:``/``talon:``-style wait
+    provider were left registered on a dead agent. Rollback now runs the
+    canonical per-feature teardown, so the hook registry AND the wait-provider
+    registry are empty afterwards.
+    """
+    from types import SimpleNamespace as _NS
+
+    from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
+    from kestrel_sovereign.features.base import Feature as _SovereignFeature
+
+    class _NoopHook(Hook):
+        def __init__(self) -> None:
+            super().__init__(
+                name="fake_feature_hook", events=[HookEvent.SESSION_START]
+            )
+
+        async def execute(self, input):  # noqa: A002 - SDK signature
+            return HookOutput()
+
+    class _FakeWaitable:
+        kind = "fakewait"
+        signal = None
+
+        async def poll(self, handle):  # pragma: no cover - never polled
+            raise NotImplementedError
+
+    class _HookWaitFeature(_SovereignFeature):
+        FAKE_SOURCE = "fake.hookwait_source"
+
+        tool_name = "hook_wait_feature"
+        tool_description = "feature registering a hook + wait provider"
+
+        def __init__(self, agent):
+            super().__init__(agent)
+            self._hook = _NoopHook()
+
+        async def initialize(self):
+            from kestrel_sovereign.signals import RegistrationPolicy
+
+            outcome = self.agent.signal_registry.register_with_policy(
+                _fake_source_registration(self.FAKE_SOURCE),
+                RegistrationPolicy.OPTIONAL,
+            )
+            self._own_signal_sources(outcome)
+
+        def get_hooks(self):
+            return [self._hook]
+
+        async def post_all_features_loaded(self, agent):
+            # Same canonical call the real task:/talon: features use — records
+            # ownership so shutdown()/rollback unregisters it.
+            self._register_wait_provider(
+                agent.wait_registry, _FakeWaitable(), replace=True
+            )
+
+        def get_agent_card(self):
+            return _NS(name=self.name, skills=[])
+
+    agent = _make_agent(tmp_path)
+    holder: dict = {}
+
+    def _discover(a, **_kw):
+        holder["feature"] = _HookWaitFeature(a)
+        return [holder["feature"]]
+
+    boom = AsyncMock(side_effect=RuntimeError("injected@memory"))
+    try:
+        with _boot_mocks():
+            with patch(
+                "kestrel_sovereign.kestrel_agent.discover_features",
+                side_effect=_discover,
+            ):
+                with patch.object(
+                    agent, "_boot_phase_memory_bootstrap_context", boom
+                ):
+                    with pytest.raises(RuntimeError, match="injected@memory"):
+                        await agent.initialize()
+
+            assert agent._boot_state is BootPhaseState.FAILED
+            feature = holder["feature"]
+
+            # The hook registered in phase 4 is gone — every event bucket empty.
+            assert all(
+                not hooks for hooks in agent.hooks_manager._hooks.values()
+            ), "feature hook left registered after boot rollback"
+            assert feature._hook not in agent.hooks_manager.get_hooks(
+                HookEvent.SESSION_START
+            )
+
+            # The wait provider registered in post_all_features_loaded is gone.
+            assert agent.wait_registry.kinds() == []
+            assert agent.wait_registry.get("fakewait") is None
+
+            # And its dispatcher signal source too (base shutdown path).
+            assert _HookWaitFeature.FAKE_SOURCE not in agent.signal_registry
+            # The feature itself was dropped from the agent.
+            assert feature.name not in agent.features
     finally:
         await _cleanup(agent)
 

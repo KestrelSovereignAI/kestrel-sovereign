@@ -274,15 +274,18 @@ class Feature(_SdkFeature):
     async def shutdown(self):
         """Cleanup resources.
 
-        Also unregisters any signal sources this feature registered on the
-        agent's dispatcher (kestrel-sovereign#2522 P2). Boot rollback
+        Also unregisters the dispatcher **signal sources** AND the **wait
+        providers** this feature registered on the agent
+        (kestrel-sovereign#2522 P2). Boot rollback
         (``KestrelAgent._boot_teardown_features``) and runtime disable both call
-        ``shutdown()``, so a feature that registered dispatcher sources and then
-        hit a later boot-phase failure must not leave feature-bound handlers /
-        closures stranded in the registry. Overrides that do their own teardown
-        should call ``await super().shutdown()``.
+        ``shutdown()``, so a feature that registered dispatcher sources or a
+        ``task:`` / ``talon:`` wait provider and then hit a later boot-phase
+        failure must not leave feature-bound handlers / closures stranded in the
+        registries. Overrides that do their own teardown should call
+        ``await super().shutdown()``.
         """
         await self._unregister_owned_signal_sources()
+        await self._unregister_owned_wait_providers()
 
     # ------------------------------------------------------------------
     # Signal-source ownership (#2522 P2)
@@ -355,6 +358,58 @@ class Feature(_SdkFeature):
                         exc,
                     )
         self._owned_signal_source_names = []
+
+    # ------------------------------------------------------------------
+    # Wait-provider ownership (#2522)
+    #
+    # Features register a ``Waitable`` provider (``task:``, ``talon:``) with the
+    # agent's WaitRegistry in ``post_all_features_loaded``. Mirror the
+    # signal-source ownership above so ``shutdown()`` (runtime disable AND boot
+    # rollback) removes exactly the kinds this feature registered — never a
+    # host's — instead of leaving a feature-bound provider stranded.
+    # ------------------------------------------------------------------
+    def _register_wait_provider(self, registry, provider, *, replace: bool = True):
+        """Register ``provider`` on ``registry`` and record its kind for teardown.
+
+        The single call features use in ``post_all_features_loaded`` so the
+        provider's ``kind`` is recorded the moment it is registered and torn
+        down again in :meth:`shutdown` — the wait-provider analogue of
+        :meth:`_own_signal_sources`.
+        """
+        registry.register(provider, replace=replace)
+        kind = getattr(provider, "kind", None)
+        if not kind:
+            return
+        owned = getattr(self, "_owned_wait_provider_kinds", None)
+        if owned is None:
+            owned = []
+            self._owned_wait_provider_kinds = owned
+        if kind not in owned:
+            owned.append(kind)
+
+    async def _unregister_owned_wait_providers(self) -> None:
+        """Unregister the wait providers this feature registered (#2522).
+
+        Best-effort and idempotent: unregistering an already-absent kind is a
+        benign no-op, so repeated shutdowns are safe.
+        """
+        kinds = getattr(self, "_owned_wait_provider_kinds", None)
+        if not kinds:
+            return
+        registry = getattr(getattr(self, "agent", None), "wait_registry", None)
+        if registry is not None and hasattr(registry, "unregister"):
+            for kind in kinds:
+                try:
+                    registry.unregister(kind)
+                except Exception as exc:  # noqa: BLE001 - best-effort teardown
+                    logger.warning(
+                        "feature '%s': could not unregister wait provider "
+                        "kind '%s': %s",
+                        getattr(self, "name", type(self).__name__),
+                        kind,
+                        exc,
+                    )
+        self._owned_wait_provider_kinds = []
 
     async def on_enable(self):
         """Called when feature is enabled.

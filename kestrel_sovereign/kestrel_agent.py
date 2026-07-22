@@ -2437,17 +2437,26 @@ class KestrelAgent(
             await svc.stop()
 
     async def _boot_teardown_features(self) -> None:
-        """Shut down every feature that registered before the failure, LIFO."""
+        """Reverse every feature registration made before the failure, LIFO.
+
+        Delegates to the canonical per-feature teardown
+        (:meth:`_unregister_feature_runtime`) so boot rollback removes exactly
+        what runtime disable does — hooks, A2A TaskManager registrations,
+        dynamic tools, owned signal sources, AND wait providers — rather than a
+        subset. The old rollback called only ``feature.shutdown()``, leaving a
+        rolled-back feature's hooks and ``task:``/``talon:`` wait providers
+        registered on a dead agent (kestrel-sovereign#2522). Each feature is
+        guarded so one stubborn teardown can't strand the rest.
+        """
         for name, feature in reversed(list(self.features.items())):
-            if hasattr(feature, "shutdown"):
-                try:
-                    await feature.shutdown()
-                except Exception as exc:  # noqa: BLE001 - best-effort teardown
-                    logging.warning(
-                        "boot rollback: feature '%s' shutdown failed: %s",
-                        name,
-                        exc,
-                    )
+            try:
+                await self._unregister_feature_runtime(feature)
+            except Exception as exc:  # noqa: BLE001 - best-effort teardown
+                logging.warning(
+                    "boot rollback: feature '%s' teardown failed: %s",
+                    name,
+                    exc,
+                )
         self.features = {}
 
     async def _boot_teardown_memory(self) -> None:
@@ -3241,6 +3250,74 @@ class KestrelAgent(
                 self._register_explored_feature_tools(feature)
                 self._pinned_features.add(feature.tool_name)
 
+    async def _unregister_feature_runtime(self, feature: "Feature") -> None:
+        """Reverse *every* runtime registration a fully-registered feature acquired.
+
+        The single canonical inverse of the wiring ``_register_feature`` and
+        ``post_all_features_loaded`` set up. Both the runtime
+        :meth:`_disable_feature` path and boot rollback
+        (:meth:`_boot_teardown_features`) call it, so neither can drift or leave
+        a feature's registrations stranded (kestrel-sovereign#2522). It removes,
+        in order:
+
+        * the ``on_enable`` lifecycle (via ``on_disable``);
+        * the feature's owned **signal sources** and **wait providers** (via
+          ``feature.shutdown()`` — base :class:`Feature` unregisters both);
+        * the hooks auto-registered from ``get_hooks()``;
+        * the A2A TaskManager agent registration;
+        * the feature's dynamic tools + hidden-tool bookkeeping;
+
+        and drops the feature from ``self.features``. It does NOT enforce the
+        mandatory-feature guard — that is a caller policy (runtime disable
+        refuses; boot rollback must tear mandatory features down too).
+        """
+        feature_key = next(
+            (key for key, value in self.features.items() if value is feature),
+            getattr(feature, "name", None),
+        )
+        feature_tool_name = getattr(feature, "tool_name", feature_key)
+
+        # Lifecycle inverse of on_enable (run during _register_feature), then the
+        # feature's own resource teardown (signal sources + wait providers).
+        await feature.on_disable()
+        await feature.shutdown()
+
+        # Auto-unregister hooks from get_hooks()
+        if self.hooks_manager:
+            for hook in feature.get_hooks():
+                self.hooks_manager.unregister(hook)
+                logging.info(
+                    f"Auto-unregistered hook '{hook.name}' from feature "
+                    f"'{feature_key}'"
+                )
+
+        if self.task_manager:
+            try:
+                self.task_manager.unregister_agent(feature.get_agent_card().name)
+            except Exception as exc:
+                logging.warning(
+                    "Failed to unregister feature '%s' from task manager: %s",
+                    feature_key,
+                    exc,
+                )
+
+        if feature_key is not None:
+            self.features.pop(feature_key, None)
+        # Capture the owned tool names before unregister mutates the maps;
+        # _tool_context_hidden_tools is reconciled against them below.
+        to_remove = [
+            name for name, owner in self._tool_to_feature.items()
+            if owner == feature_tool_name
+        ]
+        self.unregister_dynamic_tools(feature_tool_name)
+        if isinstance(getattr(self, "_tool_context_hidden_features", None), set):
+            self._tool_context_hidden_features.discard(feature_tool_name)
+            self._tool_context_hidden_features.discard(feature_key)
+            self._tool_context_hidden_features.discard(feature.__class__.__name__)
+        if isinstance(getattr(self, "_tool_context_hidden_tools", None), set):
+            self._tool_context_hidden_tools.difference_update(to_remove)
+        self._cached_features_prompt = self._build_features_prompt_section()
+
     async def _disable_feature(self, feature_name: str):
         """Disable a feature and remove its runtime registrations."""
         feature = self.get_feature(feature_name)
@@ -3258,49 +3335,8 @@ class KestrelAgent(
                 "cannot be disabled",
             )
 
-        feature_key = next(
-            (key for key, value in self.features.items() if value is feature),
-            feature.name,
-        )
-        feature_tool_name = getattr(feature, "tool_name", feature_key)
-
-        # Call on_disable lifecycle hook
-        await feature.on_disable()
-        await feature.shutdown()
-
-        # Auto-unregister hooks from get_hooks()
-        if self.hooks_manager:
-            for hook in feature.get_hooks():
-                self.hooks_manager.unregister(hook)
-                logging.info(f"Auto-unregistered hook '{hook.name}' from feature '{feature_name}'")
-
-        if self.task_manager:
-            try:
-                self.task_manager.unregister_agent(feature.get_agent_card().name)
-            except Exception as exc:
-                logging.warning(
-                    "Failed to unregister feature '%s' from task manager: %s",
-                    feature_key,
-                    exc,
-                )
-
-        self.features.pop(feature_key, None)
-        # Capture the owned tool names before unregister mutates the maps;
-        # _tool_context_hidden_tools is reconciled against them below.
-        to_remove = [
-            name for name, owner in self._tool_to_feature.items()
-            if owner == feature_tool_name
-        ]
-        self.unregister_dynamic_tools(feature_tool_name)
-        if isinstance(getattr(self, "_tool_context_hidden_features", None), set):
-            self._tool_context_hidden_features.discard(feature_tool_name)
-            self._tool_context_hidden_features.discard(feature_key)
-            self._tool_context_hidden_features.discard(feature.__class__.__name__)
-        if isinstance(getattr(self, "_tool_context_hidden_tools", None), set):
-            self._tool_context_hidden_tools.difference_update(to_remove)
-        self._cached_features_prompt = self._build_features_prompt_section()
-
-        logging.info(f"Feature '{feature_key}' disabled and removed")
+        await self._unregister_feature_runtime(feature)
+        logging.info(f"Feature '{feature_name}' disabled and removed")
 
     # Solvency State
     _current_model_preference: Optional[str] = None

@@ -198,15 +198,35 @@ def test_mismatch_detected_on_each_axis(mutate):
     assert not SourceRegistry.contract_equivalent(base, mutate())
 
 
-def test_redaction_same_summarizer_is_equivalent():
-    # The signature compares the redaction summarizer's *qualified name* and its
-    # flags (not the closure's object identity), so two summarizers declared at
-    # the same source location — as a feature rebuilding an identical
-    # registration on re-init produces — stay equivalent and are not spuriously
-    # flagged. (Both lambdas below share one qualname.)
-    a = _action_reg("s", redaction=_redaction(lambda p: "x"))
-    b = _action_reg("s", redaction=_redaction(lambda p: "y"))
+def _rebuilt_redaction() -> RedactionPolicy:
+    """A fresh RedactionPolicy whose summarizer is rebuilt from one ``def``.
+
+    Simulates a feature's ``build_*_registration()`` reconstructing an
+    identical policy on re-init: the nested summarizer is a *distinct object*
+    every call but shares one compiled code object, so the fingerprint stays
+    stable across rebuilds.
+    """
+    return RedactionPolicy(summarize=lambda p: "<redacted>")
+
+
+def test_redaction_rebuilt_summarizer_is_equivalent():
+    # The signature compares the summarizer's module + compiled code + captured
+    # values (NOT its object identity), so a feature that rebuilds an identical
+    # registration on re-init — same summarizer ``def``, fresh object — stays
+    # equivalent and is not spuriously flagged (#2522 P1).
+    a = _action_reg("s", redaction=_rebuilt_redaction())
+    b = _action_reg("s", redaction=_rebuilt_redaction())
     assert SourceRegistry.contract_equivalent(a, b)
+
+
+def test_redaction_distinct_summarizer_body_is_a_mismatch():
+    # Two summarizers with DIFFERENT bodies compile to distinct code objects
+    # and behave differently, so they are a genuine contract mismatch. The old
+    # qualname-only fingerprint equated them (both are ``<lambda>``) — the
+    # false-equivalence #2522 P1 targets.
+    a = _action_reg("s", redaction=RedactionPolicy(summarize=lambda p: "x"))
+    b = _action_reg("s", redaction=RedactionPolicy(summarize=lambda p: "y"))
+    assert not SourceRegistry.contract_equivalent(a, b)
 
 
 def test_redaction_flag_change_is_a_mismatch():
@@ -258,6 +278,56 @@ def test_optional_reregistration_with_new_owner_is_reported_not_accepted():
         RegistrationPolicy.OPTIONAL,
     )
     assert second.state is RegistrationState.MISMATCH
+
+
+def _default_bound_handler(reply):
+    # A PLAIN function (no closure cell): ``reply`` is baked into ``__defaults__``
+    # at def time, and the body reads the *parameter*, so nothing is captured as
+    # a free variable. Two handlers from this factory therefore share a qualname,
+    # module, AND compiled code object, differing ONLY in their default-bound
+    # ``reply`` — the exact shape the old qualname-only fingerprint equated.
+    async def handler(payload, reply=reply):
+        return reply
+
+    return handler
+
+
+def test_default_bound_handlers_differ_in_contract_signature():
+    # Unit-level guard on the fingerprint itself: distinct default-bound
+    # behavior is a mismatch, an identical default-bound rebuild is not (#2522
+    # P1 — plain functions were reduced to __qualname__, ignoring __defaults__).
+    a = _action_reg("s", handler=_default_bound_handler("A"))
+    b = _action_reg("s", handler=_default_bound_handler("B"))
+    a2 = _action_reg("s", handler=_default_bound_handler("A"))
+    assert not SourceRegistry.contract_equivalent(a, b)
+    assert SourceRegistry.contract_equivalent(a, a2)
+
+
+def test_optional_reregistration_with_different_default_bound_handler_is_reported():
+    # End-to-end through register_with_policy (the load-bearing path, not just
+    # contract_equivalent): two handlers built from the same factory with
+    # DIFFERENT default-bound behavior must be reported as a MISMATCH so OPTIONAL
+    # keeps the existing handler instead of silently RETAINING the wrong one — the
+    # concrete #2522 P1 defect the audit named for plain functions.
+    reg = SourceRegistry()
+    first = reg.register_with_policy(
+        _action_reg("s", handler=_default_bound_handler("A")),
+        RegistrationPolicy.OPTIONAL,
+    )
+    assert first.state is RegistrationState.REGISTERED
+    second = reg.register_with_policy(
+        _action_reg("s", handler=_default_bound_handler("B")),
+        RegistrationPolicy.OPTIONAL,
+    )
+    assert second.state is RegistrationState.MISMATCH
+    # The existing "A"-bound handler is KEPT (its default is unchanged).
+    assert reg.get("s").handler.__defaults__ == ("A",)
+    # A genuine same-default rebuild is still a benign no-op.
+    third = reg.register_with_policy(
+        _action_reg("s", handler=_default_bound_handler("A")),
+        RegistrationPolicy.OPTIONAL,
+    )
+    assert third.state is RegistrationState.ALREADY_EQUIVALENT
 
 
 # ---------------------------------------------------------------------------

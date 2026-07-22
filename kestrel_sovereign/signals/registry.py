@@ -273,10 +273,17 @@ class SourceRegistry:
         set + default, trust, the handler/artifact/sanitizer/result callables,
         throttling (rate limit + coalescing window), attention policy, resource
         ownership + self-loop policy, the redaction policy's *flags and
-        summarizer* (not merely its class), retention, and the four
-        constitutional-injection fields. A re-registration that changes any of
-        them is therefore caught as a MISMATCH instead of being silently
+        summarizer* (not merely its class), retention, the four
+        constitutional-injection fields, and the per-signal prompt-override
+        opt-in (``allow_prompt_override``). A re-registration that changes any
+        of them is therefore caught as a MISMATCH instead of being silently
         accepted as equivalent.
+
+        ``allow_prompt_override`` is validated at registration time (only a
+        ``bool`` is accepted) yet governs a real dispatch decision — whether a
+        signal's ``prompt_template_override`` is honored — so two otherwise
+        identical registrations that differ only in that flag are a genuine
+        contract mismatch and must not compare equivalent (#2522 P1).
 
         Callables are fingerprinted by :func:`_callable_identity`, which folds
         in a bound method's owner and a closure's *captured free variables* by
@@ -332,6 +339,7 @@ class SourceRegistry:
             reg.prompt_template_format,
             reg.constitution_injection,
             reg.system_prompt_budget_bytes,
+            getattr(reg, "allow_prompt_override", False),
         )
 
     @classmethod
@@ -571,18 +579,29 @@ def _value_identity(value: object) -> object:
 def _callable_identity(fn: object) -> Optional[tuple]:
     """A stable, hashable identity for a handler / sanitizer / schema callable.
 
-    Folds in *what the callable is bound to* so two closures that share a
-    qualified name but capture different owners/dependencies are distinguished
-    (kestrel-sovereign#2522 P1). A genuine same-owner rebuild yields an equal
-    identity; a callable bound to a new owner does not.
+    Fingerprints the *whole behavioral identity* of the callable so two
+    callables that merely share a qualified name are distinguished when they
+    would in fact behave differently (kestrel-sovereign#2522 P1). A genuine
+    same-definition rebuild yields an equal identity; a callable that differs
+    in owner, module, compiled code, default-bound arguments, or captured
+    dependencies does not.
 
     * ``None`` → ``None``.
     * bound method / bound builtin → ``("bound", qualname, id(owner))``.
     * :class:`functools.partial` → recurse into ``func`` plus the bound
       positional/keyword arguments (each via :func:`_value_identity`).
-    * closure → ``("closure", qualname, (captured-var-identity, ...))`` over its
-      free variables (each via :func:`_value_identity`).
-    * plain function / unbound method → ``("function", qualname)``.
+    * plain function OR closure → ``("function", module, qualname, code-id,
+      defaults, kwdefaults, closure-cells)``. Reducing this to ``qualname``
+      alone (the old behavior) equated two functions built from the same
+      factory that bake in *different* default-bound behavior, or two same-name
+      functions defined in different modules — the false-equivalence the audit
+      found. The compiled ``__code__`` object is shared across every function
+      produced from one ``def``, so a genuine rebuild keeps an equal
+      ``code-id`` while a different definition (or a different default) does
+      not. Defaults / kwdefaults / captured free variables each fold through
+      :func:`_value_identity`, so immutable captures still compare by value.
+    * bound/builtin method without ``__self__`` → ``("function", module,
+      qualname)`` (no Python code/defaults to fold).
     * any other callable object → ``("object", type-qualname, id(obj))`` — a new
       instance is (correctly) a different contract.
     """
@@ -610,19 +629,46 @@ def _callable_identity(fn: object) -> Optional[tuple]:
             tuple(sorted((k, _value_identity(v)) for k, v in fn.keywords.items())),
         )
 
-    closure = getattr(fn, "__closure__", None)
-    if closure:
+    # A Python function — closure or not. Fold module + compiled code identity
+    # + default-bound arguments + captured free variables, NOT just the
+    # qualified name. Two ``build_*(dep)`` handlers sharing a qualname but
+    # baking in a different default (or a different captured dependency, or
+    # defined in a different module) are then correctly a mismatch, while a
+    # same-``def`` rebuild — which reuses the one compiled code object and the
+    # same immutable defaults/captures — stays equivalent.
+    if inspect.isfunction(fn):
+        code = getattr(fn, "__code__", None)
         cells: list = []
-        for cell in closure:
+        for cell in getattr(fn, "__closure__", None) or ():
             try:
                 cells.append(_value_identity(cell.cell_contents))
             except ValueError:
                 # Empty cell — a free variable not yet bound; nothing to fold.
                 cells.append(None)
-        return ("closure", qual, tuple(cells))
+        defaults = tuple(
+            _value_identity(d) for d in (getattr(fn, "__defaults__", None) or ())
+        )
+        kwdefaults = tuple(
+            sorted(
+                (k, _value_identity(v))
+                for k, v in (getattr(fn, "__kwdefaults__", None) or {}).items()
+            )
+        )
+        return (
+            "function",
+            getattr(fn, "__module__", None),
+            qual,
+            id(code) if code is not None else None,
+            defaults,
+            kwdefaults,
+            tuple(cells),
+        )
 
-    if inspect.isfunction(fn) or inspect.ismethod(fn) or inspect.isbuiltin(fn):
-        return ("function", qual)
+    # A builtin function (``len``) or a stray method object without
+    # ``__self__`` has no Python ``__code__``/defaults to fold — its behavior
+    # is fixed by module + name.
+    if inspect.ismethod(fn) or inspect.isbuiltin(fn):
+        return ("function", getattr(fn, "__module__", None), qual)
 
     # Some other callable object (an instance with ``__call__``). Its identity
     # IS the instance; a fresh instance is correctly a different contract.

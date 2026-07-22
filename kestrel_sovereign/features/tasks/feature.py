@@ -92,7 +92,8 @@ class TaskFeature(Feature):
         """
         registry = getattr(agent, "wait_registry", None)
         if registry is not None:
-            registry.register(TaskWaitable(self), replace=True)
+            # Record ownership so base shutdown()/boot rollback unregisters it.
+            self._register_wait_provider(registry, TaskWaitable(self), replace=True)
 
     def set_task_manager(self, task_manager):
         """Set the A2A task manager for querying tasks."""
