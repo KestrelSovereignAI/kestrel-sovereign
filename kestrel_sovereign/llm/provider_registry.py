@@ -35,6 +35,7 @@ Entry-point providers (external packages) register under their advertised
 ``provider_name``; they become a single-route vendor with route ``api``.
 """
 import asyncio
+import hashlib
 import logging
 import os
 from typing import List, Dict, Any, Optional, Tuple
@@ -262,7 +263,7 @@ class ProviderRegistry:
         self._initialized = True
         return self.providers
 
-    async def finalize_providers(self) -> List[ProviderInfo]:
+    async def finalize_providers(self, host_db: Optional[Any] = None) -> List[ProviderInfo]:
         """Async completion pass for routes sync init could not bring up.
 
         ``initialize_providers()`` is synchronous, but some routes need an
@@ -293,7 +294,7 @@ class ProviderRegistry:
                 continue
             try:
                 self._bootstrap_openrouter_key = await _mint_bootstrap_openrouter_key(
-                    management_key
+                    management_key, host_db=host_db
                 )
                 info = self._build_route(vendor, route, vendor_cfg, route_cfg)
                 if info is not None:
@@ -867,15 +868,31 @@ def _openrouter_management_key(route_cfg: Dict[str, Any]) -> Optional[str]:
     return os.environ.get(env_name) or route_cfg.get("management_api_key")
 
 
+def _bootstrap_host_provider_id(management_key: str) -> str:
+    """Stable ``host_service_keys`` provider id for a management key's bootstrap
+    child key. Keyed by a hash of the management key so routes on DIFFERENT
+    OpenRouter accounts persist separate bootstrap keys (billing isolation),
+    mirroring the in-memory cache key.
+    """
+    digest = hashlib.sha256(management_key.encode("utf-8")).hexdigest()[:16]
+    return f"openrouter_bootstrap_{digest}"
+
+
 async def _mint_bootstrap_openrouter_key(
     management_key: str,
     limit_usd: float = _BOOTSTRAP_OPENROUTER_LIMIT_USD,
+    host_db: Optional[Any] = None,
 ) -> str:
-    """Mint (once per process) an ephemeral OpenRouter child key.
+    """Resolve the OpenRouter bootstrap child key, reusing a persisted one.
 
-    Used as the route default when a route declares only a management key. The
-    key is NOT persisted to any DB — it is process-lived and only backs the
-    default route; per-user keys override it in the call path.
+    Used as the route default when a route declares only a management key.
+    Resolution order: process cache → persisted host key (``host_db`` given) →
+    mint a new child key and persist it. Persisting is what stops the key from
+    being re-minted on every cold start — an unbounded child-key leak on the
+    OpenRouter account, since each process previously minted its own and never
+    reused across restarts. Per-user keys still override this in the call path.
+    ``host_db`` is optional: without it (e.g. a pure-SQLite sovereign with no
+    host store) behaviour falls back to the previous mint-per-process.
     """
     global _BOOTSTRAP_OPENROUTER_LOCK
     cached = _BOOTSTRAP_OPENROUTER_KEYS.get(management_key)
@@ -887,6 +904,35 @@ async def _mint_bootstrap_openrouter_key(
         cached = _BOOTSTRAP_OPENROUTER_KEYS.get(management_key)
         if cached is not None:
             return cached
+
+        provider_id = _bootstrap_host_provider_id(management_key)
+
+        # Reuse a previously-persisted bootstrap key so restarts don't mint a
+        # new child key every time.
+        if host_db is not None:
+            try:
+                from kestrel_sovereign.security.host_key_storage import (
+                    HostKeyStorage,
+                    KeyNotConfiguredError,
+                )
+                store = HostKeyStorage(host_db)
+                try:
+                    persisted = await store.get_key(provider_id)
+                except KeyNotConfiguredError:
+                    persisted = None
+                if persisted:
+                    _BOOTSTRAP_OPENROUTER_KEYS[management_key] = persisted
+                    logger.info(
+                        "Reusing persisted bootstrap OpenRouter key as route "
+                        "default (provider=%s)", provider_id,
+                    )
+                    return persisted
+            except Exception as e:  # noqa: BLE001 — never block startup on this
+                logger.warning(
+                    "Could not read persisted bootstrap OpenRouter key "
+                    "(%s); will mint a fresh one", e,
+                )
+
         # Late import: keep the provisioning surface (httpx) out of module
         # import so the registry loads on deployments that never touch it.
         from kestrel_sovereign.features.llm_keys.openrouter_provisioning import (
@@ -902,11 +948,28 @@ async def _mint_bootstrap_openrouter_key(
             )
         finally:
             await service.close()
+
+        # Persist so the next process (cold start) reuses this key instead of
+        # minting another. Best-effort — a store failure just degrades to the
+        # old mint-per-process behaviour, never breaks the route.
+        if host_db is not None:
+            try:
+                from kestrel_sovereign.security.host_key_storage import (
+                    HostKeyStorage,
+                )
+                await HostKeyStorage(host_db).store_key(provider_id, key_info.key)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Could not persist bootstrap OpenRouter key (%s); it will "
+                    "be re-minted on the next cold start", e,
+                )
+
         _BOOTSTRAP_OPENROUTER_KEYS[management_key] = key_info.key
         logger.info(
-            "Minted process-wide bootstrap OpenRouter key "
-            "(limit $%.2f/mo) as OpenRouter route default",
+            "Minted bootstrap OpenRouter key (limit $%.2f/mo) as OpenRouter "
+            "route default%s",
             limit_usd,
+            " (persisted)" if host_db is not None else "",
         )
         return key_info.key
 

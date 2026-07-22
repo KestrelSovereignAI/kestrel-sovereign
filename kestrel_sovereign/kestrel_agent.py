@@ -1319,7 +1319,10 @@ class KestrelAgent(
             # await a genuine async finalize hook.
             finalize_providers = getattr(self.llm_service, "finalize_providers", None)
             if inspect.iscoroutinefunction(finalize_providers):
-                await finalize_providers()
+                # Pass the host-level store (when present) so the registry can
+                # persist + reuse the OpenRouter bootstrap child key across
+                # restarts instead of minting a new one every cold start.
+                await finalize_providers(host_db=self._injected_host_db)
 
             # Initialize TaskManager for A2A unified routing
             # All stores use the abstract data layer (SQLite for sovereign, PostgreSQL for multi-tenant)
