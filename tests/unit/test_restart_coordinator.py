@@ -1951,6 +1951,50 @@ async def test_idle_ignores_signal_log_infra_tasks(tmp_path):
         work_task.cancel()
 
 
+@pytest.mark.asyncio
+async def test_idle_ignores_a2a_question_supervisor_tasks(tmp_path):
+    """#2666: the sender-side ``a2a_question_supervisor:*`` tasks are passive,
+    deadline-bounded waits for a peer's answer whose correlation lives durably
+    in ``pending_a2a_questions`` (the startup replay re-arms them). Counting
+    them as 'busy' pinned a phantom "N background tasks in flight" that
+    survived restarts while ``list_my_tasks`` read empty, wedging
+    idle_agents_only forever when a peer/model outage left questions
+    unanswered. They must be excluded from the idle check — including the
+    ``:replay:`` startup-replay variant — while real work still defers."""
+    feat, _ = await _make_feature(tmp_path)
+
+    async def _never():
+        await asyncio.Event().wait()
+
+    sup_task = asyncio.create_task(
+        _never(), name="a2a_question_supervisor:Claw:task-abc",
+    )
+    replay_task = asyncio.create_task(
+        _never(), name="a2a_question_supervisor:replay:Claw:task-def",
+    )
+    work_task = asyncio.create_task(
+        _never(), name="signal_dispatch:heartbeat:abc123",
+    )
+    try:
+        # Two unanswered questions in flight (the exact live repro: count
+        # pinned at 2) -> the agent is still idle; neither supervisor may
+        # wedge an idle restart.
+        feat.agent._background_tasks = {sup_task, replay_task}
+        idle = feat._agent_appears_idle()
+        assert idle["idle"] is True, idle
+
+        # A real signal_dispatch task still defers, and the supervisors don't
+        # inflate the reported count past the one genuine blocker.
+        feat.agent._background_tasks = {sup_task, replay_task, work_task}
+        busy = feat._agent_appears_idle()
+        assert busy["idle"] is False
+        assert busy["reason"] == "1 background task(s) in flight"
+    finally:
+        sup_task.cancel()
+        replay_task.cancel()
+        work_task.cancel()
+
+
 # ---------------------------------------------------------------------------
 # #1809: prompt wake (on_agent_ready) + same-session routing
 # ---------------------------------------------------------------------------
