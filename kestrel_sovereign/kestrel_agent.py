@@ -8,7 +8,12 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from kestrel_sovereign.storage import AsyncStorage, PrivacyEnforcingStorage
-from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock
+from kestrel_sovereign.storage.privacy_wrapper import (
+    ReentrantTransitionLock,
+    EphemeralPurgeReport,
+    StorePurgeResult,
+    PurgeOutcome,
+)
 from kestrel_sovereign.security.encryption import DecryptionError
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.llm.adapter import LLMResponse
@@ -99,6 +104,12 @@ class PrivacyTransitionResult:
     # confirm (nothing was pending) — so a confirm endpoint/caller can tell an
     # applied transition from a no-op without parsing the message.
     applied: bool = False
+    # True when an EPHEMERAL exit was REFUSED because a required no-trace purge
+    # sweep failed (#2673). The agent stays in EPHEMERAL (the safe, more
+    # restrictive state) and ``applied`` is False — the transition must not be
+    # reported as successful. Distinct from ``requires_confirmation`` (a staged
+    # data-destructive downgrade the user can still confirm).
+    purge_failed: bool = False
 
 
 async def _add_sovereign_ipfs_target_if_active(
@@ -190,6 +201,19 @@ KESTREL_FEATURE_SHUTDOWN_TIMEOUT_S = float(
 # *degraded* — never as "completed".
 KESTREL_SHUTDOWN_TAIL_MIN_STEP_S = float(
     os.environ.get("KESTREL_SHUTDOWN_TAIL_MIN_STEP_S", "0.5")
+)
+
+# Fraction of the EPHEMERAL shutdown-purge budget reserved for the durable
+# purge-FAILURE audit write (#2673). When the purge times out or errors, the
+# audit is the operator's evidence that the no-trace contract could not be
+# certified — but a locked/hung audit DB must not blow the shutdown budget. So
+# the audit tail is carved OUT of the same supplied budget (never added on top):
+# the purge gets ``1 - fraction`` and the audit gets the remainder, keeping the
+# whole operation bounded by the budget the caller supplied. A healthy audit
+# store writes in well under its slice; a hung one is abandoned and the lost
+# evidence is logged at ERROR.
+KESTREL_SHUTDOWN_AUDIT_TAIL_FRACTION = float(
+    os.environ.get("KESTREL_SHUTDOWN_AUDIT_TAIL_FRACTION", "0.25")
 )
 
 
@@ -2391,9 +2415,35 @@ class KestrelAgent(
             and mode != PrivacyMode.EPHEMERAL
         )
         if leaving_ephemeral:
-            await self._purge_ephemeral_leaks(
+            report = await self._purge_ephemeral_leaks(
                 reason=f"ephemeral-mode-exit-to-{mode.value}",
             )
+            if report.required_sweep_failed:
+                # Fail closed (#2673): a required content sweep could not certify
+                # "no trace", so we must NOT claim a successful exit to a less
+                # restrictive mode. Stay in EPHEMERAL (the safe, more restrictive
+                # state) and return an explicit not-applied result — the agent
+                # cannot report success. The failure was already audited by
+                # _purge_ephemeral_leaks. Resolve the storage error and retry.
+                logging.error(
+                    "Refusing EPHEMERAL exit to %s: required purge sweep(s) "
+                    "failed (%s); staying in EPHEMERAL",
+                    mode.value,
+                    [r.store for r in report.failed_stores],
+                )
+                return PrivacyTransitionResult(
+                    message=(
+                        "Privacy mode change refused: the EPHEMERAL no-trace "
+                        "purge could not be certified (a required storage sweep "
+                        "failed). Staying in EPHEMERAL; resolve the storage "
+                        "error and retry."
+                    ),
+                    allows_cloud_llm=privacy_mode_to_config(
+                        self._privacy_mode
+                    ).allows_cloud_llm(),
+                    applied=False,
+                    purge_failed=True,
+                )
 
         self._privacy_mode = mode
         self.storage.set_privacy_mode(mode)
@@ -2486,38 +2536,155 @@ class KestrelAgent(
 
         return voice_switched, biometric_warning
 
-    async def _purge_ephemeral_leaks(self, *, reason: str) -> Dict[str, int]:
-        """Drive the EPHEMERAL hard-purge defense-in-depth (#767).
+    async def _purge_ephemeral_leaks(self, *, reason: str) -> EphemeralPurgeReport:
+        """Drive the EPHEMERAL hard-purge defense-in-depth (#767 / #2673).
 
-        Calls into the storage wrapper's ``purge_ephemeral_session``
-        primitive, then if any rows were destroyed (which means the
-        privacy layer leaked), writes a security_audit_log entry via
-        the SecurityFeature so the operator finds out. Never raises
-        — losing the audit row is preferable to leaving the leak in
-        place.
+        Calls into the storage wrapper's ``purge_ephemeral_session`` primitive
+        and returns its structured :class:`EphemeralPurgeReport` so the caller
+        can distinguish a clean sweep, a leak-and-purge, and a FAILED sweep.
+
+        Three outcomes are audited distinctly (#2673):
+
+        * A raised top-level exception is treated as an UNCERTIFIED purge — the
+          report marks every required content store ``FAILED`` (unknown), NEVER a
+          zeroed clean breakdown, so the caller fails closed instead of claiming
+          a clean transition.
+        * A required-sweep failure writes a ``purge_failed`` security audit.
+        * A real leak (rows destroyed from a content store) writes the existing
+          ``leak_purged`` audit.
+
+        Never raises — losing an audit breadcrumb is preferable to crashing the
+        transition/shutdown, but a failure is always surfaced (report + audit).
         """
-        breakdown: Dict[str, int] = {"conversation_history": 0, "graph_nodes": 0}
         try:
-            breakdown = await self.storage.purge_ephemeral_session(reason=reason)
+            report = await self.storage.purge_ephemeral_session(reason=reason)
         except Exception as e:
-            logging.warning(
-                "ephemeral hard-purge failed (best-effort, continuing): %s", e
+            logging.error(
+                "ephemeral hard-purge raised; treating as an UNCERTIFIED purge "
+                "(required sweeps unknown, session must be treated as leaked): "
+                "%s", e,
             )
-            return breakdown
+            report = EphemeralPurgeReport(
+                StorePurgeResult(store, PurgeOutcome.FAILED, error=repr(e))
+                for store in ("conversation_history", "graph_nodes", "channel_messages")
+            )
 
-        # A genuine privacy leak means data reached tables EPHEMERAL must never
-        # write (conversation_history / graph_nodes). The observability sink is
-        # allowed to hold content-free metric rows during an ephemeral stint
-        # (F076), so its swept counts are reported in the breakdown but do NOT
-        # trip the leak audit.
-        leaked = breakdown.get("conversation_history", 0) + breakdown.get(
-            "graph_nodes", 0
-        )
-        if leaked > 0:
-            await self._record_ephemeral_leak_audit(
-                reason=reason, breakdown=breakdown,
+        if report.required_sweep_failed:
+            await self._record_ephemeral_purge_failure_audit(
+                reason=reason, report=report,
             )
-        return breakdown
+        elif report.leaked_rows > 0:
+            # A genuine privacy leak means data reached tables EPHEMERAL must
+            # never write. The observability sink is allowed to hold content-free
+            # metric rows during an ephemeral stint (F076), so its swept counts
+            # are reported in the breakdown but do NOT trip the leak audit.
+            await self._record_ephemeral_leak_audit(
+                reason=reason, breakdown=dict(report),
+            )
+        return report
+
+    async def _purge_ephemeral_on_shutdown(self, *, timeout: float) -> None:
+        """Run the EPHEMERAL hard-purge during shutdown, bounded by ``timeout``.
+
+        The process is exiting, so there is no mode transition to block — but a
+        failed or timed-out purge must be reported at ERROR severity with durable
+        audit evidence, never swallowed as a best-effort success (#2673).
+
+        The WHOLE operation stays bounded by ``timeout``: a durable-audit tail is
+        carved out of the supplied budget (``KESTREL_SHUTDOWN_AUDIT_TAIL_FRACTION``)
+        so the purge cannot consume the entire window and then leave an *unbounded*
+        audit write to overrun the shutdown deadline against a locked/hung audit
+        DB. The purge gets the majority of the budget; whatever remains before the
+        deadline bounds the post-timeout/error audit write. Re-raises
+        ``CancelledError`` so the shutdown method's durable-tail contract is
+        preserved.
+        """
+        loop = asyncio.get_running_loop()
+        budget = max(0.0, float(timeout))
+        deadline = loop.time() + budget
+        # Reserve a slice of the budget for a durable audit write if the purge
+        # fails/times out, so the audit is bounded by the SAME window — never an
+        # unbounded tail bolted onto the deadline (#2673).
+        reserve = budget * KESTREL_SHUTDOWN_AUDIT_TAIL_FRACTION
+        purge_timeout = max(0.0, budget - reserve)
+
+        try:
+            report = await asyncio.wait_for(
+                self._purge_ephemeral_leaks(reason="ephemeral-agent-shutdown"),
+                timeout=purge_timeout,
+            )
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            logging.error(
+                "ephemeral hard-purge during shutdown TIMED OUT after %.2fs — "
+                "the EPHEMERAL no-trace contract could not be certified before "
+                "exit", purge_timeout,
+            )
+            await self._record_bounded_shutdown_purge_failure_audit(
+                reason="ephemeral-agent-shutdown",
+                failure="shutdown-purge-timeout",
+                deadline=deadline,
+                loop=loop,
+            )
+            return
+        except Exception as e:
+            logging.error(
+                "ephemeral hard-purge during shutdown FAILED: %s — the EPHEMERAL "
+                "no-trace contract could not be certified before exit", e,
+            )
+            await self._record_bounded_shutdown_purge_failure_audit(
+                reason="ephemeral-agent-shutdown",
+                failure=f"shutdown-purge-error: {e!r}",
+                deadline=deadline,
+                loop=loop,
+            )
+            return
+
+        if report is not None and report.required_sweep_failed:
+            # _purge_ephemeral_leaks already wrote the purge_failed audit; make
+            # the shutdown log loud so an operator scanning shutdown output sees
+            # the uncertified no-trace contract.
+            logging.error(
+                "ephemeral hard-purge during shutdown could NOT certify "
+                "no-trace: required sweep(s) failed %s — session must be treated "
+                "as potentially leaked",
+                [r.store for r in report.failed_stores],
+            )
+
+    async def _record_bounded_shutdown_purge_failure_audit(
+        self, *, reason: str, failure: str, deadline: float, loop,
+    ) -> None:
+        """Bound the shutdown-time purge-FAILURE audit by the remaining budget.
+
+        During shutdown the durable ``purge_failed`` audit is the operator's only
+        evidence that EPHEMERAL's no-trace contract could not be certified — but
+        a locked or hung audit database must not overrun the shutdown deadline
+        (#2673). ``deadline`` is the absolute ``loop.time()`` by which the whole
+        purge operation (including this tail) must finish; the remaining slice
+        bounds the write. If the audit cannot be persisted within that slice it
+        is abandoned and the lost evidence is logged at ERROR — never awaited
+        unbounded. ``CancelledError`` propagates so the shutdown durable tail is
+        preserved.
+        """
+        remaining = max(0.0, deadline - loop.time())
+        try:
+            await asyncio.wait_for(
+                self._record_ephemeral_purge_failure_audit(
+                    reason=reason, failure=failure,
+                ),
+                timeout=remaining,
+            )
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            logging.error(
+                "[ephemeral-purge] SECURITY: shutdown purge-failure audit could "
+                "NOT be written within the remaining %.2fs of the shutdown budget "
+                "(reason=%s failure=%s) — durable evidence was not persisted "
+                "before exit; the session must be treated as potentially leaked",
+                remaining, reason, failure,
+            )
 
     async def _record_ephemeral_leak_audit(
         self, *, reason: str, breakdown: Dict[str, int]
@@ -2567,6 +2734,74 @@ class KestrelAgent(
                 "[ephemeral-purge] audit write failed: %s "
                 "(breakdown=%s, reason=%s)",
                 e, breakdown, reason,
+            )
+
+    async def _record_ephemeral_purge_failure_audit(
+        self, *, reason: str, report: Optional[EphemeralPurgeReport] = None,
+        failure: Optional[str] = None,
+    ) -> None:
+        """Write a durable security audit for an EPHEMERAL purge FAILURE (#2673).
+
+        Distinct from :meth:`_record_ephemeral_leak_audit`: a leak means data was
+        found and REMOVED (contract upheld); a purge FAILURE means a required
+        sweep could NOT be certified, so the session must be treated as
+        potentially still leaking. Routes through the same SecurityFeature
+        PermissionStore with ``decision="purge_failed"`` so the operator-visible
+        signal is separate from "leak found and removed". When the audit store is
+        unavailable — or the write itself fails — the evidence is logged at ERROR
+        severity rather than lost silently. Never raises: losing the breadcrumb
+        must not crash a transition or shutdown.
+
+        ``report`` (transition path) carries the per-store outcomes; ``failure``
+        (shutdown timeout / raised error) is a short reason string when there is
+        no report to attach.
+        """
+        try:
+            features = getattr(self, "features", {}) or {}
+            feature = features.get("SecurityFeature") or features.get("Security")
+            permission_store = (
+                getattr(feature, "permission_store", None) if feature else None
+            )
+        except Exception:
+            permission_store = None
+
+        failed_stores: list = []
+        breakdown: Dict[str, int] = {}
+        if report is not None:
+            try:
+                failed_stores = [r.store for r in report.failed_stores]
+                breakdown = dict(report)
+            except Exception:  # noqa: BLE001 - never let report introspection block the audit
+                pass
+
+        if permission_store is None:
+            logging.error(
+                "[ephemeral-purge] SECURITY: purge FAILURE could not be audited "
+                "(store unavailable); reason=%s failed_stores=%s failure=%s "
+                "breakdown=%s", reason, failed_stores, failure, breakdown,
+            )
+            return
+
+        try:
+            import json as _json
+            await permission_store.log_decision(
+                feature_name="ephemeral_purge",
+                tool_name="hard_purge_guard",
+                action="ephemeral_session_close",
+                decision="purge_failed",
+                args_summary=_json.dumps({
+                    "agent_did": getattr(self, "did", None),
+                    "reason": reason,
+                    "failed_stores": failed_stores,
+                    "failure": failure,
+                    "breakdown": breakdown,
+                }),
+            )
+        except Exception as e:
+            logging.error(
+                "[ephemeral-purge] SECURITY: purge-failure audit write failed: "
+                "%s (reason=%s failed_stores=%s failure=%s)",
+                e, reason, failed_stores, failure,
             )
 
 
@@ -4577,28 +4812,14 @@ Expected Duration: {expected_duration}
 
         shutdown_cancelled = False
         try:
-            # EPHEMERAL hard-purge defense-in-depth (#767). If the agent
+            # EPHEMERAL hard-purge defense-in-depth (#767 / #2673). If the agent
             # process is exiting while still in EPHEMERAL, the session is
-            # closing — fire the hard-purge so any leak doesn't survive
-            # the restart. Best-effort; never block shutdown on failure.
+            # closing — fire the hard-purge so any leak doesn't survive the
+            # restart. Shutdown stays bounded, but a failed or timed-out purge is
+            # reported at ERROR severity with durable audit evidence rather than
+            # swallowed as a best-effort success.
             if getattr(self, "_privacy_mode", None) == PrivacyMode.EPHEMERAL:
-                try:
-                    await asyncio.wait_for(
-                        self._purge_ephemeral_leaks(
-                            reason="ephemeral-agent-shutdown",
-                        ),
-                        timeout=_step_budget(),
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except asyncio.TimeoutError:
-                    logging.warning(
-                        "ephemeral hard-purge during shutdown timed out"
-                    )
-                except Exception as e:
-                    logging.warning(
-                        "ephemeral hard-purge during shutdown failed: %s", e
-                    )
+                await self._purge_ephemeral_on_shutdown(timeout=_step_budget())
 
             # Stop heartbeat runner
             if hasattr(self, 'heartbeat_runner') and self.heartbeat_runner:

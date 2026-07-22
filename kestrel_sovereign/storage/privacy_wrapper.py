@@ -1213,6 +1213,107 @@ class PrivacyPolicy:
         )
 
 
+# ── EPHEMERAL hard-purge result contract (#2673) ─────────────────────────────
+#
+# The pre-#2673 purge collapsed every sweep outcome into a single integer and
+# substituted 0 (or {}) whenever a backend raised, so a caller could not tell
+# "nothing to purge" from "could not check/delete". For a mode whose contract is
+# "leave no trace" those are materially different states: a clean zero certifies
+# no-trace, while a FAILED sweep means the session must be treated as potentially
+# leaked. This contract preserves each store's outcome so a required-sweep
+# failure fails the mode exit closed instead of reporting a false clean.
+
+
+class PurgeOutcome(Enum):
+    """Outcome of one EPHEMERAL purge sweep (#2673)."""
+
+    CLEAN = "clean"      # sweep ran, 0 rows — happy path, certifies no-trace
+    PURGED = "purged"    # sweep ran, >0 rows — a real leak was found and removed
+    FAILED = "failed"    # sweep raised — row count UNKNOWN; must not read as clean
+    SKIPPED = "skipped"  # sweep not attempted/refused (no watermark, no agent, unwired)
+
+
+@dataclass(frozen=True)
+class StorePurgeResult:
+    """Structured outcome of purging one backing store during a session close."""
+
+    store: str
+    outcome: PurgeOutcome
+    rows: int = 0
+    error: Optional[str] = None
+
+    @property
+    def failed(self) -> bool:
+        return self.outcome is PurgeOutcome.FAILED
+
+
+# Content stores that hold user text. A FAILED sweep of any of these means the
+# "leave no trace" contract cannot be certified, so mode exit must fail closed.
+# The observability sink (F076) holds content-free metrics and is NOT required —
+# a failure there is recorded but never blocks a transition.
+REQUIRED_CONTENT_STORES = frozenset({
+    "conversation_history",
+    "graph_nodes",
+    "channel_messages",
+})
+
+
+class EphemeralPurgeReport(dict):
+    """Result of :meth:`PrivacyEnforcingStorage.purge_ephemeral_session` (#2673).
+
+    Backward-compatible: it IS a ``{store: rows_destroyed}`` mapping, so existing
+    callers that read ``report["graph_nodes"]`` or compare ``report == {...}``
+    keep working. It ALSO retains each store's structured
+    :class:`StorePurgeResult` in :attr:`store_results`, so a FAILED sweep — whose
+    true row count is unknown and is surfaced as 0 in the flat mapping — stays
+    DISTINGUISHABLE from a clean zero. New callers consult
+    :attr:`required_sweep_failed` before trusting the counts and fail the mode
+    exit closed when a required content sweep could not be certified.
+    """
+
+    def __init__(self, results=None):
+        super().__init__()
+        self.store_results: Dict[str, StorePurgeResult] = {}
+        for result in (results or []):
+            self.record(result)
+
+    def record(self, result: "StorePurgeResult") -> None:
+        """Retain a store's outcome and mirror its count into the flat mapping.
+
+        A FAILED sweep contributes 0 to the flat mapping (its true count is
+        unknown), but is retained as ``FAILED`` in :attr:`store_results` — the 0
+        is never allowed to read as clean because :attr:`required_sweep_failed`
+        trips on the structured outcome, not the integer.
+        """
+        self.store_results[result.store] = result
+        self[result.store] = int(result.rows or 0)
+
+    @property
+    def failed_stores(self) -> "List[StorePurgeResult]":
+        return [r for r in self.store_results.values() if r.outcome is PurgeOutcome.FAILED]
+
+    @property
+    def required_sweep_failed(self) -> bool:
+        """True if any REQUIRED content sweep failed (outcome unknown)."""
+        return any(
+            r.store in REQUIRED_CONTENT_STORES and r.outcome is PurgeOutcome.FAILED
+            for r in self.store_results.values()
+        )
+
+    @property
+    def any_sweep_failed(self) -> bool:
+        """True if any sweep failed at all (required or not)."""
+        return any(r.outcome is PurgeOutcome.FAILED for r in self.store_results.values())
+
+    @property
+    def leaked_rows(self) -> int:
+        """Rows destroyed from REQUIRED content stores — a real privacy leak."""
+        return sum(
+            r.rows for r in self.store_results.values()
+            if r.store in REQUIRED_CONTENT_STORES and r.outcome is PurgeOutcome.PURGED
+        )
+
+
 class PrivacyEnforcingStorage:
     """
     A storage wrapper that enforces privacy mode at the storage layer.
@@ -1339,9 +1440,31 @@ class PrivacyEnforcingStorage:
         self._policy = PrivacyPolicy.from_config(self._privacy_config)
         logger.info(f"Privacy config changed: storage={old_config.storage}->{self._privacy_config.storage}, llm={old_config.llm_location}->{self._privacy_config.llm_location}")
 
+    async def _sweep_store(self, store: str, coro_factory) -> "StorePurgeResult":
+        """Run one purge sweep, mapping a raised backend error to ``FAILED``.
+
+        ``coro_factory`` is a zero-arg callable returning the awaitable, so this
+        helper owns the ``try``/``except``. A raised exception becomes a
+        ``FAILED`` outcome (row count UNKNOWN) rather than a clean zero — that is
+        the collapse the pre-#2673 code did, which let "could not check/delete"
+        read as "nothing found". A successful sweep is ``PURGED`` (>0) or
+        ``CLEAN`` (0).
+        """
+        try:
+            rows = await coro_factory()
+        except Exception as e:  # noqa: BLE001 - every backend failure is retained, not swallowed
+            logger.warning(
+                "purge_ephemeral_session: %s purge failed: %s", store, e
+            )
+            return StorePurgeResult(store, PurgeOutcome.FAILED, error=repr(e))
+        n = int(rows or 0)
+        return StorePurgeResult(
+            store, PurgeOutcome.PURGED if n > 0 else PurgeOutcome.CLEAN, rows=n,
+        )
+
     async def purge_ephemeral_session(
         self, reason: str = "ephemeral-session-close"
-    ) -> Dict[str, int]:
+    ) -> "EphemeralPurgeReport":
         """Hard-purge any data the EPHEMERAL agent may have leaked (#767).
 
         EPHEMERAL is the strongest privacy guarantee Kestrel offers —
@@ -1357,9 +1480,11 @@ class PrivacyEnforcingStorage:
         letting EPHEMERAL data live in trash. We bypass the soft-delete
         code path entirely and call the ``purge_*`` primitives.
 
-        If this method actually finds rows, it WARNs and writes a
-        security_audit_log entry — that's a bug in the privacy layer,
-        and the audit trail is the only way the operator finds out.
+        Every independent sweep is attempted even if a prior one fails, and each
+        outcome is retained (#2673): a raised backend error becomes a ``FAILED``
+        store result (row count unknown) rather than a clean zero. If a real leak
+        is found it WARNs; if a required sweep fails it logs at ERROR — either is
+        a bug in the privacy layer, and these are the operator's signal.
 
         The session-local in-memory buffer (``_session_conversations``)
         is also cleared as a belt-and-braces measure, in case the
@@ -1370,19 +1495,20 @@ class PrivacyEnforcingStorage:
             reason: Audit reason. Defaults to ``ephemeral-session-close``.
 
         Returns:
-            Dict of ``{table_name: rows_destroyed}`` so callers can log.
-            Zero is the happy path; non-zero is a leak.
+            An :class:`EphemeralPurgeReport` — a backward-compatible
+            ``{store: rows_destroyed}`` mapping that ALSO retains each store's
+            structured outcome. A clean zero, a purged non-zero, and a FAILED
+            sweep are all distinguishable; ``report.required_sweep_failed`` is
+            the caller's fail-closed signal.
         """
         agent_id = self.agent_id
         if not agent_id:
             logger.debug("purge_ephemeral_session: no agent_id, skipping")
-            return {
-                "conversation_history": 0,
-                "graph_nodes": 0,
-                "channel_messages": 0,
-            }
-
-        result: Dict[str, int] = {}
+            # Not attempted (no tenant to scope to) — SKIPPED, not a failure.
+            return EphemeralPurgeReport(
+                StorePurgeResult(store, PurgeOutcome.SKIPPED)
+                for store in REQUIRED_CONTENT_STORES
+            )
 
         # Belt-and-braces: clear in-memory ISOLATED buffer too. No row
         # count needed — the buffer never persisted.
@@ -1406,83 +1532,110 @@ class PrivacyEnforcingStorage:
                 "wipe-on-shutdown bug fixed in #867",
                 agent_id, reason,
             )
-            return {
-                "conversation_history": 0,
-                "graph_nodes": 0,
-                "channel_messages": 0,
-            }
+            # A deliberate #867 refusal is SKIPPED, not FAILED — it must not
+            # block mode exit. The watermark safety behaviour is preserved.
+            return EphemeralPurgeReport(
+                StorePurgeResult(store, PurgeOutcome.SKIPPED)
+                for store in REQUIRED_CONTENT_STORES
+            )
 
-        try:
-            convs = await self._storage.purge_conversations_since(
-                since, reason=reason,
-            )
-        except Exception as e:
-            logger.warning(
-                "purge_ephemeral_session: conversation purge failed: %s", e
-            )
-            convs = 0
-        result["conversation_history"] = convs
+        report = EphemeralPurgeReport()
 
-        try:
-            nodes = await self._storage.purge_agent_graph_nodes(
-                since_iso=since,
-            )
-        except Exception as e:
-            logger.warning(
-                "purge_ephemeral_session: graph_nodes purge failed: %s", e
-            )
-            nodes = 0
-        result["graph_nodes"] = nodes
-
-        # Defense-in-depth for the channels feature (#2096 / F112): a
-        # leaked channel_messages row must be swept on EPHEMERAL exit,
-        # scoped to the same watermark. Tolerates the table being absent
-        # when the channels feature was never loaded.
-        try:
-            channel_msgs = await self._storage.purge_channel_messages_since(
-                since, reason=reason,
-            )
-        except Exception as e:
-            logger.warning(
-                "purge_ephemeral_session: channel_messages purge failed: %s", e
-            )
-            channel_msgs = 0
-        result["channel_messages"] = channel_msgs
+        # Attempt ALL independent sweeps, retaining each outcome. A failure in
+        # one never turns into a clean count and never skips the others (#2673).
+        report.record(await self._sweep_store(
+            "conversation_history",
+            lambda: self._storage.purge_conversations_since(since, reason=reason),
+        ))
+        report.record(await self._sweep_store(
+            "graph_nodes",
+            lambda: self._storage.purge_agent_graph_nodes(since_iso=since),
+        ))
+        # Defense-in-depth for the channels feature (#2096 / F112): a leaked
+        # channel_messages row must be swept on EPHEMERAL exit, scoped to the
+        # same watermark. The primitive itself tolerates the table being absent
+        # (channels feature never loaded) and returns 0 — only a genuine backend
+        # error becomes FAILED here.
+        report.record(await self._sweep_store(
+            "channel_messages",
+            lambda: self._storage.purge_channel_messages_since(since, reason=reason),
+        ))
 
         # Safety net: sweep the A2A observability sink (a2a_tool_dispatches /
         # a2a_observability) for rows authored during the EPHEMERAL stint
         # (F076). Content-free counts that were metered are acceptable losses;
         # the contract is "leave no trace" of user content, and tool-call args
-        # are user content.
+        # are user content. This sink is NOT a required content store, so a
+        # failure here is retained (visible) but does not block mode exit.
         if self._observability_purge is not None:
+            obs_counts: Dict[str, int] = {}
             try:
-                obs_counts = await self._observability_purge(since)
-            except Exception as e:
+                obs_counts = await self._observability_purge(since) or {}
+            except Exception as e:  # noqa: BLE001 - retained as non-required outcomes, never clean
+                # The observability sink is NOT a required content store, so a
+                # failure here does not block mode exit — but it must be RETAINED
+                # (never silently read as a clean 0). A structured
+                # ``ObservabilityPurgeError`` carries the per-table successes and
+                # failures, so record each table's true outcome; a plain error
+                # means the whole sink outcome is unknown -> one FAILED entry.
                 logger.warning(
                     "purge_ephemeral_session: observability sweep failed: %s", e
                 )
+                partial = getattr(e, "partial_counts", None) or {}
+                failures = getattr(e, "failures", None) or {}
+                for table, count in partial.items():
+                    n = int(count or 0)
+                    report.record(StorePurgeResult(
+                        table, PurgeOutcome.PURGED if n > 0 else PurgeOutcome.CLEAN, rows=n,
+                    ))
+                if failures:
+                    for table, err in failures.items():
+                        report.record(StorePurgeResult(
+                            table, PurgeOutcome.FAILED, error=str(err),
+                        ))
+                else:
+                    report.record(StorePurgeResult(
+                        "a2a_observability", PurgeOutcome.FAILED, error=repr(e),
+                    ))
                 obs_counts = {}
-            for table, count in (obs_counts or {}).items():
-                result[table] = int(count or 0)
+            for table, count in obs_counts.items():
+                n = int(count or 0)
+                report.record(StorePurgeResult(
+                    table, PurgeOutcome.PURGED if n > 0 else PurgeOutcome.CLEAN, rows=n,
+                ))
 
-        # Leak accounting is scoped to the tables EPHEMERAL should NEVER write
-        # user content to — conversation_history, graph_nodes, and channel_messages
-        # (all three hold user text and are real leaks). The observability sink is
-        # *expected* to hold content-free metric rows during an EPHEMERAL stint
-        # (F076 permits counts/latency to remain), so sweeping those is routine
-        # hygiene, not a privacy-layer leak — counting them would fire a spurious
-        # security audit on every ephemeral session that ran a tool.
-        leaked = (
-            result.get("conversation_history", 0)
-            + result.get("graph_nodes", 0)
-            + result.get("channel_messages", 0)
-        )
-        if leaked > 0:
+        # Three-way accounting (#2673): a FAILED required sweep is the loudest
+        # signal — the no-trace contract could not be certified, so log at ERROR
+        # (the caller fails the transition closed). A real leak (rows destroyed
+        # from a content store) WARNs. Otherwise the sweep is clean. The
+        # observability sink is *expected* to hold content-free metric rows
+        # (F076), so its swept counts are neither a leak nor a required failure.
+        if report.required_sweep_failed:
+            logger.error(
+                "[privacy] ERROR: EPHEMERAL purge could NOT certify no-trace "
+                "(agent=%s, since=%s, reason=%s) — required sweep(s) failed: "
+                "%s; the session MUST be treated as potentially leaked",
+                agent_id, since, reason,
+                {r.store: r.error for r in report.failed_stores},
+            )
+        elif report.leaked_rows > 0:
             logger.warning(
                 "[privacy] WARNING: EPHEMERAL session leaked %d row(s) "
                 "into persistent storage (agent=%s, since=%s, breakdown=%s); "
                 "hard-purged with reason=%s",
-                leaked, agent_id, since, result, reason,
+                report.leaked_rows, agent_id, since, dict(report), reason,
+            )
+        elif report.any_sweep_failed:
+            # A non-required sweep (the F076 observability sink) failed. It does
+            # not block mode exit, but the purge is NOT clean — it must never
+            # read as "no leaks" when a table could not be certified swept.
+            logger.warning(
+                "[privacy] WARNING: EPHEMERAL purge certified the required "
+                "content stores clean, but a non-required sweep FAILED "
+                "(agent=%s, since=%s, reason=%s): %s — the observability sink "
+                "could not be fully swept",
+                agent_id, since, reason,
+                {r.store: r.error for r in report.failed_stores},
             )
         else:
             logger.debug(
@@ -1491,14 +1644,18 @@ class PrivacyEnforcingStorage:
                 agent_id, since,
             )
 
-        # Clear the watermark — the EPHEMERAL stint is over.  Re-entering
-        # EPHEMERAL refreshes it via :meth:`set_privacy_mode`.
-        self._entered_ephemeral_at = None
+        # Clear the watermark only when the sweep ran to completion. If a
+        # required sweep FAILED, PRESERVE it so a retry (the agent stays in
+        # EPHEMERAL because the caller fails the exit closed) re-scopes to the
+        # same stint rather than hitting the #867 no-watermark refusal (#2673).
+        # Re-entering EPHEMERAL refreshes it via :meth:`set_privacy_mode`.
+        if not report.required_sweep_failed:
+            self._entered_ephemeral_at = None
 
         # Audit-log emission is the caller's responsibility — the agent
         # has natural access to its SecurityFeature; the storage wrapper
         # doesn't and shouldn't try to reach back through layers.
-        return result
+        return report
     
     async def _check_write_permission(self, operation_name: str) -> None:
         """Check if write operations are allowed in current mode."""

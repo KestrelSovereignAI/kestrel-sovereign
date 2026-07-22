@@ -24,6 +24,32 @@ from kestrel_sovereign.storage.db.interface import DatabaseBackend
 
 logger = logging.getLogger(__name__)
 
+
+class ObservabilityPurgeError(Exception):
+    """One or more observability purge sweeps failed (#2673).
+
+    The EPHEMERAL leak-purge contract is "leave no trace"; a sweep that could
+    not run must never be reported as a clean zero. ``purge_observability_since``
+    attempts *every* independent table sweep and then raises this if any of them
+    failed, carrying both the per-table successes (``partial_counts``) and the
+    per-table failures (``failures``) so the caller can retain each table's true
+    outcome (``PURGED`` / ``CLEAN`` / ``FAILED``) instead of collapsing the
+    failure into ``0``.
+    """
+
+    def __init__(
+        self,
+        partial_counts: dict[str, int],
+        failures: dict[str, str],
+    ) -> None:
+        self.partial_counts: dict[str, int] = dict(partial_counts)
+        self.failures: dict[str, str] = dict(failures)
+        detail = ", ".join(f"{table}: {err}" for table, err in self.failures.items())
+        super().__init__(
+            f"observability purge failed for {list(self.failures)}: {detail}"
+        )
+
+
 MAX_TOOL_ARGS_JSON_BYTES = 2048
 MAX_TOOL_ERROR_MESSAGE_CHARS = 1024
 
@@ -531,10 +557,17 @@ class ObservabilityStore(UnifiedStoreBase):
 
         Scoped by ``agent_did`` (tool dispatches) / ``agent_name``
         (observability) when provided so a shared PostgreSQL backend never
-        reaches across tenants. Returns ``{table: rows_deleted}``.
+        reaches across tenants.
+
+        Every independent table sweep is attempted even if a prior one fails.
+        On full success returns ``{table: rows_deleted}``. If any sweep fails,
+        raises :class:`ObservabilityPurgeError` carrying the per-table successes
+        and failures — a failed sweep is NEVER collapsed into a clean ``0`` (the
+        pre-#2673 behaviour that let "could not delete" read as "nothing found").
         """
         since_param = self._normalize_since_param(since_iso)
-        result: dict[str, int] = {}
+        counts: dict[str, int] = {}
+        failures: dict[str, str] = {}
 
         dispatch_where = "ts >= ?"
         dispatch_params: list[Any] = [since_param]
@@ -542,13 +575,13 @@ class ObservabilityStore(UnifiedStoreBase):
             dispatch_where += " AND agent_did = ?"
             dispatch_params.append(agent_did)
         try:
-            result["a2a_tool_dispatches"] = await self._backend.execute(
+            counts["a2a_tool_dispatches"] = await self._backend.execute(
                 f"DELETE FROM a2a_tool_dispatches WHERE {dispatch_where}",
                 tuple(dispatch_params),
             )
-        except Exception as exc:  # noqa: BLE001 - best-effort safety net
+        except Exception as exc:  # noqa: BLE001 - retained, never collapsed to a clean 0
             logger.warning("purge_observability_since: tool-dispatch sweep failed: %s", exc)
-            result["a2a_tool_dispatches"] = 0
+            failures["a2a_tool_dispatches"] = repr(exc)
 
         obs_where = "timestamp >= ?"
         obs_params: list[Any] = [since_param]
@@ -556,15 +589,21 @@ class ObservabilityStore(UnifiedStoreBase):
             obs_where += " AND agent_name = ?"
             obs_params.append(agent_name)
         try:
-            result["a2a_observability"] = await self._backend.execute(
+            counts["a2a_observability"] = await self._backend.execute(
                 f"DELETE FROM a2a_observability WHERE {obs_where}",
                 tuple(obs_params),
             )
-        except Exception as exc:  # noqa: BLE001 - best-effort safety net
+        except Exception as exc:  # noqa: BLE001 - retained, never collapsed to a clean 0
             logger.warning("purge_observability_since: observability sweep failed: %s", exc)
-            result["a2a_observability"] = 0
+            failures["a2a_observability"] = repr(exc)
 
-        return result
+        if failures:
+            # Both sweeps were attempted; surface the failure(s) (with the
+            # successful counts riding along) so the EPHEMERAL purge records the
+            # failed table as FAILED rather than a clean zero (#2673).
+            raise ObservabilityPurgeError(counts, failures)
+
+        return counts
 
     def _normalize_since_param(self, since_iso: str) -> Any:
         """Coerce a watermark string into the store's timestamp parameter form.

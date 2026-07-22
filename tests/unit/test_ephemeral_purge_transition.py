@@ -19,6 +19,28 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.features.privacy.feature import PrivacyTransitionDecision
+from kestrel_sovereign.storage.privacy_wrapper import (
+    EphemeralPurgeReport,
+    StorePurgeResult,
+    PurgeOutcome,
+)
+
+
+def _report_from_counts(counts):
+    """Build the structured purge report the storage layer now returns (#2673).
+
+    A positive count models a purged leak; zero models a clean sweep. Failures
+    are modelled separately (via a raised ``side_effect`` or an explicit FAILED
+    ``StorePurgeResult``) so a clean zero is never confused with a failure.
+    """
+    return EphemeralPurgeReport(
+        StorePurgeResult(
+            store,
+            PurgeOutcome.PURGED if count > 0 else PurgeOutcome.CLEAN,
+            rows=count,
+        )
+        for store, count in counts.items()
+    )
 
 
 def _make_agent(*, initial_mode=PrivacyMode.EPHEMERAL, leak_breakdown=None):
@@ -38,7 +60,9 @@ def _make_agent(*, initial_mode=PrivacyMode.EPHEMERAL, leak_breakdown=None):
     agent.did = "did:test:agent"
 
     storage = MagicMock()
-    storage.purge_ephemeral_session = AsyncMock(return_value=leak_breakdown)
+    storage.purge_ephemeral_session = AsyncMock(
+        return_value=_report_from_counts(leak_breakdown)
+    )
     storage.set_privacy_mode = MagicMock()
     agent.storage = storage
 
@@ -215,10 +239,12 @@ async def test_audit_failure_does_not_block_purge_or_transition():
 
 
 @pytest.mark.asyncio
-async def test_purge_failure_does_not_block_transition():
-    """If the storage layer purge itself fails (corrupt DB, lock), the
-    transition still completes. We log a warning but don't strand the
-    agent in EPHEMERAL forever because of a downstream issue.
+async def test_required_purge_failure_blocks_transition_and_stays_ephemeral():
+    """#2673: if a required no-trace purge sweep fails (corrupt DB, lock), the
+    EPHEMERAL exit must be REFUSED — the agent cannot claim a clean transition
+    it could not certify. It stays in EPHEMERAL (the safe, more restrictive
+    state) and the failure is audited as ``purge_failed`` (distinct from a
+    leak).
     """
     agent, storage, permission_store = _make_agent(
         initial_mode=PrivacyMode.EPHEMERAL,
@@ -227,8 +253,137 @@ async def test_purge_failure_does_not_block_transition():
 
     result = await agent._set_privacy_mode_with_effects_locked(PrivacyMode.NORMAL)
 
-    assert result.message == "Privacy mode changed."
-    storage.set_privacy_mode.assert_called_once_with(PrivacyMode.NORMAL)
+    # Not applied, explicitly flagged as a purge failure — never reported as
+    # a successful mode change.
+    assert result.applied is False
+    assert result.purge_failed is True
+    # The mode was NOT flipped and no state holder changed.
+    assert agent._privacy_mode == PrivacyMode.EPHEMERAL
+    storage.set_privacy_mode.assert_not_called()
+
+    # A distinct purge-failure audit was written (not a leak_purged audit).
+    permission_store.log_decision.assert_awaited_once()
+    kwargs = permission_store.log_decision.await_args.kwargs
+    assert kwargs["decision"] == "purge_failed"
+    summary = json.loads(kwargs["args_summary"])
+    assert summary["reason"].startswith("ephemeral-mode-exit-to-")
+    assert set(summary["failed_stores"]) == {
+        "conversation_history",
+        "graph_nodes",
+        "channel_messages",
+    }
+
+
+@pytest.mark.asyncio
+async def test_partial_required_sweep_failure_blocks_transition():
+    """#2673: even a SINGLE required content-store failure (with the others
+    clean) must block the exit — a partial certification is no certification.
+    A FAILED sweep is distinguishable from a clean zero via the structured
+    report, so it cannot be waved through as ``conversation_history: 0``.
+    """
+    agent, storage, permission_store = _make_agent(
+        initial_mode=PrivacyMode.EPHEMERAL,
+    )
+    # conversation_history clean, graph_nodes FAILED, channel_messages clean.
+    storage.purge_ephemeral_session = AsyncMock(return_value=EphemeralPurgeReport([
+        StorePurgeResult("conversation_history", PurgeOutcome.CLEAN, rows=0),
+        StorePurgeResult("graph_nodes", PurgeOutcome.FAILED, error="disk I/O error"),
+        StorePurgeResult("channel_messages", PurgeOutcome.CLEAN, rows=0),
+    ]))
+
+    result = await agent._set_privacy_mode_with_effects_locked(PrivacyMode.NORMAL)
+
+    assert result.applied is False
+    assert result.purge_failed is True
+    assert agent._privacy_mode == PrivacyMode.EPHEMERAL
+    storage.set_privacy_mode.assert_not_called()
+    kwargs = permission_store.log_decision.await_args.kwargs
+    assert kwargs["decision"] == "purge_failed"
+    summary = json.loads(kwargs["args_summary"])
+    assert summary["failed_stores"] == ["graph_nodes"]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_purge_failure_records_durable_audit_and_does_not_raise():
+    """#2673 shutdown-time failure: an EPHEMERAL agent exiting while its purge
+    fails must NOT report false success. Shutdown stays bounded and the failure
+    is recorded as durable ``purge_failed`` audit evidence rather than swallowed.
+    """
+    agent, storage, permission_store = _make_agent(
+        initial_mode=PrivacyMode.EPHEMERAL,
+    )
+    storage.purge_ephemeral_session.side_effect = RuntimeError("DB locked at shutdown")
+
+    # Must not raise — shutdown continues.
+    await agent._purge_ephemeral_on_shutdown(timeout=5.0)
+
+    permission_store.log_decision.assert_awaited_once()
+    kwargs = permission_store.log_decision.await_args.kwargs
+    assert kwargs["decision"] == "purge_failed"
+    summary = json.loads(kwargs["args_summary"])
+    assert summary["reason"] == "ephemeral-agent-shutdown"
+    assert set(summary["failed_stores"]) == {
+        "conversation_history",
+        "graph_nodes",
+        "channel_messages",
+    }
+
+
+@pytest.mark.asyncio
+async def test_shutdown_purge_timeout_records_durable_audit():
+    """#2673 shutdown-time timeout: a purge that hangs past the shutdown budget
+    is bounded by the timeout and reported as a durable ``purge_failed`` audit
+    (failure=shutdown-purge-timeout), never a best-effort success.
+    """
+    import asyncio
+
+    agent, storage, permission_store = _make_agent(
+        initial_mode=PrivacyMode.EPHEMERAL,
+    )
+
+    async def _never_returns(*args, **kwargs):
+        await asyncio.sleep(10)
+
+    # Replace the mock with a real hanging coroutine so wait_for times out.
+    storage.purge_ephemeral_session = _never_returns
+
+    await agent._purge_ephemeral_on_shutdown(timeout=0.05)
+
+    permission_store.log_decision.assert_awaited_once()
+    kwargs = permission_store.log_decision.await_args.kwargs
+    assert kwargs["decision"] == "purge_failed"
+    summary = json.loads(kwargs["args_summary"])
+    assert summary["failure"] == "shutdown-purge-timeout"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_audit_write_is_bounded_by_budget():
+    """#2673: a hung/locked audit DB after a purge timeout must NOT overrun the
+    shutdown budget. The durable audit tail is carved from the supplied budget,
+    so ``_purge_ephemeral_on_shutdown`` stays bounded even when BOTH the purge
+    and the audit write hang. Before the fix the post-timeout audit was awaited
+    unbounded and a locked audit DB could exceed the shutdown deadline.
+    """
+    import asyncio
+    import time
+
+    agent, storage, permission_store = _make_agent(
+        initial_mode=PrivacyMode.EPHEMERAL,
+    )
+
+    async def _never_returns(*args, **kwargs):
+        await asyncio.sleep(10)
+
+    # Both the purge AND the durable audit write hang far past the budget.
+    storage.purge_ephemeral_session = _never_returns
+    permission_store.log_decision = AsyncMock(side_effect=_never_returns)
+
+    start = time.monotonic()
+    await agent._purge_ephemeral_on_shutdown(timeout=0.1)
+    elapsed = time.monotonic() - start
+
+    # Bounded by the 0.1s budget (generous CI headroom), NOT the 10s audit hang.
+    assert elapsed < 1.0, f"shutdown purge overran its budget: {elapsed:.2f}s"
 
 
 @pytest.mark.asyncio
