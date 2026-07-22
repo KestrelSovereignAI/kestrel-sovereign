@@ -1845,6 +1845,77 @@ async def _phoenix_tracing_status(app) -> dict:
     }
 
 
+async def _agent_detailed_health(agent) -> dict:
+    """Compute the detailed health result for a single agent.
+
+    Prefers the agent's ``HealthFeature.get_latest()`` (its cached liveness
+    result); falls back to running the check suite directly when the feature is
+    absent. The returned dict always carries at least ``status`` and ``checks``.
+    Shared by the single-agent and multi-agent (``agent_manager``) branches of
+    ``/health/detailed`` so a managed fleet is evaluated with the same logic as
+    a lone default agent (#2698).
+    """
+    features = getattr(agent, 'features', {})
+    health_feature = None
+    for feat in features.values() if isinstance(features, dict) else features:
+        if feat.__class__.__name__ == "HealthFeature":
+            health_feature = feat
+            break
+
+    if health_feature:
+        result = await health_feature.get_latest()
+        if isinstance(result, dict):
+            return result
+        return {"status": "unhealthy", "checks": []}
+
+    # Fallback: run checks directly without the feature.
+    from kestrel_sovereign.features.health.checks import (
+        check_bootstrap_state, check_context_budget, check_database,
+        check_disk_space, check_llm_service, check_memory_system,
+    )
+    db = None
+    if hasattr(agent, 'storage') and agent.storage:
+        db = getattr(agent.storage, 'db', None)
+
+    checks = [
+        await check_database(db),
+        await check_llm_service(agent),
+        await check_memory_system(agent),
+        await check_disk_space(),
+        await check_context_budget(agent),
+        await check_bootstrap_state(agent),
+    ]
+    statuses = [c.get("status") for c in checks]
+    if "fail" in statuses:
+        overall = "unhealthy"
+    elif "warn" in statuses:
+        overall = "degraded"
+    else:
+        overall = "healthy"
+    return {"status": overall, "checks": checks}
+
+
+def _roll_up_fleet_status(agent_statuses: list) -> str:
+    """Three-state rollup over a managed fleet's per-agent statuses (#2698).
+
+    - ``healthy`` only when every managed agent is healthy.
+    - ``unhealthy`` only when zero managed agents are healthy.
+    - ``degraded`` otherwise (some healthy, some not — a partial outage).
+
+    This mirrors the single-agent path's warn/fail -> degraded/unhealthy
+    semantics so a partial fleet outage is surfaced at the top level rather than
+    masked by one healthy peer.
+    """
+    if not agent_statuses:
+        return "unhealthy"
+    healthy = sum(1 for status in agent_statuses if status == "healthy")
+    if healthy == len(agent_statuses):
+        return "healthy"
+    if healthy == 0:
+        return "unhealthy"
+    return "degraded"
+
+
 @app.get("/health/detailed")
 async def health_detailed(request: Request):
     """Authenticated operator diagnostics using the HealthFeature.
@@ -1869,52 +1940,53 @@ async def health_detailed(request: Request):
                 "tracing": tracing,
             },
         )
-    if not agent:
+    if agent:
+        result = await _agent_detailed_health(agent)
+        if isinstance(result, dict):
+            result.setdefault("tracing", tracing)
+        return result
+
+    # No singleton default agent (multi-agent deployments set app.state.agent to
+    # None). Resolve health from the live fleet rather than reporting a false
+    # total outage while managed agents serve traffic (#2698).
+    managed = manager.list_agents() if manager is not None else {}
+    if managed:
+        import asyncio
+
+        names = list(managed.keys())
+        results = await asyncio.gather(
+            *(_agent_detailed_health(a) for a in managed.values()),
+            return_exceptions=True,
+        )
+        breakdown: dict = {}
+        for name, res in zip(names, results):
+            if isinstance(res, BaseException):
+                breakdown[name] = {
+                    "status": "unhealthy",
+                    "checks": [],
+                    "error": str(res),
+                }
+            else:
+                breakdown[name] = {
+                    "status": res.get("status", "unhealthy"),
+                    "checks": res.get("checks", []),
+                }
+        overall = _roll_up_fleet_status(
+            [entry["status"] for entry in breakdown.values()]
+        )
         return {
-            "status": "unhealthy",
-            "error": "No agent available",
+            "status": overall,
+            "agents": breakdown,
             "checks": [],
             "tracing": tracing,
         }
 
-    features = getattr(agent, 'features', {})
-    health_feature = None
-    for feat in features.values() if isinstance(features, dict) else features:
-        if feat.__class__.__name__ == "HealthFeature":
-            health_feature = feat
-            break
-
-    if not health_feature:
-        # Fallback: run checks directly without the feature
-        from kestrel_sovereign.features.health.checks import (
-            check_bootstrap_state, check_context_budget, check_database,
-            check_disk_space, check_llm_service, check_memory_system,
-        )
-        db = None
-        if hasattr(agent, 'storage') and agent.storage:
-            db = getattr(agent.storage, 'db', None)
-
-        checks = [
-            await check_database(db),
-            await check_llm_service(agent),
-            await check_memory_system(agent),
-            await check_disk_space(),
-            await check_context_budget(agent),
-            await check_bootstrap_state(agent),
-        ]
-        statuses = [c.get("status") for c in checks]
-        if "fail" in statuses:
-            overall = "unhealthy"
-        elif "warn" in statuses:
-            overall = "degraded"
-        else:
-            overall = "healthy"
-        return {"status": overall, "checks": checks, "tracing": tracing}
-
-    result = await health_feature.get_latest()
-    if isinstance(result, dict):
-        result.setdefault("tracing", tracing)
-    return result
+    return {
+        "status": "unhealthy",
+        "error": "No agent available",
+        "checks": [],
+        "tracing": tracing,
+    }
 
 
 def _enforce_host_csrf(request: Request):
