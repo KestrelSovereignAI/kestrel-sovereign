@@ -578,7 +578,7 @@ def _apply_platform_host_port(config, env) -> None:
 _PHOENIX_STARTUP_BUDGET_SECONDS = 180.0
 
 
-async def _supervise_phoenix_startup(supervisor) -> None:
+async def _supervise_phoenix_startup(app, supervisor) -> None:
     """Bring Phoenix up in the background so host boot never blocks on it (#2589).
 
     Runs ``supervisor.start`` (adopt-or-reap + spawn) off the event loop, then
@@ -586,33 +586,76 @@ async def _supervise_phoenix_startup(supervisor) -> None:
     outright — a still-starting child (creating its SQLite schema on first boot)
     reports ``running`` and is left alone. Adopt-or-reap makes re-invocation
     safe: a healthy orphan is adopted rather than duplicated.
+
+    A terminal failure is NOT silent (#2690): when ``start`` returns ``False``
+    (custody, port-ownership, or spawn failure — it already logged the specific
+    cause at ERROR), when the retry budget expires without reachability, or on an
+    unexpected error, this records ``app.state.phoenix_disabled_reason`` and logs
+    one ERROR with an operator action. ``/health/detailed`` then surfaces
+    'tracing disabled: <reason>' instead of ``disabled_reason: null``. The reason
+    is cleared automatically once Phoenix becomes reachable (either here on a
+    slow start, or by ``_phoenix_tracing_status`` when it probes the port). The
+    supervisor reference is left on ``app.state.phoenix`` so a slow child can
+    still recover through reachability gating and shutdown can always reap it.
     """
     import asyncio
     import time as _time
 
+    def _disable(reason: str, action: str) -> None:
+        app.state.phoenix_disabled_reason = reason
+        logger.error(
+            "Phoenix tracing DISABLED — %s. Operator action: %s; no traces are "
+            "recorded until then.",
+            reason,
+            action,
+        )
+
     try:
         # Initial adopt-or-reap + spawn, off the event loop (subprocess launch +
         # a short reachability probe).
-        await asyncio.to_thread(supervisor.start, wait_for_health=False)
+        started = await asyncio.to_thread(supervisor.start, wait_for_health=False)
+        if not started:
+            _disable(
+                "supervised start failed (custody, port ownership, or spawn — "
+                "see the ERROR logged above for the specific cause)",
+                "resolve the cause above (e.g. stop any process holding the "
+                "Phoenix port) and restart Kestrel",
+            )
+            return
         deadline = _time.monotonic() + _PHOENIX_STARTUP_BUDGET_SECONDS
         while _time.monotonic() < deadline:
             if await supervisor.is_reachable():
                 logger.info("Phoenix trace backend is reachable.")
+                # Recovered — clear any earlier transient disabled reason.
+                app.state.phoenix_disabled_reason = None
                 return
             if not supervisor.running:
                 # The child exited before binding — try a fresh (re)start.
                 logger.info("Phoenix child not running yet — restarting.")
-                await asyncio.to_thread(supervisor.start, wait_for_health=False)
+                restarted = await asyncio.to_thread(
+                    supervisor.start, wait_for_health=False
+                )
+                if not restarted:
+                    _disable(
+                        "supervised restart failed (see the ERROR logged above "
+                        "for the specific cause)",
+                        "resolve the cause above and restart Kestrel",
+                    )
+                    return
             await asyncio.sleep(2.0)
-        logger.warning(
-            "Phoenix did not become reachable within %.0fs — /phoenix returns "
-            "503 until it recovers.",
-            _PHOENIX_STARTUP_BUDGET_SECONDS,
+        _disable(
+            "Phoenix did not become reachable within "
+            f"{_PHOENIX_STARTUP_BUDGET_SECONDS:.0f}s",
+            "inspect phoenix.log in the trace working directory, then restart "
+            "Kestrel",
         )
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - Phoenix must never crash the host
-        logger.warning("Phoenix background supervision error: %s", exc)
+        _disable(
+            f"background supervision error: {exc}",
+            "check the host logs and restart Kestrel",
+        )
 
 
 @asynccontextmanager
@@ -631,8 +674,12 @@ async def lifespan(app: FastAPI):
     # installed or KESTREL_PHOENIX_ENABLED=0 — the host is unaffected.
     app.state.phoenix = None
     app.state.phoenix_task = None
+    # Reason tracing is off, surfaced on the authenticated /health/detailed so a
+    # silent-off boot is visible to operators (#2690). ``None`` == not disabled.
+    app.state.phoenix_disabled_reason = None
     try:
         from kestrel_sovereign.phoenix_supervisor import (
+            PhoenixStorageError,
             PhoenixSupervisor,
             autowire_otel_project,
             autowire_otlp_endpoint,
@@ -641,39 +688,62 @@ async def lifespan(app: FastAPI):
 
         if should_supervise_phoenix():
             supervisor = PhoenixSupervisor()
-            # Privacy gate (#2609): establish/migrate private trace custody
-            # before advertising a local OTLP collector to the host or agents.
-            # A failure leaves app.state.phoenix unset and the endpoint unwired,
-            # so tracing is clearly disabled rather than writing insecurely.
-            await asyncio.to_thread(supervisor.prepare_storage)
-            # Track the supervisor immediately so /phoenix + the mint can gate on
-            # reachability (503 until Phoenix answers). Zero-config (INV-SOLO):
-            # default the OTLP endpoint to the local Phoenix collector for this
-            # process AND for env inherited by spawned agents, unless the operator
-            # already set it.
-            app.state.phoenix = supervisor
-            endpoint = autowire_otlp_endpoint(os.environ)
-            if endpoint:
-                logger.info(
-                    "OTEL_EXPORTER_OTLP_ENDPOINT auto-set to local Phoenix (%s)",
-                    endpoint,
+            try:
+                # Custody-aware reconcile BEFORE prepare_storage (#2690): reap a
+                # leaked legacy-store (or unidentified) Phoenix holding the port
+                # so the legacy migration then sees a *stopped* store. Without
+                # this, a live legacy Phoenix is adopted yet custody refuses to
+                # migrate it, and tracing goes silently off for the whole boot.
+                await asyncio.to_thread(supervisor.reconcile_storage_conflict)
+                # Privacy gate (#2609): establish/migrate private trace custody
+                # before advertising a local OTLP collector to the host or
+                # agents. A failure leaves app.state.phoenix unset and the
+                # endpoint unwired, so tracing is clearly disabled rather than
+                # writing insecurely.
+                await asyncio.to_thread(supervisor.prepare_storage)
+            except PhoenixStorageError as exc:
+                # Never a silent-off boot (#2690): log at ERROR once with a
+                # clear operator action and record the reason for /health.
+                reason = f"private trace-store custody could not be established: {exc}"
+                logger.error(
+                    "Phoenix tracing DISABLED — %s. Operator action: resolve the "
+                    "storage conflict reported above (stop any stale Phoenix, then "
+                    "restart Kestrel); no traces are recorded until then.",
+                    reason,
                 )
-            # Group host + spawned-agent traces under a single Phoenix project
-            # (obs#32). Mutates os.environ so subprocess agents inherit it; the
-            # SDK's tracing bootstrap (>= 0.30.2) reads KESTREL_OTEL_PROJECT.
-            project = autowire_otel_project(os.environ)
-            if project:
-                logger.info(
-                    "KESTREL_OTEL_PROJECT auto-set to '%s' (fleet-scoped traces)",
-                    project,
+                app.state.phoenix = None
+                app.state.phoenix_disabled_reason = reason
+            else:
+                # Track the supervisor immediately so /phoenix + the mint can
+                # gate on reachability (503 until Phoenix answers). Zero-config
+                # (INV-SOLO): default the OTLP endpoint to the local Phoenix
+                # collector for this process AND for env inherited by spawned
+                # agents, unless the operator already set it.
+                app.state.phoenix = supervisor
+                endpoint = autowire_otlp_endpoint(os.environ)
+                if endpoint:
+                    logger.info(
+                        "OTEL_EXPORTER_OTLP_ENDPOINT auto-set to local Phoenix (%s)",
+                        endpoint,
+                    )
+                # Group host + spawned-agent traces under a single Phoenix
+                # project (obs#32). Mutates os.environ so subprocess agents
+                # inherit it; the SDK's tracing bootstrap (>= 0.30.2) reads
+                # KESTREL_OTEL_PROJECT.
+                project = autowire_otel_project(os.environ)
+                if project:
+                    logger.info(
+                        "KESTREL_OTEL_PROJECT auto-set to '%s' (fleet-scoped traces)",
+                        project,
+                    )
+                # Non-blocking first boot (#2589): Phoenix's first start (SQLite
+                # schema creation) can exceed the launcher's health window. Bring
+                # it up in the BACKGROUND (adopt-or-reap + retry) so the host's
+                # own /health never waits on Phoenix; /phoenix returns 503 until
+                # ready.
+                app.state.phoenix_task = asyncio.create_task(
+                    _supervise_phoenix_startup(app, supervisor)
                 )
-            # Non-blocking first boot (#2589): Phoenix's first start (SQLite
-            # schema creation) can exceed the launcher's health window. Bring it
-            # up in the BACKGROUND (adopt-or-reap + retry) so the host's own
-            # /health never waits on Phoenix; /phoenix returns 503 until ready.
-            app.state.phoenix_task = asyncio.create_task(
-                _supervise_phoenix_startup(supervisor)
-            )
         else:
             from kestrel_sovereign.phoenix_supervisor import (
                 _running_under_pytest,
@@ -692,8 +762,16 @@ async def lifespan(app: FastAPI):
                     phoenix_available(),
                 )
     except Exception as exc:  # noqa: BLE001 - Phoenix must never block startup
-        logger.warning("Phoenix supervision setup failed: %s", exc)
+        # Never a silent-off boot (#2690): ERROR once with an operator action,
+        # and surface the reason on /health/detailed.
+        reason = f"supervision setup failed: {exc}"
+        logger.error(
+            "Phoenix tracing DISABLED — %s. Operator action: check the host logs "
+            "above and restart Kestrel; no traces are recorded until then.",
+            reason,
+        )
         app.state.phoenix = None
+        app.state.phoenix_disabled_reason = reason
 
     # Detect multi-agent mode
     multi_agent_env = os.environ.get("KESTREL_MULTI_AGENT", "").lower() in ("1", "true", "yes")
@@ -1737,6 +1815,36 @@ def health_check(request: Request):
     )
 
 
+async def _phoenix_tracing_status(app) -> dict:
+    """Phoenix tracing status for /health/detailed (#2690).
+
+    Surfaces whether the trace backend is enabled, whether it is currently
+    reachable, and — critically — *why* it is off when supervision setup failed
+    (``phoenix_disabled_reason``). This makes a silent-off boot visible to
+    operators instead of only manifesting as a mint 503 and dead embeds. Never
+    raises: a probe error degrades to ``reachable: False``.
+    """
+    supervisor = getattr(app.state, "phoenix", None)
+    disabled_reason = getattr(app.state, "phoenix_disabled_reason", None)
+    reachable = False
+    if supervisor is not None:
+        try:
+            reachable = await supervisor.is_reachable()
+        except Exception:  # noqa: BLE001 - health must never crash on a probe
+            reachable = False
+        if reachable and disabled_reason is not None:
+            # Phoenix recovered after a transient startup stall (e.g. a slow
+            # first-boot schema build that outran the background budget) — clear
+            # the now-stale disabled reason so health reflects live state (#2690).
+            app.state.phoenix_disabled_reason = None
+            disabled_reason = None
+    return {
+        "enabled": supervisor is not None,
+        "reachable": reachable,
+        "disabled_reason": disabled_reason,
+    }
+
+
 @app.get("/health/detailed")
 async def health_detailed(request: Request):
     """Authenticated operator diagnostics using the HealthFeature.
@@ -1747,6 +1855,9 @@ async def health_detailed(request: Request):
     """
     agent = getattr(request.state, 'agent', None) or getattr(request.app.state, 'agent', None)
     manager = getattr(request.app.state, "agent_manager", None)
+    # Tracing status is surfaced on every branch so an off/unreachable trace
+    # backend (and its disabled reason) is visible regardless of agent health.
+    tracing = await _phoenix_tracing_status(request.app)
     safe_mode_records = _constitution_safe_mode_records(agent, manager)
     if safe_mode_records:
         return JSONResponse(
@@ -1755,10 +1866,16 @@ async def health_detailed(request: Request):
                 "status": "restricted",
                 "constitution_safe_mode": safe_mode_records,
                 "checks": [],
+                "tracing": tracing,
             },
         )
     if not agent:
-        return {"status": "unhealthy", "error": "No agent available", "checks": []}
+        return {
+            "status": "unhealthy",
+            "error": "No agent available",
+            "checks": [],
+            "tracing": tracing,
+        }
 
     features = getattr(agent, 'features', {})
     health_feature = None
@@ -1792,9 +1909,12 @@ async def health_detailed(request: Request):
             overall = "degraded"
         else:
             overall = "healthy"
-        return {"status": overall, "checks": checks}
+        return {"status": overall, "checks": checks, "tracing": tracing}
 
-    return await health_feature.get_latest()
+    result = await health_feature.get_latest()
+    if isinstance(result, dict):
+        result.setdefault("tracing", tracing)
+    return result
 
 
 def _enforce_host_csrf(request: Request):

@@ -600,25 +600,128 @@ class PhoenixSupervisor:
         except OSError:
             return False
 
-    def _pids_listening_on_port(self) -> list[int]:
-        """Best-effort PIDs holding the Phoenix port (POSIX ``lsof``; [] elsewhere).
+    def _legacy_store_pid(self) -> Optional[int]:
+        """PID recorded in the legacy store's pidfile, or ``None``.
 
-        Lets adopt-or-reap discover the process that actually bound the port,
-        rather than trusting the pidfile alone — the pidfile can name a zombie
-        that lost the race for the port (the split-brain observed on #2589).
+        Returns a PID only when this supervisor uses the default resolver
+        (the only configuration that migrates) AND a distinct legacy
+        ``phoenix/`` store is actually present with a pidfile. This is the
+        same legacy-store signal :meth:`_migrate_legacy_storage` consults, so
+        adopt-or-reap and the pre-storage reconcile route on it without an
+        ``lsof`` dependency (#2690).
         """
-        if sys.platform == "win32":
-            return []
+        if not self._uses_default_working_dir:
+            return None
+        legacy = legacy_phoenix_working_dir()
+        if legacy == self.working_dir or not _path_exists(legacy):
+            return None
+        return _read_pid_file(legacy / "phoenix.pid")
+
+    def _port_listener_pids(self) -> list[int]:
+        """Live PIDs actually listening on the Phoenix port (cross-platform, #2690).
+
+        Delegates to the shared :meth:`ProcessManager.find_pids_on_port` lookup
+        (``psutil`` first, then ``netstat``/``lsof``), so port ownership is
+        established the SAME way on every platform — Windows and hosts without
+        ``lsof`` included. A pidfile PID is **never** treated as proof of
+        ownership: it can name a zombie that lost the race for the port, a
+        still-live but non-listening child, or a reused PID (all observed on
+        #2589/#2690). When no listener can be identified this returns ``[]``,
+        which callers treat as "ownership unknown" and fail closed rather than
+        trusting the pidfile.
+        """
+        from kestrel_sovereign.multi_agent.process_manager import ProcessManager
+
         try:
-            out = subprocess.run(
-                ["lsof", "-iTCP:%d" % self.port, "-sTCP:LISTEN", "-t", "-Pn"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            return sorted({int(p) for p in out.stdout.split() if p.isdigit()})
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError):
+            pids = ProcessManager.find_pids_on_port(self.port)
+        except Exception:  # noqa: BLE001 - discovery must never raise into custody
             return []
+        return [p for p in pids if self._pid_alive(p)]
+
+    def reconcile_storage_conflict(self) -> None:
+        """Reap a legacy-store (or unidentified) Phoenix holding our port (#2690).
+
+        Custody-aware reconcile that MUST run *before* :meth:`prepare_storage`
+        (in both the host lifespan and :meth:`start`). A leaked pre-migration
+        Phoenix serving the legacy repo-relative store can keep the port across
+        a restart. If it survives into ``prepare_storage``, the legacy
+        migration refuses to move a *live* store (custody stays read-only,
+        #2627) — yet adopt-or-reap would otherwise adopt that same live
+        Phoenix, leaving the whole boot on the divergent legacy store with the
+        OTLP autowiring unset and tracing silently off (#2690).
+
+        So, before storage is prepared, identify what holds the port and, if it
+        is not our private-store child, reap it (SIGTERM → bounded wait →
+        SIGKILL). The legacy migration then sees a *stopped* store and a
+        fresh/adopted child serves the private store.
+
+        Ownership is resolved through the shared cross-platform listener lookup
+        (:meth:`_port_listener_pids` → ``ProcessManager.find_pids_on_port``); a
+        pidfile PID is never treated as proof of ownership. Routing:
+
+        * listener PID matches the PRIVATE pidfile → leave it (adoptable later)
+        * listener PID matches the LEGACY pidfile → reap it (a legacy-store
+          Phoenix is never adoptable)
+        * matches neither → reap conservatively (an unidentifiable Phoenix
+          squatting our port is never trustworthy to adopt — a known
+          private-store child is spawned instead)
+        * port is healthy but NO listener PID can be identified → **fail closed**
+          (:class:`PhoenixStorageError`): migrating now would strand the boot on
+          a divergent store and an unverifiable listener is never safe to adopt,
+          so leave the legacy store untouched for the operator to resolve.
+
+        Scoped to the default resolver with a legacy store actually present —
+        the only configuration that migrates — so an explicit
+        ``KESTREL_PHOENIX_WORKING_DIR`` never triggers a reap. Idempotent:
+        after the reap the port is free, so a repeat boot is a no-op here and
+        converges through adopt-or-reap instead.
+
+        Raises:
+            PhoenixStorageError: a Phoenix holds the port with an
+                unidentifiable owner while a legacy store is still present;
+                callers must leave tracing disabled (fail closed).
+        """
+        if not self._uses_default_working_dir:
+            return
+        legacy = legacy_phoenix_working_dir()
+        if legacy == self.working_dir or not _path_exists(legacy):
+            return
+        if not self.is_healthy():
+            return
+
+        private_pid = self._read_pid()
+        legacy_pid = _read_pid_file(legacy / "phoenix.pid")
+        listeners = self._port_listener_pids()
+        if not listeners:
+            # Something is serving the port but its owning PID cannot be
+            # established while a legacy store is still present. Migrating now
+            # would strand the boot on a divergent store, and an unidentifiable
+            # listener is never safe to adopt. Fail custody CLOSED (#2690) —
+            # leave the legacy store untouched and let the operator free the
+            # port rather than treating a pidfile PID as proof of ownership.
+            raise PhoenixStorageError(
+                f"a Phoenix is serving {self.host}:{self.port} but its owning "
+                f"PID cannot be identified while the legacy trace store {legacy} "
+                "is still present; refusing to migrate or adopt. Stop the "
+                "process holding the port, then restart Kestrel."
+            )
+        for pid in listeners:
+            if private_pid and pid == private_pid:
+                # Already serving the PRIVATE store — adoptable by adopt-or-reap.
+                continue
+            descriptor = (
+                "legacy-store" if (legacy_pid and pid == legacy_pid) else "unidentified"
+            )
+            logger.warning(
+                "Reaping %s Phoenix (PID %s) holding %s:%s before migration so "
+                "the legacy trace store can move to private host-data and a "
+                "private-store child can serve (#2690).",
+                descriptor,
+                pid,
+                self.host,
+                self.port,
+            )
+            self._terminate_pid(pid)
 
     def _terminate_pid(self, pid: int, *, timeout: float = 10.0) -> None:
         """Reap a leaked/zombie Phoenix child by PID (SIGTERM, then SIGKILL)."""
@@ -651,48 +754,88 @@ class PhoenixSupervisor:
         leaks the Phoenix child, which keeps serving the port across the restart.
         Spawning a *second* child into the held port just idles a zombie, while
         the mint/health gate can end up pointing at the wrong process (the
-        split-brain observed on #2589). So, before spawning:
+        split-brain observed on #2589). So, before spawning, when the port is
+        healthy we route strictly on **verified port ownership** (#2690):
 
-        * If the port already serves a healthy Phoenix, **adopt** it — track the
-          real listener by PID + pidfile and reap any *other* tracked child (the
-          zombie that lost the race for the port). Returns ``True`` so the caller
-          does **not** spawn a second child.
-        * Otherwise clear a stale pidfile and **reap** any non-serving child it
-          names (a bound-failed leak) so a fresh child can bind. Returns
-          ``False``.
+        * Listener PID matches the PRIVATE pidfile → **adopt** it (a child we
+          spawned, still serving our private store). Reap any *other* tracked
+          child (the split-brain zombie that lost the race). Returns ``True`` so
+          the caller does **not** spawn a second child.
+        * Listener PID does NOT match the private pidfile → it is **not**
+          trustworthy to adopt (it could be a legacy-store Phoenix, an external
+          process, or a reused PID — adopting it would strand the whole boot on a
+          divergent/untrusted trace store). Reap it (and any stale private PID),
+          clear the pidfile, and return ``False`` so a fresh private-store child
+          is spawned.
+        * Healthy but NO owning PID can be identified (no ``psutil``/``lsof``, or
+          the listener belongs to another user) → **fail closed**: we cannot
+          verify it is our private child and cannot reap it to spawn our own, so
+          raise :class:`PhoenixStorageError` rather than adopt an unverifiable
+          store. A pidfile PID is never treated as proof of port ownership.
+
+        When nothing healthy holds the port, reap a leaked/hung child the pidfile
+        names (a bound-failed leak) so a fresh child can bind. Returns ``False``.
         """
         prior_pid = self._read_pid()
         if self.is_healthy():
-            listeners = self._pids_listening_on_port()
-            serving_pid = listeners[0] if listeners else prior_pid
-            # Reap any *other* Phoenix child we know about — the split-brain
-            # zombie that could not bind the port.
-            for pid in {prior_pid, *listeners}:
-                if pid and pid != serving_pid and self._pid_alive(pid):
-                    self._terminate_pid(pid)
-            if serving_pid and self._pid_alive(serving_pid):
-                self._adopted_pid = serving_pid
+            listeners = self._port_listener_pids()
+            # Adopt ONLY a listener whose PID matches our PRIVATE pidfile — the
+            # PID a child WE spawned wrote there. Anything else serving the port
+            # is never adoptable as our private-store child (#2690).
+            if prior_pid and prior_pid in listeners:
+                # Reap any OTHER serving child (the split-brain zombie that lost
+                # the race for the port), then adopt the verified private child.
+                for pid in listeners:
+                    if pid != prior_pid and self._pid_alive(pid):
+                        self._terminate_pid(pid)
+                self._adopted_pid = prior_pid
                 self.process = None
-                self._write_pid(serving_pid)
+                self._write_pid(prior_pid)
                 logger.info(
-                    "Adopted already-serving Phoenix (PID %s) on %s:%s — "
-                    "not spawning a second child.",
-                    serving_pid,
+                    "Adopted already-serving private-store Phoenix (PID %s) on "
+                    "%s:%s — not spawning a second child.",
+                    prior_pid,
                     self.host,
                     self.port,
                 )
-            else:
-                # Healthy but the owning PID is unidentifiable (e.g. no lsof).
-                # Don't spawn a second child; reachability-based gating still
-                # serves the UI through the proxy.
-                self._adopted_pid = None
-                logger.info(
-                    "Phoenix already serving %s:%s (owner PID unknown) — "
-                    "not spawning a second child.",
-                    self.host,
-                    self.port,
-                )
-            return True
+                return True
+
+            if listeners:
+                # Healthy, but the listener is NOT our private-store child. Reap
+                # it (and any stale private PID the pidfile still names) and let
+                # the caller spawn a fresh private child rather than adopt an
+                # untrusted/divergent trace store (#2690).
+                legacy_pid = self._legacy_store_pid()
+                for pid in {prior_pid, *listeners}:
+                    if not pid or not self._pid_alive(pid):
+                        continue
+                    descriptor = (
+                        "legacy-store" if (legacy_pid and pid == legacy_pid)
+                        else "untrusted"
+                    )
+                    logger.warning(
+                        "Reaping %s Phoenix (PID %s) holding %s:%s — it is not "
+                        "our private-store child; spawning a fresh private-store "
+                        "child instead of adopting a divergent trace store "
+                        "(#2690).",
+                        descriptor,
+                        pid,
+                        self.host,
+                        self.port,
+                    )
+                    self._terminate_pid(pid)
+                self._clear_pid()
+                return False
+
+            # Healthy but the owning PID cannot be identified. We cannot verify
+            # it is our private child, and cannot reap it to spawn our own — fail
+            # closed rather than adopt an unverifiable trace store (#2690).
+            raise PhoenixStorageError(
+                f"a Phoenix is serving {self.host}:{self.port} but its owning "
+                "PID cannot be identified; refusing to adopt an unverifiable "
+                "trace store. Stop the process holding the port, then restart "
+                "Kestrel."
+            )
 
         # Nothing healthy on the port. Reap a leaked/hung child the pidfile names
         # (it could not bind and will never serve) so our fresh child can, then
@@ -755,6 +898,24 @@ class PhoenixSupervisor:
                 "skipping Phoenix supervision; /phoenix will return 503."
             )
             return False
+
+        # Custody-aware reconcile BEFORE storage prep (#2690): reap a leaked
+        # legacy-store (or unidentified) Phoenix holding the port so the legacy
+        # migration below sees a *stopped* store.
+        try:
+            self.reconcile_storage_conflict()
+        except PhoenixStorageError as exc:
+            # Custody could not be established safely (e.g. an unidentifiable
+            # Phoenix holds the port while a legacy store is present). Fail
+            # CLOSED rather than migrate/adopt onto a divergent store (#2690).
+            logger.error(
+                "Phoenix tracing disabled because storage-conflict reconcile "
+                "could not establish safe custody: %s",
+                exc,
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001 - other reconcile errors degrade to spawn
+            logger.warning("Phoenix storage-conflict reconcile failed: %s", exc)
 
         try:
             self.prepare_storage()

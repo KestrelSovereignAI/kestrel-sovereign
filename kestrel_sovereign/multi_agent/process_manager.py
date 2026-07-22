@@ -23,11 +23,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from kestrel_sovereign.identity.protected_export import IDENTITY_EXPORT_DIR_ENV
 from kestrel_sovereign.multi_agent.config import (
     LocalAgentConfig,
     MultiAgentConfig,
 )
+
+# NOTE: ``IDENTITY_EXPORT_DIR_ENV`` is imported lazily inside ``start_agent``
+# (its only use). Pulling it in at module scope would force ``identity``'s
+# package ``__init__`` to eager-load the identity exporter → the whole agent
+# cognition/LLM stack, so importing this module's lightweight cross-platform
+# port/process helpers (e.g. ``find_pids_on_port``, used by phoenix custody
+# discovery that must never raise) would transitively depend on that entire
+# import graph resolving cleanly. See #2690.
 
 logger = logging.getLogger(__name__)
 
@@ -476,6 +483,13 @@ class ProcessManager:
             raise RuntimeError(
                 f"Agent '{name}' validation failed: {errors[0]}"
             )
+
+        # Imported lazily (not at module scope) so the lightweight port/process
+        # helpers stay importable without the agent stack — see the module-top
+        # note and #2690.
+        from kestrel_sovereign.identity.protected_export import (
+            IDENTITY_EXPORT_DIR_ENV,
+        )
 
         # Build env
         env = self._load_env()
