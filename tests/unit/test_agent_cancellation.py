@@ -219,3 +219,46 @@ class TestStopEndpoint:
 
         assert response.status_code == 200
         mock_agent.cancel_current_request.assert_called_once_with(request_id="req-123")
+
+    @pytest.mark.asyncio
+    async def test_stream_endpoint_emits_stop_notice_on_empty_cancelled_stream(self):
+        """#2674 P2: a strict (fail-closed) response audit stopped before dispatch
+        WITHHOLDS every chunk and returns cleanly, so ``process_input_streaming``
+        yields nothing and the endpoint's in-loop cancel check never runs. The
+        endpoint's post-loop fallback must still surface the standard "Request
+        stopped" body — otherwise a stopped strict turn returns a silent, empty
+        200 and the user sees no acknowledgement of their stop."""
+        from fastapi.testclient import TestClient
+        from fastapi import FastAPI
+        from kestrel_sovereign.endpoints.agent import router
+        from kestrel_sovereign.rate_limit import limiter
+
+        app = FastAPI()
+        app.state.limiter = limiter
+        app.include_router(router)
+
+        async def _empty_stream(*args, **kwargs):
+            # Mirrors the strict cancel-before-dispatch branch: yield nothing,
+            # return cleanly. The ``yield`` after ``return`` is unreachable but
+            # makes this a genuine async generator.
+            return
+            yield  # pragma: no cover
+
+        mock_agent = MagicMock()
+        mock_agent.register_active_request = MagicMock()
+        mock_agent.process_input_streaming = _empty_stream
+        # The request was cancelled; the withheld turn produced no chunks.
+        mock_agent.is_request_cancelled = MagicMock(return_value=True)
+        mock_agent._cleanup_cancelled_request = MagicMock()
+        mock_agent.storage.resolve_session_id = AsyncMock(side_effect=lambda s: s)
+        app.state.agent = mock_agent
+
+        client = TestClient(app)
+        response = client.post("/api/agent/stream", json={"input": "hi"})
+
+        assert response.status_code == 200
+        # The post-loop fallback surfaced the stop notice on an empty stream.
+        assert "Request stopped" in response.text
+        # Exactly one notice — the post-loop emit must not double up with any
+        # in-loop emit (there were no chunks, so only the fallback fires).
+        assert response.text.count("Request stopped") == 1

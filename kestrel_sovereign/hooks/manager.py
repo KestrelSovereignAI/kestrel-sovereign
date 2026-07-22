@@ -218,6 +218,56 @@ class HooksManager:
         async with self._lock:
             matching_hooks = self._get_matching_hooks(event, input.tool_name)
 
+        return await self._run_hook_chain(event, matching_hooks, input)
+
+    async def execute_hooks_snapshot(
+        self,
+        event: HookEvent,
+        input: HookInput,
+        hooks: List[Hook],
+    ) -> HookOutput:
+        """Execute a CALLER-PINNED hook list, bypassing the live registry (#2674).
+
+        ``execute_hooks`` resolves its hook set from ``self._hooks`` at call
+        time, so a hook registered / enabled / disabled *between* turn start and
+        completion changes the set that actually runs. The strict streaming
+        audit cannot tolerate that drift: it decides whether to WITHHOLD every
+        visible byte from the POST_RESPONSE hook set captured at TURN START
+        (see ``agent/streaming.py``). Enforcement at completion must run exactly
+        that captured set, or the buffering decision and the enforcement
+        decision diverge:
+
+        * a hook *enabled* mid-turn would DENY a turn that already streamed raw
+          — the fail-open split (client saw the text, persistence stored a block
+          message); and
+        * a hook *disabled* mid-turn would let a buffered turn release WITHOUT
+          any audit at all.
+
+        So this runs ``hooks`` as given. It does NOT re-read the registry and
+        does NOT re-filter by the hooks' *current* ``enabled`` flag — a hook
+        disabled after the snapshot still audits this turn. Priority order and
+        tool-name matching are still honored. Registration / enable / disable
+        transitions take effect on the NEXT turn.
+        """
+        matching = [
+            h for h in sorted(hooks, key=lambda h: h.priority)
+            if not input.tool_name or h.matches(input.tool_name)
+        ]
+        return await self._run_hook_chain(event, matching, input)
+
+    async def _run_hook_chain(
+        self,
+        event: HookEvent,
+        matching_hooks: List[Hook],
+        input: HookInput,
+    ) -> HookOutput:
+        """Run an already-resolved, priority-ordered hook list.
+
+        Shared core of :meth:`execute_hooks` (live registry) and
+        :meth:`execute_hooks_snapshot` (caller-pinned set) so both get identical
+        DENY/ASK short-circuiting, MODIFY propagation, warning accumulation, and
+        fail-closed timeout/exception handling.
+        """
         if not matching_hooks:
             return HookOutput.allow()
 

@@ -4,11 +4,13 @@ import inspect
 import json
 import logging
 import time
+from contextlib import contextmanager
 from dataclasses import replace
 from typing import Dict, Any, Optional
 
-from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
+from kestrel_sdk.hooks.base import HookEvent, HookInput
 from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
+from kestrel_sovereign.hooks.manager import _hook_is_enforcing
 from kestrel_sdk.llm import ToolCallStarted
 from kestrel_sovereign.agent.parts import (
     PART_SENTINEL_PREFIX,
@@ -322,7 +324,9 @@ def _rebase_events_for_parts(events: list, base: int, text: str) -> list:
     return out
 
 
-def _finalize_component_parts(parts: list, text: str) -> list:
+def _finalize_component_parts(
+    parts: list, text: str, *, keep_hook_parts: bool = True,
+) -> list:
     """Finalize component parts for persistence (#1914):
 
     1. Convert each ``pos`` from a code-point offset into the persisted ``text``
@@ -331,10 +335,19 @@ def _finalize_component_parts(parts: list, text: str) -> list:
        still buffered on the collector, so drain them here and position them at
        the end of ``text`` (they carry no in-stream offset). Persist-only: the
        live stream is already closed, so these surface on reload.
+
+    The collector is ALWAYS drained (clearing the per-turn buffer), but the
+    drained hook-emitted parts are DISCARDED when ``keep_hook_parts`` is False.
+    A strict audit DENY passes ``keep_hook_parts=False`` (#2674): a POST_RESPONSE
+    hook that runs *before* the denying audit hook can stash the (about-to-be-
+    denied) ``response_text`` into an emitted part, so persisting the drained
+    parts would leak exactly the text the audit blocked — it would re-render on
+    reload beside the block message. Clearing the ``parts`` argument to ``[]`` is
+    not enough on its own: the leak rides the collector, not that list.
     """
     result = [{**p, "pos": _utf16_offset(text, p.get("pos", 0))} for p in parts]
     hook_parts = drain_parts()
-    if hook_parts:
+    if hook_parts and keep_hook_parts:
         end = _utf16_offset(text, len(text))
         result.extend({**p, "pos": end} for p in hook_parts)
     return result
@@ -505,6 +518,133 @@ def _strip_and_weld_revise_sentinels(text: str) -> str:
     return clean
 
 
+# Sentinel for "this hook exposes no mutable ``mode``" in a turn-start snapshot,
+# so a hook without a ``mode`` attribute is captured (for pinned execution) yet
+# never has a spurious ``mode`` attribute created on it by the pin (#2674).
+_NO_MODE = object()
+
+
+def _snapshot_post_response_hooks(hooks_manager) -> list:
+    """Snapshot the enabled POST_RESPONSE hook set — with each hook's turn-start
+    ``mode`` — at turn start (#2674).
+
+    Returns ``[(hook, mode_or_sentinel), ...]`` for EVERY hook enabled when the
+    turn begins (not only those exposing a mutable ``mode``). Two decisions read
+    this one snapshot so they can never diverge within a turn:
+
+    * **Buffering.** ``buffer_audit`` (whether to WITHHOLD streamed bytes) is
+      derived from this set via :func:`_hook_is_enforcing` — the same predicate
+      the hook manager fails closed on — so the withhold decision and the
+      manager's timeout/crash → DENY behavior stay in lockstep.
+    * **Enforcement.** ``_fire_post_response_hook`` runs EXACTLY this captured
+      hook set through ``HooksManager.execute_hooks_snapshot`` — bypassing the
+      live registry — so a hook the turn's tools *register*, *enable*, or
+      *disable* mid-turn cannot change what audits this turn. Concretely:
+      ``skip → audit_enable("strict")`` registers a brand-new strict hook, and
+      running the live registry at completion would DENY a turn that already
+      streamed raw (``buffer_audit`` was False) — the fail-open split. And
+      ``strict → audit_disable`` drops the hook from the live enabled list, so
+      running the live registry would release a *buffered* turn with no audit at
+      all. Freezing the set to turn start closes both; the transition takes
+      effect on the NEXT turn.
+
+    Modes are pinned during the fire by :func:`_pinned_hook_modes`, which also
+    defers an in-place ``warn → strict`` flip on an already-registered hook to
+    the next turn. Hooks without a ``mode`` carry the ``_NO_MODE`` sentinel and
+    are executed but never mode-pinned.
+    """
+    if not hooks_manager:
+        return []
+    try:
+        enabled = hooks_manager.get_enabled_hooks(HookEvent.POST_RESPONSE)
+    except Exception:
+        return []
+    return [(h, getattr(h, "mode", _NO_MODE)) for h in enabled]
+
+
+@contextmanager
+def _pinned_hook_modes(snapshot: list):
+    """Pin each snapshotted POST_RESPONSE hook to its turn-start ``mode`` for the
+    duration of the audit fire, then restore the live mode (#2674).
+
+    Restoring the *live* (possibly mid-turn-mutated) mode on exit — not the
+    pinned one — is what makes a warn→strict switch apply to the NEXT turn: this
+    turn's audit runs at the turn-start mode, subsequent turns see the new mode.
+    The turn lifecycle lock serializes turns per agent, so nothing else mutates
+    ``mode`` across the single ``await`` this wraps. Hooks captured with the
+    ``_NO_MODE`` sentinel (no mutable ``mode``) are skipped so the pin never
+    fabricates a ``mode`` attribute on them.
+    """
+    live: list = []
+    for hook, start_mode in snapshot:
+        if start_mode is _NO_MODE:
+            continue
+        live.append((hook, getattr(hook, "mode", _NO_MODE)))
+        try:
+            hook.mode = start_mode
+        except Exception:
+            pass
+    try:
+        yield
+    finally:
+        for hook, live_mode in live:
+            if live_mode is _NO_MODE:
+                continue
+            try:
+                hook.mode = live_mode
+            except Exception:
+                pass
+
+
+class _PostResponseText(str):
+    """The reviewed assistant text carrying an EXPLICIT audit verdict (#2674).
+
+    Subclasses ``str`` so every existing caller that persists, concatenates, or
+    compares the returned text keeps working unchanged — but the strict
+    streaming path reads the explicit ``denied`` / ``modified`` flags instead of
+    re-deriving the verdict from ``text != original``. That inference is unsafe:
+    a fail-closed DENY whose block message happens to equal the original prose
+    would be misread as an ALLOW and leak the raw (unaudited) buffer — sentinels,
+    typed parts and all. ``denied`` is the load-bearing flag; ``modified`` is
+    true for both DENY and a MODIFY rewrite (any hook-changed text).
+
+    A plain ``str`` returned by a test double (or any legacy caller) reports
+    ``denied=False`` / ``modified=False`` via ``getattr`` fallback — i.e. it is
+    treated as an ALLOW passthrough, which is exactly what such a double means.
+    """
+
+    denied: bool = False
+    modified: bool = False
+
+    def __new__(cls, text: str, *, denied: bool = False, modified: bool = False):
+        obj = super().__new__(cls, text)
+        obj.denied = denied
+        obj.modified = modified
+        return obj
+
+
+def _strict_audit_release(final_text: str) -> list:
+    """Post-verdict release for a strict (enforcing) buffered turn (#2674).
+
+    Only the reviewed ``final_text`` reaches the live client — the exact text
+    the POST_RESPONSE hook examined and returned: the block message on DENY, the
+    rewrite on MODIFY, the approved prose on ALLOW. The withheld raw buffer
+    (pre-tool prose, thinking, tool / revise / part sentinels) is DISCARDED and
+    never replayed, because:
+
+    * it contains material the audit never reviewed (the hook sees only the
+      final post-tool text, not pre-tool prose / thinking / structured parts), so
+      replaying it would emit unaudited bytes on an ALLOW; and
+    * pre-tool prose is retracted from the persisted turn anyway, so releasing it
+      would surface text that never survives to history reload.
+
+    Structured parts still persist to metadata on ALLOW and render on reload; the
+    LIVE strict stream is the reviewed prose only. An empty ``final_text``
+    releases nothing (e.g. an approved-but-empty turn).
+    """
+    return [str(final_text)] if final_text else []
+
+
 class StreamingMixin:
     """Mixin class providing streaming response methods."""
 
@@ -623,6 +763,22 @@ class StreamingMixin:
         2. Single streaming LLM call that yields text AND detects tools
         3. If tool calls detected at end, execute them and continue streaming
         4. Text chunks streamed to user in real-time
+
+        Strict-audit latency tradeoff (#2674): response audit is optional and
+        OFF by default. When it is enabled in an *enforcing* (fail-closed /
+        strict) mode, the fail-closed guarantee requires that no user-visible
+        byte reach the client before the POST_RESPONSE verdict exists. This path
+        therefore WITHHOLDS the entire visible turn while the turn is assembled
+        for the audit, then releases ONLY the reviewed text once the verdict
+        lands — the approved/rewritten prose on ALLOW/MODIFY, or just the block
+        message on DENY (``_strict_audit_release``). The withheld raw stream
+        (pre-tool prose, thinking, tool/revise/part sentinels) is never
+        replayed: the audit never reviewed it, and pre-tool prose is retracted
+        from the persisted turn anyway. Structured parts still persist and
+        render on history reload; the live strict stream is reviewed prose only.
+        That trades real-time token delivery (and live tool/part cards) for the
+        integrity gate. With audit disabled, or in advisory/warn mode, streaming
+        stays fully incremental and this method's behavior is unchanged.
 
         Args:
             user_input: The user's message
@@ -1019,6 +1175,30 @@ class StreamingMixin:
             self.llm_service, invocation_context, session_id
         )
 
+        # #2674: snapshot the enabled POST_RESPONSE hook set HERE (turn start).
+        # ONE snapshot drives two decisions so they can never diverge mid-turn:
+        # the buffering decision below and the completion-time enforcement in
+        # ``_fire_post_response_hook`` (which runs exactly this set via
+        # ``execute_hooks_snapshot``, ignoring any hook a tool registers/enables/
+        # disables mid-turn — that takes effect next turn). See the function's
+        # docstring for the fail-open split this closes.
+        audit_hook_snapshot = _snapshot_post_response_hooks(
+            getattr(self, "hooks_manager", None)
+        )
+        # #2674: strict response audit is fail-closed, so when an enforcing
+        # POST_RESPONSE hook is active we must NOT stream any user-visible byte
+        # before its verdict exists. WITHHOLD every visible chunk (text +
+        # sentinels + parts) — the assembled turn is still accumulated into
+        # ``full_response`` / ``tool_response_chunks`` for the audit + persist —
+        # and release ONLY the reviewed text (via ``_strict_audit_release``)
+        # after ``_fire_post_response_hook`` returns. When no enforcing hook is
+        # active this is False and streaming stays fully incremental. Derived
+        # from the same snapshot the enforcement uses, so the withhold decision
+        # and the audited hook set are guaranteed identical for this turn.
+        buffer_audit = any(
+            _hook_is_enforcing(h) for h, _mode in audit_hook_snapshot
+        )
+
         async for item in self.llm_service.stream_with_tool_detection(
             messages=messages,
             tools=feature_tools if feature_tools else None,
@@ -1059,7 +1239,8 @@ class StreamingMixin:
                 # the parts wait for the real text that follows it.
                 if pending_parts and item.strip() and not is_only_sentinels(item):
                     for _ps in _flush_part_list(pending_parts, full_response):
-                        yield _ps
+                        if not buffer_audit:
+                            yield _ps
                 # #1547: materialize a pending revise boundary lazily —
                 # only when real post-marker text lands, and only when it
                 # would otherwise weld two non-whitespace chars. Mirrors
@@ -1077,11 +1258,17 @@ class StreamingMixin:
                     if acc and not acc[-1].isspace() and not item[:1].isspace():
                         full_response.append("\n\n")
                     pending_visible_boundary = False
-                # Text chunk - yield immediately for real-time streaming
+                # Text chunk - yield immediately for real-time streaming, or
+                # withhold it under an enforcing (strict) POST_RESPONSE audit so
+                # no unaudited byte reaches the client before the verdict (#2674).
+                # The text is still accumulated into ``full_response`` for the
+                # audit + persist regardless.
                 full_response.append(item)
-                yield item
+                if not buffer_audit:
+                    yield item
             elif isinstance(item, ThinkingDelta):
-                yield _build_thinking_sentinel(item)
+                if not buffer_audit:
+                    yield _build_thinking_sentinel(item)
             elif isinstance(item, ToolCallStarted):
                 # Honesty-layer signal (#1042 layer 2 / #1045): the LLM
                 # has just begun emitting a tool call. Any pre-tool prose
@@ -1100,7 +1287,8 @@ class StreamingMixin:
                 # treat both as idempotent. NOT appended to
                 # ``full_response`` — the persisted assistant turn
                 # must not contain wire-protocol bytes.
-                yield _build_revise_sentinel(item)
+                if not buffer_audit:
+                    yield _build_revise_sentinel(item)
                 # Snapshot pre-tool prose at the FIRST marker only —
                 # subsequent markers arrive between tool calls of the
                 # same LLM turn and don't introduce new pre-tool text
@@ -1125,7 +1313,8 @@ class StreamingMixin:
         # after the tool's done sentinel — preserving tool-before-part order.
         pending_parts.extend(drain_parts())
         for _ps in _flush_part_list(pending_parts, full_response):
-            yield _ps
+            if not buffer_audit:
+                yield _ps
 
         # Log LLM response
         llm_duration = int((time.time() - llm_start) * 1000)
@@ -1156,9 +1345,20 @@ class StreamingMixin:
         # prose the LLM already yielded so the user can see what the
         # agent had been about to do.
         if has_tool_calls and request_id and self.is_request_cancelled(request_id):
-            # #1659: strip any codex inline tool sentinels from the
-            # partial pre-tool text before persisting.
-            cancelled_text, _, _ = _parse_stream_sentinels("".join(full_response))
+            if buffer_audit:
+                # #2674: under an enforcing (strict) audit this partial pre-tool
+                # prose was WITHHELD from the client and — because we cancel
+                # before dispatch, never reaching ``_fire_post_response_hook`` —
+                # was never audited. Persisting it would leak unreviewed content
+                # back on history reload (and via ContextBuilder into the next
+                # turn), defeating the fail-closed gate. Record the cancellation
+                # with NO assistant content; ``_persist_assistant_turn_safely``
+                # still stamps the ``cancelled`` marker.
+                cancelled_text = ""
+            else:
+                # #1659: strip any codex inline tool sentinels from the
+                # partial pre-tool text before persisting.
+                cancelled_text, _, _ = _parse_stream_sentinels("".join(full_response))
             await self._persist_assistant_turn_safely(
                 cancelled_text, metadata=None, session_id=session_id,
                 request_id=request_id,
@@ -1200,10 +1400,12 @@ class StreamingMixin:
                 invocation_context=resolved_context,
             ):
                 if isinstance(chunk, ThinkingDelta):
-                    yield _build_thinking_sentinel(chunk)
+                    if not buffer_audit:
+                        yield _build_thinking_sentinel(chunk)
                     continue
                 tool_response_chunks.append(chunk)
-                yield chunk
+                if not buffer_audit:
+                    yield chunk
                 # #1256: belt-and-suspenders cancel check at the outer
                 # boundary. The inner orchestrator generator also checks
                 # ``is_request_cancelled`` at iteration boundaries; this
@@ -1290,18 +1492,28 @@ class StreamingMixin:
                 pre_tool_prose=pre_tool_for_audit,
                 tool_calls=tool_calls_payload,
                 tool_results=tool_results,
+                hook_snapshot=audit_hook_snapshot,
             )
+            # #2674: read the EXPLICIT audit verdict, not string equality.
+            audit_denied = getattr(tool_final_text, "denied", False)
             # #1914 (codex P1): a POST_RESPONSE hook can rewrite or BLOCK the
             # assistant text (e.g. an audit denial → "[Response blocked ...]").
             # The component parts were positioned against the ORIGINAL post-tool
             # prose; persisting them would re-render the structured bubbles next
             # to replaced/blocked text on reload — leaking exactly what the hook
-            # removed. Drop them whenever the hook changed the text.
-            if tool_final_text != post_tool_text:
+            # removed. Drop them whenever the hook changed OR denied the text
+            # (``audit_denied`` covers the equality-collision case where a block
+            # message happens to equal the original prose — #2674).
+            if audit_denied or tool_final_text != post_tool_text:
                 component_parts = []
             # #1914: UTF-16-offset the positions for the browser + fold in any
-            # parts a POST_RESPONSE hook emitted.
-            component_parts = _finalize_component_parts(component_parts, tool_final_text)
+            # parts a POST_RESPONSE hook emitted. #2674: on a DENY, DISCARD the
+            # hook-emitted parts too — a prior POST_RESPONSE hook can smuggle the
+            # denied text into a part, and clearing ``component_parts`` above does
+            # not touch the collector those parts still ride.
+            component_parts = _finalize_component_parts(
+                component_parts, tool_final_text, keep_hook_parts=not audit_denied,
+            )
             # #1914: when this turn carries parts, rebase the tool cards onto the
             # same post-tool UTF-16 origin so the reload merge orders both
             # streams consistently (``post_base`` is the retracted pre half).
@@ -1321,7 +1533,13 @@ class StreamingMixin:
             meta: Optional[Dict[str, Any]] = None
             if tool_events or tool_results or pre_tool_text or component_parts:
                 meta = {}
-                if pre_tool_text:
+                # #2674: on a fail-closed DENY the original assistant prose was
+                # REJECTED, so it must not persist — ContextBuilder reinjects
+                # ``pre_tool_reasoning.content`` (and its ``context_replay``) into
+                # the next turn's LLM context, which would smuggle the denied
+                # text forward despite the blocked assistant content. Drop it on
+                # DENY; keep only the structural (non-content-bearing) events.
+                if pre_tool_text and not audit_denied:
                     meta['pre_tool_reasoning'] = {
                         'content': pre_tool_text,
                         'seam': seam,
@@ -1333,11 +1551,24 @@ class StreamingMixin:
                     meta['tool_results'] = tool_results
                 if component_parts:
                     meta['parts'] = component_parts
+                if not meta:
+                    meta = None
             await self._persist_assistant_turn_safely(
                 tool_final_text, metadata=meta, session_id=session_id,
                 request_id=request_id,
                 response=tool_response,
             )
+            # #2674: strict-audit release. Nothing visible was streamed live this
+            # turn; now that the POST_RESPONSE verdict exists, release ONLY the
+            # reviewed text (block message on DENY, reviewed prose on
+            # ALLOW/MODIFY). The withheld raw buffer is never replayed — see
+            # ``_strict_audit_release``. Suppressed on cancellation — a stopped,
+            # unaudited partial must not surface. No-op when buffering was off.
+            if buffer_audit and not (
+                request_id and self.is_request_cancelled(request_id)
+            ):
+                for _c in _strict_audit_release(tool_final_text):
+                    yield _c
             final_assistant_text = tool_final_text
             stop_tool_results: Optional[list] = tool_results
             # Derive stop_tool_calls from the accumulated tool_results
@@ -1464,15 +1695,20 @@ class StreamingMixin:
                 pre_tool_prose=pre_tool_text,
                 tool_calls=tool_calls_payload,
                 tool_results=tool_results,
+                hook_snapshot=audit_hook_snapshot,
             )
+            # #2674: read the EXPLICIT audit verdict, not string equality.
+            inline_denied = getattr(final_text, "denied", False)
             # #1914 (codex P1): drop component parts when a POST_RESPONSE hook
             # rewrote/blocked the text — their positions no longer match the
             # persisted content and would leak blocked structured data on reload.
-            if final_text != post_tool_text:
+            # ``inline_denied`` also covers the equality-collision case (#2674).
+            if inline_denied or final_text != post_tool_text:
                 inline_post_components = []
-            # #1914: UTF-16-offset + fold in hook-emitted parts.
+            # #1914: UTF-16-offset + fold in hook-emitted parts. #2674: on a DENY,
+            # discard hook-emitted parts too (they can carry the denied text).
             inline_post_components = _finalize_component_parts(
-                inline_post_components, final_text
+                inline_post_components, final_text, keep_hook_parts=not inline_denied,
             )
             # #1914: when parts ride along, rebase the tool cards onto the same
             # post-tool UTF-16 origin so the reload merge stays consistent.
@@ -1488,13 +1724,16 @@ class StreamingMixin:
             await self._persist_assistant_turn_safely(
                 final_text,
                 metadata={
+                    # #2674: drop the rejected pre-tool prose on a DENY — see the
+                    # has_tool_calls branch; ContextBuilder would otherwise replay
+                    # the denied content into the next turn's context.
                     **({
                         "pre_tool_reasoning": {
                             "content": pre_tool_text,
                             "seam": seam,
                             "context_replay": context_replay_text,
                         }
-                    } if pre_tool_text else {}),
+                    } if (pre_tool_text and not inline_denied) else {}),
                     "tool_events": synth_tool_events,
                     "tool_results": tool_results,
                     # #1914: component parts emitted during the inline turn,
@@ -1504,6 +1743,13 @@ class StreamingMixin:
                 session_id=session_id, request_id=request_id,
                 response=tool_response,
             )
+            # #2674: strict-audit release (inline-executed path) — only the
+            # reviewed text; the withheld raw buffer is never replayed.
+            if buffer_audit and not (
+                request_id and self.is_request_cancelled(request_id)
+            ):
+                for _c in _strict_audit_release(final_text):
+                    yield _c
             final_assistant_text = final_text
             stop_tool_results = tool_results
             stop_tool_calls = tool_calls_payload
@@ -1523,15 +1769,24 @@ class StreamingMixin:
             _no_tool_pre_hook_text = final_text
             final_text = await self._fire_post_response_hook(
                 final_text, session_id,
+                hook_snapshot=audit_hook_snapshot,
             )
+            # #2674: read the EXPLICIT audit verdict, not string equality.
+            no_tool_denied = getattr(final_text, "denied", False)
             # #1914 (codex P1): drop parts when a POST_RESPONSE hook rewrote or
             # blocked the text — their positions reference the original prose, so
             # persisting them would leak blocked structured data on reload.
-            if final_text != _no_tool_pre_hook_text:
+            # ``no_tool_denied`` also covers the equality-collision case (#2674).
+            if no_tool_denied or final_text != _no_tool_pre_hook_text:
                 no_tool_components = []
             # #1914: UTF-16-offset + fold in any parts the POST_RESPONSE hook
-            # emitted (the collector is still active while the hook runs).
-            no_tool_components = _finalize_component_parts(no_tool_components, final_text)
+            # emitted (the collector is still active while the hook runs). #2674:
+            # on a DENY, discard hook-emitted parts too (they can carry the denied
+            # text — clearing ``no_tool_components`` above doesn't drain the
+            # collector).
+            no_tool_components = _finalize_component_parts(
+                no_tool_components, final_text, keep_hook_parts=not no_tool_denied,
+            )
             _no_tool_events = _tool_parts_to_events(tool_parts)
             # #1914: with parts present, convert the tool cards to the same
             # UTF-16 origin (base 0 here — no pre-tool retraction) so the reload
@@ -1556,6 +1811,13 @@ class StreamingMixin:
                 request_id=request_id,
                 response=tool_response,
             )
+            # #2674: strict-audit release (no-tool path) — only the reviewed
+            # text; the withheld raw buffer is never replayed.
+            if buffer_audit and not (
+                request_id and self.is_request_cancelled(request_id)
+            ):
+                for _c in _strict_audit_release(final_text):
+                    yield _c
             final_assistant_text = final_text
             stop_tool_results = None
             stop_tool_calls = None
@@ -1747,12 +2009,26 @@ class StreamingMixin:
         pre_tool_prose: Optional[str] = None,
         tool_calls: Optional[list] = None,
         tool_results: Optional[list] = None,
+        hook_snapshot: Optional[list] = None,
     ) -> str:
         """Fire POST_RESPONSE hooks on completed response text.
 
-        In streaming mode the text has already been sent to the client, so
-        DENY prevents storage (and logs the issue) while MODIFY can annotate
-        what gets stored.
+        Returns a ``_PostResponseText`` — a ``str`` subclass carrying the
+        reviewed text plus an EXPLICIT verdict (``denied`` / ``modified``): the
+        block message on DENY, the rewritten text on MODIFY, otherwise the input
+        unchanged. Callers treat it as a plain string for persistence; the
+        strict streaming path reads ``.denied`` to decide the release/metadata
+        rules rather than inferring the verdict from string equality (#2674).
+
+        The caller decides what reaches the live client:
+
+        * When an **enforcing** (fail-closed) POST_RESPONSE hook is active, the
+          streaming loop withheld every visible byte until this verdict (#2674),
+          so ONLY the returned text is released — a DENY exposes none of the
+          original assistant text.
+        * When only advisory/warn hooks are active, the text was already
+          streamed incrementally, so DENY only changes what is stored/logged and
+          MODIFY only annotates the persisted copy.
 
         Args:
             response_text: Final assembled assistant text (post-tool
@@ -1771,13 +2047,37 @@ class StreamingMixin:
                 is whatever ``_serialize_tool_result`` produced —
                 usually a ``ToolResult.to_dict()`` envelope (#1042
                 layer 4) or a legacy ``{success, ...}`` dict.
+            hook_snapshot: ``[(hook, mode), ...]`` — the enabled
+                POST_RESPONSE hook set captured at turn start (#2674).
+                When provided (the streaming path always passes it, even
+                empty), ONLY this set audits the turn, run via
+                ``execute_hooks_snapshot`` and pinned to its turn-start
+                modes: a hook a tool *registers* / *enables* / *disables*
+                mid-turn cannot change what enforces on a turn whose
+                buffering decision was already fixed from this same
+                snapshot (the transition takes effect next turn).
+                ``None`` (non-streaming / legacy callers) runs the live
+                enabled set and pins nothing.
 
         Returns:
             Possibly modified response_text.
         """
         hooks_manager = getattr(self, "hooks_manager", None)
-        if not hooks_manager or not hooks_manager.get_enabled_hooks(HookEvent.POST_RESPONSE):
-            return response_text
+        if not hooks_manager:
+            return _PostResponseText(response_text)
+
+        # #2674: a provided snapshot (even empty) freezes the audited hook set to
+        # turn start; ``None`` falls back to the live enabled set for
+        # non-streaming / legacy callers. An empty snapshot means no hook was
+        # enabled at turn start — nothing enforces, regardless of what the tools
+        # registered/enabled since.
+        pinned = hook_snapshot is not None
+        if pinned:
+            snapshot_hooks = [h for h, _mode in hook_snapshot]
+            if not snapshot_hooks:
+                return _PostResponseText(response_text)
+        elif not hooks_manager.get_enabled_hooks(HookEvent.POST_RESPONSE):
+            return _PostResponseText(response_text)
 
         hook_input = HookInput(
             session_id=session_id or "",
@@ -1787,10 +2087,51 @@ class StreamingMixin:
             tool_calls=tool_calls,
             tool_results=tool_results,
         )
-        hook_output = await hooks_manager.execute_hooks(HookEvent.POST_RESPONSE, hook_input)
-        if hook_output.permission_decision == PermissionDecision.DENY:
-            logging.warning(f"POST_RESPONSE hook denied (streaming): {hook_output.permission_reason}")
-            return f"[Response blocked by audit: {hook_output.permission_reason}]"
+        # #2674: pin each snapshotted hook to its turn-start mode while the audit
+        # runs (defers an in-place warn→strict flip to the next turn), and run
+        # EXACTLY the snapshot set via ``execute_hooks_snapshot`` so the live
+        # registry — which a mid-turn register/enable/disable would have mutated
+        # — is not consulted. The buffering decision (``buffer_audit``) came from
+        # this same snapshot, so the two stay in lockstep.
+        with _pinned_hook_modes(hook_snapshot or []):
+            if pinned:
+                hook_output = await hooks_manager.execute_hooks_snapshot(
+                    HookEvent.POST_RESPONSE, hook_input, snapshot_hooks,
+                )
+            else:
+                hook_output = await hooks_manager.execute_hooks(
+                    HookEvent.POST_RESPONSE, hook_input,
+                )
+        # Return an EXPLICIT verdict (#2674): the strict streaming path must know
+        # BLOCK vs ALLOW/MODIFY directly, not infer it from string equality — a
+        # block whose message equals the original prose would otherwise be
+        # misread as ALLOW and leak the raw buffer.
+        #
+        # A POST_RESPONSE hook blocks on BOTH ``DENY`` and ``ASK`` (and a bare
+        # ``continue_execution=False``). An approval hook exposes
+        # ``awaits_user_input`` → ``_hook_is_enforcing`` → the turn was BUFFERED,
+        # and ``ASK`` means "not approved yet"; releasing the raw buffer on ASK
+        # would leak unapproved content (the P1 fail-open leak). Route through the
+        # shared ``evaluate_blocking_decision`` fail-closed gate — the same one
+        # every PRE-hook dispatch surface uses — so ASK can never silently fall
+        # through to the ALLOW passthrough below.
+        blocked = evaluate_blocking_decision(
+            hook_output,
+            deny_reason_default="blocked by response audit",
+            ask_reason_default="response withheld pending approval",
+        )
+        if blocked is not None:
+            logging.warning(
+                "POST_RESPONSE hook blocked (streaming, "
+                f"{blocked.decision.value}): {blocked.reason}"
+            )
+            return _PostResponseText(
+                f"[Response blocked by audit: {blocked.reason}]",
+                denied=True,
+                modified=True,
+            )
         elif hook_output.updated_input and "response_text" in hook_output.updated_input:
-            return hook_output.updated_input["response_text"]
-        return response_text
+            return _PostResponseText(
+                hook_output.updated_input["response_text"], modified=True,
+            )
+        return _PostResponseText(response_text)

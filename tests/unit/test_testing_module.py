@@ -131,9 +131,15 @@ class TestMockAgent:
         assert hook not in agent.hooks_manager.registered_hooks
 
     async def test_hooks_manager_execute(self):
+        from kestrel_sdk.hooks.base import PermissionDecision
+
         agent = MockAgent()
         result = await agent.hooks_manager.execute_hooks("PRE_TOOL_USE")
-        assert result.decision == "ALLOW"
+        # #2674: the mock now returns a real ``HookOutput`` (permission_decision),
+        # matching the envelope the real HooksManager returns and the streaming/
+        # dispatch paths read — not the old ``MagicMock(decision=...)``.
+        assert result.permission_decision == PermissionDecision.ALLOW
+        assert result.continue_execution is True
         assert len(agent.hooks_manager.executed_hooks) == 1
 
     async def test_create_with_storage(self):

@@ -169,7 +169,26 @@ The sentinel is **NOT appended to `full_response`**. Wire-protocol bytes must ne
 
 After tool execution, the post-tool synthesis streams through `_handle_orchestrator_response_streaming`, which now also threads a `tool_results: list` collector. Each `_dispatch_tool_call` appends `{tool_call_id, name, result}` (with `result` slim-summarized — see §8 below) to that list.
 
-The POST_RESPONSE hook fires BEFORE the persist call. The hook's DENY/MODIFY return shapes what gets stored — DENY replaces the persisted text with `[Response blocked by audit: …]`, MODIFY replaces with the hook-supplied text. The user has already received the streamed chunks; the hook can only affect the persisted record (and the next-turn history loader, which is what protects against "I don't see my own quantum response" + replays of dishonest content). Sequence:
+The POST_RESPONSE hook fires BEFORE the persist call. The hook's DENY/MODIFY return shapes what gets stored — DENY replaces the persisted text with `[Response blocked by audit: …]`, MODIFY replaces with the hook-supplied text.
+
+`_fire_post_response_hook` returns a `_PostResponseText` — a `str` subclass carrying an **explicit** verdict (`denied` / `modified`) alongside the reviewed text (#2674). Callers persist it like any string; the strict streaming path reads `.denied` to drive its release/metadata rules instead of inferring the verdict from `text == original` (a fragile comparison that misreads a DENY whose block message happens to equal the original prose).
+
+**Delivery timing depends on whether an *enforcing* audit is active (#2674):**
+
+* **Advisory / warn mode (or no audit):** chunks stream to the user in real time. By the time the hook runs the user has already received them, so DENY/MODIFY only affects the persisted record (and the next-turn history loader — what protects against "I don't see my own quantum response" + replays of dishonest content).
+* **Strict / fail-closed mode:** response audit is *optional and OFF by default*, but when it is enabled in strict mode the fail-closed guarantee requires that **no user-visible byte reach the client before the verdict exists**. The streaming path therefore WITHHOLDS the visible turn while it is assembled for the audit, then releases ONLY the reviewed text (`_strict_audit_release`) — the approved prose on ALLOW/MODIFY, or just the block message on DENY. The withheld raw stream (pre-tool prose, thinking, tool/revise/part sentinels) is never replayed; a DENY exposes none of the original text, and a cancellation before dispatch persists **no** unaudited content. This trades real-time token delivery (and live tool/part cards, which still persist and render on reload) for the integrity gate.
+
+**Mid-turn audit transitions take effect on the *next* turn (#2674).** `buffer_audit` — whether to withhold — is decided once, before the first byte streams, from the POST_RESPONSE hook set enabled at turn start. A tool running *inside* the turn can change that set three ways, each of which would desync the buffering decision from a live-registry enforcement at completion:
+
+* **`warn → strict` on an already-registered hook** — `enable_audit("strict")` mutates `hook.mode` (and `fail_closed` derives from it). Enforcing live would DENY *after* the bytes streamed — the client sees raw text while persistence stores the block message: a fail-open split.
+* **`skip → audit_enable("strict")`** — registers a *brand-new* strict hook. It was absent at turn start (`buffer_audit` False, raw streamed), so a live-registry audit would retroactively DENY an already-delivered turn — the same split.
+* **`strict → audit_disable`** — drops the hook from the live enabled list. The turn was *buffered* (withheld) because it was strict at turn start, so a live-registry audit would find no hook and release the buffered turn with **no audit at all**.
+
+To keep the buffering decision and the enforcement decision in lockstep, `process_input_streaming` snapshots the enabled POST_RESPONSE hook set — hooks *and* their turn-start modes — at turn start (`_snapshot_post_response_hooks`). `buffer_audit` is derived from that snapshot, and `_fire_post_response_hook` runs **exactly that set** through `HooksManager.execute_hooks_snapshot` — which bypasses the live registry and does not re-filter by each hook's *current* `enabled` flag — while pinning each hook to its turn-start mode (`_pinned_hook_modes`). So a hook registered, enabled, disabled, or mode-flipped mid-turn cannot change what audits this turn; the transition applies from the next turn on.
+
+**A DENY discards hook-emitted parts, not just stream-parsed ones (#2674).** A POST_RESPONSE hook that runs *before* the denying audit hook (lower `priority`) can `emit_part` the response text into the per-turn collector. Clearing the parts parsed from the stream is not enough — the leak rides the collector. `_finalize_component_parts(..., keep_hook_parts=not denied)` drains the collector either way (to clear it) but discards the drained parts on a DENY, so denied text never reaches `metadata.parts` and cannot re-render on reload. Applies to the tool, inline-tool, and no-tool branches uniformly.
+
+Sequence:
 
 ```python
 tool_final_text = await self._fire_post_response_hook(
@@ -177,6 +196,10 @@ tool_final_text = await self._fire_post_response_hook(
     pre_tool_prose=..., tool_calls=..., tool_results=...,
 )
 await self._persist_assistant_turn_safely(tool_final_text, ...)
+# strict mode only: release the reviewed text now that the verdict exists
+if buffer_audit and not cancelled:
+    for chunk in _strict_audit_release(tool_final_text):
+        yield chunk
 ```
 
 The HookInput is populated with the SDK-0.9 fields:

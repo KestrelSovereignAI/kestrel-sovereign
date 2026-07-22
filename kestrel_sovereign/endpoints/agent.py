@@ -375,6 +375,17 @@ async def stream_agent_response(request: Request):
             effective_session_id = session_id  # fall back; never block the stream
 
         async def generate():
+            # Shared stop notice for the in-loop cancel check AND the post-loop
+            # fallback (#2674). A strict (fail-closed) response audit that is
+            # stopped before dispatch WITHHOLDS every chunk and returns cleanly,
+            # so the generator is empty and the in-loop check below never runs —
+            # without the post-loop emit the client would get a silent, empty 200
+            # instead of the standard "Request stopped" body.
+            stop_notice = (
+                "\n\n---\n⏹️ **Request stopped**\n\n"
+                "Type `!continue` to resume from where I left off, or start a new message."
+            )
+            stop_notice_emitted = False
             try:
                 from kestrel_sovereign.agent.streaming import strip_revise_sentinels
                 async for chunk in agent.process_input_streaming(
@@ -388,7 +399,8 @@ async def stream_agent_response(request: Request):
                 ):
                     # Check if request was cancelled
                     if agent.is_request_cancelled(request_id):
-                        yield "\n\n---\n⏹️ **Request stopped**\n\nType `!continue` to resume from where I left off, or start a new message."
+                        yield stop_notice
+                        stop_notice_emitted = True
                         break
                     # Wave 5E: strip the in-band revise sentinel before
                     # publishing to TTS subscribers — voice/TTS speaks
@@ -400,6 +412,15 @@ async def stream_agent_response(request: Request):
                     if tts_chunk:
                         await stream_tap.publish(request_id, tts_chunk)
                     yield chunk
+                # #2674: a strict-audit turn cancelled before dispatch withholds
+                # every chunk and returns cleanly, so the loop body above never
+                # ran and the in-loop notice never fired. Surface the standard
+                # stop notice once here when the request was cancelled and nothing
+                # emitted it yet — a break already set the flag, so a normal
+                # in-loop cancel won't double-emit.
+                if not stop_notice_emitted and agent.is_request_cancelled(request_id):
+                    yield stop_notice
+                    stop_notice_emitted = True
             except Exception as e:
                 logger.error(f"Streaming error: {e}", exc_info=True)
                 # Surface the real error to the user instead of a generic

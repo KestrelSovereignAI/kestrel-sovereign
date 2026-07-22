@@ -1094,6 +1094,19 @@ class PostResponseModifyHook(Hook):
         )
 
 
+class PostResponseDenyHook(Hook):
+    """POST_RESPONSE hook that always DENIES — mirrors response_audit strict mode
+    blocking a risky turn."""
+
+    def __init__(self, name: str = "post_response_deny", priority: int = 50):
+        super().__init__(name=name, events=[HookEvent.POST_RESPONSE], priority=priority)
+        self.call_count = 0
+
+    async def execute(self, input: HookInput) -> HookOutput:
+        self.call_count += 1
+        return HookOutput.deny("blocked by audit")
+
+
 class TestPostResponseModify:
     """Regression tests for #2033: POST_RESPONSE MODIFY must round-trip
     its ``updated_input`` back to the caller, not be dropped on the
@@ -1136,6 +1149,90 @@ class TestPostResponseModify:
         # Second hook saw the first hook's rewrite threaded into response_text.
         assert second.seen_response_text == "base [first]"
         assert output.updated_input["response_text"] == "base [first] [second]"
+
+
+class TestExecuteHooksSnapshot:
+    """#2674: ``execute_hooks_snapshot`` runs a CALLER-PINNED hook list, so the
+    strict streaming audit enforces exactly the POST_RESPONSE set captured at
+    turn start — independent of anything the turn's tools register/enable/disable
+    at the live registry mid-turn."""
+
+    @pytest.mark.asyncio
+    async def test_snapshot_ignores_hook_registered_after_capture(self):
+        """A hook registered AFTER the snapshot is not in the pinned list, so it
+        does not run — even though it is live in the registry now (the
+        skip→enable-strict fail-open case)."""
+        manager = HooksManager()
+        hook_input = HookInput(
+            session_id="t",
+            hook_event_name=HookEvent.POST_RESPONSE.value,
+            response_text="base",
+        )
+        # Snapshot taken while the registry is empty.
+        snapshot = manager.get_enabled_hooks(HookEvent.POST_RESPONSE)
+        assert snapshot == []
+
+        # A denier is registered live afterwards.
+        denier = PostResponseDenyHook()
+        manager.register(denier)
+
+        out = await manager.execute_hooks_snapshot(
+            HookEvent.POST_RESPONSE, hook_input, snapshot,
+        )
+        # Snapshot was empty → nothing enforced, despite the live denier.
+        assert out.permission_decision == PermissionDecision.ALLOW
+        assert denier.call_count == 0
+        # Sanity: the LIVE registry WOULD have denied.
+        live = await manager.execute_hooks(HookEvent.POST_RESPONSE, hook_input)
+        assert live.permission_decision == PermissionDecision.DENY
+
+    @pytest.mark.asyncio
+    async def test_snapshot_runs_hook_disabled_after_capture(self):
+        """A hook captured while enabled still runs from the snapshot even after
+        it is disabled — ignoring the current ``enabled`` flag (the
+        strict→disable release-without-audit case)."""
+        manager = HooksManager()
+        denier = PostResponseDenyHook()
+        manager.register(denier)
+        hook_input = HookInput(
+            session_id="t",
+            hook_event_name=HookEvent.POST_RESPONSE.value,
+            response_text="base",
+        )
+        snapshot = manager.get_enabled_hooks(HookEvent.POST_RESPONSE)
+        assert snapshot == [denier]
+
+        # Disable it after capture, as ``audit_disable`` would.
+        denier.enabled = False
+        # Live execution now finds nothing enabled → ALLOW.
+        live = await manager.execute_hooks(HookEvent.POST_RESPONSE, hook_input)
+        assert live.permission_decision == PermissionDecision.ALLOW
+
+        # Snapshot execution ignores the disable and still enforces.
+        out = await manager.execute_hooks_snapshot(
+            HookEvent.POST_RESPONSE, hook_input, snapshot,
+        )
+        assert out.permission_decision == PermissionDecision.DENY
+        assert denier.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_snapshot_preserves_priority_order(self):
+        """The pinned list is executed in priority order regardless of the order
+        it was passed in."""
+        manager = HooksManager()
+        first = PostResponseModifyHook(suffix=" [first]", name="first", priority=10)
+        second = PostResponseModifyHook(suffix=" [second]", name="second", priority=90)
+        hook_input = HookInput(
+            session_id="t",
+            hook_event_name=HookEvent.POST_RESPONSE.value,
+            response_text="base",
+        )
+        # Passed high-priority-first; the manager must still run first→second.
+        out = await manager.execute_hooks_snapshot(
+            HookEvent.POST_RESPONSE, hook_input, [second, first],
+        )
+        assert second.seen_response_text == "base [first]"
+        assert out.updated_input["response_text"] == "base [first] [second]"
 
 
 # === Run tests ===
