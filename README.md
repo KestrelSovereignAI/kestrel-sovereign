@@ -9,7 +9,7 @@ Kestrel is a continuously-developing framework for creating autonomous AI agents
 | Pillar | What it means |
 |--------|--------------|
 | **Portable DID identity** | Cryptographic identity the agent's user owns. Exportable, self-hostable, cloud-optional — the agent is not bound to any provider. |
-| **Persistent memory you own** | Local-first memory with full-text search, knowledge graph retrieval, and RAG. Conversations, documents, relationships — searchable, portable, and encrypted at rest when configured. SQLAlchemy-backed vector storage is in tree for saved items, document chunks, and conversation history; saved-item and RAG embeddings route through the active LLM provider when that provider supports embeddings. |
+| **Persistent memory you own** | Local-first memory with full-text search, knowledge graph retrieval, and RAG. Conversations, documents, relationships — searchable and portable. Conversation history, file blobs, identity private keys, and agent-resource bodies encrypt at rest when `KESTREL_DATA_KEY` is set; saved-item and RAG document-chunk bodies are still plaintext columns until application-layer encryption lands (see [Encryption at Rest](#-encryption-at-rest)). SQLAlchemy-backed vector storage is in tree for saved items, document chunks, and conversation history; saved-item and RAG embeddings route through the active LLM provider when that provider supports embeddings. |
 | **Constitutional governance** | Every agent runs under an audited set of principles enforced *above* the LLM. Genesis audit on creation. Amendment requires cryptographic signature. |
 
 ### What's in core, what's an add-on
@@ -152,7 +152,7 @@ kestrel start
 
 **Where data lives.** `kestrel` resolves the project directory in this order: `KESTREL_HOME` → walk up from CWD looking for a `multi_agent.toml` / `kestrel.toml` / `.env` marker → `~/.kestrel/` for pip-installed users with no markers anywhere. A pure pip install with no `KESTREL_HOME` and no project in CWD lands on `~/.kestrel/` and creates it on first run. **Never** writes to `site-packages/` — `pip install --upgrade kestrel-sovereign` is safe and won't touch your agent data.
 
-If you later want to switch your data dir, move it: `mv ~/.kestrel /new/path && export KESTREL_HOME=/new/path`. The agent's encrypted DB is portable; nothing about the data dir is hard-coded.
+If you later want to switch your data dir, move it: `mv ~/.kestrel /new/path && export KESTREL_HOME=/new/path`. The agent's database file is portable; nothing about the data dir is hard-coded.
 
 ### CLI Commands (Cross-Platform)
 
@@ -676,7 +676,7 @@ Each backup produces a `backup_artifact` node in the graph linked to the agent w
 
 ## 🔒 Encryption at Rest
 
-- Files and conversation history can be encrypted at rest by setting `KESTREL_DATA_KEY` (Fernet key or passphrase):
+`KESTREL_DATA_KEY` (a Fernet key or passphrase) is the master key for Kestrel's **application-layer** encryption at rest. It is **not** whole-database encryption. With it set, Kestrel transparently encrypts conversation-history rows, stored file blobs, agent identity private keys (`SecureKeyStorage`, AES-256-GCM), and agent-resource bodies such as the SOUL (`AgentResourceStore`, Fernet). It does **not** cover saved-item (`saved_items.content`) or RAG document-chunk (`document_chunks.content`) bodies — those are plaintext columns today, with application-layer encryption tracked in [#2677](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2677). Set it before first run:
 
 ```bash
 export KESTREL_DATA_KEY=$(python - <<'PY'
@@ -686,18 +686,29 @@ PY
 )
 ```
 
-- With the key set, stored file blobs and conversation entries are encrypted transparently. Backups remain encrypted by default. For production, wire the backup master key to an env/KMS and avoid the dev placeholder.
+Encryption is transparent on read/write. Remote backups (the IPFS/Filecoin export tiers) are encrypted by default, deriving their key from the same `KESTREL_DATA_KEY` master key — there is no separate backup key, and the export fails if `KESTREL_DATA_KEY` is unset. Local exports (`storage_tier="local"`) are written **unencrypted**. For production, set `KESTREL_DATA_KEY` from an env/KMS secret rather than the dev placeholder.
 
-### Optional: Full-DB Encryption (SQLCipher)
+What is actually encrypted at rest today:
 
-- If you install `pysqlcipher3` and set `KESTREL_DB_KEY`, the SQLite connection will use SQLCipher and encrypt the entire DB:
+| Data at rest | Encrypted at rest today? | Mechanism |
+|---|---|---|
+| Conversation-history rows | Yes, when `KESTREL_DATA_KEY` is set | App-layer Fernet/AEAD |
+| Stored file blobs | Yes, when `KESTREL_DATA_KEY` is set | App-layer Fernet/AEAD |
+| Agent identity private keys | Yes, when `KESTREL_DATA_KEY` is set | `SecureKeyStorage`, AES-256-GCM (key derived from `KESTREL_DATA_KEY`) |
+| Agent-resource bodies (e.g. SOUL) | Yes, when `KESTREL_DATA_KEY` is set | `AgentResourceStore`, Fernet (agent-scoped, derived from `KESTREL_DATA_KEY`) |
+| Saved-item bodies (`saved_items.content`) | **No** — plaintext column | Application-layer encryption planned — [#2677](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2677) |
+| RAG document-chunk bodies (`document_chunks.content`) | **No** — plaintext column | Same gap — [#2677](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2677) |
+| Embeddings (vectors) | No | Numeric vectors, not reversible ciphertext — their presence is not encryption |
+| Remote backups (IPFS/Filecoin export) | Yes, by default | Encrypted from the `KESTREL_DATA_KEY` master key; export fails if the key is unset |
+| Local export (`storage_tier="local"`) | **No** — written unencrypted | — |
+| Identity export packages | N/A — not storage-at-rest encryption | Signed, permissioned continuity packages — see [Identity export custody](docs/architecture/security/IDENTITY_EXPORT_CUSTODY.md) |
+| Whole database file (SQLCipher) | **No** — not wired in this release | `KESTREL_DB_KEY` is not read by the runtime today; the SQLite backend opens plain (`aiosqlite`) databases |
 
-```bash
-export KESTREL_DB_KEY="your-db-passphrase"
-uv run python -m kestrel_sovereign.server --host 127.0.0.1 --port 8888
-```
+Directory and file permissions (`0700` / `0600`) are access control, not encryption; they do not substitute for the mechanisms above.
 
-- Without `pysqlcipher3`, the system falls back to normal SQLite. File blobs and conversations still encrypt with `KESTREL_DATA_KEY` if set.
+### Whole-database encryption (SQLCipher) — not yet wired
+
+Whole-database (SQLCipher) encryption is **not implemented in this release**. The runtime opens the SQLite database with plain `aiosqlite` and does not read `KESTREL_DB_KEY`, so setting that variable does not encrypt the database today. Until full-DB or application-layer encryption lands, the saved-item and RAG document-chunk bodies noted above remain plaintext at rest ([#2677](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2677)). Do not rely on `KESTREL_DB_KEY` for at-rest protection.
 
 ## 🧩 OpenAI-Compatible API
 
