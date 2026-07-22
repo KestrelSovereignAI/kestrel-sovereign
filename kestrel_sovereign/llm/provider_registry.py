@@ -952,12 +952,14 @@ async def _mint_bootstrap_openrouter_key(
         # Persist so the next process (cold start) reuses this key instead of
         # minting another. Best-effort — a store failure just degrades to the
         # old mint-per-process behaviour, never breaks the route.
+        persisted = False
         if host_db is not None:
             try:
                 from kestrel_sovereign.security.host_key_storage import (
                     HostKeyStorage,
                 )
                 await HostKeyStorage(host_db).store_key(provider_id, key_info.key)
+                persisted = True
             except Exception as e:  # noqa: BLE001
                 logger.warning(
                     "Could not persist bootstrap OpenRouter key (%s); it will "
@@ -969,7 +971,7 @@ async def _mint_bootstrap_openrouter_key(
             "Minted bootstrap OpenRouter key (limit $%.2f/mo) as OpenRouter "
             "route default%s",
             limit_usd,
-            " (persisted)" if host_db is not None else "",
+            " (persisted)" if persisted else "",
         )
         return key_info.key
 
