@@ -18,13 +18,17 @@ import json
 import pytest
 
 from kestrel_sovereign.a2a.stores.unified.observability_store import (
+    ObservabilityPurgeError,
     ObservabilityStore,
     ToolDispatchEntry,
     _CONTENT_GATED_MARKER,
 )
 from kestrel_sovereign.privacy import get_privacy_preset
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
-from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+from kestrel_sovereign.storage.privacy_wrapper import (
+    PrivacyEnforcingStorage,
+    PurgeOutcome,
+)
 
 
 def _pii_entry(**overrides) -> ToolDispatchEntry:
@@ -338,6 +342,13 @@ async def test_purge_ephemeral_session_drives_observability_sweep(tmp_path):
             async def purge_agent_graph_nodes(self, *, since_iso):
                 return 0
 
+            async def purge_channel_messages_since(self, since, *, reason):
+                # The wrapper now sweeps channel_messages too (#2096/#2673); a
+                # fake that omits it would raise AttributeError and the wrapper
+                # would (correctly) record channel_messages as a required FAILED
+                # store, masking this clean-path assertion.
+                return 0
+
         # Enter EPHEMERAL first (records the watermark), THEN leak a dispatch
         # row that bypassed the gate — the sweep only scrubs rows since the
         # watermark, so ordering matters.
@@ -350,8 +361,102 @@ async def test_purge_ephemeral_session_drives_observability_sweep(tmp_path):
         await store.log_tool_dispatch(_pii_entry())
 
         breakdown = await wrapper.purge_ephemeral_session()
+        # This is a clean path: every required content sweep succeeded, so mode
+        # exit is permitted (no FAILED required store).
+        assert breakdown.required_sweep_failed is False
         assert breakdown.get("a2a_tool_dispatches", 0) >= 1
         assert await _dispatch_row(backend) is None
+    finally:
+        await store.close()
+
+
+def _flaky_execute_factory(backend, fail_sql_fragment):
+    """Return an ``execute`` shim that raises for one DELETE but delegates the
+    rest, so a single table sweep fails while the others still run."""
+    real_execute = backend.execute
+
+    async def _flaky_execute(sql, params=()):
+        if fail_sql_fragment in sql:
+            raise RuntimeError("disk I/O error")
+        return await real_execute(sql, params)
+
+    return _flaky_execute
+
+
+@pytest.mark.asyncio
+async def test_purge_observability_since_raises_on_partial_failure(tmp_path):
+    """#2673: a failed table sweep is surfaced as ``ObservabilityPurgeError``
+    carrying per-table successes/failures — never collapsed into a clean 0. The
+    OTHER independent sweep is still attempted."""
+    backend, store = await _store(tmp_path, "obs-purge-fail.db")
+    try:
+        await store.log_tool_dispatch(_pii_entry())
+        await store.log_tool_call(
+            agent_name="did:test:emma", tool_name="github", session_id="sess-1"
+        )
+
+        backend.execute = _flaky_execute_factory(
+            backend, "DELETE FROM a2a_tool_dispatches"
+        )
+
+        with pytest.raises(ObservabilityPurgeError) as excinfo:
+            await store.purge_observability_since(
+                "2000-01-01 00:00:00",
+                agent_did="did:test:emma",
+                agent_name="did:test:emma",
+            )
+
+        err = excinfo.value
+        # The failed table is retained as a failure...
+        assert "a2a_tool_dispatches" in err.failures
+        # ...and the independent observability sweep still ran and succeeded.
+        assert err.partial_counts.get("a2a_observability", 0) >= 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_purge_ephemeral_session_records_observability_failure(tmp_path):
+    """#2673: an observability sweep failure is retained as FAILED (never a
+    clean 0) but does NOT block mode exit — the sink is a non-required content
+    store, so ``required_sweep_failed`` stays False while ``any_sweep_failed``
+    trips."""
+    backend, store = await _store(tmp_path, "obs-purge-wrapper-fail.db")
+    try:
+        class _FakeStorage:
+            agent_id = "did:test:emma"
+
+            async def purge_conversations_since(self, since, *, reason):
+                return 0
+
+            async def purge_agent_graph_nodes(self, *, since_iso):
+                return 0
+
+            async def purge_channel_messages_since(self, since, *, reason):
+                return 0
+
+        backend.execute = _flaky_execute_factory(
+            backend, "DELETE FROM a2a_tool_dispatches"
+        )
+
+        wrapper = PrivacyEnforcingStorage(_FakeStorage(), "ephemeral")
+        wrapper.set_observability_purge(
+            lambda since: store.purge_observability_since(
+                since, agent_did="did:test:emma", agent_name="did:test:emma"
+            )
+        )
+        await store.log_tool_dispatch(_pii_entry())
+
+        report = await wrapper.purge_ephemeral_session()
+
+        # The failed table reads as FAILED, not a clean 0.
+        assert (
+            report.store_results["a2a_tool_dispatches"].outcome is PurgeOutcome.FAILED
+        )
+        # Non-required content store: mode exit is still permitted...
+        assert report.required_sweep_failed is False
+        # ...but the purge is NOT clean.
+        assert report.any_sweep_failed is True
     finally:
         await store.close()
 

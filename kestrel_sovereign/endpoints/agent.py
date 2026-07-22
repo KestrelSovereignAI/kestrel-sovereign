@@ -580,6 +580,19 @@ async def set_privacy_mode(request: Request):
                 "message": transition.message,
             }
 
+        # An EPHEMERAL exit was REFUSED because a required no-trace purge sweep
+        # failed (#2673). Nothing flipped — the agent stayed in EPHEMERAL — so we
+        # must report the ACTUAL (unchanged) mode and failure, never success.
+        # Reporting success here would let the agent claim a transition that did
+        # not happen.
+        if transition is not None and not getattr(transition, "applied", True):
+            return {
+                "success": False,
+                "purge_failed": getattr(transition, "purge_failed", False),
+                "mode": agent.privacy_mode.value,
+                "message": transition.message,
+            }
+
         # If switching to a local-only mode, auto-switch model to a local provider
         # If switching back to cloud-allowed mode, restore the previous model
         config = privacy_mode_to_config(new_mode)

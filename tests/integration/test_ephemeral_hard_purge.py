@@ -21,7 +21,10 @@ import pytest
 
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage import AsyncStorage
-from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+from kestrel_sovereign.storage.privacy_wrapper import (
+    PrivacyEnforcingStorage,
+    PurgeOutcome,
+)
 
 
 AGENT_ID = "did:test:ephemeral-purge"
@@ -460,3 +463,124 @@ async def test_purge_with_empty_agent_id_is_a_safe_noop(tmp_path):
             "graph_nodes": 0,
             "channel_messages": 0,
         }
+        # A safe no-op is SKIPPED, never FAILED — it must not block mode exit.
+        assert result.required_sweep_failed is False
+
+
+@pytest.mark.parametrize("backend_method, failed_store", [
+    ("purge_conversations_since", "conversation_history"),
+    ("purge_agent_graph_nodes", "graph_nodes"),
+    ("purge_channel_messages_since", "channel_messages"),
+])
+@pytest.mark.asyncio
+async def test_backend_failure_is_distinguishable_from_clean_zero(
+    tmp_path, monkeypatch, backend_method, failed_store
+):
+    """#2673: an injected failure in EACH purge backend must be distinguishable
+    from a clean zero. The flat count reads 0 (row count unknown) exactly like a
+    clean sweep, but the structured outcome is FAILED and required_sweep_failed
+    trips — so a caller can tell "could not check/delete" from "nothing found".
+    """
+    db_path = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+        await asyncio.sleep(1.05)
+
+        async def _boom(*args, **kwargs):
+            raise RuntimeError("simulated backend failure")
+
+        # Inject a failure into just this one backend sweep.
+        monkeypatch.setattr(storage, backend_method, _boom)
+
+        report = await wrapper.purge_ephemeral_session(reason="test-fail")
+
+    # Flat mapping: the failed store reads 0 (unknown), same shape a clean zero
+    # would produce — so the flat count alone cannot distinguish them.
+    assert report[failed_store] == 0
+    # The structured outcome DOES distinguish: FAILED vs a genuine CLEAN zero.
+    failed = report.store_results[failed_store]
+    assert failed.outcome is PurgeOutcome.FAILED
+    assert failed.error is not None
+    # The other required stores swept cleanly — a genuine CLEAN zero.
+    for store in ("conversation_history", "graph_nodes", "channel_messages"):
+        if store == failed_store:
+            continue
+        other = report.store_results[store]
+        assert other.outcome is PurgeOutcome.CLEAN and other.rows == 0
+    # The required-failure signal trips off the FAILED sweep, not the counts.
+    assert report.required_sweep_failed is True
+
+
+@pytest.mark.asyncio
+async def test_all_sweeps_attempted_even_when_one_fails(tmp_path, monkeypatch):
+    """#2673: a failure in one sweep must not skip the others. The graph sweep
+    still runs and purges its leaked node even though the conversation sweep
+    raised — every independent sweep is attempted and its outcome retained.
+    """
+    from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+    db_path = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+        await asyncio.sleep(1.05)
+        leak_ts = _now_iso_utc()
+        await storage.graph.add_node(GraphNode(
+            node_id="leak-node", node_type="memory", label="leaked",
+            properties={"agent_id": AGENT_ID, "created_at": leak_ts},
+        ))
+
+        async def _boom(*args, **kwargs):
+            raise RuntimeError("conversation sweep down")
+
+        monkeypatch.setattr(storage, "purge_conversations_since", _boom)
+
+        report = await wrapper.purge_ephemeral_session(reason="test-partial")
+
+        # Conversation sweep failed...
+        assert report.store_results["conversation_history"].outcome is PurgeOutcome.FAILED
+        # ...but the graph sweep still ran and purged the leaked node.
+        assert report.store_results["graph_nodes"].outcome is PurgeOutcome.PURGED
+        assert report["graph_nodes"] == 1
+        assert await storage.graph.get_node("leak-node") is None
+        assert report.required_sweep_failed is True
+
+
+@pytest.mark.asyncio
+async def test_watermark_preserved_when_required_sweep_fails(tmp_path, monkeypatch):
+    """#2673: a required sweep failure must NOT clear the entered-ephemeral
+    watermark. The caller keeps the agent in EPHEMERAL (fail closed), so the
+    watermark must survive for a retry to re-scope to the same stint rather than
+    hitting the #867 no-watermark refusal.
+    """
+    db_path = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+        await asyncio.sleep(1.05)
+        watermark = wrapper._entered_ephemeral_at
+        assert watermark is not None
+
+        async def _boom(*args, **kwargs):
+            raise RuntimeError("down")
+
+        monkeypatch.setattr(storage, "purge_conversations_since", _boom)
+
+        report = await wrapper.purge_ephemeral_session(reason="test-fail")
+        assert report.required_sweep_failed is True
+        # Watermark NOT cleared — a retry can still scope to the same stint.
+        assert wrapper._entered_ephemeral_at == watermark
+
+
+@pytest.mark.asyncio
+async def test_clean_sweep_clears_watermark(tmp_path):
+    """#2673 counterpart: a fully clean sweep DOES retire the watermark (the
+    stint is certified complete), preserving the pre-existing semantics."""
+    db_path = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+        await asyncio.sleep(1.05)
+        assert wrapper._entered_ephemeral_at is not None
+
+        report = await wrapper.purge_ephemeral_session(reason="test-clean")
+
+        assert report.required_sweep_failed is False
+        assert wrapper._entered_ephemeral_at is None
