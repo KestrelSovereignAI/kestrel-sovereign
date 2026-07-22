@@ -63,6 +63,35 @@ class _StubRegistry:
         self.registered.append(reg)
         self.by_name[reg.name] = reg
 
+    def register_with_policy(self, reg, policy=None):
+        """Model the real ``SourceRegistry.register_with_policy`` (#2522).
+
+        The feature now registers under an explicit
+        :class:`RegistrationPolicy`, so the stub must return the same
+        structured :class:`RegistrationOutcome` envelope. Contract equivalence
+        is decided by the *real* ``SourceRegistry.contract_signature``, so an
+        identical re-registration on a second ``initialize()`` is a no-op
+        ``ALREADY_EQUIVALENT`` rather than a duplicate.
+        """
+        from kestrel_sovereign.signals import (
+            RegistrationOutcome,
+            RegistrationState,
+            SourceRegistry,
+        )
+
+        existing = self.by_name.get(reg.name)
+        if existing is None:
+            self.registered.append(reg)
+            self.by_name[reg.name] = reg
+            return RegistrationOutcome(reg.name, RegistrationState.REGISTERED)
+        if SourceRegistry.contract_equivalent(existing, reg):
+            return RegistrationOutcome(
+                reg.name, RegistrationState.ALREADY_EQUIVALENT
+            )
+        return RegistrationOutcome(
+            reg.name, RegistrationState.MISMATCH, "stub contract mismatch"
+        )
+
     def get(self, name):
         return self.by_name.get(name)
 

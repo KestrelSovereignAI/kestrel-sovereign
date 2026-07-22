@@ -148,12 +148,19 @@ class SchedulerFeature(Feature):
                     "bootstrap_timeout_check": self._run_bootstrap_timeout_check,
                 },
             )
-            for reg in cron_registrations:
-                # Idempotent against re-init: skip if already registered
-                # (the registry rejects duplicates, but a feature reload
-                # in tests shouldn't blow up).
-                if reg.name not in registry:
-                    registry.register(reg)
+            from kestrel_sovereign.signals import RegistrationPolicy
+
+            # OPTIONAL policy (#2522): a feature reload re-registering an
+            # equivalent cron source is a no-op; a name clash with a DIFFERENT
+            # contract is reported (logged loudly) rather than silently skipped
+            # by the old ``name not in registry`` precheck. Never raises, so
+            # scheduler init is not aborted by one bad source.
+            cron_outcomes = registry.register_batch(
+                cron_registrations, RegistrationPolicy.OPTIONAL
+            )
+            # Own the cron sources we newly registered so shutdown / boot
+            # rollback unregisters exactly them (#2522 P2).
+            self._own_signal_sources(cron_outcomes)
 
             # github_pr_watch (#1618) is an ACTION cron task that, on a
             # relevant change, enqueues a COGNITION github.pr_activity
@@ -162,20 +169,26 @@ class SchedulerFeature(Feature):
             # (no GitHub feature required), so the source lives with the
             # scheduler rather than an external package.
             from kestrel_sovereign.signals.sources.github_pr_watch import (
-                SOURCE_NAME as _PR_ACTIVITY_SOURCE,
                 build_github_pr_activity_registration,
             )
 
-            if _PR_ACTIVITY_SOURCE not in registry:
-                registry.register(build_github_pr_activity_registration())
+            self._own_signal_sources(
+                registry.register_with_policy(
+                    build_github_pr_activity_registration(),
+                    RegistrationPolicy.OPTIONAL,
+                )
+            )
 
             from kestrel_sovereign.signals.sources.ecosystem_discovery import (
-                SOURCE_NAME as _DISCOVERY_SOURCE,
                 build_ecosystem_discovery_registration,
             )
 
-            if _DISCOVERY_SOURCE not in registry:
-                registry.register(build_ecosystem_discovery_registration())
+            self._own_signal_sources(
+                registry.register_with_policy(
+                    build_ecosystem_discovery_registration(),
+                    RegistrationPolicy.OPTIONAL,
+                )
+            )
         else:
             logger.warning(
                 "SchedulerFeature: no signal_registry on agent, "
@@ -369,6 +382,8 @@ class SchedulerFeature(Feature):
         """Stop the background runner."""
         if self._runner:
             await self._runner.stop()
+        # Unregister the cron / pr-watch / discovery sources (base #2522 P2).
+        await super().shutdown()
 
     # ------------------------------------------------------------------
     # Task executor — dispatches via SignalDispatcher (Phase 4 of #889)

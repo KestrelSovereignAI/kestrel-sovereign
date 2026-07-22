@@ -272,8 +272,89 @@ class Feature(_SdkFeature):
         pass
 
     async def shutdown(self):
-        """Cleanup resources."""
-        pass
+        """Cleanup resources.
+
+        Also unregisters any signal sources this feature registered on the
+        agent's dispatcher (kestrel-sovereign#2522 P2). Boot rollback
+        (``KestrelAgent._boot_teardown_features``) and runtime disable both call
+        ``shutdown()``, so a feature that registered dispatcher sources and then
+        hit a later boot-phase failure must not leave feature-bound handlers /
+        closures stranded in the registry. Overrides that do their own teardown
+        should call ``await super().shutdown()``.
+        """
+        await self._unregister_owned_signal_sources()
+
+    # ------------------------------------------------------------------
+    # Signal-source ownership (#2522 P2)
+    #
+    # A feature that self-registers dispatcher sources must be able to remove
+    # *exactly the sources it created* on shutdown / boot rollback — never a
+    # host's pre-existing source. It records the names it newly registered here
+    # and tears them down in ``shutdown()``.
+    # ------------------------------------------------------------------
+    def _own_signal_sources(self, result) -> None:
+        """Record the signal-source names this feature NEWLY registered.
+
+        ``result`` is whatever a ``register_*`` helper returned — a
+        :class:`RegistrationOutcome`, a list of outcomes, a list of names, or a
+        single name. Only *newly created* sources are recorded: a
+        ``RegistrationOutcome`` counts only in the ``REGISTERED`` state, and the
+        name-list helpers already exclude sources a host owned. Recording just
+        the newly-owned names means :meth:`_unregister_owned_signal_sources`
+        tears down exactly this feature's sources and never a host's.
+        """
+        if not result:
+            return
+        try:
+            from kestrel_sovereign.signals import (
+                RegistrationOutcome,
+                RegistrationState,
+            )
+        except Exception:  # pragma: no cover - signals always importable in-tree
+            RegistrationOutcome = None  # type: ignore[assignment]
+            RegistrationState = None  # type: ignore[assignment]
+
+        items = result if isinstance(result, (list, tuple, set)) else [result]
+        owned = getattr(self, "_owned_signal_source_names", None)
+        if owned is None:
+            owned = []
+            self._owned_signal_source_names = owned
+        for item in items:
+            name = None
+            if isinstance(item, str):
+                name = item
+            elif (
+                RegistrationOutcome is not None
+                and isinstance(item, RegistrationOutcome)
+            ):
+                if item.state is RegistrationState.REGISTERED:
+                    name = item.name
+            if name and name not in owned:
+                owned.append(name)
+
+    async def _unregister_owned_signal_sources(self) -> None:
+        """Unregister the signal sources this feature registered (#2522 P2).
+
+        Best-effort and idempotent: unregistering an already-absent source is a
+        benign no-op, so repeated shutdowns are safe.
+        """
+        names = getattr(self, "_owned_signal_source_names", None)
+        if not names:
+            return
+        registry = getattr(getattr(self, "agent", None), "signal_registry", None)
+        if registry is not None and hasattr(registry, "unregister"):
+            for name in names:
+                try:
+                    registry.unregister(name)
+                except Exception as exc:  # noqa: BLE001 - best-effort teardown
+                    logger.warning(
+                        "feature '%s': could not unregister signal source "
+                        "'%s': %s",
+                        getattr(self, "name", type(self).__name__),
+                        name,
+                        exc,
+                    )
+        self._owned_signal_source_names = []
 
     async def on_enable(self):
         """Called when feature is enabled.

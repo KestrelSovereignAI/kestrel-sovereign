@@ -35,9 +35,13 @@ additions"):
 
 from __future__ import annotations
 
+import enum
+import functools
 import inspect
+import logging
 import warnings
-from typing import Iterator, Optional
+from dataclasses import dataclass
+from typing import Iterable, Iterator, Optional
 
 from kestrel_sdk.signals import (
     ResourceLock,
@@ -45,6 +49,8 @@ from kestrel_sdk.signals import (
     SourceRegistration,
     Trust,
 )
+
+logger = logging.getLogger(__name__)
 
 # Allowed values for the SDK-typed Literal fields. The SDK dataclass
 # only declares these via `Literal[...]` annotations, which Python does
@@ -82,6 +88,63 @@ class RegistrationError(ValueError):
     """
 
 
+class RegistrationPolicy(enum.Enum):
+    """Explicit policy for how a source registration resolves a name clash.
+
+    The bare :meth:`SourceRegistry.register` is one-shot and raises on ANY
+    duplicate name — safe for the single core-boot path where every name is
+    registered exactly once, but too blunt for the feature/boot paths that
+    historically hand-rolled precheck-by-name skips, catch-and-continue, or
+    partial-set loops (kestrel-sovereign#2522). Those paths silently equated a
+    same-name source that in fact carried a *different* trust, mode set,
+    redaction, handler, or ownership. This enum makes the intended behavior a
+    declared policy instead of an accident of the surrounding try/except:
+
+    * ``MANDATORY`` — a name clash with a non-equivalent contract is a hard
+      :class:`RegistrationError`; an equivalent re-registration is a no-op
+      success. Boot-critical sources use this. In a batch it is atomic
+      (see :meth:`SourceRegistry.register_batch`).
+    * ``OPTIONAL`` — never raises. A validation failure, or a clash with a
+      non-equivalent contract, is *reported* (a ``MISMATCH`` / ``INVALID``
+      outcome, logged loudly) and the existing registration is kept. Feature
+      sources whose absence is a degraded-but-tolerable state use this.
+    * ``IDEMPOTENT`` — an equivalent re-registration is a no-op success; a
+      clash with a *different* contract raises. Same failure contract as
+      ``MANDATORY`` but names the intent ("register once; re-runs are only
+      valid if identical").
+    """
+
+    MANDATORY = "mandatory"
+    OPTIONAL = "optional"
+    IDEMPOTENT = "idempotent"
+
+
+class RegistrationState(enum.Enum):
+    """Outcome state of a single policy-driven registration."""
+
+    REGISTERED = "registered"           # newly added
+    ALREADY_EQUIVALENT = "already_equivalent"  # present with an equivalent contract
+    MISMATCH = "mismatch"               # present with a DIFFERENT contract (reported)
+    INVALID = "invalid"                 # failed validation (reported, OPTIONAL only)
+
+
+@dataclass(frozen=True)
+class RegistrationOutcome:
+    """Structured result of a policy-driven registration (never a silent skip)."""
+
+    name: str
+    state: RegistrationState
+    detail: str = ""
+
+    @property
+    def ok(self) -> bool:
+        """True when the source is present with the intended contract."""
+        return self.state in (
+            RegistrationState.REGISTERED,
+            RegistrationState.ALREADY_EQUIVALENT,
+        )
+
+
 class SourceRegistry:
     """In-memory registry of signal sources keyed by `source.name`.
 
@@ -105,6 +168,178 @@ class SourceRegistry:
                 "Re-registration is not supported; restart the process to change."
             )
         self._sources[registration.name] = registration
+
+    def unregister(self, name: str) -> bool:
+        """Remove a source by name. Returns True if one was present.
+
+        Used by the agent boot state machine to roll a partial signal-source
+        set back in reverse order when a later boot phase fails
+        (kestrel-sovereign#2522). Registration is otherwise one-shot; this is
+        the deliberate inverse for the teardown path, not a mutate-behind-a-
+        running-dispatcher tool.
+        """
+        return self._sources.pop(name, None) is not None
+
+    def register_with_policy(
+        self,
+        registration: SourceRegistration,
+        policy: RegistrationPolicy = RegistrationPolicy.MANDATORY,
+    ) -> RegistrationOutcome:
+        """Register a source under an explicit name-clash :class:`RegistrationPolicy`.
+
+        Returns a :class:`RegistrationOutcome`. A same-name source is only
+        accepted when it is *contract-equivalent* to the existing one (see
+        :meth:`contract_signature`); a differing trust/mode/redaction/handler/
+        ownership is a ``MISMATCH`` — reported (and raised for MANDATORY /
+        IDEMPOTENT) rather than silently equated.
+        """
+        try:
+            self._validate(registration)
+        except RegistrationError as exc:
+            if policy is RegistrationPolicy.OPTIONAL:
+                logger.warning(
+                    "signal source '%s' failed validation under OPTIONAL "
+                    "policy; not registered: %s",
+                    registration.name,
+                    exc,
+                )
+                return RegistrationOutcome(
+                    registration.name, RegistrationState.INVALID, str(exc)
+                )
+            raise
+
+        existing = self._sources.get(registration.name)
+        if existing is None:
+            self._sources[registration.name] = registration
+            return RegistrationOutcome(registration.name, RegistrationState.REGISTERED)
+
+        if self.contract_equivalent(existing, registration):
+            return RegistrationOutcome(
+                registration.name, RegistrationState.ALREADY_EQUIVALENT
+            )
+
+        detail = (
+            f"Source '{registration.name}' is already registered with a "
+            "DIFFERENT contract (trust/modes/redaction/handler/ownership); "
+            "refusing to silently treat them as equivalent."
+        )
+        if policy is RegistrationPolicy.OPTIONAL:
+            logger.error(
+                "%s Keeping the existing registration; the new one is dropped "
+                "(existing=%s incoming=%s).",
+                detail,
+                self.contract_signature(existing),
+                self.contract_signature(registration),
+            )
+            return RegistrationOutcome(
+                registration.name, RegistrationState.MISMATCH, detail
+            )
+        raise RegistrationError(detail)
+
+    def register_batch(
+        self,
+        registrations: Iterable[SourceRegistration],
+        policy: RegistrationPolicy = RegistrationPolicy.MANDATORY,
+    ) -> list[RegistrationOutcome]:
+        """Register several sources under one policy.
+
+        Under ``MANDATORY``/``IDEMPOTENT`` the batch is **atomic**: if any
+        registration raises, every source newly added *by this batch* is
+        removed before the error propagates, so a mid-sequence failure never
+        leaves a partial source set behind (kestrel-sovereign#2522 partial-set
+        defect). Under ``OPTIONAL`` each source is independent and reported.
+        """
+        outcomes: list[RegistrationOutcome] = []
+        newly_added: list[str] = []
+        try:
+            for registration in registrations:
+                outcome = self.register_with_policy(registration, policy)
+                outcomes.append(outcome)
+                if outcome.state is RegistrationState.REGISTERED:
+                    newly_added.append(outcome.name)
+        except RegistrationError:
+            for name in newly_added:
+                self._sources.pop(name, None)
+            raise
+        return outcomes
+
+    @staticmethod
+    def contract_signature(reg: SourceRegistration) -> tuple:
+        """A hashable fingerprint of *every* behavior-affecting field of a source.
+
+        Two registrations are *contract-equivalent* iff their signatures are
+        equal. The fingerprint deliberately covers the whole dispatch contract,
+        not a subset (kestrel-sovereign#2522 P1): identity + schema, the mode
+        set + default, trust, the handler/artifact/sanitizer/result callables,
+        throttling (rate limit + coalescing window), attention policy, resource
+        ownership + self-loop policy, the redaction policy's *flags and
+        summarizer* (not merely its class), retention, and the four
+        constitutional-injection fields. A re-registration that changes any of
+        them is therefore caught as a MISMATCH instead of being silently
+        accepted as equivalent.
+
+        Callables are fingerprinted by :func:`_callable_identity`, which folds
+        in a bound method's owner and a closure's *captured free variables* by
+        object identity. That is what distinguishes two
+        ``build_*_registration(coordinator)`` handlers that share a qualname but
+        capture *different* coordinators (or two ``fleet_stalled_sweep``
+        registrations bound to different discovery callbacks): a genuine
+        same-owner re-init compares equivalent (the same captured instance), a
+        handler bound to a new owner/dependency is a mismatch — the exact
+        false-equivalence the signal-duplication audit found. Immutable scalars
+        captured by a closure (e.g. a task name) still compare by value, so a
+        rebuilt-but-identical registration is not spuriously flagged.
+        """
+        rl = reg.rate_limit
+        ap = reg.attention_policy
+        red = reg.log_redaction
+        return (
+            reg.name,
+            _callable_identity(reg.schema),
+            reg.default_mode,
+            frozenset(reg.allowed_modes),
+            _callable_identity(reg.handler),
+            _callable_identity(reg.artifact_handler),
+            str(reg.prompt_template) if reg.prompt_template is not None else None,
+            reg.trust,
+            _callable_identity(reg.sanitizer),
+            (rl.per_minute, rl.per_hour, rl.burst) if rl is not None else None,
+            reg.coalescing_window,
+            (
+                (
+                    ap.quiet_hours,
+                    ap.tz,
+                    frozenset(ap.modes_governed),
+                    ap.urgency_override,
+                )
+                if ap is not None
+                else None
+            ),
+            frozenset(reg.resources),
+            reg.allow_self_loops,
+            (
+                (
+                    _callable_identity(red.summarize),
+                    red.store_raw_trusted,
+                    red.redact_caller_identifier,
+                )
+                if red is not None
+                else None
+            ),
+            reg.retention_days,
+            _callable_identity(reg.result_summary),
+            reg.require_constitution_echo,
+            reg.prompt_template_format,
+            reg.constitution_injection,
+            reg.system_prompt_budget_bytes,
+        )
+
+    @classmethod
+    def contract_equivalent(
+        cls, a: SourceRegistration, b: SourceRegistration
+    ) -> bool:
+        """True when ``a`` and ``b`` declare the same source contract."""
+        return cls.contract_signature(a) == cls.contract_signature(b)
 
     @staticmethod
     def _validate(reg: SourceRegistration) -> None:
@@ -300,6 +535,98 @@ class SourceRegistry:
 
     def __len__(self) -> int:
         return len(self._sources)
+
+
+def _value_identity(value: object) -> object:
+    """A hashable, comparison-stable identity for a closure-captured value.
+
+    Used by :func:`_callable_identity` to fingerprint each free variable a
+    handler closure captures (kestrel-sovereign#2522 P1):
+
+    * ``None`` and immutable scalars (``str``/``bytes``/``bool``/numbers) and
+      enums compare **by value**, so a rebuilt closure that captured an equal
+      ``task_name`` string is still equivalent — no spurious mismatch.
+    * A captured *callable* recurses through :func:`_callable_identity`, so a
+      captured bound method compares by its owner instance (stable across a
+      same-instance re-init even though the bound-method wrapper object is
+      freshly created on each attribute access).
+    * Any other object (a coordinator, a discovery callback object, …) compares
+      **by ``id()``** — a distinct owner/dependency instance is correctly a
+      different contract.
+
+    ``id()`` is reliable for this comparison because both the existing and the
+    incoming registration hold a live reference to their callables (and thus to
+    everything those capture) for the duration of the equivalence check, so no
+    id can be reused between the two operands.
+    """
+    if value is None or isinstance(value, (str, bytes, bool, int, float, complex)):
+        return value
+    if isinstance(value, enum.Enum):
+        return value
+    if callable(value):
+        return _callable_identity(value)
+    return id(value)
+
+
+def _callable_identity(fn: object) -> Optional[tuple]:
+    """A stable, hashable identity for a handler / sanitizer / schema callable.
+
+    Folds in *what the callable is bound to* so two closures that share a
+    qualified name but capture different owners/dependencies are distinguished
+    (kestrel-sovereign#2522 P1). A genuine same-owner rebuild yields an equal
+    identity; a callable bound to a new owner does not.
+
+    * ``None`` → ``None``.
+    * bound method / bound builtin → ``("bound", qualname, id(owner))``.
+    * :class:`functools.partial` → recurse into ``func`` plus the bound
+      positional/keyword arguments (each via :func:`_value_identity`).
+    * closure → ``("closure", qualname, (captured-var-identity, ...))`` over its
+      free variables (each via :func:`_value_identity`).
+    * plain function / unbound method → ``("function", qualname)``.
+    * any other callable object → ``("object", type-qualname, id(obj))`` — a new
+      instance is (correctly) a different contract.
+    """
+    if fn is None:
+        return None
+
+    qual = (
+        getattr(fn, "__qualname__", None)
+        or getattr(fn, "__name__", None)
+        or type(fn).__qualname__
+    )
+
+    # Bound method (or bound builtin): the owner instance is the
+    # behavior-affecting binding, and it survives a same-instance re-init even
+    # though ``obj.method`` yields a fresh wrapper object on each access.
+    self_obj = getattr(fn, "__self__", None)
+    if self_obj is not None:
+        return ("bound", qual, id(self_obj))
+
+    if isinstance(fn, functools.partial):
+        return (
+            "partial",
+            _callable_identity(fn.func),
+            tuple(_value_identity(a) for a in fn.args),
+            tuple(sorted((k, _value_identity(v)) for k, v in fn.keywords.items())),
+        )
+
+    closure = getattr(fn, "__closure__", None)
+    if closure:
+        cells: list = []
+        for cell in closure:
+            try:
+                cells.append(_value_identity(cell.cell_contents))
+            except ValueError:
+                # Empty cell — a free variable not yet bound; nothing to fold.
+                cells.append(None)
+        return ("closure", qual, tuple(cells))
+
+    if inspect.isfunction(fn) or inspect.ismethod(fn) or inspect.isbuiltin(fn):
+        return ("function", qual)
+
+    # Some other callable object (an instance with ``__call__``). Its identity
+    # IS the instance; a fresh instance is correctly a different contract.
+    return ("object", type(fn).__qualname__, id(fn))
 
 
 def _has_echo_rationale(reg: SourceRegistration) -> bool:

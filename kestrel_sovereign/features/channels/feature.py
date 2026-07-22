@@ -152,13 +152,22 @@ class ChannelFeature(Feature):
 
     def _register_channel_signal_source(self) -> None:
         signal_registry = getattr(self.agent, "signal_registry", None)
-        if signal_registry is None:
+        if signal_registry is None or not hasattr(
+            signal_registry, "register_with_policy"
+        ):
             return
-        try:
-            if signal_registry.get("channel.message") is None:
-                signal_registry.register(build_channel_message_registration())
-        except Exception as exc:
-            logger.warning("Could not register channel.message signal source: %s", exc)
+        from kestrel_sovereign.signals import RegistrationPolicy
+
+        # OPTIONAL policy (#2522): idempotent on re-init, but an existing
+        # channel.message source with a DIFFERENT contract is reported rather
+        # than silently accepted by a precheck-by-name skip. Never raises.
+        outcome = signal_registry.register_with_policy(
+            build_channel_message_registration(),
+            RegistrationPolicy.OPTIONAL,
+        )
+        # Own the source we newly registered so shutdown / boot rollback
+        # unregisters it (#2522 P2).
+        self._own_signal_sources(outcome)
 
     async def shutdown(self):
         """Disconnect all registered adapters."""
@@ -173,6 +182,8 @@ class ChannelFeature(Feature):
                         info["channel_type"],
                         exc,
                     )
+        # Unregister channel.message (base #2522 P2 teardown).
+        await super().shutdown()
 
     # ------------------------------------------------------------------
     # Message logging helpers

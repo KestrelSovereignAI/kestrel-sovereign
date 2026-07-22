@@ -224,17 +224,22 @@ class RestartCoordinatorFeature(Feature):
         # extracts to an external feature, the registration travels
         # with it.
         registry = getattr(self.agent, "signal_registry", None)
-        if registry is not None and hasattr(registry, "register"):
-            try:
-                from kestrel_sovereign.signals.sources.restart import (
-                    build_restart_completed_registration,
+        if registry is not None and hasattr(registry, "register_with_policy"):
+            from kestrel_sovereign.signals import RegistrationPolicy
+            from kestrel_sovereign.signals.sources.restart import (
+                build_restart_completed_registration,
+            )
+            # OPTIONAL policy (#2522): idempotent on a second initialize(); an
+            # existing restart.completed with a DIFFERENT contract is reported
+            # rather than swallowed by a broad except. Never raises.
+            # Own the source we newly registered so the base-class shutdown /
+            # boot rollback unregisters it (#2522 P2).
+            self._own_signal_sources(
+                registry.register_with_policy(
+                    build_restart_completed_registration(),
+                    RegistrationPolicy.OPTIONAL,
                 )
-                registry.register(build_restart_completed_registration())
-            except Exception as e:
-                logger.warning(
-                    "RestartCoordinatorFeature: signal-source register "
-                    "failed: %s", e,
-                )
+            )
 
         # Recover any row left in ``updating`` by a host that went down
         # mid-update (operator restart, crash) BEFORE the executing
