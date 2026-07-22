@@ -35,9 +35,11 @@ class _Storage:
     async def get_node(self, node_id):
         return self.node if node_id == self.node.node_id else None
 
-    async def add_node(self, node, *, control_plane: bool = False):
-        # Mirrors the real facade/wrapper signature — governance writers pass
-        # ``control_plane=True`` for the agent identity node (#2672).
+    async def add_node(self, node, *, capability=None):
+        # Mirrors the real facade/wrapper signature — governance writers pass the
+        # unforgeable control-plane ``capability`` for the agent identity node
+        # (#2672). persist_agent_description now writes without a capability
+        # (source-gated in volatile modes, ungoverned in persistent modes).
         self.saved = node
         self.node = node
 
@@ -772,7 +774,10 @@ class TestPersistAgentDescription:
 
     @pytest.mark.asyncio
     async def test_writes_both_metadata_and_node(self):
-        from kestrel_sovereign.bootstrap.service import persist_agent_description
+        from kestrel_sovereign.bootstrap.service import (
+            PersistOutcome,
+            persist_agent_description,
+        )
 
         node = _GraphNode(node_id="agent-1")
         storage = _Storage(node)
@@ -780,7 +785,7 @@ class TestPersistAgentDescription:
 
         wrote = await persist_agent_description(db, storage, "agent-1", "Self-authored bio")
 
-        assert wrote is True
+        assert wrote is PersistOutcome.PERSISTED
         assert db.data[("agent-1", "description")] == "Self-authored bio"
         assert storage.node.properties["description"] == "Self-authored bio"
 
@@ -809,7 +814,7 @@ class TestPersistAgentDescription:
             async def get_node(self, _id):
                 return _GraphNode(node_id="agent-1", properties={"description": "old"})
 
-            async def add_node(self, _node, *, control_plane: bool = False):
+            async def add_node(self, _node, *, capability=None):
                 raise RuntimeError("graph write failed")
 
         with pytest.raises(RuntimeError):
@@ -818,7 +823,10 @@ class TestPersistAgentDescription:
     @pytest.mark.asyncio
     async def test_node_absent_writes_metadata_only(self):
         """No graph node (abnormal) — metadata-only write still reports True."""
-        from kestrel_sovereign.bootstrap.service import persist_agent_description
+        from kestrel_sovereign.bootstrap.service import (
+            PersistOutcome,
+            persist_agent_description,
+        )
 
         db = MockDB()
 
@@ -826,16 +834,19 @@ class TestPersistAgentDescription:
             async def get_node(self, _id):
                 return None
 
-            async def add_node(self, _node, *, control_plane: bool = False):  # pragma: no cover - never reached
+            async def add_node(self, _node, *, capability=None):  # pragma: no cover - never reached
                 raise AssertionError("should not be called")
 
         wrote = await persist_agent_description(db, _NoNodeStorage(), "agent-1", "bio")
-        assert wrote is True
+        assert wrote is PersistOutcome.PERSISTED
         assert db.data[("agent-1", "description")] == "bio"
 
     @pytest.mark.asyncio
     async def test_none_description_is_noop(self):
-        from kestrel_sovereign.bootstrap.service import persist_agent_description
+        from kestrel_sovereign.bootstrap.service import (
+            PersistOutcome,
+            persist_agent_description,
+        )
 
         node = _GraphNode(node_id="agent-1")
         storage = _Storage(node)
@@ -843,7 +854,7 @@ class TestPersistAgentDescription:
 
         wrote = await persist_agent_description(db, storage, "agent-1", None)
 
-        assert wrote is False
+        assert wrote is PersistOutcome.NOOP
         assert ("agent-1", "description") not in db.data
         assert "description" not in node.properties
 
@@ -939,3 +950,126 @@ class TestInvocationContextThreading:
 
         assert mock_llm.last_kwargs is not None
         assert mock_llm.last_kwargs.get("invocation_context") is None
+
+
+class _VolatileStorage:
+    """A storage facade whose privacy policy forbids durable user-content writes.
+
+    Mirrors the one surface the bootstrap discovery paths probe —
+    ``allows_persistent_writes()`` returning ``False`` — so the service takes its
+    volatile-mode branch (session-only discovery history, no durable persist).
+    """
+
+    def allows_persistent_writes(self) -> bool:
+        return False
+
+
+@pytest.fixture
+def volatile_bootstrap_service(mock_db, mock_llm, temp_agent_dir):
+    """A BootstrapService whose privacy mode forbids durable persistence."""
+    return BootstrapService(
+        db=mock_db,
+        agent_id="did:pkh:eip155:1:0xVOLATILE",
+        agent_name="TestAgent",
+        llm_service=mock_llm,
+        agent_data_path=temp_agent_dir,
+        storage=_VolatileStorage(),
+    )
+
+
+class TestVolatileDiscoveryHistory:
+    """#2672 review P1 — in a volatile privacy mode the raw discovery
+    conversation must NOT reach the durable ``agent_metadata`` table, but it must
+    still accumulate ACROSS turns in a session-only store. Otherwise every turn
+    reloads ``[]``, the exchange count is pinned to one, the natural
+    "three exchanges" completion condition is unreachable, and SOUL generation
+    sees no history.
+    """
+
+    def _durable_history_rows(self, service):
+        """Every durable discovery-history row the service wrote (must be empty)."""
+        return [
+            key
+            for key in service.db.data
+            if key == (service.agent_id, BootstrapService.DISCOVERY_HISTORY_KEY)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_history_accumulates_across_turns_without_persisting(
+        self, volatile_bootstrap_service
+    ):
+        """Successive discovery turns accumulate in the session store — the
+        exchange count grows to three (reaching the completion threshold) — while
+        NOTHING is written to the durable table."""
+        service = volatile_bootstrap_service
+
+        await service.process_discovery_message("Hi, I'm Alice!")
+        h1 = await service.get_discovery_history()
+        assert len([m for m in h1 if m["role"] == "user"]) == 1
+
+        await service.process_discovery_message("I like things brief.")
+        h2 = await service.get_discovery_history()
+        assert len([m for m in h2 if m["role"] == "user"]) == 2
+
+        await service.process_discovery_message("Sounds good.")
+        h3 = await service.get_discovery_history()
+        # The exact input the "three exchanges" completion condition needs — it
+        # was pinned to one before the fix.
+        assert len([m for m in h3 if m["role"] == "user"]) == 3
+        assert h3[0]["content"] == "Hi, I'm Alice!"
+
+        # And nothing durable was ever written.
+        assert self._durable_history_rows(service) == []
+        assert service._session_discovery_history is not None
+        assert len(service._session_discovery_history) == 6
+
+    @pytest.mark.asyncio
+    async def test_system_prompt_exchange_count_advances(
+        self, volatile_bootstrap_service, mock_llm
+    ):
+        """The discovery system prompt's exchange count advances turn over turn —
+        proof the LLM sees the accumulating (not reset) history."""
+        service = volatile_bootstrap_service
+
+        await service.process_discovery_message("Hi!")
+        first_prompt = mock_llm.last_messages[0]["content"]
+        await service.process_discovery_message("More.")
+        second_prompt = mock_llm.last_messages[0]["content"]
+
+        assert "Exchange count: 0" in first_prompt
+        assert "Exchange count: 1" in second_prompt
+
+    @pytest.mark.asyncio
+    async def test_soul_generation_sees_session_history(
+        self, volatile_bootstrap_service, mock_llm
+    ):
+        """SOUL generation reads the session-only discovery history (not the empty
+        default), so a volatile-mode agent still gets a personalized SOUL."""
+        service = volatile_bootstrap_service
+        await service.process_discovery_message("Call me Alice; keep it casual.")
+
+        soul = await service.generate_soul_md()
+
+        # It went through the LLM path (non-empty history), not the default
+        # template, and the discovery content reached the generation prompt.
+        assert soul == mock_llm.responses[-1]
+        generation_prompt = mock_llm.last_messages[1]["content"]
+        assert "Call me Alice" in generation_prompt
+
+    @pytest.mark.asyncio
+    async def test_restart_discovery_clears_session_store(
+        self, volatile_bootstrap_service
+    ):
+        """``restart_discovery`` resets the session-only store so discovery starts
+        fresh, and the reset is reported as a success (not a false failure)."""
+        service = volatile_bootstrap_service
+        await service.process_discovery_message("Hi, I'm Alice!")
+        assert await service.get_discovery_history()  # non-empty
+
+        result = await service.restart_discovery()
+
+        assert await service.get_discovery_history() == []
+        assert not service._session_discovery_history
+        # A privacy skip is not a failure — the clear must report success.
+        assert result.history_clear_error is None
+        assert result.history_clear_succeeded is True

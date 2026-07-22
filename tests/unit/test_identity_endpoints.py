@@ -30,7 +30,9 @@ class MockStorage:
     async def get_node(self, node_id):
         return self.nodes.get(node_id)
 
-    async def add_node(self, node):
+    async def add_node(self, node, *, capability=None):
+        # Mirrors the real AsyncStorage/wrapper envelope: trusted governance
+        # callers (rename_agent_core) pass the control-plane capability (#2672).
         self.nodes[node.node_id] = node
 
 
@@ -150,6 +152,94 @@ class TestRenameAgentCore:
         node = await agent.storage.get_node(agent.agent_id)
         assert node.properties["name"] == "NodeTest"
         assert node.label == "NodeTest"
+
+
+# ---------------------------------------------------------------------------
+# PATCH /api/identity write-outcome contract in a volatile privacy mode
+# (#2672 review P1/P2): a skipped durable write must report partial (207 /
+# success:false), never a false 200/success:true.
+# ---------------------------------------------------------------------------
+
+
+class _VolatileStorage(MockStorage):
+    """Mock storage whose privacy policy forbids durable user-content writes."""
+
+    def __init__(self):
+        super().__init__()
+        from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
+        self.privacy_config = privacy_mode_to_config(PrivacyMode.EPHEMERAL)
+
+    def allows_persistent_writes(self):
+        return False
+
+
+def _volatile_agent():
+    agent = MockAgent()
+    agent.storage = _VolatileStorage()
+    agent.storage.nodes[agent.agent_id] = MockNode(
+        agent.agent_id,
+        properties={"name": "TestAgent", "description": "stored bio", "avatar_hash": None},
+        label="TestAgent",
+    )
+    return agent
+
+
+def _request_for(agent):
+    req = MagicMock()
+    req.state.agent = agent
+    return req
+
+
+class TestUpdateIdentityVolatileSkip:
+    @pytest.mark.asyncio
+    async def test_description_skip_reports_partial_not_success(self):
+        """A description skipped for privacy returns 207 / success:false with an
+        explicit skip flag — never a 200/success:true false confirmation (P2)."""
+        from fastapi import Response
+        from kestrel_sovereign.endpoints.models import (
+            UpdateIdentityRequest,
+            update_identity,
+        )
+
+        agent = _volatile_agent()
+        response = Response()
+        payload = await update_identity.__wrapped__(
+            _request_for(agent), response,
+            UpdateIdentityRequest(description="a fresh bio"),
+        )
+
+        assert response.status_code == 207
+        assert payload["success"] is False
+        assert payload["description_skipped_privacy"] is True
+        assert "description_skipped_privacy" in payload["updated_fields"]
+        assert "description" not in payload["updated_fields"]
+        # The stored value is untouched (not the requested one).
+        node = await agent.storage.get_node(agent.agent_id)
+        assert node.properties["description"] == "stored bio"
+
+    @pytest.mark.asyncio
+    async def test_name_skip_reports_partial_not_success(self):
+        """A name skipped for privacy returns 207 / success:false (P1)."""
+        from fastapi import Response
+        from kestrel_sovereign.endpoints.models import (
+            UpdateIdentityRequest,
+            update_identity,
+        )
+
+        agent = _volatile_agent()
+        response = Response()
+        payload = await update_identity.__wrapped__(
+            _request_for(agent), response,
+            UpdateIdentityRequest(name="NewName"),
+        )
+
+        assert response.status_code == 207
+        assert payload["success"] is False
+        assert "name_skipped_privacy" in payload["updated_fields"]
+        # In-memory name applied, durable name unchanged.
+        assert agent._agent_name == "NewName"
+        node = await agent.storage.get_node(agent.agent_id)
+        assert node.properties["name"] == "TestAgent"
 
 
 # ---------------------------------------------------------------------------

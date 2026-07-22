@@ -20,8 +20,57 @@ from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
 from kestrel_sovereign.storage.agent_resource_store import (
     SOUL_MARKDOWN_RESOURCE_TYPE,
 )
+from kestrel_sovereign.storage.privacy_wrapper import (
+    acquire_control_plane_capability,
+    optional_transition_lock,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _durable_user_writes_permitted(storage) -> bool:
+    """Whether ``storage``'s privacy policy permits durable user-content writes.
+
+    Volatile privacy modes (EPHEMERAL / ISOLATED / DEIDENTIFIED) return ``False``
+    so bootstrap/discovery writes that carry user-derived content — the agent's
+    free-text ``description``, the raw discovery conversation, the discovered
+    user name — do NOT leak into the durable ``agent_metadata`` table or the
+    identity graph node while volatile (#2672 live-path bypass). Raw storage or a
+    facade without the policy surface (``None`` / offline CLI paths) returns
+    ``True``, preserving prior behaviour where no privacy policy is in force.
+    """
+    checker = getattr(storage, "allows_persistent_writes", None)
+    if not callable(checker):
+        return True
+    try:
+        return bool(checker())
+    except Exception:  # noqa: BLE001 - never let a policy probe block a write path
+        return False
+
+
+class PersistOutcome(Enum):
+    """Explicit result of a durable write helper (#2672 review P2).
+
+    Replaces the ambiguous ``bool`` where ``False`` conflated "intentionally
+    skipped in a volatile privacy mode" with "failed to persist". Callers can
+    then report a skipped write honestly instead of as either a false success
+    (the PATCH endpoint) or a false failure (``restart_discovery``).
+    """
+
+    PERSISTED = "persisted"           # a durable write happened
+    SKIPPED_PRIVACY = "skipped_privacy"  # intentionally not written (volatile mode)
+    NOOP = "noop"                     # nothing to write (e.g., value was None)
+    FAILED = "failed"                 # attempted but failed
+
+    @property
+    def wrote(self) -> bool:
+        """True only when a durable write actually landed."""
+        return self is PersistOutcome.PERSISTED
+
+    @property
+    def is_failure(self) -> bool:
+        """True only for a genuine persistence failure (not a privacy skip/no-op)."""
+        return self is PersistOutcome.FAILED
 
 #: Cap on how many prior turns we seed into discovery history (#1490).
 #: Bootstrap typically contributes 1 user turn + 1 wake-up greeting;
@@ -121,7 +170,9 @@ def derive_description_from_soul(content: str) -> Optional[str]:
     return None
 
 
-async def persist_agent_description(db, storage, agent_id: str, description: str) -> bool:
+async def persist_agent_description(
+    db, storage, agent_id: str, description: str, *, transition_lock=None
+) -> PersistOutcome:
     """Persist an agent description to both stores the read paths consult.
 
     The authoritative read order (``get_agent_card`` / ``GET /api/identity``)
@@ -138,32 +189,62 @@ async def persist_agent_description(db, storage, agent_id: str, description: str
     SOUL path wraps this call to stay best-effort (a self-description must
     never block saving the SOUL itself).
 
-    ``description`` of ``None`` is a no-op; an empty string is allowed so an
-    operator can deliberately clear the field via PATCH. Returns True once a
-    write has been performed.
+    Returns an explicit :class:`PersistOutcome` (#2672 review P2) rather than a
+    bool so callers can distinguish an intentional privacy skip from a write:
+
+    - ``NOOP`` when ``description is None`` (nothing to write; an empty string is
+      still allowed so an operator can deliberately clear the field via PATCH),
+    - ``SKIPPED_PRIVACY`` when a volatile privacy mode gates the durable write,
+    - ``PERSISTED`` once the ``agent_metadata`` row (and the identity graph node,
+      when present) have been written.
     """
     if description is None:
-        return False
+        return PersistOutcome.NOOP
 
-    now = datetime.now(timezone.utc)
-    await db.execute(
-        """
-        INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
-        VALUES (?, ?, ?, ?)
-        """,
-        (agent_id, "description", description, now),
-    )
+    # Privacy boundary (#2672): the description is user/operator-derived free
+    # text (PATCH /api/identity body, or a SOUL-derived tagline). It is gated
+    # here at its single source of truth rather than by blanket-trusting the
+    # ``agent`` node type — in a volatile mode BOTH the durable ``agent_metadata``
+    # row and the identity graph node are skipped, so no new user-derived
+    # description reaches durable storage. This closes the direct ``agent_metadata``
+    # write that bypassed the graph privacy boundary entirely.
+    #
+    # The privacy check and the durable writes are serialized under the agent's
+    # privacy-transition lock (#2672 review P1 race): otherwise a concurrent
+    # ``set_privacy_mode`` could flip NORMAL→EPHEMERAL between the check and the
+    # ``await``ed writes, persisting the description after the mode became volatile.
+    # ``transition_lock`` is ``None`` on paths already holding it (SOUL derivation
+    # inside ``save_soul_md``) or with no running agent (CLI); those run unguarded.
+    async with optional_transition_lock(transition_lock):
+        if not _durable_user_writes_permitted(storage):
+            logger.debug(
+                "persist_agent_description: skipping durable description write for "
+                "%s — persistent writes are disabled in the current privacy mode "
+                "(#2672)",
+                agent_id,
+            )
+            return PersistOutcome.SKIPPED_PRIVACY
 
-    if storage is not None:
-        node = await storage.get_node(agent_id)
-        if node:
-            node.properties["description"] = description
-            # Trusted control-plane write: the agent identity node carries the
-            # free-text ``description`` and may only be persisted through the
-            # trusted path in volatile privacy modes (#2672).
-            await storage.add_node(node, control_plane=True)
+        now = datetime.now(timezone.utc)
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (agent_id, "description", description, now),
+        )
 
-    return True
+        if storage is not None:
+            node = await storage.get_node(agent_id)
+            if node:
+                node.properties["description"] = description
+                # The identity graph node is a control-plane type: this write is on
+                # the persistent-mode path (volatile modes returned above), and the
+                # wrapper only enforces the capability while governance is active, so
+                # no capability is needed here (#2672).
+                await storage.add_node(node)
+
+        return PersistOutcome.PERSISTED
 
 
 class BootstrapState(Enum):
@@ -246,6 +327,7 @@ class BootstrapService:
         agent_data_path: Path,
         storage=None,
         capabilities: Optional[List[str]] = None,
+        privacy_transition_lock=None,
     ):
         """
         Initialize the bootstrap service.
@@ -260,6 +342,12 @@ class BootstrapService:
             capabilities: Names of the agent's currently enabled features.
                 Fed into SOUL.md generation so the agent's self-authored
                 tagline can reflect what it can actually do.
+            privacy_transition_lock: The agent's ``_privacy_transition_lock``.
+                Held across the privacy CHECK and the durable write in every
+                direct user-content writer (discovery history, user name, SOUL,
+                description) so a concurrent ``set_privacy_mode`` cannot flip the
+                mode into the ``await`` gap and persist after it became volatile
+                (#2672 review P1 race). ``None`` on offline/test paths → unguarded.
         """
         self.db = db
         self.agent_id = agent_id
@@ -268,6 +356,20 @@ class BootstrapService:
         self.agent_data_path = Path(agent_data_path) if agent_data_path else None
         self.storage = storage
         self.capabilities = list(capabilities) if capabilities else []
+        self._privacy_transition_lock = privacy_transition_lock
+
+        # Session-only discovery history for volatile privacy modes (#2672 review
+        # P1). In EPHEMERAL / ISOLATED / DEIDENTIFIED the raw discovery
+        # conversation must NOT reach the durable ``agent_metadata`` table, but the
+        # exchange still has to accumulate ACROSS turns or the completion
+        # condition (three exchanges) is unreachable and SOUL generation sees an
+        # empty history. This in-memory list is the volatile-mode substitute:
+        # written and read in place of the durable table for the lifetime of this
+        # process, never persisted, and reset by ``restart_discovery``. ``None``
+        # means "no volatile discovery has occurred yet" (reads yield ``[]``).
+        # It is deliberately NOT consulted in a persistent mode, where the durable
+        # table remains the single source of truth.
+        self._session_discovery_history: Optional[List[Dict[str, str]]] = None
 
         # Load prompts
         self._discovery_prompt = self._load_prompt(DISCOVERY_PROMPT_FILE)
@@ -482,8 +584,12 @@ class BootstrapService:
             updated_node.properties["bootstrap_stale_at"] = stale_at
             if age_seconds is not None:
                 updated_node.properties["bootstrap_pending_age_seconds"] = int(age_seconds)
-            # Trusted control-plane write: agent identity node (#2672).
-            await storage.add_node(updated_node, control_plane=True)
+            # Trusted control-plane write: agent identity node. The written fields
+            # are content-free bootstrap state; the capability admits the durable
+            # write in a volatile mode (#2672).
+            await storage.add_node(
+                updated_node, capability=acquire_control_plane_capability()
+            )
         except Exception as exc:
             logger.warning("Failed to persist stale bootstrap graph state: %s", exc)
 
@@ -618,7 +724,17 @@ And how do you like to work together - quick and direct, or more room to think t
             return []
 
     async def _load_discovery_history_strict(self) -> List[Dict[str, str]]:
-        """Load discovery history without swallowing DB or JSON errors."""
+        """Load discovery history without swallowing DB or JSON errors.
+
+        In a volatile privacy mode the durable ``agent_metadata`` row is never
+        written (raw user conversation), so the authoritative source is the
+        session-only in-memory store (#2672 review P1). Reading the durable table
+        while volatile would both return stale data and, worse, read persisted
+        user content the mode forbids — so volatile reads are session-only, fail
+        closed to ``[]`` when nothing has accumulated yet.
+        """
+        if not _durable_user_writes_permitted(self.storage):
+            return list(self._session_discovery_history or [])
         result = await self.db.fetchall(
             """
             SELECT value FROM agent_metadata
@@ -630,35 +746,77 @@ And how do you like to work together - quick and direct, or more room to think t
             return json.loads(result[0][0])
         return []
 
-    async def _save_discovery_history(self, history: List[Dict[str, str]]) -> bool:
-        """Save the discovery conversation history."""
-        try:
-            now = datetime.now(timezone.utc)
-            await self.db.execute(
-                """
-                INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (self.agent_id, self.DISCOVERY_HISTORY_KEY, json.dumps(history), now),
-            )
-            return True
-        except Exception as e:
-            logger.error(f"Failed to save discovery history: {e}")
-            return False
+    async def _save_discovery_history(
+        self, history: List[Dict[str, str]]
+    ) -> PersistOutcome:
+        """Save the discovery conversation history.
+
+        The discovery history is raw user conversation, so in a volatile privacy
+        mode it must not reach the durable ``agent_metadata`` table (#2672
+        live-path bypass). Instead it is held in the session-only in-memory store
+        so discovery can still accumulate across turns and reach its natural
+        completion without ever persisting (#2672 review P1). Returns an explicit
+        :class:`PersistOutcome` so callers never conflate an intentional privacy
+        skip with a failure (#2672 review P2): ``SKIPPED_PRIVACY`` in a volatile
+        mode (nothing DURABLE was written — the session store is not durable),
+        ``PERSISTED`` on success, ``FAILED`` on a DB error.
+        """
+        # Serialize the privacy check with the durable write under the agent's
+        # privacy-transition lock so a concurrent ``set_privacy_mode`` can't flip
+        # the mode into the ``await`` gap and persist this raw user conversation
+        # after the mode became volatile (#2672 review P1 race).
+        async with optional_transition_lock(self._privacy_transition_lock):
+            if not _durable_user_writes_permitted(self.storage):
+                # Volatile mode: keep the exchange in memory so subsequent turns see
+                # it (and completion / SOUL generation work), but never persist it.
+                self._session_discovery_history = list(history)
+                logger.debug(
+                    "Holding discovery history in session-only store — durable "
+                    "persistent writes are disabled in the current privacy mode "
+                    "(#2672)"
+                )
+                return PersistOutcome.SKIPPED_PRIVACY
+            try:
+                now = datetime.now(timezone.utc)
+                await self.db.execute(
+                    """
+                    INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (self.agent_id, self.DISCOVERY_HISTORY_KEY, json.dumps(history), now),
+                )
+                return PersistOutcome.PERSISTED
+            except Exception as e:
+                logger.error(f"Failed to save discovery history: {e}")
+                return PersistOutcome.FAILED
 
     async def _save_user_name(self, name: str) -> None:
-        """Save the discovered user name."""
-        try:
-            now = datetime.now(timezone.utc)
-            await self.db.execute(
-                """
-                INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (self.agent_id, self.USER_NAME_KEY, name, now),
-            )
-        except Exception as e:
-            logger.error(f"Failed to save user name: {e}")
+        """Save the discovered user name.
+
+        The discovered user name is user-derived content, so in a volatile
+        privacy mode it must not reach the durable ``agent_metadata`` table
+        (#2672 live-path bypass). The privacy check and the write are serialized
+        under the agent's privacy-transition lock so a concurrent mode flip can't
+        race between them (#2672 review P1 race).
+        """
+        async with optional_transition_lock(self._privacy_transition_lock):
+            if not _durable_user_writes_permitted(self.storage):
+                logger.debug(
+                    "Skipping durable user-name persist — persistent writes are "
+                    "disabled in the current privacy mode (#2672)"
+                )
+                return
+            try:
+                now = datetime.now(timezone.utc)
+                await self.db.execute(
+                    """
+                    INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (self.agent_id, self.USER_NAME_KEY, name, now),
+                )
+            except Exception as e:
+                logger.error(f"Failed to save user name: {e}")
 
     #: Hard cap on the discovery LLM round-trip. Discovery sits inside the
     #: agent's CONVERSATION lock — if the call hangs, *every* subsequent
@@ -1037,32 +1195,56 @@ Your preferences matter - tell me what works and what doesn't.
             logger.warning("No agent_data_path configured, cannot save SOUL.md")
             return False
 
-        try:
-            soul_path = self.agent_data_path / "SOUL.md"
-            soul_path.parent.mkdir(parents=True, exist_ok=True)
-            soul_path.write_text(content, encoding="utf-8")
-            logger.info(f"Saved SOUL.md to {soul_path}")
-            await self._promote_soul_resource(content, source=str(soul_path))
+        # Privacy boundary (#2672 review P1): the SOUL body is user-derived — it
+        # is generated from the discovery conversation. In a volatile privacy mode
+        # ("leave no trace") it must not be written to disk, promoted into the
+        # encrypted ``agent_identity_resources`` table, referenced in the durable
+        # graph, or mined for a durable description. Skip EVERY durable SOUL write;
+        # the in-session personality falls back to defaults rather than persisting.
+        #
+        # The privacy check and every durable write below are serialized under the
+        # agent's privacy-transition lock so a concurrent ``set_privacy_mode``
+        # can't flip the mode into an ``await`` gap and persist part of the SOUL
+        # after the mode became volatile (#2672 review P1 race). The nested
+        # ``persist_agent_description`` is called WITHOUT a lock because it is
+        # already serialized under the lock we hold here (avoids self-deadlock on
+        # the non-reentrant asyncio lock).
+        async with optional_transition_lock(self._privacy_transition_lock):
+            if not _durable_user_writes_permitted(self.storage):
+                logger.info(
+                    "SOUL.md not persisted for %s — the SOUL body is user-derived and "
+                    "durable writes (disk file, encrypted resource, graph reference) "
+                    "are disabled in the current privacy mode (#2672)",
+                    self.agent_id,
+                )
+                return False
 
-            # Derive the agent's public description from its own SOUL.md.
-            # This replaces the hardcoded "Constitutional AI Agent..."
-            # fallback with a self-authored tagline once the agent has
-            # woken up. Best-effort: a derivation/persist failure must
-            # never block saving the SOUL itself.
             try:
-                description = derive_description_from_soul(content)
-                if description:
-                    await persist_agent_description(
-                        self.db, self.storage, self.agent_id, description
-                    )
-                    logger.info("Set agent description from SOUL.md: %r", description)
-            except Exception as exc:
-                logger.warning("Could not derive description from SOUL.md: %s", exc)
+                soul_path = self.agent_data_path / "SOUL.md"
+                soul_path.parent.mkdir(parents=True, exist_ok=True)
+                soul_path.write_text(content, encoding="utf-8")
+                logger.info(f"Saved SOUL.md to {soul_path}")
+                await self._promote_soul_resource(content, source=str(soul_path))
 
-            return True
-        except Exception as e:
-            logger.error(f"Failed to save SOUL.md: {e}")
-            return False
+                # Derive the agent's public description from its own SOUL.md.
+                # This replaces the hardcoded "Constitutional AI Agent..."
+                # fallback with a self-authored tagline once the agent has
+                # woken up. Best-effort: a derivation/persist failure must
+                # never block saving the SOUL itself.
+                try:
+                    description = derive_description_from_soul(content)
+                    if description:
+                        await persist_agent_description(
+                            self.db, self.storage, self.agent_id, description
+                        )
+                        logger.info("Set agent description from SOUL.md: %r", description)
+                except Exception as exc:
+                    logger.warning("Could not derive description from SOUL.md: %s", exc)
+
+                return True
+            except Exception as e:
+                logger.error(f"Failed to save SOUL.md: {e}")
+                return False
 
     async def _promote_soul_resource(self, content: str, *, source: str) -> None:
         """Best-effort promotion of SOUL.md content into private resources."""
@@ -1145,10 +1327,17 @@ What would you like to help with?"""
         Returns:
             Structured reset result.
         """
-        # Clear discovery history
+        # Clear discovery history. In a volatile mode the session-only store is
+        # the authoritative copy, so reset it explicitly to guarantee a fresh
+        # start regardless of the current privacy mode (#2672 review P1); the
+        # empty durable write below is the persistent-mode counterpart.
+        self._session_discovery_history = None
         history_clear_error = None
-        save_ok = await self._save_discovery_history([])
-        if not save_ok:
+        clear_outcome = await self._save_discovery_history([])
+        # A privacy skip is NOT a failure: in a volatile mode discovery history was
+        # never persisted, so there is nothing durable to clear. Only a genuine
+        # FAILED write is an error here (#2672 review P2).
+        if clear_outcome.is_failure:
             history_clear_error = "failed to persist empty discovery history"
 
         # Reset state to pending
@@ -1175,8 +1364,13 @@ What would you like to help with?"""
             history_count_after = -1
             history_clear_error = f"failed to verify discovery history clear: {e}"
 
-        history_clear_succeeded = save_ok and history_count_after == 0
-        if save_ok and history_count_after > 0:
+        # ``cleared_ok`` is True for both a PERSISTED empty-write and a
+        # SKIPPED_PRIVACY volatile mode; the clear is confirmed once the durable
+        # table is verified empty (0 rows). Only a FAILED write, or a still-
+        # non-empty table, is reported as an error (#2672 review P2).
+        cleared_ok = not clear_outcome.is_failure
+        history_clear_succeeded = cleared_ok and history_count_after == 0
+        if cleared_ok and history_count_after > 0:
             history_clear_error = (
                 f"discovery history still has {history_count_after} "
                 "persisted entr(ies) after reset"

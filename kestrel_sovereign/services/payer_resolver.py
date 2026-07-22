@@ -691,6 +691,18 @@ class FoundationPayerResolver:
     ) -> None:
         """Write openrouter_key_hash to graph_nodes.properties.
 
+        ``openrouter_key_hash`` is content-free control-plane billing metadata
+        (a provider-issued credential handle, never user content), and it is a
+        CANONICAL, validated ``agent``-node property in the privacy schema
+        (``_STRUCTURAL_NODE_SHAPES["agent"]`` — validated as an opaque credential
+        hash). Persisting it is therefore consistent with the privacy boundary
+        rather than a write "around" it: a later full agent-node governance
+        upsert (doctrine / bootstrap / audit) carrying this field is accepted in
+        a volatile mode instead of failing closed on a non-canonical key
+        (#2672 review P2). This host-owned resolver writes it directly for the
+        same reason inception writes the identity node — control-plane state that
+        must persist regardless of the agent's conversational privacy mode.
+
         Args:
             require_row: When True, raise _GraphNodeVanishedError if
                 no graph_nodes row exists (treats the missing-row case

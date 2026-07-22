@@ -773,10 +773,10 @@ class AsyncStorage:
     
     # --- Graph Operations ---
     
-    async def add_node(self, node: GraphNode, *, control_plane: bool = False) -> None:
+    async def add_node(self, node: GraphNode, *, capability: Any = None) -> None:
         """Add a node to the knowledge graph.
 
-        ``control_plane`` is accepted (and ignored) so trusted governance callers
+        ``capability`` is accepted (and ignored) so trusted governance callers
         can pass it uniformly whether they hold the raw facade or the
         privacy-enforcing wrapper, which is where it is actually enforced (#2672).
         """
@@ -791,7 +791,7 @@ class AsyncStorage:
         new_node: GraphNode,
         allowed_node_types: Optional[frozenset] = None,
         *,
-        control_plane: bool = False,
+        capability: Any = None,
     ) -> NodeSwapResult:
         """Atomically update a graph node's properties only if they still match.
 
@@ -825,10 +825,10 @@ class AsyncStorage:
     
     async def add_edge(self, source_id: str, target_id: str, label: str,
                        properties: Optional[Dict] = None,
-                       *, control_plane: bool = False) -> None:
+                       *, capability: Any = None) -> None:
         """Add an edge between nodes.
 
-        ``control_plane`` is accepted (and ignored) here for call-site uniformity
+        ``capability`` is accepted (and ignored) here for call-site uniformity
         with the privacy wrapper, which enforces it (#2672).
         """
         if not self._initialized:

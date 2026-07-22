@@ -20,15 +20,19 @@ class MockStorage:
         """Get a node by ID."""
         return self.nodes.get(node_id)
 
-    async def add_node(self, node):
-        """Add or update a node."""
+    async def add_node(self, node, *, capability=None):
+        """Add or update a node.
+
+        Accepts the control-plane ``capability`` kwarg trusted governance
+        callers (rename_agent_core) now pass, mirroring the real envelope (#2672).
+        """
         self.nodes[node.node_id] = node
 
 
 class FailingAddNodeStorage(MockStorage):
     """Storage that can read the graph node but fails writing it."""
 
-    async def add_node(self, node):
+    async def add_node(self, node, *, capability=None):
         raise RuntimeError("graph store unavailable")
 
 
@@ -220,6 +224,56 @@ class TestRenameValidation:
         assert outcome.success is False
         assert outcome.any_written is False
         assert "metadata DB write failed" in outcome.error
+
+    @pytest.mark.asyncio
+    async def test_rename_skips_all_durable_writes_when_volatile(self, mock_agent):
+        """A volatile privacy mode persists NOTHING durable on rename — no metadata
+        row, no graph node — and only updates the live in-memory name, returning an
+        explicit skipped outcome (#2672 review P1)."""
+        from kestrel_sovereign.features.bootstrap.feature import rename_agent_core
+        from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
+
+        mock_agent.storage.privacy_config = privacy_mode_to_config(PrivacyMode.EPHEMERAL)
+        mock_agent.storage.nodes[mock_agent.agent_id] = MockNode(
+            mock_agent.agent_id, properties={"name": "OldName"}, label="OldName",
+        )
+        mock_agent._agent_name = "OldName"
+
+        outcome = await rename_agent_core(mock_agent, "NewName")
+
+        assert outcome.skipped_privacy is True
+        assert outcome.success is False
+        assert outcome.db_row_written is False
+        assert outcome.graph_updated is False
+        # In-memory name reflects the session change...
+        assert mock_agent._agent_name == "NewName"
+        assert mock_agent.bootstrap_service.agent_name == "NewName"
+        # ...but nothing durable was written.
+        assert mock_agent._raw_storage.db.executed == []
+        node = await mock_agent.storage.get_node(mock_agent.agent_id)
+        assert node.properties["name"] == "OldName"
+        assert node.label == "OldName"
+
+    @pytest.mark.asyncio
+    async def test_rename_tool_reports_partial_skip_when_volatile(self, mock_agent):
+        """The !rename tool surfaces a volatile-mode skip as PARTIAL (session-only,
+        not persisted), never a false success or a hard failure (#2672 P1)."""
+        from kestrel_sovereign.features.bootstrap.feature import BootstrapFeature
+        from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
+        from kestrel_sdk.tools.result import ToolResultStatus
+
+        mock_agent.storage.privacy_config = privacy_mode_to_config(PrivacyMode.ISOLATED)
+        mock_agent.storage.nodes[mock_agent.agent_id] = MockNode(
+            mock_agent.agent_id, properties={"name": "OldName"}, label="OldName",
+        )
+        feature = BootstrapFeature(mock_agent)
+        await feature.initialize()
+
+        result = await feature.rename_agent("NewName")
+
+        assert result.status is ToolResultStatus.PARTIAL
+        assert result.data["rename_outcome"]["skipped_privacy"] is True
+        assert "session" in result.confirmation.lower()
 
 
 class TestRenameExecution:

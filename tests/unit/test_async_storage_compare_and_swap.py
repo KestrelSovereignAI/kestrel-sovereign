@@ -45,8 +45,35 @@ from kestrel_sovereign.storage.async_storage import AsyncStorage
 from kestrel_sovereign.storage.privacy_wrapper import (
     PrivacyEnforcingStorage,
     PrivacyViolationError,
+    acquire_control_plane_capability,
 )
 from kestrel_sovereign.privacy import PrivacyMode
+
+
+def _control_plane_capability():
+    """Obtain the real control-plane capability via a genuine trusted-module call.
+
+    The token is closure-private (no importable singleton — #2672 review P2); the
+    only legitimate way to get it is a call whose caller frame IS a trusted
+    module's namespace, so bind a throwaway probe into that module's ``__dict__``.
+    """
+    import importlib
+
+    module = importlib.import_module("kestrel_sovereign.bootstrap.service")
+    namespace = module.__dict__
+    exec("def __cp_probe():\n    return acquire_control_plane_capability()", namespace)
+    try:
+        return namespace["__cp_probe"]()
+    finally:
+        namespace.pop("__cp_probe", None)
+
+
+_CONTROL_PLANE_CAPABILITY = _control_plane_capability()
+
+# A realistic 64-hex SHA-256 digest — the per-field validators (#2672 review P1)
+# require content-free structural fields to be hash / timestamp / enum shaped.
+_HEX = "0123456789abcdef" * 4
+_HEX2 = "fedcba9876543210" * 4
 
 
 def _nid(prefix: str = "cas") -> str:
@@ -448,14 +475,14 @@ class TestFacadeAndPrivacyWrapper:
         """CAS is privacy-governed in EPHEMERAL (#2672), without decomposing the
         atomic primitive.
 
-        A durable graph write is not "structural, not PII". Two tiers (review
-        finding P1): a user-derived / unknown node CAS is default-denied and
-        writes no row; a content-free structural type (here ``document``) is
-        admitted on the ordinary path and lands atomically; and a value-bearing
-        control-plane type (``feature_config``) is admitted ONLY through the
-        trusted control-plane capability. In every case the governance inspects
-        ``new_node`` up front and then delegates the single atomic CAS — it never
-        becomes get_node + add_node.
+        A durable graph write is not "structural, not PII". Two tiers: a
+        user-derived / unknown node CAS is default-denied and writes no row; a
+        content-free structural type (here ``document``) is admitted on the
+        ordinary path with strict per-field validation and lands atomically; and a
+        control-plane type (here ``constitution_amendment_artifact``) is admitted
+        ONLY through the unforgeable control-plane capability. In every case the
+        governance inspects ``new_node`` up front and then delegates the single
+        atomic CAS — it never becomes get_node + add_node.
         """
         storage = await AsyncStorage.create_sqlite(str(tmp_path / "eph.db"))
         wrapped = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
@@ -468,8 +495,9 @@ class TestFacadeAndPrivacyWrapper:
                 )
             assert await storage.get_node(blocked) is None
 
-            # Content-free structural type → admitted on the ordinary path.
-            allowed = _nid("eph-allowed")
+            # Content-free structural type → admitted on the ordinary path. The
+            # document ``hash`` must be a real digest AND equal the node id.
+            allowed = _HEX
             result = await wrapped.compare_and_swap_node(
                 allowed,
                 None,
@@ -484,19 +512,27 @@ class TestFacadeAndPrivacyWrapper:
             assert result == NodeSwapResult.SWAPPED
             assert (await storage.get_node(allowed)) is not None
 
-            # Value-bearing control-plane type → denied untrusted, admitted only
-            # through the trusted capability.
-            cp = _nid("eph-control-plane")
+            # Control-plane type → denied without the capability, admitted only
+            # when the caller presents the unforgeable control-plane capability.
+            cp = _HEX2
             cp_node = _node(
-                cp, {"config": {"enabled": True}}, node_type="feature_config",
-                label="todo config",
+                cp,
+                {
+                    "hash": cp,
+                    "type": "SignedConstitutionAmendment",
+                    "constitution_hash": _HEX,
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "anchored_at": "2026-01-01T00:00:00+00:00",
+                },
+                node_type="constitution_amendment_artifact",
+                label="Signed Constitution Reanchor Artifact",
             )
             with pytest.raises(PrivacyViolationError):
                 await wrapped.compare_and_swap_node(cp, None, cp_node)
             assert await storage.get_node(cp) is None
 
             result = await wrapped.compare_and_swap_node(
-                cp, None, cp_node, control_plane=True
+                cp, None, cp_node, capability=_CONTROL_PLANE_CAPABILITY
             )
             assert result == NodeSwapResult.SWAPPED
             assert (await storage.get_node(cp)) is not None

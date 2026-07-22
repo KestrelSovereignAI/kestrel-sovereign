@@ -77,7 +77,12 @@ async def test_doctrine_anchor_persists_in_volatile_mode(tmp_path, mode):
                 node_id=AGENT_ID,
                 node_type="agent",
                 label="Kestrel",
-                properties={"name": "Kestrel", "constitution_hash": "c0ffee"},
+                # A realistic 64-hex SHA-256 constitution hash — the per-field
+                # validator (#2672 review P1) rejects a non-hash in this field.
+                properties={
+                    "name": "Kestrel",
+                    "constitution_hash": "b" * 64,
+                },
             )
         )
 

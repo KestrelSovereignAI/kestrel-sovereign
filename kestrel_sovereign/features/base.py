@@ -421,6 +421,26 @@ class Feature(_SdkFeature):
         if storage is None:
             logger.debug(f"No storage available to persist config for {self.name}")
             return
+        # Privacy boundary (#2672): the feature ``config`` is an arbitrary,
+        # operator-influenced settings dict (it can hold API keys and free-form
+        # values), so it is gated at its single source of truth rather than by
+        # blanket-trusting a ``feature_config`` node type. Persisting config is
+        # purely a survive-restarts cache; a volatile privacy mode's contract is
+        # "don't persist", and the feature still boots and re-derives its config
+        # from kestrel.toml, so skip the durable write entirely while volatile.
+        allows = getattr(storage, "allows_persistent_writes", None)
+        if callable(allows):
+            try:
+                permitted = bool(allows())
+            except Exception:  # noqa: BLE001 - never let a policy probe block boot
+                permitted = False
+            if not permitted:
+                logger.debug(
+                    "Skipping durable config persist for %s — persistent writes "
+                    "are disabled in the current privacy mode (#2672)",
+                    self.name,
+                )
+                return
         try:
             from kestrel_sovereign.storage.async_graph_store import GraphNode
             node = GraphNode(
@@ -429,11 +449,7 @@ class Feature(_SdkFeature):
                 label=f"{self.name} config",
                 properties={"config": config},
             )
-            # Trusted control-plane write: ``feature_config`` carries an arbitrary
-            # settings dict, so it may only be persisted through the trusted path
-            # in volatile privacy modes (feature init runs regardless of mode so a
-            # default-volatile agent can still boot its features) (#2672).
-            await storage.add_node(node, control_plane=True)
+            await storage.add_node(node)
         except Exception as e:
             logger.warning(f"Failed to persist config for {self.name}: {e}")
 
