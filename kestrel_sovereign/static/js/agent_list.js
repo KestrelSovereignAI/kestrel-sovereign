@@ -62,16 +62,28 @@ export function createDefaultAgentAdapter(api = API) {
             adapter.canCreateAgents = data.can_create_agents === true;
             adapter.classificationLoaded = true;
             const agents = data.agents || [];
-            return agents.map((a) => ({
-                name: a.name,
-                id: a.id || a.did || a.name,
-                displayName: a.name,
-                description: a.description,
-                avatarUrl: a.avatar_hash ? `/api/files/${a.avatar_hash}` : undefined,
-                status: a.status,
-                isDemo: a.is_demo === true,
-                raw: a,
-            }));
+            return agents.map((a) => {
+                // `routing_name` is the AgentManager's immutable registration
+                // key — what `/api/agents/{key}/…` paths MUST be built from.
+                // `name` is the live/effective DISPLAY name, which a volatile
+                // rename updates in the session without a durable write (#2672
+                // review P2). The list item's `name` drives selection/routing
+                // (select → setHostAgent → applyHostAgentPrefix), so it must be
+                // the routing key; `displayName` carries the live name for the
+                // visible card. Fall back to `a.name` when `routing_name` is
+                // absent (standalone payloads / older hosts).
+                const routingKey = a.routing_name || a.name;
+                return {
+                    name: routingKey,
+                    id: a.id || a.did || routingKey,
+                    displayName: a.name,
+                    description: a.description,
+                    avatarUrl: a.avatar_hash ? `/api/files/${a.avatar_hash}` : undefined,
+                    status: a.status,
+                    isDemo: a.is_demo === true,
+                    raw: a,
+                };
+            });
         },
     };
     return adapter;
@@ -96,7 +108,9 @@ function makeConsoleRenderer({ onStop }) {
 
         const thinkingDot = doc.createElement('span');
         thinkingDot.className = 'agent-thinking-dot';
-        thinkingDot.title = `${item.name || 'Agent'} is thinking`;
+        // Tooltips show the live DISPLAY name (`name` local, displayName-first),
+        // not the routing key, so a session rename reads correctly (#2672 P2).
+        thinkingDot.title = `${name} is thinking`;
         frag.appendChild(thinkingDot);
 
         const info = doc.createElement('div');
@@ -117,8 +131,10 @@ function makeConsoleRenderer({ onStop }) {
         // not also fire the row's selection handler.
         const stopBtn = doc.createElement('button');
         stopBtn.className = 'agent-stop-btn';
-        stopBtn.title = `Stop ${item.name || 'agent'}`;
-        stopBtn.setAttribute('aria-label', `Stop ${item.name || 'agent'}`);
+        // Label with the live display name; but stop ROUTES by item.name (the
+        // manager routing key) so the abort reaches the right agent (#2672 P2).
+        stopBtn.title = `Stop ${name}`;
+        stopBtn.setAttribute('aria-label', `Stop ${name}`);
         stopBtn.innerHTML = '&times;';
         stopBtn.addEventListener('click', (e) => {
             e.stopPropagation();

@@ -21,17 +21,20 @@ The admit policy is CONTENT-based, not caller-identity-based:
   timestamp, an ``entries_count`` must be a non-negative int, ``document.type``
   must be the literal ``"Constitution"``, ``document.hash`` must equal the
   node's own content-hash id. A short secret is none of those.
-* **Control-plane types** — ``agent`` / ``constitution_amendment_artifact`` —
-  carry a control-plane CAPABILITY marker, but the marker is same-process
-  defense-in-depth, NOT an authorization boundary: the governance writers are
-  mixin methods on the agent and feature code holds the agent, so any in-process
-  caller can obtain the marker (e.g. by ``exec``-ing into a trusted module's
-  ``__dict__``). The LOAD-BEARING privacy gate for the ``agent`` node is the
-  CARRIED-ALONG identity boundary — user-facing free-text (name / description /
-  expected_duration) is admitted only when unchanged from the stored node, so a
-  fresh/changed value is refused even to a caller holding a genuine (forged)
-  marker (this is what closes the reproduced ``agent.description`` leak). The
-  governance-receipt free-text fields are a documented process-isolation residual.
+* **Control-plane type** — the ``agent`` identity node (the only capability-gated
+  type; ``constitution_amendment_artifact`` was dropped from the allowlist
+  entirely, see the note by its former shape entry) — carries a control-plane
+  CAPABILITY marker, but the marker is same-process defense-in-depth, NOT an
+  authorization boundary: the governance writers are mixin methods on the agent
+  and feature code holds the agent, so any in-process caller can obtain the marker
+  (e.g. by ``exec``-ing into a trusted module's ``__dict__``). The LOAD-BEARING
+  privacy gate for the ``agent`` node is the CARRIED-ALONG identity boundary —
+  user-facing free-text (name / description / expected_duration) AND the top-level
+  identity ``label`` are admitted only when unchanged from the stored node, so a
+  fresh/changed value is refused even to a caller holding a genuine (forged) marker
+  (this is what closes the reproduced ``agent.description`` and ``agent.label``
+  leaks). The governance-receipt free-text fields are a documented
+  process-isolation residual.
 
 The two user-derived surfaces the review told us not to blanket-trust —
 ``agent.description`` and ``feature_config.config`` — are gated at their single
@@ -41,6 +44,7 @@ all. NORMAL / PUBLIC / ANONYMOUS are unchanged.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import types
 from datetime import datetime, timedelta, timezone
@@ -54,6 +58,8 @@ from kestrel_sovereign.storage.privacy_wrapper import (
     CONTROL_PLANE_ONLY_NODE_TYPES,
     PrivacyEnforcingStorage,
     PrivacyViolationError,
+    ReentrantTransitionLock,
+    bind_transition_lock_reentry,
     STRUCTURAL_GRAPH_EDGE_LABELS,
     STRUCTURAL_GRAPH_NODE_TYPES,
     _TRUSTED_CONTROL_PLANE_MODULES,
@@ -406,6 +412,43 @@ async def test_module_dict_injection_cannot_persist_fresh_description(
         assert USER_SECRET not in json.dumps(stored.properties)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", VOLATILE_MODES)
+@pytest.mark.parametrize("surface", ["facade", "graph"])
+async def test_module_dict_injection_cannot_persist_fresh_label(
+    tmp_path, mode, surface
+):
+    """The reproduced P1 label leak: code injected into a REAL trusted module's
+    ``__dict__`` obtains the GENUINE marker, yet CANNOT persist arbitrary durable
+    user text through the top-level ``GraphNode.label`` in a volatile mode — the
+    carried-along boundary now covers the label as well as the properties, so a
+    fresh/changed identity label is refused on BOTH the facade and the graph proxy,
+    and the stored label is left byte-for-byte intact (#2672 review P1).
+
+    All content-free PROPERTIES are carried along unchanged here, so the ONLY thing
+    the write tries to change is the label — isolating the label as the smuggling
+    channel the fix closes."""
+    forged = _capability_via_module_dict_injection(
+        "kestrel_sovereign.agent.constitution"
+    )
+    assert _has_control_plane_capability(forged)  # injection yields the real marker
+
+    async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
+        await raw.add_node(_structural_node("agent"))  # stored label = "Kestrel"
+        wrapper = PrivacyEnforcingStorage(raw, mode)
+
+        evil = _structural_node("agent")
+        evil.label = f"exfiltrated: {USER_SECRET}"  # arbitrary user text in the label
+        target = wrapper if surface == "facade" else wrapper.graph
+        with pytest.raises(PrivacyViolationError):
+            await target.add_node(evil, capability=forged)
+
+        stored = await raw.get_node(AGENT_ID)
+        assert stored.label == "Kestrel"  # stored row unchanged
+        assert USER_SECRET not in (stored.label or "")
+        assert USER_SECRET not in json.dumps(stored.properties)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Carried-along identity boundary on the agent node (#2672 review P1)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -460,6 +503,112 @@ async def test_changed_identity_field_refused_even_with_capability(tmp_path, mod
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", VOLATILE_MODES)
+@pytest.mark.parametrize("surface", ["facade", "graph"])
+async def test_changed_label_refused_but_unchanged_label_admitted(
+    tmp_path, mode, surface
+):
+    """The top-level identity LABEL follows the same carried-along rule as the
+    identity properties: a CHANGED label is refused even with the genuine marker
+    (stored label intact), while the SAME label riding a content-free governance
+    mutation is admitted. Proven on both the facade and the graph proxy (#2672 P1).
+    """
+    async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
+        await raw.add_node(GraphNode(
+            node_id=AGENT_ID, node_type="agent", label="Kestrel",
+            properties={"constitution_hash": VALID_HASH, "created_at": _now_iso(),
+                        "name": "Kestrel"},
+        ))
+        wrapper = PrivacyEnforcingStorage(raw, mode)
+        target = wrapper if surface == "facade" else wrapper.graph
+
+        stored = await raw.get_node(AGENT_ID)
+        changed_label = GraphNode(
+            node_id=AGENT_ID, node_type="agent", label="Renamed Live",
+            properties={**dict(stored.properties), "bootstrap_state": "complete"},
+        )
+        with pytest.raises(PrivacyViolationError):
+            await target.add_node(changed_label, capability=CAP)
+        after = await raw.get_node(AGENT_ID)
+        assert after.label == "Kestrel"  # stored label unchanged
+        assert "bootstrap_state" not in (after.properties or {})
+
+        # Same label + a content-free mutation → admitted.
+        same_label = GraphNode(
+            node_id=AGENT_ID, node_type="agent", label="Kestrel",
+            properties={**dict(stored.properties), "bootstrap_state": "complete"},
+        )
+        await target.add_node(same_label, capability=CAP)
+        after = await raw.get_node(AGENT_ID)
+        assert after.label == "Kestrel"
+        assert after.properties["bootstrap_state"] == "complete"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", VOLATILE_MODES)
+@pytest.mark.parametrize("surface", ["facade", "graph"])
+async def test_none_label_cannot_clear_stored_label(tmp_path, mode, surface):
+    """``add_node`` is a whole-row upsert, so a write carrying ``label=None`` would
+    CLEAR the stored user name. On an EXISTING node that is a durable label
+    mutation, not carry-along, so it is refused even with the genuine marker and
+    the stored label survives byte-for-byte. Proven on both surfaces (#2672 P2).
+
+    Every content-free property is carried along and a governance field is added,
+    isolating the ``None`` label as the only mutation the write attempts."""
+    async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
+        await raw.add_node(GraphNode(
+            node_id=AGENT_ID, node_type="agent", label="Kestrel",
+            properties={"constitution_hash": VALID_HASH, "created_at": _now_iso(),
+                        "name": "Kestrel"},
+        ))
+        wrapper = PrivacyEnforcingStorage(raw, mode)
+        target = wrapper if surface == "facade" else wrapper.graph
+
+        stored = await raw.get_node(AGENT_ID)
+        cleared = GraphNode(
+            node_id=AGENT_ID, node_type="agent", label=None,
+            properties={**dict(stored.properties), "bootstrap_state": "complete"},
+        )
+        with pytest.raises(PrivacyViolationError):
+            await target.add_node(cleared, capability=CAP)
+        after = await raw.get_node(AGENT_ID)
+        assert after.label == "Kestrel"  # stored label NOT cleared to None
+        assert "bootstrap_state" not in (after.properties or {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", VOLATILE_MODES)
+@pytest.mark.parametrize("surface", ["facade", "graph"])
+async def test_did_form_label_cannot_overwrite_stored_user_name(
+    tmp_path, mode, surface
+):
+    """The content-free DID-derived ``Agent {node_id}`` label is admitted ONLY on a
+    fresh create (nothing to carry). On an EXISTING node whose stored label is a
+    real user name, replacing it with the DID form still DESTROYS the stored name —
+    a durable label mutation — so it is refused and the stored user label survives.
+    Proven on both surfaces (#2672 P2)."""
+    async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
+        await raw.add_node(GraphNode(
+            node_id=AGENT_ID, node_type="agent", label="Kestrel",
+            properties={"constitution_hash": VALID_HASH, "created_at": _now_iso(),
+                        "name": "Kestrel"},
+        ))
+        wrapper = PrivacyEnforcingStorage(raw, mode)
+        target = wrapper if surface == "facade" else wrapper.graph
+
+        stored = await raw.get_node(AGENT_ID)
+        did_form = GraphNode(
+            node_id=AGENT_ID, node_type="agent", label=f"Agent {AGENT_ID}",
+            properties={**dict(stored.properties), "bootstrap_state": "complete"},
+        )
+        with pytest.raises(PrivacyViolationError):
+            await target.add_node(did_form, capability=CAP)
+        after = await raw.get_node(AGENT_ID)
+        assert after.label == "Kestrel"  # stored user name NOT overwritten
+        assert "bootstrap_state" not in (after.properties or {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", VOLATILE_MODES)
 async def test_carried_along_identity_admitted_with_governance_mutation(
     tmp_path, mode
 ):
@@ -499,6 +648,50 @@ async def test_cas_create_with_fresh_identity_refused(tmp_path, mode):
         with pytest.raises(PrivacyViolationError):
             await wrapper.compare_and_swap_node(AGENT_ID, None, node, capability=CAP)
         assert await raw.get_node(AGENT_ID) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", VOLATILE_MODES)
+@pytest.mark.parametrize("surface", ["facade", "graph"])
+async def test_cas_compare_and_create_agent_label_refused(tmp_path, mode, surface):
+    """A compare-and-CREATE (``expected is None``) of an agent node — whose only
+    user-derived content is a fresh free-text LABEL (every property is content-free)
+    — is refused even with the genuine marker: a create has no stored trusted label
+    to carry from, so the label is fresh content and nothing persists. Closes the
+    label smuggling channel on the CAS create path, both surfaces (#2672 P1)."""
+    async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
+        wrapper = PrivacyEnforcingStorage(raw, mode)
+        target = wrapper if surface == "facade" else wrapper.graph
+        node = _structural_node("agent")  # content-free props, label "Kestrel"
+        node.label = f"exfiltrated: {USER_SECRET}"
+        with pytest.raises(PrivacyViolationError):
+            await target.compare_and_swap_node(AGENT_ID, None, node, capability=CAP)
+        assert await raw.get_node(AGENT_ID) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", VOLATILE_MODES)
+@pytest.mark.parametrize("surface", ["facade", "graph"])
+async def test_born_agent_did_derived_label_create_admitted(tmp_path, mode, surface):
+    """The born-agent boot path: first materialising the identity node in a
+    volatile mode with the DID-derived ``Agent {node_id}`` label IS admitted even
+    on a fresh create — that label is fully determined by the node's own id, so it
+    carries no user text. This is the ``KestrelAgent.initialize`` fresh-node write;
+    it must not be caught by the label carry-along that refuses a user-authored
+    name (#2672 review P1)."""
+    async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
+        wrapper = PrivacyEnforcingStorage(raw, mode)
+        target = wrapper if surface == "facade" else wrapper.graph
+        node = GraphNode(
+            node_id=AGENT_ID,
+            node_type="agent",
+            label=f"Agent {AGENT_ID}",       # DID-derived, content-free
+            properties={"initialBalance": "100.0"},
+        )
+        await target.add_node(node, capability=CAP)  # must NOT raise
+        stored = await raw.get_node(AGENT_ID)
+        assert stored is not None
+        assert stored.label == f"Agent {AGENT_ID}"
 
 
 @pytest.mark.asyncio
@@ -825,10 +1018,17 @@ async def test_short_secret_rejected_in_every_content_free_field(
 @pytest.mark.parametrize("mode", VOLATILE_MODES)
 @pytest.mark.parametrize("node_type", sorted(CONTROL_PLANE_ONLY_NODE_TYPES))
 async def test_control_plane_node_requires_capability(tmp_path, mode, node_type):
-    """A control-plane node is admitted ONLY with the unforgeable capability;
-    without it (or on the proxy without it) the write is denied and persists
-    nothing."""
+    """A control-plane node update is admitted ONLY with the unforgeable
+    capability; without it (or on the proxy without it) the write is denied and the
+    stored node is left unchanged.
+
+    The agent node exists from inception (written to the RAW store); a volatile
+    wrapper only ever CARRIES it along, so the capability gate is exercised here on
+    that realistic carried-along-update path. A fresh create through the wrapper is
+    independently refused by the label carry-along boundary (see the dedicated
+    label tests) — inception never routes through the wrapper."""
     async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
+        await raw.add_node(_structural_node(node_type))
         wrapper = PrivacyEnforcingStorage(raw, mode)
         node = _structural_node(node_type)
 
@@ -836,9 +1036,10 @@ async def test_control_plane_node_requires_capability(tmp_path, mode, node_type)
             await wrapper.add_node(node)
         with pytest.raises(PrivacyViolationError):
             await wrapper.graph.add_node(node)
-        assert await raw.get_node(node.node_id) is None
+        stored = await raw.get_node(node.node_id)
+        assert stored is not None and stored.label == node.label
 
-        # With the capability: admitted, content-free.
+        # With the capability: admitted (carried-along update), content-free.
         await wrapper.add_node(node, capability=CAP)
         persisted = await raw.get_node(node.node_id)
         assert persisted is not None
@@ -1010,7 +1211,10 @@ async def test_volatile_reanchor_superseded_receipt_refused_by_wrapper(tmp_path,
         # Stored node unchanged: the changed receipt never landed via the wrapper.
         after = await raw.get_node(AGENT_ID)
         assert after.properties["constitution_hash"] == VALID_HASH
-        assert after.properties["genesis_audit_history"]
+        # The fresh ``genesis_audit_history`` was only ever added to the rejected
+        # copy — it must be absent from the untouched stored node.
+        assert "genesis_audit_history" not in after.properties
+        assert after.properties["genesis_audit"] == {"status": "passed", "risk_level": 1}
 
 
 @pytest.mark.asyncio
@@ -1019,9 +1223,11 @@ async def test_governed_by_edge_allowed_end_to_end(tmp_path, mode):
     """The structural `governed_by` binding still writes in a volatile mode — what
     lets the startup constitution audit bind a born-volatile agent."""
     async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
+        # The agent node exists from inception (raw store); the wrapper carries it
+        # along, never freshly creates it in a volatile mode (#2672 P1 label gate).
+        await raw.add_node(_structural_node("agent"))
         wrapper = PrivacyEnforcingStorage(raw, mode)
 
-        await wrapper.add_node(_structural_node("agent"), capability=CAP)
         await wrapper.add_node(_structural_node("document"))
 
         await wrapper.add_edge(AGENT_ID, VALID_HASH, "governed_by")
@@ -1053,6 +1259,42 @@ async def test_structural_node_rejects_smuggled_property(tmp_path, mode, node_ty
             await wrapper.graph.add_node(node, **admit)
 
         assert await raw.get_node(node.node_id) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", VOLATILE_MODES)
+@pytest.mark.parametrize("node_type", sorted(STRUCTURAL_GRAPH_NODE_TYPES))
+async def test_smuggled_label_refused_on_every_allowlisted_type(
+    tmp_path, mode, node_type
+):
+    """Per-type label audit: NO allowlisted structural type admits arbitrary user
+    text in its top-level ``label``. A content-free-labeled type (document /
+    audit_anchor) refuses a non-canonical label by shape; the free-text-labeled
+    agent node refuses a fresh/changed label by carry-along. Proven on the facade
+    AND the graph proxy so no shape can smuggle durable user text through
+    ``GraphNode.label`` (#2672 review P1)."""
+    admit = _admit_kwargs(node_type)
+    control_plane = node_type in CONTROL_PLANE_ONLY_NODE_TYPES
+    async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
+        # The free-text-labeled agent node exists from inception (raw store), so the
+        # ONLY thing the write changes is the label. The content-free-labeled types
+        # are fresh creates whose canonical label is checked by shape.
+        if control_plane:
+            await raw.add_node(_structural_node(node_type))
+        wrapper = PrivacyEnforcingStorage(raw, mode)
+        node = _structural_node(node_type)
+        node.label = f"smuggled {USER_SECRET}"
+
+        with pytest.raises(PrivacyViolationError):
+            await wrapper.add_node(node, **admit)
+        with pytest.raises(PrivacyViolationError):
+            await wrapper.graph.add_node(node, **admit)
+
+        stored = await raw.get_node(node.node_id)
+        if control_plane:
+            assert stored is not None and USER_SECRET not in (stored.label or "")
+        else:
+            assert stored is None
 
 
 @pytest.mark.asyncio
@@ -1104,8 +1346,10 @@ async def test_governed_by_edge_rejects_user_content_properties(tmp_path, mode):
     """A structural governance edge carrying a user-content payload is rejected;
     the clean, property-free binding still writes."""
     async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
+        # Inception-written agent node (raw store); the wrapper only carries it
+        # along in a volatile mode (#2672 P1 label gate).
+        await raw.add_node(_structural_node("agent"))
         wrapper = PrivacyEnforcingStorage(raw, mode)
-        await wrapper.add_node(_structural_node("agent"), capability=CAP)
         await wrapper.add_node(_structural_node("document"))
 
         with pytest.raises(PrivacyViolationError):
@@ -1205,21 +1449,34 @@ async def test_cas_swap_of_existing_structural_node_allowed(tmp_path, mode):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", VOLATILE_MODES)
 async def test_cas_control_plane_swap_requires_capability(tmp_path, mode):
-    """A compare-and-create of a control-plane node via CAS needs the capability;
-    without it the atomic primitive never runs and nothing persists (P2)."""
+    """A CAS swap of a control-plane node needs the capability; without it the
+    atomic primitive never runs and the stored node is unchanged (P2).
+
+    The swap is the realistic control-plane CAS: the agent node exists from
+    inception (raw store) and a governance write updates its content-free state
+    while carrying the identity label along. A compare-and-CREATE with a fresh
+    free-text label is refused by the label carry-along boundary — see
+    ``test_cas_compare_and_create_agent_label_refused`` (#2672 P1)."""
     async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
+        seed = _structural_node("agent")
+        await raw.add_node(seed)
         wrapper = PrivacyEnforcingStorage(raw, mode)
-        node = _structural_node("agent")
+        swapped_props = dict(seed.properties)
+        swapped_props["bootstrap_state"] = "complete"
+        new = GraphNode(
+            node_id=AGENT_ID, node_type="agent", label="Kestrel",
+            properties=swapped_props,
+        )
 
         with pytest.raises(PrivacyViolationError):
-            await wrapper.compare_and_swap_node(AGENT_ID, None, node)
-        assert await raw.get_node(AGENT_ID) is None
+            await wrapper.compare_and_swap_node(AGENT_ID, seed.properties, new)
+        assert (await raw.get_node(AGENT_ID)).properties.get("bootstrap_state") != "complete"
 
         result = await wrapper.compare_and_swap_node(
-            AGENT_ID, None, node, capability=CAP
+            AGENT_ID, seed.properties, new, capability=CAP
         )
         assert result == NodeSwapResult.SWAPPED
-        assert await raw.get_node(AGENT_ID) is not None
+        assert (await raw.get_node(AGENT_ID)).properties["bootstrap_state"] == "complete"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1293,8 +1550,9 @@ async def test_persist_agent_description_skips_durable_writes_when_volatile(
     )
 
     async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
+        # Inception-written agent node (raw store); the wrapper carries it along.
+        await raw.add_node(_structural_node("agent"))
         wrapper = PrivacyEnforcingStorage(raw, mode)
-        await wrapper.add_node(_structural_node("agent"), capability=CAP)
 
         wrote = await persist_agent_description(
             raw.db, wrapper, AGENT_ID, f"secret bio {USER_SECRET}"
@@ -1431,6 +1689,675 @@ async def test_save_soul_md_persists_in_normal(tmp_path, monkeypatch):
         assert saved is True
         assert (agent_dir / "SOUL.md").exists()
         assert await raw.get_node(f"{soul_agent}#soul") is not None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ReentrantTransitionLock — task-reentrant so a durable-write tool nested inside a
+# streamed turn (which already holds the lock) does not self-deadlock (#2672 P1).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_reentrant_transition_lock_same_task_reentry():
+    """Same-task nested acquire returns immediately (no deadlock) and only the
+    OUTERMOST exit releases — the property that fixes the streamed-rename hang."""
+    lock = ReentrantTransitionLock()
+    async with lock:
+        assert lock.locked()
+        async with lock:  # would hang forever on a plain asyncio.Lock
+            assert lock.locked()
+        assert lock.locked()  # inner exit must NOT release while outer holds
+    assert not lock.locked()  # outer exit releases
+
+
+@pytest.mark.asyncio
+async def test_reentrant_transition_lock_cross_task_exclusion():
+    """Across DIFFERENT tasks the lock is still mutually exclusive — a second task
+    waits until the first fully releases the outermost acquire, preserving the
+    writer-vs-transition serialization the #2672 race needs."""
+    lock = ReentrantTransitionLock()
+    order: list[str] = []
+
+    async def holder():
+        async with lock:
+            order.append("A-acquire")
+            for _ in range(6):  # give B a chance to (fail to) acquire
+                await asyncio.sleep(0)
+            order.append("A-release")
+
+    async def waiter():
+        while "A-acquire" not in order:  # ensure A grabs it first
+            await asyncio.sleep(0)
+        async with lock:
+            order.append("B-acquire")
+
+    await asyncio.gather(holder(), waiter())
+    assert order == ["A-acquire", "A-release", "B-acquire"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Deterministic privacy-transition interleaving: a NORMAL→volatile flip that
+# lands in the CHECK→PERSIST gap is respected because every direct user-content
+# writer holds the agent's privacy-transition lock across both steps (#2672 P1
+# race). Covers rename, description, discovery history, discovered user name, and
+# SOUL — check-through-persist.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def _flip_lands_in_check_persist_gap(lock, coro, flip):
+    """Deterministically land ``flip`` inside a writer's check→persist gap.
+
+    Pre-hold ``lock`` (a privacy transition is "in flight"), start ``coro`` (it
+    blocks entering its OWN ``async with lock``), assert it is BLOCKED, apply the
+    volatile ``flip``, assert it is STILL blocked (the entire transition happened
+    inside the gap), then release. The writer then runs its whole
+    check-through-persist under the lock AFTER the flip, so it must observe the
+    volatile mode and skip — proving the check and the persist are one serialized
+    unit and a transition can never land between them (#2672 review P1 race)."""
+    await lock.acquire()
+    task = asyncio.create_task(coro)
+    for _ in range(6):
+        await asyncio.sleep(0)
+    assert not task.done(), "writer must block on the held privacy-transition lock"
+    flip()
+    for _ in range(4):
+        await asyncio.sleep(0)
+    assert not task.done(), "writer must stay serialized behind the transition"
+    lock.release()
+    return await task
+
+
+class _RenameAgent:
+    """Minimal agent shape for ``rename_agent_core``: live name, bootstrap-service
+    name mirror, the wrapper as ``storage`` (so ``hides_persisted_user_content``
+    reads the CURRENT mode from it), the raw db for the metadata write, and the
+    shared privacy-transition lock."""
+
+    def __init__(self, wrapper, raw, lock):
+        self.agent_id = AGENT_ID
+        self._agent_name = "Kestrel"
+        self.storage = wrapper
+        self._raw_storage = types.SimpleNamespace(db=raw.db)
+        self.bootstrap_service = types.SimpleNamespace(
+            agent_name="Kestrel", agent_data_path=None
+        )
+        self._lock = lock
+
+    def _get_privacy_transition_lock(self):
+        return self._lock
+
+
+async def _metadata_value(raw, key):
+    if not await raw.db.table_exists("agent_metadata"):
+        return None
+    rows = await raw.db.fetchall(
+        "SELECT value FROM agent_metadata WHERE agent_id = ? AND key = ?",
+        (AGENT_ID, key),
+    )
+    return rows[0][0] if rows else None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", VOLATILE_MODES)
+async def test_transition_in_gap_rename_skips_all_durable_writes(tmp_path, mode):
+    """RENAME: a NORMAL→volatile flip landing in the gap makes the rename skip
+    every durable store (metadata row, graph node/label, SOUL) and update only the
+    live session name."""
+    from kestrel_sovereign.features.bootstrap.feature import rename_agent_core
+
+    async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
+        await raw.add_node(_structural_node("agent"))  # stored label "Kestrel"
+        wrapper = PrivacyEnforcingStorage(raw, PrivacyMode.NORMAL)
+        lock = asyncio.Lock()
+        agent = _RenameAgent(wrapper, raw, lock)
+
+        outcome = await _flip_lands_in_check_persist_gap(
+            lock,
+            rename_agent_core(agent, "RenamedLive"),
+            lambda: wrapper.set_privacy_mode(mode),
+        )
+
+        assert outcome.skipped_privacy is True
+        assert agent._agent_name == "RenamedLive"          # live/session name only
+        assert await _metadata_value(raw, "name") is None  # nothing durable
+        node = await raw.get_node(AGENT_ID)
+        assert node.label == "Kestrel"                     # stored node untouched
+        assert node.properties.get("name") != "RenamedLive"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [PrivacyMode.NORMAL, PrivacyMode.EPHEMERAL])
+async def test_rename_under_held_turn_lock_does_not_deadlock(tmp_path, mode):
+    """P1 regression: a streamed turn holds the privacy-transition lock across the
+    WHOLE turn (``agent/streaming.py`` acquires it before dispatching tools), and
+    ``rename_agent`` runs as a tool WITHIN that turn. With a non-reentrant
+    ``asyncio.Lock`` the tool would wait on a lock its OWN task already holds and
+    hang the stream forever. The real agent lock (``ReentrantTransitionLock``) is
+    task-reentrant, so the nested rename completes and still persists (NORMAL) or
+    skips (volatile) correctly. Uses the REAL lock type and drives the write under
+    a ``wait_for`` timeout so a regression fails loudly instead of hanging the whole
+    suite (#2672 review P1)."""
+    from kestrel_sovereign.features.bootstrap.feature import rename_agent_core
+
+    async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
+        await raw.add_node(_structural_node("agent"))  # stored label "Kestrel"
+        wrapper = PrivacyEnforcingStorage(raw, mode)
+        lock = ReentrantTransitionLock()
+        agent = _RenameAgent(wrapper, raw, lock)
+
+        # Streaming path: hold the transition lock across the whole "turn", then
+        # dispatch the rename tool inside it — exactly the same-task re-acquire
+        # that deadlocked with a plain asyncio.Lock.
+        async with lock:
+            assert lock.locked()
+            outcome = await asyncio.wait_for(
+                rename_agent_core(agent, "RenamedInTurn"), timeout=5.0
+            )
+
+        assert agent._agent_name == "RenamedInTurn"        # live name always updates
+        if mode is PrivacyMode.NORMAL:
+            assert outcome.skipped_privacy is False
+            assert outcome.db_row_written is True
+            assert await _metadata_value(raw, "name") == "RenamedInTurn"
+            node = await raw.get_node(AGENT_ID)
+            assert node.label == "RenamedInTurn"           # durable node renamed
+        else:
+            assert outcome.skipped_privacy is True
+            assert await _metadata_value(raw, "name") is None  # nothing durable
+            node = await raw.get_node(AGENT_ID)
+            assert node.label == "Kestrel"                 # stored node untouched
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CROSS-TASK reentry (#2672 review P1 follow-up). The same-task test above covers
+# the ANTHROPIC path, where the inline rename runs on the turn task that holds the
+# lock. It does NOT cover the CODEX app-server path: the long-lived app-server
+# dispatches each ``item/tool/call`` handler on its OWN reader-spawned task, so the
+# nested rename runs on a DIFFERENT task than the lock owner. Same-task reentry
+# cannot help it — without the captured per-turn reentry token the turn (blocked
+# awaiting the app-server's tool result) and the tool (blocked acquiring the lock
+# the turn holds) DEADLOCK. This drives the REAL inline executor
+# (``_make_inline_tool_executor``) across a faithful reader-task boundary.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin  # noqa: E402
+
+
+class _InlineOrchestratorHost(OrchestratorEngineMixin):
+    """Real orchestrator host that builds the PRODUCTION inline executor.
+
+    Combines the orchestrator mixin (so ``_make_inline_tool_executor`` is the real
+    code under test — token capture and re-presentation included) with the
+    ``_RenameAgent`` identity shape ``rename_agent_core`` needs and the shared
+    ``ReentrantTransitionLock``. ``execute_named_tool`` routes to
+    ``rename_agent_core`` exactly like the live app-server path
+    (server→client ``item/tool/call`` → ``execute_named_tool`` → the named tool).
+    """
+
+    def __init__(self, wrapper, raw, lock):
+        self.agent_id = AGENT_ID
+        self._agent_name = "Kestrel"
+        self.storage = wrapper
+        self._raw_storage = types.SimpleNamespace(db=raw.db)
+        self.bootstrap_service = types.SimpleNamespace(
+            agent_name="Kestrel", agent_data_path=None
+        )
+        self._privacy_transition_lock = lock
+
+    def _get_privacy_transition_lock(self):
+        return self._privacy_transition_lock
+
+    async def execute_named_tool(self, name, args, *, session_id, source, _capture):
+        assert name == "rename_agent"
+        from kestrel_sovereign.features.bootstrap.feature import rename_agent_core
+
+        _capture["effective_args"] = args
+        return await rename_agent_core(self, args["new_name"])
+
+
+class _AppServerReaderHarness:
+    """Reproduces the codex app-server reader-task topology WITHOUT a live server.
+
+    The reader loop is spawned once; each dispatched tool call runs in its OWN task
+    spawned FROM the reader (mirrors ``codex_app_server`` running each
+    ``item/tool/call`` on a per-call task), so the tool never runs on the turn task
+    — exactly the topology that deadlocks without the captured reentry token.
+    """
+
+    def __init__(self):
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._reader = None
+
+    async def ensure_started(self):
+        if self._reader is None:
+            self._reader = asyncio.create_task(self._read_loop())
+
+    async def _read_loop(self):
+        while True:
+            executor, name, args, done = await self._queue.get()
+            if executor is None:
+                return
+            asyncio.create_task(self._handle(executor, name, args, done))
+
+    async def _handle(self, executor, name, args, done):
+        try:
+            done.set_result(await executor(name, args))
+        except Exception as exc:  # pragma: no cover - defensive
+            done.set_exception(exc)
+
+    async def dispatch(self, executor, name, args):
+        done = asyncio.get_event_loop().create_future()
+        await self._queue.put((executor, name, args, done))
+        return await done
+
+    async def stop(self):
+        if self._reader is not None:
+            await self._queue.put((None, None, None, None))
+            await self._reader
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [PrivacyMode.NORMAL, PrivacyMode.EPHEMERAL])
+async def test_inline_rename_from_app_server_task_does_not_deadlock(tmp_path, mode):
+    """P1 (the CROSS-TASK case the same-task test cannot reach): the turn holds the
+    transition lock and dispatches the rename tool through the REAL inline executor
+    onto the codex app-server's reader task. That task is NOT the lock owner, so the
+    nested rename can only proceed via the per-turn reentry token the executor
+    captured on the turn task; without it the turn and tool deadlock. A ``wait_for``
+    timeout makes a regression fail loudly instead of hanging the whole suite
+    (#2672 review P1)."""
+    async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
+        await raw.add_node(_structural_node("agent"))  # stored label "Kestrel"
+        wrapper = PrivacyEnforcingStorage(raw, mode)
+        lock = ReentrantTransitionLock()
+        host = _InlineOrchestratorHost(wrapper, raw, lock)
+        harness = _AppServerReaderHarness()
+
+        # Streaming path: hold the transition lock across the whole "turn", build
+        # the inline executor INSIDE the held lock (as the orchestrator does, so it
+        # captures this turn's token), then dispatch the rename onto a reader-spawned
+        # task and AWAIT it — the turn is now blocked on the app-server's result
+        # exactly as in production, while the tool runs on a foreign task.
+        async with lock:
+            assert lock.locked()
+            executor = host._make_inline_tool_executor("sess-inline")
+            await harness.ensure_started()
+            _eff, outcome = await asyncio.wait_for(
+                harness.dispatch(
+                    executor, "rename_agent", {"new_name": "RenamedInline"}
+                ),
+                timeout=5.0,
+            )
+        await harness.stop()
+
+        assert host._agent_name == "RenamedInline"  # live name always updates
+        if mode is PrivacyMode.NORMAL:
+            assert outcome.skipped_privacy is False
+            assert outcome.db_row_written is True
+            assert await _metadata_value(raw, "name") == "RenamedInline"
+            node = await raw.get_node(AGENT_ID)
+            assert node.label == "RenamedInline"           # durable node renamed
+        else:
+            assert outcome.skipped_privacy is True
+            assert await _metadata_value(raw, "name") is None  # nothing durable
+            node = await raw.get_node(AGENT_ID)
+            assert node.label == "Kestrel"                 # stored node untouched
+
+
+@pytest.mark.asyncio
+async def test_concurrent_transition_from_unrelated_task_still_serializes(tmp_path):
+    """The token admits ONLY the owning turn's nested write cross-task; a genuinely
+    concurrent ``set_privacy_mode`` from an UNRELATED task (which captured no token)
+    must still block behind the held lock. Proves the fix preserves the cross-turn
+    exclusion the #2672 check-then-write race depends on — it does not turn the lock
+    into a free-for-all (#2672 review P1)."""
+    async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
+        wrapper = PrivacyEnforcingStorage(raw, PrivacyMode.NORMAL)
+        lock = ReentrantTransitionLock()
+        order: list[str] = []
+
+        async def turn_holds_lock():
+            async with lock:
+                # A bound token exists, but it is NEVER handed to the intruder.
+                assert lock.current_reentry_token() is not None
+                order.append("turn-acquire")
+                for _ in range(6):
+                    await asyncio.sleep(0)
+                order.append("turn-release")
+
+        async def unrelated_transition():
+            while "turn-acquire" not in order:
+                await asyncio.sleep(0)
+            async with lock:  # no captured token → must wait for the outer release
+                order.append("transition-acquire")
+
+        await asyncio.wait_for(
+            asyncio.gather(turn_holds_lock(), unrelated_transition()), timeout=5.0
+        )
+        assert order == ["turn-acquire", "turn-release", "transition-acquire"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_reader_tasks_with_shared_token_serialize():
+    """P1 core (the review's requested regression): the codex app-server dispatches
+    each inline tool RPC of ONE turn on its OWN reader task, and EVERY such callback
+    carries the SAME captured span token. Admitting them purely on token match let
+    two durable identity writes run concurrently and interleave their
+    metadata/graph/memory/SOUL writes. Two concurrent reader tasks, both bearing the
+    turn's token, must therefore SERIALIZE through the per-span reentry mutex: the
+    second cannot enter its critical section until the first completes (#2672 review
+    P1). Each reader yields control repeatedly INSIDE the lock, so a regression that
+    let them overlap would be caught by ``max_concurrent`` > 1."""
+    lock = ReentrantTransitionLock()
+    events: list[str] = []
+    inside = 0
+    max_concurrent = 0
+
+    async def reader(token, label):
+        nonlocal inside, max_concurrent
+        # Faithful to the reader task: bind the captured token, then re-acquire the
+        # lock the turn owner holds (as rename_agent_core does inside a volatile
+        # transition guard). The token authorizes re-entry; the mutex serializes it.
+        with bind_transition_lock_reentry(token):
+            async with lock:
+                inside += 1
+                max_concurrent = max(max_concurrent, inside)
+                events.append(f"{label}-enter")
+                for _ in range(5):  # a durable write awaits several times
+                    await asyncio.sleep(0)
+                events.append(f"{label}-exit")
+                inside -= 1
+
+    async with lock:  # the streamed turn holds the transition lock across the turn
+        assert lock.locked()
+        token = lock.current_reentry_token()
+        assert token is not None
+        r1 = asyncio.create_task(reader(token, "A"))
+        # Start B only once A is already INSIDE its critical section, so a broken
+        # lock would let B overlap A right here.
+        while "A-enter" not in events:
+            await asyncio.sleep(0)
+        r2 = asyncio.create_task(reader(token, "B"))
+        # The turn task now blocks awaiting the "tool results", exactly as the turn
+        # blocks on the app-server response in production while tools run cross-task.
+        await asyncio.wait_for(asyncio.gather(r1, r2), timeout=5.0)
+
+    assert max_concurrent == 1, "two token-bearing reentrant writes overlapped"
+    # A's critical section is fully bracketed before B's — strict serialization.
+    assert events == ["A-enter", "A-exit", "B-enter", "B-exit"]
+
+
+@pytest.mark.asyncio
+async def test_owner_cancel_drains_active_cross_task_writer_before_release():
+    """P1 cancellation (the review's requested regression): the codex app-server
+    dispatches an inline durable-identity write on a DETACHED reader task, admitted
+    cross-task under the owning turn's span token. If the streamed turn is cancelled
+    while that reader is PAUSED between its privacy check and its persistence, the
+    owner's ``__aexit__`` must NOT release the base lock — a concurrent privacy
+    transition must stay blocked — until the paused writer finishes. Otherwise the
+    transition could acquire the lock and flip to a volatile mode while the
+    already-admitted NORMAL-mode write is still persisting (#2672 review P1
+    cancellation). Drives the REAL ``ReentrantTransitionLock`` across a faithful
+    reader-task boundary and asserts the transition cannot proceed until the writer
+    is done."""
+    lock = ReentrantTransitionLock()
+    writer_inside = asyncio.Event()   # reader has entered its critical section
+    release_writer = asyncio.Event()  # let the reader finish its "persist"
+    owner_ready = asyncio.Event()     # owner holds the lock and spawned the reader
+    transition_acquired = False
+
+    async def reader(token):
+        # Faithful reader task: bind the captured token and re-enter the lock the
+        # turn owner holds, then PAUSE mid-write — exactly the check→persist gap.
+        with bind_transition_lock_reentry(token):
+            async with lock:
+                writer_inside.set()
+                await release_writer.wait()
+
+    async def owner_turn():
+        async with lock:
+            token = lock.current_reentry_token()
+            assert token is not None
+            asyncio.create_task(reader(token))
+            await writer_inside.wait()  # the reader is now mid-write
+            owner_ready.set()
+            # Block as the streamed turn blocks awaiting the app-server tool
+            # result; the test cancels this task while we are parked here.
+            await asyncio.Event().wait()
+
+    async def transition():
+        nonlocal transition_acquired
+        async with lock:  # an UNRELATED privacy transition (captured no token)
+            transition_acquired = True
+
+    owner_task = asyncio.create_task(owner_turn())
+    await asyncio.wait_for(owner_ready.wait(), timeout=5.0)
+
+    # Cancel the owning turn while the reader is paused mid-write.
+    owner_task.cancel()
+    for _ in range(8):  # let the cancellation reach __aexit__ and enter the drain
+        await asyncio.sleep(0)
+    assert not owner_task.done(), "owner released the lock without draining the writer"
+    assert lock.locked(), "base lock must stay held while a cross-task write is live"
+
+    # A concurrent privacy transition must NOT acquire the lock while the
+    # already-admitted writer is still paused mid-write.
+    transition_task = asyncio.create_task(transition())
+    for _ in range(8):
+        await asyncio.sleep(0)
+    assert not transition_task.done(), "transition acquired the lock during a live write"
+    assert transition_acquired is False
+
+    # Let the paused writer finish; the owner's drain now completes, it releases the
+    # base lock, its own cancellation propagates, and ONLY THEN may the transition run.
+    release_writer.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(owner_task, timeout=5.0)
+    await asyncio.wait_for(transition_task, timeout=5.0)
+    assert transition_acquired is True
+
+
+@pytest.mark.asyncio
+async def test_owner_normal_exit_does_not_wait_when_no_reentrant_writer():
+    """The cancellation drain is a NO-OP on the normal path: with no cross-task
+    reentrant writer ever admitted, the outermost owner exit releases the base lock
+    immediately (the idle event starts set), so ordinary turns pay zero added
+    latency for the #2672 cancellation guarantee."""
+    lock = ReentrantTransitionLock()
+    async with lock:
+        assert lock.locked()
+    assert not lock.locked()  # released synchronously on exit, no drain wait
+
+
+@pytest.mark.asyncio
+async def test_reader_cancel_also_unblocks_owner_drain():
+    """The drain terminates even if the paused reader is itself CANCELLED rather than
+    completing: the reader's ``__aexit__`` sets the idle signal on the cancellation
+    path too, so the owner's drain never hangs holding the base lock (#2672 review
+    P1 cancellation, cancellation-safe cleanup on both sides)."""
+    lock = ReentrantTransitionLock()
+    writer_inside = asyncio.Event()
+    owner_ready = asyncio.Event()
+    reader_holder: dict = {}
+
+    async def reader(token):
+        with bind_transition_lock_reentry(token):
+            async with lock:
+                writer_inside.set()
+                await asyncio.Event().wait()  # park until cancelled
+
+    async def owner_turn():
+        async with lock:
+            token = lock.current_reentry_token()
+            reader_holder["task"] = asyncio.create_task(reader(token))
+            await writer_inside.wait()
+            owner_ready.set()
+            await asyncio.Event().wait()
+
+    owner_task = asyncio.create_task(owner_turn())
+    await asyncio.wait_for(owner_ready.wait(), timeout=5.0)
+
+    owner_task.cancel()
+    for _ in range(8):
+        await asyncio.sleep(0)
+    assert not owner_task.done(), "owner must block in drain while the reader is live"
+    assert lock.locked()
+
+    # Cancelling the reader (not letting it complete) must still release the drain.
+    reader_holder["task"].cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(owner_task, timeout=5.0)
+    assert not lock.locked(), "owner must release the base lock once the reader is gone"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_inline_renames_serialize_durable_writes(tmp_path):
+    """End-to-end P1: two ``rename_agent`` tool calls of one turn are dispatched
+    CONCURRENTLY through the REAL inline executor onto the codex app-server's reader
+    tasks. The per-span reentry mutex serializes them, so their durable
+    metadata/graph writes never interleave and the stores converge on ONE final
+    name (matching the live name) rather than a torn mix (#2672 review P1)."""
+    async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
+        await raw.add_node(_structural_node("agent"))  # stored label "Kestrel"
+        wrapper = PrivacyEnforcingStorage(raw, PrivacyMode.NORMAL)
+        lock = ReentrantTransitionLock()
+        host = _InlineOrchestratorHost(wrapper, raw, lock)
+        harness = _AppServerReaderHarness()
+
+        async with lock:
+            executor = host._make_inline_tool_executor("sess-inline")
+            await harness.ensure_started()
+            results = await asyncio.wait_for(
+                asyncio.gather(
+                    harness.dispatch(executor, "rename_agent", {"new_name": "AlphaName"}),
+                    harness.dispatch(executor, "rename_agent", {"new_name": "BetaName"}),
+                ),
+                timeout=5.0,
+            )
+        await harness.stop()
+
+        # Both renames succeeded (neither deadlocked nor errored).
+        assert all(outcome.success for _eff, outcome in results)
+        # Durable state is CONSISTENT: metadata, node label, and live name all agree
+        # on the same winner — no interleaving left the sources torn apart.
+        final_live = host._agent_name
+        assert final_live in {"AlphaName", "BetaName"}
+        assert await _metadata_value(raw, "name") == final_live
+        node = await raw.get_node(AGENT_ID)
+        assert node.label == final_live
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", VOLATILE_MODES)
+async def test_transition_in_gap_description_skips_durable_write(tmp_path, mode):
+    """DESCRIPTION: a flip in the gap makes ``persist_agent_description`` report
+    SKIPPED_PRIVACY and leave the durable stores untouched."""
+    from kestrel_sovereign.bootstrap.service import (
+        PersistOutcome,
+        persist_agent_description,
+    )
+
+    async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
+        await raw.add_node(_structural_node("agent"))
+        wrapper = PrivacyEnforcingStorage(raw, PrivacyMode.NORMAL)
+        lock = asyncio.Lock()
+
+        outcome = await _flip_lands_in_check_persist_gap(
+            lock,
+            persist_agent_description(
+                raw.db, wrapper, AGENT_ID, f"bio {USER_SECRET}", transition_lock=lock
+            ),
+            lambda: wrapper.set_privacy_mode(mode),
+        )
+
+        assert outcome is PersistOutcome.SKIPPED_PRIVACY
+        assert await _metadata_value(raw, "description") is None
+        node = await raw.get_node(AGENT_ID)
+        assert "description" not in (node.properties or {})
+
+
+def _bootstrap_service(raw, wrapper, lock, agent_data_path=None):
+    from kestrel_sovereign.bootstrap.service import BootstrapService
+
+    return BootstrapService(
+        db=raw.db,
+        agent_id=AGENT_ID,
+        agent_name="Kestrel",
+        llm_service=None,
+        agent_data_path=agent_data_path,
+        storage=wrapper,
+        privacy_transition_lock=lock,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", VOLATILE_MODES)
+async def test_transition_in_gap_discovery_history_skips_durable_write(tmp_path, mode):
+    """DISCOVERY HISTORY: a flip in the gap makes ``_save_discovery_history`` skip
+    the durable ``agent_metadata`` row and hold the raw conversation in the
+    session-only store instead."""
+    from kestrel_sovereign.bootstrap.service import PersistOutcome
+
+    async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
+        wrapper = PrivacyEnforcingStorage(raw, PrivacyMode.NORMAL)
+        lock = asyncio.Lock()
+        service = _bootstrap_service(raw, wrapper, lock)
+        history = [{"role": "user", "content": f"my secret is {USER_SECRET}"}]
+
+        outcome = await _flip_lands_in_check_persist_gap(
+            lock,
+            service._save_discovery_history(history),
+            lambda: wrapper.set_privacy_mode(mode),
+        )
+
+        assert outcome is PersistOutcome.SKIPPED_PRIVACY
+        assert await _metadata_value(raw, service.DISCOVERY_HISTORY_KEY) is None
+        assert service._session_discovery_history == history  # session-only
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", VOLATILE_MODES)
+async def test_transition_in_gap_user_name_skips_durable_write(tmp_path, mode):
+    """DISCOVERED USER NAME: a flip in the gap makes ``_save_user_name`` skip the
+    durable ``agent_metadata`` row entirely."""
+    async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
+        wrapper = PrivacyEnforcingStorage(raw, PrivacyMode.NORMAL)
+        lock = asyncio.Lock()
+        service = _bootstrap_service(raw, wrapper, lock)
+
+        await _flip_lands_in_check_persist_gap(
+            lock,
+            service._save_user_name(f"User {USER_SECRET}"),
+            lambda: wrapper.set_privacy_mode(mode),
+        )
+
+        assert await _metadata_value(raw, service.USER_NAME_KEY) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", VOLATILE_MODES)
+async def test_transition_in_gap_soul_skips_all_durable_writes(tmp_path, mode):
+    """SOUL: a flip in the gap makes ``save_soul_md`` skip the disk file, the
+    encrypted resource, the ``#soul`` graph reference, and the SOUL-derived
+    description."""
+    agent_dir = tmp_path / "agentdata"
+    agent_dir.mkdir()
+    async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
+        wrapper = PrivacyEnforcingStorage(raw, PrivacyMode.NORMAL)
+        lock = asyncio.Lock()
+        service = _bootstrap_service(raw, wrapper, lock, agent_data_path=str(agent_dir))
+
+        saved = await _flip_lands_in_check_persist_gap(
+            lock,
+            service.save_soul_md(f"# SOUL.md\n\n{USER_SECRET}"),
+            lambda: wrapper.set_privacy_mode(mode),
+        )
+
+        assert saved is False
+        assert not (agent_dir / "SOUL.md").exists()
+        assert await raw.get_node(f"{AGENT_ID}#soul") is None
+        assert await _metadata_value(raw, "description") is None
 
 
 @pytest.mark.parametrize(
@@ -1651,6 +2578,9 @@ async def test_agent_node_with_openrouter_key_hash_admitted(tmp_path, mode):
     governance upsert — the field is canonical and validated, so it no longer
     trips the non-canonical-key refusal (#2672 review P2)."""
     async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
+        # Inception-written agent node (raw store); the volatile-mode governance
+        # upsert carries the identity label along and adds a content-free field.
+        await raw.add_node(_structural_node("agent"))
         wrapper = PrivacyEnforcingStorage(raw, mode)
         node = _structural_node("agent")
         node.properties["openrouter_key_hash"] = VALID_OPENROUTER_KEY_HASH

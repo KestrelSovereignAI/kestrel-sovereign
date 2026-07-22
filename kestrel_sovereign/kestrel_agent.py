@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from kestrel_sovereign.storage import AsyncStorage, PrivacyEnforcingStorage
+from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock
 from kestrel_sovereign.security.encryption import DecryptionError
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.llm.adapter import LLMResponse
@@ -679,7 +680,11 @@ class KestrelAgent(
         # restart coordinator can age out stale markers (#1558).
         self._active_request_started_at: dict[str, float] = {}
         self._cancelled_requests: set = set()
-        self._privacy_transition_lock = asyncio.Lock()
+        # Task-reentrant so a durable-identity write (rename / description /
+        # discovery / user-name / SOUL) invoked as a TOOL inside a streamed turn
+        # — which already holds this lock across the whole turn — re-enters
+        # instead of self-deadlocking on its own task's lock (#2672 review P1).
+        self._privacy_transition_lock = ReentrantTransitionLock()
         # A data-destructive privacy transition (e.g. PUBLIC → EPHEMERAL) staged
         # awaiting explicit confirmation via confirm_privacy_transition. None when
         # no transition is pending. Guarded by _privacy_transition_lock.
@@ -2265,11 +2270,16 @@ class KestrelAgent(
             return None
         return privacy_agent.privacy_config
 
-    def _get_privacy_transition_lock(self) -> asyncio.Lock:
-        """Return the lock that serializes privacy transitions with active streams."""
+    def _get_privacy_transition_lock(self) -> ReentrantTransitionLock:
+        """Return the lock that serializes privacy transitions with active streams.
+
+        Task-reentrant (#2672 review P1): a streamed turn holds it across the whole
+        turn, so a durable-identity write dispatched as a tool inside that turn must
+        be able to re-enter its own task's lock rather than deadlock on it.
+        """
         lock = getattr(self, "_privacy_transition_lock", None)
         if lock is None:
-            lock = asyncio.Lock()
+            lock = ReentrantTransitionLock()
             self._privacy_transition_lock = lock
         return lock
     

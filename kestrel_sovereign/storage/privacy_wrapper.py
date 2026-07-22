@@ -14,12 +14,14 @@ This is a defense-in-depth measure - even if application code forgets to
 check privacy mode, the storage layer will enforce it.
 """
 
+import asyncio
+import contextvars
 import json
 import logging
 import re
 import sys
 import warnings
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 
 from kestrel_sovereign.storage.session_grouping import summarize_sessions
 from typing import Dict, List, Optional, Any, Tuple, TYPE_CHECKING, Union
@@ -106,6 +108,311 @@ class OperationType(Enum):
     READ = "read"
     WRITE = "write"
     DELETE = "delete"
+
+
+# ── Cross-task reentry token for the privacy-transition lock (#2672 review P1) ──
+#
+# Same-task reentry (below) fixes the ANTHROPIC path, where a durable-identity
+# write dispatched inline runs on the SAME asyncio task that holds the turn's
+# transition lock. It does NOT fix the CODEX app-server path: the long-lived
+# app-server dispatches each ``item/tool/call`` handler on its own reader-spawned
+# task (``agent/orchestrator_engine.py`` — the reader loop spawns a per-call
+# task), NOT the turn task. That handler task calls ``execute_named_tool`` →
+# ``rename_agent_core`` (or description / discovery history / user name / SOUL),
+# which re-acquires the SAME lock. By task identity it is a DIFFERENT task, so it
+# would block waiting for the turn task to release — while the turn task is itself
+# blocked awaiting the app-server's tool response. That is a deadlock.
+#
+# The fix, per the review: give inline tool callbacks a private, captured
+# per-turn ownership token that permits re-entry into the lock for THAT specific
+# active turn. The executor captures the owning turn's token on the turn task
+# (where the lock is held — see ``ReentrantTransitionLock.current_reentry_token``)
+# and re-presents it via ``bind_transition_lock_reentry`` around the tool call.
+# The lock then admits that one turn's nested write cross-task, while a genuinely
+# concurrent ``set_privacy_mode`` from an UNRELATED task (which captured no token)
+# still serializes — cross-turn exclusion, the only exclusion the #2672
+# check-then-write race needs, is preserved.
+#
+# The token authorizes re-entry but does NOT wave the reentrant write straight
+# through: because the app-server can dispatch MULTIPLE inline tools of one turn
+# concurrently — each on its own reader task, all carrying the SAME token — the
+# lock funnels cross-task reentrants through a per-span reentry mutex
+# (``_reentry_lock``) so two durable identity writes cannot interleave. See the
+# ``ReentrantTransitionLock`` docstring and ``__aenter__`` for the serialization.
+_transition_lock_reentry_token: "contextvars.ContextVar[Optional[object]]" = (
+    contextvars.ContextVar("kestrel_transition_lock_reentry_token", default=None)
+)
+
+
+@contextmanager
+def bind_transition_lock_reentry(token: Optional[object]):
+    """Re-present a captured transition-lock reentry token on the current task.
+
+    Companion to :meth:`ReentrantTransitionLock.current_reentry_token`. An
+    inline-tool executor built inside a streamed turn captures that turn's token
+    (on the turn task, which holds the lock) and wraps the actual tool call in
+    ``with bind_transition_lock_reentry(token):`` so a nested durable-identity
+    write (rename / description / discovery history / user name / SOUL) dispatched
+    on the codex app-server's SEPARATE reader task can re-enter the lock its
+    OWNING turn holds instead of deadlocking (#2672 review P1). The token is the
+    identity of ONE held span on ONE lock instance, so it authorizes re-entry into
+    that span only — a different lock (another agent) or a later span sees no
+    match. Binding ``None`` is a no-op (the anthropic path runs the tool on the
+    turn task, where reentry is by task identity), preserving prior behaviour.
+    """
+    if token is None:
+        yield
+        return
+    reset = _transition_lock_reentry_token.set(token)
+    try:
+        yield
+    finally:
+        _transition_lock_reentry_token.reset(reset)
+
+
+class ReentrantTransitionLock:
+    """Task-reentrant async lock for the privacy-transition boundary (#2672 P1).
+
+    ``asyncio.Lock`` is NOT reentrant. A streamed turn holds the privacy-transition
+    lock across the ENTIRE turn — including feature/tool execution
+    (``agent/streaming.py`` acquires it before dispatching tools) — so a durable
+    identity write invoked as a tool WITHIN that turn (rename / description /
+    discovery history / user name / SOUL) that re-acquires the SAME lock would wait
+    forever on a lock its own turn already holds, hanging the stream. This lock
+    admits such a nested write via TWO scoped-to-the-held-span signals:
+
+      * SAME-TASK reentry — the task that acquired the lock re-acquires it. This
+        covers the anthropic path, where the inline write runs on the turn task
+        itself. A nested acquire returns immediately and bumps a depth counter;
+        only the OUTERMOST acquire releases to other tasks.
+
+      * CROSS-TASK reentry via a captured token — the codex app-server dispatches
+        each inline tool on its own reader-spawned task, NOT the turn task, so
+        same-task reentry cannot help it and it would DEADLOCK (the tool waits on
+        the lock the turn holds; the turn waits on the app-server's tool result).
+        The inline executor captures this span's token on the turn task (via
+        :meth:`current_reentry_token`) and re-presents it via
+        :func:`bind_transition_lock_reentry`; a caller carrying THIS span's token
+        re-enters cross-task — but through a SEPARATE per-span reentry mutex, not
+        by bypassing the lock outright. That mutex serializes the app-server's
+        concurrent reader tasks against each other: all inline tools of one turn
+        share the same token, so two durable identity writes (e.g. two
+        ``rename_agent`` calls) that would otherwise interleave their
+        metadata/graph/memory/SOUL writes are forced one-at-a-time, the second
+        blocked until the first's critical section completes (#2672 review P1).
+        The mutex is distinct from the base lock the turn owner holds, so the
+        cross-task write still never deadlocks; a nested write on the SAME reader
+        task re-enters the mutex by task identity.
+
+    Cross-turn exclusion is unchanged — a writer in task A and a concurrent
+    ``set_privacy_mode`` in task B (which captured no token) still serialize —
+    which is the only exclusion the #2672 check-then-write race needs. Both reentry
+    signals are scoped to the ONE currently-held span (the token is a fresh object
+    identity minted on the outermost acquire and cleared on the outermost release),
+    so a stale token from a prior span never re-enters a later one. Exposes the
+    ``asyncio.Lock``-compatible surface (``locked()`` + async context manager) the
+    call sites use.
+
+    CANCELLATION DRAIN (#2672 review P1). A cross-task reentry admitted via the
+    token is an ACTIVE LEASE on the outer span, not merely a hold of the reentry
+    mutex: the codex app-server runs each inline tool on a DETACHED reader task, so
+    if the owning turn is cancelled/disconnected while such a reader is mid
+    durable-write, the naive release would clear the token and free ``_lock``
+    immediately — and a concurrent privacy transition could then acquire ``_lock``
+    and flip to a volatile mode while the already-admitted NORMAL-mode write is
+    still persisting. To prevent that, the outermost owner exit first INVALIDATES
+    the token (rejecting any new reentry) and then WAITS for every active
+    token-bearing writer to finish before releasing ``_lock`` — cancellation-safely,
+    re-raising the turn's own cancellation only after the base lock is released. A
+    reader that is itself cancelled unblocks the drain via the same idle signal, so
+    the drain always terminates.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._owner: Optional["asyncio.Task"] = None
+        self._depth = 0
+        # Fresh identity per HELD span, minted on the outermost acquire and
+        # cleared on the outermost release. Handed to inline tool callbacks that
+        # run on a foreign task so they can re-enter THIS span cross-task; a token
+        # from a prior span never matches a later span's fresh identity.
+        self._token: Optional[object] = None
+        # Serializes CROSS-TASK token reentries within a span (#2672 review P1).
+        # The codex app-server dispatches every inline tool RPC of one turn on
+        # its OWN reader-spawned task, and all of them carry the SAME span token.
+        # Admitting them purely on token match (the prior bug) let two durable
+        # identity writes — e.g. two ``rename_agent`` calls in one turn — run
+        # their metadata/graph/memory/SOUL writes concurrently and interleave,
+        # leaving the durable identity sources inconsistent. Cross-task
+        # reentrants therefore acquire THIS mutex — distinct from the base
+        # ``_lock`` the turn owner holds, so there is no deadlock — which makes
+        # the second reentrant write wait for the first to complete. The owner's
+        # own (same-task) reentry never touches it; a single task cannot run two
+        # critical sections at once, so a depth bump is already exclusive there.
+        self._reentry_lock = asyncio.Lock()
+        # The reader task currently inside the reentry mutex, plus its nesting
+        # depth — so a nested durable write on that SAME reader task re-enters by
+        # task identity instead of self-deadlocking on the non-reentrant mutex.
+        self._reentry_owner: Optional["asyncio.Task"] = None
+        self._reentry_depth = 0
+        # Set when NO cross-task reentrant writer holds this span, cleared while one
+        # is active. The outermost owner AWAITS this before releasing ``_lock`` so a
+        # detached reader task's ALREADY-ADMITTED durable write completes INSIDE the
+        # owner's lock span even when the owning turn is cancelled/disconnected
+        # mid-flight (#2672 review P1 cancellation). Without the drain, the owner's
+        # ``__aexit__`` would clear the token and release ``_lock`` the instant the
+        # turn is cancelled — while the codex app-server's detached tool task is
+        # still persisting — and a concurrent ``set_privacy_mode`` could then
+        # acquire ``_lock`` and flip to a volatile mode under that in-flight
+        # NORMAL-mode write. Starts set (no reentrant writer at construction).
+        self._reentry_idle = asyncio.Event()
+        self._reentry_idle.set()
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+    def current_reentry_token(self) -> Optional[object]:
+        """The token that permits cross-task re-entry into the CURRENTLY-held span.
+
+        Returns the active span's token ONLY when the current task owns the lock —
+        i.e. when called on the turn task at the point the inline-tool executor
+        closure is built (``_make_inline_tool_executor`` runs inside the streamed
+        turn's ``async with transition_lock``). The executor captures this and
+        re-presents it via :func:`bind_transition_lock_reentry` when its tool runs
+        on the codex app-server's separate reader task, so a nested durable-identity
+        write re-enters the lock instead of deadlocking (#2672 review P1). Returns
+        ``None`` when the current task does not own the lock — there is no span to
+        authorize re-entry into, so an unrelated caller gets no token and still
+        serializes.
+        """
+        task = asyncio.current_task()
+        if task is not None and self._owner is task and self._token is not None:
+            return self._token
+        return None
+
+    def _token_matches_current_span(self) -> bool:
+        """Whether the current task carries THIS span's cross-task reentry token."""
+        token = _transition_lock_reentry_token.get()
+        return token is not None and self._token is not None and token is self._token
+
+    async def __aenter__(self) -> "ReentrantTransitionLock":
+        task = asyncio.current_task()
+        # (1) Same-task reentry by the span owner (the anthropic inline path runs
+        #     the write on the turn task itself; also any nested acquire). A single
+        #     task cannot run two critical sections at once, so a depth bump is
+        #     both sufficient and exclusive — no reentry mutex needed.
+        if task is not None and self._owner is task:
+            self._depth += 1
+            return self
+        # (2) Cross-task reentry by a reader task that ALREADY holds the reentry
+        #     mutex — a nested durable write on that SAME reader task. Reentrant by
+        #     task identity so it can't self-deadlock on the non-reentrant mutex.
+        if task is not None and self._reentry_owner is task:
+            self._reentry_depth += 1
+            return self
+        # (3) First cross-task reentry via a captured span token (the codex
+        #     app-server's per-tool reader task). Multiple inline tools in ONE turn
+        #     all carry the SAME span token; serialize concurrent token-bearers on
+        #     the per-span reentry mutex so the second durable identity write cannot
+        #     enter until the first's critical section completes — while STILL
+        #     bypassing the base lock the turn owner holds, so there is no deadlock
+        #     (#2672 review P1). The owner never reaches here: branch (1) caught it.
+        if self._token_matches_current_span():
+            await self._reentry_lock.acquire()
+            # Re-validate after awaiting: the owning span may have ended while we
+            # waited (owner released the base lock, token now stale). If so this is
+            # no longer a reentry — release the mutex and fall through to a normal
+            # acquire so a genuinely-after-span write serializes as its own turn.
+            if self._token_matches_current_span():
+                self._reentry_owner = task
+                self._reentry_depth = 1
+                # A cross-task reentrant writer is now ACTIVE in this span: mark the
+                # span non-idle so the owner's outermost exit drains it before
+                # releasing ``_lock`` (#2672 review P1 cancellation).
+                self._reentry_idle.clear()
+                return self
+            self._reentry_lock.release()
+        # (4) Normal acquire — an unrelated task (cross-turn), or the stale-token
+        #     fallthrough above. This is the cross-turn exclusion the #2672
+        #     check-then-write race depends on, unchanged.
+        await self._lock.acquire()
+        self._owner = asyncio.current_task()
+        self._token = object()
+        self._depth = 1
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        task = asyncio.current_task()
+        # Unwind a cross-task reentry frame (reader task holding the reentry mutex)
+        # before the base-lock frame — the two are always distinct tasks, so task
+        # identity disambiguates which frame this ``__aexit__`` pairs with.
+        if self._reentry_owner is not None and self._reentry_owner is task:
+            self._reentry_depth -= 1
+            if self._reentry_depth <= 0:
+                self._reentry_depth = 0
+                self._reentry_owner = None
+                self._reentry_lock.release()
+                # This cross-task reentrant write has finished its critical
+                # section; signal any owner blocked in the drain that it may now
+                # release the base lock (#2672 review P1 cancellation).
+                self._reentry_idle.set()
+            return False
+        self._depth -= 1
+        if self._depth <= 0:
+            self._depth = 0
+            self._owner = None
+            # (a) Invalidate the span token FIRST so no NEW cross-task reentry is
+            #     admitted past this point — a foreign task presenting the now-stale
+            #     token re-validates in ``__aenter__`` branch (3) and falls through
+            #     to a normal acquire, blocking on ``_lock`` until we release it.
+            self._token = None
+            # (b) DRAIN any ALREADY-admitted cross-task reentrant writer before
+            #     releasing the base lock. On the normal path the reader's write has
+            #     already completed (the app-server returned its tool result, which
+            #     is what unblocked this turn), so the event is set and this is a
+            #     no-op. On the cancellation path a detached reader may still be mid
+            #     durable-write; hold ``_lock`` until it finishes (or is itself
+            #     cancelled — its ``__aexit__`` sets the event either way) so a
+            #     concurrent privacy transition cannot flip the mode under it
+            #     (#2672 review P1 cancellation).
+            pending_cancel = await self._drain_active_reentrant()
+            self._lock.release()
+            # Re-raise a cancellation that arrived DURING the drain only after the
+            # lock is safely released, so the owning turn's cancellation still
+            # propagates but never at the cost of skipping the drain.
+            if pending_cancel is not None:
+                raise pending_cancel
+        return False
+
+    async def _drain_active_reentrant(self) -> Optional[BaseException]:
+        """Block until no cross-task reentrant writer holds this span.
+
+        Called by the outermost owner exit AFTER the span token is invalidated and
+        BEFORE ``_lock`` is released. Returns immediately on the normal path (the
+        detached reader's write already finished, so ``_reentry_idle`` is set). On
+        the cancellation path a detached codex app-server tool task may still be mid
+        durable-write; wait for it to signal idle — its own ``__aexit__`` sets the
+        event when its critical section completes OR when the reader task is itself
+        cancelled, so the drain always terminates. The wait is SHIELDED so cancelling
+        the owning turn cannot skip the drain (and cannot busy-spin under repeated
+        cancellation — the shielded waiter keeps the reader schedulable); a caught
+        cancellation is returned for the caller to re-raise AFTER releasing the base
+        lock (#2672 review P1 cancellation).
+        """
+        if self._reentry_idle.is_set():
+            return None
+        cancelled: Optional[BaseException] = None
+        waiter = asyncio.ensure_future(self._reentry_idle.wait())
+        try:
+            while not self._reentry_idle.is_set():
+                try:
+                    await asyncio.shield(waiter)
+                except asyncio.CancelledError as exc:
+                    cancelled = exc
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+        return cancelled
 
 
 @asynccontextmanager
@@ -617,6 +924,23 @@ class _StructuralNodeShape:
     @property
     def keys(self) -> frozenset:
         return frozenset(self.field_validators)
+
+    @property
+    def label_content_free(self) -> bool:
+        """Whether this type's LABEL is validated content-free by shape.
+
+        ``True`` when the label is pinned to a literal set or a strict regex
+        (``document`` / ``audit_anchor``): such a label cannot carry user text,
+        so it is admitted on content alone. ``False`` when the label is an
+        identity-derived free-text string (the ``agent`` node's name) that no
+        regex can prove content-free — that label is a top-level free-text field
+        and, exactly like the free-text PROPERTIES, is admitted in a volatile
+        mode ONLY carried along UNCHANGED from the stored node. This split is the
+        per-type label audit the P1 review demanded: EVERY allowlisted type is
+        either content-free-labeled or free-text-carried, so no shape can smuggle
+        durable user text through ``GraphNode.label`` (#2672 review P1).
+        """
+        return self.label_literals is not None or self.label_regex is not None
 
 
 _STRUCTURAL_NODE_SHAPES: Dict[str, _StructuralNodeShape] = {
@@ -1494,10 +1818,16 @@ class PrivacyEnforcingStorage:
         self, node_type, label, shape: "_StructuralNodeShape", operation: str
     ) -> None:
         """Fail closed unless a structural node's label matches its type's rule."""
-        if shape.label_literals is None and shape.label_regex is None:
-            # Identity-derived label (agent name / "<feature> config"): agent or
-            # operator state, not conversation content. It must still be a plain
-            # string, never a structured payload smuggling content.
+        if not shape.label_content_free:
+            # Identity-derived label (the agent's own name): agent state, not
+            # conversation content, but STILL user-derived free-text that no regex
+            # can prove content-free. The load-bearing gate for it is the
+            # carried-along boundary applied by the async caller
+            # (:meth:`_enforce_free_text_carry_along` /
+            # :meth:`_governed_compare_and_swap`), which admits it only UNCHANGED
+            # from the stored trusted label — the same treatment as the free-text
+            # properties (#2672 review P1). Here we only enforce the shape: it must
+            # be a plain string, never a structured payload smuggling content.
             if label is not None and not isinstance(label, str):
                 raise PrivacyViolationError(
                     f"Graph write '{operation}' blocked: {node_type!r} node label "
@@ -1550,28 +1880,102 @@ class PrivacyEnforcingStorage:
             f"REGARDLESS of any control-plane capability (#2672)."
         )
 
+    @staticmethod
+    def _label_is_free_text(node_type) -> bool:
+        """Whether a structural type's LABEL is identity-derived free-text.
+
+        ``True`` only for a control-plane node whose label is the agent's own
+        name (no literal/regex proves it content-free); such a label is a
+        top-level free-text field guarded by carry-along (#2672 review P1).
+        """
+        shape = _STRUCTURAL_NODE_SHAPES.get(node_type)
+        return shape is not None and not shape.label_content_free
+
+    @staticmethod
+    def _is_content_free_identity_label(node) -> bool:
+        """Whether ``node``'s label is the DID-derived ``Agent {node_id}`` form.
+
+        That form is fully determined by the node's own id, so it carries NO user
+        text and is content-free by construction — admitted even on a fresh create
+        with no stored label to carry from. This is exactly what the born-agent
+        boot path writes when it first materialises the identity node in a volatile
+        mode, and it is the ONLY fresh identity label a volatile-mode create admits
+        (a real user-authored name is refused) (#2672 review P1)."""
+        label = getattr(node, "label", None)
+        node_id = getattr(node, "node_id", None)
+        return isinstance(node_id, str) and label == f"Agent {node_id}"
+
+    def _label_carry_violation(self, node, stored) -> bool:
+        """True when an identity-labeled control-plane node's LABEL would introduce
+        or MUTATE durable user text vs. the stored node.
+
+        The top-level label is the agent's name — user-derived free-text exactly
+        like ``properties['name']``. ``add_node`` is a whole-row upsert, so on an
+        EXISTING node any label other than the stored one is a durable mutation:
+        ``None`` would CLEAR the stored name and the DID-derived ``Agent {node_id}``
+        form would OVERWRITE a stored user name. So the admitted set depends on
+        whether a stored row exists (#2672 review P2):
+
+        * Existing node (``stored is not None``) — carry-along means EXACTLY the
+          stored label, nothing else. Require ``new_label == stored_label`` (which
+          also permits ``None`` only when the stored label is itself ``None``).
+        * Fresh create (``stored is None``) — no trusted label to carry, so admit
+          only a label that carries no user text: ``None`` (writes nothing) or the
+          content-free DID-derived ``Agent {node_id}`` form. Any other non-null
+          label is fresh user content and is refused.
+        """
+        new_label = getattr(node, "label", None)
+        if stored is not None:
+            # Carry-along on an existing node = identical to the stored label only.
+            return new_label != getattr(stored, "label", None)
+        # Fresh create: no stored label to carry from.
+        if new_label is None or self._is_content_free_identity_label(node):
+            return False
+        return True
+
+    def _raise_label_carry(self, node_type, operation) -> None:
+        raise PrivacyViolationError(
+            f"Graph write '{operation}' blocked: {node_type!r} node label is "
+            f"user-derived identity free-text being introduced or changed (it "
+            f"differs from the stored node's label). In the current privacy config "
+            f"(storage={self._privacy_config.storage}) a control-plane node admits "
+            f"its identity label ONLY carried along UNCHANGED — a volatile rename "
+            f"updates the live session name but skips the durable node — so a "
+            f"fresh/changed label is user content and is default-denied REGARDLESS "
+            f"of any control-plane capability, closing the label smuggling channel "
+            f"(#2672 review P1)."
+        )
+
     async def _enforce_free_text_carry_along(self, node, store, operation) -> None:
-        """Read the stored node and refuse a fresh/changed free-text field on a
-        control-plane write in a volatile mode. No-op otherwise.
+        """Read the stored node and refuse a fresh/changed free-text field — in a
+        property OR in the top-level LABEL — on a control-plane write in a volatile
+        mode. No-op otherwise.
 
         The stored read is only reached when the write actually carries one of the
-        guarded free-text fields, so ordinary content-free governance writes pay
-        nothing.
+        guarded free-text properties OR targets a free-text-labeled control-plane
+        type, so ordinary content-free governance writes on content-free-labeled
+        types pay nothing.
         """
         if not self._graph_writes_governed:
             return
         node_type = getattr(node, "node_type", None)
         carry_fields = _free_text_carry_along_fields(node_type)
-        if not carry_fields:
-            return
         props = getattr(node, "properties", None) or {}
-        if not any(f in props for f in carry_fields):
+        has_prop_carry = bool(carry_fields) and any(f in props for f in carry_fields)
+        label_free_text = self._label_is_free_text(node_type)
+        if not has_prop_carry and not label_free_text:
             return
         stored = await store.get_node(getattr(node, "node_id", None))
         stored_props = (getattr(stored, "properties", None) or {}) if stored else {}
         field = self._free_text_carry_violation(node_type, props, stored_props)
         if field is not None:
             self._raise_free_text_carry(node_type, field, operation)
+        # The label is a top-level free-text field on the identity-labeled agent
+        # node — guard it with the same carried-along boundary as the properties,
+        # or a forged capability could persist arbitrary durable user text through
+        # ``GraphNode.label`` while the property gate looked closed (#2672 P1).
+        if label_free_text and self._label_carry_violation(node, stored):
+            self._raise_label_carry(node_type, operation)
 
     def _assert_graph_edge_write_allowed(
         self, label, operation: str, properties: Optional[Dict] = None,
@@ -1644,6 +2048,19 @@ class PrivacyEnforcingStorage:
             )
             if field is not None:
                 self._raise_free_text_carry(new_type, field, operation)
+        # A swap NEVER writes ``label`` (the primitive is properties-only), so the
+        # label carry-along only bites on a compare-and-CREATE (``expected is
+        # None``), where the full node — including a fresh label — WOULD be
+        # inserted. With no stored trusted label to carry from, only the
+        # content-free ``Agent {node_id}`` form is admitted; a fresh user-authored
+        # label is refused, closing the label smuggling channel on the CAS path too
+        # (#2672 P1).
+        if (
+            expected is None
+            and self._label_is_free_text(new_type)
+            and self._label_carry_violation(new_node, None)
+        ):
+            self._raise_label_carry(new_type, operation)
         result = await store.compare_and_swap_node(
             node_id,
             expected,

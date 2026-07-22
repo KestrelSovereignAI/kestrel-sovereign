@@ -41,6 +41,9 @@ from kestrel_sovereign.agent.parts import (
     drain_parts,
     sanitize_part,
 )
+from kestrel_sovereign.storage.privacy_wrapper import (
+    bind_transition_lock_reentry,
+)
 from kestrel_sovereign.agent.streaming import (
     _build_revise_sentinel,
     _build_tool_sentinel,
@@ -635,6 +638,20 @@ class OrchestratorEngineMixin:
         # multiplexed by threadId over one long-lived app-server — routing to
         # their own buffers; a process-global "current collector" would clobber.
         turn_part_collector = current_part_collector()
+        # Capture the OWNING turn's privacy-transition reentry token the same way,
+        # and for the same reason (#2672 review P1). A streamed turn holds the
+        # transition lock across the whole turn; the codex app-server dispatches
+        # each inline tool on its own reader-spawned task, so a durable-identity
+        # write (rename / description / discovery history / user name / SOUL) run
+        # inline re-acquires that lock from a DIFFERENT task — a deadlock, because
+        # the write waits on the lock the turn holds while the turn waits on the
+        # app-server's tool result. Capturing the token here (on the turn task,
+        # which holds the lock) and re-presenting it around the tool execution lets
+        # THAT turn's write re-enter the lock; a genuinely concurrent transition
+        # from an unrelated task still serializes. ``None`` off a streamed turn /
+        # when no lock is held (anthropic path runs the tool on the turn task, so
+        # reentry is by task identity and needs no token).
+        transition_reentry_token = self._capture_transition_reentry_token()
 
         async def _exec(name: str, args: dict):
             # Capture the post-hook args so the inline adapter's
@@ -642,7 +659,8 @@ class OrchestratorEngineMixin:
             # redactors stay applied in audit/UI/STOP-hook
             # surfaces — pre-hook args would leak redacted values).
             capture: Dict[str, Any] = {}
-            with bind_part_collector(turn_part_collector):
+            with bind_part_collector(turn_part_collector), \
+                    bind_transition_lock_reentry(transition_reentry_token):
                 result = await self.execute_named_tool(
                     name, args, session_id=session_id, source="codex_app_server",
                     _capture=capture,
@@ -650,6 +668,27 @@ class OrchestratorEngineMixin:
             return capture.get("effective_args", args), result
 
         return _exec
+
+    def _capture_transition_reentry_token(self):
+        """Capture the owning turn's transition-lock reentry token, or ``None``.
+
+        Called on the turn task inside the streamed turn's held transition lock
+        (``_make_inline_tool_executor`` runs there), so the returned token
+        authorizes re-entry into THAT span from the codex app-server's reader task
+        (#2672 review P1). Returns ``None`` when no lock is held (off a streamed
+        turn — nothing to re-enter) or the agent shape has no transition lock
+        (tests / CLI), in which case the inline write runs unguarded or on the turn
+        task. Never raises — token capture must not break tool dispatch.
+        """
+        getter = getattr(self, "_get_privacy_transition_lock", None)
+        if not callable(getter):
+            return None
+        try:
+            lock = getter()
+            grab = getattr(lock, "current_reentry_token", None)
+            return grab() if callable(grab) else None
+        except Exception:  # noqa: BLE001 - never let token capture break dispatch
+            return None
 
     async def _append_executed_tool_breadcrumbs(
         self, messages: list,

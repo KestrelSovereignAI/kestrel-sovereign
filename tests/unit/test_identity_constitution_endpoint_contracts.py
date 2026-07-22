@@ -45,6 +45,23 @@ def test_identity_endpoint_returns_avatar_and_constitution_fields():
     storage.get_node = AsyncMock(return_value=agent_node)
 
     agent = MagicMock(agent_id="did:pkh:eip155:1:0xabc", storage=storage)
+    # GET /api/identity now resolves the display name through the agent
+    # interface (resolve_effective_name), not by reading the node directly, so
+    # a volatile-mode rename is reflected live (#2672 review P2). A bare
+    # MagicMock returns a MagicMock here (serialized as ``{}``), so give this
+    # contract fake the real resolution semantics: prefer a live string name,
+    # else the stored node's name, else the default.
+    def _resolve_effective_name(node=None, *, default=None):
+        live = getattr(agent, "_agent_name", None)
+        if isinstance(live, str) and live.strip():
+            return live
+        props = getattr(node, "properties", None) or {}
+        name = props.get("name")
+        if isinstance(name, str) and name.strip():
+            return name
+        return default
+    agent._agent_name = None  # no live rename in this contract; fall to node
+    agent.resolve_effective_name = _resolve_effective_name
     app, original = _prepare_app(agent)
     try:
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):

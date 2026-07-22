@@ -88,6 +88,21 @@ class MockAgent:
             label=agent_name,
         )
 
+    def resolve_effective_name(self, agent_node=None, *, default=None):
+        # Mirror KestrelAgent.resolve_effective_name: the live in-memory name
+        # is the session source of truth (a volatile rename updates it while
+        # skipping the durable node), then the stored node, then ``default``
+        # (#2672 review P2).
+        live = getattr(self, "_agent_name", None)
+        if isinstance(live, str) and live.strip():
+            return live
+        if agent_node is not None:
+            props = getattr(agent_node, "properties", None) or {}
+            name = props.get("name")
+            if isinstance(name, str) and name.strip():
+                return name
+        return default
+
 
 # ---------------------------------------------------------------------------
 # Tests for rename_agent_core (extracted function)
@@ -240,6 +255,120 @@ class TestUpdateIdentityVolatileSkip:
         assert agent._agent_name == "NewName"
         node = await agent.storage.get_node(agent.agent_id)
         assert node.properties["name"] == "TestAgent"
+
+
+class TestVolatileRenameLiveVsRestart:
+    """A session-only (volatile-mode) rename is visible LIVE — on the PATCH
+    response AND the A2A discovery card, which share one resolver — but leaves no
+    durable trace, so a restarted agent (which reloads its name from the durable
+    node) answers to the OLD name (#2672 review P2)."""
+
+    @pytest.mark.asyncio
+    async def test_session_rename_visible_live_but_absent_after_restart(self):
+        from fastapi import Response
+        from kestrel_sovereign.endpoints.models import (
+            UpdateIdentityRequest,
+            update_identity,
+        )
+        from kestrel_sovereign.kestrel_agent import KestrelAgent
+
+        agent = _volatile_agent()  # durable stored name "TestAgent"
+        response = Response()
+        payload = await update_identity.__wrapped__(
+            _request_for(agent), response,
+            UpdateIdentityRequest(name="SessionName"),
+        )
+
+        # LIVE (API): the PATCH response reports the live session name, 207 partial.
+        assert response.status_code == 207
+        assert payload["success"] is False
+        assert payload["name"] == "SessionName"
+        assert agent._agent_name == "SessionName"
+
+        # LIVE (A2A card): the real card builder shares resolve_effective_name, so
+        # it advertises the same live session name — endpoint and card never
+        # disagree after a volatile rename.
+        card = await KestrelAgent.get_agent_card(agent)
+        assert card.name == "SessionName"
+
+        # DURABLE: the stored node was never renamed.
+        node = await agent.storage.get_node(agent.agent_id)
+        assert node.properties["name"] == "TestAgent"
+        assert node.label == "TestAgent"
+
+        # RESTART: a fresh agent reloads its live name from the durable node, which
+        # still holds the OLD name — the session rename left no trace anywhere.
+        restarted = _volatile_agent()
+        restarted._agent_name = (
+            await restarted.storage.get_node(restarted.agent_id)
+        ).properties["name"]
+        assert restarted._agent_name == "TestAgent"
+        restarted_card = await KestrelAgent.get_agent_card(restarted)
+        assert restarted_card.name == "TestAgent"
+
+
+class TestMultiAgentDiscoveryLiveName:
+    """The multi-agent ``GET /api/agents`` discovery route advertises each agent's
+    LIVE display name (from ``get_agent_card`` → ``resolve_effective_name``) and
+    exposes the AgentManager routing key separately as ``routing_name``. It must
+    NOT overwrite the live name with the immutable key — the prior bug hid every
+    session rename behind the registration name in host discovery (#2672 review
+    P2)."""
+
+    @pytest.mark.asyncio
+    async def test_get_agents_reports_live_name_and_routing_key(self):
+        from kestrel_sovereign.endpoints.models import get_agents
+
+        # Registered under manager key "Emma" but renamed live to "RenamedLive"
+        # (a volatile session rename that skipped the durable node write). The card
+        # carries the live name; the manager key is the routing identity.
+        card = MagicMock()
+        card.model_dump.return_value = {
+            "name": "RenamedLive",
+            "description": "d",
+            "url": "http://localhost:8888",
+            "skills": [],
+        }
+        agent = MagicMock(agent_id="did:emma", is_demo=False)
+        agent.get_agent_card = AsyncMock(return_value=card)
+
+        manager = MagicMock()
+        manager.list_agents.return_value = {"Emma": agent}
+
+        request = MagicMock()
+        request.app.state.agent_manager = manager
+        request.app.state.demo_mode = False
+
+        result = await get_agents(request)
+
+        assert result["mode"] == "multi_agent"
+        entry = result["agents"][0]
+        assert entry["name"] == "RenamedLive", "discovery advertises the LIVE name"
+        assert entry["routing_name"] == "Emma", "manager key exposed for path routing"
+        assert entry["id"] == "did:emma"
+
+    @pytest.mark.asyncio
+    async def test_get_agents_error_fallback_carries_routing_name(self):
+        """When card generation fails the fallback entry still carries the routing
+        key under BOTH ``name`` (best available) and ``routing_name`` so path
+        construction never loses the manager key (#2672 review P2)."""
+        from kestrel_sovereign.endpoints.models import get_agents
+
+        agent = MagicMock(agent_id="did:emma", is_demo=False)
+        agent.get_agent_card = AsyncMock(side_effect=RuntimeError("boom"))
+
+        manager = MagicMock()
+        manager.list_agents.return_value = {"Emma": agent}
+
+        request = MagicMock()
+        request.app.state.agent_manager = manager
+        request.app.state.demo_mode = False
+
+        result = await get_agents(request)
+        entry = result["agents"][0]
+        assert entry["status"] == "error"
+        assert entry["name"] == "Emma"
+        assert entry["routing_name"] == "Emma"
 
 
 # ---------------------------------------------------------------------------

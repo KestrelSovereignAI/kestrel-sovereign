@@ -478,11 +478,14 @@ class TestFacadeAndPrivacyWrapper:
         A durable graph write is not "structural, not PII". Two tiers: a
         user-derived / unknown node CAS is default-denied and writes no row; a
         content-free structural type (here ``document``) is admitted on the
-        ordinary path with strict per-field validation and lands atomically; and a
-        control-plane type (here ``constitution_amendment_artifact``) is admitted
-        ONLY through the unforgeable control-plane capability. In every case the
-        governance inspects ``new_node`` up front and then delegates the single
-        atomic CAS — it never becomes get_node + add_node.
+        ordinary path with strict per-field validation and lands atomically; and
+        the ``agent`` control-plane type is admitted through the unforgeable
+        control-plane capability, but only as a SWAP of an existing node whose
+        identity label is carried along unchanged (a compare-and-create with a
+        fresh free-text label is refused by the label carry-along boundary —
+        #2672 review P1). In every case the governance inspects ``new_node`` up
+        front and then delegates the single atomic CAS — it never becomes
+        get_node + add_node.
         """
         storage = await AsyncStorage.create_sqlite(str(tmp_path / "eph.db"))
         wrapped = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
@@ -512,30 +515,31 @@ class TestFacadeAndPrivacyWrapper:
             assert result == NodeSwapResult.SWAPPED
             assert (await storage.get_node(allowed)) is not None
 
-            # Control-plane type → denied without the capability, admitted only
-            # when the caller presents the unforgeable control-plane capability.
-            cp = _HEX2
-            cp_node = _node(
-                cp,
-                {
-                    "hash": cp,
-                    "type": "SignedConstitutionAmendment",
-                    "constitution_hash": _HEX,
-                    "created_at": "2026-01-01T00:00:00+00:00",
-                    "anchored_at": "2026-01-01T00:00:00+00:00",
-                },
-                node_type="constitution_amendment_artifact",
-                label="Signed Constitution Reanchor Artifact",
-            )
+            # Control-plane ``agent`` type → the realistic CAS is a properties SWAP
+            # of the inception-written node, carrying the identity label along. It
+            # is denied without the capability, admitted only when the caller
+            # presents the unforgeable control-plane capability.
+            cp = _nid("agent")
+            base_props = {
+                "constitution_hash": _HEX,
+                "created_at": "2026-01-01T00:00:00+00:00",
+            }
+            # Seed the inception-written agent node directly (raw store).
+            await storage.add_node(_node(
+                cp, dict(base_props), label="Kestrel", node_type="agent",
+            ))
+            swapped_props = {**base_props, "bootstrap_state": "complete"}
+            cp_node = _node(cp, swapped_props, label="Kestrel", node_type="agent")
+
             with pytest.raises(PrivacyViolationError):
-                await wrapped.compare_and_swap_node(cp, None, cp_node)
-            assert await storage.get_node(cp) is None
+                await wrapped.compare_and_swap_node(cp, base_props, cp_node)
+            assert (await storage.get_node(cp)).properties.get("bootstrap_state") != "complete"
 
             result = await wrapped.compare_and_swap_node(
-                cp, None, cp_node, capability=_CONTROL_PLANE_CAPABILITY
+                cp, base_props, cp_node, capability=_CONTROL_PLANE_CAPABILITY
             )
             assert result == NodeSwapResult.SWAPPED
-            assert (await storage.get_node(cp)) is not None
+            assert (await storage.get_node(cp)).properties["bootstrap_state"] == "complete"
         finally:
             await storage.close()
 

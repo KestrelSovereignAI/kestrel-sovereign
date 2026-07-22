@@ -84,7 +84,18 @@ async def get_agents(request: Request):
                 agent_card = await agent.get_agent_card()
                 card_dict = agent_card.model_dump()
                 card_dict["id"] = agent.agent_id
-                card_dict["name"] = name
+                # ``name`` (from the card) is the agent's live/effective DISPLAY
+                # name — resolve_effective_name reflects a volatile-mode rename
+                # that intentionally skips the durable node write, so keep it so
+                # host discovery advertises the live name (#2672 review P2).
+                # Overwriting it with the AgentManager key (the prior bug) hid
+                # every session rename behind the immutable registration name.
+                # Expose that stable key separately as ``routing_name`` for the
+                # UI / peers that build ``/api/agents/{key}/…`` paths — those MUST
+                # use the manager key, never the (mutable) display name.
+                card_dict["routing_name"] = name
+                if not (isinstance(card_dict.get("name"), str) and card_dict["name"].strip()):
+                    card_dict["name"] = name
                 card_dict["status"] = "online"
                 card_dict["is_demo"] = _is_demo(agent)
                 agents_list.append(card_dict)
@@ -93,6 +104,7 @@ async def get_agents(request: Request):
                 agents_list.append({
                     "id": agent.agent_id,
                     "name": name,
+                    "routing_name": name,
                     "status": "error",
                     "is_demo": _is_demo(agent),
                 })
