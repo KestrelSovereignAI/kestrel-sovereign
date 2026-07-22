@@ -2878,6 +2878,20 @@ class CodexAdapter(LLMAdapter):
             tool_calls: List[ToolCall] = []
             usage: Dict[str, Optional[int]] = {}
             seen_tool_ids: set = set()
+            # #2675: the clean prose the model emitted BEFORE the first
+            # inline tool call — the non-streaming equivalent of the
+            # streaming path's ``pre_tool_prose_snapshot``. Codex executes
+            # kestrel-dispatched tools inline (``tool_calls`` stays ``None``
+            # on the returned ``LLMResponse``; the calls surface via
+            # ``executed_tool_calls``), so ``content`` alone is the FULL
+            # turn (pre- AND post-tool synthesis) — it cannot stand in for
+            # "what the agent said it was about to do". Snapshot ``text_parts``
+            # at the FIRST ``{"tool_call": tc}`` boundary (== streaming's first
+            # ``ToolCallStarted``) so POST_RESPONSE narration auditing gets the
+            # same pre-tool prose on both transports. ``None`` when no inline
+            # tool fired; tool sentinels are never in ``text_parts`` so this is
+            # already clean (streaming strips them via ``_parse_stream_sentinels``).
+            pre_tool_prose_snapshot: Optional[str] = None
             # Tool items the user has seen a "🔧 Calling X..." line for.
             # We dedupe BOTH on start and on complete so retries or
             # split-event quirks can't produce a stray marker line that
@@ -3079,6 +3093,13 @@ class CodexAdapter(LLMAdapter):
                             # surfacing it would make the orchestrator
                             # re-dispatch through ``_execute_tool_batch`` and
                             # duplicate every tool's side effects.
+                            #
+                            # #2675: snapshot the pre-tool prose at this FIRST
+                            # tool boundary (mirrors StreamingMixin snapshotting
+                            # at the first ``ToolCallStarted``). Later markers are
+                            # inter-tool prose, not pre-tool, so guard on ``None``.
+                            if pre_tool_prose_snapshot is None:
+                                pre_tool_prose_snapshot = "".join(text_parts)
                             yield {"tool_call": tc}
                 elif method == "thread/tokenUsage/updated":
                     usage = _usage_from(p.get("tokenUsage") or {})
@@ -3140,6 +3161,11 @@ class CodexAdapter(LLMAdapter):
                 # "executed_tool_calls", None) and produces standard
                 # chat-history breadcrumbs from it.
                 "executed": list(executed_log),
+                # #2675: pre-tool prose snapshot (None when no inline tool
+                # fired). ``get_response`` attaches it to the LLMResponse so
+                # the non-streaming POST_RESPONSE narration check gets the same
+                # pre-tool evidence the streaming path already captures.
+                "pre_tool_prose": pre_tool_prose_snapshot,
             }
         except CodexAppServerTransportError as e:
             # Invalidate the session→thread cache BEFORE the ``finally``
@@ -3328,6 +3354,7 @@ class CodexAdapter(LLMAdapter):
         tool_calls: Optional[List[ToolCall]] = None
         usage: Dict[str, Optional[int]] = {}
         executed: List[Dict[str, Any]] = []
+        pre_tool_prose: Optional[str] = None
         async for ev in self._run_turn_with_retry(
             model, messages, tools, session_id, tool_executor,
             cancel_token=cancel_token,
@@ -3336,6 +3363,7 @@ class CodexAdapter(LLMAdapter):
             if "final" in ev:
                 content, tool_calls, usage = ev["final"]
                 executed = ev.get("executed") or []
+                pre_tool_prose = ev.get("pre_tool_prose")
         resp = LLMResponse(
             content=content,
             tool_calls=tool_calls,
@@ -3352,6 +3380,14 @@ class CodexAdapter(LLMAdapter):
         # typed upgrade is a no-op behaviorally.
         if executed:
             resp.executed_tool_calls = executed
+        # #2675: preserve the marker-bound pre-tool prose snapshot so the
+        # non-streaming POST_RESPONSE narration check (kestrel_agent's #2675
+        # assembly) sees the SAME pre-tool evidence the streaming path
+        # captures. This is NOT ``content`` (which is the full pre+post-tool
+        # turn); it is the clean prose emitted before the first inline tool.
+        # Attached only when an inline tool actually fired.
+        if executed and pre_tool_prose is not None:
+            resp.pre_tool_prose = pre_tool_prose
         return resp
 
     async def get_streaming_response(

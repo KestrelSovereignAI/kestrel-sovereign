@@ -4283,6 +4283,63 @@ Expected Duration: {expected_duration}
             invocation_context=resolved_context,
         )
 
+        # #2675: assemble the SAME tool/narration evidence the streaming path
+        # hands POST_RESPONSE so the deterministic narration check
+        # (ResponseAuditHook / #1042 layer 3) sees identical inputs on both
+        # transports. Non-streaming previously fired the hook with only
+        # ``response_text``, so ``pre_tool_prose`` / ``tool_calls`` /
+        # ``tool_results`` were all ``None`` and the same dishonest
+        # "tool succeeded" narration streaming catches silently no-op'd here.
+        #
+        # ``stop_tool_results`` is the multi-iteration envelope list the
+        # orchestrator accumulated in place (``{tool_call_id, name, arguments,
+        # result}`` per dispatch, ordered by execution across every iteration).
+        # Derive the LLM-shaped ``tool_calls`` from it (``id``/``name``/
+        # ``arguments``) so calls and results line up by index — the SAME
+        # derivation the STOP hook below reuses (built once here).
+        stop_tool_calls = (
+            [
+                {
+                    "id": env.get("tool_call_id"),
+                    "name": env.get("name"),
+                    "arguments": env.get("arguments"),
+                }
+                for env in stop_tool_results
+            ]
+            if stop_tool_results
+            else None
+        )
+        # Non-streaming equivalent of streaming's ``pre_tool_prose``: the text
+        # the model emitted in the SAME completion as its (first) tool calls —
+        # what it "said it was about to do" BEFORE observing any tool result.
+        #
+        # Two shapes reach here, mirroring the two ways a turn can dispatch a
+        # tool:
+        #
+        # * Orchestrator-dispatched (``response.tool_calls`` present): the
+        #   pre-tool prose is exactly ``response.content`` on the INITIAL
+        #   response. ``_handle_orchestrator_response`` reassigns its own local
+        #   ``response``, leaving this scope's ``response`` the pre-tool one.
+        # * Inline-executed (codex/openai:plan): the adapter runs kestrel tools
+        #   inline and returns ``tool_calls=None`` with the calls on
+        #   ``executed_tool_calls`` — so ``has_tool_calls`` is False even though
+        #   ``stop_tool_results`` is populated. Here ``response.content`` is the
+        #   FULL turn (pre- AND post-tool synthesis), NOT a pre-tool snapshot, so
+        #   using it would feed the narration check post-tool text it must not
+        #   see. Instead read the marker-bound snapshot the adapter preserved on
+        #   ``response.pre_tool_prose`` (#2675) — the streaming path snapshots the
+        #   same boundary. Absent (non-codex inline path, or a tool that fired
+        #   before any prose) → ``None``; we never invent a boundary.
+        #
+        # A no-tool turn has no pre/post split (streaming passes ``None`` too).
+        # ``analyze_narration`` no-ops on empty prose or empty results.
+        if has_tool_calls:
+            pre_tool_prose = response.content
+        elif stop_tool_results:
+            pre_tool_prose = getattr(response, "pre_tool_prose", None)
+        else:
+            pre_tool_prose = None
+
         # Fire POST_RESPONSE hooks (e.g., response audit). #2674: route through
         # the SHARED, fail-closed ``_fire_post_response_hook`` — the same gate
         # the streaming path uses — instead of the open-coded DENY-only check
@@ -4300,6 +4357,9 @@ Expected Duration: {expected_duration}
         # streaming command wrapper reads to decide whether to release parts.
         response_text = await self._fire_post_response_hook(
             response_text, session_id,
+            pre_tool_prose=pre_tool_prose,
+            tool_calls=stop_tool_calls,
+            tool_results=stop_tool_results or None,
             hook_snapshot=audit_hook_snapshot,
         )
 
@@ -4322,24 +4382,13 @@ Expected Duration: {expected_duration}
         # storage to reconstruct the turn that just completed. Mirrors
         # the streaming path's STOP fire in agent/streaming.py.
         if self.hooks_manager:
-            # Derive stop_tool_calls from the accumulated tool_results
-            # envelopes so multi-iteration tool flows (model calls A, sees
-            # the result, then calls B) produce a payload where tool_calls
-            # and tool_results line up by index — building from
-            # ``response.tool_calls`` alone would only capture the first
-            # iteration (codex review on the initial enrichment).
-            stop_tool_calls = (
-                [
-                    {
-                        "id": env.get("tool_call_id"),
-                        "name": env.get("name"),
-                        "arguments": env.get("arguments"),
-                    }
-                    for env in stop_tool_results
-                ]
-                if stop_tool_results
-                else None
-            )
+            # ``stop_tool_calls`` was derived above (before the POST_RESPONSE
+            # fire) from the accumulated ``stop_tool_results`` envelopes so
+            # multi-iteration tool flows (model calls A, sees the result, then
+            # calls B) produce a payload where tool_calls and tool_results line
+            # up by index — building from ``response.tool_calls`` alone would
+            # only capture the first iteration (codex review on the initial
+            # enrichment). #2675 reuses that single derivation for both hooks.
             # #2674 finding 4: mirror the streaming path's STOP-payload nulling.
             # A STOP hook is an ARBITRARY subscriber (e.g. the reflection
             # ``on_stop`` handler) that may persist or emit its HookInput. Under
