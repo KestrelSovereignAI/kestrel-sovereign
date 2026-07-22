@@ -120,7 +120,12 @@ from kestrel_sovereign.storage.db.write_audit import (
     requested_handler_write_audit_callback,
     suppress_write_audit,
 )
-from kestrel_sovereign.telemetry import optional_span
+from kestrel_sovereign.telemetry import (
+    KESTREL_AGENT_NAME,
+    OI_SPAN_KIND,
+    OI_SPAN_KIND_CHAIN,
+    optional_span,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -724,6 +729,12 @@ class SignalDispatcher:
         # the audit fills out so a partial dispatch (e.g. drift
         # refusal) still records what was resolved.
         span_attrs = {
+            OI_SPAN_KIND: OI_SPAN_KIND_CHAIN,
+            # The dispatcher owns one agent; stamp its name so this COGNITION
+            # dispatch span groups under the right agent lane in Phoenix rather
+            # than "(none)" (#2699). None (duck-typed/test agent) is dropped by
+            # ``optional_span``, so this stays safe for minimal agents.
+            KESTREL_AGENT_NAME: getattr(self._agent, "agent_name", None),
             "kestrel.signal.source": signal.source,
             "kestrel.signal.id": signal.id,
             "kestrel.constitution.injection": registration.constitution_injection,

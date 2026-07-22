@@ -211,15 +211,29 @@ _OTLP_ENDPOINT_ENV = "OTEL_EXPORTER_OTLP_ENDPOINT"
 # served model and response text are only known post-call). Prefer the semconv
 # constants; fall back to the literal convention strings.
 try:
-    from openinference.semconv.trace import SpanAttributes as _OISpanAttributes
+    from openinference.semconv.trace import (
+        OpenInferenceSpanKindValues as _OISpanKindValues,
+        SpanAttributes as _OISpanAttributes,
+    )
 
     OI_INPUT_VALUE = _OISpanAttributes.INPUT_VALUE
     OI_OUTPUT_VALUE = _OISpanAttributes.OUTPUT_VALUE
     OI_LLM_MODEL_NAME = _OISpanAttributes.LLM_MODEL_NAME
+    OI_SPAN_KIND = _OISpanAttributes.OPENINFERENCE_SPAN_KIND
+    OI_SPAN_KIND_CHAIN = _OISpanKindValues.CHAIN.value
+    OI_SPAN_KIND_TOOL = _OISpanKindValues.TOOL.value
 except Exception:  # pragma: no cover - openinference optional
     OI_INPUT_VALUE = "input.value"
     OI_OUTPUT_VALUE = "output.value"
     OI_LLM_MODEL_NAME = "llm.model_name"
+    OI_SPAN_KIND = "openinference.span.kind"
+    OI_SPAN_KIND_CHAIN = "CHAIN"
+    OI_SPAN_KIND_TOOL = "TOOL"
+
+# Attribute key naming the owning agent on a span. Same key #2573/#2602 stamp on
+# LLM spans, so telemetry-layer lifecycle/dispatch spans group under the right
+# agent lane in Phoenix instead of "(none)" (issue #2699).
+KESTREL_AGENT_NAME = "kestrel.agent_name"
 
 
 def _resolved_otlp_endpoint() -> Optional[str]:
