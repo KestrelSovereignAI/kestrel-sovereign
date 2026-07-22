@@ -653,6 +653,180 @@ def test_detailed_health_cannot_report_healthy_during_safe_mode():
     assert response.json()["status"] == "restricted"
 
 
+def _make_health_agent(status, checks=None):
+    """Build a MagicMock agent whose HealthFeature reports ``status``."""
+    health_feature = MagicMock()
+    health_feature.get_latest = AsyncMock(
+        return_value={"status": status, "checks": checks or []}
+    )
+    health_feature.__class__.__name__ = "HealthFeature"
+    agent = MagicMock()
+    agent.features = {"HealthFeature": health_feature}
+    return agent
+
+
+def test_detailed_health_reports_fleet_when_no_singleton_agent():
+    """Multi-agent hosts (app.state.agent is None) must resolve from the fleet.
+
+    Regression for #2698: a running managed agent must not be reported as
+    "No agent available".
+    """
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+
+    emma = _make_health_agent(
+        "healthy", checks=[{"name": "database", "status": "pass"}]
+    )
+    manager = MagicMock()
+    manager.list_agents.return_value = {"Emma": emma}
+
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = None
+        app.state.agent_manager = manager
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app, client=("203.0.113.10", 55000)) as client:
+                response = client.get(
+                    "/health/detailed",
+                    headers={"X-API-Key": "test-key"},
+                )
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "healthy"
+    assert "No agent available" not in response.text
+    assert body["agents"]["Emma"]["status"] == "healthy"
+    assert body["agents"]["Emma"]["checks"] == [
+        {"name": "database", "status": "pass"}
+    ]
+    # Tracing block stays present on the fleet branch (#2690).
+    assert "tracing" in body
+
+
+def test_detailed_health_fleet_mixed_failure_is_degraded():
+    """Some healthy + some not rolls up to degraded, with per-agent detail."""
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+
+    manager = MagicMock()
+    manager.list_agents.return_value = {
+        "Emma": _make_health_agent("healthy"),
+        "Nellie": _make_health_agent(
+            "unhealthy", checks=[{"name": "llm_service", "status": "fail"}]
+        ),
+    }
+
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = None
+        app.state.agent_manager = manager
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app, client=("203.0.113.10", 55000)) as client:
+                response = client.get(
+                    "/health/detailed",
+                    headers={"X-API-Key": "test-key"},
+                )
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "degraded"
+    assert body["agents"]["Emma"]["status"] == "healthy"
+    assert body["agents"]["Nellie"]["status"] == "unhealthy"
+
+
+def test_detailed_health_fleet_all_failing_is_unhealthy():
+    """Zero healthy managed agents rolls up to unhealthy."""
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+
+    manager = MagicMock()
+    manager.list_agents.return_value = {
+        "Emma": _make_health_agent("unhealthy"),
+        "Nellie": _make_health_agent("degraded"),
+    }
+
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = None
+        app.state.agent_manager = manager
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app, client=("203.0.113.10", 55000)) as client:
+                response = client.get(
+                    "/health/detailed",
+                    headers={"X-API-Key": "test-key"},
+                )
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "unhealthy"
+
+
+def test_detailed_health_no_agents_reports_no_agent_available():
+    """Truly no agents (no singleton, empty/absent manager) keeps today's text."""
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = None
+        app.state.agent_manager = None
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app, client=("203.0.113.10", 55000)) as client:
+                response = client.get(
+                    "/health/detailed",
+                    headers={"X-API-Key": "test-key"},
+                )
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "unhealthy"
+    assert body["error"] == "No agent available"
+    assert "tracing" in body
+
+
 def test_oauth_session_can_access_detailed_health():
     """A signed browser session retains operator diagnostic access."""
     from server import app
