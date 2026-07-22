@@ -225,6 +225,8 @@ class HooksManager:
         event: HookEvent,
         input: HookInput,
         hooks: List[Hook],
+        *,
+        enforcement_overrides: Optional[Dict[int, bool]] = None,
     ) -> HookOutput:
         """Execute a CALLER-PINNED hook list, bypassing the live registry (#2674).
 
@@ -248,18 +250,73 @@ class HooksManager:
         disabled after the snapshot still audits this turn. Priority order and
         tool-name matching are still honored. Registration / enable / disable
         transitions take effect on the NEXT turn.
+
+        ``enforcement_overrides`` (#2674 P0-1) is the per-hook, ``id(hook)``-keyed
+        fail-closed verdict CAPTURED at turn start. The buffering decision was
+        derived from those SAME captured booleans, so pinning them here keeps the
+        withhold decision and the crash/timeout → DENY resolution in lockstep: a
+        hook whose ``fail_closed`` / ``awaits_user_input`` flips AFTER the capture
+        cannot make a buffered turn's failure silently resolve to ALLOW. Omitted
+        (``None``) for live callers, which read the current flag as before.
         """
         matching = [
             h for h in sorted(hooks, key=lambda h: h.priority)
             if not input.tool_name or h.matches(input.tool_name)
         ]
-        return await self._run_hook_chain(event, matching, input)
+        return await self._run_hook_chain(
+            event, matching, input,
+            enforcement_overrides=enforcement_overrides,
+        )
+
+    async def execute_post_response_observers(
+        self,
+        event: HookEvent,
+        input: HookInput,
+        hooks: List[Hook],
+        *,
+        enforcement_overrides: Optional[Dict[int, bool]] = None,
+    ) -> HookOutput:
+        """Run POST-GATE observer hooks over the ALREADY-REVIEWED response (#2674 finding 2).
+
+        The second phase of the enforcing POST_RESPONSE pipeline. After the
+        enforcing gate hook(s) have produced the reviewed release (or a sanitized
+        block), the remaining advisory / observer hooks run here — but with one
+        safety constraint the normal chain does not impose: they may NOT mutate
+        the reviewed release. An observer that returns ``modify(updated_input=
+        {"response_text": ...})`` after the gate approved the text would smuggle
+        UNAUDITED bytes into the release; ``freeze_response_text=True`` drops that
+        rewrite (and logs it) while still honoring the observer's warnings and its
+        ability to DENY/ASK (a strictly MORE-restrictive outcome that re-blocks
+        the release, which is always fail-safe).
+
+        Observers are non-enforcing by construction (the caller partitions on
+        the CAPTURED turn-start enforcement — see ``agent/streaming.py`` — not a
+        live :func:`_hook_is_enforcing` read), so a timeout / crash skips the
+        observer as before — it can never fail the turn closed. ``enforcement_
+        overrides`` (#2674 P0-1) carries those captured booleans so an observer
+        whose ``fail_closed`` flips to True mid-turn still SKIPS on crash rather
+        than re-blocking an approved release off a live flag the turn's buffering
+        never accounted for. Priority order and tool-name matching are honored;
+        the set is caller-pinned (no live-registry read), matching
+        :meth:`execute_hooks_snapshot`.
+        """
+        matching = [
+            h for h in sorted(hooks, key=lambda h: h.priority)
+            if not input.tool_name or h.matches(input.tool_name)
+        ]
+        return await self._run_hook_chain(
+            event, matching, input, freeze_response_text=True,
+            enforcement_overrides=enforcement_overrides,
+        )
 
     async def _run_hook_chain(
         self,
         event: HookEvent,
         matching_hooks: List[Hook],
         input: HookInput,
+        *,
+        freeze_response_text: bool = False,
+        enforcement_overrides: Optional[Dict[int, bool]] = None,
     ) -> HookOutput:
         """Run an already-resolved, priority-ordered hook list.
 
@@ -267,7 +324,36 @@ class HooksManager:
         :meth:`execute_hooks_snapshot` (caller-pinned set) so both get identical
         DENY/ASK short-circuiting, MODIFY propagation, warning accumulation, and
         fail-closed timeout/exception handling.
+
+        ``freeze_response_text`` (#2674 finding 2) drives the post-gate observer
+        phase: a hook's ``updated_input['response_text']`` rewrite is DROPPED
+        (logged, never applied to the chained input nor carried on the returned
+        output) so an unaudited observer cannot alter the gate-reviewed release.
+        Every other behavior — DENY/ASK short-circuit, warning accumulation,
+        non-response_text ``updated_input`` propagation, fail handling — is
+        unchanged.
+
+        ``enforcement_overrides`` (#2674 P0-1) is an ``id(hook)`` → fail-closed
+        boolean map CAPTURED at turn start. When present it is AUTHORITATIVE for
+        the crash/timeout fail-closed decision below (see :func:`_resolve_
+        enforcing`), so a caller-pinned run resolves failures exactly as the
+        turn's buffering decision assumed — a hook that flips its ``fail_closed``
+        / ``awaits_user_input`` mid-turn cannot desync the two. The runtime
+        watchdog-bypass still reads the live ``awaits_user_input`` (whether the
+        hook actually blocks on a human is a runtime property, and a captured-
+        enforcing hook that crashes/times out still denies via the override).
         """
+        def _resolve_enforcing(hook) -> bool:
+            """Authoritative fail-closed verdict for THIS run. Prefers the
+            caller-captured override (turn-start value) over a live read so a
+            mid-turn ``fail_closed`` / ``awaits_user_input`` flip cannot change
+            whether a crash/timeout denies (#2674 P0-1)."""
+            if enforcement_overrides is not None:
+                override = enforcement_overrides.get(id(hook))
+                if override is not None:
+                    return override
+            return _hook_is_enforcing(hook)
+
         if not matching_hooks:
             return HookOutput.allow()
 
@@ -332,19 +418,40 @@ class HooksManager:
                 # clearing all sensitive fields — is honored rather
                 # than silently dropped by truthiness fallback.
                 if output.updated_input is not None:
-                    input.tool_input = output.updated_input
-                    accumulated_updated_input = output.updated_input
+                    updated_input = output.updated_input
+                    # #2674 finding 2: in the post-gate observer phase, an
+                    # observer must not rewrite the already-reviewed release —
+                    # that would release UNAUDITED bytes. Strip ``response_text``
+                    # from the rewrite (keep any other keys) and log the drop.
+                    if (
+                        freeze_response_text
+                        and "response_text" in updated_input
+                    ):
+                        logger.warning(
+                            "POST_RESPONSE observer '%s' attempted to rewrite the "
+                            "gate-reviewed response_text; dropping the unaudited "
+                            "rewrite (fail-closed observer contract).",
+                            hook.name,
+                        )
+                        updated_input = {
+                            k: v for k, v in updated_input.items()
+                            if k != "response_text"
+                        }
+                    input.tool_input = updated_input
+                    accumulated_updated_input = updated_input
                     # POST_RESPONSE hooks rewrite the response text rather
                     # than tool args; keep ``input.response_text`` in sync so
                     # a subsequent hook in the chain audits the rewritten text.
-                    if "response_text" in output.updated_input:
-                        input.response_text = output.updated_input["response_text"]
+                    if "response_text" in updated_input:
+                        input.response_text = updated_input["response_text"]
 
             except asyncio.TimeoutError:
                 # FAIL CLOSED for enforcing hooks: a deny-capable hook that times
                 # out must not silently become "allowed" — that turns a block
-                # into a pass (#1723). Advisory hooks are still skipped.
-                if _hook_is_enforcing(hook):
+                # into a pass (#1723). Enforcement is the CAPTURED turn-start
+                # verdict when the caller pinned one (#2674 P0-1). Advisory hooks
+                # are still skipped.
+                if _resolve_enforcing(hook):
                     logger.error(
                         f"Enforcing hook '{hook.name}' timed out after "
                         f"{hook.timeout}s — failing closed (deny)."
@@ -361,8 +468,10 @@ class HooksManager:
             except Exception as e:
                 # FAIL CLOSED for enforcing hooks: a crashed deny-capable hook
                 # (e.g. an approval hook whose queue backend raised) must deny,
-                # not allow (#1723). Advisory hooks are still skipped.
-                if _hook_is_enforcing(hook):
+                # not allow (#1723). Enforcement is the CAPTURED turn-start
+                # verdict when the caller pinned one (#2674 P0-1). Advisory hooks
+                # are still skipped.
+                if _resolve_enforcing(hook):
                     logger.error(
                         f"Enforcing hook '{hook.name}' raised ({e}) — failing closed (deny).",
                         exc_info=True,

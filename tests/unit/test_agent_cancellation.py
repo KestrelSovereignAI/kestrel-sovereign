@@ -262,3 +262,271 @@ class TestStopEndpoint:
         # Exactly one notice — the post-loop emit must not double up with any
         # in-loop emit (there were no chunks, so only the fallback fires).
         assert response.text.count("Request stopped") == 1
+
+    @pytest.mark.asyncio
+    async def test_stream_endpoint_late_cancel_after_completed_output_no_stop_notice(self):
+        """#2674 P2 race: a normal/strict-approved turn streams its full answer,
+        then the user's cancellation becomes visible AFTER the final chunk has
+        already been yielded but BEFORE the endpoint's async generator exits.
+
+        The post-loop fallback must NOT retroactively append "Request stopped"
+        to an already-delivered, complete response. The fallback is gated on the
+        stream having produced NO output — so a turn that emitted any user-visible
+        chunk keeps its clean ending even when ``is_request_cancelled`` flips True
+        during teardown."""
+        from fastapi.testclient import TestClient
+        from fastapi import FastAPI
+        from kestrel_sovereign.endpoints.agent import router
+        from kestrel_sovereign.rate_limit import limiter
+
+        app = FastAPI()
+        app.state.limiter = limiter
+        app.include_router(router)
+
+        async def _completed_stream(*args, **kwargs):
+            # A normal turn that fully streams its answer to the client.
+            yield "The answer "
+            yield "is 42."
+
+        # ``is_request_cancelled`` is consulted once per chunk inside the loop
+        # (must be False so both chunks pass through). It would return True on
+        # any later call — modeling a stop that lands only after the final chunk
+        # was already yielded. On the pre-fix code the post-loop fallback would
+        # call this a 3rd time, see True, and wrongly append the stop notice; the
+        # fixed fallback short-circuits on ``response_chunk_yielded`` and never
+        # reaches this predicate again.
+        cancel_calls = {"n": 0}
+
+        def late_cancel(request_id=None):
+            cancel_calls["n"] += 1
+            # False for the two in-loop checks (both chunks stream through);
+            # True on any subsequent call (the late cancellation).
+            return cancel_calls["n"] > 2
+
+        mock_agent = MagicMock()
+        mock_agent.register_active_request = MagicMock()
+        mock_agent.process_input_streaming = _completed_stream
+        mock_agent.is_request_cancelled = late_cancel
+        mock_agent._cleanup_cancelled_request = MagicMock()
+        mock_agent.storage.resolve_session_id = AsyncMock(side_effect=lambda s: s)
+        app.state.agent = mock_agent
+
+        client = TestClient(app)
+        response = client.post("/api/agent/stream", json={"input": "hi"})
+
+        assert response.status_code == 200
+        # The complete answer reached the client...
+        assert "The answer is 42." in response.text
+        # ...and was NOT retroactively labeled stopped by the late cancellation.
+        assert "Request stopped" not in response.text
+        # Only the two in-loop checks ran: the post-loop fallback short-circuited
+        # on ``response_chunk_yielded`` and never consulted the cancellation flag
+        # a third time. (On the pre-fix code this predicate fired a 3rd time and
+        # the stop notice leaked onto the completed answer.)
+        assert cancel_calls["n"] == 2
+
+
+class TestStreamEndpointErrorContract:
+    """#2674 findings 4 & 6: the streaming endpoint must NEVER reflect arbitrary
+    exception text to the client. ``str(e)`` for an internal exception is
+    untrusted — a mid-buffer failure under a strict audit could carry the
+    withheld response (a proven ``RAW_EXCEPTION_RESPONSE_MARKER`` leak). The
+    coherent API contract is a CONSTANT safe failure body for every streaming
+    internal exception; the full detail goes to the operator log only.
+
+    #2674 finding 4: a typed ``LLMStreamingError`` route failure must NOT reflect
+    ``provider`` either — that field is an unvalidated free string accepted at
+    construction (Terra leaked ``ROUTE_FIELD_UNBOUNDED_MARKER__WITHHELD_TEXT``
+    through it). The endpoint now emits a CONSTANT "your selected model route"
+    label with the same no-blind-fallback / recovery guidance, so the user can
+    still recover without a silent model swap while nothing route-, underlying-,
+    or message-derived reaches them. The failing route stays operator-log only."""
+
+    def _app_with_stream(self, stream_fn):
+        from fastapi import FastAPI
+        from kestrel_sovereign.endpoints.agent import router
+        from kestrel_sovereign.rate_limit import limiter
+
+        app = FastAPI()
+        app.state.limiter = limiter
+        app.include_router(router)
+
+        mock_agent = MagicMock()
+        mock_agent.register_active_request = MagicMock()
+        mock_agent.process_input_streaming = stream_fn
+        mock_agent.is_request_cancelled = MagicMock(return_value=False)
+        mock_agent._cleanup_cancelled_request = MagicMock()
+        mock_agent.storage.resolve_session_id = AsyncMock(side_effect=lambda s: s)
+        app.state.agent = mock_agent
+        return app
+
+    @pytest.mark.asyncio
+    async def test_generic_exception_yields_constant_not_raw_text(self):
+        from fastapi.testclient import TestClient
+
+        marker = "RAW_EXCEPTION_RESPONSE_MARKER_should_never_surface"
+
+        async def _boom(*args, **kwargs):
+            yield "some withheld pre-verdict bytes"  # (never reaches client here)
+            raise RuntimeError(marker)
+
+        app = self._app_with_stream(_boom)
+        client = TestClient(app)
+        response = client.post("/api/agent/stream", json={"input": "hi"})
+
+        assert response.status_code == 200
+        # The arbitrary exception text is NOT reflected to the user...
+        assert marker not in response.text
+        # ...and a stable, constant safe failure body is present instead.
+        assert "Error generating response." in response.text
+
+    @pytest.mark.asyncio
+    async def test_generic_exception_body_is_constant_across_errors(self):
+        """Two different internal exceptions produce the SAME safe body — the
+        constant contract, not a per-exception rendering."""
+        from fastapi.testclient import TestClient
+
+        def _run(exc):
+            async def _boom(*args, **kwargs):
+                raise exc
+                yield  # pragma: no cover
+
+            app = self._app_with_stream(_boom)
+            return TestClient(app).post(
+                "/api/agent/stream", json={"input": "hi"}
+            ).text
+
+        body_a = _run(RuntimeError("first distinctive DETAIL_AAA"))
+        body_b = _run(ValueError("second distinctive DETAIL_BBB"))
+        assert "DETAIL_AAA" not in body_a
+        assert "DETAIL_BBB" not in body_b
+        # The user-visible failure text is identical regardless of the exception.
+        marker = "⚠️ **Error generating response.**"
+        assert marker in body_a and marker in body_b
+
+    @pytest.mark.asyncio
+    async def test_llm_streaming_error_uses_constant_route_label(self):
+        """#2674 finding 4: a typed route/mandate failure keeps the
+        no-blind-fallback / recovery guidance but does NOT reflect ``provider``
+        (an unvalidated free string). The user sees a CONSTANT selected-route
+        label, never the route name, and no withheld prose."""
+        from fastapi.testclient import TestClient
+        from kestrel_sovereign.llm.streaming import LLMStreamingError
+
+        async def _route_fail(*args, **kwargs):
+            raise LLMStreamingError(
+                "route mandate failed",
+                provider="openai:plan",
+                underlying="401 Unauthorized",
+            )
+            yield  # pragma: no cover
+
+        app = self._app_with_stream(_route_fail)
+        client = TestClient(app)
+        response = client.post("/api/agent/stream", json={"input": "hi"})
+
+        assert response.status_code == 200
+        # The provider/route name is NOT reflected...
+        assert "openai:plan" not in response.text
+        # ...but the constant label + recovery guidance is present.
+        assert "Your selected model route failed" in response.text
+        assert "No fallback response was generated" in response.text
+
+    @pytest.mark.asyncio
+    async def test_llm_streaming_error_does_not_leak_underlying_text(self):
+        """#2674 findings 1 & 4: neither the ``underlying`` exception / ``str(e)``
+        (raw adapter text) NOR the ``provider`` route (an unvalidated free string)
+        may reach the client. Faithfully models the ``raise LLMStreamingError(
+        f"Selected route {name} failed: {e}", underlying=e)`` site where a marker
+        rides the message AND the underlying — and also proves the provider label
+        itself is never reflected."""
+        from fastapi.testclient import TestClient
+        from kestrel_sovereign.llm.streaming import LLMStreamingError
+
+        marker = "UNDERLYING_ADAPTER_MARKER_should_never_surface"
+
+        async def _route_fail(*args, **kwargs):
+            underlying = RuntimeError(marker)
+            raise LLMStreamingError(
+                f"Selected route openai:plan failed: {underlying}",
+                provider="openai:plan",
+                underlying=underlying,
+            )
+            yield  # pragma: no cover
+
+        app = self._app_with_stream(_route_fail)
+        client = TestClient(app)
+        response = client.post("/api/agent/stream", json={"input": "hi"})
+
+        assert response.status_code == 200
+        # Neither the raw underlying text NOR the provider route reaches the
+        # client...
+        assert marker not in response.text
+        assert "openai:plan" not in response.text
+        # ...but the constant no-fallback guidance still does, so the user can
+        # recover without a silent model swap.
+        assert "No fallback response was generated" in response.text
+
+    @pytest.mark.asyncio
+    async def test_llm_streaming_error_after_partial_yield_hides_underlying(self):
+        """A late adapter failure: the stream yields partial prose and THEN the
+        routing layer raises ``LLMStreamingError`` wrapping that late exception.
+        On the direct (unbuffered) stream the partial prose already reached the
+        client, but the wrapped underlying marker must still never appear."""
+        from fastapi.testclient import TestClient
+        from kestrel_sovereign.llm.streaming import LLMStreamingError
+
+        marker = "LATE_UNDERLYING_MARKER_should_never_surface"
+
+        async def _partial_then_fail(*args, **kwargs):
+            yield "here is some partial answer prose "
+            underlying = RuntimeError(marker)
+            raise LLMStreamingError(
+                f"Selected route openai:plan failed: {underlying}",
+                provider="openai:plan",
+                underlying=underlying,
+            )
+
+        app = self._app_with_stream(_partial_then_fail)
+        client = TestClient(app)
+        response = client.post("/api/agent/stream", json={"input": "hi"})
+
+        assert response.status_code == 200
+        # Partial prose that streamed before the late failure is present (direct
+        # path is incremental)...
+        assert "partial answer prose" in response.text
+        # ...but neither the wrapped underlying marker NOR the provider route is.
+        assert marker not in response.text
+        assert "openai:plan" not in response.text
+        assert "No fallback response was generated" in response.text
+
+    @pytest.mark.asyncio
+    async def test_llm_streaming_error_provider_field_marker_never_surfaces(self):
+        """#2674 finding 4 (direct Terra repro): ``LLMStreamingError.provider``
+        accepts ARBITRARY strings at construction, so a marker smuggled into the
+        provider field itself must not reach the client. The endpoint reflects a
+        CONSTANT route label, never ``provider``, so the marker in message,
+        underlying AND provider are all absent while the guidance remains."""
+        from fastapi.testclient import TestClient
+        from kestrel_sovereign.llm.streaming import LLMStreamingError
+
+        marker = "ROUTE_FIELD_UNBOUNDED_MARKER__WITHHELD_TEXT"
+
+        async def _route_fail(*args, **kwargs):
+            raise LLMStreamingError(
+                f"route failed {marker}",
+                provider=marker,       # attacker/content-controlled free string
+                underlying=RuntimeError(marker),
+            )
+            yield  # pragma: no cover
+
+        app = self._app_with_stream(_route_fail)
+        client = TestClient(app)
+        response = client.post("/api/agent/stream", json={"input": "hi"})
+
+        assert response.status_code == 200
+        # The marker rode message, underlying AND provider — none may surface.
+        assert marker not in response.text
+        # The constant label + recovery guidance still reach the user.
+        assert "Your selected model route failed" in response.text
+        assert "No fallback response was generated" in response.text

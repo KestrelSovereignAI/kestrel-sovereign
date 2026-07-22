@@ -1235,6 +1235,159 @@ class TestExecuteHooksSnapshot:
         assert out.updated_input["response_text"] == "base [first] [second]"
 
 
+class _FlippableEnforcingHook(Hook):
+    """A hook whose enforcement flag (``fail_closed`` / ``awaits_user_input``)
+    can be flipped AFTER the turn-start snapshot, and whose ``execute`` can be
+    scripted to raise or hang (#2674 P0-1). Models a generic (mode-less)
+    POST_RESPONSE gate whose live flag drifts from its captured turn-start value.
+    """
+
+    def __init__(self, *, fail_closed=False, awaits_user_input=False,
+                 behavior="allow", priority=10, timeout=0.05):
+        super().__init__(
+            name="flippable", events=[HookEvent.PRE_TOOL_USE],
+            priority=priority, timeout=timeout,
+            awaits_user_input=awaits_user_input,
+        )
+        # A plain mutable attribute (NOT the ResponseAuditHook's mode-derived
+        # property) — the exact shape the P0-1 repro flips mid-turn.
+        self.fail_closed = fail_closed
+        self.behavior = behavior
+        self.executed = 0
+
+    async def execute(self, input):
+        self.executed += 1
+        if self.behavior == "raise":
+            raise RuntimeError("enforcing backend exploded")
+        if self.behavior == "hang":
+            await asyncio.sleep(5.0)
+        return HookOutput.allow()
+
+
+class TestSnapshotEnforcementOverrides:
+    """#2674 P0-1: ``enforcement_overrides`` pins the CAPTURED (turn-start)
+    fail-closed verdict for a caller-pinned run, so a hook whose ``fail_closed``
+    / ``awaits_user_input`` flips mid-turn cannot change whether its crash /
+    timeout denies. Without the override the live read wins and the two
+    directions diverge — the raw-streamed / block-persisted fail-open split."""
+
+    def _pre_tool_input(self):
+        return HookInput(
+            session_id="t", hook_event_name="PreToolUse", tool_name="x",
+        )
+
+    @pytest.mark.asyncio
+    async def test_override_keeps_flipped_hook_fail_closed_on_crash(self):
+        """Captured enforcing=True + live flip to False + crash → override wins →
+        DENY. The control (no override, live read) skips and ALLOWs — the exact
+        fail-open the override closes."""
+        manager = HooksManager()
+        hook = _FlippableEnforcingHook(fail_closed=True, behavior="raise")
+        # Enforcement captured True at snapshot, then flipped False mid-turn.
+        overrides = {id(hook): True}
+        hook.fail_closed = False
+
+        out = await manager.execute_hooks_snapshot(
+            HookEvent.PRE_TOOL_USE, self._pre_tool_input(), [hook],
+            enforcement_overrides=overrides,
+        )
+        assert out.permission_decision == PermissionDecision.DENY
+        assert out.continue_execution is False
+
+        # Control: same flipped hook, NO override → live read (False) → skip →
+        # ALLOW (the pre-fix fail-open).
+        hook2 = _FlippableEnforcingHook(fail_closed=True, behavior="raise")
+        hook2.fail_closed = False
+        live = await manager.execute_hooks_snapshot(
+            HookEvent.PRE_TOOL_USE, self._pre_tool_input(), [hook2],
+        )
+        assert live.permission_decision == PermissionDecision.ALLOW
+
+    @pytest.mark.asyncio
+    async def test_override_keeps_flipped_hook_fail_closed_on_timeout(self):
+        """Same as the crash case but the enforcing hook TIMES OUT: the captured
+        override still fails it closed even though its live ``fail_closed`` is
+        now False."""
+        manager = HooksManager()
+        hook = _FlippableEnforcingHook(
+            fail_closed=True, behavior="hang", timeout=0.05,
+        )
+        overrides = {id(hook): True}
+        hook.fail_closed = False
+
+        out = await manager.execute_hooks_snapshot(
+            HookEvent.PRE_TOOL_USE, self._pre_tool_input(), [hook],
+            enforcement_overrides=overrides,
+        )
+        assert out.permission_decision == PermissionDecision.DENY
+
+    @pytest.mark.asyncio
+    async def test_override_keeps_nonenforcing_hook_advisory_on_crash(self):
+        """Inverse transition: captured enforcing=False + live flip to True +
+        crash → override wins → SKIP (ALLOW), staying advisory for the turn its
+        buffering decision never accounted for. The control (live read, no
+        override) would DENY off the flipped flag."""
+        manager = HooksManager()
+        hook = _FlippableEnforcingHook(fail_closed=False, behavior="raise")
+        overrides = {id(hook): False}
+        hook.fail_closed = True  # flip to enforcing AFTER capture
+
+        out = await manager.execute_hooks_snapshot(
+            HookEvent.PRE_TOOL_USE, self._pre_tool_input(), [hook],
+            enforcement_overrides=overrides,
+        )
+        assert out.permission_decision == PermissionDecision.ALLOW
+
+        # Control: the live read (no override) sees the flipped True → DENY.
+        hook2 = _FlippableEnforcingHook(fail_closed=False, behavior="raise")
+        hook2.fail_closed = True
+        live = await manager.execute_hooks_snapshot(
+            HookEvent.PRE_TOOL_USE, self._pre_tool_input(), [hook2],
+        )
+        assert live.permission_decision == PermissionDecision.DENY
+
+    @pytest.mark.asyncio
+    async def test_override_captures_awaits_user_input_enforcement(self):
+        """``_hook_is_enforcing`` = ``fail_closed OR awaits_user_input``. An
+        approval hook captured enforcing via ``awaits_user_input`` that drops the
+        flag mid-turn (and crashes) must still DENY off the captured value."""
+        manager = HooksManager()
+        hook = _FlippableEnforcingHook(
+            awaits_user_input=True, behavior="raise", timeout=0.05,
+        )
+        overrides = {id(hook): True}
+        hook.awaits_user_input = False  # flip after capture
+
+        out = await manager.execute_hooks_snapshot(
+            HookEvent.PRE_TOOL_USE, self._pre_tool_input(), [hook],
+            enforcement_overrides=overrides,
+        )
+        assert out.permission_decision == PermissionDecision.DENY
+
+    @pytest.mark.asyncio
+    async def test_observer_override_skips_crashed_flipped_hook(self):
+        """``execute_post_response_observers`` honors the captured override too:
+        an observer captured non-enforcing that flips ``fail_closed`` True and
+        crashes SKIPS (never re-blocks an approved release off a live flag the
+        turn's buffering never accounted for)."""
+        manager = HooksManager()
+        obs = _FlippableEnforcingHook(
+            fail_closed=False, behavior="raise", priority=90,
+        )
+        hook_input = HookInput(
+            session_id="t", hook_event_name=HookEvent.POST_RESPONSE.value,
+            response_text="reviewed release",
+        )
+        obs.fail_closed = True  # flip to enforcing after capture
+
+        out = await manager.execute_post_response_observers(
+            HookEvent.POST_RESPONSE, hook_input, [obs],
+            enforcement_overrides={id(obs): False},
+        )
+        # Crashed observer skipped → the approved release stands (ALLOW).
+        assert out.permission_decision == PermissionDecision.ALLOW
+
+
 # === Run tests ===
 
 if __name__ == "__main__":

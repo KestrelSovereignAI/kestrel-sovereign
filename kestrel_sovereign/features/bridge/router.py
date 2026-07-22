@@ -226,9 +226,19 @@ def get_router() -> APIRouter:
                     duration_ms=elapsed_ms,
                 )
             except Exception as e:
+                # #2674 finding 3: the FULL error goes to the operator log (a
+                # separate trust boundary); the SSE client gets ONLY a stable safe
+                # payload built by the SAME shared boundary /api/agent/stream uses.
+                # Reflecting ``str(e)`` verbatim leaked a
+                # BRIDGE_STRICT_WITHHELD_PROSE_MARKER (Terra): an adapter that
+                # raises after yielding partial prose wraps that late exception,
+                # so its text can carry withheld response content under a strict
+                # buffered audit. Never emit the underlying/message/provider text.
                 logger.error(f"Bridge stream error: {e}", exc_info=True)
-                error_data = json.dumps({"type": "error", "message": str(e)})
-                yield f"data: {error_data}\n\n"
+                from kestrel_sovereign.llm.streaming_errors import (
+                    bridge_sse_error_event,
+                )
+                yield bridge_sse_error_event(e)
 
         return StreamingResponse(
             event_generator(),

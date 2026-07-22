@@ -130,9 +130,24 @@ class MockHooksManager:
 
     async def execute_hooks_snapshot(self, event, input_data=None, hooks=None, **kwargs):
         """Record snapshot-pinned execution and return a real ALLOW ``HookOutput``
-        (#2674 parity with the real ``HooksManager.execute_hooks_snapshot``)."""
+        (#2674 parity with the real ``HooksManager.execute_hooks_snapshot``).
+
+        ``**kwargs`` absorbs ``enforcement_overrides`` (#2674 P0-1) so the
+        captured-enforcement contract passes through the mock unchanged."""
         self.executed_hooks.append(
             {"event": event, "input": input_data, "snapshot": hooks, **kwargs}
+        )
+        return HookOutput.allow()
+
+    async def execute_post_response_observers(
+        self, event, input_data=None, hooks=None, **kwargs,
+    ):
+        """Record post-gate observer execution and return ALLOW (#2674 parity
+        with the real ``HooksManager.execute_post_response_observers``). Present
+        so a gate+observer ``_fire_post_response_hook`` fire over this mock does
+        not ``AttributeError``. ``**kwargs`` absorbs ``enforcement_overrides``."""
+        self.executed_hooks.append(
+            {"event": event, "input": input_data, "observers": hooks, **kwargs}
         )
         return HookOutput.allow()
 

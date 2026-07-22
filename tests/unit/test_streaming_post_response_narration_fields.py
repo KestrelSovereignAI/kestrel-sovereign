@@ -40,9 +40,11 @@ class _CapturingHooks:
         self.captured["input"] = hook_input
         return HookOutput.allow("ok")
 
-    async def execute_hooks_snapshot(self, _event, hook_input, _hooks):
+    async def execute_hooks_snapshot(self, _event, hook_input, _hooks, **_kwargs):
         # #2674: the streaming path enforces the turn-start snapshot through this
-        # entry point; capture the same way ``execute_hooks`` does.
+        # entry point; capture the same way ``execute_hooks`` does. ``**_kwargs``
+        # absorbs ``enforcement_overrides`` (#2674 P0-1) — the double must track
+        # the real ``execute_hooks_snapshot`` keyword-only envelope.
         from kestrel_sdk.hooks.base import HookOutput
         self.captured["input"] = hook_input
         return HookOutput.allow("ok")

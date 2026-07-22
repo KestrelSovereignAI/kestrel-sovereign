@@ -524,18 +524,47 @@ def _strip_and_weld_revise_sentinels(text: str) -> str:
 _NO_MODE = object()
 
 
+class PostResponseHookSnapshotError(RuntimeError):
+    """The turn-start POST_RESPONSE hook snapshot could not be read (#2674).
+
+    Both the streaming and non-streaming turn paths capture this snapshot BEFORE
+    any provider/output work and derive the fail-closed ``buffer_audit`` /
+    completion-enforcement decisions from it. If the underlying
+    ``get_enabled_hooks`` read fails, returning an EMPTY snapshot would silently
+    set ``buffer_audit=False`` and stream/persist raw output with NO audit — a
+    fail-OPEN that masquerades as the legitimate "no audit configured" state.
+
+    Raising instead fails CLOSED: because every entry path snapshots before the
+    LLM is invoked and before any byte is yielded or persisted, propagating this
+    error aborts the turn with no raw response data released. The genuine "agent
+    has no hooks_manager" case still returns ``[]`` (a real absence of audit, not
+    an infrastructure failure) — only a raising ``get_enabled_hooks`` reaches
+    here.
+    """
+
+
 def _snapshot_post_response_hooks(hooks_manager) -> list:
     """Snapshot the enabled POST_RESPONSE hook set — with each hook's turn-start
-    ``mode`` — at turn start (#2674).
+    ``mode`` AND turn-start enforcement state — at turn start (#2674).
 
-    Returns ``[(hook, mode_or_sentinel), ...]`` for EVERY hook enabled when the
-    turn begins (not only those exposing a mutable ``mode``). Two decisions read
-    this one snapshot so they can never diverge within a turn:
+    Returns ``[(hook, mode_or_sentinel, enforcing), ...]`` for EVERY hook enabled
+    when the turn begins (not only those exposing a mutable ``mode``). Two
+    decisions read this one snapshot so they can never diverge within a turn:
 
     * **Buffering.** ``buffer_audit`` (whether to WITHHOLD streamed bytes) is
-      derived from this set via :func:`_hook_is_enforcing` — the same predicate
-      the hook manager fails closed on — so the withhold decision and the
-      manager's timeout/crash → DENY behavior stay in lockstep.
+      derived from the captured ``enforcing`` flag — :func:`_hook_is_enforcing`
+      evaluated HERE, at TRUE turn start (before ``USER_PROMPT_SUBMIT``), NOT
+      re-read from the live hook later. That closes the finding-1 race: a
+      ``USER_PROMPT`` hook that flips a strict audit to warn AFTER this snapshot
+      (but before ``buffer_audit`` is computed) would otherwise make a live
+      ``_hook_is_enforcing`` read return False and stream raw bytes, while the
+      completion audit — pinned to the captured strict ``mode`` — still DENIES,
+      the raw-streamed / block-persisted fail-open split. Capturing enforcement
+      at the same instant as the mode keeps the withhold decision and the pinned
+      completion verdict in lockstep for this turn (the flip takes effect NEXT
+      turn), with no temporary shared hook mutation. It is also the predicate the
+      hook manager fails closed on, so the withhold decision and the manager's
+      timeout/crash → DENY behavior stay aligned.
     * **Enforcement.** ``_fire_post_response_hook`` runs EXACTLY this captured
       hook set through ``HooksManager.execute_hooks_snapshot`` — bypassing the
       live registry — so a hook the turn's tools *register*, *enable*, or
@@ -551,15 +580,43 @@ def _snapshot_post_response_hooks(hooks_manager) -> list:
     Modes are pinned during the fire by :func:`_pinned_hook_modes`, which also
     defers an in-place ``warn → strict`` flip on an already-registered hook to
     the next turn. Hooks without a ``mode`` carry the ``_NO_MODE`` sentinel and
-    are executed but never mode-pinned.
+    are executed but never mode-pinned. The captured ``enforcing`` flag is a
+    static per-hook boolean taken at this instant; because a generic hook's
+    ``fail_closed`` / ``awaits_user_input`` do not depend on ``mode`` it matches
+    a later live read, while a mode-derived ``fail_closed`` (the response audit
+    hook) is frozen to its turn-start value here.
+
+    **Fail closed on infrastructure failure (#2674).** A missing ``hooks_manager``
+    is a legitimate "no audit configured" state → empty snapshot. But if the
+    registry read itself (``get_enabled_hooks``) RAISES, the snapshot is unknown,
+    not empty: swallowing it into ``[]`` would set ``buffer_audit=False`` and
+    release/persist raw output with no audit — a fail-OPEN. Both callers snapshot
+    before any provider/output work, so this raises
+    :class:`PostResponseHookSnapshotError` to abort the turn before the LLM runs,
+    guaranteeing no raw response byte is yielded or persisted.
     """
     if not hooks_manager:
         return []
     try:
         enabled = hooks_manager.get_enabled_hooks(HookEvent.POST_RESPONSE)
-    except Exception:
-        return []
-    return [(h, getattr(h, "mode", _NO_MODE)) for h in enabled]
+    except Exception as e:
+        # #2674 finding 3: FAIL CLOSED — do NOT swallow into an empty snapshot.
+        # An empty snapshot disables buffering (``buffer_audit`` False) and the
+        # completion audit, releasing/persisting raw output while masquerading as
+        # "no audit". Both entry paths capture this snapshot before invoking any
+        # LLM/provider and before yielding/persisting response data, so raising
+        # here aborts the turn with no raw output released.
+        raise PostResponseHookSnapshotError(
+            "failed to read enabled POST_RESPONSE hooks at turn start; failing "
+            "closed so no unaudited response is released or persisted"
+        ) from e
+    # Capture ``mode`` (for pinned execution) AND enforcement (for the buffering
+    # decision) at the SAME instant — true turn start — so a later USER_PROMPT
+    # mode flip can never make the withhold decision disagree with the pinned
+    # completion verdict (#2674 finding 1).
+    return [
+        (h, getattr(h, "mode", _NO_MODE), _hook_is_enforcing(h)) for h in enabled
+    ]
 
 
 @contextmanager
@@ -576,7 +633,7 @@ def _pinned_hook_modes(snapshot: list):
     fabricates a ``mode`` attribute on them.
     """
     live: list = []
-    for hook, start_mode in snapshot:
+    for hook, start_mode, *_rest in snapshot:
         if start_mode is _NO_MODE:
             continue
         live.append((hook, getattr(hook, "mode", _NO_MODE)))
@@ -609,18 +666,44 @@ class _PostResponseText(str):
     true for both DENY and a MODIFY rewrite (any hook-changed text).
 
     A plain ``str`` returned by a test double (or any legacy caller) reports
-    ``denied=False`` / ``modified=False`` via ``getattr`` fallback — i.e. it is
-    treated as an ALLOW passthrough, which is exactly what such a double means.
+    ``denied=False`` / ``modified=False`` / ``enforcing=False`` via ``getattr``
+    fallback — i.e. it is treated as an unaudited ALLOW passthrough, which is
+    exactly what such a double (or a pure-local command result) means.
+
+    ``enforcing`` records whether the POST_RESPONSE audit that produced this
+    verdict ran under a fail-closed (strict) hook, derived from the SAME
+    turn-start ``hook_snapshot`` / live hook set ``_fire_post_response_hook``
+    actually executed. The streaming command wrapper reads it to decide whether
+    to withhold this turn's typed parts, instead of taking a fresh registry
+    snapshot that could diverge from the one the audit ran under (#2674).
     """
 
     denied: bool = False
     modified: bool = False
+    enforcing: bool = False
 
-    def __new__(cls, text: str, *, denied: bool = False, modified: bool = False):
+    def __new__(
+        cls, text: str, *,
+        denied: bool = False, modified: bool = False, enforcing: bool = False,
+    ):
         obj = super().__new__(cls, text)
         obj.denied = denied
         obj.modified = modified
+        obj.enforcing = enforcing
         return obj
+
+
+# #2674 finding 2: the deterministic block a strict (buffered) turn releases
+# when its post-tool continuation LLM call times out. It carries NO route name,
+# duration, raw error, tool argument, or model-generated text — a fixed, safe
+# body so the fail-closed audit path can never resolve to an empty 200. Held as
+# a module constant so the endpoint contract and the regression tests share one
+# string.
+STRICT_AUDIT_CONTINUATION_TIMEOUT_BLOCK = (
+    "⚠️ The response could not be completed: the model did not finish "
+    "after a tool step within the allowed time. No partial or unreviewed "
+    "content was released. Please try again."
+)
 
 
 def _strict_audit_release(final_text: str) -> list:
@@ -638,11 +721,72 @@ def _strict_audit_release(final_text: str) -> list:
     * pre-tool prose is retracted from the persisted turn anyway, so releasing it
       would surface text that never survives to history reload.
 
-    Structured parts still persist to metadata on ALLOW and render on reload; the
-    LIVE strict stream is the reviewed prose only. An empty ``final_text``
-    releases nothing (e.g. an approved-but-empty turn).
+    Structured parts do NOT survive a strict buffered turn — on ALLOW as much as
+    on DENY. The buffered-persist path drops the whole metadata envelope (parts,
+    pre_tool_reasoning, tool_events, tool_results) under an enforcing audit, so
+    the invariant holds on every verdict: persisted == reloaded == released
+    reviewed prose, nothing more. The audit never reviewed those side channels,
+    so releasing OR persisting them would surface unaudited bytes. An empty
+    ``final_text`` releases nothing (e.g. an approved-but-empty turn).
     """
     return [str(final_text)] if final_text else []
+
+
+def _post_response_verdict(
+    hook_output, original_text: str, *, enforcing: bool,
+) -> "_PostResponseText":
+    """Translate a POST_RESPONSE ``HookOutput`` into an explicit verdict (#2674).
+
+    Returns a ``_PostResponseText`` carrying BLOCK vs ALLOW/MODIFY directly, not
+    inferred from string equality — a block whose message equals the original
+    prose would otherwise be misread as ALLOW and leak the raw buffer.
+
+    A POST_RESPONSE hook blocks on BOTH ``DENY`` and ``ASK`` (and a bare
+    ``continue_execution=False``). An approval hook exposes ``awaits_user_input``
+    → the turn was BUFFERED, and ``ASK`` means "not approved yet"; releasing the
+    raw buffer on ASK would leak unapproved content. Route through the shared
+    ``evaluate_blocking_decision`` fail-closed gate so ASK can never fall through
+    to the ALLOW passthrough.
+
+    Module-level (not a method) so the MagicMock-based streaming test harnesses,
+    which bind only a curated set of mixin methods onto a bare mock agent, call
+    the REAL verdict logic instead of an auto-returned child mock.
+    """
+    blocked = evaluate_blocking_decision(
+        hook_output,
+        deny_reason_default="blocked by response audit",
+        ask_reason_default="response withheld pending approval",
+    )
+    if blocked is not None:
+        logging.warning(
+            "POST_RESPONSE hook blocked (streaming, "
+            f"{blocked.decision.value}): {blocked.reason}"
+        )
+        # #2674 finding 2: this block message is the ONLY text a strict
+        # (enforcing / buffered) turn releases AND persists. ``blocked.reason``
+        # carries UNTRUSTED diagnostics (the audit LLM's reasoning may quote raw
+        # response content; a fail-closed crash carries exception text), so
+        # reflecting it would leak exactly what the buffer withheld. Release a
+        # CONSTANT, decision-typed message; the full reason is in the operator
+        # log above (a different trust boundary).
+        safe_reason = (
+            "response withheld pending approval"
+            if blocked.is_ask
+            else "response withheld by audit policy"
+        )
+        return _PostResponseText(
+            f"[Response blocked by audit: {safe_reason}]",
+            denied=True,
+            modified=True,
+            enforcing=enforcing,
+        )
+    if hook_output.updated_input and "response_text" in hook_output.updated_input:
+        return _PostResponseText(
+            hook_output.updated_input["response_text"],
+            modified=True,
+            enforcing=enforcing,
+        )
+    return _PostResponseText(original_text, enforcing=enforcing)
 
 
 class StreamingMixin:
@@ -774,11 +918,16 @@ class StreamingMixin:
         message on DENY (``_strict_audit_release``). The withheld raw stream
         (pre-tool prose, thinking, tool/revise/part sentinels) is never
         replayed: the audit never reviewed it, and pre-tool prose is retracted
-        from the persisted turn anyway. Structured parts still persist and
-        render on history reload; the live strict stream is reviewed prose only.
-        That trades real-time token delivery (and live tool/part cards) for the
-        integrity gate. With audit disabled, or in advisory/warn mode, streaming
-        stays fully incremental and this method's behavior is unchanged.
+        from the persisted turn anyway. A strict buffered turn ALSO drops its
+        whole unaudited metadata envelope on persist — parts, pre_tool_reasoning,
+        tool_events and tool_results — on ALLOW as much as on DENY, and suppresses
+        the out-of-band ``revising`` SSE event while sanitizing the STOP hook's
+        tool_calls/tool_results (#2674). So the live stream, the persisted row,
+        the reloaded turn and every hook side channel all carry the reviewed prose
+        ONLY — nothing the audit did not see. That trades real-time token delivery
+        (and live tool/part cards, which no longer survive a buffered turn) for
+        the integrity gate. With audit disabled, or in advisory/warn mode,
+        streaming stays fully incremental and this method's behavior is unchanged.
 
         Args:
             user_input: The user's message
@@ -847,6 +996,38 @@ class StreamingMixin:
         # collector around the delegation and flush any parts it emitted as
         # PART sentinels after the command result, mirroring the normal path.
         if user_input.startswith("!"):
+            # #2674 finding 1: a command that produces an LLM response — notably
+            # ``!continue`` (process_input rewrites it into a continuation
+            # prompt) and any command whose handler returns None and falls
+            # through to a normal LLM turn — is audited by process_input's
+            # POST_RESPONSE fire, now fail-closed + turn-start-snapshot-pinned
+            # (see kestrel_agent._process_input_traced_locked). So ``result`` is
+            # already the reviewed text (or the block message on
+            # DENY/ASK/failure/timeout). A *pure local* command response returns
+            # before that fire and is intentionally NOT audited (established
+            # contract) — its ``result`` is a plain ``str``, not a
+            # ``_PostResponseText``.
+            #
+            # But typed parts a tool emitted during the turn ride the per-turn
+            # collector, NOT ``response_text``, so the audit never reviewed them.
+            # Releasing them would leak unreviewed data past the fail-closed gate
+            # exactly like findings 2/3 on the streaming path. Mirror that here:
+            # under an enforcing audit, or on a blocked verdict, drop the drained
+            # parts (the client receives only the reviewed/blocked text). A pure
+            # local command (plain-``str`` result) is never an audited LLM turn,
+            # so its parts — e.g. a ``!todo add`` card — always flow, even with a
+            # strict audit enabled.
+            #
+            # #2674: the enforcing verdict is read off ``result`` itself — the
+            # ``_PostResponseText`` stamped by ``_fire_post_response_hook`` from
+            # the SAME turn-start snapshot the audit ran under — NOT a fresh
+            # registry snapshot taken here. A second snapshot could diverge from
+            # ``process_input``'s turn-start capture if a hook is
+            # registered/enabled/disabled/mode-flipped between the two reads,
+            # which would let a strict-audited turn's unaudited parts escape while
+            # this wrapper believed the turn was non-enforcing. A plain ``str``
+            # (pure-local command) reports ``enforcing=False`` via ``getattr``, so
+            # its parts always flow.
             with part_collector():
                 # Preserve the pre-existing positional call shape
                 # (test_streaming_audit asserts it) — invocation_context
@@ -859,10 +1040,15 @@ class StreamingMixin:
                     invocation_context=invocation_context,
                 )
                 yield result
-                for part in drain_parts():
-                    sentinel = build_part_sentinel(part)
-                    if sentinel:
-                        yield sentinel
+                release_parts = not getattr(result, "denied", False) and not (
+                    getattr(result, "enforcing", False)
+                )
+                drained = drain_parts()
+                if release_parts:
+                    for part in drained:
+                        sentinel = build_part_sentinel(part)
+                        if sentinel:
+                            yield sentinel
             return
 
         # Start OTEL span for streaming request lifecycle
@@ -923,6 +1109,26 @@ class StreamingMixin:
         self._active_session_id = session_id
         # Prompt injection detection (log-only, does not block)
         check_prompt_injection(user_input)
+
+        # #2674 finding 2: snapshot the enabled POST_RESPONSE hook set at TRUE
+        # turn start — BEFORE USER_PROMPT_SUBMIT fires — so the fail-closed
+        # buffering / enforcement decision reflects the audit that was pinned when
+        # the turn began. Capturing it AFTER USER_PROMPT_SUBMIT would let a
+        # USER_PROMPT hook that unregisters / disables the strict audit turn the
+        # gate OFF for the very turn it was present at start of, streaming raw
+        # bytes with no audit — a fail-OPEN that violates the documented contract
+        # (a strict hook present at turn start remains pinned; registration,
+        # removal and warn↔strict flips are NEXT-turn transitions). The turn-
+        # lifecycle lock already serializes turns, so nothing else mutates the
+        # registry between here and the completion audit. ``None`` hooks_manager
+        # stays a legitimate "no audit configured" empty snapshot; a raising
+        # registry read fails CLOSED (PostResponseHookSnapshotError) before any
+        # byte is streamed. The command / ``!continue`` fall-through returns above
+        # and re-enters ``process_input``, which snapshots the same way BEFORE its
+        # own USER_PROMPT_SUBMIT — one snapshot per path, never a double capture.
+        audit_hook_snapshot = _snapshot_post_response_hooks(
+            getattr(self, "hooks_manager", None)
+        )
 
         # Fire USER_PROMPT_SUBMIT hook
         if self.hooks_manager:
@@ -1175,16 +1381,16 @@ class StreamingMixin:
             self.llm_service, invocation_context, session_id
         )
 
-        # #2674: snapshot the enabled POST_RESPONSE hook set HERE (turn start).
-        # ONE snapshot drives two decisions so they can never diverge mid-turn:
-        # the buffering decision below and the completion-time enforcement in
-        # ``_fire_post_response_hook`` (which runs exactly this set via
-        # ``execute_hooks_snapshot``, ignoring any hook a tool registers/enables/
-        # disables mid-turn — that takes effect next turn). See the function's
-        # docstring for the fail-open split this closes.
-        audit_hook_snapshot = _snapshot_post_response_hooks(
-            getattr(self, "hooks_manager", None)
-        )
+        # #2674 finding 2: ``audit_hook_snapshot`` was captured at the TOP of
+        # this method — BEFORE USER_PROMPT_SUBMIT — so a USER_PROMPT hook that
+        # registers / removes / mode-flips the audit takes effect NEXT turn, not
+        # this one. ONE snapshot drives two decisions so they can never diverge
+        # mid-turn: the buffering decision below and the completion-time
+        # enforcement in ``_fire_post_response_hook`` (which runs exactly this set
+        # via ``execute_hooks_snapshot``, ignoring any hook a tool registers/
+        # enables/disables mid-turn). See the function's docstring for the
+        # fail-open split this closes.
+        #
         # #2674: strict response audit is fail-closed, so when an enforcing
         # POST_RESPONSE hook is active we must NOT stream any user-visible byte
         # before its verdict exists. WITHHOLD every visible chunk (text +
@@ -1192,12 +1398,33 @@ class StreamingMixin:
         # ``full_response`` / ``tool_response_chunks`` for the audit + persist —
         # and release ONLY the reviewed text (via ``_strict_audit_release``)
         # after ``_fire_post_response_hook`` returns. When no enforcing hook is
-        # active this is False and streaming stays fully incremental. Derived
-        # from the same snapshot the enforcement uses, so the withhold decision
-        # and the audited hook set are guaranteed identical for this turn.
+        # active this is False and streaming stays fully incremental.
+        #
+        # #2674 finding 1: read the enforcement flag CAPTURED in the snapshot at
+        # true turn start — NOT a fresh ``_hook_is_enforcing(h)`` on the live
+        # hook. USER_PROMPT_SUBMIT has already fired by this point, so a
+        # USER_PROMPT hook that flipped a strict audit to warn would make a live
+        # read return False and stream raw bytes, while the completion audit —
+        # pinned to the captured strict mode — still DENIES (the raw-streamed /
+        # block-persisted fail-open split). The captured flag and the pinned
+        # completion verdict both reflect the turn-start mode, so they stay in
+        # lockstep with no temporary shared hook mutation; the flip applies NEXT
+        # turn.
         buffer_audit = any(
-            _hook_is_enforcing(h) for h, _mode in audit_hook_snapshot
+            enforcing for _h, _mode, enforcing in audit_hook_snapshot
         )
+        # #2674 finding 3: when the turn is buffered for an enforcing audit, the
+        # assistant prose is withheld from the user pending the verdict — so the
+        # provider call's raw prompt/response must NOT land in durable llm_calls
+        # telemetry or the OTel LLM span before (or, on DENY, ever after) it.
+        # Carry the content-redaction flag on the FROZEN per-turn context (never
+        # global state, so concurrent turns are unaffected); it also covers the
+        # follow-up tool-synthesis calls that reuse ``resolved_context``.
+        # ``isinstance`` guard: a partial test host / double may supply a
+        # non-dataclass context (MagicMock) — never crash the turn to set a
+        # telemetry flag.
+        if buffer_audit and isinstance(resolved_context, LLMInvocationContext):
+            resolved_context = replace(resolved_context, redact_content=True)
 
         async for item in self.llm_service.stream_with_tool_detection(
             messages=messages,
@@ -1274,20 +1501,34 @@ class StreamingMixin:
                 # has just begun emitting a tool call. Any pre-tool prose
                 # the user is currently watching is about to be obsolete
                 # — the agent will substitute the tool's actual result.
-                # Fire a "revising" SSE event so subscribers can clear
-                # the in-flight bubble; carries the request_id for pane
-                # routing and the marker's `index` for ordering.
-                await self._emit_revising_event(
-                    item, session_id=session_id, request_id=request_id,
-                )
-                # Wave 5E: in-band sentinel on the chat stream itself.
-                # Strictly ordered with the chunks, so the chat client
-                # can never race the post-tool synthesis. The Wave 5C
-                # SSE event is the reliability backup; chat clients
-                # treat both as idempotent. NOT appended to
-                # ``full_response`` — the persisted assistant turn
-                # must not contain wire-protocol bytes.
+                # Two idempotent retraction signals tell the client to
+                # clear the in-flight bubble: a Wave 5C "revising" SSE
+                # event (carries the request_id for pane routing and the
+                # marker's `index` for ordering) and a Wave 5E in-band
+                # sentinel on the chat stream itself (strictly ordered with
+                # the chunks, so the client can never race the post-tool
+                # synthesis; chat clients treat both as idempotent).
+                #
+                # #2674 finding 1: suppress BOTH under an enforcing
+                # (buffered) audit. The strict client never received the
+                # pre-tool prose — every visible byte was withheld pending
+                # the verdict — so there is nothing to retract. And both
+                # signals carry response-derived tool id/name the audit has
+                # NOT yet approved; the SSE event in particular is delivered
+                # (or buffered) on the PARALLEL notifications channel
+                # (``/api/agent/notifications/sse``), OUTSIDE the buffered
+                # chat stream, so firing it here would leak unaudited —
+                # possibly-to-be-denied — tool metadata past the fail-closed
+                # gate. Emit both only when streaming live (warn / no-audit),
+                # preserving the established behavior there exactly. The
+                # sentinel is likewise NOT appended to ``full_response`` (the
+                # persisted assistant turn must not contain wire-protocol
+                # bytes). The pre-tool accumulation below runs regardless of
+                # buffering — the audit + persist still need it.
                 if not buffer_audit:
+                    await self._emit_revising_event(
+                        item, session_id=session_id, request_id=request_id,
+                    )
                     yield _build_revise_sentinel(item)
                 # Snapshot pre-tool prose at the FIRST marker only —
                 # subsequent markers arrive between tool calls of the
@@ -1385,6 +1626,12 @@ class StreamingMixin:
             tool_response_chunks = []
             tool_events = []
             tool_results: list = []
+            # #2674 finding 2: per-turn channel for a strict continuation-timeout
+            # signal. In advisory mode a follow-up-LLM timeout renders as an ❌
+            # tool card; under an enforcing (buffered) audit that sentinel is
+            # stripped, so the orchestrator sets ``timed_out`` here instead and we
+            # substitute a deterministic safe block below.
+            strict_timeout_state: Dict[str, Any] = {}
             async for chunk in self._handle_orchestrator_response_streaming(
                 response=tool_response,
                 feature_tools=feature_tools,
@@ -1398,6 +1645,8 @@ class StreamingMixin:
                 request_id=request_id,
                 images=eager_images or None,
                 invocation_context=resolved_context,
+                buffer_audit=buffer_audit,
+                strict_timeout_state=strict_timeout_state,
             ):
                 if isinstance(chunk, ThinkingDelta):
                     if not buffer_audit:
@@ -1413,6 +1662,44 @@ class StreamingMixin:
                 # arrives between the inner check and the next yield.
                 if request_id and self.is_request_cancelled(request_id):
                     break
+            # #2674 finding 2: a strict (buffered) POST-TOOL continuation stopped
+            # before its reviewed release withheld every byte and never audited
+            # the partial synthesis. Discard the whole withheld buffer (prose,
+            # parts, tool_events, tool_results) and persist an EMPTY cancelled row
+            # — matching the strict cancel-before-dispatch path — instead of
+            # persisting the unfinished synthesis (which would resurface on reload
+            # and replay into the next turn's context). Nothing is released, so the
+            # endpoint surfaces its standard stop notice exactly once. Return
+            # before the audit fire / STOP hook / memory pipeline, none of which
+            # should run over discarded content. Advisory turns already streamed
+            # their partial, so this is gated on ``buffer_audit``. Inlined (not a
+            # helper method) so the MagicMock-based streaming harnesses run the
+            # REAL check via the bound ``is_request_cancelled`` /
+            # ``_persist_assistant_turn_safely`` instead of an auto-truthy mock.
+            if buffer_audit and request_id and self.is_request_cancelled(
+                request_id
+            ):
+                await self._persist_assistant_turn_safely(
+                    "", metadata=None, session_id=session_id,
+                    request_id=request_id, response=tool_response,
+                )
+                return
+            # #2674 finding 2: a strict (buffered) continuation that TIMED OUT
+            # withheld every byte and yielded no reviewable text. Discard the
+            # withheld continuation prose entirely — any partial buffered text or
+            # typed parts are protected, unfinished content the audit should not
+            # release — and replace the REVIEWABLE text with a single
+            # deterministic safe block. It then flows through the SAME buffered
+            # audit → persist → release path as any other turn, so persisted ==
+            # reloaded == released == delivered, the client gets a non-empty safe
+            # body (never a silent empty 200), and no protected marker, tool
+            # argument, or raw error can escape. ``tool_events`` / ``tool_results``
+            # are left intact: the buffered persist drops the whole metadata
+            # envelope (``meta = None`` below) so they never reach the client or
+            # history, while the audit narration check and the STOP-hook payload
+            # keep seeing the real tool activity that actually ran.
+            if buffer_audit and strict_timeout_state.get('timed_out'):
+                tool_response_chunks = [STRICT_AUDIT_CONTINUATION_TIMEOUT_BLOCK]
             # Persist only the post-tool synthesis in ``content``. Any
             # pre-tool prose was already retracted from the SSE client by
             # the ToolCallStarted/revising protocol, so storing it in
@@ -1494,6 +1781,28 @@ class StreamingMixin:
                 tool_results=tool_results,
                 hook_snapshot=audit_hook_snapshot,
             )
+            # #2674 P0-2: cancellation can arrive WHILE the audit provider call is
+            # in flight (``get_audit_response`` hangs, user hits stop, the audit
+            # then returns ALLOW). The pre-dispatch/pre-audit cancel checks above
+            # ran BEFORE this await, so they cannot see it. Under ``buffer_audit``
+            # nothing streamed live and the strict release below is suppressed on
+            # cancel — but the persist would still store the reviewed-yet-withheld
+            # prose (resurfacing on reload AND replaying into the next turn's
+            # context) with a ``cancelled`` marker, the exact split this gate
+            # exists to prevent. Recheck AFTER the await: discard the reviewed
+            # text / parts / tool data and persist exactly ONE empty cancelled row
+            # (matching the strict cancel-before-dispatch path), then return
+            # before metadata / persist / release / memory / STOP. Inlined (not a
+            # helper) so the MagicMock streaming harnesses run the REAL bound
+            # ``is_request_cancelled`` / ``_persist_assistant_turn_safely``.
+            if buffer_audit and request_id and self.is_request_cancelled(
+                request_id
+            ):
+                await self._persist_assistant_turn_safely(
+                    "", metadata=None, session_id=session_id,
+                    request_id=request_id, response=tool_response,
+                )
+                return
             # #2674: read the EXPLICIT audit verdict, not string equality.
             audit_denied = getattr(tool_final_text, "denied", False)
             # #1914 (codex P1): a POST_RESPONSE hook can rewrite or BLOCK the
@@ -1553,6 +1862,21 @@ class StreamingMixin:
                     meta['parts'] = component_parts
                 if not meta:
                     meta = None
+            # #2674 findings 2 & 3: under an enforcing (buffered) audit the client
+            # received ONLY the reviewed release (``_strict_audit_release``) —
+            # nothing streamed live. Every other channel here is UNREVIEWED by the
+            # audit, which examined only the sentinel-stripped ``post_tool_text``:
+            # typed ``parts`` carry structured tool data, ``pre_tool_reasoning``
+            # replays into the next turn's LLM context AND renders on reload,
+            # ``tool_events`` carry tool exception strings the frontend renders,
+            # ``tool_results`` carry result payloads. Persisting any of them would
+            # leak material the audit never saw (ALLOW) or explicitly rejected
+            # (DENY/ASK), and make the reloaded turn richer than what was
+            # released. Drop all of it so persisted == reloaded == released
+            # reviewed text. Warn / no-audit turns (``buffer_audit`` False) keep
+            # their metadata exactly as before.
+            if buffer_audit:
+                meta = None
             await self._persist_assistant_turn_safely(
                 tool_final_text, metadata=meta, session_id=session_id,
                 request_id=request_id,
@@ -1595,6 +1919,21 @@ class StreamingMixin:
             else:
                 stop_tool_calls = None
         elif inline_executed:
+            # #2674 finding 2: a strict (buffered) inline-executed turn stopped
+            # before its reviewed release withheld every byte and never audited
+            # the synthesis. Discard the withheld buffer and persist an EMPTY
+            # cancelled row (same as the post-tool and no-tool paths) rather than
+            # the unfinished, unreviewed content. Gated on ``buffer_audit`` so
+            # advisory turns — which already streamed incrementally — are
+            # unchanged.
+            if buffer_audit and request_id and self.is_request_cancelled(
+                request_id
+            ):
+                await self._persist_assistant_turn_safely(
+                    "", metadata=None, session_id=session_id,
+                    request_id=request_id, response=tool_response,
+                )
+                return
             # Inline-executed branch: the adapter ran tools mid-call
             # (codex app-server's item/tool/call RPC). No
             # ``_dispatch_tool_call`` ran, so synthesize the same
@@ -1697,6 +2036,19 @@ class StreamingMixin:
                 tool_results=tool_results,
                 hook_snapshot=audit_hook_snapshot,
             )
+            # #2674 P0-2: cancellation that lands WHILE the audit await was in
+            # flight is invisible to the pre-audit check above. Recheck here and
+            # discard the withheld inline synthesis — persist exactly one empty
+            # cancelled row and return before metadata / persist / release /
+            # memory / STOP (see the has_tool_calls branch for the full rationale).
+            if buffer_audit and request_id and self.is_request_cancelled(
+                request_id
+            ):
+                await self._persist_assistant_turn_safely(
+                    "", metadata=None, session_id=session_id,
+                    request_id=request_id, response=tool_response,
+                )
+                return
             # #2674: read the EXPLICIT audit verdict, not string equality.
             inline_denied = getattr(final_text, "denied", False)
             # #1914 (codex P1): drop component parts when a POST_RESPONSE hook
@@ -1721,25 +2073,33 @@ class StreamingMixin:
             # actual call envelopes (id, name, arguments, summarized
             # result) so a future loader can see what produced what,
             # not just *that* something ran.
+            inline_meta: Optional[Dict[str, Any]] = {
+                # #2674: drop the rejected pre-tool prose on a DENY — see the
+                # has_tool_calls branch; ContextBuilder would otherwise replay
+                # the denied content into the next turn's context.
+                **({
+                    "pre_tool_reasoning": {
+                        "content": pre_tool_text,
+                        "seam": seam,
+                        "context_replay": context_replay_text,
+                    }
+                } if (pre_tool_text and not inline_denied) else {}),
+                "tool_events": synth_tool_events,
+                "tool_results": tool_results,
+                # #1914: component parts emitted during the inline turn,
+                # rebased onto the persisted post-tool content.
+                **({"parts": inline_post_components} if inline_post_components else {}),
+            }
+            # #2674 findings 2 & 3: under an enforcing (buffered) audit persist
+            # ONLY the reviewed release — drop every unreviewed side channel
+            # (parts, pre_tool_reasoning, tool_events incl. tool exception
+            # strings, tool_results). Same invariant as the has_tool_calls
+            # branch: persisted == reloaded == released reviewed text.
+            if buffer_audit:
+                inline_meta = None
             await self._persist_assistant_turn_safely(
                 final_text,
-                metadata={
-                    # #2674: drop the rejected pre-tool prose on a DENY — see the
-                    # has_tool_calls branch; ContextBuilder would otherwise replay
-                    # the denied content into the next turn's context.
-                    **({
-                        "pre_tool_reasoning": {
-                            "content": pre_tool_text,
-                            "seam": seam,
-                            "context_replay": context_replay_text,
-                        }
-                    } if (pre_tool_text and not inline_denied) else {}),
-                    "tool_events": synth_tool_events,
-                    "tool_results": tool_results,
-                    # #1914: component parts emitted during the inline turn,
-                    # rebased onto the persisted post-tool content.
-                    **({"parts": inline_post_components} if inline_post_components else {}),
-                },
+                metadata=inline_meta,
                 session_id=session_id, request_id=request_id,
                 response=tool_response,
             )
@@ -1754,6 +2114,23 @@ class StreamingMixin:
             stop_tool_results = tool_results
             stop_tool_calls = tool_calls_payload
         else:
+            # #2674 finding 2: a strict (buffered) NO-TOOL turn stopped mid-stream
+            # withheld every byte and never audited the partial synthesis. Under
+            # ``buffer_audit`` nothing streamed live, so a cancellation here means
+            # the buffered partial was never released; persisting it as content
+            # would resurface it on reload and replay into the next turn's context.
+            # Discard it and persist an EMPTY cancelled row — matching the strict
+            # cancel-before-dispatch path — before the audit fire / STOP hook /
+            # memory pipeline. Advisory turns already streamed their partial, so
+            # this is gated on ``buffer_audit`` and their behavior is unchanged.
+            if buffer_audit and request_id and self.is_request_cancelled(
+                request_id
+            ):
+                await self._persist_assistant_turn_safely(
+                    "", metadata=None, session_id=session_id,
+                    request_id=request_id, response=tool_response,
+                )
+                return
             # No tool calls - text was already streamed above. Pre-tool
             # prose / tool_calls / tool_results all stay None: a hook
             # writing the narration check should treat ``tool_results
@@ -1771,6 +2148,19 @@ class StreamingMixin:
                 final_text, session_id,
                 hook_snapshot=audit_hook_snapshot,
             )
+            # #2674 P0-2: cancellation that lands WHILE the audit await was in
+            # flight is invisible to the pre-audit check above. Recheck here and
+            # discard the withheld reviewed prose — persist exactly one empty
+            # cancelled row and return before metadata / persist / release /
+            # memory / STOP (see the has_tool_calls branch for the full rationale).
+            if buffer_audit and request_id and self.is_request_cancelled(
+                request_id
+            ):
+                await self._persist_assistant_turn_safely(
+                    "", metadata=None, session_id=session_id,
+                    request_id=request_id, response=tool_response,
+                )
+                return
             # #2674: read the EXPLICIT audit verdict, not string equality.
             no_tool_denied = getattr(final_text, "denied", False)
             # #1914 (codex P1): drop parts when a POST_RESPONSE hook rewrote or
@@ -1804,6 +2194,12 @@ class StreamingMixin:
                     _no_tool_meta["tool_events"] = _no_tool_events
                 if no_tool_components:
                     _no_tool_meta["parts"] = no_tool_components
+            # #2674 findings 2 & 3: under an enforcing (buffered) audit persist
+            # ONLY the reviewed release — drop the unreviewed side channels
+            # (codex-native ``tool_events`` and typed ``parts``). Same invariant
+            # as the tool branches: persisted == reloaded == released text.
+            if buffer_audit:
+                _no_tool_meta = None
             await self._persist_assistant_turn_safely(
                 final_text,
                 metadata=_no_tool_meta,
@@ -1850,13 +2246,31 @@ class StreamingMixin:
         # for STOP too.
         hooks_manager = getattr(self, "hooks_manager", None)
         if hooks_manager:
+            # #2674 finding 2: a STOP hook is an ARBITRARY subscriber that may
+            # persist or emit its HookInput (e.g. the reflection ``on_stop``
+            # handler). Under an enforcing (buffered) audit it must receive ONLY
+            # the reviewed final text. ``tool_calls`` / ``tool_results`` carry
+            # raw, unaudited tool envelopes — ids, arguments, full result
+            # payloads (incl. tool exception strings) — that the POST_RESPONSE
+            # audit never saw, and on a DENY explicitly rejected. Forwarding them
+            # would leak the same unreviewed side channel the persist path now
+            # drops (findings 2/3), just through the hook instead of storage.
+            # Null BOTH on every verdict (ALLOW / MODIFY / ASK / DENY) and every
+            # branch (tool / inline / no-tool): ``buffer_audit`` is the enforcing
+            # flag, independent of the verdict. ``final_assistant_text`` is
+            # already the reviewed release (block message on DENY, rewrite on
+            # MODIFY, approved prose on ALLOW), so ``response_text`` stays safe.
+            # Warn / no-audit turns (``buffer_audit`` False) keep the full STOP
+            # payload exactly as before.
+            stop_hook_tool_calls = None if buffer_audit else stop_tool_calls
+            stop_hook_tool_results = None if buffer_audit else stop_tool_results
             hook_input = HookInput(
                 session_id=session_id or "",
                 hook_event_name=HookEvent.STOP.value,
                 user_message=user_input,
                 response_text=final_assistant_text,
-                tool_calls=stop_tool_calls,
-                tool_results=stop_tool_results,
+                tool_calls=stop_hook_tool_calls,
+                tool_results=stop_hook_tool_results,
             )
             await hooks_manager.execute_hooks_parallel(
                 HookEvent.STOP, hook_input
@@ -2047,7 +2461,7 @@ class StreamingMixin:
                 is whatever ``_serialize_tool_result`` produced —
                 usually a ``ToolResult.to_dict()`` envelope (#1042
                 layer 4) or a legacy ``{success, ...}`` dict.
-            hook_snapshot: ``[(hook, mode), ...]`` — the enabled
+            hook_snapshot: ``[(hook, mode, enforcing), ...]`` — the enabled
                 POST_RESPONSE hook set captured at turn start (#2674).
                 When provided (the streaming path always passes it, even
                 empty), ONLY this set audits the turn, run via
@@ -2072,12 +2486,36 @@ class StreamingMixin:
         # enabled at turn start — nothing enforces, regardless of what the tools
         # registered/enabled since.
         pinned = hook_snapshot is not None
+        # #2674 P0-1: when pinned, the enforcement flag CAPTURED at turn start —
+        # ``entry[2]`` — is AUTHORITATIVE for this turn: it drove the buffering
+        # (withhold) decision, so it must also drive the returned verdict, the
+        # gate/observer partition, AND the manager's crash/timeout fail-closed
+        # resolution. A live ``_hook_is_enforcing(h)`` re-read here could disagree
+        # (a generic hook whose ``fail_closed`` flips to False mid-turn, or an
+        # approval hook that drops ``awaits_user_input`` — neither is mode-pinned)
+        # and produce the raw-streamed / block-persisted fail-open split. Key the
+        # override by ``id(hook)`` (each hook is held alive by the snapshot for
+        # the whole fire, so identity is stable). Live callers (``None`` snapshot)
+        # keep reading the current flag.
+        captured_enforcing: Optional[dict] = None
         if pinned:
-            snapshot_hooks = [h for h, _mode in hook_snapshot]
+            snapshot_hooks = [entry[0] for entry in hook_snapshot]
+            captured_enforcing = {
+                id(entry[0]): bool(entry[2]) for entry in hook_snapshot
+            }
             if not snapshot_hooks:
                 return _PostResponseText(response_text)
         elif not hooks_manager.get_enabled_hooks(HookEvent.POST_RESPONSE):
             return _PostResponseText(response_text)
+
+        def _is_enforcing(hook) -> bool:
+            """Turn-authoritative fail-closed verdict for ``hook``: the captured
+            snapshot value when pinned, else the live read (#2674 P0-1)."""
+            if captured_enforcing is not None:
+                override = captured_enforcing.get(id(hook))
+                if override is not None:
+                    return override
+            return _hook_is_enforcing(hook)
 
         hook_input = HookInput(
             session_id=session_id or "",
@@ -2094,44 +2532,126 @@ class StreamingMixin:
         # — is not consulted. The buffering decision (``buffer_audit``) came from
         # this same snapshot, so the two stay in lockstep.
         with _pinned_hook_modes(hook_snapshot or []):
+            # #2674: derive the enforcing verdict from the EXACT hook set this
+            # audit executes, at its pinned (turn-start) modes — the snapshot set
+            # when pinned, else the live enabled set. The streaming command
+            # wrapper reads THIS flag rather than re-snapshotting the registry.
             if pinned:
-                hook_output = await hooks_manager.execute_hooks_snapshot(
-                    HookEvent.POST_RESPONSE, hook_input, snapshot_hooks,
-                )
+                audited_hooks = list(snapshot_hooks)
             else:
-                hook_output = await hooks_manager.execute_hooks(
-                    HookEvent.POST_RESPONSE, hook_input,
+                audited_hooks = list(
+                    hooks_manager.get_enabled_hooks(HookEvent.POST_RESPONSE)
                 )
-        # Return an EXPLICIT verdict (#2674): the strict streaming path must know
-        # BLOCK vs ALLOW/MODIFY directly, not infer it from string equality — a
-        # block whose message equals the original prose would otherwise be
-        # misread as ALLOW and leak the raw buffer.
-        #
-        # A POST_RESPONSE hook blocks on BOTH ``DENY`` and ``ASK`` (and a bare
-        # ``continue_execution=False``). An approval hook exposes
-        # ``awaits_user_input`` → ``_hook_is_enforcing`` → the turn was BUFFERED,
-        # and ``ASK`` means "not approved yet"; releasing the raw buffer on ASK
-        # would leak unapproved content (the P1 fail-open leak). Route through the
-        # shared ``evaluate_blocking_decision`` fail-closed gate — the same one
-        # every PRE-hook dispatch surface uses — so ASK can never silently fall
-        # through to the ALLOW passthrough below.
-        blocked = evaluate_blocking_decision(
-            hook_output,
-            deny_reason_default="blocked by response audit",
-            ask_reason_default="response withheld pending approval",
-        )
-        if blocked is not None:
-            logging.warning(
-                "POST_RESPONSE hook blocked (streaming, "
-                f"{blocked.decision.value}): {blocked.reason}"
+            # #2674 P0-1: derive from the CAPTURED (turn-start) flag when pinned,
+            # so this verdict's ``enforcing`` — read by the streaming command
+            # wrapper to decide whether to withhold typed parts — stays in
+            # lockstep with the buffering decision that came from the same
+            # snapshot. A live read could diverge under a mid-turn flip.
+            enforcing = any(_is_enforcing(h) for h in audited_hooks)
+
+            # #2674 finding 2: the principled enforcing pipeline. When an
+            # enforcing (fail-closed) gate hook is present, ONLY the gate hook(s)
+            # may see the raw unreviewed response — an advisory hook that ran
+            # first (lower priority number) could otherwise persist/emit the raw
+            # text before a later DENY, an irreversible side effect no post-hoc
+            # part-drop can undo; and an advisory hook that ran last (higher
+            # priority number) could rewrite the gate-approved prose into an
+            # UNAUDITED release. Partition on ``_hook_is_enforcing`` (preserving
+            # priority order within each partition) and run the gate first, then
+            # the observers over the REVIEWED text only.
+            # #2674 P0-1: partition on the CAPTURED enforcement (via
+            # ``_is_enforcing``), NOT a fresh live read — a generic gate hook that
+            # dropped ``fail_closed`` mid-turn would otherwise be misfiled as an
+            # observer, run over the raw response (leaking it past the freeze),
+            # and lose fail-closed handling on the very turn its capture buffered.
+            gate_hooks = [h for h in audited_hooks if _is_enforcing(h)]
+            observer_hooks = [
+                h for h in audited_hooks if not _is_enforcing(h)
+            ]
+
+            if not gate_hooks:
+                # No enforcing hook: preserve the normal single priority-ordered
+                # chain with full MODIFY propagation (nothing is buffered, so an
+                # advisory MODIFY only annotates the already-streamed copy).
+                if pinned:
+                    hook_output = await hooks_manager.execute_hooks_snapshot(
+                        HookEvent.POST_RESPONSE, hook_input, audited_hooks,
+                        enforcement_overrides=captured_enforcing,
+                    )
+                else:
+                    hook_output = await hooks_manager.execute_hooks(
+                        HookEvent.POST_RESPONSE, hook_input,
+                    )
+                return _post_response_verdict(
+                    hook_output, response_text, enforcing=enforcing,
+                )
+
+            # PHASE 1 — enforcement. Only the gate hook(s) receive the raw
+            # unreviewed response; multiple gate hooks chain in priority order
+            # (MODIFY propagates between them, DENY/ASK short-circuits). The
+            # captured overrides make a gate hook's crash/timeout fail closed off
+            # its turn-start verdict even if its live ``fail_closed`` flipped.
+            gate_output = await hooks_manager.execute_hooks_snapshot(
+                HookEvent.POST_RESPONSE, hook_input, gate_hooks,
+                enforcement_overrides=captured_enforcing,
             )
-            return _PostResponseText(
-                f"[Response blocked by audit: {blocked.reason}]",
-                denied=True,
-                modified=True,
+            gate_verdict = _post_response_verdict(
+                gate_output, response_text, enforcing=enforcing,
             )
-        elif hook_output.updated_input and "response_text" in hook_output.updated_input:
-            return _PostResponseText(
-                hook_output.updated_input["response_text"], modified=True,
-            )
-        return _PostResponseText(response_text)
+
+            # PHASE 2 — observation. Advisory / observer hooks receive the
+            # REVIEWED release (the reviewed prose on ALLOW/MODIFY, or the
+            # sanitized block message on DENY/ASK) — NEVER the raw response — and
+            # cannot mutate that release (``execute_post_response_observers``
+            # freezes ``response_text``). They may still record/emit and warn,
+            # and a stricter observer DENY/ASK can re-block an otherwise-approved
+            # release (always fail-safe). Run them even on a gate block so an
+            # external recorder observes the sanitized outcome.
+            #
+            # #2674 finding 1: the reviewed release is ``str(gate_verdict)``, but
+            # ``pre_tool_prose`` / ``tool_calls`` / ``tool_results`` are the RAW,
+            # unaudited side channels the gate never released — the pre-tool prose
+            # (retracted from the persisted turn), the model-generated tool
+            # arguments, and the full tool result payloads. An observer is an
+            # ARBITRARY advisory consumer (an external recorder, a webhook) that
+            # may persist or forward its HookInput; handing it those raw fields
+            # would leak past the fail-closed gate exactly what findings 2/4 drop
+            # from the live stream, the persisted row and the STOP hook. This
+            # observer phase runs ONLY when a gate hook is present (enforcing), and
+            # under an enforcing audit there is NO reviewed equivalent of the raw
+            # side channels — the audit reviewed prose only — so NULL all three.
+            # Advisory-only turns never reach here (they take the ``not gate_hooks``
+            # branch above with the full, already-streamed input), so their
+            # behavior is unchanged.
+            if observer_hooks:
+                observer_input = HookInput(
+                    session_id=session_id or "",
+                    hook_event_name=HookEvent.POST_RESPONSE.value,
+                    response_text=str(gate_verdict),
+                    pre_tool_prose=None,
+                    tool_calls=None,
+                    tool_results=None,
+                )
+                observer_output = (
+                    await hooks_manager.execute_post_response_observers(
+                        HookEvent.POST_RESPONSE, observer_input, observer_hooks,
+                        enforcement_overrides=captured_enforcing,
+                    )
+                )
+                if not gate_verdict.denied:
+                    observer_block = evaluate_blocking_decision(
+                        observer_output,
+                        deny_reason_default="blocked by response audit",
+                        ask_reason_default="response withheld pending approval",
+                    )
+                    if observer_block is not None:
+                        logging.warning(
+                            "POST_RESPONSE observer re-blocked an approved "
+                            "release (%s): %s",
+                            observer_block.decision.value, observer_block.reason,
+                        )
+                        return _post_response_verdict(
+                            observer_output, str(gate_verdict),
+                            enforcing=enforcing,
+                        )
+            return gate_verdict
