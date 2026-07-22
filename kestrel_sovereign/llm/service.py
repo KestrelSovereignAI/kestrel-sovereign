@@ -3013,7 +3013,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             logger.error(f"Failed to initialize providers: {e}")
             return []
 
-    async def finalize_providers(self) -> None:
+    async def finalize_providers(self, host_db: "Optional[AsyncDatabase]" = None) -> None:
         """Async completion pass for routes sync init couldn't bring up.
 
         Sync ``__init__`` builds the registry via ``initialize_providers()``,
@@ -3021,13 +3021,17 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         route configured with only ``OPENROUTER_MANAGEMENT_API_KEY``, which is
         completed by minting a bootstrap child key). Called once from the
         agent's async ``initialize()``. Safe to call multiple times.
+
+        ``host_db`` (when the caller has a host-level store) lets the registry
+        persist and reuse the bootstrap child key across restarts instead of
+        minting a new one every cold start.
         """
         registry = getattr(self, "provider_registry", None)
         if registry is None or not hasattr(registry, "finalize_providers"):
             return
         before = {p.get("name") for p in (self.providers or [])}
         try:
-            provider_infos = await registry.finalize_providers()
+            provider_infos = await registry.finalize_providers(host_db=host_db)
         except Exception as e:  # noqa: BLE001 - never block startup on this
             logger.warning("finalize_providers failed: %s", e)
             return
