@@ -833,15 +833,40 @@ class Feature(_SdkFeature):
         deny returns the same PERMISSION DENIED envelope the
         non-inline path produces (codex round 1 P1 on #1461 follow-up
         — without this, hook-gated policies were bypassed by the
-        inline-execution path)."""
+        inline-execution path).
+
+        NESTED cross-task reentry (#2672 review P1 follow-up). This executor is
+        BUILT while ``execute_as_subagent`` runs on the PARENT inline executor's
+        reader task, INSIDE that executor's ``bind_transition_lock_reentry`` scope,
+        so the owning turn's transition-lock reentry token is visible in the
+        ContextVar here. But the codex app-server dispatches THIS subagent's OWN
+        inline tools on a SEPARATE, freshly-spawned reader task that does NOT inherit
+        that binding — so a nested durable-identity write (rename / description /
+        discovery history / user name / SOUL) invoked by the subagent would
+        re-acquire the transition lock from a token-less foreign task and DEADLOCK
+        against the turn that holds it (the turn is blocked awaiting the app-server
+        result; the write is blocked acquiring the lock the turn holds). Capture the
+        bound token here and re-present it around the subagent tool call — the exact
+        cross-task seam ``OrchestratorEngineMixin._make_inline_tool_executor``
+        installs for the parent turn — so that one write re-enters the owning turn's
+        span. ``None`` (anthropic path, or a subagent not nested under a held turn
+        lock) is a no-op, so an unrelated background task grants no token and the
+        privacy trust boundary is unchanged."""
+        from kestrel_sovereign.storage.privacy_wrapper import (
+            bind_transition_lock_reentry,
+            current_bound_reentry_token,
+        )
+        transition_reentry_token = current_bound_reentry_token()
+
         async def _exec(name: str, args: Dict[str, Any]):
-            return await self._execute_subagent_tool(
-                tool_name=name,
-                args=args or {},
-                tools_by_name={t.name: t for t in self.get_tools()},
-                return_with_effective_args=True,
-                parts_sink=parts_sink,
-            )
+            with bind_transition_lock_reentry(transition_reentry_token):
+                return await self._execute_subagent_tool(
+                    tool_name=name,
+                    args=args or {},
+                    tools_by_name={t.name: t for t in self.get_tools()},
+                    return_with_effective_args=True,
+                    parts_sink=parts_sink,
+                )
         return _exec
 
     async def _execute_subagent_tool(

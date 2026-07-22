@@ -1882,6 +1882,7 @@ async def test_rename_under_held_turn_lock_does_not_deadlock(tmp_path, mode):
 
 
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin  # noqa: E402
+from kestrel_sovereign.features.base import Feature  # noqa: E402
 
 
 class _InlineOrchestratorHost(OrchestratorEngineMixin):
@@ -2246,6 +2247,157 @@ async def test_concurrent_inline_renames_serialize_durable_writes(tmp_path):
         assert await _metadata_value(raw, "name") == final_live
         node = await raw.get_node(AGENT_ID)
         assert node.label == final_live
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NESTED cross-task reentry (#2672 review P1 follow-up). The prior cross-task test
+# covers ONE reader boundary: the turn dispatches a durable-identity tool directly
+# onto the codex app-server's reader task, and the PARENT inline executor
+# (``_make_inline_tool_executor``) captures + re-presents the reentry token. It
+# does NOT cover a durable-identity write invoked by a FEATURE SUBAGENT: the
+# subagent runs its OWN inline tool loop through
+# ``Feature._make_feature_inline_tool_executor``, and the app-server dispatches the
+# subagent's tools on a SECOND, freshly-spawned reader task that does not inherit
+# the parent reader task's token binding. Without the subagent executor ALSO
+# capturing the bound token and re-presenting it, that nested write re-acquires the
+# transition lock token-less from a foreign task and DEADLOCKS against the turn
+# that holds it. This drives the REAL parent AND subagent executors across a
+# faithful two-level reader-task boundary.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class _NestedRenameTool:
+    """Minimal ``AgentTool``-shaped tool whose ``execute`` runs the REAL
+    ``rename_agent_core`` — a durable-identity write that re-acquires the agent's
+    privacy-transition lock (the deadlock surface under test)."""
+
+    name = "rename_agent"
+
+    def __init__(self, rename_agent):
+        self._rename_agent = rename_agent
+
+    async def execute(self, **kwargs):
+        from kestrel_sovereign.features.bootstrap.feature import rename_agent_core
+
+        outcome = await rename_agent_core(self._rename_agent, kwargs["new_name"])
+        return {
+            "success": outcome.success,
+            "skipped_privacy": outcome.skipped_privacy,
+            "db_row_written": outcome.db_row_written,
+        }
+
+
+class _RenameSubagentFeature(Feature):
+    """Real ``Feature`` exercising the PRODUCTION
+    ``_make_feature_inline_tool_executor`` / ``_execute_subagent_tool`` across a
+    nested reader-task boundary (#2672 review P1 follow-up). Only the subagent
+    inline-executor machinery is needed, so ``Feature.__init__`` is deliberately
+    bypassed; ``self.agent`` is the ``_RenameAgent`` shape (no ``hooks_manager`` →
+    the PRE_TOOL_USE gate is skipped, orthogonal to the deadlock seam)."""
+
+    def __init__(self, rename_agent):
+        self.agent = rename_agent
+        self.name = "rename_feature"
+        self._tools = [_NestedRenameTool(rename_agent)]
+
+    async def initialize(self):  # abstract
+        pass
+
+    @property
+    def tool_description(self) -> str:  # abstract
+        return "Renames the agent."
+
+    def get_tools(self):
+        return self._tools
+
+
+class _NestedSubagentOrchestratorHost(OrchestratorEngineMixin):
+    """Parent turn host that builds the REAL parent inline executor, then dispatches
+    a feature SUBAGENT whose own inline tool call performs the durable rename on a
+    SECOND reader task. ``execute_named_tool`` runs on the parent reader task INSIDE
+    the parent executor's bound-token scope — exactly where the subagent executor
+    must capture the token for it to survive onto the nested reader task."""
+
+    def __init__(self, lock, feature, harness):
+        self._privacy_transition_lock = lock
+        self._feature = feature
+        self._harness = harness
+
+    def _get_privacy_transition_lock(self):
+        return self._privacy_transition_lock
+
+    async def execute_named_tool(self, name, args, *, session_id, source, _capture):
+        assert name == "dispatch_subagent"
+        _capture["effective_args"] = args
+        # Built here (on the parent reader task, inside the parent's bound-token
+        # scope) so the REAL subagent executor captures the owning turn's token,
+        # then the durable rename is dispatched onto a NESTED reader task.
+        subagent_executor = self._feature._make_feature_inline_tool_executor(
+            parts_sink=[]
+        )
+        _eff, result = await self._harness.dispatch(
+            subagent_executor, "rename_agent", {"new_name": args["new_name"]}
+        )
+        return result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [PrivacyMode.NORMAL, PrivacyMode.EPHEMERAL])
+async def test_nested_subagent_rename_from_app_server_task_does_not_deadlock(
+    tmp_path, mode
+):
+    """P1 follow-up (the NESTED subagent case neither prior cross-task test reaches):
+    the streamed turn holds the transition lock and dispatches a feature subagent
+    through the REAL parent inline executor onto the codex app-server's reader task;
+    that subagent's OWN inline tool loop then dispatches a durable ``rename_agent``
+    onto a SECOND reader task. Both reader tasks are foreign to the lock owner, so
+    the nested rename can only proceed if the subagent executor
+    (``_make_feature_inline_tool_executor``) captured the owning turn's reentry token
+    and re-presented it — WITHOUT it the turn (blocked awaiting the app-server) and
+    the tool (blocked acquiring the lock the turn holds) DEADLOCK. A ``wait_for``
+    timeout makes a regression fail loudly instead of hanging the suite (#2672 review
+    P1 follow-up)."""
+    async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
+        await raw.add_node(_structural_node("agent"))  # stored label "Kestrel"
+        wrapper = PrivacyEnforcingStorage(raw, mode)
+        lock = ReentrantTransitionLock()
+        rename_agent = _RenameAgent(wrapper, raw, lock)  # _get_privacy_transition_lock → lock
+        feature = _RenameSubagentFeature(rename_agent)
+        harness = _AppServerReaderHarness()
+        host = _NestedSubagentOrchestratorHost(lock, feature, harness)
+
+        # Streaming path: hold the transition lock across the whole "turn", build the
+        # parent inline executor INSIDE the held lock (so it captures this turn's
+        # token), then dispatch the subagent onto a reader-spawned task and AWAIT it —
+        # the turn is now blocked on the app-server result exactly as in production
+        # while BOTH the subagent dispatch and its nested rename run on foreign tasks.
+        async with lock:
+            assert lock.locked()
+            parent_executor = host._make_inline_tool_executor("sess-nested")
+            await harness.ensure_started()
+            _eff, result = await asyncio.wait_for(
+                harness.dispatch(
+                    parent_executor,
+                    "dispatch_subagent",
+                    {"new_name": "NestedRenamed"},
+                ),
+                timeout=5.0,
+            )
+        await harness.stop()
+
+        assert rename_agent._agent_name == "NestedRenamed"  # live name always updates
+        if mode is PrivacyMode.NORMAL:
+            assert result["success"] is True
+            assert result["skipped_privacy"] is False
+            assert result["db_row_written"] is True
+            assert await _metadata_value(raw, "name") == "NestedRenamed"
+            node = await raw.get_node(AGENT_ID)
+            assert node.label == "NestedRenamed"           # durable node renamed
+        else:
+            assert result["skipped_privacy"] is True
+            assert await _metadata_value(raw, "name") is None  # nothing durable
+            node = await raw.get_node(AGENT_ID)
+            assert node.label == "Kestrel"                 # stored node untouched
 
 
 @pytest.mark.asyncio

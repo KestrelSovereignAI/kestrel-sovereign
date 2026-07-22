@@ -170,6 +170,27 @@ def bind_transition_lock_reentry(token: Optional[object]):
         _transition_lock_reentry_token.reset(reset)
 
 
+def current_bound_reentry_token() -> Optional[object]:
+    """Return the transition-lock reentry token currently BOUND on this task, or ``None``.
+
+    Companion to :func:`bind_transition_lock_reentry`. Where
+    :meth:`ReentrantTransitionLock.current_reentry_token` reads the token off the
+    LOCK (meaningful only on the task that OWNS the lock), this reads it off the
+    CONTEXTVAR — i.e. whatever a surrounding :func:`bind_transition_lock_reentry`
+    put there. This is what a NESTED inline executor needs (#2672 review P1
+    follow-up): the feature-subagent inline executor is BUILT on the parent inline
+    executor's reader task, INSIDE that executor's ``bind_transition_lock_reentry``
+    scope, so the owning turn's token is visible here even though this task does not
+    own the lock. The nested executor captures it and re-presents it around its OWN
+    cross-task tool dispatch, so a durable-identity write invoked by a subagent
+    re-enters the owning turn's span instead of deadlocking. Returns ``None`` when no
+    reentry token is bound (the anthropic path, or a subagent not nested under a held
+    turn lock) — so an unrelated background task, which captured no token, still
+    serializes.
+    """
+    return _transition_lock_reentry_token.get()
+
+
 class ReentrantTransitionLock:
     """Task-reentrant async lock for the privacy-transition boundary (#2672 P1).
 
