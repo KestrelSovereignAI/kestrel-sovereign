@@ -279,3 +279,78 @@ test('destroy() removes the BUILT resize handle from a bare container (codex P2)
     handle2.destroy();
     assert.ok(el2.querySelector('.resize-handle'), 'adopted handle survives destroy');
 });
+
+test('built header sits directly above the body when the pane has foreign leading chrome (contiguous two-part unit)', async () => {
+    // An embedder (Frinz) nests its own user panel INSIDE the pane so the whole
+    // column — chrome + list — collapses together. The component must not pin its
+    // header to paneEl.firstChild and sandwich that chrome between header and list.
+    const el = document.createElement('div');
+    const userChrome = document.createElement('div');
+    userChrome.className = 'user-info';
+    userChrome.textContent = 'user@example.com';
+    el.appendChild(userChrome);            // pre-existing leading child
+    document.body.appendChild(el);
+
+    const handle = mountAgentListPane(el, {
+        adapter: fakeAdapter([{ name: 'Sally', status: 'online' }]),
+        onNew: () => {},
+        newLabel: 'Add a companion',
+        title: 'Companions',
+        storageKey: 'a:test-foreign-child',
+        autoLoad: false,
+    });
+    await tick();
+
+    const kids = Array.from(el.children);
+    const iChrome = kids.indexOf(userChrome);
+    const iHeader = kids.indexOf(el.querySelector('.pane-header'));
+    const iBody = kids.indexOf(el.querySelector('.agent-list-pane-body'));
+    const iHandle = kids.indexOf(el.querySelector('.resize-handle'));
+
+    // Foreign chrome stays first; the component's header + body are contiguous
+    // below it (header immediately followed by body), handle last.
+    assert.equal(iChrome, 0, 'foreign user chrome stays at the top');
+    assert.equal(iHeader, 1, 'built header sits right below the foreign chrome');
+    assert.equal(iBody, 2, 'list body is immediately after the header (contiguous)');
+    assert.equal(iBody - iHeader, 1, 'header and body are adjacent — chrome is not sandwiched between them');
+    assert.ok(iHandle > iBody, 'resize handle stays last');
+
+    // Collapse still hides the whole pane (chrome included), since chrome is
+    // inside paneEl.
+    handle.close();
+    assert.equal(el.style.display, 'none', 'collapse hides the whole pane, user chrome included');
+    handle.destroy();
+});
+
+test('adopted body nested inside foreign chrome does not throw (built-header reposition guard)', async () => {
+    // Unusual shape: an existing list body is nested INSIDE a foreign wrapper, so
+    // it is not a direct child of the pane. The built-header reposition must skip
+    // (guarded on body.parentNode === paneEl) rather than throw NotFoundError.
+    // Uses the class-based body selector (.agent-list-pane-body) rather than the
+    // #agents-list id to avoid colliding with the console-adopt test's leftover
+    // pane in the shared JSDOM document.
+    const el = document.createElement('div');
+    const wrapper = document.createElement('div');
+    wrapper.className = 'host-wrapper';
+    const nestedBody = document.createElement('div');
+    nestedBody.className = 'pane-content agent-list-pane-body';
+    wrapper.appendChild(nestedBody);
+    el.appendChild(wrapper);
+    document.body.appendChild(el);
+
+    let handle;
+    assert.doesNotThrow(() => {
+        handle = mountAgentListPane(el, {
+            adapter: fakeAdapter([{ name: 'Emma', status: 'online' }]),
+            storageKey: 'a:test-nested-body',
+            autoLoad: false,
+        });
+    }, 'mount with a nested adopted body must not throw');
+    await tick();
+    // The guard's contract: the nested body is adopted in place (not moved), a
+    // header was still built, and the list mounted into the adopted body.
+    assert.equal(nestedBody.parentNode, wrapper, 'nested body stays where the host put it');
+    assert.ok(el.querySelector('.pane-header'), 'header still built');
+    assert.ok(nestedBody.querySelector('.agent-list-root'), 'list mounts into the adopted nested body');
+    handle.destroy();
+});
