@@ -505,6 +505,24 @@ export function mountAgentListPane(containerEl, config = {}) {
         else paneEl.appendChild(body);
     }
 
+    // A BUILT header sits directly above the body, not pinned to
+    // paneEl.firstChild. When the pane carries foreign leading children — e.g.
+    // an embedder nests its own chrome (a user panel) INSIDE the pane so it
+    // collapses together with the list — pinning the header to the very top
+    // would sandwich that chrome between the header and the list, splitting the
+    // component's two-part unit. Placing the built header adjacent to the body
+    // keeps header + list contiguous below any pre-existing chrome. Adopted
+    // headers (the console's static #agents-pane) are never repositioned — their
+    // placement is the host's to own.
+    // The `body.parentNode === paneEl` guard matters because `body` may have
+    // been ADOPTED via a descendant querySelector (an existing #agents-list can
+    // be nested inside foreign chrome, not a direct pane child); insertBefore
+    // requires a direct child, so in that unusual shape we leave the built
+    // header where it is rather than throw.
+    if (builtHeader && body.parentNode === paneEl && header.nextSibling !== body) {
+        paneEl.insertBefore(header, body);
+    }
+
     // --- Resize handle (adopt existing .resize-handle, else build one) ------
     let resizeHandle = paneEl.querySelector('.resize-handle');
     let builtResizeHandle = false;
