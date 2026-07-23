@@ -5,10 +5,16 @@ Covers the acceptance criteria of issue #2681 for
 
 * the pre-move QUICKSTART paths reproduce as a failing fixture and the current
   file passes after correction,
+* existence is validated for *every* repository-local target — a missing local
+  ``.py``/config file fails, a valid one passes,
+* anchor/fragment *content* validation is Markdown-only: a ``#L10`` line
+  reference never requires a matching heading (on Markdown or code targets),
 * missing files and missing local anchors are reported with actionable output,
 * valid percent-encoded paths and parenthesised destinations are handled,
 * external links are classified as external and never fetched,
-* generated/vendor directories are explicitly excluded from source scanning, and
+* only genuinely generated/archived files are excluded from source scanning —
+  active ``docs/audit`` ledgers and ``docs/demos`` scripts ARE scanned, with a
+  narrow ``demo-output/`` target exception for gitignored screenshot evidence,
 * the live repository passes the guard (the CI invariant).
 """
 
@@ -140,11 +146,55 @@ def test_root_absolute_paths_resolve_from_repo_root(repo):
     assert checker.check_file(src) == []
 
 
-def test_source_code_targets_are_treated_as_cross_references(repo):
-    # A link to a source/config file is an informational cross-reference: the
-    # checker validates documentation navigation, not code layout, so a missing
-    # ``.py`` target is not reported.
-    src = _write(repo, "docs/src.md", "[code](../kestrel_sovereign/nope.py#L10)\n")
+def test_valid_source_code_target_passes(repo):
+    # A link to an existing source/config file resolves: existence is validated
+    # for every repository-local target, not just Markdown and doc assets.
+    _write(repo, "kestrel_sovereign/module.py", "x = 1\n")
+    _write(repo, "config.toml", "[tool]\n")
+    src = _write(
+        repo,
+        "docs/src.md",
+        "[code](../kestrel_sovereign/module.py)\n[cfg](../config.toml)\n",
+    )
+    assert checker.check_file(src) == []
+
+
+def test_missing_source_code_target_is_reported(repo):
+    # A missing ``.py``/config cross-reference is a broken link and must fail —
+    # the checker no longer skips source/config existence.
+    src = _write(repo, "docs/src.md", "[code](../kestrel_sovereign/nope.py)\n")
+    broken = checker.check_file(src)
+    assert len(broken) == 1
+    assert broken[0].reason == "missing file"
+    assert broken[0].raw_target == "../kestrel_sovereign/nope.py"
+    assert broken[0].resolved == "kestrel_sovereign/nope.py"
+
+
+def test_code_line_reference_checks_path_not_anchor(repo):
+    # A ``#L10`` on a code target is a GitHub blob line offset, not a heading
+    # anchor: the path's existence is checked, the fragment is never anchor-
+    # validated. So a valid code line ref passes and a missing one fails on the
+    # path (not the fragment). A non-line ``#fragment`` on code is also ignored.
+    _write(repo, "kestrel_sovereign/module.py", "line1\nline2\n")
+    src = _write(
+        repo,
+        "docs/src.md",
+        "[valid](../kestrel_sovereign/module.py#L10)\n"
+        "[section](../kestrel_sovereign/module.py#anything)\n"
+        "[missing](../kestrel_sovereign/gone.py#L10)\n",
+    )
+    broken = checker.check_file(src)
+    assert len(broken) == 1
+    assert broken[0].raw_target == "../kestrel_sovereign/gone.py#L10"
+    assert broken[0].reason == "missing file"
+    assert broken[0].resolved == "kestrel_sovereign/gone.py"
+
+
+def test_markdown_line_reference_does_not_require_heading(repo):
+    # ``target.md#L10`` is a blob line offset even on a Markdown target: the file
+    # must exist, but no ``L10`` heading anchor is required.
+    _write(repo, "docs/target.md", "# Only Heading\n")
+    src = _write(repo, "docs/src.md", "[line](target.md#L10)\n[range](target.md#L5-L9)\n")
     assert checker.check_file(src) == []
 
 
@@ -215,26 +265,94 @@ def test_external_links_do_not_touch_the_network(repo, monkeypatch):
 def test_excluded_directories_are_explicit_and_documented():
     for excluded in (
         "docs/generated",
-        "docs/audit",
-        "docs/demos",
         "docs/research",
+        "docs/audit/issues",
         "node_modules",
         ".venv",
         ".git",
     ):
         assert excluded in checker.EXCLUDED_SOURCE_DIRS
+    # Active, hand-maintained trees are NOT excluded wholesale: only the narrow
+    # docs/audit/issues archive is skipped; docs/audit ledgers and docs/demos
+    # scripts are scanned in full (generated *files* inside them are handled by
+    # ``_is_generated_doc`` / ``_is_generated_target``, not a directory exclusion).
+    assert "docs/audit" not in checker.EXCLUDED_SOURCE_DIRS
+    assert "docs/demos" not in checker.EXCLUDED_SOURCE_DIRS
 
 
-def test_generated_and_vendor_dirs_are_not_scanned(repo):
+def test_generated_and_archive_dirs_are_not_scanned(repo):
     _write(repo, "README.md", "root\n")
     _write(repo, "docs/good.md", "ok\n")
     _write(repo, "docs/generated/DERIVED.md", "[broken](./nope.md)\n")
-    _write(repo, "docs/audit/SNAP.md", "[broken](./nope.md)\n")
+    _write(repo, "docs/audit/issues/42-snapshot.md", "[broken](./nope.md)\n")
     scanned = {p.relative_to(repo).as_posix() for p in checker.iter_source_files()}
     assert "README.md" in scanned
     assert "docs/good.md" in scanned
     assert "docs/generated/DERIVED.md" not in scanned
-    assert "docs/audit/SNAP.md" not in scanned
+    assert "docs/audit/issues/42-snapshot.md" not in scanned
+
+
+def test_active_audit_and_demo_markdown_are_scanned(repo):
+    # docs/audit ledgers and docs/demos scripts are hand-maintained navigation;
+    # they must be scanned so their relative links are guarded.
+    _write(repo, "docs/audit/FEATURE_MATRIX.md", "# Ledger\n")
+    _write(repo, "docs/demos/DEMO_SCRIPT.md", "# Demo\n")
+    scanned = {p.relative_to(repo).as_posix() for p in checker.iter_source_files()}
+    assert "docs/audit/FEATURE_MATRIX.md" in scanned
+    assert "docs/demos/DEMO_SCRIPT.md" in scanned
+
+
+def test_generated_demo_output_target_is_exempt(repo):
+    # A gitignored, generated-on-demand demo screenshot *image* under
+    # ``demos/**/demo-output/`` is a narrow, documented target exception: the
+    # referring page IS scanned, but the missing capture is not reported. A
+    # missing committed image elsewhere still fails.
+    src = _write(
+        repo,
+        "docs/demos/DEMO_SCRIPT.md",
+        "![shot](../../demos/technical/demo-output/01-did.png)\n"
+        "![logo](../../assets/committed-logo.png)\n",
+    )
+    broken = checker.check_file(src)
+    assert [b.raw_target for b in broken] == ["../../assets/committed-logo.png"]
+    assert broken[0].reason == "missing file"
+
+
+def test_missing_non_image_in_demo_output_is_still_reported(repo):
+    # The exception is image-only: a missing source/config/Markdown file inside a
+    # ``demo-output/`` capture directory is a real broken link and must fail. The
+    # image sibling in the same directory stays exempt.
+    src = _write(
+        repo,
+        "docs/demos/DEMO_SCRIPT.md",
+        "[gen](../../demos/technical/demo-output/generate.py)\n"
+        "[notes](../../demos/technical/demo-output/narration.md)\n"
+        "![shot](../../demos/technical/demo-output/01-did.png)\n",
+    )
+    broken = checker.check_file(src)
+    assert {b.raw_target for b in broken} == {
+        "../../demos/technical/demo-output/generate.py",
+        "../../demos/technical/demo-output/narration.md",
+    }
+    assert all(b.reason == "missing file" for b in broken)
+
+
+def test_demo_output_outside_demos_root_is_not_exempt(repo):
+    # The exception is location-scoped to ``demos/**/demo-output/``. A
+    # ``demo-output/`` directory anywhere else in the tree (here under
+    # ``docs/assets/``) is NOT exempt, so even a missing image is reported.
+    src = _write(
+        repo,
+        "docs/guide.md",
+        "![shot](./assets/demo-output/missing-doc.png)\n"
+        "[src](./assets/demo-output/missing-source.py)\n",
+    )
+    broken = checker.check_file(src)
+    assert {b.raw_target for b in broken} == {
+        "./assets/demo-output/missing-doc.png",
+        "./assets/demo-output/missing-source.py",
+    }
+    assert all(b.reason == "missing file" for b in broken)
 
 
 # --- QUICKSTART regression (issue #2681) -------------------------------------

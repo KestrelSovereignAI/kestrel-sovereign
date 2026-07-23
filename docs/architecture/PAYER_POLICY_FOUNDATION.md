@@ -462,7 +462,7 @@ forward-compat for new resource classes and new payer kinds.
   - `frinz/security/platform_key_storage.py`
   - `frinz/security/user_key_storage.py`
   - `frinz/services/layered_key_resolver.py`
-- Move accompanying test [`tests/unit/test_layered_key_resolver.py`][lkr-test]
+- Move accompanying test `tests/unit/test_layered_key_resolver.py`
   from foundation to Frinz.
 - Update Frinz consumers' import paths:
   - `frinz/endpoints/admin_keys.py`
@@ -851,9 +851,9 @@ env-var presence. CI does not need them; local pre-PR run does.
 [inc-comment]: ../../kestrel_sovereign/inception_service.py
 [ret]: ../../kestrel_sovereign/retirement_service.py
 [sks]: ../../kestrel_sovereign/security/service_key_storage.py
-[skstor]: ../../kestrel_sovereign/features/wallet/filecoin_keys.py
-[wf]: ../../kestrel_sovereign/features/wallet/wallet_feature.py
-[onramp]: ../../kestrel_sovereign/features/wallet/onramp/stripe_onramp.py
+[skstor]: https://github.com/KestrelSovereignAI/kestrel-feature-wallet
+[wf]: https://github.com/KestrelSovereignAI/kestrel-feature-wallet
+[onramp]: https://github.com/KestrelSovereignAI/kestrel-feature-wallet
 [setup]: ../../kestrel_sovereign/setup/
 [crypto-inv]: security/CRYPTO_INVENTORY.md
 [qh-test]: ../../tests/integration/test_quantum_hardening_e2e.py
@@ -865,6 +865,5 @@ env-var presence. CI does not need them; local pre-PR run does.
 [ka292]: ../../kestrel_sovereign/kestrel_agent.py
 [adv-test]: ../../tests/integration/test_constitution_adversarial.py
 [llm-svc]: ../../kestrel_sovereign/llm/service.py
-[lkr-test]: ../../tests/unit/test_layered_key_resolver.py
 [pe]: PROVIDER_ECONOMICS.md
 [da06]: ../diagrams/data-architecture/DA-06-filecoin-lighthouse.md

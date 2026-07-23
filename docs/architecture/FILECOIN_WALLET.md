@@ -106,22 +106,22 @@ Once a Kestrel agent has a wallet configured:
 
 ### Components
 
-- **FilecoinKeyManager** ([features/wallet/filecoin_keys.py](../../features/wallet/filecoin_keys.py))
+- **FilecoinKeyManager** ([`features/wallet/filecoin_keys.py`](https://github.com/KestrelSovereignAI/kestrel-feature-wallet))
   - Generates secp256k1 keypairs
   - Derives t1... addresses (BLAKE2b-160 hash)
   - Encrypts private keys using SecureKeyStorage
 
-- **FilecoinTestnetAdapter** ([features/wallet/filecoin_testnet.py](../../features/wallet/filecoin_testnet.py))
+- **FilecoinTestnetAdapter** ([`features/wallet/filecoin_testnet.py`](https://github.com/KestrelSovereignAI/kestrel-feature-wallet))
   - RPC client for Calibration testnet
   - Uses Glif public endpoint: `https://api.calibration.node.glif.io/rpc/v1`
   - Read-only operations (balance queries)
 
-- **WalletAgent** ([features/wallet/feature.py](../../features/wallet/feature.py))
+- **WalletAgent** ([`features/wallet/feature.py`](https://github.com/KestrelSovereignAI/kestrel-feature-wallet))
   - Multi-currency internal ledger (FIL, USDC, USDT)
   - 90/10 main/audit balance split
   - Persists to SQLite
 
-- **WalletFeature** ([features/wallet/wallet_feature.py](../../features/wallet/wallet_feature.py))
+- **WalletFeature** ([`features/wallet/wallet_feature.py`](https://github.com/KestrelSovereignAI/kestrel-feature-wallet))
   - Agent tool interface
   - Economic gate methods (`is_paid_tier()`, `has_revenue_share()`)
 

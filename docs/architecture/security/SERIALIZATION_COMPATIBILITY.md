@@ -89,7 +89,7 @@ The foundational bug this exposes: **most artifacts today have no `{v, alg}` tag
 
 | Field | v1 (today) | v2 (Wave 5 audit only) |
 |---|---|---|
-| Producer | [`endpoints/auth_oauth.py:182`](../../../endpoints/auth_oauth.py#L182) | Same |
+| Producer | [`endpoints/auth_oauth.py:182`](../../../kestrel_sovereign/endpoints/auth_oauth.py#L182) | Same |
 | Container | Standard JWT, `alg: "HS256"`, secret from env | Same; symmetric, Grover-safe at ≥256-bit secret |
 | Version tag? | JOSE `alg` header | Already version-tagged via JOSE |
 | Algorithm tag? | Yes (`alg`) | Yes; verifier already pins `algorithms=["HS256"]` |

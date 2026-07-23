@@ -111,7 +111,7 @@ AES-256-GCM is **not hybrid** because it doesn't need to be. Local at-rest encry
 
 Old Fernet tokens still decrypt automatically (we kept read-compat) so you don't have to migrate any data on disk.
 
-> **Files:** [`kestrel_sdk/security/aead.py`](../../../kestrel_sdk/security/aead.py), [`security/key_storage.py`](../../../kestrel_sovereign/security/key_storage.py).
+> **Files:** [`kestrel_sdk/security/aead.py`](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/blob/main/kestrel_sdk/security/aead.py), [`security/key_storage.py`](../../../kestrel_sovereign/security/key_storage.py).
 
 ## Why hybrid is the steady state, not a transition
 
