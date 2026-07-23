@@ -2,6 +2,14 @@
 
 Thank you for your interest in contributing. Kestrel is sovereign AI infrastructure — contributions here affect how people own and control their AI agents. We take that responsibility seriously.
 
+<!-- canonical-contributing-notice:start -->
+> **Canonical contributor guide:** this root file is the source of truth. The
+> public-repository copy at `scripts/public_repo_files/CONTRIBUTING.md` is
+> synchronized from it. After editing this guide, run
+> `uv run python scripts/sync_public_repo_files.py --check` before opening a
+> pull request.
+<!-- canonical-contributing-notice:end -->
+
 ---
 
 ## Table of Contents
@@ -18,7 +26,9 @@ Thank you for your interest in contributing. Kestrel is sovereign AI infrastruct
 
 ## Getting started
 
-**Prerequisites:** Python 3.11–3.13, [uv](https://github.com/astral-sh/uv), [Ollama](https://ollama.ai) (for local LLM testing)
+**Prerequisites:** Python 3.11–3.14 and [uv](https://docs.astral.sh/uv/).
+Ollama is optional and only needed when you want to exercise a local model
+route.
 
 ```bash
 git clone https://github.com/KestrelSovereignAI/kestrel-sovereign.git
@@ -29,7 +39,7 @@ uv run kestrel setup       # interactive: writes kestrel.toml [llm] + .env
 # or hand-edit: cp kestrel.toml.example kestrel.toml
 ```
 
-Start Ollama in a separate terminal (needed for tests that exercise the LLM layer):
+To exercise a local Ollama route, start it in a separate terminal:
 
 ```bash
 ollama serve
@@ -39,7 +49,7 @@ ollama pull llama3.2:3b
 Verify the setup:
 
 ```bash
-uv run kestrel health
+uv run kestrel doctor
 ```
 
 ---
@@ -47,28 +57,26 @@ uv run kestrel health
 ## Running tests
 
 ```bash
-# Full test suite
-uv run pytest
+# Unit tests (fast, no external provider required)
+./run_tests.py --unit --skip-check
 
-# Unit tests only (fast, no Ollama required)
-uv run pytest tests/unit/
-
-# Integration tests (requires Ollama running)
-uv run pytest tests/integration/
+# Integration tests (configure any required external provider/service first)
+./run_tests.py --integration --skip-check
 
 # A specific test file
 uv run pytest tests/unit/test_kestrel_agent.py -v
 
-# Parallel (faster on multi-core)
-uv run pytest -n auto
-
-# With coverage
-uv run pytest --cov=kestrel_sovereign --cov-report=term-missing
+# Check the repository's documentation invariants
+uv run python scripts/generate_feature_docs.py --check
+uv run python scripts/docs_verify.py audit --check
+uv run python scripts/sync_public_repo_files.py --check
 ```
 
-Current test suite: ~1000+ unit tests, integration tests for core subsystems, E2E tests for privacy modes.
-
-**Before submitting a PR:** all unit tests must pass. Integration tests are encouraged but not always required (they need a live Ollama instance).
+The test inventory changes frequently; use the commands above and the
+[testing guide](docs/architecture/testing/TESTING_GUIDE.md) instead of relying
+on a fixed test count. Before submitting a PR, run the targeted tests for your
+change and the relevant repository gate. Run integration tests when your change
+or configuration affects an integration path.
 
 ---
 
@@ -124,15 +132,18 @@ By submitting a PR, you confirm that your contributions are made under the Apach
 
 ## Where we need help
 
-These areas are actively accepting contributions. Each links to the tracking issue.
+Browse the current
+[open issues](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues)
+and the `agent-ready` label for work that has a current owner, scope, and
+acceptance criteria.
 
 ### Core infrastructure
 
 | Area | What's needed | Skill level |
 |------|--------------|-------------|
-| Privacy modes | Frontend indicators, storage policy tests | Intermediate |
-| Constitution | Custom constitution authoring tools | Intermediate |
-| LLM service | Additional provider adapters (Anthropic, Gemini) | Advanced |
+| Privacy modes | Storage-policy tests, UX clarity, and documentation | Intermediate |
+| Constitution | Authoring and governance tooling | Intermediate |
+| LLM service | Provider and route adapters | Advanced |
 | Memory / RAG | Retrieval quality improvements, embedding model options | Advanced |
 | Cryptographic anchoring | Audit trail UI, key rotation support | Advanced |
 
@@ -140,7 +151,7 @@ These areas are actively accepting contributions. Each links to the tracking iss
 
 | Area | What's needed | Skill level |
 |------|--------------|-------------|
-| QUICKSTART validation | Test on clean Mac + Linux installs (#184) | Beginner |
+| Installation validation | Test on clean supported platforms | Beginner |
 | Tutorials | "Build your first companion" walkthrough | Intermediate |
 | API reference | Auto-generated docs from type hints | Intermediate |
 
@@ -148,7 +159,7 @@ These areas are actively accepting contributions. Each links to the tracking iss
 
 | Area | What's needed | Skill level |
 |------|--------------|-------------|
-| Frontend auth | Unit tests for `frontend/` auth flows (#254) | Intermediate |
+| Frontend auth | Unit tests for console auth flows | Intermediate |
 | Load testing | Concurrent agent sessions under load | Advanced |
 | E2E | Clean-install automation (Mac/Linux/Windows) | Intermediate |
 
