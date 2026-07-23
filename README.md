@@ -2,14 +2,14 @@
 
 > Build AI agents that nobody can take away from their users — not you, not the cloud, not the next pivot.
 
-Kestrel is a continuously-developing framework for creating autonomous AI agents with cryptographic identity, persistent memory, and constitutional governance. Every agent you deploy is **owned by its user**, governed by **immutable principles**, and able to **remember across every conversation**. The core install is stable enough to run real agents today; the surrounding ecosystem (cloud providers, training adapters, integrations) is actively evolving — see [Feature Stability](#-feature-stability-v018-beta) for the current per-feature picture.
+Kestrel is a pre-1.0 framework for creating autonomous AI agents with cryptographic identity, privacy-aware memory, and constitutional governance. An agent's identity, keys, and local data remain under its operator's control; persistence, cloud routing, response auditing, and specialized integrations are explicit configuration or feature choices. See [Feature maturity](#-feature-maturity) for the current boundaries.
 
 ### Three Pillars
 
 | Pillar | What it means |
 |--------|--------------|
-| **Portable DID identity** | Cryptographic identity the agent's user owns. Exportable, self-hostable, cloud-optional — the agent is not bound to any provider. |
-| **Persistent memory you own** | Local-first memory with full-text search, knowledge graph retrieval, and RAG. Conversations, documents, relationships — searchable and portable. Conversation history, file blobs, identity private keys, and agent-resource bodies encrypt at rest when `KESTREL_DATA_KEY` is set; saved-item and RAG document-chunk bodies are still plaintext columns until application-layer encryption lands (see [Encryption at Rest](#-encryption-at-rest)). SQLAlchemy-backed vector storage is in tree for saved items, document chunks, and conversation history; saved-item and RAG embeddings route through the active LLM provider when that provider supports embeddings. |
+| **Portable DID identity** | Cryptographic identity the operator controls. Exportable, self-hostable, cloud-optional — the agent is not bound to a model provider. |
+| **Privacy-aware memory** | Local-first search, knowledge graph retrieval, and RAG when the selected privacy mode permits persistence. `EPHEMERAL` conversations are intentionally not retained. Conversation history, file blobs, identity private keys, and agent-resource bodies encrypt at rest when `KESTREL_DATA_KEY` is set; saved-item and RAG document-chunk bodies remain plaintext columns until application-layer encryption lands (see [Encryption at Rest](#-encryption-at-rest)). SQLAlchemy-backed vector storage is in tree for saved items, document chunks, and conversation history; saved-item and RAG embeddings route through the active LLM provider when that provider supports embeddings. |
 | **Constitutional governance** | Every agent runs under an audited set of principles enforced *above* the LLM. Genesis audit on creation. Amendment requires cryptographic signature. |
 
 ### What's in core, what's an add-on
@@ -167,7 +167,7 @@ All commands work on Windows, macOS, and Linux. Pass the agent directory as an a
 > the project environment for you.
 
 ```bash
-kestrel health                       # Check prerequisites
+kestrel doctor                       # Check prerequisites and readiness
 kestrel create MyAgent               # Create a new agent
 kestrel start MyAgent                # Start an agent
 kestrel stop MyAgent                 # Stop an agent
@@ -244,7 +244,7 @@ After the new code lands in your checkout, `kestrel update` alone handles subseq
 
 ### Feature management (`kestrel feature`)
 
-Kestrel ships a lean core. Optional feature packages register `Feature` classes through the `kestrel_sovereign.features` entry-point group. Provider packages, such as cloud, voice, and storage backends, register with provider-specific entry-point groups and are consumed by their owning core or feature module.
+Kestrel ships a self-contained core with the local storage, identity, governance, and built-in LLM-routing dependencies needed to run an agent. Optional feature packages register `Feature` classes through the `kestrel_sovereign.features` entry-point group. Provider packages, such as cloud, voice, and storage backends, register with provider-specific entry-point groups and are consumed by their owning core or feature module.
 
 ```bash
 kestrel feature list                   # Show installed + available features
@@ -374,7 +374,8 @@ the complete precedence and managed-container behavior.
 
 Kestrel includes a built-in web interface called the **Sovereign Console**. Once your agent is running, open the URL the CLI printed on start — `http://localhost:8888` for the multi-agent host (default `kestrel start` mode), or the per-agent port for a single-agent start — in any browser; no additional software required.
 
-The console provides 9 tabs:
+The built-in console exposes the following panels; installed features may add
+their own contributions:
 
 | Tab | Description |
 |-----|-------------|
@@ -385,8 +386,10 @@ The console provides 9 tabs:
 | **Tasks** | Monitor background tasks and activity |
 | **Sovereignty** | Manage data sovereignty, backups, and exports |
 | **Resources** | View agent resource usage and configuration |
+| **Metrics** | Inspect the metrics dashboard when the optional Observability feature is installed |
 | **Features** | Browse installed, available, enabled, and disabled features |
 | **Security** | Manage permissions, audit logs, and session security |
+| **Approvals** | Review pending and recent governed invocations |
 
 > **Alternative clients:** The server also exposes an OpenAI-compatible API at `/v1/chat/completions`, so you can connect any OpenAI-compatible client (e.g., [Open WebUI](https://github.com/open-webui/open-webui)) if you prefer.
 
@@ -394,11 +397,11 @@ The console provides 9 tabs:
 
 Kestrel agents are built on several key components:
 
-- **Cryptographic Identity**: Each agent has a unique DID (Decentralized Identifier)
-- **Enhanced Storage**: Local-first memory with SQL-backed stores, SQLAlchemy vector mappings, FTS, knowledge graphs, RAG, and provider-backed embedding generation where the active LLM route supports it
-- **Multi-Model LLM**: Fallback between local (Ollama) and cloud (OpenAI) models
-- **Constitutional Governance**: Immutable principles with interpretive flexibility
-- **Blockchain Anchoring**: Optional integrity verification via blockchain
+- **Cryptographic identity**: each agent has a DID and signed identity lifecycle.
+- **Privacy-aware storage**: local SQL-backed memory, FTS, knowledge graphs, RAG, and provider-backed embeddings where the selected route supports them.
+- **Multi-provider LLM routing**: vendor/route/model configuration for built-in Anthropic/Claude Max, OpenAI/Codex, Gemini/Vertex AI, Ollama, and OpenRouter adapters, with additional providers discoverable through entry points.
+- **Constitutional governance**: immutable articles with governed interpretation and amendment paths.
+- **Local audit anchors**: optional persistent, tamper-evident integrity anchors and verification. Kestrel does not implement external blockchain anchoring.
 
 ## 📁 Project Structure
 
@@ -430,20 +433,21 @@ kestrel-sovereign/
 ## 🎯 Core Features
 
 ### 1. Sovereign Memory
-- **Persistent Storage**: SQL-backed stores with full-text search and knowledge graphs
+- **Privacy-gated Storage**: SQL-backed stores with full-text search and knowledge graphs when the active privacy mode permits persistence
 - **RAG Pipeline**: Document chunking and semantic retrieval through SQLAlchemy-backed vector search where available; embeddings are requested from the active LLM provider route when it advertises embedding support, otherwise search falls back to BM25/LIKE paths
-- **Conversation History**: Complete interaction tracking with metadata
-- **Human-Led Interactions**: Prioritizes user narratives (e.g., storytelling) for preservation and no-loss continuity.
+- **Conversation History**: retained interaction metadata and history outside `EPHEMERAL` mode
+- **Human-Led Interactions**: user-directed memory and retrieval controls rather than an unconditional promise to retain every turn
 
 ### 2. Multi-Model Intelligence
-- **Local First**: Ollama for privacy and cost efficiency
-- **Cloud Fallback**: OpenAI for complex reasoning when needed
-- **Configurable**: Easy provider switching via configuration
+- **Local or cloud routes**: Ollama can keep inference local; configured cloud routes are available when an operator opts in
+- **Vendor/route/model selection**: routing is configured per provider and can use ordered fallbacks
+- **Extensible adapters**: the in-tree adapters and entry-point providers expose their capabilities through the same registry
 
 ### 3. Cryptographic Identity
-- **DID Generation**: Unique decentralized identifiers
-- **Signed Operations**: Cryptographic verification of agent actions
-- **Ownership Transfer**: Secure agent handoff between users
+- **DID Generation**: self-certifying `did:pkh` roots plus supported `did:web` deployment paths
+- **Verification roots**: exported `did:key` identities are supported as self-certifying verification roots; inception does not create new `did:key` agents
+- **Fresh-target verification**: exported self-certifying identities carry public succession evidence; a born-hybrid `did:web` root requires a receiver-owned public-key pin
+- **Bounded trust**: arbitrary network DID documents and package-declared keys are not implicitly trusted; third-party verification remains an explicit integration boundary
 
 ### 4. Constitutional Governance
 - **Immutable Articles**: Core principles that cannot be changed
@@ -452,49 +456,42 @@ kestrel-sovereign/
 
 ### 5. Data Sovereignty & Privacy Modes
 - **Ephemeral Mode**: True off-the-record conversations (nothing stored)
-- **Privacy Granularity**: 5 distinct privacy levels for different use cases
-- **Decentralized Storage**: Filecoin/IPFS integration for vendor independence
+- **Privacy Granularity**: selectable privacy modes for different use cases
+- **Portable data**: operator-controlled local data and identity exports; decentralized-storage integrations are optional surfaces
 - **Optional Economics**: Wallet and autonomous payment flows are installable feature-package surfaces, not part of the base install
 
-## ⚠️ Feature Stability (v0.18+ Beta)
+## ⚠️ Feature maturity
 
-Kestrel covers a wide surface; not all of it ships at the same maturity. **Verified 2026-05-31** against the current feature inventory, runtime registry, package-boundary docs, tests, and recent documentation audit:
+Kestrel is pre-1.0 and its public interfaces may change. The maintained source
+of truth for the in-tree feature inventory, providers, commands, and endpoints
+is [`KESTREL_FEATURES.md`](KESTREL_FEATURES.md). Use `kestrel feature list` or
+the runtime installed-features API, plus the
+[testing guide](docs/architecture/testing/TESTING_GUIDE.md), when evaluating a
+specific deployment. The categories below are qualitative so they do not turn
+into stale release metrics.
 
-### ✅ Stable — battle-tested in production by the maintainers
+### Maintained core
 
-- **Constitutional AI** — Genesis audits, hierarchical permissions, approval queues
-- **DID-based Identity** — `did:pkh` format, portable agent identity, export/import
-- **5-Level Privacy Modes** — EPHEMERAL → ISOLATED → ANONYMOUS → NORMAL → PUBLIC
-- **Memory & Storage** — Local-first memory, FTS, knowledge graph, RAG, SQLAlchemy-backed vector storage, and provider-backed embedding generation are core; providers without embeddings fall back gracefully to keyword search
-- **LLM service** — Vendor/route/model architecture with Anthropic, OpenAI, Vertex AI, Ollama, OpenRouter, xAI, Groq; retry, structured output, streaming, vision
-- **A2A Protocol** — JSON-RPC 2.0 for agent-to-agent communication
-- **Cloud Run deploy** — 90 tests, active maintenance; the most-tested cloud feature
+- **Constitutional governance, privacy modes, identity lifecycle, local storage, and the LLM service** are bundled and exercised as the framework's primary runtime path.
+- **Identity verification** supports fresh-target trust for exported self-certifying roots and pin-gated born-hybrid `did:web` roots. It deliberately does not treat arbitrary third-party DID documents as trusted.
+- **Memory and retrieval** support FTS, knowledge graphs, RAG, vector search, and keyword fallback, subject to the selected privacy mode and provider capabilities.
+- **Local audit anchors** make supported audit data tamper-evident. Per-response auditing is optional and must be enabled by the operator.
+- **Cloud Run** is the maintained serverless deployment path; local and self-hosted operation remain first-class.
 
-### 🧪 Experimental — works on the happy path; gaps to know about
+### Optional or actively evolving surfaces
 
-- **Optional voice feature package** — `kestrel-feature-voice` supplies `VoiceFeature`; cloud TTS/STT providers live in `kestrel-voice-*` provider packages.
-- **Wallet / agent economics** — installable feature package surface, not part of the base install.
-- **RunPod, Vast.ai, and GCP Compute** — cloud provider packages/bridges, not core features; integration tests skip in CI without provider credentials.
-- **Azure Container Apps deploy** — provider stub; not the recommended deploy target.
-- **GitHub code introspection** — file reading, code search, definition lookup, issue tools all work (48 unit tests). The deeper static-analysis surface promised in [`docs/architecture/GITHUB_FEATURE_DESIGN.md`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/architecture/GITHUB_FEATURE_DESIGN.md) (call graphs, inheritance trees, dependency analysis) is not implemented.
-- **Training (LoRA pipeline)** — core ships the protocol + factory; the local-MPS adapter is actively maintained. Cloud-training adapters (RunPod/Vertex/Replicate) work but skip CI without API keys; production-grade adapters are being moved to private packages.
+- **Voice, wallets/economics, channels, observability, and specialized provider backends** are feature or provider packages, not guarantees of the base install.
+- **RunPod, Vast.ai, and GCP Compute** are provider integrations whose live behavior depends on credentials and the selected package.
+- **Training/LoRA** supplies core protocol and local-adapter seams; cloud adapters are evolving separately.
+- **GitHub code introspection** supports its shipped retrieval and issue-tool surface. The deeper static-analysis design in [`docs/architecture/GITHUB_FEATURE_DESIGN.md`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/architecture/GITHUB_FEATURE_DESIGN.md) is not an implementation claim.
 
-### ⚠️ Work-in-progress
+### Known boundaries
 
-- **DID Verification Layer** — generation works; verification is incomplete
-- **E2E Test Stability** — some integration tests are occasionally flaky
-- **API Stability** — APIs may change before v1.0; breaking changes will be documented
+- **APIs and configuration** can change before a 1.0 release.
+- **Turnkey WhatsApp, Telegram, Discord, and Slack adapters; browser automation; and visual workspaces** are not bundled in this framework.
+- **Encryption coverage has explicit limits**; see [Encryption at Rest](#-encryption-at-rest) rather than assuming whole-database encryption.
 
-### ❌ Not implemented in this framework
-
-These are not bundled in the `kestrel-sovereign` base install:
-
-- **Turnkey channel adapters** — WhatsApp, Telegram, Discord, and Slack adapters are not shipped in the base install; the core channels surface is a registry/logging foundation.
-- **Bundled voice cloud backends** — ElevenLabs, Deepgram, and OpenAI voice support live in optional `kestrel-voice-*` provider packages.
-- **Browser Automation** — Chrome/Chromium control
-- **Visual Workspaces** — A2UI canvas, live reload
-
-**Bottom line:** Kestrel is ready for developers building privacy-first, economically-independent AI agents and for the soft-launch preview cohort. Not yet ready for unmanaged production apps or general consumer use. If you find a stability classification above doesn't match your experience, please open an issue — that's the kind of signal we need.
+**Bottom line:** Kestrel is suited to developers and supervised operators building privacy-first, portable agents. Treat a deployment as an engineering system: choose its privacy mode and providers deliberately, verify its enabled features, and do not rely on it as an unmanaged consumer platform.
 
 ## 📚 Documentation
 
