@@ -72,15 +72,9 @@
         "CONTRIBUTING.md",
         "QUICKSTART.md"
       ],
-      "findings": [
-        "missing_local_links"
-      ],
+      "findings": [],
       "missing_code_refs": [],
-      "missing_links": [
-        "CRYPTOGRAPHIC_ANCHORING.md",
-        "architecture/CRYPTOGRAPHIC_ANCHORING.md",
-        "architecture/PRIVACY_MODES.md"
-      ],
+      "missing_links": [],
       "path": "docs/SOVEREIGNTY.md",
       "privacy": "public",
       "render": "public",
@@ -395,15 +389,9 @@
         "scripts/benchmark_memory_quality.py",
         "tests/fixtures/memory_quality_eval.json"
       ],
-      "findings": [
-        "missing_local_links"
-      ],
+      "findings": [],
       "missing_code_refs": [],
-      "missing_links": [
-        "architecture/security/PRIVACY_MODES.md",
-        "architecture/storage/HUMAN_MEMORY_SYSTEM.md",
-        "architecture/storage/STORAGE_ARCHITECTURE.md"
-      ],
+      "missing_links": [],
       "path": "docs/architecture/MEMORY_SYSTEM.md",
       "privacy": "public",
       "render": "internal",
@@ -614,16 +602,9 @@
     },
     {
       "existing_code_refs": [],
-      "findings": [
-        "missing_local_links"
-      ],
+      "findings": [],
       "missing_code_refs": [],
-      "missing_links": [
-        "../../kestrel/database_schema.md",
-        "../../kestrel/migrations/009_eldercare_trusted_circle.sql",
-        "../plans/VENDING_MACHINE_FUNDING.md",
-        "./PRIVACY_MODES.md"
-      ],
+      "missing_links": [],
       "path": "docs/architecture/USER_LIFECYCLE_MANAGEMENT.md",
       "privacy": "public",
       "render": "internal",
@@ -643,8 +624,7 @@
         "tests/integration/test_vastai_e2e.py"
       ],
       "missing_links": [
-        "../docker/simpletuner_api.py",
-        "./RUNPOD_TRAINING.md"
+        "../docker/simpletuner_api.py"
       ],
       "path": "docs/architecture/VASTAI_TRAINING.md",
       "privacy": "public",
@@ -3484,13 +3464,9 @@
     },
     {
       "existing_code_refs": [],
-      "findings": [
-        "missing_local_links"
-      ],
+      "findings": [],
       "missing_code_refs": [],
-      "missing_links": [
-        "../archive/code_reviews/"
-      ],
+      "missing_links": [],
       "path": "docs/code_reviews/README.md",
       "privacy": "internal",
       "render": "internal",
@@ -3744,13 +3720,9 @@
         "AGENTS.md",
         "server.py"
       ],
-      "findings": [
-        "missing_local_links"
-      ],
+      "findings": [],
       "missing_code_refs": [],
-      "missing_links": [
-        "PROJECT_STATUS.md"
-      ],
+      "missing_links": [],
       "path": "docs/development/DEVCONTAINER_QUICKSTART.md",
       "privacy": "internal",
       "render": "internal",
@@ -3760,14 +3732,9 @@
     },
     {
       "existing_code_refs": [],
-      "findings": [
-        "missing_local_links"
-      ],
+      "findings": [],
       "missing_code_refs": [],
-      "missing_links": [
-        "DEEP_CONV.md",
-        "SECURITY_AUDIT_REPORT.md"
-      ],
+      "missing_links": [],
       "path": "docs/development/README.md",
       "privacy": "internal",
       "render": "internal",
@@ -3967,13 +3934,9 @@
     },
     {
       "existing_code_refs": [],
-      "findings": [
-        "missing_local_links"
-      ],
+      "findings": [],
       "missing_code_refs": [],
-      "missing_links": [
-        "01-kestrel-kestrel-overview.md"
-      ],
+      "missing_links": [],
       "path": "docs/diagrams/README.md",
       "privacy": "public",
       "render": "internal",
@@ -4496,13 +4459,9 @@
       "existing_code_refs": [
         "kestrel_sovereign/cli_agent_docker.py"
       ],
-      "findings": [
-        "missing_local_links"
-      ],
+      "findings": [],
       "missing_code_refs": [],
-      "missing_links": [
-        "../plans/AGENT_MULTI_AGENT.md"
-      ],
+      "missing_links": [],
       "path": "docs/user-documentation/EMMA_INCEPTION_GUIDE.md",
       "privacy": "public",
       "render": "internal",

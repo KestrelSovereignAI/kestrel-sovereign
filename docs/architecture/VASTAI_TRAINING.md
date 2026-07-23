@@ -321,5 +321,5 @@ VASTAI_API_KEY=xxx pytest tests/integration/test_vastai_e2e.py -v \
 
 - [VastAI Documentation](https://docs.vast.ai/)
 - [VastAI CLI GitHub](https://github.com/vast-ai/vast-cli)
-- [SimpleTuner API](../docker/simpletuner_api.py)
-- [RunPod Training (Working)](./RUNPOD_TRAINING.md)
+- [SimpleTuner API](../../docker/simpletuner_api.py)
+- [RunPod Training (Working)](./RUNPOD_LORA_TRAINING.md)

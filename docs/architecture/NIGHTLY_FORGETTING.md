@@ -88,7 +88,7 @@ consolidator with a paired KG node, `node_id == episode.id`) has only
 `created_at` / `emotional_arc` — **no importance, access_count, strength, or
 archived fields.** Nothing decays or archives episodes today. This is why an
 age-based sweep was tempting for them, and it is the substantive design gap
-(see [Episode participation](#episode-participation-in-the-decay-model)).
+(see [Episode participation](#2-episode-participation-in-the-decay-model)).
 
 ### The scheduling is fragmented
 

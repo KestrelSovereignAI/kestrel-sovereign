@@ -33,7 +33,6 @@ A series of slide-ready Mermaid diagrams organized for presenting the Kestrel + 
 
 | Document | Topic | Slides |
 |----------|-------|--------|
-| [01-kestrel-kestrel-overview.md](01-kestrel-kestrel-overview.md) | What is Kestrel & Kestrel, how they relate | ~8 |
 | [02-privacy-problem.md](02-privacy-problem.md) | The problem with ChatGPT/current AI, why sovereignty matters | ~6 |
 | [03-privacy-modes.md](03-privacy-modes.md) | Kestrel's 5-tier privacy system (boolean presets) | ~10 |
 | [04-feature-framework.md](04-feature-framework.md) | Dynamic feature system architecture (12 features) | ~10 |

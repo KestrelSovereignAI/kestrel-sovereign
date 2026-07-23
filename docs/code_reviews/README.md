@@ -32,6 +32,6 @@ Point-in-time code review notes that are still useful during active PR or follow
 
 ## Archive Policy
 
-Historical code reviews live in [../archive/code_reviews/](../archive/code_reviews/). Move PR review notes there after confirming the PR is merged/closed and no follow-up issue still depends on the note.
+Historical code reviews are moved into the local-only archive at `docs/archive/code_reviews/` (the `docs/archive/` tree is gitignored, not part of the tracked docs) after confirming the PR is merged/closed and no follow-up issue still depends on the note.
 
 The May 2026 documentation audit tracks this cleanup in [../audit/documentation-2026-05/STALE_ARTIFACTS.md](../audit/documentation-2026-05/STALE_ARTIFACTS.md).

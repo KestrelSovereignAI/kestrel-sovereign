@@ -606,7 +606,7 @@ See `.env.example` for a complete list. Key variables:
 
 ## 🚢 Deployment
 
-Kestrel supports multiple deployment targets. See [KESTREL_FEATURES.md](KESTREL_FEATURES.md#11-deployment) for the full catalog.
+Kestrel supports multiple deployment targets. See [KESTREL_FEATURES.md](KESTREL_FEATURES.md) for the full catalog.
 
 ### Cloud Run (Serverless)
 

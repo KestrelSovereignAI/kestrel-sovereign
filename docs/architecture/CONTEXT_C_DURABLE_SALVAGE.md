@@ -62,7 +62,7 @@ privacy: public
 7. [Failure modes + ops](#failure-modes--ops)
 8. [Pre-C history (what about the spans we have already lost?)](#pre-c-history)
 9. [Acceptance criteria](#acceptance-criteria)
-10. [Open questions for Emma](#open-questions-for-emma)
+10. [Review record](#review-record)
 11. [Source files](#source-files)
 
 ---
@@ -118,13 +118,13 @@ flips off the day C ships.
 
 In both cases the per-row metadata stays untouched: no
 `excluded_from_context` flag, no `summarized_into` link, no anything.
-The `restore_excluded` tool ([`features/context/feature.py:537-593`](kestrel_sovereign/features/context/feature.py))
+The `restore_excluded` tool ([`features/context/feature.py:537-593`](../../kestrel_sovereign/features/context/feature.py))
 finds nothing to restore — because nothing was marked.
 
 ### What `compact_session` already does (the machinery we will reuse)
 
 `ConversationManager.compact_session`
-([`conversation_manager.py:79-243`](kestrel_sovereign/agent/conversation_manager.py))
+([`conversation_manager.py:79-243`](../../kestrel_sovereign/agent/conversation_manager.py))
 already implements the durable-fold pattern:
 
 - LLM-summarises the older messages.
@@ -148,7 +148,7 @@ not block on a summarization round trip.
 
 `SignalDispatcher` exposes `enqueue_signal` with durable execution,
 retry, back-pressure, causation, supervised tasks
-([`signals/dispatcher.py:363-377`](kestrel_sovereign/signals/dispatcher.py)).
+([`signals/dispatcher.py:363-377`](../../kestrel_sovereign/signals/dispatcher.py)).
 C's deferred-summarization can ride on it instead of duplicating that
 machinery (Tortoise #2 from `WORKFLOWS_FEATURE_DESIGN.md` — *the
 symptom is "every multi-stage epic reinvents orchestration"; the
@@ -157,7 +157,7 @@ disease is "no Workflow primitive"*).
 ### Episodes are orthogonal
 
 `MemoryConsolidator._create_episode_from_messages`
-([`storage/memory_consolidator.py:194-202`](kestrel_sovereign/storage/memory_consolidator.py))
+([`storage/memory_consolidator.py:194-202`](../../kestrel_sovereign/storage/memory_consolidator.py))
 only fires when an emotionally-significant cluster is detected. C
 covers the *non-emotional* spans episodes never look at. Both can
 coexist as long as the design prevents double-summarising the same
@@ -321,10 +321,10 @@ Rides on `SignalDispatcher`:
 
 - Salvage write enqueues a `Signal(type="SALVAGE_SUMMARIZE",
   payload={salvage_marker_id, session_id, model_at_salvage})` via
-  `enqueue_signal` ([`signals/dispatcher.py:363`](kestrel_sovereign/signals/dispatcher.py)).
+  `enqueue_signal` ([`signals/dispatcher.py:363`](../../kestrel_sovereign/signals/dispatcher.py)).
 - Handler: load originals via `original_message_ids`, run the same
   summarization prompt `compact_session` uses
-  ([`conversation_manager.py:142-154`](kestrel_sovereign/agent/conversation_manager.py)),
+  ([`conversation_manager.py:142-154`](../../kestrel_sovereign/agent/conversation_manager.py)),
   write the summary text to `salvage_marker.content`, flip
   `salvage_state` to `durable-folded`, increment `summary_attempts`,
   set `summarized_at`.
@@ -349,7 +349,7 @@ under (`model_at_salvage`). The summary prompt is the existing
 
 `MemoryConsolidator._create_episode_from_messages` looks for
 emotionally-significant clusters of messages
-([`memory_consolidator.py:208`](kestrel_sovereign/storage/memory_consolidator.py)).
+([`memory_consolidator.py:208`](../../kestrel_sovereign/storage/memory_consolidator.py)).
 After C lands, those clusters can include `excluded_from_context`
 rows because the originals are still in the table. To prevent double
 summarising, the consolidator:
@@ -403,7 +403,7 @@ folds from prune-driven folds when useful.
 
 ### `restore_excluded` contract
 
-`restore_excluded` ([`features/context/feature.py:537-593`](kestrel_sovereign/features/context/feature.py))
+`restore_excluded` ([`features/context/feature.py:537-593`](../../kestrel_sovereign/features/context/feature.py))
 **continues to work unchanged** for salvage markers. The function
 already operates on `excluded_from_context` and `summarized_into`
 metadata — neither field's shape changes. The user-facing tool
@@ -418,7 +418,7 @@ Already supported by the existing implementation.
 ## UI surfacing
 
 D / #1310 shipped badge slots ready for these states ([chat.js
-`renderContextBreakdown`](kestrel_sovereign/static/js/chat.js)):
+`renderContextBreakdown`](../../kestrel_sovereign/static/js/chat.js)):
 
 | Salvage state | Conversation-row badge | Source of label |
 |---|---|---|
@@ -466,7 +466,7 @@ path. Budget for one prune event:
 - 1× INSERT into `conversation_history` (the salvage marker).
 - 1× UPDATE on `conversation_history` rows by id-list (mark
   originals excluded). Already batched in `compact_session`
-  ([`conversation_manager.py:225-228`](kestrel_sovereign/agent/conversation_manager.py)).
+  ([`conversation_manager.py:225-228`](../../kestrel_sovereign/agent/conversation_manager.py)).
 - 1× enqueue into the SignalDispatcher's queue.
 
 Total expected wall time on SQLite local: < 5ms p99 for typical span
@@ -633,8 +633,8 @@ C implementation (separate sub-ticket) is accepted when:
   `last_attempt_error`) is implemented with the existing
   `excluded_from_context` + `summarized_into` link.
 - [ ] Both prune sites in `ContextManager.build_context`
-  ([pre-trim](kestrel_sovereign/agent/context_manager.py),
-  [post-budget](kestrel_sovereign/agent/context_manager.py))
+  ([pre-trim](../../kestrel_sovereign/agent/context_manager.py),
+  [post-budget](../../kestrel_sovereign/agent/context_manager.py))
   call the salvage primitive **synchronously before** any LLM call
   for the turn proceeds.
 - [ ] LLM call **cannot proceed** if the sync salvage write fails;

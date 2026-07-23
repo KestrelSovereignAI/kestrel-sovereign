@@ -160,7 +160,7 @@ Kestrel has five privacy levels that control what your agent stores. The default
 | `EPHEMERAL` | Nothing stored — true off-the-record mode |
 | `PUBLIC` | Stored with sharing enabled |
 
-See [docs/architecture/PRIVACY_MODES.md](docs/architecture/PRIVACY_MODES.md) for the full reference.
+See [docs/architecture/security/PRIVACY_MODES.md](docs/architecture/security/PRIVACY_MODES.md) for the full reference.
 
 ---
 
@@ -222,8 +222,8 @@ uv run kestrel config ./agent_data/MyAgent    # show agent config
 
 | Guide | What it covers |
 |-------|---------------|
-| [docs/architecture/PRIVACY_MODES.md](docs/architecture/PRIVACY_MODES.md) | Privacy mode internals |
-| [docs/architecture/CRYPTOGRAPHIC_ANCHORING.md](docs/architecture/CRYPTOGRAPHIC_ANCHORING.md) | DID identity and integrity anchoring |
+| [docs/architecture/security/PRIVACY_MODES.md](docs/architecture/security/PRIVACY_MODES.md) | Privacy mode internals |
+| [docs/architecture/security/CRYPTOGRAPHIC_ANCHORING.md](docs/architecture/security/CRYPTOGRAPHIC_ANCHORING.md) | DID identity and integrity anchoring |
 | [docs/principles/KESTREL_CONSTITUTION.md](docs/principles/KESTREL_CONSTITUTION.md) | The default constitutional framework — and how to write your own |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | How to contribute to Kestrel |
 
