@@ -1012,11 +1012,11 @@ Falls back to keyword-based analysis if spaCy is not installed.
 
 ## Further Reading
 
-- [Human Memory System (architecture doc)](architecture/storage/HUMAN_MEMORY_SYSTEM.md) --
+- [Human Memory System (architecture doc)](storage/HUMAN_MEMORY_SYSTEM.md) --
   original design document with integration examples
-- [Storage Architecture](architecture/storage/STORAGE_ARCHITECTURE.md) --
+- [Storage Architecture](storage/STORAGE_ARCHITECTURE.md) --
   the broader storage layer this builds on
-- [Privacy Modes](architecture/security/PRIVACY_MODES.md) --
+- [Privacy Modes](security/PRIVACY_MODES.md) --
   full privacy system documentation
 - Ebbinghaus, H. (1885). *Memory: A Contribution to Experimental Psychology* --
   the research behind the forgetting curve

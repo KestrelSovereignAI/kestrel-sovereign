@@ -243,7 +243,7 @@ Kestrel's sovereignty stack is designed against these adversary classes:
 | Attacker with DB access | Reads stored memories | Fernet encryption at rest |
 | Prompt injection | Overrides constitution in-context | Constitution is in system prompt, not user prompt |
 
-This is not a complete security audit. See [docs/architecture/CRYPTOGRAPHIC_ANCHORING.md](CRYPTOGRAPHIC_ANCHORING.md) for the full cryptographic specification.
+This is not a complete security audit. See [docs/architecture/security/CRYPTOGRAPHIC_ANCHORING.md](architecture/security/CRYPTOGRAPHIC_ANCHORING.md) for the full cryptographic specification.
 
 ---
 
@@ -253,6 +253,6 @@ This is not a complete security audit. See [docs/architecture/CRYPTOGRAPHIC_ANCH
 |----------|---------------|
 | [QUICKSTART.md](../QUICKSTART.md) | Get a sovereign agent running in 30 minutes |
 | [docs/principles/KESTREL_CONSTITUTION.md](principles/KESTREL_CONSTITUTION.md) | The default constitutional framework |
-| [docs/architecture/PRIVACY_MODES.md](architecture/PRIVACY_MODES.md) | Privacy mode internals and policy enforcement |
-| [docs/architecture/CRYPTOGRAPHIC_ANCHORING.md](architecture/CRYPTOGRAPHIC_ANCHORING.md) | DID generation, key management, genesis audit |
+| [docs/architecture/security/PRIVACY_MODES.md](architecture/security/PRIVACY_MODES.md) | Privacy mode internals and policy enforcement |
+| [docs/architecture/security/CRYPTOGRAPHIC_ANCHORING.md](architecture/security/CRYPTOGRAPHIC_ANCHORING.md) | DID generation, key management, genesis audit |
 | [CONTRIBUTING.md](../CONTRIBUTING.md) | How to contribute |

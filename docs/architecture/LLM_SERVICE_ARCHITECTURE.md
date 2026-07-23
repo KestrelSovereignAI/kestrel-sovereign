@@ -363,7 +363,7 @@ New hits in service / adapter / endpoint code fail review.
 - [model_discovery.py](../../kestrel_sovereign/llm/model_discovery.py) — per-vendor discovery, dispatcher.
 - [model_catalog.py](../../kestrel_sovereign/llm/model_catalog.py) — enrichment, overrides.
 - [mandate.py](../../kestrel_sovereign/llm/mandate.py) — selector resolution for role mandates.
-- [endpoints/models.py](../../endpoints/models.py) — `/api/models`, `/api/model/current`, `/api/model/set`.
+- [endpoints/models.py](../../kestrel_sovereign/endpoints/models.py) — `/api/models`, `/api/model/current`, `/api/model/set`.
 - [agent/model_preference.py](../../kestrel_sovereign/agent/model_preference.py) — persistence.
 
 ## Related architecture docs

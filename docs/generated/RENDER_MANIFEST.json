@@ -72,15 +72,9 @@
         "CONTRIBUTING.md",
         "QUICKSTART.md"
       ],
-      "findings": [
-        "missing_local_links"
-      ],
+      "findings": [],
       "missing_code_refs": [],
-      "missing_links": [
-        "CRYPTOGRAPHIC_ANCHORING.md",
-        "architecture/CRYPTOGRAPHIC_ANCHORING.md",
-        "architecture/PRIVACY_MODES.md"
-      ],
+      "missing_links": [],
       "path": "docs/SOVEREIGNTY.md",
       "privacy": "public",
       "render": "public",
@@ -276,18 +270,12 @@
     {
       "existing_code_refs": [],
       "findings": [
-        "missing_local_links",
         "missing_code_refs"
       ],
       "missing_code_refs": [
         "tests/integration/test_filecoin_testnet_e2e.py"
       ],
-      "missing_links": [
-        "../../features/wallet/feature.py",
-        "../../features/wallet/filecoin_keys.py",
-        "../../features/wallet/filecoin_testnet.py",
-        "../../features/wallet/wallet_feature.py"
-      ],
+      "missing_links": [],
       "path": "docs/architecture/FILECOIN_WALLET.md",
       "privacy": "public",
       "render": "internal",
@@ -344,6 +332,7 @@
       "existing_code_refs": [
         "CLAUDE.md",
         "kestrel_sovereign/agent/model_preference.py",
+        "kestrel_sovereign/endpoints/models.py",
         "kestrel_sovereign/llm/adapter.py",
         "kestrel_sovereign/llm/embedding_service.py",
         "kestrel_sovereign/llm/mandate.py",
@@ -352,13 +341,9 @@
         "kestrel_sovereign/llm/provider_registry.py",
         "kestrel_sovereign/llm/service.py"
       ],
-      "findings": [
-        "missing_local_links"
-      ],
+      "findings": [],
       "missing_code_refs": [],
-      "missing_links": [
-        "../../endpoints/models.py"
-      ],
+      "missing_links": [],
       "path": "docs/architecture/LLM_SERVICE_ARCHITECTURE.md",
       "privacy": "public",
       "render": "internal",
@@ -395,15 +380,9 @@
         "scripts/benchmark_memory_quality.py",
         "tests/fixtures/memory_quality_eval.json"
       ],
-      "findings": [
-        "missing_local_links"
-      ],
+      "findings": [],
       "missing_code_refs": [],
-      "missing_links": [
-        "architecture/security/PRIVACY_MODES.md",
-        "architecture/storage/HUMAN_MEMORY_SYSTEM.md",
-        "architecture/storage/STORAGE_ARCHITECTURE.md"
-      ],
+      "missing_links": [],
       "path": "docs/architecture/MEMORY_SYSTEM.md",
       "privacy": "public",
       "render": "internal",
@@ -530,15 +509,12 @@
         "docker/simpletuner_flux1_api.py"
       ],
       "findings": [
-        "missing_local_links",
         "missing_code_refs"
       ],
       "missing_code_refs": [
         "tests/e2e/test_luna_runpod_lora.spec.cjs"
       ],
-      "missing_links": [
-        "/runpod_config.toml"
-      ],
+      "missing_links": [],
       "path": "docs/architecture/RUNPOD_LORA_TRAINING.md",
       "privacy": "public",
       "render": "internal",
@@ -556,16 +532,9 @@
         "kestrel_sovereign/heartbeat.py",
         "kestrel_sovereign/kestrel_agent.py"
       ],
-      "findings": [
-        "missing_local_links",
-        "missing_code_refs"
-      ],
-      "missing_code_refs": [
-        "kestrel_sovereign/features/wallet/onramp/webhook_handler.py"
-      ],
-      "missing_links": [
-        "../../kestrel_sovereign/features/wallet/onramp/webhook_handler.py#L80"
-      ],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
       "path": "docs/architecture/SIGNAL_DISPATCHER.md",
       "privacy": "public",
       "render": "internal",
@@ -614,16 +583,9 @@
     },
     {
       "existing_code_refs": [],
-      "findings": [
-        "missing_local_links"
-      ],
+      "findings": [],
       "missing_code_refs": [],
-      "missing_links": [
-        "../../kestrel/database_schema.md",
-        "../../kestrel/migrations/009_eldercare_trusted_circle.sql",
-        "../plans/VENDING_MACHINE_FUNDING.md",
-        "./PRIVACY_MODES.md"
-      ],
+      "missing_links": [],
       "path": "docs/architecture/USER_LIFECYCLE_MANAGEMENT.md",
       "privacy": "public",
       "render": "internal",
@@ -636,16 +598,12 @@
         "docker/simpletuner_api.py"
       ],
       "findings": [
-        "missing_local_links",
         "missing_code_refs"
       ],
       "missing_code_refs": [
         "tests/integration/test_vastai_e2e.py"
       ],
-      "missing_links": [
-        "../docker/simpletuner_api.py",
-        "./RUNPOD_TRAINING.md"
-      ],
+      "missing_links": [],
       "path": "docs/architecture/VASTAI_TRAINING.md",
       "privacy": "public",
       "render": "internal",
@@ -1043,6 +1001,8 @@
       "existing_code_refs": [
         "examples/demo_sovereignty.py",
         "kestrel_sovereign/agent/constitution.py",
+        "kestrel_sovereign/endpoints/auth_oauth.py",
+        "kestrel_sovereign/endpoints/conversations.py",
         "kestrel_sovereign/features/compute/script_signer.py",
         "kestrel_sovereign/features/webhooks/auth.py",
         "kestrel_sovereign/filecoin_adapter.py",
@@ -1071,21 +1031,9 @@
         "tests/unit/test_key_rotation.py",
         "tests/unit/test_post_response_pipeline.py"
       ],
-      "findings": [
-        "missing_local_links",
-        "missing_code_refs"
-      ],
-      "missing_code_refs": [
-        "kestrel_sovereign/features/wallet/filecoin_keys.py"
-      ],
-      "missing_links": [
-        "../../../endpoints/auth_oauth.py#L182",
-        "../../../endpoints/auth_oauth.py#L185-L190",
-        "../../../endpoints/conversations.py",
-        "../../../kestrel_sdk/security/encryption.py",
-        "../../../kestrel_sovereign/features/wallet/filecoin_keys.py",
-        "../../../kestrel_sovereign/features/wallet/filecoin_keys.py#L66-L78"
-      ],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
       "path": "docs/architecture/security/CRYPTO_INVENTORY.md",
       "privacy": "public",
       "render": "internal",
@@ -1273,13 +1221,9 @@
         "scripts/quantum_rotation_dry_run.py",
         "tests/integration/test_quantum_hardening_e2e.py"
       ],
-      "findings": [
-        "missing_local_links"
-      ],
+      "findings": [],
       "missing_code_refs": [],
-      "missing_links": [
-        "../../../kestrel_sdk/security/aead.py"
-      ],
+      "missing_links": [],
       "path": "docs/architecture/security/SECURITY_OVERVIEW.md",
       "privacy": "public",
       "render": "internal",
@@ -1290,6 +1234,7 @@
     {
       "existing_code_refs": [
         "kestrel_sovereign/agent/constitution.py",
+        "kestrel_sovereign/endpoints/auth_oauth.py",
         "kestrel_sovereign/features/compute/script_signer.py",
         "kestrel_sovereign/identity/signing.py",
         "kestrel_sovereign/inception_service.py",
@@ -1297,13 +1242,9 @@
         "kestrel_sovereign/spawn/mandate.py",
         "kestrel_sovereign/storage/sovereign_adapter.py"
       ],
-      "findings": [
-        "missing_local_links"
-      ],
+      "findings": [],
       "missing_code_refs": [],
-      "missing_links": [
-        "../../../endpoints/auth_oauth.py#L182"
-      ],
+      "missing_links": [],
       "path": "docs/architecture/security/SERIALIZATION_COMPATIBILITY.md",
       "privacy": "public",
       "render": "internal",
@@ -3484,13 +3425,9 @@
     },
     {
       "existing_code_refs": [],
-      "findings": [
-        "missing_local_links"
-      ],
+      "findings": [],
       "missing_code_refs": [],
-      "missing_links": [
-        "../archive/code_reviews/"
-      ],
+      "missing_links": [],
       "path": "docs/code_reviews/README.md",
       "privacy": "internal",
       "render": "internal",
@@ -3744,13 +3681,9 @@
         "AGENTS.md",
         "server.py"
       ],
-      "findings": [
-        "missing_local_links"
-      ],
+      "findings": [],
       "missing_code_refs": [],
-      "missing_links": [
-        "PROJECT_STATUS.md"
-      ],
+      "missing_links": [],
       "path": "docs/development/DEVCONTAINER_QUICKSTART.md",
       "privacy": "internal",
       "render": "internal",
@@ -3760,14 +3693,9 @@
     },
     {
       "existing_code_refs": [],
-      "findings": [
-        "missing_local_links"
-      ],
+      "findings": [],
       "missing_code_refs": [],
-      "missing_links": [
-        "DEEP_CONV.md",
-        "SECURITY_AUDIT_REPORT.md"
-      ],
+      "missing_links": [],
       "path": "docs/development/README.md",
       "privacy": "internal",
       "render": "internal",
@@ -3967,13 +3895,9 @@
     },
     {
       "existing_code_refs": [],
-      "findings": [
-        "missing_local_links"
-      ],
+      "findings": [],
       "missing_code_refs": [],
-      "missing_links": [
-        "01-kestrel-kestrel-overview.md"
-      ],
+      "missing_links": [],
       "path": "docs/diagrams/README.md",
       "privacy": "public",
       "render": "internal",
@@ -4496,13 +4420,9 @@
       "existing_code_refs": [
         "kestrel_sovereign/cli_agent_docker.py"
       ],
-      "findings": [
-        "missing_local_links"
-      ],
+      "findings": [],
       "missing_code_refs": [],
-      "missing_links": [
-        "../plans/AGENT_MULTI_AGENT.md"
-      ],
+      "missing_links": [],
       "path": "docs/user-documentation/EMMA_INCEPTION_GUIDE.md",
       "privacy": "public",
       "render": "internal",

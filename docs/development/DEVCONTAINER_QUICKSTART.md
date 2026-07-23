@@ -254,14 +254,14 @@ docker volume rm kestrel-venv kestrel-agent-data kestrel-logs postgres-data redi
 
 ## 📚 Learn More
 
-- Full documentation: [.devcontainer/README.md](.devcontainer/README.md)
-- Docker status: See root [AGENTS.md](AGENTS.md) or [PROJECT_STATUS.md](PROJECT_STATUS.md)
+- Full documentation: [.devcontainer/README.md](../../.devcontainer/README.md)
+- Docker status: See root [AGENTS.md](../../AGENTS.md)
 - VS Code Dev Containers: https://code.visualstudio.com/docs/devcontainers/containers
 
 ## 🆘 Get Help
 
 If something isn't working:
-1. Check [.devcontainer/README.md](.devcontainer/README.md) troubleshooting section
+1. Check [.devcontainer/README.md](../../.devcontainer/README.md) troubleshooting section
 2. View container logs: `docker-compose -f .devcontainer/docker-compose.devcontainer.yml logs`
 3. Rebuild container: `Cmd+Shift+P` → "Rebuild Container"
 

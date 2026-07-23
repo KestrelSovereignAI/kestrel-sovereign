@@ -48,7 +48,7 @@ privacy: public
    - [C — Unify auto-prune with durable compaction](#c--unify-auto-prune-with-durable-compaction)
    - [D — Legible context: clickable breakdown popup](#d--legible-context-clickable-breakdown-popup)
 5. [Non-goals](#non-goals)
-6. [Review questions for Emma](#review-questions-for-emma)
+6. [Review record](#review-record)
 7. [Source Files](#source-files)
 
 ---

@@ -802,4 +802,4 @@ base_prompt = f"A photo of TRIGGER_WORD, {scene_description}. High quality, phot
 - [SimpleTuner FLUX2.md](https://github.com/bghira/SimpleTuner/blob/main/documentation/quickstart/FLUX2.md)
 - [Flux-Uncensored-V2](https://huggingface.co/enhanceaiteam/Flux-Uncensored-V2) - Uncensored LoRA for FLUX.1-dev
 - [PLAN_RUNPOD_INTEGRATION.md](./PLAN_RUNPOD_INTEGRATION.md) - General RunPod architecture
-- [runpod_config.toml](/runpod_config.toml) - Pod configuration profiles
+- `runpod_config.toml` (create at the repo root; gitignored) - Pod configuration profiles

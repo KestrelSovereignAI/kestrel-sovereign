@@ -142,9 +142,9 @@ ad hoc.
 | OpenRouter per-agent provisioning service | [`features/llm_keys/openrouter_provisioning.py`][orp] | Built, tested, NOT called from inception ([`inception_service.py:500-501`][inc-comment] commented out) |
 | Retirement guard for OpenRouter key | [`retirement_service.py:197-202`][ret] | Already defensive (`if openrouter_key_hash:`) |
 | Encrypted vendor key store, agent-DID-scoped | [`security/service_key_storage.py`][sks] | `lighthouse`, `openrouter`, `anthropic`, `openai`, `github`, `runpod`, `vastai` listed as supported providers |
-| Encrypted private-key store for wallets | [`features/wallet/filecoin_keys.py`][skstor] | Used by wallet feature; encrypts with `KESTREL_DATA_KEY` |
-| Multi-currency agent wallets | [`features/wallet/wallet_feature.py`][wf] | FIL, USDC, USDT on FEVM/Ethereum/Polygon |
-| Stripe **on-ramp** (fiat → crypto, into agent wallet) | [`features/wallet/onramp/stripe_onramp.py`][onramp] | Built; card never enters Kestrel |
+| Encrypted private-key store for wallets | [`kestrel_feature_wallet/filecoin_keys.py`][skstor] | Used by wallet feature; encrypts with `KESTREL_DATA_KEY` |
+| Multi-currency agent wallets | [`kestrel_feature_wallet/wallet_feature.py`][wf] | FIL, USDC, USDT on FEVM/Ethereum/Polygon |
+| Stripe **on-ramp** (fiat → crypto, into agent wallet) | [`kestrel_feature_wallet/onramp/stripe_onramp.py`][onramp] | Built; card never enters Kestrel |
 | Lighthouse provider with unused key resolver hook | [`storage/providers/lighthouse_provider.py:72-82`][lhp] | Constructor accepts `key_resolver`; `_get_api_key()` delegates to it; never wired |
 | Setup wizard with step modules | [`kestrel_sovereign/setup/`][setup] | Steps: agent, emancipation, integrations, keys, llm, talon, verify |
 | Emma-named scripts (audited individually) | `scripts/provision_emma_openrouter.py`, `scripts/rotate_emma_key.py`, `scripts/emma_scheduler.py` | First two have real functionality with bad Emma-defaulted names (provision-and-persist-key, AEAD passphrase rotation) — generalize. Third is one-off Emma scaffolding (born in initial commit, never modified, never invoked anywhere) — delete. Phase 0 handles all three. |
@@ -462,7 +462,7 @@ forward-compat for new resource classes and new payer kinds.
   - `frinz/security/platform_key_storage.py`
   - `frinz/security/user_key_storage.py`
   - `frinz/services/layered_key_resolver.py`
-- Move accompanying test [`tests/unit/test_layered_key_resolver.py`][lkr-test]
+- Move accompanying test `tests/unit/test_layered_key_resolver.py`
   from foundation to Frinz.
 - Update Frinz consumers' import paths:
   - `frinz/endpoints/admin_keys.py`
@@ -851,9 +851,9 @@ env-var presence. CI does not need them; local pre-PR run does.
 [inc-comment]: ../../kestrel_sovereign/inception_service.py
 [ret]: ../../kestrel_sovereign/retirement_service.py
 [sks]: ../../kestrel_sovereign/security/service_key_storage.py
-[skstor]: ../../kestrel_sovereign/features/wallet/filecoin_keys.py
-[wf]: ../../kestrel_sovereign/features/wallet/wallet_feature.py
-[onramp]: ../../kestrel_sovereign/features/wallet/onramp/stripe_onramp.py
+[skstor]: https://github.com/KestrelSovereignAI/kestrel-feature-wallet/blob/main/kestrel_feature_wallet/filecoin_keys.py
+[wf]: https://github.com/KestrelSovereignAI/kestrel-feature-wallet/blob/main/kestrel_feature_wallet/wallet_feature.py
+[onramp]: https://github.com/KestrelSovereignAI/kestrel-feature-wallet/blob/main/kestrel_feature_wallet/onramp/stripe_onramp.py
 [setup]: ../../kestrel_sovereign/setup/
 [crypto-inv]: security/CRYPTO_INVENTORY.md
 [qh-test]: ../../tests/integration/test_quantum_hardening_e2e.py
@@ -865,6 +865,5 @@ env-var presence. CI does not need them; local pre-PR run does.
 [ka292]: ../../kestrel_sovereign/kestrel_agent.py
 [adv-test]: ../../tests/integration/test_constitution_adversarial.py
 [llm-svc]: ../../kestrel_sovereign/llm/service.py
-[lkr-test]: ../../tests/unit/test_layered_key_resolver.py
 [pe]: PROVIDER_ECONOMICS.md
 [da06]: ../diagrams/data-architecture/DA-06-filecoin-lighthouse.md

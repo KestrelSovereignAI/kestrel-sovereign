@@ -472,7 +472,4 @@ TEST_USER_PATTERNS = [
 
 ## Related Documents
 
-- [Database Schema](../../kestrel/database_schema.md)
-- [Privacy Modes](./PRIVACY_MODES.md)
-- [Vending Machine Funding](../plans/VENDING_MACHINE_FUNDING.md)
-- [Eldercare Trusted Circle](../../kestrel/migrations/009_eldercare_trusted_circle.sql)
+- [Privacy Modes](security/PRIVACY_MODES.md)
