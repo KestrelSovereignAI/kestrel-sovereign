@@ -588,6 +588,21 @@ class SchedulerFeature(Feature):
         # No hooks manager (bare test host) — execute directly.
         return await agent_tool.execute(**effective_args)
 
+    @staticmethod
+    def _feature_enabled(feature: Any) -> bool:
+        """Whether ``feature`` is live-enabled and safe for the scheduler to run.
+
+        A soft-disabled feature stays in ``agent.features`` with
+        ``enabled=False`` but has ALL of its live surfaces detached (tools,
+        hooks, A2A agent, routes) by ``_unregister_feature_runtime``. The
+        scheduler must treat it as absent so a persisted schedule can't invoke a
+        disabled tool on a background tick (#2522) — the one execution path that
+        never re-checks the orchestrator's own ``enabled`` gate. Mirrors that
+        gate's ``getattr(feature, "enabled", True)`` exactly, so a feature that
+        never set the flag (the normal booted state) stays executable.
+        """
+        return bool(getattr(feature, "enabled", True))
+
     async def _lookup_and_run_tool(self, task_name: str, args: dict) -> Any:
         """Tool-lookup body shared by every cron source handler that
         delegates to a feature tool. This is the existing executor's
@@ -596,10 +611,16 @@ class SchedulerFeature(Feature):
 
         Every resolved tool runs through ``_run_tool_hook_gated`` so the
         PRE_TOOL_USE/POST_TOOL_USE hooks and the SecurityHook DENY/ASK
-        gate fire on each tick (F245)."""
+        gate fire on each tick (F245). Disabled features are skipped so a
+        persisted schedule cannot invoke a soft-disabled tool (#2522)."""
         features = getattr(self.agent, "features", {})
         for feature in features.values():
             if not hasattr(feature, "get_tools"):
+                continue
+            if not self._feature_enabled(feature):
+                # A disabled feature's tools are detached from every other live
+                # surface; the scheduler skips it too (handled benignly below if
+                # the task actually resolves to it).
                 continue
             for agent_tool in feature.get_tools():
                 if agent_tool.name == task_name:
@@ -627,6 +648,31 @@ class SchedulerFeature(Feature):
                 if isinstance(result, str):
                     return result
                 return json.dumps(_serialize_tool_result(result), default=str)
+
+        # A persisted schedule that names a tool owned by a NOW-disabled feature
+        # must not execute it. Skip benignly (like the startup-order race below)
+        # rather than raising, so a disable doesn't spam the execution log with a
+        # failure every tick; re-enabling the feature restores execution on the
+        # next tick. Detected AFTER the enabled-feature search so an enabled
+        # owner always wins, and distinguished from a genuinely-unknown task so
+        # the operator sees the real reason.
+        for feature in features.values():
+            if not hasattr(feature, "get_tools") or self._feature_enabled(feature):
+                continue
+            try:
+                disabled_tools = feature.get_tools()
+            except Exception:  # noqa: BLE001 - a broken feature can't block others
+                continue
+            if any(getattr(t, "name", None) == task_name for t in disabled_tools):
+                feature_name = getattr(feature, "name", type(feature).__name__)
+                logger.info(
+                    "Scheduler: task %r is owned by disabled feature %r; "
+                    "skipping this tick", task_name, feature_name,
+                )
+                return (
+                    f"skipped: {task_name} owning feature {feature_name!r} "
+                    "is disabled"
+                )
 
         # A persisted built-in cron task (e.g. restart_coordinator) can
         # fire on the first scheduler tick after a restart BEFORE its
@@ -674,6 +720,12 @@ class SchedulerFeature(Feature):
         features = getattr(self.agent, "features", {}) or {}
         for feature in features.values():
             if not hasattr(feature, "get_tools"):
+                continue
+            if not self._feature_enabled(feature):
+                # A disabled feature's tools are not executable, so they are not
+                # schedulable — mirrors the runtime executor's skip (#2522), so
+                # schedule_add can't accept a name that would then be skipped
+                # every tick.
                 continue
             try:
                 for agent_tool in feature.get_tools():
@@ -732,6 +784,12 @@ class SchedulerFeature(Feature):
         # its permissions: keyed by the agent.features name (feature.name).
         for feature_name, feature in features.items():
             if not hasattr(feature, "get_tools"):
+                continue
+            if not self._feature_enabled(feature):
+                # A disabled feature's tool is not schedulable at all
+                # (rejected by _scheduler_executable_task_names), so its
+                # permission row is irrelevant here — skip it for consistency
+                # with the runtime executor (#2522).
                 continue
             try:
                 tools = feature.get_tools()

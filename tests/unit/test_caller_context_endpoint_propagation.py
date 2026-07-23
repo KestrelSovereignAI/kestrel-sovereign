@@ -35,6 +35,7 @@ def _prepare_app(agent):
         "lifespan": app.router.lifespan_context,
         "agent": getattr(app.state, "agent", None),
         "manager": getattr(app.state, "agent_manager", None),
+        "route_count": len(app.routes),
     }
     app.router.lifespan_context = noop_lifespan
     app.state.agent = agent
@@ -46,6 +47,12 @@ def _restore_app(app, original):
     app.router.lifespan_context = original["lifespan"]
     app.state.agent = original["agent"]
     app.state.agent_manager = original["manager"]
+    # The /api/bridge/* cases pull the per-agent bridge router into the shared
+    # ``server.app`` singleton with ``app.include_router(get_router())``. Drop
+    # any routes the test appended so they don't leak into later tests that
+    # assert the app's route set (e.g. the #2522 route-gate suite counting a
+    # single mounted /api/bridge/health).
+    del app.routes[original["route_count"]:]
 
 
 def _capturing_agent():

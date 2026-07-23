@@ -165,47 +165,136 @@ class WaitRegistry:
     Lives at ``agent.wait_registry`` (mirrors ``agent.signal_registry``).
     Features register one provider per handle kind; the generic ``wait``
     tool and the Wave-2 reconciler resolve kinds here.
+
+    Ownership per kind is a **stack**, not a single slot plus a saved
+    "previous" provider (#2522 P3 redesign). Each ``register`` pushes; the
+    effective provider for a kind is the top of its stack. A displaced
+    predecessor sits *beneath* the provider that displaced it and becomes
+    effective again only when every provider above it is torn down. This is
+    what makes teardown restore the nearest **still-live** predecessor: a
+    provider removed from the *middle* of the stack (e.g. a soft-disabled
+    feature that a newer provider already superseded) is gone for good and can
+    never be resurrected by a later teardown. The old single-slot design saved
+    each owner's ``previous`` at registration time, so a three-deep chain
+    ``host → A → B`` would, on ``disable A`` then ``disable B``, restore B's
+    saved ``previous`` (== A) and resurrect the disabled A — the exact bug this
+    redesign fixes.
     """
 
     def __init__(self) -> None:
-        self._providers: Dict[str, Waitable] = {}
+        # kind -> ownership stack, oldest (host) first, current (effective) last.
+        self._stacks: Dict[str, List[Waitable]] = {}
 
-    def register(self, provider: Waitable, *, replace: bool = False) -> None:
-        """Register ``provider`` under its ``kind``.
-
-        Raises ``ValueError`` on a malformed kind or a duplicate kind
-        (unless ``replace=True``) — a silent overwrite would mask two
-        features fighting over the same namespace.
-        """
+    @staticmethod
+    def _validate_kind(provider: Waitable) -> str:
         kind = getattr(provider, "kind", None)
         if not kind or not isinstance(kind, str) or ":" in kind:
             raise ValueError(
                 f"Waitable.kind must be a non-empty ':'-free string, got {kind!r}"
             )
-        if kind in self._providers and not replace:
+        return kind
+
+    def register(self, provider: Waitable, *, replace: bool = False) -> None:
+        """Push ``provider`` onto its ``kind``'s ownership stack.
+
+        Raises ``ValueError`` on a malformed kind or a duplicate kind
+        (unless ``replace=True``) — a silent overwrite would mask two features
+        fighting over the same namespace. Re-registering the SAME provider
+        object is idempotent: it is moved to the top of the stack rather than
+        stacked as a duplicate, so a feature whose ``initialize()`` /
+        ``post_all_features_loaded`` re-runs in one live cycle never buries a
+        second copy of itself.
+        """
+        kind = self._validate_kind(provider)
+        stack = self._stacks.setdefault(kind, [])
+
+        # Idempotent re-registration: drop any existing occurrence of THIS exact
+        # provider so it ends up on top exactly once (no duplicate stack entry).
+        existing = [i for i, p in enumerate(stack) if p is provider]
+        for index in reversed(existing):
+            del stack[index]
+
+        if stack and not replace and not existing:
             raise ValueError(
                 f"a Waitable provider for kind {kind!r} is already registered"
             )
-        self._providers[kind] = provider
-        logger.debug("registered wait provider kind=%s (%s)", kind, type(provider).__name__)
+        stack.append(provider)
+        logger.debug(
+            "registered wait provider kind=%s (%s), depth=%d",
+            kind, type(provider).__name__, len(stack),
+        )
 
     def unregister(self, kind: str) -> bool:
-        """Remove the provider registered under ``kind``. Returns True if present.
+        """Pop the CURRENT (top) provider off ``kind``'s stack. Returns True if present.
 
-        The deliberate inverse of :meth:`register`, used by feature teardown /
-        boot rollback so a feature that registered a ``task:`` / ``talon:`` wait
-        provider in ``post_all_features_loaded`` does not leave it stranded in
-        the registry when the feature is disabled or a later boot phase fails
-        (kestrel-sovereign#2522). Idempotent: unregistering an absent kind is a
-        benign ``False``.
+        The deliberate inverse of a bare :meth:`register`. Feature teardown /
+        boot rollback should instead use :meth:`deregister` (identity-aware) so
+        a feature only ever removes *its own* provider; this bare pop is kept
+        for callers that just want to drop the current provider for a kind.
+        Idempotent: popping an absent/empty kind is a benign ``False``.
         """
-        return self._providers.pop(kind, None) is not None
+        stack = self._stacks.get(kind)
+        if not stack:
+            return False
+        stack.pop()
+        if not stack:
+            self._stacks.pop(kind, None)
+        return True
+
+    def deregister(self, kind: str, provider: Waitable) -> bool:
+        """Remove ``provider`` from ``kind``'s stack by object identity, wherever
+        it sits, and let the nearest still-live predecessor become effective
+        (#2522 P3).
+
+        This is the identity-aware teardown primitive feature shutdown / boot
+        rollback use. Removing the CURRENT (top) provider restores whatever is
+        beneath it — the nearest predecessor that is still on the stack, never a
+        provider some earlier teardown already removed. Removing a MIDDLE
+        provider (one a newer owner already superseded) simply drops it without
+        disturbing the current owner. Identity is checked with ``is``: two
+        distinct providers of the same kind are different owners.
+
+        Returns True iff ``provider`` was the current (top) provider before
+        removal — i.e. its removal changed which provider is effective.
+        """
+        stack = self._stacks.get(kind)
+        if not stack:
+            return False
+        was_current = stack[-1] is provider
+        removed = False
+        for index in range(len(stack) - 1, -1, -1):
+            if stack[index] is provider:
+                del stack[index]
+                removed = True
+                break
+        if not stack:
+            self._stacks.pop(kind, None)
+        return removed and was_current
+
+    def restore_if_current(
+        self,
+        kind: str,
+        expected: Waitable,
+        previous: Optional[Waitable] = None,
+    ) -> bool:
+        """Back-compat teardown shim over :meth:`deregister` (#2522 P3).
+
+        Removes ``expected`` from ``kind``'s stack so the nearest still-live
+        predecessor becomes effective. ``previous`` is retained only for call
+        compatibility and is IGNORED: the per-kind stack is now the single
+        source of truth for what gets restored, so teardown can never resurrect
+        a disabled predecessor by trusting a stale saved value. Returns True
+        when ``expected`` was the current provider (its removal restored a
+        predecessor).
+        """
+        return self.deregister(kind, expected)
 
     def get(self, kind: str) -> Optional[Waitable]:
-        return self._providers.get(kind)
+        stack = self._stacks.get(kind)
+        return stack[-1] if stack else None
 
     def kinds(self) -> List[str]:
-        return sorted(self._providers)
+        return sorted(kind for kind, stack in self._stacks.items() if stack)
 
     async def wait(
         self,
@@ -220,7 +309,7 @@ class WaitRegistry:
             kind, handle = parse_ref(ref)
         except ValueError as exc:
             return ToolResult.failed(str(exc))
-        provider = self._providers.get(kind)
+        provider = self.get(kind)
         if provider is None:
             known = ", ".join(self.kinds()) or "(none registered)"
             return ToolResult.failed(

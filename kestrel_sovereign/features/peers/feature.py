@@ -1000,10 +1000,16 @@ class PeersFeature(Feature):
                 },
             )
 
-        # Spawn the supervisor as an agent-owned background task. It
-        # runs the SSE loop, fires the a2a.question_answered signal on
-        # terminal frame, and exits.
-        self.agent._track_background_task(
+        # Spawn the supervisor as a FEATURE-owned background task. It runs the
+        # SSE loop, fires the a2a.question_answered signal on terminal frame,
+        # and exits. Still agent-tracked (auto-cancelled at full agent shutdown
+        # by ``_shutdown_background_tasks``), but also owned by this feature so
+        # runtime disable / boot rollback / soft disable cancel it via
+        # ``Feature.shutdown()`` — an agent-only task would keep supervising
+        # (and could still fire a resumption signal) after this feature is torn
+        # down (kestrel-sovereign#2522 P1). Same ownership as the startup-replay
+        # supervisor and the hourly expiry sweep.
+        self._track_owned_background_task(
             self._supervise_a2a_question(
                 task_id=task_id,
                 recipient=recipient,
@@ -1759,9 +1765,16 @@ class PeersFeature(Feature):
         reply_text: str,
         causation_chain: Optional[list],
     ) -> None:
-        """Schedule near-term retries for a restored terminal wake payload."""
-        import asyncio
+        """Schedule near-term retries for a restored terminal wake payload.
 
+        The retry loop is a FEATURE-owned background task (#2522 P1): it is
+        reachable during boot startup-replay (a restored WAITING row whose
+        wakeup signal failed to enqueue), so an agent-only task could keep
+        retrying — and eventually fire a resumption signal — after boot
+        rollback / soft disable tore this feature down. Owning it means
+        ``Feature.shutdown()`` cancels it, while ``_track_owned_background_task``
+        still registers it in the agent's global reap set for full shutdown.
+        """
         coro = self._retry_restored_question_answered_signal(
             task_id=task_id,
             recipient=recipient,
@@ -1771,17 +1784,10 @@ class PeersFeature(Feature):
             reply_text=reply_text,
             causation_chain=causation_chain,
         )
-        tracker = getattr(self.agent, "_track_background_task", None)
-        if callable(tracker):
-            tracker(coro, name=f"a2a_question_answered_retry:{recipient}:{task_id}")
-        else:
-            task = asyncio.create_task(coro)
-            tasks = getattr(self, "_question_answered_retry_tasks", None)
-            if tasks is None:
-                tasks = set()
-                self._question_answered_retry_tasks = tasks
-            tasks.add(task)
-            task.add_done_callback(tasks.discard)
+        self._track_owned_background_task(
+            coro,
+            name=f"a2a_question_answered_retry:{recipient}:{task_id}",
+        )
 
     async def _retry_restored_question_answered_signal(
         self,
@@ -1973,9 +1979,14 @@ class PeersFeature(Feature):
                 e, exc_info=True,
             )
 
-        # Hourly sweep as agent-owned background task. Auto-cancelled
-        # on agent shutdown by ``_shutdown_background_tasks``.
-        agent._track_background_task(
+        # Hourly sweep as a FEATURE-owned background task. Still agent-tracked
+        # (auto-cancelled at full agent shutdown by
+        # ``_shutdown_background_tasks``), but also owned by this feature so
+        # runtime disable / boot rollback / soft disable cancel it via
+        # ``Feature.shutdown()`` — the agent's global reap only fires at full
+        # shutdown, so an agent-only task would keep sweeping after this feature
+        # is torn down (kestrel-sovereign#2522 P1).
+        self._track_owned_background_task(
             self._hourly_expiry_sweep_loop(store),
             name="a2a_question_expiry_sweep",
         )
@@ -2025,8 +2036,12 @@ class PeersFeature(Feature):
             # Within deadline — spawn supervisor. Chain is not
             # persisted across restarts; the resumed signal fires with
             # an empty chain and the dispatcher applies its normal
-            # depth-bounded cycle check from scratch.
-            self.agent._track_background_task(
+            # depth-bounded cycle check from scratch. FEATURE-owned (like
+            # the hourly sweep) so boot rollback / soft disable cancel it
+            # via ``Feature.shutdown()`` — an agent-only task would keep
+            # supervising (and could still fire a resumption signal) after
+            # this feature is torn down (kestrel-sovereign#2522 P1).
+            self._track_owned_background_task(
                 self._supervise_a2a_question(
                     task_id=row.task_id,
                     recipient=row.recipient,

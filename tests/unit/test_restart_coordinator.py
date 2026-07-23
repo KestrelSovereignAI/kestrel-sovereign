@@ -2528,3 +2528,101 @@ async def test_reattach_ignores_incidental_not_for_merge_tag_line(tmp_path):
     assert "skip" not in out["stdout_tail"]
     assert _git_out(clone, "symbolic-ref", "HEAD") == "refs/heads/main"
     assert _git_out(clone, "rev-parse", "refs/heads/main") == origin_tip
+
+
+# ---------------------------------------------------------------------------
+# The in-flight restart-completed ack supervisor is FEATURE-owned, so runtime
+# disable / boot rollback cancel it — a delayed acknowledgement must never
+# survive a disabled feature and flag wake_delivered against torn-down state
+# (kestrel-sovereign#2522 P2).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_disable_cancels_inflight_ack_supervisor(tmp_path):
+    """``_spawn_ack_supervisor`` awaits ``handle.wait()`` and only then flags
+    ``wake_delivered``. It must be a FEATURE-owned background task so
+    ``Feature.shutdown()`` (what runtime disable / boot rollback call) cancels
+    the in-flight wait — before the fix it lived only in the agent-global set,
+    which is reaped ONLY at full agent shutdown, so a disabled feature's ack
+    survived and could later mark a wake delivered against torn-down state."""
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+
+    row = SimpleNamespace(id="req-inflight")
+    feat._inflight_restart_acks.add(row.id)
+
+    # A dispatch handle whose wake never lands on its own, so the ack supervisor
+    # is a genuinely PENDING task at disable time.
+    started = asyncio.Event()
+
+    class _BlockingHandle:
+        async def wait(self):
+            started.set()
+            await asyncio.Event().wait()  # blocks until cancelled
+
+    marked: list = []
+
+    async def _spy_mark_wake_delivered(r):
+        marked.append(r)
+
+    feat._mark_wake_delivered = _spy_mark_wake_delivered
+
+    feat._spawn_ack_supervisor(row, _BlockingHandle())
+
+    # The ack supervisor is FEATURE-owned AND still agent-tracked underneath.
+    owned = list(feat._owned_background_tasks)
+    assert len(owned) == 1
+    ack_task = owned[0]
+    assert ack_task in agent.background_tasks
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    assert not ack_task.done()
+
+    # Canonical feature disable (runtime disable / boot rollback both call
+    # Feature.shutdown()).
+    await feat.shutdown()
+
+    # The in-flight ack is cancelled — no delayed acknowledgement survives.
+    assert ack_task.done()
+    assert ack_task.cancelled()
+    assert feat._owned_background_tasks == []
+    assert marked == [], "a cancelled ack must NOT flag wake_delivered"
+    # The in-flight marker is released on cancellation (the ack's finally).
+    assert row.id not in feat._inflight_restart_acks
+
+
+@pytest.mark.asyncio
+async def test_delivered_ack_supervisor_self_removes_from_owned(tmp_path):
+    """A completed ack must not linger in the feature's owned-task list — the
+    owned tracker self-cleans on completion (mirroring the agent's global set),
+    so repeated per-restart acks can't accumulate finished-task refs. Proves the
+    ownership change stays leak-free on the happy path too (#2522 P2)."""
+    from kestrel_sdk.signals import Status
+
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="pre-restart",
+    )
+    await update_status(
+        backend, req.id, status="executing", expected_current_status="pending",
+    )
+    row = await get_request(backend, req.id)
+
+    class _OkHandle:
+        async def wait(self):
+            return SimpleNamespace(status=Status.OK)
+
+    feat._inflight_restart_acks.add(row.id)
+    feat._spawn_ack_supervisor(row, _OkHandle())
+
+    ack_task = list(feat._owned_background_tasks)[-1]
+    await agent.drain_background_tasks()
+
+    # The delivered ack landed...
+    assert ack_task.done() and not ack_task.cancelled()
+    updated = await get_request(backend, req.id)
+    assert updated.wake_delivered is True
+    # ...and self-removed from the owned list (no accumulation).
+    assert ack_task not in feat._owned_background_tasks

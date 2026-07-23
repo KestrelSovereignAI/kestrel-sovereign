@@ -3124,29 +3124,44 @@ class KestrelAgent(
         await store.clear(self.did, kind, name)
 
     async def _shutdown_failed_feature(self, feature: Feature) -> None:
-        """Release the resources of a feature whose registration failed mid-way.
+        """Drain EVERY registration of a feature whose registration failed mid-way.
 
-        ``feature.initialize()`` may have opened a connection, started a worker,
-        or registered signal sources before a later registration step raised —
-        and the feature may or may not have made it into ``self.features`` yet.
-        Its ``shutdown()`` unregisters its owned signal sources and stops its
-        workers (base ``Feature.shutdown`` #2522 P2), so call it here and drop
-        the feature from ``self.features`` if present. Boot rollback
-        (``_boot_teardown_features``) then never leaves a half-initialized
-        feature's resources running and never double-shuts-down it (#2522 P1).
+        ``_register_feature`` wires a feature up in stages — ``initialize()``
+        (signal sources), ``_wire_feature_hooks`` (HooksManager hooks),
+        ``on_enable()``, then ``_wire_feature_a2a`` (A2A TaskManager agent +
+        ``set_task_manager``). Any stage after the first can raise having left the
+        EARLIER stages' registrations live: an ``on_enable`` failure strands the
+        hooks already registered, and an ``_wire_feature_a2a`` failure past
+        ``register_agent`` strands both the hooks and the A2A agent. The old
+        rollback popped the feature from ``self.features`` FIRST and then called
+        only ``feature.shutdown()`` — which reverses the feature's OWN resources
+        (signal sources / wait providers / owned tasks / sleep hooks) but NOT the
+        agent-side hook / A2A / dynamic-tool registrations — so those leaked, and
+        because the feature was already gone from ``self.features`` boot rollback
+        (``_boot_teardown_features``) could no longer find it to finish the job
+        (#2522 P1).
+
+        Route through the ONE canonical teardown instead, with the feature left
+        in ``self.features`` so it drains every registration (``on_disable`` →
+        ``shutdown`` → hooks → A2A → dynamic tools, each independent and run
+        unconditionally) BEFORE it is dropped — the exact inverse of the wiring
+        ``_register_feature`` performs. It is best-effort here: a teardown error
+        is logged, never raised, so the ORIGINAL registration failure (or its
+        ``MandatoryFeatureReadinessError`` wrap) is what surfaces to the caller.
+        Every teardown step is idempotent, so it is safe even when the feature
+        only got as far as ``initialize()`` (never added to ``self.features``) or
+        a stage left nothing to undo — and ``unload=True`` still drops the
+        instance so boot rollback never double-tears-down it (#2522 P1).
         """
         name = getattr(feature, "name", None)
-        if name is not None and self.features.get(name) is feature:
-            self.features.pop(name, None)
-        if hasattr(feature, "shutdown"):
-            try:
-                await feature.shutdown()
-            except Exception as exc:  # noqa: BLE001 - best-effort teardown
-                logging.warning(
-                    "boot rollback: failed feature '%s' shutdown errored: %s",
-                    name or type(feature).__name__,
-                    exc,
-                )
+        try:
+            await self._unregister_feature_runtime(feature, unload=True)
+        except Exception as exc:  # noqa: BLE001 - best-effort teardown
+            logging.warning(
+                "boot rollback: failed feature '%s' teardown errored: %s",
+                name or type(feature).__name__,
+                exc,
+            )
 
     async def _register_feature(self, feature: Feature):
         """Register a feature with A2A TaskManager for unified command routing."""
@@ -3169,13 +3184,7 @@ class KestrelAgent(
 
         # Auto-register hooks from get_hooks() with the agent's HooksManager
         try:
-            if self.hooks_manager:
-                for hook in feature.get_hooks():
-                    self.hooks_manager.register(hook)
-                    logging.info(
-                        f"Auto-registered hook '{hook.name}' from feature "
-                        f"'{feature.name}'"
-                    )
+            self._wire_feature_hooks(feature)
         except Exception as exc:
             await self._shutdown_failed_feature(feature)
             if mandatory:
@@ -3200,31 +3209,7 @@ class KestrelAgent(
             raise
 
         try:
-            # Get command prefixes for routing
-            command_prefixes = {}
-            for tool in feature.get_tools():
-                if tool.schema.command_prefix:
-                    command_prefixes[tool.schema.command_prefix] = tool.name
-                logging.info(
-                    f"Registered tool '{tool.name}' from feature '{feature.name}'"
-                )
-
-            # Register with A2A TaskManager (unified routing)
-            if self.task_manager:
-                agent_card = feature.get_agent_card()
-                self.task_manager.register_agent(
-                    agent_card=agent_card,
-                    handler=feature,
-                    command_prefixes=command_prefixes,
-                )
-                logging.info(
-                    f"Registered A2A agent '{agent_card.name}' with "
-                    f"{len(agent_card.skills)} skills"
-                )
-
-                # Wire task_manager into features that need it
-                if hasattr(feature, 'set_task_manager'):
-                    feature.set_task_manager(self.task_manager)
+            self._wire_feature_a2a(feature)
         except Exception as exc:
             await self._shutdown_failed_feature(feature)
             if mandatory:
@@ -3234,6 +3219,58 @@ class KestrelAgent(
                     "could not register its tools",
                 ) from exc
             raise
+
+    def _wire_feature_hooks(self, feature: "Feature") -> None:
+        """Register a feature's ``get_hooks()`` with the agent's HooksManager.
+
+        One source of truth for hook registration, shared by boot
+        (:meth:`_register_feature`) and runtime re-enable
+        (:meth:`_activate_feature_runtime`). The exact inverse is the hook
+        unregister block in :meth:`_unregister_feature_runtime`.
+        """
+        if not self.hooks_manager:
+            return
+        for hook in feature.get_hooks():
+            self.hooks_manager.register(hook)
+            logging.info(
+                f"Auto-registered hook '{hook.name}' from feature "
+                f"'{feature.name}'"
+            )
+
+    def _wire_feature_a2a(self, feature: "Feature") -> None:
+        """Register a feature as an A2A agent with the TaskManager.
+
+        Collects command prefixes, registers the feature's agent card + handler
+        for unified command routing, and wires the task_manager into features
+        that consume it. One source of truth shared by boot
+        (:meth:`_register_feature`) and runtime re-enable
+        (:meth:`_activate_feature_runtime`); the inverse is the
+        ``task_manager.unregister_agent`` call in
+        :meth:`_unregister_feature_runtime`.
+        """
+        command_prefixes = {}
+        for tool in feature.get_tools():
+            if tool.schema.command_prefix:
+                command_prefixes[tool.schema.command_prefix] = tool.name
+            logging.info(
+                f"Registered tool '{tool.name}' from feature '{feature.name}'"
+            )
+
+        if self.task_manager:
+            agent_card = feature.get_agent_card()
+            self.task_manager.register_agent(
+                agent_card=agent_card,
+                handler=feature,
+                command_prefixes=command_prefixes,
+            )
+            logging.info(
+                f"Registered A2A agent '{agent_card.name}' with "
+                f"{len(agent_card.skills)} skills"
+            )
+
+            # Wire task_manager into features that need it
+            if hasattr(feature, 'set_task_manager'):
+                feature.set_task_manager(self.task_manager)
 
     def _promote_startup_feature_tools(self) -> None:
         """Promote direct tools for features that opt into startup exposure.
@@ -3250,45 +3287,164 @@ class KestrelAgent(
                 self._register_explored_feature_tools(feature)
                 self._pinned_features.add(feature.tool_name)
 
-    async def _unregister_feature_runtime(self, feature: "Feature") -> None:
+    async def _activate_feature_runtime(self, feature: "Feature") -> None:
+        """Bring an already-loaded feature fully live — the inverse of
+        :meth:`_unregister_feature_runtime` (kestrel-sovereign#2522 P1).
+
+        The canonical runtime *activation* re-runs the same registration boot
+        performed, on the SAME feature instance, so a soft-disabled feature is
+        restored end to end:
+
+        * ``initialize()`` — re-registers the feature's owned **signal sources**
+          (talon registers ``talon.job_complete`` etc. here);
+        * hooks from ``get_hooks()`` (via :meth:`_wire_feature_hooks`);
+        * the ``on_enable`` lifecycle;
+        * the A2A TaskManager agent registration (via :meth:`_wire_feature_a2a`);
+        * startup-promoted **dynamic tools** (mirrors
+          :meth:`_promote_startup_feature_tools`);
+        * ``post_all_features_loaded()`` — re-registers the feature's owned
+          **wait providers** (``task:`` / ``talon:``);
+        * ``on_agent_ready()`` — the ready-phase hook boot fires only after all
+          services are live (RestartCoordinator's post-restart wake sweep runs
+          here, #1809). Runtime re-enable must fire it too or a re-enabled
+          feature silently skips its ready work.
+
+        Precondition: ``feature.initialize()`` must be idempotent — it is re-run
+        to restore signal sources a disable detached (talon / tasks are, and
+        document it). Atomic: on any failure BEFORE the commit, the partial
+        activation is torn back down *softly* (``unload=False`` — the instance
+        stays re-enable-able) and the error re-raised, so a failed enable never
+        leaves half-registered state. ``on_agent_ready`` runs AFTER the commit
+        and is best-effort (mirroring boot): its failure is logged, not fatal,
+        so a transient ready-hook error doesn't roll back an otherwise-live
+        feature. Used by the public enable endpoint; boot uses
+        :meth:`_register_feature` (which additionally handles first-load
+        discovery and the mandatory-feature readiness contract).
+        """
+        try:
+            await feature.initialize()
+            self._wire_feature_hooks(feature)
+            await feature.on_enable()
+            self._wire_feature_a2a(feature)
+            if getattr(feature, "promote_tools_on_startup", False):
+                self._register_explored_feature_tools(feature)
+                self._pinned_features.add(feature.tool_name)
+            await feature.post_all_features_loaded(self)
+            self.features[feature.name] = feature
+            feature.enabled = True
+            self._cached_features_prompt = self._build_features_prompt_section()
+        except Exception:
+            # Atomic activation: undo whatever partially registered so a failed
+            # enable can't strand hooks / sources / tools. Soft teardown keeps
+            # the instance loaded (re-enable-able); its own errors are logged so
+            # the ORIGINAL activation error is what surfaces.
+            try:
+                await self._unregister_feature_runtime(feature, unload=False)
+            except Exception as cleanup_exc:  # noqa: BLE001 - best-effort undo
+                logging.warning(
+                    "Cleanup after failed activation of feature '%s' failed: %s",
+                    getattr(feature, "name", type(feature).__name__),
+                    cleanup_exc,
+                )
+            raise
+
+        # Ready-phase lifecycle — fire ONLY after activation committed, so a
+        # re-enabled feature gets the same ``on_agent_ready`` signal boot gives
+        # it once services are live (#1809). Best-effort per the boot policy: an
+        # optional hook, and a failure here logs but never rolls back the
+        # now-live feature (kestrel-sovereign#2522 P2).
+        ready_hook = getattr(feature, "on_agent_ready", None)
+        if ready_hook is not None:
+            try:
+                await ready_hook(self)
+            except Exception as exc:  # noqa: BLE001 - readiness is non-fatal
+                logging.warning(
+                    "on_agent_ready failed for %s during re-enable: %s",
+                    getattr(feature, "name", type(feature).__name__),
+                    exc,
+                )
+
+    async def _unregister_feature_runtime(
+        self, feature: "Feature", *, unload: bool = True
+    ) -> None:
         """Reverse *every* runtime registration a fully-registered feature acquired.
 
-        The single canonical inverse of the wiring ``_register_feature`` and
-        ``post_all_features_loaded`` set up. Both the runtime
-        :meth:`_disable_feature` path and boot rollback
-        (:meth:`_boot_teardown_features`) call it, so neither can drift or leave
-        a feature's registrations stranded (kestrel-sovereign#2522). It removes,
-        in order:
+        The single canonical inverse of the wiring ``_register_feature`` /
+        :meth:`_activate_feature_runtime` and ``post_all_features_loaded`` set
+        up. The runtime :meth:`_disable_feature` path, boot rollback
+        (:meth:`_boot_teardown_features`), and the public disable endpoint all
+        call it, so none can drift or leave a feature's registrations stranded
+        (kestrel-sovereign#2522). It removes, in order:
 
         * the ``on_enable`` lifecycle (via ``on_disable``);
         * the feature's owned **signal sources** and **wait providers** (via
           ``feature.shutdown()`` — base :class:`Feature` unregisters both);
         * the hooks auto-registered from ``get_hooks()``;
         * the A2A TaskManager agent registration;
-        * the feature's dynamic tools + hidden-tool bookkeeping;
+        * the feature's dynamic tools + hidden-tool bookkeeping.
 
-        and drops the feature from ``self.features``. It does NOT enforce the
-        mandatory-feature guard — that is a caller policy (runtime disable
-        refuses; boot rollback must tear mandatory features down too).
+        ``unload`` controls the endpoint soft-toggle vs. full unload:
+
+        * ``True`` (default — runtime disable + boot rollback): the feature is
+          dropped from ``self.features`` (a full unload).
+        * ``False`` (public disable endpoint soft-toggle): the feature stays in
+          ``self.features`` with ``enabled=False`` so the SAME instance can be
+          re-enabled via :meth:`_activate_feature_runtime`.
+
+        Every inverse step is INDEPENDENT of the others, so each runs
+        UNCONDITIONALLY even if an earlier one raises (#2522 P2): a failing
+        ``on_disable`` must not leave the feature's shutdown / hooks / A2A /
+        tools / dropped-from-``features`` cleanup un-run. Errors are collected
+        and the first is re-raised *after* all cleanup so callers still see the
+        failure. It does NOT enforce the mandatory-feature guard — that is a
+        caller policy (runtime disable refuses; boot rollback must tear mandatory
+        features down too).
         """
         feature_key = next(
             (key for key, value in self.features.items() if value is feature),
             getattr(feature, "name", None),
         )
         feature_tool_name = getattr(feature, "tool_name", feature_key)
+        errors: List[Exception] = []
 
-        # Lifecycle inverse of on_enable (run during _register_feature), then the
-        # feature's own resource teardown (signal sources + wait providers).
-        await feature.on_disable()
-        await feature.shutdown()
+        # Lifecycle inverse of on_enable (run during activation). Independent of
+        # every teardown step below, so its failure must not skip them.
+        try:
+            await feature.on_disable()
+        except Exception as exc:  # noqa: BLE001 - cleanup continues below
+            errors.append(exc)
+            logging.exception(
+                "Feature '%s' on_disable() failed during teardown; "
+                "continuing with the remaining cleanup",
+                feature_key,
+            )
+
+        # The feature's own resource teardown (signal sources + wait providers).
+        try:
+            await feature.shutdown()
+        except Exception as exc:  # noqa: BLE001 - cleanup continues below
+            errors.append(exc)
+            logging.exception(
+                "Feature '%s' shutdown() failed during teardown; "
+                "continuing with the remaining cleanup",
+                feature_key,
+            )
 
         # Auto-unregister hooks from get_hooks()
         if self.hooks_manager:
-            for hook in feature.get_hooks():
-                self.hooks_manager.unregister(hook)
-                logging.info(
-                    f"Auto-unregistered hook '{hook.name}' from feature "
-                    f"'{feature_key}'"
+            try:
+                for hook in feature.get_hooks():
+                    self.hooks_manager.unregister(hook)
+                    logging.info(
+                        f"Auto-unregistered hook '{hook.name}' from feature "
+                        f"'{feature_key}'"
+                    )
+            except Exception as exc:  # noqa: BLE001 - cleanup continues below
+                errors.append(exc)
+                logging.exception(
+                    "Feature '%s' hook unregistration failed during teardown; "
+                    "continuing with the remaining cleanup",
+                    feature_key,
                 )
 
         if self.task_manager:
@@ -3301,22 +3457,40 @@ class KestrelAgent(
                     exc,
                 )
 
-        if feature_key is not None:
-            self.features.pop(feature_key, None)
-        # Capture the owned tool names before unregister mutates the maps;
-        # _tool_context_hidden_tools is reconciled against them below.
-        to_remove = [
-            name for name, owner in self._tool_to_feature.items()
-            if owner == feature_tool_name
-        ]
-        self.unregister_dynamic_tools(feature_tool_name)
-        if isinstance(getattr(self, "_tool_context_hidden_features", None), set):
-            self._tool_context_hidden_features.discard(feature_tool_name)
-            self._tool_context_hidden_features.discard(feature_key)
-            self._tool_context_hidden_features.discard(feature.__class__.__name__)
-        if isinstance(getattr(self, "_tool_context_hidden_tools", None), set):
-            self._tool_context_hidden_tools.difference_update(to_remove)
+        # Dynamic tools + hidden-tool bookkeeping (independent of the above).
+        try:
+            # Capture the owned tool names before unregister mutates the maps;
+            # _tool_context_hidden_tools is reconciled against them below.
+            to_remove = [
+                name for name, owner in self._tool_to_feature.items()
+                if owner == feature_tool_name
+            ]
+            self.unregister_dynamic_tools(feature_tool_name)
+            if isinstance(getattr(self, "_tool_context_hidden_features", None), set):
+                self._tool_context_hidden_features.discard(feature_tool_name)
+                self._tool_context_hidden_features.discard(feature_key)
+                self._tool_context_hidden_features.discard(feature.__class__.__name__)
+            if isinstance(getattr(self, "_tool_context_hidden_tools", None), set):
+                self._tool_context_hidden_tools.difference_update(to_remove)
+        except Exception as exc:  # noqa: BLE001 - cleanup continues below
+            errors.append(exc)
+            logging.exception(
+                "Feature '%s' dynamic-tool teardown failed; "
+                "continuing with the remaining cleanup",
+                feature_key,
+            )
+
+        # Full unload drops the instance; soft-toggle keeps it re-enable-able.
+        if unload:
+            if feature_key is not None:
+                self.features.pop(feature_key, None)
+        else:
+            feature.enabled = False
         self._cached_features_prompt = self._build_features_prompt_section()
+
+        # Surface the failure only AFTER every independent cleanup step ran.
+        if errors:
+            raise errors[0]
 
     async def _disable_feature(self, feature_name: str):
         """Disable a feature and remove its runtime registrations."""

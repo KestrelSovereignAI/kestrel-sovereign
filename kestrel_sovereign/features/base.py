@@ -1,3 +1,4 @@
+import asyncio
 import contextlib
 import inspect
 import json
@@ -274,18 +275,31 @@ class Feature(_SdkFeature):
     async def shutdown(self):
         """Cleanup resources.
 
-        Also unregisters the dispatcher **signal sources** AND the **wait
-        providers** this feature registered on the agent
-        (kestrel-sovereign#2522 P2). Boot rollback
+        Reverses **every** post-load registration a feature makes on the agent
+        so runtime disable, soft-disable, and boot rollback all leave nothing
+        stranded (kestrel-sovereign#2522). Boot rollback
         (``KestrelAgent._boot_teardown_features``) and runtime disable both call
-        ``shutdown()``, so a feature that registered dispatcher sources or a
-        ``task:`` / ``talon:`` wait provider and then hit a later boot-phase
-        failure must not leave feature-bound handlers / closures stranded in the
-        registries. Overrides that do their own teardown should call
+        ``shutdown()`` (via ``_unregister_feature_runtime``), so a feature that
+        registered any of the following and then hit a later boot-phase failure
+        must not leave feature-bound handlers / closures / loops stranded:
+
+        * dispatcher **signal sources** and ``task:`` / ``talon:`` **wait
+          providers** (P2);
+        * long-lived **background tasks** it started via
+          :meth:`_track_owned_background_task` — e.g. Peers' hourly expiry sweep,
+          which the agent's global reap only cancels at FULL shutdown, so
+          without feature ownership a disabled feature's loop keeps running (P1);
+        * **sleep hooks** it appended to ``agent.sleep_hooks`` via
+          :meth:`_register_sleep_hook` — e.g. Memory's ReflectionSleepHook (P1).
+
+        Each teardown is best-effort and idempotent so repeated shutdowns are
+        safe. Overrides that do their own teardown should call
         ``await super().shutdown()``.
         """
         await self._unregister_owned_signal_sources()
         await self._unregister_owned_wait_providers()
+        await self._cancel_owned_background_tasks()
+        await self._unregister_owned_sleep_hooks()
 
     # ------------------------------------------------------------------
     # Signal-source ownership (#2522 P2)
@@ -360,56 +374,206 @@ class Feature(_SdkFeature):
         self._owned_signal_source_names = []
 
     # ------------------------------------------------------------------
-    # Wait-provider ownership (#2522)
+    # Wait-provider ownership (#2522, identity-aware stack in P3)
     #
     # Features register a ``Waitable`` provider (``task:``, ``talon:``) with the
-    # agent's WaitRegistry in ``post_all_features_loaded``. Mirror the
-    # signal-source ownership above so ``shutdown()`` (runtime disable AND boot
-    # rollback) removes exactly the kinds this feature registered — never a
-    # host's — instead of leaving a feature-bound provider stranded.
+    # agent's WaitRegistry in ``post_all_features_loaded``. The registry keeps a
+    # per-kind ownership STACK, so a feature only needs to record the exact
+    # provider it pushed; on ``shutdown()`` (runtime disable AND boot rollback)
+    # it removes that provider from the stack by IDENTITY, and the registry lets
+    # the nearest still-live predecessor become effective. This restores the
+    # host provider a feature displaced — but only while the feature's own
+    # provider is still current — and never a newer provider some other owner
+    # installed after us, nor an already-removed (disabled) predecessor. The
+    # feature no longer saves a "previous" snapshot: that snapshot could name a
+    # provider a later teardown already removed, which is exactly how a
+    # ``host → A → B`` chain used to resurrect a disabled A on ``disable B``.
     # ------------------------------------------------------------------
     def _register_wait_provider(self, registry, provider, *, replace: bool = True):
-        """Register ``provider`` on ``registry`` and record its kind for teardown.
+        """Register ``provider`` on ``registry`` and record it for teardown.
 
-        The single call features use in ``post_all_features_loaded`` so the
-        provider's ``kind`` is recorded the moment it is registered and torn
-        down again in :meth:`shutdown` — the wait-provider analogue of
-        :meth:`_own_signal_sources`.
+        The single call features use in ``post_all_features_loaded``. It records
+        the exact provider this feature pushed so :meth:`shutdown` can remove it
+        from the registry's per-kind stack by identity (#2522 P3). This is the
+        wait-provider analogue of :meth:`_own_signal_sources`.
         """
-        registry.register(provider, replace=replace)
         kind = getattr(provider, "kind", None)
-        if not kind:
-            return
-        owned = getattr(self, "_owned_wait_provider_kinds", None)
+        owned = getattr(self, "_owned_wait_providers", None)
         if owned is None:
             owned = []
-            self._owned_wait_provider_kinds = owned
-        if kind not in owned:
-            owned.append(kind)
+            self._owned_wait_providers = owned
+        if kind:
+            for index, (owned_kind, owned_provider) in enumerate(owned):
+                if owned_kind == kind:
+                    # Re-registering this kind in one live cycle with a NEW
+                    # provider object: drop our previous provider from the stack
+                    # first so we don't leave a self-owned entry buried beneath
+                    # the new one (the displaced host/other provider is kept —
+                    # it lives further down the stack, untouched).
+                    if owned_provider is not provider and hasattr(
+                        registry, "deregister"
+                    ):
+                        registry.deregister(kind, owned_provider)
+                    owned[index] = (kind, provider)
+                    break
+            else:
+                owned.append((kind, provider))
+        registry.register(provider, replace=replace)
 
     async def _unregister_owned_wait_providers(self) -> None:
-        """Unregister the wait providers this feature registered (#2522).
+        """Remove the wait providers this feature pushed (#2522 P3).
 
-        Best-effort and idempotent: unregistering an already-absent kind is a
-        benign no-op, so repeated shutdowns are safe.
+        For each kind this feature registered, remove its own provider from the
+        registry's per-kind stack by identity. The registry then lets the
+        nearest still-live predecessor become effective again — never a newer
+        provider some other owner installed after us, and never a predecessor an
+        earlier teardown already removed. Best-effort and idempotent: a provider
+        already gone from the stack is a benign no-op, so repeated shutdowns are
+        safe.
         """
-        kinds = getattr(self, "_owned_wait_provider_kinds", None)
-        if not kinds:
+        owned = getattr(self, "_owned_wait_providers", None)
+        if not owned:
             return
         registry = getattr(getattr(self, "agent", None), "wait_registry", None)
-        if registry is not None and hasattr(registry, "unregister"):
-            for kind in kinds:
+        if registry is not None:
+            for kind, provider in owned:
                 try:
-                    registry.unregister(kind)
+                    if hasattr(registry, "deregister"):
+                        registry.deregister(kind, provider)
+                    elif hasattr(registry, "restore_if_current"):
+                        # Registry predating the stack API: identity-aware
+                        # single-slot teardown still removes our provider.
+                        registry.restore_if_current(kind, provider)
+                    elif hasattr(registry, "unregister"):
+                        # Oldest fallback: a plain unregister clears the slot.
+                        registry.unregister(kind)
                 except Exception as exc:  # noqa: BLE001 - best-effort teardown
                     logger.warning(
-                        "feature '%s': could not unregister wait provider "
+                        "feature '%s': could not remove wait provider "
                         "kind '%s': %s",
                         getattr(self, "name", type(self).__name__),
                         kind,
                         exc,
                     )
-        self._owned_wait_provider_kinds = []
+        self._owned_wait_providers = []
+
+    # ------------------------------------------------------------------
+    # Background-task ownership (#2522 P1)
+    #
+    # A feature that starts a long-lived agent-owned background task in
+    # ``post_all_features_loaded`` (Peers' hourly expiry sweep) must be able to
+    # cancel EXACTLY the tasks it started on shutdown / boot rollback / soft
+    # disable. The agent's global ``_shutdown_background_tasks`` only reaps at
+    # FULL agent shutdown, so without feature ownership a disabled feature's
+    # loop keeps running against a torn-down feature.
+    # ------------------------------------------------------------------
+    def _track_owned_background_task(self, coro, *, name: str) -> asyncio.Task:
+        """Start an agent-owned background task AND record it for feature
+        teardown (#2522 P1).
+
+        Delegates to ``agent._track_background_task`` so the task still lives in
+        the agent's global reap set (the full-shutdown safety net), but also
+        records it here so :meth:`shutdown` cancels exactly this feature's tasks
+        on runtime disable / boot rollback / soft disable. Returns the created
+        ``asyncio.Task``. This is the background-task analogue of
+        :meth:`_own_signal_sources` / :meth:`_register_wait_provider`.
+        """
+        agent = getattr(self, "agent", None)
+        track = getattr(agent, "_track_background_task", None)
+        if not callable(track):
+            # The agent owns background-task lifecycle; a feature can't safely
+            # start an unreaped task. Fail loudly rather than leak the coroutine.
+            coro.close()
+            raise RuntimeError(
+                f"feature '{getattr(self, 'name', type(self).__name__)}': agent "
+                "has no _track_background_task; cannot own background task "
+                f"'{name}'"
+            )
+        task = track(coro, name=name)
+        owned = getattr(self, "_owned_background_tasks", None)
+        if owned is None:
+            owned = []
+            self._owned_background_tasks = owned
+        owned.append(task)
+        # Self-clean on completion so repeated / unbounded spawners (Peers'
+        # per-question supervisors, RestartCoordinator's per-restart ack) don't
+        # accumulate finished-task refs here — the mirror of the agent's global
+        # set auto-discard. ``_owned`` binds THIS list, so a late callback firing
+        # after :meth:`_cancel_owned_background_tasks` rebinds the attribute is a
+        # harmless no-op rather than touching the fresh list (#2522 P1/P2).
+        task.add_done_callback(
+            lambda finished, _owned=owned: (
+                _owned.remove(finished) if finished in _owned else None
+            )
+        )
+        return task
+
+    async def _cancel_owned_background_tasks(self) -> None:
+        """Cancel exactly the background tasks this feature started (#2522 P1).
+
+        Best-effort and idempotent: a task already finished / cancelled is a
+        benign no-op, so repeated shutdowns are safe. Only tasks this feature
+        started via :meth:`_track_owned_background_task` are cancelled — never a
+        host's or another feature's. The agent's ``done_callback`` drops the
+        cancelled task from its global set, so this does not leave a dangling
+        reference there.
+        """
+        tasks = getattr(self, "_owned_background_tasks", None)
+        if not tasks:
+            return
+        pending = [task for task in tasks if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._owned_background_tasks = []
+
+    # ------------------------------------------------------------------
+    # Sleep-hook ownership (#2522 P1)
+    #
+    # A feature that appends a ``*SleepHook`` to ``agent.sleep_hooks`` in
+    # ``post_all_features_loaded`` (Memory's ReflectionSleepHook) must remove
+    # exactly its own hook on shutdown / boot rollback / soft disable — never
+    # another feature's or a host's. Ownership is tracked by object IDENTITY.
+    # ------------------------------------------------------------------
+    def _register_sleep_hook(self, agent, hook) -> None:
+        """Append ``hook`` to ``agent.sleep_hooks`` and record it for teardown.
+
+        Records the exact instance so :meth:`shutdown` removes ONLY this
+        feature's hook (by identity) on runtime disable / boot rollback / soft
+        disable. Idempotent per instance: re-registering the same hook object
+        neither double-appends to ``agent.sleep_hooks`` nor double-tracks it.
+        """
+        hooks = getattr(agent, "sleep_hooks", None)
+        if hooks is None:
+            hooks = []
+            agent.sleep_hooks = hooks
+        owned = getattr(self, "_owned_sleep_hooks", None)
+        if owned is None:
+            owned = []
+            self._owned_sleep_hooks = owned
+        if not any(existing is hook for existing in hooks):
+            hooks.append(hook)
+        if not any(existing is hook for existing in owned):
+            owned.append(hook)
+
+    async def _unregister_owned_sleep_hooks(self) -> None:
+        """Remove exactly the sleep hooks this feature registered (#2522 P1).
+
+        Removes by object identity so a hook another feature/host appended is
+        never touched. Best-effort and idempotent: a hook already gone is a
+        benign no-op, so repeated shutdowns are safe.
+        """
+        owned = getattr(self, "_owned_sleep_hooks", None)
+        if not owned:
+            return
+        hooks = getattr(getattr(self, "agent", None), "sleep_hooks", None)
+        if isinstance(hooks, list):
+            for hook in owned:
+                for index in range(len(hooks) - 1, -1, -1):
+                    if hooks[index] is hook:
+                        del hooks[index]
+        self._owned_sleep_hooks = []
 
     async def on_enable(self):
         """Called when feature is enabled.

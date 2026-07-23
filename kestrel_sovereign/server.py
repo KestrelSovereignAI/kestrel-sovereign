@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from starlette.routing import Match
 from kestrel_sovereign.main import get_agent_did_async
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.lifecycle_checks import verify_identity_isolation
@@ -333,50 +334,102 @@ async def verify_api_key(
     )
 
 
+def _is_webhook_receiver(receiver) -> bool:
+    """Duck-typed webhook-receiver check (keeps core decoupled from the class)."""
+    return (
+        receiver is not None
+        and hasattr(receiver, "handle_webhook")
+        and hasattr(receiver, "webhooks")
+    )
+
+
+def _resolve_route_agent(scope, mount_agent):
+    """Resolve which agent owns the request hitting a gated feature route.
+
+    Prefers the per-request agent the multi-agent routing middleware attached
+    to ``scope["state"]`` (so ``/api/agents/{name}/...`` resolves to the RIGHT
+    agent), and falls back to the agent captured when the route was mounted
+    (single-agent mode, where no per-request agent is set).
+    """
+    state = scope.get("state") or {}
+    return state.get("agent") or mount_agent
+
+
+def _gate_feature_route(route, feature_name: str, mount_agent) -> None:
+    """Wrap ``route`` so it only serves while its owning feature is live-enabled.
+
+    Feature routers are mounted ONCE at startup, but features can be
+    soft-disabled or removed at runtime. Rather than unmount/remount (which
+    risks duplicate routes on re-enable and drift from the enable/disable
+    lifecycle), the route stays physically mounted and this gate rejects the
+    request at match time when the owning feature is currently disabled or
+    gone (kestrel-sovereign#2522). Re-enabling the feature flips the gate back
+    on with no route churn. Only the feature-contributed routes are gated;
+    core/server routes are never touched.
+
+    The gate lives at ``route.matches()`` rather than ``route.app``: Starlette
+    otherwise produces a 405 for a wrong-method request before it calls the
+    app, and a WebSocket route would receive an invalid HTTP ``JSONResponse``.
+    Returning :class:`starlette.routing.Match.NONE` removes a disabled route
+    from both HTTP and WebSocket matching before either protocol is handled.
+    """
+    original_matches = route.matches
+
+    def _gated_matches(scope):
+        agent = _resolve_route_agent(scope, mount_agent)
+        features = getattr(agent, "features", None) or {}
+        feature = features.get(feature_name) if hasattr(features, "get") else None
+        if feature is None or not bool(getattr(feature, "enabled", True)):
+            return Match.NONE, {}
+        return original_matches(scope)
+
+    route.matches = _gated_matches
+
+
 def _mount_feature_routers(app: FastAPI) -> None:
     """Mount routers contributed by discovered features.
 
     After agent initialization, iterate over all registered features and
     call ``feature.get_router()``. If a feature returns a router, include
     it in the FastAPI app. This allows feature packages (voice, spawn,
-    observability, etc.) to contribute HTTP endpoints dynamically —
-    disabling a feature cleanly removes its routes.
+    observability, etc.) to contribute HTTP endpoints dynamically.
+
+    Each contributed route is wrapped by :func:`_gate_feature_route` so that
+    disabling or removing the owning feature at runtime makes its routes 404
+    without unmounting them — the Bridge router, for instance, stops serving
+    the moment its feature is disabled and resumes on re-enable, with no
+    duplicate routes (kestrel-sovereign#2522).
 
     Tracks the number of routes added so they can be removed on shutdown
     via ``_unmount_feature_routers``.
     """
     routes_before = len(app.routes)
     mounted = []
-    # Webhook receivers are collected across every agent and served by ONE
-    # shared /webhooks/{name} dispatch router. Each WebhookFeature's own
-    # get_router() produces an identical /webhooks/{name} catch-all, so
-    # mounting them per-agent would let the first-mounted agent shadow all the
-    # others — every webhook owned by a later agent would 404 (issue #2089).
-    webhook_receivers = []
-
-    def _is_webhook_receiver(receiver) -> bool:
-        # Duck-typed so core server.py stays decoupled from the feature class.
-        return (
-            receiver is not None
-            and hasattr(receiver, "handle_webhook")
-            and hasattr(receiver, "webhooks")
-        )
 
     def _collect_routers_from_agent(agent) -> None:
         features = getattr(agent, "features", {})
         if not features:
             return
         for name, feature in features.items():
-            receiver = getattr(feature, "receiver", None)
-            if _is_webhook_receiver(receiver):
-                if receiver not in webhook_receivers:
-                    webhook_receivers.append(receiver)
+            # Webhook receivers are NOT mounted per-feature here — they are
+            # served by ONE shared, live /webhooks/{name} dispatch router
+            # (below) whose receiver set is re-scanned per request and filtered
+            # to enabled features, so a disabled feature's webhooks stop
+            # dispatching without a stale startup snapshot (#2089/#2522).
+            if _is_webhook_receiver(getattr(feature, "receiver", None)):
                 continue
             try:
                 router = feature.get_router()
-                if router is not None:
-                    app.include_router(router)
-                    mounted.append(name)
+                if router is None:
+                    continue
+                before = len(app.routes)
+                app.include_router(router)
+                # Gate exactly the routes this feature just contributed so a
+                # runtime disable/remove makes them 404 (never a core route).
+                for route in app.routes[before:]:
+                    if hasattr(route, "app"):
+                        _gate_feature_route(route, name, agent)
+                mounted.append(name)
             except Exception as exc:
                 logger.warning("Failed to mount router from feature %s: %s", name, exc)
 
@@ -393,25 +446,105 @@ def _mount_feature_routers(app: FastAPI) -> None:
             if agent is not None:
                 _collect_routers_from_agent(agent)
 
-    # Mount one cross-agent webhook dispatch router for all collected receivers.
-    if webhook_receivers:
+    # Mount one cross-agent webhook dispatch router with a LIVE, scope-aware
+    # receiver provider. It re-scans the current agents' ENABLED features on
+    # every request (not a startup-captured list), so a webhook stops
+    # dispatching the instant its feature is disabled and resumes when
+    # re-enabled — the exact "startup-captured receivers still process requests
+    # even when disabled" bug (#2522). The provider also honours the
+    # request-scoped target agent: an agent-prefixed
+    # /api/agents/{name}/webhooks/{name} request sees ONLY that agent's enabled
+    # receivers (so it can't dispatch to another agent's identically-named
+    # webhook), while the unprefixed /webhooks/{name} form aggregates across
+    # every agent (#2522). Mounted when at least one enabled webhook receiver
+    # exists at startup; the provider itself stays live thereafter.
+    if _live_webhook_receivers(app):
         try:
             from kestrel_sovereign.features.webhooks.receiver import (
                 build_webhook_dispatch_router,
             )
 
             app.include_router(
-                build_webhook_dispatch_router(lambda: list(webhook_receivers))
+                build_webhook_dispatch_router(
+                    lambda agent=None: _live_webhook_receivers(app, agent)
+                )
             )
             mounted.append("webhooks")
         except Exception as exc:
             logger.warning("Failed to mount webhook dispatch router: %s", exc)
 
-    # Record how many routes were added so shutdown can remove them
-    app.state._feature_route_count = len(app.routes) - routes_before
+    # Retain the concrete route objects, rather than just a trailing count.
+    # Lifespan restarts and test harnesses can call this helper more than once
+    # before an outer teardown runs.  A single count would be overwritten by
+    # the later mount and leave the earlier routes behind; object ownership
+    # lets ``_unmount_feature_routers`` remove every batch it owns.
+    added_routes = list(app.routes[routes_before:])
+    tracked_routes = list(getattr(app.state, "_feature_routes", ()))
+    tracked_routes.extend(added_routes)
+    app.state._feature_routes = tracked_routes
+    # Kept for compatibility with any external diagnostics that surface the
+    # old state field.  Teardown uses ``_feature_routes`` as its authority.
+    app.state._feature_route_count = len(tracked_routes)
 
     if mounted:
         logger.info("Dynamically mounted routers from features: %s", ", ".join(mounted))
+
+
+def _iter_current_agents(app: FastAPI):
+    """Yield every agent currently loaded on the app (single- or multi-agent)."""
+    agent = getattr(app.state, "agent", None)
+    if agent is not None:
+        yield agent
+    manager = getattr(app.state, "agent_manager", None)
+    if manager is not None:
+        for agent_name in manager.list_agents():
+            resolved = manager.get_agent(agent_name)
+            if resolved is not None:
+                yield resolved
+
+
+def _agent_webhook_receivers(agent) -> list:
+    """Enabled webhook receivers contributed by a SINGLE agent's features.
+
+    Deduplicated by identity; a disabled/removed feature's receiver is dropped.
+    """
+    receivers: list = []
+    features = getattr(agent, "features", {}) or {}
+    for feature in features.values():
+        if not bool(getattr(feature, "enabled", True)):
+            continue
+        receiver = getattr(feature, "receiver", None)
+        if _is_webhook_receiver(receiver) and receiver not in receivers:
+            receivers.append(receiver)
+    return receivers
+
+
+def _live_webhook_receivers(app: FastAPI, agent=None) -> list:
+    """Collect webhook receivers from currently ENABLED features (live).
+
+    Re-scanned on every webhook request by the dispatch router, so a
+    disabled/removed feature's receiver is dropped and a re-enabled feature's
+    receiver reappears — no stale startup closure.
+
+    Request/scope-aware (kestrel-sovereign#2522): when ``agent`` is provided —
+    the target agent the multi-agent routing middleware resolved for an
+    agent-prefixed ``/api/agents/{name}/webhooks/{name}`` request — ONLY that
+    agent's enabled receivers are returned, so an agent-prefixed request can
+    never dispatch to another agent's webhook (e.g. A's feature disabled while
+    B enables the same webhook name). When ``agent`` is ``None`` (the
+    unprefixed ``/webhooks/{name}`` form, or single-agent mode) the aggregate
+    of every current agent's enabled receivers is returned. Deduplicated by
+    identity because one receiver can be reached through multiple agents.
+    """
+    if agent is not None:
+        return _agent_webhook_receivers(agent)
+
+    receivers: list = []
+    for current in _iter_current_agents(app):
+        for receiver in _agent_webhook_receivers(current):
+            if receiver not in receivers:
+                receivers.append(receiver)
+    return receivers
 
 
 def _unmount_feature_routers(app: FastAPI) -> None:
@@ -420,11 +553,17 @@ def _unmount_feature_routers(app: FastAPI) -> None:
     This prevents route accumulation when the app lifespan restarts
     (e.g. across TestClient sessions in the same pytest process).
     """
-    count = getattr(app.state, "_feature_route_count", 0)
-    if count > 0:
-        del app.routes[-count:]
+    tracked_routes = tuple(getattr(app.state, "_feature_routes", ()))
+    if tracked_routes:
+        tracked_ids = {id(route) for route in tracked_routes}
+        app.routes[:] = [
+            route for route in app.routes if id(route) not in tracked_ids
+        ]
+        app.state._feature_routes = []
         app.state._feature_route_count = 0
-        logger.info("Removed %d dynamically-mounted feature routes", count)
+        logger.info(
+            "Removed %d dynamically-mounted feature routes", len(tracked_routes)
+        )
 
 
 def _mount_feature_ui_assets(app: FastAPI) -> None:

@@ -902,3 +902,95 @@ async def test_persisted_config_survives_restart(monkeypatch, tmp_path):
     assert (await f2.get_config())["allowed_senders"] == ["777"]
     # And the reloaded service was launched with that config.
     assert f2._host_config["allowed_senders"] == ["777"]
+
+
+@pytest.mark.asyncio
+async def test_reenable_restarts_live_health_supervisor(tmp_path):
+    """Runtime disable → re-enable on the SAME ProxyFeature instance must leave a
+    LIVE health supervisor.
+
+    ``shutdown()`` latches ``_stopping=True`` to unwind the supervisor; the
+    canonical re-enable (``_activate_feature_runtime``) re-runs ``initialize()``
+    on the same instance. Before the fix the stale ``_stopping`` made the new
+    ``_supervise()`` task exit on its first ``while not self._stopping`` check,
+    silently leaving the re-enabled service with NO health supervisor
+    (kestrel-sovereign#2522 P2). This drives the real initialize/shutdown/
+    initialize lifecycle and proves the second supervisor stays alive AND
+    actively probes the freshly launched client."""
+    import asyncio
+    import os
+
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    clients = []
+
+    class CountingClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.health_calls = 0
+
+        async def health(self):
+            self.health_calls += 1
+            return True
+
+    def factory(**kw):
+        client = CountingClient(**kw)
+        clients.append(client)
+        return client
+
+    runtime = InstalledFeatureRuntime(
+        class_name="ReenableFeature",
+        entry_point="r.feature:ReenableFeature",
+        distribution="r-pkg",
+        runtime="isolated-venv",
+        service="r",
+    )
+    agent = Mock(storage_path=str(tmp_path / "a" / "db.db"), features={})
+    feature = ProxyFeature(agent, runtime, client_factory=factory)
+    os.environ["KESTREL_FEATURE_REENABLEFEATURE_BIN"] = str(tmp_path / "r-bin")
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(ir, "_HEALTH_PROBE_TIMEOUT", 0.05)
+    try:
+        # First enable → supervisor #1 against client #1.
+        await feature.initialize()
+        first_task = feature._supervision_task
+        assert first_task is not None and not first_task.done()
+        assert feature._stopping is False
+
+        # Canonical disable latches _stopping and unwinds supervisor #1.
+        await feature.shutdown()
+        assert feature._stopping is True
+        assert first_task.done()
+
+        # Re-enable: initialize() re-runs on the SAME instance.
+        await feature.initialize()
+        second_task = feature._supervision_task
+        # The lifecycle flag was reset to the fresh-start baseline.
+        assert feature._stopping is False
+        assert second_task is not first_task
+        second_client = clients[-1]
+
+        # The second supervisor is LIVE — it does NOT exit on its first check and
+        # it actively probes the newly launched client. Before the fix
+        # second_task would already be done() and health_calls would stay 0.
+        for _ in range(150):
+            if second_client.health_calls >= 1:
+                break
+            await asyncio.sleep(0.02)
+        assert not second_task.done(), (
+            "re-enabled health supervisor exited immediately (stale _stopping)"
+        )
+        assert second_client.health_calls >= 1, (
+            "re-enabled supervisor never probed health — supervisor is dead"
+        )
+    finally:
+        feature._stopping = True
+        if feature._supervision_task:
+            feature._supervision_task.cancel()
+            try:
+                await feature._supervision_task
+            except asyncio.CancelledError:
+                pass
+        monkey.undo()
+        os.environ.pop("KESTREL_FEATURE_REENABLEFEATURE_BIN", None)

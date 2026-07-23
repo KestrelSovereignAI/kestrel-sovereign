@@ -314,77 +314,40 @@ async def enable_feature(request: Request, name: str) -> Dict[str, Any]:
     """
     Enable a loaded feature.
 
-    Re-registers hooks with the HooksManager and calls on_enable().
+    Runs the agent's canonical runtime *activation*
+    (``KestrelAgent._activate_feature_runtime``) per member — the exact inverse
+    of the disable teardown, so signal sources, wait providers, hooks, the A2A
+    agent, and dynamic tools are all re-registered on the SAME loaded instance
+    (kestrel-sovereign#2522). The endpoint owns only the group-transactional
+    orchestration: enabling a package is all-or-nothing, so if any member fails
+    to activate the already-activated members are soft-disabled again before the
+    error surfaces. Per-member work is NOT duplicated here — it lives in the one
+    canonical activation used by boot and the disable/enable rails alike.
     """
     agent = get_agent(request)
     loaded = _get_loaded_features_or_404(agent, name)
 
-    # Re-register hooks with the agent's HooksManager. Track what we registered
-    # so a failing on_enable() can be fully rolled back — otherwise the feature
-    # would be left half-enabled (hooks live, `enabled` flag true) while the
-    # endpoint reports an error, and the next capability computation would see it
-    # as enabled.
-    hooks_manager = getattr(agent, "hooks_manager", None)
-    activated: List[tuple[str, Any, List[Any], bool]] = []
+    activated: List[tuple[str, Any]] = []
     try:
         for class_name, feature in loaded:
-            original = bool(getattr(feature, "enabled", True))
-            if original:
+            if bool(getattr(feature, "enabled", True)):
+                # Already enabled — nothing to re-activate.
                 continue
-            registered_hooks = []
-            if hooks_manager:
-                for hook in feature.get_hooks():
-                    hooks_manager.register(hook)
-                    registered_hooks.append(hook)
-                    logger.info(
-                        "Re-registered hook '%s' for feature '%s'",
-                        hook.name,
-                        class_name,
-                    )
-            try:
-                await feature.on_enable()
-            except Exception:
-                try:
-                    await feature.on_disable()
-                except Exception:
-                    logger.exception(
-                        "Cleanup after failed enable of feature '%s' failed",
-                        class_name,
-                    )
-                finally:
-                    if hooks_manager:
-                        for hook in registered_hooks:
-                            try:
-                                hooks_manager.unregister(hook)
-                            except Exception:
-                                logger.exception(
-                                    "Hook rollback failed for feature '%s'",
-                                    class_name,
-                                )
-                    feature.enabled = original
-                raise
-            feature.enabled = True
-            activated.append((class_name, feature, registered_hooks, original))
+            await agent._activate_feature_runtime(feature)
+            activated.append((class_name, feature))
     except Exception:
-        for class_name, feature, registered_hooks, original in reversed(activated):
+        # Group transaction: roll the already-activated members back to the
+        # disabled state (soft-toggle) so a partial package-enable never leaves
+        # a mix of live and dead members.
+        for class_name, feature in reversed(activated):
             try:
-                await feature.on_disable()
+                await agent._unregister_feature_runtime(feature, unload=False)
             except Exception:
                 logger.exception(
-                    "Lifecycle rollback failed for feature '%s'",
+                    "Enable rollback (re-disable) failed for feature '%s'",
                     class_name,
                 )
-            finally:
-                if hooks_manager:
-                    for hook in registered_hooks:
-                        try:
-                            hooks_manager.unregister(hook)
-                        except Exception:
-                            logger.exception(
-                                "Hook rollback failed for feature '%s'",
-                                class_name,
-                            )
-                feature.enabled = original
+            else:
                 logger.info("Rolled back enable of feature '%s'", class_name)
         raise
 
@@ -401,7 +364,18 @@ async def disable_feature(request: Request, name: str) -> Dict[str, Any]:
     """
     Disable a loaded feature.
 
-    Calls on_disable() and unregisters hooks from the HooksManager.
+    Runs the agent's canonical runtime *teardown*
+    (``KestrelAgent._unregister_feature_runtime`` with ``unload=False``) per
+    member, so a disabled feature has its signal sources, wait providers, hooks,
+    A2A agent, and dynamic tools all detached — not just ``on_disable()`` +
+    hooks (the old light path left ``task:`` / ``talon:`` wait providers and
+    dispatcher sources live, kestrel-sovereign#2522). ``unload=False`` keeps the
+    SAME instance loaded so ``/enable`` can re-activate it. The endpoint owns
+    only the group-transactional orchestration: disabling a package is
+    all-or-nothing, so if any member fails to tear down the members touched so
+    far are re-activated before the error surfaces. Per-member cleanup is NOT
+    duplicated here — it is the one canonical teardown boot rollback and runtime
+    disable also use.
     """
     agent = get_agent(request)
     loaded = _get_loaded_features_or_404(agent, name)
@@ -419,47 +393,29 @@ async def disable_feature(request: Request, name: str) -> Dict[str, Any]:
             ),
         )
 
-    # Unregister hooks from the agent's HooksManager
-    hooks_manager = getattr(agent, "hooks_manager", None)
-    deactivated: List[tuple[str, Any, List[Any], bool]] = []
+    # ``attempted`` records every member we STARTED to tear down (before the
+    # call, so a member whose teardown raises is still rolled back). The
+    # canonical teardown runs its independent cleanup unconditionally even on a
+    # failing ``on_disable`` (#2522 P2), so a member that raised is left in a
+    # torn-down state; rolling the whole group back re-activates it too.
+    attempted: List[tuple[str, Any]] = []
     try:
         for class_name, feature in loaded:
-            original = bool(getattr(feature, "enabled", True))
-            if not original:
+            if not bool(getattr(feature, "enabled", True)):
+                # Already disabled — nothing to tear down.
                 continue
-            await feature.on_disable()
-            hooks = list(feature.get_hooks())
-            if hooks_manager:
-                for hook in hooks:
-                    hooks_manager.unregister(hook)
-                    logger.info(
-                        "Unregistered hook '%s' for feature '%s'",
-                        hook.name,
-                        class_name,
-                    )
-            feature.enabled = False
-            deactivated.append((class_name, feature, hooks, original))
+            attempted.append((class_name, feature))
+            await agent._unregister_feature_runtime(feature, unload=False)
     except Exception:
-        for class_name, feature, hooks, original in reversed(deactivated):
+        for class_name, feature in reversed(attempted):
             try:
-                if hooks_manager:
-                    for hook in hooks:
-                        try:
-                            hooks_manager.register(hook)
-                        except Exception:
-                            logger.exception(
-                                "Hook rollback failed for feature '%s'",
-                                class_name,
-                            )
-                try:
-                    await feature.on_enable()
-                except Exception:
-                    logger.exception(
-                        "Lifecycle rollback failed for feature '%s'",
-                        class_name,
-                    )
-            finally:
-                feature.enabled = original
+                await agent._activate_feature_runtime(feature)
+            except Exception:
+                logger.exception(
+                    "Disable rollback (re-enable) failed for feature '%s'",
+                    class_name,
+                )
+            else:
                 logger.info("Rolled back disable of feature '%s'", class_name)
         raise
 
@@ -476,8 +432,18 @@ async def remove_feature(request: Request, name: str) -> Dict[str, Any]:
     """
     Uninstall a feature package.
 
-    Calls on_remove() for cleanup, then pip uninstalls the package.
-    Requires a sovereign agent — governed agents cannot remove packages.
+    Runs the agent's canonical runtime *teardown*
+    (``KestrelAgent._unregister_feature_runtime`` with ``unload=True``) per
+    loaded member so removal drains EVERYTHING a live feature acquired — signal
+    sources, ``task:`` / ``talon:`` wait providers, hooks, the A2A agent, owned
+    background tasks / sleep hooks, AND promoted direct tools — then calls
+    ``on_remove()`` for stored-data cleanup, then pip-uninstalls the package. The
+    old path detached only hooks and set ``enabled=False``, leaving every other
+    registration live; the promoted **direct tools** in particular stayed
+    executable because tool resolution gates on the feature's ``enabled`` flag,
+    not on membership of a still-registered tool map, so a "removed" feature's
+    ``@tool`` methods remained callable until restart (kestrel-sovereign#2522
+    P1). Requires a sovereign agent — governed agents cannot remove packages.
     """
     agent = get_agent(request)
 
@@ -488,7 +454,29 @@ async def remove_feature(request: Request, name: str) -> Dict[str, Any]:
     if pkg_info.core:
         raise HTTPException(status_code=400, detail="Cannot remove a core feature")
 
-    # Check if feature is loaded — unregister hooks and call on_remove if so
+    # Mandatory sovereignty features must never be torn down / uninstalled: the
+    # canonical teardown below (``unload=True``) would drop their signal sources,
+    # wait providers, and A2A wiring, crippling the agent. Mirrors the /disable
+    # guard (kestrel-sovereign#2522). Today every mandatory feature is already
+    # blocked earlier (core members → 400, ``WaitFeature`` is absent from the
+    # removable registry → 404), so this is defense in depth against a future
+    # removable package that declares one — the guard fails closed rather than
+    # relying on that coincidence.
+    mandatory = sorted(
+        class_name
+        for class_name in pkg_info.features
+        if class_name in MANDATORY_FEATURES
+    )
+    if mandatory:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Mandatory sovereignty features cannot be removed: "
+                + ", ".join(mandatory)
+            ),
+        )
+
+    # Check if feature is loaded — drain its full runtime, then on_remove.
     features = getattr(agent, "features", {}) or {}
     loaded = [
         (class_name, features[class_name])
@@ -496,17 +484,15 @@ async def remove_feature(request: Request, name: str) -> Dict[str, Any]:
         if class_name in features
     ]
     for class_name, feature in loaded:
-        # Unregister hooks before removal
-        hooks_manager = getattr(agent, "hooks_manager", None)
-        if hooks_manager:
-            for hook in feature.get_hooks():
-                hooks_manager.unregister(hook)
-                logger.info(
-                    "Unregistered hook '%s' during removal of feature '%s'",
-                    hook.name,
-                    class_name,
-                )
-
+        # Full canonical runtime teardown BEFORE uninstall — the SAME inverse
+        # boot rollback and /disable use, not a hooks-only subset. ``unload=True``
+        # drops the instance from ``agent.features`` once every registration is
+        # drained (kestrel-sovereign#2522 P1).
+        await agent._unregister_feature_runtime(feature, unload=True)
+        # ``on_remove`` (stored-data cleanup) runs AFTER the runtime is fully
+        # quiesced, but on the SAME still-referenced instance whose ``agent`` /
+        # storage / config the teardown never touched — so unloading loses it no
+        # feature state, and no still-live background task can race the deletion.
         await feature.on_remove()
         feature.enabled = False
 

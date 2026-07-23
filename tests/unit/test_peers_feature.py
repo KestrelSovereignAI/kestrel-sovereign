@@ -860,3 +860,265 @@ async def test_get_peer_task_result_legacy_single_unnamed_group_still_works():
 
     assert result.data["artifact_body"] == "the answer"
     assert result.data["artifact_body_complete"] is True
+
+
+# ---------------------------------------------------------------------------
+# Startup-replay supervisors are FEATURE-owned so boot rollback / soft disable
+# cancel them — they must not outlive the torn-down feature and later fire a
+# resumption signal (kestrel-sovereign#2522 P1).
+# ---------------------------------------------------------------------------
+
+
+class _TrackingAgent:
+    """Agent double with the REAL background-task lifecycle: tasks are actual
+    ``asyncio.Task`` objects tracked in a global set that auto-discards on
+    completion, exactly like ``KestrelAgent._track_background_task``. This lets
+    the test prove a spawned supervisor is a live, cancellable task (a coroutine
+    that a stub ``close()``s could never leak)."""
+
+    def __init__(self, name="emma"):
+        import asyncio
+
+        self._agent_name = name
+        self.did = f"did:test:{name}"
+        self._background_tasks: set = set()
+        self._asyncio = asyncio
+
+    def _track_background_task(self, coro, *, name=""):
+        task = self._asyncio.ensure_future(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+
+def _within_deadline_waiting_row(task_id="t-replay", recipient="claw"):
+    from datetime import datetime, timedelta, timezone
+
+    deadline = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    return SimpleNamespace(
+        task_id=task_id,
+        recipient=recipient,
+        original_question="still waiting?",
+        origin_session_id="sess-1",
+        deadline=deadline,
+        retry_state=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_replay_supervisor_is_feature_owned_and_cancelled_on_shutdown():
+    """Boot startup-replay of a within-deadline WAITING row spawns the
+    resubscription supervisor as a FEATURE-owned background task, so
+    ``Feature.shutdown()`` (what boot rollback / soft disable call) cancels it —
+    leaving NO task behind that could later dispatch a resumption signal against
+    a torn-down feature (#2522 P1)."""
+    import asyncio
+
+    agent = _TrackingAgent()
+    feature = PeersFeature(agent)
+    feature._host_url = "http://multi_agent"
+    feature._api_key = ""
+    feature._own_name = "emma"
+
+    # Replace the real SSE supervisor with one that blocks forever, so the
+    # spawned task stays PENDING and we can prove teardown cancels it (the real
+    # supervisor would make network calls and complete immediately, hiding the
+    # leak the fix addresses). The REAL replay code path still runs and is what
+    # decides to spawn — and how it tracks — the task.
+    async def _never_returns(**kwargs):
+        await asyncio.Event().wait()
+
+    feature._supervise_a2a_question = _never_returns
+
+    store = MagicMock()
+    store.list_waiting = AsyncMock(
+        return_value=[_within_deadline_waiting_row()]
+    )
+
+    await feature._replay_pending_a2a_questions(store)
+
+    # The supervisor is tracked as a FEATURE-owned task (the crux of the fix —
+    # before it, replay used the agent-global tracker and shutdown could not
+    # reach it) AND lives in the agent's global reap set.
+    owned = list(feature._owned_background_tasks)
+    assert len(owned) == 1
+    supervisor = owned[0]
+    assert not supervisor.done()
+    assert supervisor in agent._background_tasks
+
+    # Boot rollback / soft disable both call Feature.shutdown().
+    await feature.shutdown()
+
+    assert supervisor.done()
+    assert supervisor.cancelled()
+    assert feature._owned_background_tasks == []
+    # Dropped from the agent's global set too (no dangling reference).
+    assert supervisor not in agent._background_tasks
+
+
+@pytest.mark.asyncio
+async def test_replay_past_deadline_row_spawns_no_supervisor():
+    """A past-deadline WAITING row is expired in place (synthetic signal), never
+    resubscribed — so no supervisor task is owned. Guards the replay branch that
+    feeds the ownership fix so a regression can't silently spawn nothing."""
+    from datetime import datetime, timedelta, timezone
+
+    agent = _TrackingAgent()
+    feature = PeersFeature(agent)
+    feature._host_url = "http://multi_agent"
+    feature._api_key = ""
+    feature._own_name = "emma"
+    feature._handle_expired_row = AsyncMock(return_value=None)
+
+    past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    row = SimpleNamespace(
+        task_id="t-old",
+        recipient="claw",
+        original_question="q",
+        origin_session_id="s",
+        deadline=past,
+        retry_state=None,
+    )
+    store = MagicMock()
+    store.list_waiting = AsyncMock(return_value=[row])
+
+    await feature._replay_pending_a2a_questions(store)
+
+    feature._handle_expired_row.assert_awaited_once()
+    assert getattr(feature, "_owned_background_tasks", []) == []
+    assert agent._background_tasks == set()
+
+
+# ---------------------------------------------------------------------------
+# The LIVE ``send_a2a_question`` supervisor and the restored-payload retry loop
+# are the two sibling long-lived Peers coroutines that must share the startup-
+# replay supervisor's ownership: both are agent-tracked for full-shutdown reap
+# but ALSO feature-owned, so runtime disable / boot rollback / soft disable
+# cancel them via ``Feature.shutdown()``. An agent-only task would keep running
+# (and could still fire a resumption signal) against a torn-down feature
+# (kestrel-sovereign#2522 P1).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_live_question_supervisor_is_feature_owned_and_cancelled_on_shutdown():
+    """The live ``send_a2a_question`` POST spawns its SSE resumption supervisor
+    as a FEATURE-owned background task, so ``Feature.shutdown()`` (what boot
+    rollback / soft disable call) cancels it — no supervisor outlives the
+    torn-down feature to later dispatch a resumption signal (#2522 P1). This is
+    the direct-ask analogue of the startup-replay supervisor guarantee."""
+    import asyncio
+
+    feature = _make_a2a_feature()
+
+    # Swap the fixture's coro-closing stub for the REAL background-task
+    # lifecycle (actual ``asyncio.Task`` in a self-discarding global set, like
+    # ``KestrelAgent._track_background_task``) so we can prove the supervisor is
+    # a live, cancellable task — a coroutine a stub ``close()``s could never leak.
+    tracked: set = set()
+
+    def _track_bg(coro, *, name=""):
+        task = asyncio.ensure_future(coro)
+        tracked.add(task)
+        task.add_done_callback(tracked.discard)
+        return task
+    feature.agent._track_background_task = _track_bg
+
+    # Block the supervisor forever so the spawned task stays PENDING and teardown
+    # must cancel it (the real SSE supervisor would make network calls and finish
+    # immediately, hiding the leak the fix addresses). The REAL send path still
+    # runs and is what decides to spawn — and how it tracks — the task.
+    async def _never_returns(**kwargs):
+        await asyncio.Event().wait()
+    feature._supervise_a2a_question = _never_returns
+
+    post_resp = _mock_post_response(task_id="q-live", state="submitted")
+    client = _async_client_with(post_resp=post_resp)
+    with patch(
+        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
+        return_value=client,
+    ):
+        result = await feature.send_a2a_question("meridian", "still there?")
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["awaiting_reply"] is True
+
+    # The supervisor is tracked as a FEATURE-owned task (the crux of the fix —
+    # before it, the live path used the agent-global tracker and shutdown could
+    # not reach it) AND lives in the agent's global reap set.
+    owned = list(feature._owned_background_tasks)
+    assert len(owned) == 1
+    supervisor = owned[0]
+    assert not supervisor.done()
+    assert supervisor in tracked
+
+    # Boot rollback / soft disable both call Feature.shutdown().
+    await feature.shutdown()
+
+    assert supervisor.done()
+    assert supervisor.cancelled()
+    assert feature._owned_background_tasks == []
+    # Dropped from the agent's global set too (no dangling reference).
+    assert supervisor not in tracked
+
+
+@pytest.mark.asyncio
+async def test_question_answered_retry_is_feature_owned_and_cancelled_on_shutdown():
+    """When a restored WAITING row's wakeup signal fails to enqueue, the
+    near-term retry loop is scheduled as a FEATURE-owned background task. That
+    loop is reachable during boot startup-replay, so ``Feature.shutdown()``
+    (boot rollback / soft disable) must cancel it rather than leave it retrying
+    — and eventually firing a resumption signal — against a torn-down feature
+    (#2522 P1). Driven through the real restore path that boot replay hits."""
+    import asyncio
+
+    agent = _TrackingAgent()
+    feature = PeersFeature(agent)
+    feature._host_url = "http://multi_agent"
+    feature._api_key = ""
+    feature._own_name = "emma"
+
+    # Block the retry loop forever so the spawned task stays PENDING and teardown
+    # must cancel it (the real loop sleeps, refires, then completes — which would
+    # hide the leak). The REAL restore→schedule code path still runs.
+    async def _never_returns(**kwargs):
+        await asyncio.Event().wait()
+    feature._retry_restored_question_answered_signal = _never_returns
+
+    # Real restore path: mark_waiting_for_retry succeeds, so
+    # ``_restore_pending_question_waiting`` schedules the retry — exactly what
+    # boot replay reaches when a wakeup-signal enqueue fails.
+    store = MagicMock()
+    store.mark_waiting_for_retry = AsyncMock(return_value=True)
+    agent.pending_a2a_questions = store
+
+    await feature._restore_pending_question_waiting(
+        "t-retry",
+        state="completed",
+        reply_text="the answer",
+        recipient="claw",
+        original_question="still waiting?",
+        sess_id="sess-1",
+        causation_chain=None,
+        schedule_retry=True,
+    )
+
+    store.mark_waiting_for_retry.assert_awaited_once()
+
+    # The retry loop is a live FEATURE-owned task (before the fix it used the
+    # agent-global tracker — or, worse, an untracked ``create_task`` fallback —
+    # neither of which ``Feature.shutdown()`` could reach) AND is agent-tracked.
+    owned = list(feature._owned_background_tasks)
+    assert len(owned) == 1
+    retry_task = owned[0]
+    assert not retry_task.done()
+    assert retry_task in agent._background_tasks
+
+    # Boot rollback / soft disable both call Feature.shutdown().
+    await feature.shutdown()
+
+    assert retry_task.done()
+    assert retry_task.cancelled()
+    assert feature._owned_background_tasks == []
+    # Dropped from the agent's global set too (no dangling reference).
+    assert retry_task not in agent._background_tasks

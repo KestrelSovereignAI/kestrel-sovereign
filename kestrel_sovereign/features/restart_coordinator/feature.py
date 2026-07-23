@@ -1780,13 +1780,15 @@ class RestartCoordinatorFeature(Feature):
                 return
             await self._mark_wake_delivered(row)
 
-        tracker = getattr(self.agent, "_track_background_task", None)
-        if callable(tracker):
-            tracker(
-                _await_and_ack(), name=f"restart_completed_ack:{row.id}",
-            )
-        else:  # pragma: no cover - production agents always expose tracker
-            asyncio.ensure_future(_await_and_ack())
+        # FEATURE-owned so ``Feature.shutdown()`` (runtime disable / boot
+        # rollback / soft disable) cancels this in-flight ack. The agent-global
+        # task set is only reaped at FULL agent shutdown, so an agent-only task
+        # would outlive a disabled feature and later flag ``wake_delivered``
+        # against torn-down state (kestrel-sovereign#2522 P2). Still
+        # agent-tracked underneath, so full shutdown reaps it too.
+        self._track_owned_background_task(
+            _await_and_ack(), name=f"restart_completed_ack:{row.id}",
+        )
 
     async def _terminalize_completed(self, row, now: str) -> bool:
         """Mark a swept restart row ``completed`` and mirror the COGNITION

@@ -637,22 +637,34 @@ class TestAPIEndpointLifecycle:
     """Test enable/disable/remove via the FastAPI endpoints."""
 
     @pytest.fixture
-    def app_with_feature(self):
-        """Create a FastAPI app with the features router and a mock agent."""
+    def app_with_feature(self, tmp_path):
+        """FastAPI app + a REAL KestrelAgent wired to the features router.
+
+        The disable/enable endpoints delegate per-feature work to the agent's
+        canonical ``_unregister_feature_runtime`` / ``_activate_feature_runtime``
+        (#2522) — there is no endpoint-local teardown to mock — so this must be a
+        real agent. Construction is cheap (no ``initialize()``); the signal /
+        wait registries the teardown touches are attached empty and the A2A task
+        manager left unset (mock features need no agent-card wiring).
+        """
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
         from kestrel_sovereign.endpoints.features import router
+        from kestrel_sovereign.signals.registry import SourceRegistry
+        from kestrel_sovereign.waits import WaitRegistry
 
         app = FastAPI()
         app.include_router(router)
 
-        # Create mock agent with real HooksManager
-        manager = HooksManager()
-        agent = MagicMock()
-        agent.hooks_manager = manager
-        agent.features = {}
-        agent.storage = None
+        agent = KestrelAgent(
+            did="did:test:lifecycle-endpoints",
+            storage_path=str(tmp_path / "endpoint_lc.db"),
+        )
+        manager = agent.hooks_manager  # real HooksManager from __init__
         agent.task_manager = None
+        agent.signal_registry = SourceRegistry()
+        agent.wait_registry = WaitRegistry()
+        agent.features = {}
 
         feature = LifecycleTestFeature(agent)
         agent.features["LifecycleTestFeature"] = feature

@@ -25,17 +25,29 @@ logger = logging.getLogger(__name__)
 
 
 def build_webhook_dispatch_router(
-    receiver_provider: "Callable[[], Iterable['WebhookReceiver']]",
+    receiver_provider: "Callable[[Optional[Any]], Iterable['WebhookReceiver']]",
 ):
     """Build a single ``POST /webhooks/{name}`` router that dispatches across
     many receivers.
 
-    ``receiver_provider()`` returns the current iterable of
-    :class:`WebhookReceiver` instances — one per agent in a multi-agent
-    process. Each request resolves ``{name}`` to the receiver that has that
+    ``receiver_provider(agent)`` returns the current iterable of
+    :class:`WebhookReceiver` instances to consider for THIS request. The
+    ``agent`` argument is the request-scoped target agent
+    (``request.state.agent``) that the multi-agent routing middleware attached
+    for an agent-prefixed ``/api/agents/{name}/webhooks/{name}`` request, or
+    ``None`` for the unprefixed ``/webhooks/{name}`` form (and single-agent
+    mode). The provider is responsible for scoping accordingly:
+
+    * agent-prefixed → ONLY that agent's enabled receivers, so a request
+      addressed to agent *A* can never dispatch to agent *B*'s webhook even
+      when *A*'s owning feature is disabled/removed and *B* registers the same
+      name (kestrel-sovereign#2522);
+    * unprefixed → the aggregate of every current agent's enabled receivers.
+
+    Each request resolves ``{name}`` to the (scoped) receiver that has that
     webhook registered and dispatches there; an unregistered name is recorded
-    on the first receiver (so the 404 is still audited) or returns a bare 404
-    when no receiver exists.
+    on the first in-scope receiver (so the 404 is still audited) or returns a
+    bare 404 when no in-scope receiver exists.
 
     This replaces mounting each agent's own ``/webhooks/{name}`` catch-all: two
     identical routes would otherwise shadow each other (first-mounted wins),
@@ -54,7 +66,12 @@ def build_webhook_dispatch_router(
         headers = {k.lower(): v for k, v in request.headers.items()}
         source_ip = request.client.host if request.client else "unknown"
 
-        receivers = list(receiver_provider())
+        # Scope resolution to the request's target agent (set by the
+        # multi-agent routing middleware for an agent-prefixed request); the
+        # provider narrows to that agent's enabled receivers, or aggregates
+        # across all agents for the unprefixed form (#2522).
+        target_agent = getattr(request.state, "agent", None)
+        receivers = list(receiver_provider(target_agent))
         target = next(
             (r for r in receivers if webhook_name in r.webhooks),
             None,
@@ -289,7 +306,9 @@ class WebhookReceiver:
         Returns:
             A ``fastapi.APIRouter`` instance.
         """
-        return build_webhook_dispatch_router(lambda: (self,))
+        # Single-agent mode: this one receiver serves every request regardless
+        # of the (always ``None`` here) request-scoped agent argument.
+        return build_webhook_dispatch_router(lambda _agent=None: (self,))
 
     # ------------------------------------------------------------------
     # Queries
