@@ -332,6 +332,21 @@ def reset_kestrel_tracer() -> None:
     _kestrel_tracer = None
 
 
+def _reset_tracer_for_tests() -> None:
+    """Reset ALL cached tracer state so the next call re-evaluates the env.
+
+    Clears both the generic lifecycle tracer (:func:`setup_tracing`) and the
+    SDK-owned LLM tracer (:func:`get_kestrel_tracer`). The autouse test fixture
+    calls this — with ``OTEL_EXPORTER_OTLP_*`` / ``KESTREL_OTEL_PROJECT`` stripped
+    from the environment — so no test inherits a tracer built from a machine
+    default endpoint and ships real spans to a live Phoenix store (issue #2704,
+    the sovereign twin of talon#82).
+    """
+    global _tracer, _kestrel_tracer
+    _tracer = None
+    _kestrel_tracer = None
+
+
 def otel_max_io_chars() -> int:
     """Max serialized chars kept in an LLM span's input/output value.
 

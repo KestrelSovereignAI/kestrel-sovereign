@@ -191,6 +191,40 @@ def setup_test_config():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_otel_export_env(monkeypatch):
+    """Strip live OTLP export env from every test and reset the tracer cache.
+
+    ``OTEL_EXPORTER_OTLP_ENDPOINT`` is now a machine default (autowired via the
+    talon launcher's ``~/.config/kestrel-talon/config.env``) and is inherited by
+    the worktree ``pytest`` a talon run spawns for its verification gates.
+    Without this fixture, any test that drives the LLM span chokepoint —
+    directly via ``telemetry.llm_span`` or indirectly through
+    ``LLMService.get_response`` — would lazily build a real ``OTLPSpanExporter``
+    and ship zero-duration ``llm.get_response``/``llm.generate*`` spans to the
+    live Phoenix ``default`` project (issue #2704, the sovereign twin of
+    talon#82).
+
+    Stripping the endpoint (and the project override) and resetting the cached
+    tracers makes every test re-evaluate enablement from a clean slate: tracing
+    is off by default. Tests that need an enabled tracer opt in explicitly with a
+    fake/in-memory exporter — never a network one.
+    """
+    from kestrel_sovereign import telemetry
+
+    for var in (
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "KESTREL_OTEL_PROJECT",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    telemetry._reset_tracer_for_tests()
+    yield
+    # Drop any tracer a test built via an opt-in seam so it never leaks into the
+    # next test's enablement check.
+    telemetry._reset_tracer_for_tests()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_shared_model_cache():
     """Reset the process-wide model-discovery cache around every test.
 
