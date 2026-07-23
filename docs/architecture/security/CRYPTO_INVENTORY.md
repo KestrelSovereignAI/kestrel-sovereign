@@ -37,7 +37,7 @@ The single classical signature primitive in use across all sovereign-identity su
 | Identity-package signing | [`identity/signing.py:104-110`](../../../kestrel_sovereign/identity/signing.py#L104-L110) | `private_key.sign(content_hash.encode('utf-8'), ec.ECDSA(SHA256))` (signs the **hex-encoded** SHA-256 digest as ASCII bytes, not the raw 32-byte digest) | [`identity/signing.py:160-164`](../../../kestrel_sovereign/identity/signing.py#L160-L164), [`identity/signing.py:222-232`](../../../kestrel_sovereign/identity/signing.py#L222-L232) (DID-doc fallback) | DER signature, hex-encoded into `package.signature` |
 | Spawn-mandate signing | [`spawn/mandate.py:77-89`](../../../kestrel_sovereign/spawn/mandate.py#L77-L89) | `parent_private_key.sign(payload, ec.ECDSA(SHA256))` | [`spawn/mandate.py:92+`](../../../kestrel_sovereign/spawn/mandate.py#L92) | DER signature, hex into `mandate.parent_signature` |
 | Script signing (primary path) | [`features/compute/script_signer.py:153-163`](../../../kestrel_sovereign/features/compute/script_signer.py#L153-L163) | `_private_key.sign(content_hash_bytes, ec.ECDSA(SHA256))` (signs `sha256(content_hash_string).digest()` — i.e., the script's hex-content-hash *re-hashed* into raw 32 bytes, see `script_signer.py:151`) | [`features/compute/script_signer.py:198+`](../../../kestrel_sovereign/features/compute/script_signer.py#L198) | `ecdsa:{base64}` |
-| Wallet — Filecoin/EVM | [`features/wallet/filecoin_keys.py`](https://github.com/KestrelSovereignAI/kestrel-feature-wallet) | secp256k1 (chain-bound) | n/a (chain-verified) | wallet address |
+| Wallet — Filecoin/EVM | [`kestrel_feature_wallet/filecoin_keys.py`](https://github.com/KestrelSovereignAI/kestrel-feature-wallet/blob/main/kestrel_feature_wallet/filecoin_keys.py) | secp256k1 (chain-bound) | n/a (chain-verified) | wallet address |
 
 ### Ed25519
 
@@ -136,7 +136,7 @@ Six unit test files reference `Fernet` to exercise the production crypto: [`test
 
 | Use | File:Line |
 |---|---|
-| Filecoin address derivation | [`features/wallet/filecoin_keys.py:66-78`](https://github.com/KestrelSovereignAI/kestrel-feature-wallet) |
+| Filecoin address derivation | [`kestrel_feature_wallet/filecoin_keys.py:66-78`](https://github.com/KestrelSovereignAI/kestrel-feature-wallet/blob/main/kestrel_feature_wallet/filecoin_keys.py#L66-L78) |
 | CAR-file CID computation | [`storage/car_builder.py`](../../../kestrel_sovereign/storage/car_builder.py) |
 
 ## Library footprint
@@ -161,7 +161,7 @@ The DID format is **structurally welded to secp256k1** — the DID *is* `keccak(
 
 ## Wallet keys (out of scope, called out for clarity)
 
-[`features/wallet/filecoin_keys.py`](https://github.com/KestrelSovereignAI/kestrel-feature-wallet) and any EVM signing must remain secp256k1 — they are **chain-bound**: Filecoin and Ethereum mandate that curve and any PQ-resistant chain replacement is decades away. Per the threat model, wallet keys are explicitly **non-authoritative for agent identity continuity**: a wallet is a payment instrument the agent holds, not its selfhood. This must be enforced in code (no spawn mandate, no constitution anchor, no identity package can sign with a wallet key) so that the inevitable post-quantum break of these chains' identity layer does not break Kestrel's identity layer.
+[`kestrel_feature_wallet/filecoin_keys.py`](https://github.com/KestrelSovereignAI/kestrel-feature-wallet/blob/main/kestrel_feature_wallet/filecoin_keys.py) and any EVM signing must remain secp256k1 — they are **chain-bound**: Filecoin and Ethereum mandate that curve and any PQ-resistant chain replacement is decades away. Per the threat model, wallet keys are explicitly **non-authoritative for agent identity continuity**: a wallet is a payment instrument the agent holds, not its selfhood. This must be enforced in code (no spawn mandate, no constitution anchor, no identity package can sign with a wallet key) so that the inevitable post-quantum break of these chains' identity layer does not break Kestrel's identity layer.
 
 ## Hardware-backed custody
 

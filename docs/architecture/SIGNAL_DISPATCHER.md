@@ -57,7 +57,7 @@ The bird has at least five mechanisms that legitimately wake it up or trigger wo
 | Scheduled cron | [features/scheduler/runner.py:68](../../kestrel_sovereign/features/scheduler/runner.py#L68) | Invokes a feature tool | Trigger cognition |
 | A2A task complete | [a2a/task_manager.py:89](../../kestrel_sovereign/a2a/task_manager.py#L89) | Queues an SSE notification | Re-enter the agent |
 | Approval request | [features/security/approval_queue.py:81](../../kestrel_sovereign/features/security/approval_queue.py#L81) | Both a hook AND an event | Pick one |
-| Webhook (Stripe) | [features/wallet/onramp/webhook_handler.py:80](https://github.com/KestrelSovereignAI/kestrel-feature-wallet) | Stores + fires callback | Wake the bird |
+| Webhook (Stripe) | [kestrel_feature_wallet/onramp/webhook_handler.py:80](https://github.com/KestrelSovereignAI/kestrel-feature-wallet/blob/main/kestrel_feature_wallet/onramp/webhook_handler.py#L80) | Stores + fires callback | Wake the bird |
 
 Each was added at a different time by a different author. Same accretion shape as the model-selection postmortem in [CLAUDE.md](../../CLAUDE.md). With one signal, the abstraction is invisible. With five, overdue.
 
