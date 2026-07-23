@@ -41,6 +41,13 @@ from kestrel_sovereign.a2a.stores import (
 )
 # PostgreSQL stores imported conditionally when pg_pool is available
 from kestrel_sovereign.agent import ContextBuilder, ContextManager
+from kestrel_sovereign.agent.boot import (
+    AgentBootError,
+    BootContext,
+    BootPhase,
+    BootPhaseState,
+    run_boot_sequence,
+)
 from kestrel_sovereign.agent.operator_signals import inject_operator_turn
 from kestrel_sovereign.agent.constitution import ConstitutionMixin
 from kestrel_sovereign.agent.streaming import (
@@ -614,6 +621,14 @@ class KestrelAgent(
         self._raw_storage = None
         self.storage = None
 
+        # Explicit boot state (#2522). Replaces the old ``_raw_storage is None``
+        # proxy that let a second initialize() skip the body and run only the
+        # readiness tail over partial state. The boot sequence advances this
+        # NOT_STARTED → IN_PROGRESS → READY, or → FAILED (terminal, rolled back)
+        # on any phase failure. Readiness may only fire in READY.
+        self._boot_state: BootPhaseState = BootPhaseState.NOT_STARTED
+        self._boot_context: Optional[BootContext] = None
+
         self.llm_service = llm_service or LLMService()
         from kestrel_sovereign.agent.operator_signals import OperatorSignalProducer
         self.operator_signal_producer = OperatorSignalProducer(self)
@@ -1152,1077 +1167,1180 @@ class KestrelAgent(
             )
 
     async def initialize(self) -> None:
-        """Async initialization of storage and features."""
-        if self._raw_storage is None:
-            # Cold-start restore from Lighthouse if DB doesn't exist (ephemeral environments)
-            if (
-                os.environ.get("LIGHTHOUSE_API_KEY")
-                and self._db_backend.lower() != "postgres"
-                and self.storage_path
-                and not Path(self.storage_path).exists()
-            ):
-                try:
-                    from kestrel_sovereign.storage.sync.targets import LighthouseTarget
+        """Boot the agent as an explicit, ordered, rollback-safe phase sequence.
 
-                    agent_id = self.did or "default"
-                    state_dir = Path(self.storage_path).parent
-                    target = LighthouseTarget(
-                        api_key=os.environ["LIGHTHOUSE_API_KEY"],
-                        agent_id=agent_id,
-                        state_dir=state_dir,
-                    )
-                    result = await target.restore_snapshot(Path(self.storage_path))
-                    if result and result.success:
-                        logging.info(
-                            f"Cold-start: restored {result.bytes_synced} bytes "
-                            f"from Lighthouse (CID: {result.metadata.get('cid', 'unknown')})"
-                        )
-                    else:
-                        logging.info("Cold-start: no Lighthouse snapshot found, starting fresh")
-                except (ImportError, AttributeError, TypeError, ConnectionError) as e:
-                    logging.warning(f"Cold-start restore from Lighthouse failed: {e}")
-                except Exception as e:
-                    logging.warning(f"Cold-start restore from Lighthouse failed: {e}", exc_info=True)
+        Replaces the old ``if self._raw_storage is None:`` monolith (#2522).
+        Boot advances NOT_STARTED -> IN_PROGRESS -> READY, or -> FAILED (with a
+        reverse-order rollback of every resource the partial boot acquired) on
+        any phase failure. Idempotent when already READY. A prior FAILED boot is
+        terminal: a retry is refused with :class:`AgentBootError` (close/rebuild
+        first) so readiness can never run on partial state.
+        """
+        state = self._boot_state
+        if state is BootPhaseState.READY:
+            return
+        if state is BootPhaseState.IN_PROGRESS:
+            raise AgentBootError(
+                "initialize() is already in progress for this agent; "
+                "concurrent/re-entrant boot is not supported."
+            )
+        if state is BootPhaseState.FAILED:
+            raise AgentBootError(
+                "agent boot previously failed and its partial state was rolled "
+                "back; construct a fresh agent (or shutdown() this one) before "
+                "retrying — a partial-state retry is refused."
+            )
+        ctx = BootContext(logger_=logging.getLogger(__name__))
+        self._boot_context = ctx
 
-            # Initialize async storage based on backend type
-            if self._db_backend.lower() == "postgres" and (self.pg_pool or self._database_url):
-                # PostgreSQL backend - reuse shared pool if available
-                if self.pg_pool:
-                    from kestrel_sovereign.storage.db.postgres import PostgresBackend
-                    pg_backend = PostgresBackend.from_pool(self.pg_pool)
-                    self._raw_storage = AsyncStorage(
-                        backend=pg_backend,
-                        agent_id=self.did,
-                        llm_service=self.llm_service,
+        def _set_state(new_state: BootPhaseState) -> None:
+            self._boot_state = new_state
+
+        await run_boot_sequence(self._boot_phases(), ctx, _set_state)
+
+    def _boot_phases(self) -> list[BootPhase]:
+        """The ordered boot phases — this order IS the dependency contract.
+
+        Each phase declares the resources it deliberately RETAINS on failure
+        via ``retained``; everything else it acquires is registered for
+        reverse-order rollback on the :class:`BootContext`.
+        """
+        return [
+            BootPhase("storage_privacy", self._boot_phase_storage_privacy),
+            BootPhase(
+                "a2a_observability_signals",
+                self._boot_phase_a2a_observability_signals,
+            ),
+            BootPhase(
+                "providers_payer_sync", self._boot_phase_providers_payer_sync
+            ),
+            BootPhase(
+                "identity_constitution_features",
+                self._boot_phase_identity_constitution_features,
+                retained=(
+                    "agent identity graph node (durable; reused on a fresh retry)",
+                ),
+            ),
+            BootPhase(
+                "memory_bootstrap_context",
+                self._boot_phase_memory_bootstrap_context,
+            ),
+            BootPhase(
+                "periodic_services_readiness",
+                self._boot_phase_periodic_services_readiness,
+            ),
+        ]
+
+    async def _boot_phase_storage_privacy(self, ctx: BootContext) -> None:
+        """Phase 1 — storage + privacy. Cold-restore, raw/privacy storage, constitution runtime state, embedding-pin hydration, privacy agent, and the force-local-only embedding gate. Owns the primary DB connection."""
+        # Cold-start restore from Lighthouse if DB doesn't exist (ephemeral environments)
+        if (
+            os.environ.get("LIGHTHOUSE_API_KEY")
+            and self._db_backend.lower() != "postgres"
+            and self.storage_path
+            and not Path(self.storage_path).exists()
+        ):
+            try:
+                from kestrel_sovereign.storage.sync.targets import LighthouseTarget
+
+                agent_id = self.did or "default"
+                state_dir = Path(self.storage_path).parent
+                target = LighthouseTarget(
+                    api_key=os.environ["LIGHTHOUSE_API_KEY"],
+                    agent_id=agent_id,
+                    state_dir=state_dir,
+                )
+                result = await target.restore_snapshot(Path(self.storage_path))
+                if result and result.success:
+                    logging.info(
+                        f"Cold-start: restored {result.bytes_synced} bytes "
+                        f"from Lighthouse (CID: {result.metadata.get('cid', 'unknown')})"
                     )
-                    logging.info(f"Using shared PostgreSQL pool for Kestrel storage (agent: {self.did})")
                 else:
-                    self._raw_storage = AsyncStorage(
-                        backend="postgres",
-                        dsn=self._database_url,
-                        agent_id=self.did,
-                        llm_service=self.llm_service,
-                    )
-                    logging.info(f"Using PostgreSQL backend for Kestrel storage (agent: {self.did})")
-            else:
-                # SQLite backend (default) - agent_id optional since each agent has own DB
+                    logging.info("Cold-start: no Lighthouse snapshot found, starting fresh")
+            except (ImportError, AttributeError, TypeError, ConnectionError) as e:
+                logging.warning(f"Cold-start restore from Lighthouse failed: {e}")
+            except Exception as e:
+                logging.warning(f"Cold-start restore from Lighthouse failed: {e}", exc_info=True)
+
+        # Initialize async storage based on backend type
+        if self._db_backend.lower() == "postgres" and (self.pg_pool or self._database_url):
+            # PostgreSQL backend - reuse shared pool if available
+            if self.pg_pool:
+                from kestrel_sovereign.storage.db.postgres import PostgresBackend
+                pg_backend = PostgresBackend.from_pool(self.pg_pool)
                 self._raw_storage = AsyncStorage(
-                    self.storage_path,
+                    backend=pg_backend,
                     agent_id=self.did,
                     llm_service=self.llm_service,
                 )
-                logging.info(f"Using SQLite backend for Kestrel storage: {self.storage_path}")
-
-            await self._raw_storage.initialize()
-
-            # Wrap storage with privacy-enforcing layer
-            self.storage = PrivacyEnforcingStorage(self._raw_storage, self._privacy_mode)
-
-            # Distinguish a genuinely new identity from a legacy identity that
-            # merely lacks the new runtime-state row. Only a genuine first boot
-            # may establish its initial constitution anchor automatically; a
-            # lookup failure is treated as existing/unknown and therefore
-            # follows the fail-closed migration path.
-            early_agent_node = None
-            identity_lookup_succeeded = False
-            try:
-                early_agent_node = await self.storage.get_node(self.agent_id)
-                identity_lookup_succeeded = True
-            except Exception as exc:  # noqa: BLE001
-                logging.warning(
-                    "Could not load agent identity node for sync policy: %s",
-                    exc,
-                )
-
-            # Safe Mode and periodic-audit deadlines are authoritative runtime
-            # state. Restore them before features can emit startup cognition or
-            # the server can report readiness. Legacy agents receive a due-now
-            # migration record; the full verification runs later in this same
-            # initialize call, after feature/spawn constraints are available.
-            await self._initialize_constitution_runtime_state(
-                is_new_identity=(
-                    identity_lookup_succeeded and early_agent_node is None
-                )
-            )
-
-            # #2290 — re-apply any previously-verified shared embedding-space
-            # pins from the persisted parity record. ``_verified_space_pins`` is
-            # process-local, so without this a restart would silently drop the
-            # shared local/cloud space until an operator re-ran the parity probe,
-            # stranding reindexed rows outside kNN. Best-effort; never blocks init.
-            try:
-                if self.llm_service and hasattr(
-                    self.llm_service, "hydrate_verified_space_pins"
-                ):
-                    await self.llm_service.hydrate_verified_space_pins(
-                        getattr(self._raw_storage, "db", None)
-                    )
-            except Exception as exc:  # noqa: BLE001
-                logging.debug("Embedding-space pin hydration skipped: %s", exc)
-
-            if early_agent_node is not None:
-                self._is_test_instance = bool(
-                    early_agent_node.properties.get("is_test_instance", False)
-                )
-                self._test_cycle_id = early_agent_node.properties.get("test_cycle_id")
-                self._agent_name = early_agent_node.properties.get("name", "Unnamed Agent")
-                self._is_demo = bool(early_agent_node.properties.get("is_demo", False))
-
-            # Initialize privacy agent. When the agent's kestrel.toml flips
-            # ``[privacy] computer_access = true`` (#956), we build a
-            # ``PrivacyConfig`` from the preset, set the flag, and pass that
-            # in instead of the raw mode string. The flag is independent of
-            # the preset by design (privacy.py comment: "must be opted into
-            # explicitly"), so the only way to enable it on a running
-            # agent is via this path.
-            if self._privacy_computer_access:
-                from kestrel_sovereign.privacy import (
-                    PrivacyConfig,
-                    privacy_mode_to_config,
-                )
-                base_cfg = privacy_mode_to_config(self._privacy_mode)
-                opted_in = PrivacyConfig(
-                    storage=base_cfg.storage,
-                    processing=base_cfg.processing,
-                    sharing=base_cfg.sharing,
-                    assurance=base_cfg.assurance,
-                    audit=base_cfg.audit,
-                    computer_access=True,
-                )
-                self.privacy_agent = PrivacyAgent(self._raw_storage, opted_in)
+                logging.info(f"Using shared PostgreSQL pool for Kestrel storage (agent: {self.did})")
             else:
-                self.privacy_agent = PrivacyAgent(self._raw_storage, self._privacy_mode)
+                self._raw_storage = AsyncStorage(
+                    backend="postgres",
+                    dsn=self._database_url,
+                    agent_id=self.did,
+                    llm_service=self.llm_service,
+                )
+                logging.info(f"Using PostgreSQL backend for Kestrel storage (agent: {self.did})")
+        else:
+            # SQLite backend (default) - agent_id optional since each agent has own DB
+            self._raw_storage = AsyncStorage(
+                self.storage_path,
+                agent_id=self.did,
+                llm_service=self.llm_service,
+            )
+            logging.info(f"Using SQLite backend for Kestrel storage: {self.storage_path}")
 
-            # Bind the privacy gate for the embedding routing path
-            # (#1492). The chat path threads force_local_only
-            # explicitly, but embeddings are called from the storage
-            # layer (e.g. AsyncConversationStore.add_conversation)
-            # which has no direct view of privacy_agent. Routing this
-            # through a callable keeps the embedding path honest
-            # without each storage caller having to know about
-            # privacy modes. Captured by reference — future
-            # privacy-mode flips are picked up automatically.
-            #
-            # hasattr-guarded because tests / external integrations
-            # inject lightweight LLM-service fakes that don't
-            # implement this hook; matches the same pattern this
-            # constructor already uses for other optional LLM-service
-            # methods like ``attach_to_agent``.
-            if hasattr(self.llm_service, "set_force_local_only_provider"):
-                self.llm_service.set_force_local_only_provider(
-                    lambda pa=self.privacy_agent: (
-                        not pa.privacy_config.allows_cloud_llm()
+        # Register the reverse-order teardown BEFORE opening the connection.
+        # ``AsyncStorage.initialize()`` may open the primary DB connection and
+        # then raise partway (e.g. a failed migration), so registering the undo
+        # only after it returns would leak that connection on a mid-initialize
+        # failure (#2522 P1). The teardown null-guards + ``hasattr(raw, close)``
+        # so closing a partially-initialized storage is safe; it also drops the
+        # privacy wrapper / privacy agent set below.
+        ctx.on_rollback("storage", self._boot_teardown_storage)
+        await self._raw_storage.initialize()
+
+        # Wrap storage with privacy-enforcing layer
+        self.storage = PrivacyEnforcingStorage(self._raw_storage, self._privacy_mode)
+
+        # Distinguish a genuinely new identity from a legacy identity that
+        # merely lacks the new runtime-state row. Only a genuine first boot
+        # may establish its initial constitution anchor automatically; a
+        # lookup failure is treated as existing/unknown and therefore
+        # follows the fail-closed migration path.
+        early_agent_node = None
+        identity_lookup_succeeded = False
+        try:
+            early_agent_node = await self.storage.get_node(self.agent_id)
+            identity_lookup_succeeded = True
+        except Exception as exc:  # noqa: BLE001
+            logging.warning(
+                "Could not load agent identity node for sync policy: %s",
+                exc,
+            )
+        # Carry the identity node to the providers/sync phase (its
+        # constitution-anchor gate reads it) — the single value that crosses a
+        # phase boundary now that the body is split.
+        ctx.early_agent_node = early_agent_node
+
+        # Safe Mode and periodic-audit deadlines are authoritative runtime
+        # state. Restore them before features can emit startup cognition or
+        # the server can report readiness. Legacy agents receive a due-now
+        # migration record; the full verification runs later in this same
+        # initialize call, after feature/spawn constraints are available.
+        await self._initialize_constitution_runtime_state(
+            is_new_identity=(
+                identity_lookup_succeeded and early_agent_node is None
+            )
+        )
+
+        # #2290 — re-apply any previously-verified shared embedding-space
+        # pins from the persisted parity record. ``_verified_space_pins`` is
+        # process-local, so without this a restart would silently drop the
+        # shared local/cloud space until an operator re-ran the parity probe,
+        # stranding reindexed rows outside kNN. Best-effort; never blocks init.
+        try:
+            if self.llm_service and hasattr(
+                self.llm_service, "hydrate_verified_space_pins"
+            ):
+                await self.llm_service.hydrate_verified_space_pins(
+                    getattr(self._raw_storage, "db", None)
+                )
+        except Exception as exc:  # noqa: BLE001
+            logging.debug("Embedding-space pin hydration skipped: %s", exc)
+
+        if early_agent_node is not None:
+            self._is_test_instance = bool(
+                early_agent_node.properties.get("is_test_instance", False)
+            )
+            self._test_cycle_id = early_agent_node.properties.get("test_cycle_id")
+            self._agent_name = early_agent_node.properties.get("name", "Unnamed Agent")
+            self._is_demo = bool(early_agent_node.properties.get("is_demo", False))
+
+        # Initialize privacy agent. When the agent's kestrel.toml flips
+        # ``[privacy] computer_access = true`` (#956), we build a
+        # ``PrivacyConfig`` from the preset, set the flag, and pass that
+        # in instead of the raw mode string. The flag is independent of
+        # the preset by design (privacy.py comment: "must be opted into
+        # explicitly"), so the only way to enable it on a running
+        # agent is via this path.
+        if self._privacy_computer_access:
+            from kestrel_sovereign.privacy import (
+                PrivacyConfig,
+                privacy_mode_to_config,
+            )
+            base_cfg = privacy_mode_to_config(self._privacy_mode)
+            opted_in = PrivacyConfig(
+                storage=base_cfg.storage,
+                processing=base_cfg.processing,
+                sharing=base_cfg.sharing,
+                assurance=base_cfg.assurance,
+                audit=base_cfg.audit,
+                computer_access=True,
+            )
+            self.privacy_agent = PrivacyAgent(self._raw_storage, opted_in)
+        else:
+            self.privacy_agent = PrivacyAgent(self._raw_storage, self._privacy_mode)
+
+        # Bind the privacy gate for the embedding routing path
+        # (#1492). The chat path threads force_local_only
+        # explicitly, but embeddings are called from the storage
+        # layer (e.g. AsyncConversationStore.add_conversation)
+        # which has no direct view of privacy_agent. Routing this
+        # through a callable keeps the embedding path honest
+        # without each storage caller having to know about
+        # privacy modes. Captured by reference — future
+        # privacy-mode flips are picked up automatically.
+        #
+        # hasattr-guarded because tests / external integrations
+        # inject lightweight LLM-service fakes that don't
+        # implement this hook; matches the same pattern this
+        # constructor already uses for other optional LLM-service
+        # methods like ``attach_to_agent``.
+        if hasattr(self.llm_service, "set_force_local_only_provider"):
+            self.llm_service.set_force_local_only_provider(
+                lambda pa=self.privacy_agent: (
+                    not pa.privacy_config.allows_cloud_llm()
+                )
+            )
+
+        # Async completion pass for routes the sync registry build couldn't
+        # bring up (e.g. an OpenRouter route with only a management key, now
+        # completed via a bootstrap child key). Guard on iscoroutinefunction
+        # rather than hasattr: MagicMock-based LLM-service fakes satisfy
+        # hasattr (auto-attr) but are NOT awaitable, so a bare hasattr guard
+        # would raise "MagicMock can't be awaited" in every such test. Only
+        # await a genuine async finalize hook.
+        finalize_providers = getattr(self.llm_service, "finalize_providers", None)
+        if inspect.iscoroutinefunction(finalize_providers):
+            # Pass the host-level store so the registry can persist + reuse
+            # the OpenRouter bootstrap child key across restarts instead of
+            # minting a new one every cold start. Resolve it (injected host
+            # db, else the on-disk ``host.db``) so standalone/SQLite
+            # deployments — not just multi-tenant embeddings — get the reuse.
+            await finalize_providers(host_db=await self._resolve_host_db())
+
+
+    async def _boot_phase_a2a_observability_signals(self, ctx: BootContext) -> None:
+        """Phase 2 — A2A stores, observability, and the signal spine. TaskManager + its stores, the observability/feedback sinks, the enablement store, the SignalDispatcher/registries, and the core (always-on) signal sources."""
+        # Initialize TaskManager for A2A unified routing
+        # All stores use the abstract data layer (SQLite for sovereign, PostgreSQL for multi-tenant)
+        if self._db_backend.lower() == "postgres" and self.pg_pool:
+            # PostgreSQL mode: use PostgreSQL stores with existing pool
+            from kestrel_sovereign.a2a.stores.postgres import (
+                PostgresTaskStore, PostgresSessionService,
+                PostgresMemoryService, PostgresObservabilityStore,
+                PostgresFeedbackStore
+            )
+            task_store = PostgresTaskStore(self.pg_pool)
+            session_service = PostgresSessionService(self.pg_pool)
+            observability_store = PostgresObservabilityStore(self.pg_pool)
+            memory_service = PostgresMemoryService(self.pg_pool)
+            feedback_store = PostgresFeedbackStore(self.pg_pool)
+            logging.info(f"Using PostgreSQL A2A stores for agent {self.did}")
+        else:
+            # SQLite mode: use SQLite stores with file path
+            task_store_path = self.storage_path
+            task_store = SQLiteTaskStore(task_store_path)
+            session_service = SQLiteSessionService(task_store_path)
+            observability_store = SQLiteObservabilityStore(task_store_path)
+            memory_service = SQLiteMemoryService(task_store_path)
+            feedback_store = SQLiteFeedbackStore(task_store_path)
+            logging.info(f"Using SQLite A2A stores for agent {self.did}")
+
+        self.task_manager = TaskManager(
+            task_store=task_store,
+            session_service=session_service,
+            observability_store=observability_store,
+            memory_service=memory_service,
+            feedback_store=feedback_store,
+            hooks_manager=self.hooks_manager,  # Pass hooks manager for security
+            on_task_complete=self._on_background_task_complete,  # For notifications
+            # Inbound-task callback: when a peer creates a task
+            # addressed to this agent, wake the cognition loop via
+            # the dispatcher. Without this, peer-submitted tasks
+            # sat SUBMITTED in the store with no autonomous trigger
+            # — the missing piece behind every "I sent it, did you
+            # get it?" thread (#645 / Emma↔Meridian).
+            on_task_submitted=self._on_task_submitted,
+            # Provider returns the in-flight cognition turn's
+            # causation chain (serialized) so outbound A2A tasks
+            # carry the lineage. The dispatcher sets the chain on
+            # the agent before calling process_input for COGNITION
+            # signals; create_task reads it via this provider.
+            # See #905 review P1 — without this, A→B→A loops would
+            # restart at depth 1 every iteration.
+            causation_chain_provider=self._provide_causation_chain,
+        )
+        # Register teardown BEFORE initialize: ``TaskManager.initialize()`` opens
+        # its A2A store connections (task/session/observability/memory/feedback)
+        # SEQUENTIALLY, so a later store's failure must still close the earlier
+        # ones — registering the undo only after it returns would leak them on a
+        # mid-initialize failure (#2522 P1).
+        ctx.on_rollback("task_manager", self._boot_teardown_task_manager)
+        await self.task_manager.initialize()
+
+        # Expose feedback store for features and commands
+        self.feedback_store = feedback_store
+
+        # Expose observability store for orchestrator instrumentation
+        self.observability_store = observability_store
+
+        # Wire the store into the per-agent LLMService so every chat /
+        # generate / streaming call lands in a2a_llm_calls (#2236). The
+        # service instruments all chokepoints but stays dark without
+        # this attach — only features logging directly to the store
+        # (e.g. reflection) showed up in the LLM Calls panel.
+        if hasattr(self.llm_service, "set_observability_store"):
+            self.llm_service.set_observability_store(observability_store)
+
+        # Privacy-gate the observability sink at the layer boundary (F076).
+        # Tool-call args and metadata are user content, so the sink must
+        # honour the agent's privacy mode: EPHEMERAL/ISOLATED elide the
+        # payload, ANONYMOUS anonymizes it. Bind the live privacy config by
+        # reference (same pattern as set_force_local_only_provider) so
+        # mid-session mode flips are picked up automatically.
+        if hasattr(observability_store, "set_privacy_config_provider"):
+            observability_store.set_privacy_config_provider(
+                lambda pa=self.privacy_agent: pa.privacy_config
+            )
+        # Wire the EPHEMERAL safety-net sweep into the storage wrapper so
+        # purge_ephemeral_session also scrubs any observability rows
+        # authored during the ephemeral stint (F076). Tool-call args in
+        # a2a_observability use the agent DID as agent_name (see the
+        # log_tool_call callers), so scope by DID on both columns.
+        if hasattr(self.storage, "set_observability_purge"):
+            self.storage.set_observability_purge(
+                lambda since, obs=observability_store, did=self.did: (
+                    obs.purge_observability_since(
+                        since, agent_did=did, agent_name=did
                     )
                 )
-
-            # Async completion pass for routes the sync registry build couldn't
-            # bring up (e.g. an OpenRouter route with only a management key, now
-            # completed via a bootstrap child key). Guard on iscoroutinefunction
-            # rather than hasattr: MagicMock-based LLM-service fakes satisfy
-            # hasattr (auto-attr) but are NOT awaitable, so a bare hasattr guard
-            # would raise "MagicMock can't be awaited" in every such test. Only
-            # await a genuine async finalize hook.
-            finalize_providers = getattr(self.llm_service, "finalize_providers", None)
-            if inspect.iscoroutinefunction(finalize_providers):
-                # Pass the host-level store so the registry can persist + reuse
-                # the OpenRouter bootstrap child key across restarts instead of
-                # minting a new one every cold start. Resolve it (injected host
-                # db, else the on-disk ``host.db``) so standalone/SQLite
-                # deployments — not just multi-tenant embeddings — get the reuse.
-                await finalize_providers(host_db=await self._resolve_host_db())
-
-            # Initialize TaskManager for A2A unified routing
-            # All stores use the abstract data layer (SQLite for sovereign, PostgreSQL for multi-tenant)
-            if self._db_backend.lower() == "postgres" and self.pg_pool:
-                # PostgreSQL mode: use PostgreSQL stores with existing pool
-                from kestrel_sovereign.a2a.stores.postgres import (
-                    PostgresTaskStore, PostgresSessionService,
-                    PostgresMemoryService, PostgresObservabilityStore,
-                    PostgresFeedbackStore
-                )
-                task_store = PostgresTaskStore(self.pg_pool)
-                session_service = PostgresSessionService(self.pg_pool)
-                observability_store = PostgresObservabilityStore(self.pg_pool)
-                memory_service = PostgresMemoryService(self.pg_pool)
-                feedback_store = PostgresFeedbackStore(self.pg_pool)
-                logging.info(f"Using PostgreSQL A2A stores for agent {self.did}")
-            else:
-                # SQLite mode: use SQLite stores with file path
-                task_store_path = self.storage_path
-                task_store = SQLiteTaskStore(task_store_path)
-                session_service = SQLiteSessionService(task_store_path)
-                observability_store = SQLiteObservabilityStore(task_store_path)
-                memory_service = SQLiteMemoryService(task_store_path)
-                feedback_store = SQLiteFeedbackStore(task_store_path)
-                logging.info(f"Using SQLite A2A stores for agent {self.did}")
-
-            self.task_manager = TaskManager(
-                task_store=task_store,
-                session_service=session_service,
-                observability_store=observability_store,
-                memory_service=memory_service,
-                feedback_store=feedback_store,
-                hooks_manager=self.hooks_manager,  # Pass hooks manager for security
-                on_task_complete=self._on_background_task_complete,  # For notifications
-                # Inbound-task callback: when a peer creates a task
-                # addressed to this agent, wake the cognition loop via
-                # the dispatcher. Without this, peer-submitted tasks
-                # sat SUBMITTED in the store with no autonomous trigger
-                # — the missing piece behind every "I sent it, did you
-                # get it?" thread (#645 / Emma↔Meridian).
-                on_task_submitted=self._on_task_submitted,
-                # Provider returns the in-flight cognition turn's
-                # causation chain (serialized) so outbound A2A tasks
-                # carry the lineage. The dispatcher sets the chain on
-                # the agent before calling process_input for COGNITION
-                # signals; create_task reads it via this provider.
-                # See #905 review P1 — without this, A→B→A loops would
-                # restart at depth 1 every iteration.
-                causation_chain_provider=self._provide_causation_chain,
-            )
-            await self.task_manager.initialize()
-
-            # Expose feedback store for features and commands
-            self.feedback_store = feedback_store
-
-            # Expose observability store for orchestrator instrumentation
-            self.observability_store = observability_store
-
-            # Wire the store into the per-agent LLMService so every chat /
-            # generate / streaming call lands in a2a_llm_calls (#2236). The
-            # service instruments all chokepoints but stays dark without
-            # this attach — only features logging directly to the store
-            # (e.g. reflection) showed up in the LLM Calls panel.
-            if hasattr(self.llm_service, "set_observability_store"):
-                self.llm_service.set_observability_store(observability_store)
-
-            # Privacy-gate the observability sink at the layer boundary (F076).
-            # Tool-call args and metadata are user content, so the sink must
-            # honour the agent's privacy mode: EPHEMERAL/ISOLATED elide the
-            # payload, ANONYMOUS anonymizes it. Bind the live privacy config by
-            # reference (same pattern as set_force_local_only_provider) so
-            # mid-session mode flips are picked up automatically.
-            if hasattr(observability_store, "set_privacy_config_provider"):
-                observability_store.set_privacy_config_provider(
-                    lambda pa=self.privacy_agent: pa.privacy_config
-                )
-            # Wire the EPHEMERAL safety-net sweep into the storage wrapper so
-            # purge_ephemeral_session also scrubs any observability rows
-            # authored during the ephemeral stint (F076). Tool-call args in
-            # a2a_observability use the agent DID as agent_name (see the
-            # log_tool_call callers), so scope by DID on both columns.
-            if hasattr(self.storage, "set_observability_purge"):
-                self.storage.set_observability_purge(
-                    lambda since, obs=observability_store, did=self.did: (
-                        obs.purge_observability_since(
-                            since, agent_did=did, agent_name=did
-                        )
-                    )
-                )
-
-            # Per-agent enablement deltas (agent-driven feature/MCP-server
-            # add/remove that must survive restart). Reuses the observability
-            # backend so it lands in the agent's own DB. Initialized BEFORE
-            # feature discovery so the reconcile-union below can read it.
-            # Degrades to None (deltas disabled) rather than blocking init.
-            self._feature_enablement_store = None
-            try:
-                from kestrel_sovereign.a2a.stores.unified.feature_enablement_store import (
-                    FeatureEnablementStore,
-                )
-                backend = observability_store.backend
-                await backend.connect()  # idempotent — no-op if already connected
-                store = FeatureEnablementStore(backend)
-                await store.initialize()
-                self._feature_enablement_store = store
-            except Exception as e:  # noqa: BLE001 - never block init on this
-                logging.warning(
-                    "FeatureEnablementStore unavailable; enablement deltas "
-                    "disabled (features still load from the bootstrap allowlist): %s",
-                    e,
-                )
-
-            # Initialize SignalDispatcher with the agent's existing
-            # OrderedLockManager (shared with the turn lifecycle so
-            # disjoint resource locks parallelize correctly) and a
-            # signal_log store backed by the agent's primary database
-            # connection. Source registrations land in the registry as
-            # features/runners initialize — heartbeat (Phase 3, this PR)
-            # is the first; scheduler/A2A/Stripe follow in Phases 4-6.
-            from kestrel_sovereign.signals import (
-                SignalDispatcher,
-                SignalLogStore,
-                SourceRegistry,
-            )
-            from kestrel_sovereign.waits import WaitRegistry
-
-            # AsyncStorage owns the underlying DatabaseBackend; reuse it
-            # so signal_log shares the agent's pool/connection rather than
-            # opening a separate one to the same db.
-            signal_log_store = SignalLogStore(self._raw_storage._backend)
-            await signal_log_store.initialize()
-
-            self.signal_registry = SourceRegistry()
-            # Per-agent dispatch table for generic waits. Features register
-            # one Waitable provider per handle kind in
-            # post_all_features_loaded; the generic `wait("<kind>:<handle>")`
-            # tool resolves kinds here. Mirrors signal_registry.
-            self.wait_registry = WaitRegistry()
-            self.signal_log_store = signal_log_store
-            self.dispatcher = SignalDispatcher(
-                agent=self,
-                registry=self.signal_registry,
-                lock_manager=self._lock_manager,
-                store=signal_log_store,
             )
 
-            # Register the a2a.task_complete source so peer-task
-            # completions wake the bird via the dispatcher (Phase 5 of
-            # #889). The receiving callback in EventManagerMixin builds
-            # the Signal envelope and calls enqueue_signal; this
-            # registration provides the routing target.
-            from kestrel_sovereign.signals.sources.a2a import (
-                build_a2a_task_complete_registration,
+        # Per-agent enablement deltas (agent-driven feature/MCP-server
+        # add/remove that must survive restart). Reuses the observability
+        # backend so it lands in the agent's own DB. Initialized BEFORE
+        # feature discovery so the reconcile-union below can read it.
+        # Degrades to None (deltas disabled) rather than blocking init.
+        self._feature_enablement_store = None
+        try:
+            from kestrel_sovereign.a2a.stores.unified.feature_enablement_store import (
+                FeatureEnablementStore,
             )
-            self.signal_registry.register(
-                build_a2a_task_complete_registration()
-            )
-
-            # Register the a2a.task_submitted source — the inbound-
-            # direction wake (#645 missing piece). When a peer creates
-            # a task addressed to this agent, TaskManager.create_task
-            # fires ``_on_task_submitted`` which builds a Signal from
-            # this registration and enqueues it via the dispatcher.
-            # Mirrors `channels.feature.py:425` — the proven inbound
-            # wake pattern.
-            from kestrel_sovereign.signals.sources.a2a_task_submitted import (
-                build_a2a_task_submitted_registration,
-            )
-            self.signal_registry.register(
-                build_a2a_task_submitted_registration()
+            backend = observability_store.backend
+            await backend.connect()  # idempotent — no-op if already connected
+            store = FeatureEnablementStore(backend)
+            await store.initialize()
+            self._feature_enablement_store = store
+        except Exception as e:  # noqa: BLE001 - never block init on this
+            logging.warning(
+                "FeatureEnablementStore unavailable; enablement deltas "
+                "disabled (features still load from the bootstrap allowlist): %s",
+                e,
             )
 
-            # Register the Stripe deposit-complete webhook source
-            # (Phase 6 of #889 — the first UNTRUSTED COGNITION source).
-            # Registration is unconditional even when the wallet
-            # feature isn't loaded; the StripeWebhookHandler is wired
-            # by the wallet feature when it initializes, and uses
-            # `agent.on_stripe_deposit_complete` (defined elsewhere on
-            # the agent) as its on_deposit_complete callback.
-            from kestrel_sovereign.signals.sources.wallet import (
-                build_stripe_deposit_registration,
-            )
-            self.signal_registry.register(
-                build_stripe_deposit_registration()
-            )
+        # Initialize SignalDispatcher with the agent's existing
+        # OrderedLockManager (shared with the turn lifecycle so
+        # disjoint resource locks parallelize correctly) and a
+        # signal_log store backed by the agent's primary database
+        # connection. Source registrations land in the registry as
+        # features/runners initialize — heartbeat (Phase 3, this PR)
+        # is the first; scheduler/A2A/Stripe follow in Phases 4-6.
+        from kestrel_sovereign.signals import (
+            SignalDispatcher,
+            SignalLogStore,
+            SourceRegistry,
+        )
+        from kestrel_sovereign.waits import WaitRegistry
 
-            # Register the a2a.question_answered source — the SENDER-
-            # side resumption rail for ``send_a2a_question`` (#1444).
-            # When the sender's subscription supervisor sees the
-            # outbound task reach a terminal state on the receiver, it
-            # builds a signal from this registration and enqueues it
-            # locally so the asking turn resumes via a fresh COGNITION
-            # turn rather than a long-blocking poll.
-            from kestrel_sovereign.signals.sources.a2a_question_answered import (
-                build_a2a_question_answered_registration,
-            )
-            self.signal_registry.register(
-                build_a2a_question_answered_registration()
-            )
+        # AsyncStorage owns the underlying DatabaseBackend; reuse it
+        # so signal_log shares the agent's pool/connection rather than
+        # opening a separate one to the same db.
+        signal_log_store = SignalLogStore(self._raw_storage._backend)
+        await signal_log_store.initialize()
 
-            # Register the generic wait.complete source — the resumption
-            # rail the Wave-2 wait reconciler (#1860) fires when ANY
-            # MonitorableWaitable provider's handle reaches a terminal
-            # Outcome. Providers that declare their own signal name
-            # (e.g. TalonWaitable -> talon.job_complete) keep firing that;
-            # wait.complete is the fallback for providers that only set the
-            # generic name. Registered unconditionally (core, not gated on
-            # any feature) so the reconciler always has a routing target.
-            from kestrel_sovereign.signals.sources.wait import (
-                build_wait_complete_registration,
-            )
-            self.signal_registry.register(
-                build_wait_complete_registration()
-            )
+        self.signal_registry = SourceRegistry()
+        # Per-agent dispatch table for generic waits. Features register
+        # one Waitable provider per handle kind in
+        # post_all_features_loaded; the generic `wait("<kind>:<handle>")`
+        # tool resolves kinds here. Mirrors signal_registry.
+        self.wait_registry = WaitRegistry()
+        self.signal_log_store = signal_log_store
+        self.dispatcher = SignalDispatcher(
+            agent=self,
+            registry=self.signal_registry,
+            lock_manager=self._lock_manager,
+            store=signal_log_store,
+        )
 
-            # Sender-side store for in-flight send_a2a_question
-            # correlation rows (#1444). PeersFeature.send_a2a_question
-            # inserts here on POST; the subscription supervisor marks
-            # RESOLVED on terminal SSE frame; the hourly expiry sweep
-            # walks ``list_waiting_past_deadline`` and marks EXPIRED.
-            from kestrel_sovereign.storage.async_pending_a2a_question_store import (
-                PendingA2AQuestionStore,
-            )
-            # ``agent_id`` is the agent's DID — scopes every query so a
-            # shared backend cannot leak rows across agents (codex
-            # round 1 P1 on PR #1453). DID is guaranteed non-None by
-            # the time we get here.
-            self.pending_a2a_questions = PendingA2AQuestionStore(
-                self._raw_storage.db,
-                agent_id=self.did or "",
-            )
+        # Register the always-on core signal sources under an explicit
+        # MANDATORY policy (#2522). These are boot-critical routing targets,
+        # so a registration failure must abort boot — but as an ATOMIC batch:
+        # if any one fails validation, register_batch removes the ones already
+        # added in this batch, so a partial core source set never survives.
+        # Each build_* is unconditional (not gated on any feature):
+        #   a2a.task_complete    — peer-task completion wake (#889 Phase 5)
+        #   a2a.task_submitted   — inbound peer-task wake (#645)
+        #   stripe.deposit       — Stripe deposit webhook (UNTRUSTED COGNITION)
+        #   a2a.question_answered— send_a2a_question resumption rail (#1444)
+        #   wait.complete        — generic wait reconciler rail (#1860)
+        from kestrel_sovereign.signals import RegistrationPolicy
+        from kestrel_sovereign.signals.sources.a2a import (
+            build_a2a_task_complete_registration,
+        )
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            build_a2a_task_submitted_registration,
+        )
+        from kestrel_sovereign.signals.sources.wallet import (
+            build_stripe_deposit_registration,
+        )
+        from kestrel_sovereign.signals.sources.a2a_question_answered import (
+            build_a2a_question_answered_registration,
+        )
+        from kestrel_sovereign.signals.sources.wait import (
+            build_wait_complete_registration,
+        )
 
-            # Initialize storage providers for features (reflection self-model, etc.)
-            self.lighthouse_provider = None
-            from kestrel_sovereign.storage.sync.service import (
-                RemoteTierPolicyContext,
-                SyncService,
-                _remote_tiers_allowed,
-            )
+        core_source_registrations = [
+            build_a2a_task_complete_registration(),
+            build_a2a_task_submitted_registration(),
+            build_stripe_deposit_registration(),
+            build_a2a_question_answered_registration(),
+            build_wait_complete_registration(),
+        ]
+        core_source_names = [reg.name for reg in core_source_registrations]
+        self.signal_registry.register_batch(
+            core_source_registrations, RegistrationPolicy.MANDATORY
+        )
+        # Unregister them in reverse if a later phase fails, so the discarded
+        # boot leaves no orphan source registrations behind.
+        ctx.on_rollback(
+            "core_signal_sources",
+            lambda names=list(core_source_names): self._boot_teardown_signal_sources(names),
+        )
 
-            agent_id = self.did or "default"
-            state_dir = Path(self.storage_path).parent if self.storage_path else None
-            has_constitution_anchor = (
-                bool(early_agent_node.properties.get("constitution_hash"))
-                if early_agent_node is not None
-                else False
+        # Sender-side store for in-flight send_a2a_question
+        # correlation rows (#1444). PeersFeature.send_a2a_question
+        # inserts here on POST; the subscription supervisor marks
+        # RESOLVED on terminal SSE frame; the hourly expiry sweep
+        # walks ``list_waiting_past_deadline`` and marks EXPIRED.
+        from kestrel_sovereign.storage.async_pending_a2a_question_store import (
+            PendingA2AQuestionStore,
+        )
+        # ``agent_id`` is the agent's DID — scopes every query so a
+        # shared backend cannot leak rows across agents (codex
+        # round 1 P1 on PR #1453). DID is guaranteed non-None by
+        # the time we get here.
+        self.pending_a2a_questions = PendingA2AQuestionStore(
+            self._raw_storage.db,
+            agent_id=self.did or "",
+        )
+
+
+    async def _boot_phase_providers_payer_sync(self, ctx: BootContext) -> None:
+        """Phase 3 — storage providers, payer policy, and the sync service. Reads the identity node carried from phase 1 for the constitution-anchor gate."""
+        # Initialize storage providers for features (reflection self-model, etc.)
+        self.lighthouse_provider = None
+        from kestrel_sovereign.storage.sync.service import (
+            RemoteTierPolicyContext,
+            SyncService,
+            _remote_tiers_allowed,
+        )
+
+        agent_id = self.did or "default"
+        state_dir = Path(self.storage_path).parent if self.storage_path else None
+        early_agent_node = ctx.early_agent_node
+        has_constitution_anchor = (
+            bool(early_agent_node.properties.get("constitution_hash"))
+            if early_agent_node is not None
+            else False
+        )
+        remote_policy_context = RemoteTierPolicyContext(
+            identity=agent_id,
+            db_path=self.storage_path,
+            is_test_instance=self.is_test_instance,
+            has_constitution_anchor=has_constitution_anchor,
+            is_sovereign_identity=bool(agent_id)
+            and not str(agent_id).lower().startswith("did:test:"),
+            privacy_mode=self._privacy_mode.value
+            if hasattr(self._privacy_mode, "value")
+            else str(self._privacy_mode),
+        )
+
+        def live_remote_policy_context() -> RemoteTierPolicyContext:
+            privacy_mode = (
+                self._privacy_mode.value
+                if hasattr(self._privacy_mode, "value")
+                else str(self._privacy_mode)
             )
-            remote_policy_context = RemoteTierPolicyContext(
+            return RemoteTierPolicyContext(
                 identity=agent_id,
                 db_path=self.storage_path,
                 is_test_instance=self.is_test_instance,
                 has_constitution_anchor=has_constitution_anchor,
                 is_sovereign_identity=bool(agent_id)
                 and not str(agent_id).lower().startswith("did:test:"),
-                privacy_mode=self._privacy_mode.value
-                if hasattr(self._privacy_mode, "value")
-                else str(self._privacy_mode),
+                privacy_mode=privacy_mode,
             )
 
-            def live_remote_policy_context() -> RemoteTierPolicyContext:
-                privacy_mode = (
-                    self._privacy_mode.value
-                    if hasattr(self._privacy_mode, "value")
-                    else str(self._privacy_mode)
-                )
-                return RemoteTierPolicyContext(
-                    identity=agent_id,
-                    db_path=self.storage_path,
-                    is_test_instance=self.is_test_instance,
-                    has_constitution_anchor=has_constitution_anchor,
-                    is_sovereign_identity=bool(agent_id)
-                    and not str(agent_id).lower().startswith("did:test:"),
-                    privacy_mode=privacy_mode,
-                )
+        remote_policy_decision = _remote_tiers_allowed(remote_policy_context)
 
-            remote_policy_decision = _remote_tiers_allowed(remote_policy_context)
-
-            # Storage path through PayerPolicy resolver. Honors the policy's
-            # `storage` slot:
-            #   NONE     → do not construct LighthouseProvider at all
-            #   HOST_ENV → construct with the resolver as the single credential
-            #              source (no constructor-time env-var bleed-through)
-            #   SELF_WALLET → mint/store a Lighthouse key by signing the
-            #                 auth challenge with the agent's secp256k1 key
-            #
-            # Cold-start restore above (line ~488) is intentionally policy-
-            # unaware: it runs before the agent's DB exists and so cannot
-            # consult the policy. Operators who want NONE storage should not
-            # set LIGHTHOUSE_API_KEY.
-            if not remote_policy_decision.allowed:
-                logging.warning(
-                    "Remote storage providers skipped by policy: %s",
-                    remote_policy_decision.reason,
-                )
-            else:
-                try:
-                    from kestrel_sdk.payer_policy import ResourceClass
-                    from kestrel_sovereign.services.payer_resolver import (
-                        FoundationPayerResolver,
-                    )
-                    from kestrel_sovereign.storage.providers.lighthouse_provider import (
-                        LighthouseProvider,
-                    )
-
-                    # Injected policy/host-db (multi-tenant embedding) take
-                    # precedence over the standalone kestrel.toml / on-disk host.db.
-                    # When no host master is configured, _resolve_host_db returns
-                    # None and the resolver falls back to the agent's db (which has
-                    # no host_service_keys rows → 'no host master' for delegated
-                    # kinds). See #1649.
-                    _policy = self._resolve_payer_policy()
-                    _host_db = await self._resolve_host_db()
-                    _resolver = FoundationPayerResolver(
-                        _policy,
-                        db=self._raw_storage.db if self._raw_storage else None,
-                        host_db=_host_db,
-                        wallet_private_key=self._private_key,
-                    )
-                    _resolved = await _resolver.resolve_for(self.did, ResourceClass.STORAGE)
-                    if _resolved.enabled:
-                        self.lighthouse_provider = LighthouseProvider(
-                            api_key=None,
-                            key_resolver=_resolved.key_resolver,
-                        )
-                        # With api_key=None at construction, the provider's
-                        # internal client isn't created until _ensure_client()
-                        # consults the resolver. Drive that once now so
-                        # is_available() reflects the resolver's result rather
-                        # than the (None) constructor input. Without this poke
-                        # the provider would always look unavailable post-policy.
-                        await self.lighthouse_provider._ensure_client()
-                        if not self.lighthouse_provider.is_available():
-                            self.lighthouse_provider = None
-                    # else: NONE policy — leave self.lighthouse_provider as None
-                except NotImplementedError:
-                    # Deferred PayerKind values (for example Lighthouse
-                    # HOST_MASTER_PROVISIONED) raise here. Surface
-                    # explicitly rather than degrading silently.
-                    raise
-                except Exception as e:
-                    logging.warning(f"LighthouseProvider init failed: {e}")
-
-            # Sync service — event-driven snapshots to all configured targets.
-            # Targets are ordered by trust: Sovereign → Federated → Delegated → Expedient.
-            # Snapshots fire on shutdown, scheduled backup, or explicit !backup command.
-            self._sync_service = None
-            if self._db_backend.lower() != "postgres" and self._sync_enabled:
-                try:
-                    from kestrel_sovereign.storage.sync.targets import (
-                        GCSTarget,
-                        LighthouseTarget,
-                        TrustTier,
-                    )
-
-                    self._sync_service = SyncService(
-                        db_path=self.storage_path,
-                        policy_context=remote_policy_context,
-                        policy_context_provider=live_remote_policy_context,
-                    )
-
-                    # Sovereign-operated: self-hosted IPFS. The historical
-                    # kestrel-ipfs VM is decommissioned, so absence or
-                    # unreachability is an explicit inactive state.
-                    sovereign_url = os.environ.get("SOVEREIGN_IPFS_URL")
-                    await _add_sovereign_ipfs_target_if_active(
-                        self._sync_service,
-                        agent_id=agent_id,
-                        state_dir=state_dir,
-                        sovereign_url=sovereign_url,
-                    )
-
-                    # Delegated: Lighthouse (API key). Honor PayerPolicy.storage:
-                    # if the resolver came back with no LighthouseProvider
-                    # (NONE policy, or no resolver-supplied key, or env var
-                    # unset), DO NOT add the sync target. Otherwise the
-                    # policy would gate live storage but leave snapshot
-                    # uploads going to Lighthouse anyway.
-                    if self.lighthouse_provider is not None and os.environ.get(
-                        "LIGHTHOUSE_API_KEY"
-                    ):
-                        self._sync_service.add_remote_target(
-                            f"lighthouse://{agent_id}",
-                            TrustTier.DELEGATED,
-                            lambda: LighthouseTarget(
-                                api_key=os.environ["LIGHTHOUSE_API_KEY"],
-                                agent_id=agent_id,
-                                state_dir=state_dir,
-                            ),
-                        )
-
-                    # Expedient: GCS (fast cloud backup)
-                    gcs_bucket = os.environ.get("GCS_BACKUP_BUCKET")
-                    if gcs_bucket:
-                        self._sync_service.add_remote_target(
-                            f"gs://{gcs_bucket}/kestrel/{agent_id}",
-                            TrustTier.EXPEDIENT,
-                            lambda: GCSTarget(
-                                bucket=gcs_bucket,
-                                agent_id=agent_id,
-                                state_dir=state_dir,
-                                project=os.environ.get("GCP_PROJECT"),
-                                credentials_path=os.environ.get(
-                                    "GOOGLE_APPLICATION_CREDENTIALS"
-                                ),
-                            ),
-                        )
-
-                    if self._sync_service.has_work:
-                        await self._sync_service.start()
-                    else:
-                        self._sync_service = None
-
-                except Exception as e:
-                    logging.warning(f"Sync service init failed: {e}", exc_info=True)
-                    self._sync_service = None
-            elif not self._sync_enabled:
-                logging.info("Sync service disabled by configuration")
-
-            # Resolve agent name BEFORE features so features can use it
-            # (e.g. PeersFeature._get_own_name() reads self._agent_name)
-            _agent_node = await self.storage.get_node(self.agent_id)
-            if _agent_node:
-                self._agent_name = _agent_node.properties.get("name", "Unnamed Agent")
-            else:
-                self._agent_name = "Unnamed Agent"
-            # Upgrade the observability display name from the construction-time
-            # floor to the authoritative graph-node name (#2602), so every span
-            # emitted for the rest of initialize() — genesis audit, feature init
-            # — and by non-fleet agents (single-agent host, CLI/REPL) that never
-            # reach the registrar carries the real name. ``_register_agent``
-            # overrides this with the registered routing key for fleet members.
-            if _agent_node:
-                self._set_display_name(self._agent_name)
-
-            # Verify the per-agent constitution overlay against its anchor BEFORE
-            # feature discovery (#1722). ComputerUseFeature.initialize() reads
-            # _granted_capabilities() to build its backend; if the overlay were
-            # verified later, a legitimate anchored overlay's grants would be
-            # ignored at feature-init time and the backend would never build.
-            # For a brand-new agent the identity node doesn't exist yet → no
-            # anchor → an overlay (if present) stays unverified until anchored,
-            # which is the correct fail-closed default.
-            try:
-                ok, msg = await self.verify_constitution_overlay()
-                if not ok:
-                    logging.warning("Constitution overlay not trusted: %s", msg)
-            except Exception as e:  # noqa: BLE001 - never block init on this
-                logging.warning("Constitution overlay verification errored: %s", e)
-                self.constitution_overlay_verified = False
-
-            # Auto-discover and register features from features/ directory
-            # Features can be disabled via KESTREL_DISABLED_FEATURES env var
-            # Per-agent feature profiles filter via allowed_features — the
-            # config bootstrap set unioned with agent-driven enablement deltas
-            # from the DB. This is the READ side of the primitive; the production
-            # writers (FeatureFeaturesFeature.feature_add/remove + MCPAgent
-            # enable/disable, which call persist_feature_enablement) land in the
-            # follow-up PRs. With no deltas the effective set == the bootstrap
-            # allowlist, so behavior is unchanged today.
-            effective_features = await self._effective_allowed_features()
-            # Enforce a spawned child's mandate feature ceiling (#2226) on EVERY
-            # boot path. The AgentManager spawn path threads mandate.features_
-            # allowed into config (#1946), but single-agent server / CLI / direct
-            # KestrelAgent boots do not — so without this a restarted child would
-            # load features beyond its mandate. The ceiling is read from the
-            # durable spawned_by edge and INTERSECTED with any operator allowlist
-            # (never widening it). discover_features always force-loads
-            # MANDATORY_FEATURES regardless, so this can't drop constitution/
-            # security. Fail-closed: a read error propagates (see mandate_reload).
-            if self.did and self.storage is not None:
-                from kestrel_sovereign.spawn.mandate_reload import (
-                    read_spawn_features_allowed,
-                )
-
-                mandate_features = await read_spawn_features_allowed(
-                    self.storage, self.did
-                )
-                # A recorded ceiling is always a non-empty list; None/empty means
-                # "no explicit ceiling" (root, legacy, or inherit-from-degenerate-
-                # parent) → load all. See read_spawn_features_allowed.
-                if mandate_features:
-                    ceiling = set(mandate_features)
-                    effective_features = (
-                        ceiling
-                        if effective_features is None
-                        else set(effective_features) & ceiling
-                    )
-            # Disabled deltas must be honored even when there is no bootstrap
-            # allowlist (effective is None → discover_features loads all), so a
-            # runtime feature_remove survives restart for bootstrap-less agents
-            # too. Mandatory features are never in this set.
-            disabled_features = await self._disabled_feature_names()
-            discovered_features = discover_features(
-                self, allowed_features=effective_features
+        # Storage path through PayerPolicy resolver. Honors the policy's
+        # `storage` slot:
+        #   NONE     → do not construct LighthouseProvider at all
+        #   HOST_ENV → construct with the resolver as the single credential
+        #              source (no constructor-time env-var bleed-through)
+        #   SELF_WALLET → mint/store a Lighthouse key by signing the
+        #                 auth challenge with the agent's secp256k1 key
+        #
+        # Cold-start restore above (line ~488) is intentionally policy-
+        # unaware: it runs before the agent's DB exists and so cannot
+        # consult the policy. Operators who want NONE storage should not
+        # set LIGHTHOUSE_API_KEY.
+        if not remote_policy_decision.allowed:
+            logging.warning(
+                "Remote storage providers skipped by policy: %s",
+                remote_policy_decision.reason,
             )
-            for feature in discovered_features:
-                if feature.name in disabled_features:
-                    continue
-                await self._register_feature(feature)
-            verify_mandatory_feature_set(
-                self.features,
-                stage="agent readiness",
-            )
-
-            # Notify all features that discovery is complete (cross-feature wiring)
-            for feature in self.features.values():
-                try:
-                    await feature.post_all_features_loaded(self)
-                except Exception as exc:
-                    from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
-
-                    if type(feature).__name__ in MANDATORY_FEATURES:
-                        raise MandatoryFeatureReadinessError(
-                            type(feature).__name__,
-                            "post-load wiring",
-                            "could not finish cross-feature wiring",
-                        ) from exc
-                    raise
-            logging.info("post_all_features_loaded called for all features")
-
-            # Feature references resolved lazily via properties
-            logging.info("Feature references available via lazy properties")
-
-            # Initialize state
-            self.conversations = {}
-            self.extension = None
-            self._session_briefed = False
-            self._constitution_verified = False
-            logging.info("State initialized")
-
-            # Fire SESSION_START hook
-            if self.hooks_manager:
-                from kestrel_sdk.hooks.base import HookInput, HookEvent
-                hook_input = HookInput(
-                    session_id="agent_init",
-                    hook_event_name=HookEvent.SESSION_START.value,
-                )
-                await self.hooks_manager.execute_hooks_parallel(
-                    HookEvent.SESSION_START, hook_input
-                )
-
-            # Ensure agent graph node exists
-            logging.info(f"Getting agent node from storage (agent_id={self.agent_id})")
-            agent_node = await self.storage.get_node(self.agent_id)
-            logging.info(f"Agent node retrieved: {agent_node is not None}")
-            if agent_node is None:
-                from kestrel_sovereign.storage import GraphNode
-                from kestrel_sovereign.storage.privacy_wrapper import (
-                    acquire_control_plane_capability,
-                )
-                agent_node = GraphNode(
-                    node_id=self.agent_id,
-                    node_type="agent",
-                    label=f"Agent {self.agent_id}",
-                    properties={"initialBalance": "100.0"}
-                )
-                # Trusted control-plane write: agent identity node. The capability
-                # admits the durable identity write in a volatile mode (#2672).
-                await self.storage.add_node(
-                    agent_node, capability=acquire_control_plane_capability()
-                )
-                logging.info("Agent node created")
-
-            # A missing durable row or an audit older than 24 hours must be
-            # resolved before initialize() can make this agent visible as
-            # ready. A failure enters durable Safe Mode; a success advances the
-            # deadline but never auto-clears an already-restored Safe Mode.
-            await self._audit_constitution_on_startup()
-
-            # Load prompts from external files (fallback to embedded defaults)
-            self.prompt_template = _load_prompt_file(
-                SYSTEM_PROMPT_FILE,
-                fallback=self._get_default_system_prompt()
-            )
-            self.user_prompt_template = _load_prompt_file(
-                USER_PROMPT_FILE,
-                fallback=self._get_default_user_prompt()
-            )
-            # Extract just the template portion from user prompt file
-            if "```" in self.user_prompt_template:
-                match = re.search(r'```\s*(.*?)\s*```', self.user_prompt_template, re.DOTALL)
-                if match:
-                    self.user_prompt_template = match.group(1).strip()
-
-            # Check if this is a test instance and load disclosure if so
-            self._is_test_instance = agent_node.properties.get("is_test_instance", False)
-            self._test_cycle_id = agent_node.properties.get("test_cycle_id")
-            self._agent_name = agent_node.properties.get("name", "Unnamed Agent")
-            # #766: server-side demo-isolation rail — agents flagged here
-            # bypass the destructive-op refusal that protects live agents.
-            self._is_demo = bool(agent_node.properties.get("is_demo", False))
-
-            if self._is_test_instance:
-                logging.info(f"TEST INSTANCE detected: {self._agent_name} (cycle: {self._test_cycle_id})")
-                self._load_test_disclosure(agent_node.properties)
-            if self._is_demo:
-                logging.info(f"DEMO AGENT detected: {self._agent_name} — destructive ops permitted")
-
-            # LLM path through PayerPolicy resolver. Phase 3a ships:
-            #   NONE     → flag the agent's LLMService disabled (Phase 3b
-            #              adds the _check_policy guard on generation
-            #              entry points that honors this flag).
-            #   HOST_ENV → no-op; the shared key already serves this agent.
-            #   HOST_MASTER_PROVISIONED / SPONSOR → call use_agent_key
-            #              against the agent's previously-provisioned key
-            #              (back-compat with manual provisioning via
-            #              scripts/provision_agent_openrouter.py). Phase 3c
-            #              wires the resolver to mint child credentials
-            #              automatically when none exist yet.
-            #   SELF_WALLET → NotImplementedError (deferred indefinitely
-            #                 per support matrix; x402-native LLM is not
-            #                 a today-shippable contract).
+        else:
             try:
                 from kestrel_sdk.payer_policy import ResourceClass
                 from kestrel_sovereign.services.payer_resolver import (
                     FoundationPayerResolver,
                 )
+                from kestrel_sovereign.storage.providers.lighthouse_provider import (
+                    LighthouseProvider,
+                )
 
-                # Injected policy/host-db (multi-tenant embedding) override the
-                # standalone kestrel.toml / on-disk host.db. See #1649.
-                _llm_policy = self._resolve_payer_policy()
-                _llm_host_db = await self._resolve_host_db()
-                _llm_resolver = FoundationPayerResolver(
-                    _llm_policy,
+                # Injected policy/host-db (multi-tenant embedding) take
+                # precedence over the standalone kestrel.toml / on-disk host.db.
+                # When no host master is configured, _resolve_host_db returns
+                # None and the resolver falls back to the agent's db (which has
+                # no host_service_keys rows → 'no host master' for delegated
+                # kinds). See #1649.
+                _policy = self._resolve_payer_policy()
+                _host_db = await self._resolve_host_db()
+                _resolver = FoundationPayerResolver(
+                    _policy,
                     db=self._raw_storage.db if self._raw_storage else None,
-                    host_db=_llm_host_db,
+                    host_db=_host_db,
+                    wallet_private_key=self._private_key,
                 )
-                _llm_resolved = await _llm_resolver.resolve_for(
-                    self.did, ResourceClass.LLM
-                )
-                if not _llm_resolved.enabled:
-                    # NONE: Phase 3b's _check_policy guard reads this flag.
-                    self.llm_service.disabled = True
-                    logging.info(
-                        f"PayerPolicy.llm = NONE for agent {self.did[:30]}...; "
-                        f"LLMService.disabled = True"
+                _resolved = await _resolver.resolve_for(self.did, ResourceClass.STORAGE)
+                if _resolved.enabled:
+                    self.lighthouse_provider = LighthouseProvider(
+                        api_key=None,
+                        key_resolver=_resolved.key_resolver,
                     )
-                else:
-                    # Always try to swap to a per-agent key. use_agent_key
-                    # returns False if no key is in ServiceKeyStorage —
-                    # same end result as today's no-key-hash condition,
-                    # but no longer keyed off the deprecated
-                    # openrouter_key_hash metadata field. Phase 3c's
-                    # resolver may have just minted a child key under
-                    # HOST_MASTER_PROVISIONED policy; this call picks it
-                    # up. Manually-provisioned agents (via
-                    # scripts/provision_agent_openrouter.py) also work
-                    # here because that script writes to the same
-                    # ServiceKeyStorage.
-                    try:
-                        key_activated = await self.llm_service.use_agent_key(
-                            agent_did=self.did,
-                            db=self._raw_storage.db,
-                            provider="openrouter",
-                        )
-                        if key_activated:
-                            logging.info(
-                                f"Agent using own OpenRouter key "
-                                f"(agent={self.did[:30]}...)"
-                            )
-                    except (KeyError, ValueError, AttributeError, ConnectionError) as e:
-                        logging.warning(
-                            f"Could not activate agent OpenRouter key: {e}"
-                        )
-                    except Exception as e:
-                        logging.warning(
-                            f"Could not activate agent OpenRouter key: {e}",
-                            exc_info=True,
-                        )
+                    # With api_key=None at construction, the provider's
+                    # internal client isn't created until _ensure_client()
+                    # consults the resolver. Drive that once now so
+                    # is_available() reflects the resolver's result rather
+                    # than the (None) constructor input. Without this poke
+                    # the provider would always look unavailable post-policy.
+                    await self.lighthouse_provider._ensure_client()
+                    if not self.lighthouse_provider.is_available():
+                        self.lighthouse_provider = None
+                # else: NONE policy — leave self.lighthouse_provider as None
             except NotImplementedError:
-                # SELF_WALLET / phase-deferred kinds. Re-raise so the
-                # operator sees a clear failure rather than a half-init
-                # agent.
+                # Deferred PayerKind values (for example Lighthouse
+                # HOST_MASTER_PROVISIONED) raise here. Surface
+                # explicitly rather than degrading silently.
                 raise
             except Exception as e:
-                # Fail-closed for known policy/provisioning errors:
-                # PayerPolicyError (e.g., HOST_MASTER_PROVISIONED but
-                # no master configured) and OpenRouterProvisioningError
-                # (rate limited, invalid master, network error during
-                # mint) are intentional fail-fast signals. Letting the
-                # agent boot on the shared host key would silently
-                # violate the policy. Re-raise so init fails loudly.
-                _exc_module = type(e).__module__
-                _exc_name = type(e).__qualname__
-                if (
-                    _exc_name == "PayerPolicyError"
-                    or _exc_name == "UnsupportedCombinationError"
-                    or _exc_name == "PassphraseRequiredError"
-                    or _exc_name == "DecryptionError"
-                    or "OpenRouterProvisioning" in _exc_name
+                logging.warning(f"LighthouseProvider init failed: {e}")
+
+        # Sync service — event-driven snapshots to all configured targets.
+        # Targets are ordered by trust: Sovereign → Federated → Delegated → Expedient.
+        # Snapshots fire on shutdown, scheduled backup, or explicit !backup command.
+        self._sync_service = None
+        if self._db_backend.lower() != "postgres" and self._sync_enabled:
+            try:
+                from kestrel_sovereign.storage.sync.targets import (
+                    GCSTarget,
+                    LighthouseTarget,
+                    TrustTier,
+                )
+
+                self._sync_service = SyncService(
+                    db_path=self.storage_path,
+                    policy_context=remote_policy_context,
+                    policy_context_provider=live_remote_policy_context,
+                )
+
+                # Sovereign-operated: self-hosted IPFS. The historical
+                # kestrel-ipfs VM is decommissioned, so absence or
+                # unreachability is an explicit inactive state.
+                sovereign_url = os.environ.get("SOVEREIGN_IPFS_URL")
+                await _add_sovereign_ipfs_target_if_active(
+                    self._sync_service,
+                    agent_id=agent_id,
+                    state_dir=state_dir,
+                    sovereign_url=sovereign_url,
+                )
+
+                # Delegated: Lighthouse (API key). Honor PayerPolicy.storage:
+                # if the resolver came back with no LighthouseProvider
+                # (NONE policy, or no resolver-supplied key, or env var
+                # unset), DO NOT add the sync target. Otherwise the
+                # policy would gate live storage but leave snapshot
+                # uploads going to Lighthouse anyway.
+                if self.lighthouse_provider is not None and os.environ.get(
+                    "LIGHTHOUSE_API_KEY"
                 ):
-                    logging.error(
-                        f"PayerPolicy.llm resolution FAILED CLOSED for agent "
-                        f"{self.did[:30]}... ({_exc_module}.{_exc_name}): {e}"
+                    self._sync_service.add_remote_target(
+                        f"lighthouse://{agent_id}",
+                        TrustTier.DELEGATED,
+                        lambda: LighthouseTarget(
+                            api_key=os.environ["LIGHTHOUSE_API_KEY"],
+                            agent_id=agent_id,
+                            state_dir=state_dir,
+                        ),
                     )
-                    raise
-                logging.warning(
-                    f"PayerPolicy.llm resolution failed for agent "
-                    f"{self.did[:30]}...: {e}",
-                    exc_info=True,
+
+                # Expedient: GCS (fast cloud backup)
+                gcs_bucket = os.environ.get("GCS_BACKUP_BUCKET")
+                if gcs_bucket:
+                    self._sync_service.add_remote_target(
+                        f"gs://{gcs_bucket}/kestrel/{agent_id}",
+                        TrustTier.EXPEDIENT,
+                        lambda: GCSTarget(
+                            bucket=gcs_bucket,
+                            agent_id=agent_id,
+                            state_dir=state_dir,
+                            project=os.environ.get("GCP_PROJECT"),
+                            credentials_path=os.environ.get(
+                                "GOOGLE_APPLICATION_CREDENTIALS"
+                            ),
+                        ),
+                    )
+
+                if self._sync_service.has_work:
+                    await self._sync_service.start()
+                    # Started a background sync worker — stop it on rollback.
+                    ctx.on_rollback(
+                        "sync_service", self._boot_teardown_sync_service
+                    )
+                else:
+                    self._sync_service = None
+
+            except Exception as e:
+                logging.warning(f"Sync service init failed: {e}", exc_info=True)
+                self._sync_service = None
+        elif not self._sync_enabled:
+            logging.info("Sync service disabled by configuration")
+
+
+    async def _boot_phase_identity_constitution_features(self, ctx: BootContext) -> None:
+        """Phase 4 — identity name, constitution overlay verification (BEFORE feature discovery), feature discovery/enablement/registration, the durable agent node, the startup constitution audit, and LLM payer policy."""
+        # Resolve agent name BEFORE features so features can use it
+        # (e.g. PeersFeature._get_own_name() reads self._agent_name)
+        _agent_node = await self.storage.get_node(self.agent_id)
+        if _agent_node:
+            self._agent_name = _agent_node.properties.get("name", "Unnamed Agent")
+        else:
+            self._agent_name = "Unnamed Agent"
+        # Upgrade the observability display name from the construction-time
+        # floor to the authoritative graph-node name (#2602), so every span
+        # emitted for the rest of initialize() — genesis audit, feature init
+        # — and by non-fleet agents (single-agent host, CLI/REPL) that never
+        # reach the registrar carries the real name. ``_register_agent``
+        # overrides this with the registered routing key for fleet members.
+        if _agent_node:
+            self._set_display_name(self._agent_name)
+
+        # Verify the per-agent constitution overlay against its anchor BEFORE
+        # feature discovery (#1722). ComputerUseFeature.initialize() reads
+        # _granted_capabilities() to build its backend; if the overlay were
+        # verified later, a legitimate anchored overlay's grants would be
+        # ignored at feature-init time and the backend would never build.
+        # For a brand-new agent the identity node doesn't exist yet → no
+        # anchor → an overlay (if present) stays unverified until anchored,
+        # which is the correct fail-closed default.
+        try:
+            ok, msg = await self.verify_constitution_overlay()
+            if not ok:
+                logging.warning("Constitution overlay not trusted: %s", msg)
+        except Exception as e:  # noqa: BLE001 - never block init on this
+            logging.warning("Constitution overlay verification errored: %s", e)
+            self.constitution_overlay_verified = False
+
+        # Auto-discover and register features from features/ directory
+        # Features can be disabled via KESTREL_DISABLED_FEATURES env var
+        # Per-agent feature profiles filter via allowed_features — the
+        # config bootstrap set unioned with agent-driven enablement deltas
+        # from the DB. This is the READ side of the primitive; the production
+        # writers (FeatureFeaturesFeature.feature_add/remove + MCPAgent
+        # enable/disable, which call persist_feature_enablement) land in the
+        # follow-up PRs. With no deltas the effective set == the bootstrap
+        # allowlist, so behavior is unchanged today.
+        effective_features = await self._effective_allowed_features()
+        # Enforce a spawned child's mandate feature ceiling (#2226) on EVERY
+        # boot path. The AgentManager spawn path threads mandate.features_
+        # allowed into config (#1946), but single-agent server / CLI / direct
+        # KestrelAgent boots do not — so without this a restarted child would
+        # load features beyond its mandate. The ceiling is read from the
+        # durable spawned_by edge and INTERSECTED with any operator allowlist
+        # (never widening it). discover_features always force-loads
+        # MANDATORY_FEATURES regardless, so this can't drop constitution/
+        # security. Fail-closed: a read error propagates (see mandate_reload).
+        if self.did and self.storage is not None:
+            from kestrel_sovereign.spawn.mandate_reload import (
+                read_spawn_features_allowed,
+            )
+
+            mandate_features = await read_spawn_features_allowed(
+                self.storage, self.did
+            )
+            # A recorded ceiling is always a non-empty list; None/empty means
+            # "no explicit ceiling" (root, legacy, or inherit-from-degenerate-
+            # parent) → load all. See read_spawn_features_allowed.
+            if mandate_features:
+                ceiling = set(mandate_features)
+                effective_features = (
+                    ceiling
+                    if effective_features is None
+                    else set(effective_features) & ceiling
                 )
+        # Disabled deltas must be honored even when there is no bootstrap
+        # allowlist (effective is None → discover_features loads all), so a
+        # runtime feature_remove survives restart for bootstrap-less agents
+        # too. Mandatory features are never in this set.
+        disabled_features = await self._disabled_feature_names()
+        discovered_features = discover_features(
+            self, allowed_features=effective_features
+        )
+        # Register the feature teardown BEFORE the loop so a failure partway
+        # through registration (or in post_all_features_loaded below) rolls back
+        # every feature already initialized — each feature.initialize() may have
+        # opened connections or started workers.
+        ctx.on_rollback("features", self._boot_teardown_features)
+        for feature in discovered_features:
+            if feature.name in disabled_features:
+                continue
+            await self._register_feature(feature)
+        verify_mandatory_feature_set(
+            self.features,
+            stage="agent readiness",
+        )
 
-            # Initialize memory system (single source of truth for all memory components)
-            logging.info("Creating MemorySystem")
-            self.memory_system = MemorySystem(
-                storage=self._raw_storage,
-                agent_id=self.agent_id,
-                # Route durable memory graph writes through the privacy-governing
-                # facade and gate the consolidator's direct memory_episodes write,
-                # so manual / scheduled consolidation can't leak user-derived
-                # memory in a volatile privacy mode (#2672).
-                privacy_storage=self.storage,
+        # Notify all features that discovery is complete (cross-feature wiring)
+        for feature in self.features.values():
+            try:
+                await feature.post_all_features_loaded(self)
+            except Exception as exc:
+                from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+
+                if type(feature).__name__ in MANDATORY_FEATURES:
+                    raise MandatoryFeatureReadinessError(
+                        type(feature).__name__,
+                        "post-load wiring",
+                        "could not finish cross-feature wiring",
+                    ) from exc
+                raise
+        logging.info("post_all_features_loaded called for all features")
+
+        # Feature references resolved lazily via properties
+        logging.info("Feature references available via lazy properties")
+
+        # Initialize state
+        self.conversations = {}
+        self.extension = None
+        self._session_briefed = False
+        self._constitution_verified = False
+        logging.info("State initialized")
+
+        # Fire SESSION_START hook
+        if self.hooks_manager:
+            from kestrel_sdk.hooks.base import HookInput, HookEvent
+            hook_input = HookInput(
+                session_id="agent_init",
+                hook_event_name=HookEvent.SESSION_START.value,
             )
-            await self.memory_system.initialize()
-            # Use MemorySystem's consolidator — it has graph_store for KG episode writing
-            self.memory_consolidator = self.memory_system.consolidator
-            logging.info("MemorySystem initialized")
-
-            # Initialize command handler and context builder
-            logging.info("Creating CommandHandler and ContextBuilder")
-            self.command_handler = CommandHandler(self, task_manager=self.task_manager)
-            # Derive agent data directory from storage path
-            agent_data_dir = str(Path(self.storage_path).parent) if self.storage_path else None
-            self.context_builder = ContextBuilder(
-                self.storage,
-                llm_service=self.llm_service,
-                consolidator=self.memory_consolidator,
-                agent_data_path=agent_data_dir,
-                db=self._raw_storage.db,
-                agent_id=self.agent_id,
-            )
-            # Merge DB-backed bootstrap config (bootstrap_add / bootstrap_remove
-            # persistence) into the loader before the first system-prompt
-            # assembly (#2135, F099). Storage is up here and no prompt has been
-            # built yet, so there is no first-prompt ordering regression.
-            await self.context_builder.load_bootstrap_db_config()
-            await self._load_or_promote_soul_resource(agent_data_dir)
-
-            # Initialize unified context manager (orchestrates all context sources).
-            # Model identity derived lazily from llm_service.get_active_model_id().
-            # Inject the ContextBuilder we just built — it has bootstrap files
-            # (SOUL.md, AGENTS.md, …) loaded with this agent's identity.  If we
-            # let ContextManager construct its own, it would have no
-            # agent_data_path and its BootstrapLoader would stay empty, so
-            # the system prompt sent on every chat turn would contain no
-            # identity block.  (That was the original bug this fix addresses.)
-            self.context_manager = ContextManager(
-                storage=self.storage,
-                agent_id=self.agent_id,
-                consolidator=self.memory_consolidator,
-                memory_retriever=self.memory_system.retriever,
-                llm_service=self.llm_service,
-                context_builder=self.context_builder,
-            )
-
-            # Context stats accumulator for duplicate detection / token attribution.
-            # Resets on session change or compaction.
-            self.context_stats = ContextStats()
-
-            # Initialize bootstrap service for first-time agent wake-up
-            self.bootstrap_service = BootstrapService(
-                db=self._raw_storage.db,
-                agent_id=self.agent_id,
-                agent_name=self._agent_name,
-                llm_service=self.llm_service,
-                agent_data_path=agent_data_dir,
-                storage=self.storage,
-                capabilities=sorted(self.features.keys()) if getattr(self, "features", None) else None,
-                # Serialize the bootstrap service's direct user-content writes
-                # (discovery history, user name, SOUL, description) against
-                # concurrent privacy-mode transitions (#2672 review P1 race).
-                privacy_transition_lock=self._get_privacy_transition_lock(),
-            )
-            logging.info("BootstrapService initialized")
-            from kestrel_sovereign.lifecycle_checks import warn_stale_bootstrap_pending
-
-            await warn_stale_bootstrap_pending(
-                self,
-                threshold_seconds=BootstrapService.DEFAULT_PENDING_TIMEOUT_SECONDS,
-                context="startup",
+            await self.hooks_manager.execute_hooks_parallel(
+                HookEvent.SESSION_START, hook_input
             )
 
-            # Load persisted model preference from database and register persistence callback
-            await self._load_model_preference()
-            self.llm_service.set_preference_persistence_callback(self._persist_model_preference)
+        # Ensure agent graph node exists
+        logging.info(f"Getting agent node from storage (agent_id={self.agent_id})")
+        agent_node = await self.storage.get_node(self.agent_id)
+        logging.info(f"Agent node retrieved: {agent_node is not None}")
+        if agent_node is None:
+            from kestrel_sovereign.storage import GraphNode
+            from kestrel_sovereign.storage.privacy_wrapper import (
+                acquire_control_plane_capability,
+            )
+            agent_node = GraphNode(
+                node_id=self.agent_id,
+                node_type="agent",
+                label=f"Agent {self.agent_id}",
+                properties={"initialBalance": "100.0"}
+            )
+            # Trusted control-plane write: agent identity node. The capability
+            # admits the durable identity write in a volatile mode (#2672).
+            await self.storage.add_node(
+                agent_node, capability=acquire_control_plane_capability()
+            )
+            logging.info("Agent node created")
 
-            # Wire the corpus dominant-embedding-profile provider (#2366) so auto
-            # embedding-model resolution prefers continuity with the DB's
-            # existing embedding space over catalog order. This MUST be registered
-            # BEFORE any path that reconciles embedding capabilities
-            # (``_load_embedding_route`` / ``_load_route_embedding_models`` below
-            # both call ``reconcile_embedding_capabilities``): reconcile only
-            # writes ``caps["embedding_model"]`` when it is empty, so a reconcile
-            # that ran without the corpus provider would latch the catalog-first
-            # default and later corpus-aware reconciles could not correct it.
-            if hasattr(self.llm_service, "set_corpus_embedding_profile_provider"):
-                self.llm_service.set_corpus_embedding_profile_provider(
-                    self._dominant_embedding_profile
+        # A missing durable row or an audit older than 24 hours must be
+        # resolved before initialize() can make this agent visible as
+        # ready. A failure enters durable Safe Mode; a success advances the
+        # deadline but never auto-clears an already-restored Safe Mode.
+        await self._audit_constitution_on_startup()
+
+        # Load prompts from external files (fallback to embedded defaults)
+        self.prompt_template = _load_prompt_file(
+            SYSTEM_PROMPT_FILE,
+            fallback=self._get_default_system_prompt()
+        )
+        self.user_prompt_template = _load_prompt_file(
+            USER_PROMPT_FILE,
+            fallback=self._get_default_user_prompt()
+        )
+        # Extract just the template portion from user prompt file
+        if "```" in self.user_prompt_template:
+            match = re.search(r'```\s*(.*?)\s*```', self.user_prompt_template, re.DOTALL)
+            if match:
+                self.user_prompt_template = match.group(1).strip()
+
+        # Check if this is a test instance and load disclosure if so
+        self._is_test_instance = agent_node.properties.get("is_test_instance", False)
+        self._test_cycle_id = agent_node.properties.get("test_cycle_id")
+        self._agent_name = agent_node.properties.get("name", "Unnamed Agent")
+        # #766: server-side demo-isolation rail — agents flagged here
+        # bypass the destructive-op refusal that protects live agents.
+        self._is_demo = bool(agent_node.properties.get("is_demo", False))
+
+        if self._is_test_instance:
+            logging.info(f"TEST INSTANCE detected: {self._agent_name} (cycle: {self._test_cycle_id})")
+            self._load_test_disclosure(agent_node.properties)
+        if self._is_demo:
+            logging.info(f"DEMO AGENT detected: {self._agent_name} — destructive ops permitted")
+
+        # LLM path through PayerPolicy resolver. Phase 3a ships:
+        #   NONE     → flag the agent's LLMService disabled (Phase 3b
+        #              adds the _check_policy guard on generation
+        #              entry points that honors this flag).
+        #   HOST_ENV → no-op; the shared key already serves this agent.
+        #   HOST_MASTER_PROVISIONED / SPONSOR → call use_agent_key
+        #              against the agent's previously-provisioned key
+        #              (back-compat with manual provisioning via
+        #              scripts/provision_agent_openrouter.py). Phase 3c
+        #              wires the resolver to mint child credentials
+        #              automatically when none exist yet.
+        #   SELF_WALLET → NotImplementedError (deferred indefinitely
+        #                 per support matrix; x402-native LLM is not
+        #                 a today-shippable contract).
+        try:
+            from kestrel_sdk.payer_policy import ResourceClass
+            from kestrel_sovereign.services.payer_resolver import (
+                FoundationPayerResolver,
+            )
+
+            # Injected policy/host-db (multi-tenant embedding) override the
+            # standalone kestrel.toml / on-disk host.db. See #1649.
+            _llm_policy = self._resolve_payer_policy()
+            _llm_host_db = await self._resolve_host_db()
+            _llm_resolver = FoundationPayerResolver(
+                _llm_policy,
+                db=self._raw_storage.db if self._raw_storage else None,
+                host_db=_llm_host_db,
+            )
+            _llm_resolved = await _llm_resolver.resolve_for(
+                self.did, ResourceClass.LLM
+            )
+            if not _llm_resolved.enabled:
+                # NONE: Phase 3b's _check_policy guard reads this flag.
+                self.llm_service.disabled = True
+                logging.info(
+                    f"PayerPolicy.llm = NONE for agent {self.did[:30]}...; "
+                    f"LLMService.disabled = True"
                 )
-
-            # Load persisted embedding_route knob and register persistence (#2263)
-            await self._load_embedding_route()
-            self.llm_service.set_embedding_route_persistence_callback(self._persist_embedding_route)
-
-            # Load persisted per-route embedding_model pins and register
-            # persistence (#2337) — the runtime equivalent of the TOML
-            # embedding_model/embedding_dim keys, set from the embeddings UI.
-            if hasattr(self.llm_service, "set_route_embedding_model_persistence_callback"):
-                await self._load_route_embedding_models()
-                self.llm_service.set_route_embedding_model_persistence_callback(
-                    self._persist_route_embedding_models
+            else:
+                # Always try to swap to a per-agent key. use_agent_key
+                # returns False if no key is in ServiceKeyStorage —
+                # same end result as today's no-key-hash condition,
+                # but no longer keyed off the deprecated
+                # openrouter_key_hash metadata field. Phase 3c's
+                # resolver may have just minted a child key under
+                # HOST_MASTER_PROVISIONED policy; this call picks it
+                # up. Manually-provisioned agents (via
+                # scripts/provision_agent_openrouter.py) also work
+                # here because that script writes to the same
+                # ServiceKeyStorage.
+                try:
+                    key_activated = await self.llm_service.use_agent_key(
+                        agent_did=self.did,
+                        db=self._raw_storage.db,
+                        provider="openrouter",
+                    )
+                    if key_activated:
+                        logging.info(
+                            f"Agent using own OpenRouter key "
+                            f"(agent={self.did[:30]}...)"
+                        )
+                except (KeyError, ValueError, AttributeError, ConnectionError) as e:
+                    logging.warning(
+                        f"Could not activate agent OpenRouter key: {e}"
+                    )
+                except Exception as e:
+                    logging.warning(
+                        f"Could not activate agent OpenRouter key: {e}",
+                        exc_info=True,
+                    )
+        except NotImplementedError:
+            # SELF_WALLET / phase-deferred kinds. Re-raise so the
+            # operator sees a clear failure rather than a half-init
+            # agent.
+            raise
+        except Exception as e:
+            # Fail-closed for known policy/provisioning errors:
+            # PayerPolicyError (e.g., HOST_MASTER_PROVISIONED but
+            # no master configured) and OpenRouterProvisioningError
+            # (rate limited, invalid master, network error during
+            # mint) are intentional fail-fast signals. Letting the
+            # agent boot on the shared host key would silently
+            # violate the policy. Re-raise so init fails loudly.
+            _exc_module = type(e).__module__
+            _exc_name = type(e).__qualname__
+            if (
+                _exc_name == "PayerPolicyError"
+                or _exc_name == "UnsupportedCombinationError"
+                or _exc_name == "PassphraseRequiredError"
+                or _exc_name == "DecryptionError"
+                or "OpenRouterProvisioning" in _exc_name
+            ):
+                logging.error(
+                    f"PayerPolicy.llm resolution FAILED CLOSED for agent "
+                    f"{self.did[:30]}... ({_exc_module}.{_exc_name}): {e}"
                 )
-
-            # Cache the features prompt (built once at session start)
-            self._cached_features_prompt = self._build_features_prompt_section()
-
-            # Pre-explore features whose descriptors request direct tools
-            # from turn one. This keeps startup generic: individual features
-            # decide whether they are meta-orchestration / agent-management
-            # surfaces that should bypass the first subagent dispatch.
-            self._promote_startup_feature_tools()
-
-            # Initialize heartbeat system (periodic agent self-checks).
-            # Registers the heartbeat source with the dispatcher so its
-            # ticks route through the signal pipeline (Phase 3 of #889).
-            from kestrel_sovereign.heartbeat import HeartbeatConfig, HeartbeatRunner
-            from kestrel_sovereign.signals.sources.heartbeat import (
-                build_heartbeat_registration,
+                raise
+            logging.warning(
+                f"PayerPolicy.llm resolution failed for agent "
+                f"{self.did[:30]}...: {e}",
+                exc_info=True,
             )
 
-            self._heartbeat_config = HeartbeatConfig.from_config()
-            self.signal_registry.register(
-                build_heartbeat_registration(
-                    interval_seconds=self._heartbeat_config.interval_seconds,
-                    active_hours_start=self._heartbeat_config.active_hours_start,
-                    active_hours_end=self._heartbeat_config.active_hours_end,
-                    timezone_name=self._heartbeat_config.timezone,
-                )
+
+    async def _boot_phase_memory_bootstrap_context(self, ctx: BootContext) -> None:
+        """Phase 5 — memory system, command handler, context builder/manager, bootstrap service, and model/embedding-preference hydration (corpus profile provider BEFORE any embedding reconcile)."""
+        # Initialize memory system (single source of truth for all memory components)
+        logging.info("Creating MemorySystem")
+        self.memory_system = MemorySystem(
+            storage=self._raw_storage,
+            agent_id=self.agent_id,
+            # Route durable memory graph writes through the privacy-governing
+            # facade and gate the consolidator's direct memory_episodes write,
+            # so manual / scheduled consolidation can't leak user-derived
+            # memory in a volatile privacy mode (#2672).
+            privacy_storage=self.storage,
+        )
+        # Register teardown BEFORE initialize so a failure partway through
+        # ``MemorySystem.initialize()`` (which may open stores / start workers)
+        # still shuts it down rather than leaking (#2522 P1).
+        ctx.on_rollback("memory_system", self._boot_teardown_memory)
+        await self.memory_system.initialize()
+        # Use MemorySystem's consolidator — it has graph_store for KG episode writing
+        self.memory_consolidator = self.memory_system.consolidator
+        logging.info("MemorySystem initialized")
+
+        # Initialize command handler and context builder
+        logging.info("Creating CommandHandler and ContextBuilder")
+        self.command_handler = CommandHandler(self, task_manager=self.task_manager)
+        # Derive agent data directory from storage path
+        agent_data_dir = str(Path(self.storage_path).parent) if self.storage_path else None
+        self.context_builder = ContextBuilder(
+            self.storage,
+            llm_service=self.llm_service,
+            consolidator=self.memory_consolidator,
+            agent_data_path=agent_data_dir,
+            db=self._raw_storage.db,
+            agent_id=self.agent_id,
+        )
+        # Merge DB-backed bootstrap config (bootstrap_add / bootstrap_remove
+        # persistence) into the loader before the first system-prompt
+        # assembly (#2135, F099). Storage is up here and no prompt has been
+        # built yet, so there is no first-prompt ordering regression.
+        await self.context_builder.load_bootstrap_db_config()
+        await self._load_or_promote_soul_resource(agent_data_dir)
+
+        # Initialize unified context manager (orchestrates all context sources).
+        # Model identity derived lazily from llm_service.get_active_model_id().
+        # Inject the ContextBuilder we just built — it has bootstrap files
+        # (SOUL.md, AGENTS.md, …) loaded with this agent's identity.  If we
+        # let ContextManager construct its own, it would have no
+        # agent_data_path and its BootstrapLoader would stay empty, so
+        # the system prompt sent on every chat turn would contain no
+        # identity block.  (That was the original bug this fix addresses.)
+        self.context_manager = ContextManager(
+            storage=self.storage,
+            agent_id=self.agent_id,
+            consolidator=self.memory_consolidator,
+            memory_retriever=self.memory_system.retriever,
+            llm_service=self.llm_service,
+            context_builder=self.context_builder,
+        )
+
+        # Context stats accumulator for duplicate detection / token attribution.
+        # Resets on session change or compaction.
+        self.context_stats = ContextStats()
+
+        # Initialize bootstrap service for first-time agent wake-up
+        self.bootstrap_service = BootstrapService(
+            db=self._raw_storage.db,
+            agent_id=self.agent_id,
+            agent_name=self._agent_name,
+            llm_service=self.llm_service,
+            agent_data_path=agent_data_dir,
+            storage=self.storage,
+            capabilities=sorted(self.features.keys()) if getattr(self, "features", None) else None,
+            # Serialize the bootstrap service's direct user-content writes
+            # (discovery history, user name, SOUL, description) against
+            # concurrent privacy-mode transitions (#2672 review P1 race).
+            privacy_transition_lock=self._get_privacy_transition_lock(),
+        )
+        logging.info("BootstrapService initialized")
+        from kestrel_sovereign.lifecycle_checks import warn_stale_bootstrap_pending
+
+        await warn_stale_bootstrap_pending(
+            self,
+            threshold_seconds=BootstrapService.DEFAULT_PENDING_TIMEOUT_SECONDS,
+            context="startup",
+        )
+
+        # Load persisted model preference from database and register persistence callback
+        await self._load_model_preference()
+        self.llm_service.set_preference_persistence_callback(self._persist_model_preference)
+
+        # Wire the corpus dominant-embedding-profile provider (#2366) so auto
+        # embedding-model resolution prefers continuity with the DB's
+        # existing embedding space over catalog order. This MUST be registered
+        # BEFORE any path that reconciles embedding capabilities
+        # (``_load_embedding_route`` / ``_load_route_embedding_models`` below
+        # both call ``reconcile_embedding_capabilities``): reconcile only
+        # writes ``caps["embedding_model"]`` when it is empty, so a reconcile
+        # that ran without the corpus provider would latch the catalog-first
+        # default and later corpus-aware reconciles could not correct it.
+        if hasattr(self.llm_service, "set_corpus_embedding_profile_provider"):
+            self.llm_service.set_corpus_embedding_profile_provider(
+                self._dominant_embedding_profile
             )
-            self.heartbeat_runner = HeartbeatRunner(self, self._heartbeat_config)
-            if self._heartbeat_config.enabled:
-                await self.heartbeat_runner.start()
 
-            # Host sleep/wake resilience (#1545). The ResumeMonitor watches
-            # for a wall-clock-vs-monotonic divergence (a host suspend) and
-            # dispatches one `system.resumed` ACTION signal; its handler
-            # re-anchors the dispatcher's throttling windows, which otherwise
-            # disagree about elapsed time across a sleep. The scheduler and
-            # heartbeat detect staleness on their own ticks, so they self-heal
-            # independently of this signal — the monitor is the observable
-            # spine plus the dispatcher's re-anchor trigger.
-            from kestrel_sovereign.resume_monitor import (
-                ResumeMonitor,
-                ResumeMonitorConfig,
-            )
-            from kestrel_sovereign.signals.sources.system_resumed import (
-                SOURCE_NAME as RESUME_SOURCE_NAME,
-                build_system_resumed_registration,
+        # Load persisted embedding_route knob and register persistence (#2263)
+        await self._load_embedding_route()
+        self.llm_service.set_embedding_route_persistence_callback(self._persist_embedding_route)
+
+        # Load persisted per-route embedding_model pins and register
+        # persistence (#2337) — the runtime equivalent of the TOML
+        # embedding_model/embedding_dim keys, set from the embeddings UI.
+        if hasattr(self.llm_service, "set_route_embedding_model_persistence_callback"):
+            await self._load_route_embedding_models()
+            self.llm_service.set_route_embedding_model_persistence_callback(
+                self._persist_route_embedding_models
             )
 
-            async def _resume_action_handler(payload: dict):
-                gap = float(payload.get("gap_seconds", 0.0))
-                self.dispatcher.notify_resume(gap)
-                return {"re_anchored": True, "gap_seconds": gap}
+        # Cache the features prompt (built once at session start)
+        self._cached_features_prompt = self._build_features_prompt_section()
 
-            self.signal_registry.register(
-                build_system_resumed_registration(handler=_resume_action_handler)
+        # Pre-explore features whose descriptors request direct tools
+        # from turn one. This keeps startup generic: individual features
+        # decide whether they are meta-orchestration / agent-management
+        # surfaces that should bypass the first subagent dispatch.
+        self._promote_startup_feature_tools()
+
+
+    async def _boot_phase_periodic_services_readiness(self, ctx: BootContext) -> None:
+        """Phase 6 — periodic services (heartbeat, resume monitor, salvage worker), spawn-mandate reattach, provider-reachability readiness, and the on_agent_ready hooks. Readiness fires only after every prior phase committed."""
+        # Initialize heartbeat system (periodic agent self-checks).
+        # Registers the heartbeat source with the dispatcher so its
+        # ticks route through the signal pipeline (Phase 3 of #889).
+        from kestrel_sovereign.heartbeat import HeartbeatConfig, HeartbeatRunner
+        from kestrel_sovereign.signals.sources.heartbeat import (
+            build_heartbeat_registration,
+        )
+
+        from kestrel_sovereign.signals import RegistrationPolicy
+
+        self._heartbeat_config = HeartbeatConfig.from_config()
+        _heartbeat_reg = build_heartbeat_registration(
+            interval_seconds=self._heartbeat_config.interval_seconds,
+            active_hours_start=self._heartbeat_config.active_hours_start,
+            active_hours_end=self._heartbeat_config.active_hours_end,
+            timezone_name=self._heartbeat_config.timezone,
+        )
+        self.signal_registry.register_with_policy(
+            _heartbeat_reg, RegistrationPolicy.MANDATORY
+        )
+        ctx.on_rollback(
+            "heartbeat_source",
+            lambda n=_heartbeat_reg.name: self._boot_teardown_signal_sources([n]),
+        )
+        self.heartbeat_runner = HeartbeatRunner(self, self._heartbeat_config)
+        if self._heartbeat_config.enabled:
+            await self.heartbeat_runner.start()
+            ctx.on_rollback("heartbeat_runner", self._boot_teardown_heartbeat)
+
+        # Host sleep/wake resilience (#1545). The ResumeMonitor watches
+        # for a wall-clock-vs-monotonic divergence (a host suspend) and
+        # dispatches one `system.resumed` ACTION signal; its handler
+        # re-anchors the dispatcher's throttling windows, which otherwise
+        # disagree about elapsed time across a sleep. The scheduler and
+        # heartbeat detect staleness on their own ticks, so they self-heal
+        # independently of this signal — the monitor is the observable
+        # spine plus the dispatcher's re-anchor trigger.
+        from kestrel_sovereign.resume_monitor import (
+            ResumeMonitor,
+            ResumeMonitorConfig,
+        )
+        from kestrel_sovereign.signals.sources.system_resumed import (
+            SOURCE_NAME as RESUME_SOURCE_NAME,
+            build_system_resumed_registration,
+        )
+
+        async def _resume_action_handler(payload: dict):
+            gap = float(payload.get("gap_seconds", 0.0))
+            self.dispatcher.notify_resume(gap)
+            return {"re_anchored": True, "gap_seconds": gap}
+
+        self.signal_registry.register_with_policy(
+            build_system_resumed_registration(handler=_resume_action_handler),
+            RegistrationPolicy.MANDATORY,
+        )
+        ctx.on_rollback(
+            "system_resumed_source",
+            lambda n=RESUME_SOURCE_NAME: self._boot_teardown_signal_sources([n]),
+        )
+
+        self._resume_monitor_config = ResumeMonitorConfig.from_config()
+
+        async def _on_resume(gap_seconds: float) -> None:
+            from kestrel_sdk.signals import Signal, SignalMode, Visibility
+
+            signal = Signal(
+                source=RESUME_SOURCE_NAME,
+                kind="resumed",
+                mode=SignalMode.ACTION,
+                payload={"gap_seconds": gap_seconds},
+                target_agent=self.did,
+                visibility=Visibility.INTERNAL,
             )
+            await self.dispatcher.dispatch_signal(signal)
 
-            self._resume_monitor_config = ResumeMonitorConfig.from_config()
+        self.resume_monitor = ResumeMonitor(
+            on_resume=_on_resume,
+            tick_seconds=self._resume_monitor_config.tick_seconds,
+            threshold_seconds=self._resume_monitor_config.threshold_seconds,
+        )
+        if self._resume_monitor_config.enabled:
+            await self.resume_monitor.start()
+            ctx.on_rollback("resume_monitor", self._boot_teardown_resume)
 
-            async def _on_resume(gap_seconds: float) -> None:
-                from kestrel_sdk.signals import Signal, SignalMode, Visibility
+        # Default schedules are now set up by SchedulerFeature.post_all_features_loaded()
 
-                signal = Signal(
-                    source=RESUME_SOURCE_NAME,
-                    kind="resumed",
-                    mode=SignalMode.ACTION,
-                    payload={"gap_seconds": gap_seconds},
-                    target_agent=self.did,
-                    visibility=Visibility.INTERNAL,
-                )
-                await self.dispatcher.dispatch_signal(signal)
-
-            self.resume_monitor = ResumeMonitor(
-                on_resume=_on_resume,
-                tick_seconds=self._resume_monitor_config.tick_seconds,
-                threshold_seconds=self._resume_monitor_config.threshold_seconds,
-            )
-            if self._resume_monitor_config.enabled:
-                await self.resume_monitor.start()
-
-            # Default schedules are now set up by SchedulerFeature.post_all_features_loaded()
 
         # C / #1311 durable salvage worker — only starts when the
         # feature flag is enabled (otherwise no-op). Wired here so
@@ -2233,6 +2351,7 @@ class KestrelAgent(
         if hasattr(self, "context_manager") and self.context_manager:
             try:
                 await self.context_manager.start_salvage_worker()
+                ctx.on_rollback("salvage_worker", self._boot_teardown_salvage)
             except Exception as e:
                 logging.warning(f"failed to start salvage worker: {e}")
 
@@ -2286,6 +2405,107 @@ class KestrelAgent(
                 logging.warning(
                     "on_agent_ready failed for %s: %s",
                     getattr(feature, "name", type(feature).__name__), e,
+                )
+
+    # ------------------------------------------------------------------
+    # Boot rollback teardown helpers (#2522)
+    #
+    # Each releases exactly ONE resource a boot phase acquired and is
+    # registered via ``ctx.on_rollback`` at the moment of acquisition, so the
+    # BootContext can unwind them in reverse (LIFO) order on any phase failure.
+    # All are idempotent and guarded: they null their handle first so a later
+    # ``shutdown()`` (e.g. the AgentManager cleanup path) is a clean no-op, and
+    # they never raise past their own guard — the rollback driver logs and
+    # continues so one stubborn resource can't strand the others.
+    # ------------------------------------------------------------------
+    async def _boot_teardown_storage(self) -> None:
+        """Close the primary DB connection and drop the privacy layer."""
+        raw = self._raw_storage
+        self._raw_storage = None
+        self.storage = None
+        self.privacy_agent = None
+        if raw is not None and hasattr(raw, "close"):
+            await raw.close()
+
+    async def _boot_teardown_task_manager(self) -> None:
+        """Close the A2A TaskManager stores."""
+        tm = self.task_manager
+        self.task_manager = None
+        if tm is not None and hasattr(tm, "close"):
+            await tm.close()
+
+    async def _boot_teardown_sync_service(self) -> None:
+        """Stop the background sync worker."""
+        svc = self._sync_service
+        self._sync_service = None
+        if svc is not None and getattr(svc, "is_running", False):
+            await svc.stop()
+
+    async def _boot_teardown_features(self) -> None:
+        """Reverse every feature registration made before the failure, LIFO.
+
+        Delegates to the canonical per-feature teardown
+        (:meth:`_unregister_feature_runtime`) so boot rollback removes exactly
+        what runtime disable does — hooks, A2A TaskManager registrations,
+        dynamic tools, owned signal sources, AND wait providers — rather than a
+        subset. The old rollback called only ``feature.shutdown()``, leaving a
+        rolled-back feature's hooks and ``task:``/``talon:`` wait providers
+        registered on a dead agent (kestrel-sovereign#2522). Each feature is
+        guarded so one stubborn teardown can't strand the rest.
+        """
+        for name, feature in reversed(list(self.features.items())):
+            try:
+                await self._unregister_feature_runtime(feature)
+            except Exception as exc:  # noqa: BLE001 - best-effort teardown
+                logging.warning(
+                    "boot rollback: feature '%s' teardown failed: %s",
+                    name,
+                    exc,
+                )
+        self.features = {}
+
+    async def _boot_teardown_memory(self) -> None:
+        """Shut down the memory system."""
+        ms = getattr(self, "memory_system", None)
+        self.memory_system = None
+        if ms is not None and hasattr(ms, "shutdown"):
+            await ms.shutdown()
+
+    async def _boot_teardown_salvage(self) -> None:
+        """Drain and stop the context-manager salvage worker."""
+        cm = getattr(self, "context_manager", None)
+        if cm is not None and hasattr(cm, "stop_salvage_worker"):
+            await cm.stop_salvage_worker()
+
+    async def _boot_teardown_heartbeat(self) -> None:
+        """Stop the heartbeat runner."""
+        hb = getattr(self, "heartbeat_runner", None)
+        if hb is not None and hasattr(hb, "stop"):
+            await hb.stop()
+
+    async def _boot_teardown_resume(self) -> None:
+        """Stop the resume monitor."""
+        rm = getattr(self, "resume_monitor", None)
+        if rm is not None and hasattr(rm, "stop"):
+            await rm.stop()
+
+    async def _boot_teardown_signal_sources(self, names: list[str]) -> None:
+        """Unregister the named signal sources (registry rollback).
+
+        Async so it composes with the ``await``-based rollback driver even
+        though ``unregister`` itself is synchronous.
+        """
+        reg = getattr(self, "signal_registry", None)
+        if reg is None:
+            return
+        for name in names:
+            try:
+                reg.unregister(name)
+            except Exception as exc:  # noqa: BLE001 - best-effort teardown
+                logging.warning(
+                    "boot rollback: could not unregister source '%s': %s",
+                    name,
+                    exc,
                 )
 
     @property
@@ -2908,6 +3128,46 @@ class KestrelAgent(
             return
         await store.clear(self.did, kind, name)
 
+    async def _shutdown_failed_feature(self, feature: Feature) -> None:
+        """Drain EVERY registration of a feature whose registration failed mid-way.
+
+        ``_register_feature`` wires a feature up in stages — ``initialize()``
+        (signal sources), ``_wire_feature_hooks`` (HooksManager hooks),
+        ``on_enable()``, then ``_wire_feature_a2a`` (A2A TaskManager agent +
+        ``set_task_manager``). Any stage after the first can raise having left the
+        EARLIER stages' registrations live: an ``on_enable`` failure strands the
+        hooks already registered, and an ``_wire_feature_a2a`` failure past
+        ``register_agent`` strands both the hooks and the A2A agent. The old
+        rollback popped the feature from ``self.features`` FIRST and then called
+        only ``feature.shutdown()`` — which reverses the feature's OWN resources
+        (signal sources / wait providers / owned tasks / sleep hooks) but NOT the
+        agent-side hook / A2A / dynamic-tool registrations — so those leaked, and
+        because the feature was already gone from ``self.features`` boot rollback
+        (``_boot_teardown_features``) could no longer find it to finish the job
+        (#2522 P1).
+
+        Route through the ONE canonical teardown instead, with the feature left
+        in ``self.features`` so it drains every registration (``on_disable`` →
+        ``shutdown`` → hooks → A2A → dynamic tools, each independent and run
+        unconditionally) BEFORE it is dropped — the exact inverse of the wiring
+        ``_register_feature`` performs. It is best-effort here: a teardown error
+        is logged, never raised, so the ORIGINAL registration failure (or its
+        ``MandatoryFeatureReadinessError`` wrap) is what surfaces to the caller.
+        Every teardown step is idempotent, so it is safe even when the feature
+        only got as far as ``initialize()`` (never added to ``self.features``) or
+        a stage left nothing to undo — and ``unload=True`` still drops the
+        instance so boot rollback never double-tears-down it (#2522 P1).
+        """
+        name = getattr(feature, "name", None)
+        try:
+            await self._unregister_feature_runtime(feature, unload=True)
+        except Exception as exc:  # noqa: BLE001 - best-effort teardown
+            logging.warning(
+                "boot rollback: failed feature '%s' teardown errored: %s",
+                name or type(feature).__name__,
+                exc,
+            )
+
     async def _register_feature(self, feature: Feature):
         """Register a feature with A2A TaskManager for unified command routing."""
         from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
@@ -2917,6 +3177,7 @@ class KestrelAgent(
         try:
             await feature.initialize()
         except Exception as exc:
+            await self._shutdown_failed_feature(feature)
             if mandatory:
                 raise MandatoryFeatureReadinessError(
                     feature_class_name,
@@ -2928,14 +3189,9 @@ class KestrelAgent(
 
         # Auto-register hooks from get_hooks() with the agent's HooksManager
         try:
-            if self.hooks_manager:
-                for hook in feature.get_hooks():
-                    self.hooks_manager.register(hook)
-                    logging.info(
-                        f"Auto-registered hook '{hook.name}' from feature "
-                        f"'{feature.name}'"
-                    )
+            self._wire_feature_hooks(feature)
         except Exception as exc:
+            await self._shutdown_failed_feature(feature)
             if mandatory:
                 raise MandatoryFeatureReadinessError(
                     feature_class_name,
@@ -2948,6 +3204,7 @@ class KestrelAgent(
         try:
             await feature.on_enable()
         except Exception as exc:
+            await self._shutdown_failed_feature(feature)
             if mandatory:
                 raise MandatoryFeatureReadinessError(
                     feature_class_name,
@@ -2957,32 +3214,9 @@ class KestrelAgent(
             raise
 
         try:
-            # Get command prefixes for routing
-            command_prefixes = {}
-            for tool in feature.get_tools():
-                if tool.schema.command_prefix:
-                    command_prefixes[tool.schema.command_prefix] = tool.name
-                logging.info(
-                    f"Registered tool '{tool.name}' from feature '{feature.name}'"
-                )
-
-            # Register with A2A TaskManager (unified routing)
-            if self.task_manager:
-                agent_card = feature.get_agent_card()
-                self.task_manager.register_agent(
-                    agent_card=agent_card,
-                    handler=feature,
-                    command_prefixes=command_prefixes,
-                )
-                logging.info(
-                    f"Registered A2A agent '{agent_card.name}' with "
-                    f"{len(agent_card.skills)} skills"
-                )
-
-                # Wire task_manager into features that need it
-                if hasattr(feature, 'set_task_manager'):
-                    feature.set_task_manager(self.task_manager)
+            self._wire_feature_a2a(feature)
         except Exception as exc:
+            await self._shutdown_failed_feature(feature)
             if mandatory:
                 raise MandatoryFeatureReadinessError(
                     feature_class_name,
@@ -2990,6 +3224,58 @@ class KestrelAgent(
                     "could not register its tools",
                 ) from exc
             raise
+
+    def _wire_feature_hooks(self, feature: "Feature") -> None:
+        """Register a feature's ``get_hooks()`` with the agent's HooksManager.
+
+        One source of truth for hook registration, shared by boot
+        (:meth:`_register_feature`) and runtime re-enable
+        (:meth:`_activate_feature_runtime`). The exact inverse is the hook
+        unregister block in :meth:`_unregister_feature_runtime`.
+        """
+        if not self.hooks_manager:
+            return
+        for hook in feature.get_hooks():
+            self.hooks_manager.register(hook)
+            logging.info(
+                f"Auto-registered hook '{hook.name}' from feature "
+                f"'{feature.name}'"
+            )
+
+    def _wire_feature_a2a(self, feature: "Feature") -> None:
+        """Register a feature as an A2A agent with the TaskManager.
+
+        Collects command prefixes, registers the feature's agent card + handler
+        for unified command routing, and wires the task_manager into features
+        that consume it. One source of truth shared by boot
+        (:meth:`_register_feature`) and runtime re-enable
+        (:meth:`_activate_feature_runtime`); the inverse is the
+        ``task_manager.unregister_agent`` call in
+        :meth:`_unregister_feature_runtime`.
+        """
+        command_prefixes = {}
+        for tool in feature.get_tools():
+            if tool.schema.command_prefix:
+                command_prefixes[tool.schema.command_prefix] = tool.name
+            logging.info(
+                f"Registered tool '{tool.name}' from feature '{feature.name}'"
+            )
+
+        if self.task_manager:
+            agent_card = feature.get_agent_card()
+            self.task_manager.register_agent(
+                agent_card=agent_card,
+                handler=feature,
+                command_prefixes=command_prefixes,
+            )
+            logging.info(
+                f"Registered A2A agent '{agent_card.name}' with "
+                f"{len(agent_card.skills)} skills"
+            )
+
+            # Wire task_manager into features that need it
+            if hasattr(feature, 'set_task_manager'):
+                feature.set_task_manager(self.task_manager)
 
     def _promote_startup_feature_tools(self) -> None:
         """Promote direct tools for features that opt into startup exposure.
@@ -3005,6 +3291,211 @@ class KestrelAgent(
             if getattr(feature, "promote_tools_on_startup", False):
                 self._register_explored_feature_tools(feature)
                 self._pinned_features.add(feature.tool_name)
+
+    async def _activate_feature_runtime(self, feature: "Feature") -> None:
+        """Bring an already-loaded feature fully live — the inverse of
+        :meth:`_unregister_feature_runtime` (kestrel-sovereign#2522 P1).
+
+        The canonical runtime *activation* re-runs the same registration boot
+        performed, on the SAME feature instance, so a soft-disabled feature is
+        restored end to end:
+
+        * ``initialize()`` — re-registers the feature's owned **signal sources**
+          (talon registers ``talon.job_complete`` etc. here);
+        * hooks from ``get_hooks()`` (via :meth:`_wire_feature_hooks`);
+        * the ``on_enable`` lifecycle;
+        * the A2A TaskManager agent registration (via :meth:`_wire_feature_a2a`);
+        * startup-promoted **dynamic tools** (mirrors
+          :meth:`_promote_startup_feature_tools`);
+        * ``post_all_features_loaded()`` — re-registers the feature's owned
+          **wait providers** (``task:`` / ``talon:``);
+        * ``on_agent_ready()`` — the ready-phase hook boot fires only after all
+          services are live (RestartCoordinator's post-restart wake sweep runs
+          here, #1809). Runtime re-enable must fire it too or a re-enabled
+          feature silently skips its ready work.
+
+        Precondition: ``feature.initialize()`` must be idempotent — it is re-run
+        to restore signal sources a disable detached (talon / tasks are, and
+        document it). Atomic: on any failure BEFORE the commit, the partial
+        activation is torn back down *softly* (``unload=False`` — the instance
+        stays re-enable-able) and the error re-raised, so a failed enable never
+        leaves half-registered state. ``on_agent_ready`` runs AFTER the commit
+        and is best-effort (mirroring boot): its failure is logged, not fatal,
+        so a transient ready-hook error doesn't roll back an otherwise-live
+        feature. Used by the public enable endpoint; boot uses
+        :meth:`_register_feature` (which additionally handles first-load
+        discovery and the mandatory-feature readiness contract).
+        """
+        try:
+            await feature.initialize()
+            self._wire_feature_hooks(feature)
+            await feature.on_enable()
+            self._wire_feature_a2a(feature)
+            if getattr(feature, "promote_tools_on_startup", False):
+                self._register_explored_feature_tools(feature)
+                self._pinned_features.add(feature.tool_name)
+            await feature.post_all_features_loaded(self)
+            self.features[feature.name] = feature
+            feature.enabled = True
+            self._cached_features_prompt = self._build_features_prompt_section()
+        except Exception:
+            # Atomic activation: undo whatever partially registered so a failed
+            # enable can't strand hooks / sources / tools. Soft teardown keeps
+            # the instance loaded (re-enable-able); its own errors are logged so
+            # the ORIGINAL activation error is what surfaces.
+            try:
+                await self._unregister_feature_runtime(feature, unload=False)
+            except Exception as cleanup_exc:  # noqa: BLE001 - best-effort undo
+                logging.warning(
+                    "Cleanup after failed activation of feature '%s' failed: %s",
+                    getattr(feature, "name", type(feature).__name__),
+                    cleanup_exc,
+                )
+            raise
+
+        # Ready-phase lifecycle — fire ONLY after activation committed, so a
+        # re-enabled feature gets the same ``on_agent_ready`` signal boot gives
+        # it once services are live (#1809). Best-effort per the boot policy: an
+        # optional hook, and a failure here logs but never rolls back the
+        # now-live feature (kestrel-sovereign#2522 P2).
+        ready_hook = getattr(feature, "on_agent_ready", None)
+        if ready_hook is not None:
+            try:
+                await ready_hook(self)
+            except Exception as exc:  # noqa: BLE001 - readiness is non-fatal
+                logging.warning(
+                    "on_agent_ready failed for %s during re-enable: %s",
+                    getattr(feature, "name", type(feature).__name__),
+                    exc,
+                )
+
+    async def _unregister_feature_runtime(
+        self, feature: "Feature", *, unload: bool = True
+    ) -> None:
+        """Reverse *every* runtime registration a fully-registered feature acquired.
+
+        The single canonical inverse of the wiring ``_register_feature`` /
+        :meth:`_activate_feature_runtime` and ``post_all_features_loaded`` set
+        up. The runtime :meth:`_disable_feature` path, boot rollback
+        (:meth:`_boot_teardown_features`), and the public disable endpoint all
+        call it, so none can drift or leave a feature's registrations stranded
+        (kestrel-sovereign#2522). It removes, in order:
+
+        * the ``on_enable`` lifecycle (via ``on_disable``);
+        * the feature's owned **signal sources** and **wait providers** (via
+          ``feature.shutdown()`` — base :class:`Feature` unregisters both);
+        * the hooks auto-registered from ``get_hooks()``;
+        * the A2A TaskManager agent registration;
+        * the feature's dynamic tools + hidden-tool bookkeeping.
+
+        ``unload`` controls the endpoint soft-toggle vs. full unload:
+
+        * ``True`` (default — runtime disable + boot rollback): the feature is
+          dropped from ``self.features`` (a full unload).
+        * ``False`` (public disable endpoint soft-toggle): the feature stays in
+          ``self.features`` with ``enabled=False`` so the SAME instance can be
+          re-enabled via :meth:`_activate_feature_runtime`.
+
+        Every inverse step is INDEPENDENT of the others, so each runs
+        UNCONDITIONALLY even if an earlier one raises (#2522 P2): a failing
+        ``on_disable`` must not leave the feature's shutdown / hooks / A2A /
+        tools / dropped-from-``features`` cleanup un-run. Errors are collected
+        and the first is re-raised *after* all cleanup so callers still see the
+        failure. It does NOT enforce the mandatory-feature guard — that is a
+        caller policy (runtime disable refuses; boot rollback must tear mandatory
+        features down too).
+        """
+        feature_key = next(
+            (key for key, value in self.features.items() if value is feature),
+            getattr(feature, "name", None),
+        )
+        feature_tool_name = getattr(feature, "tool_name", feature_key)
+        errors: List[Exception] = []
+
+        # Lifecycle inverse of on_enable (run during activation). Independent of
+        # every teardown step below, so its failure must not skip them.
+        try:
+            await feature.on_disable()
+        except Exception as exc:  # noqa: BLE001 - cleanup continues below
+            errors.append(exc)
+            logging.exception(
+                "Feature '%s' on_disable() failed during teardown; "
+                "continuing with the remaining cleanup",
+                feature_key,
+            )
+
+        # The feature's own resource teardown (signal sources + wait providers).
+        try:
+            await feature.shutdown()
+        except Exception as exc:  # noqa: BLE001 - cleanup continues below
+            errors.append(exc)
+            logging.exception(
+                "Feature '%s' shutdown() failed during teardown; "
+                "continuing with the remaining cleanup",
+                feature_key,
+            )
+
+        # Auto-unregister hooks from get_hooks()
+        if self.hooks_manager:
+            try:
+                for hook in feature.get_hooks():
+                    self.hooks_manager.unregister(hook)
+                    logging.info(
+                        f"Auto-unregistered hook '{hook.name}' from feature "
+                        f"'{feature_key}'"
+                    )
+            except Exception as exc:  # noqa: BLE001 - cleanup continues below
+                errors.append(exc)
+                logging.exception(
+                    "Feature '%s' hook unregistration failed during teardown; "
+                    "continuing with the remaining cleanup",
+                    feature_key,
+                )
+
+        if self.task_manager:
+            try:
+                self.task_manager.unregister_agent(feature.get_agent_card().name)
+            except Exception as exc:
+                logging.warning(
+                    "Failed to unregister feature '%s' from task manager: %s",
+                    feature_key,
+                    exc,
+                )
+
+        # Dynamic tools + hidden-tool bookkeeping (independent of the above).
+        try:
+            # Capture the owned tool names before unregister mutates the maps;
+            # _tool_context_hidden_tools is reconciled against them below.
+            to_remove = [
+                name for name, owner in self._tool_to_feature.items()
+                if owner == feature_tool_name
+            ]
+            self.unregister_dynamic_tools(feature_tool_name)
+            if isinstance(getattr(self, "_tool_context_hidden_features", None), set):
+                self._tool_context_hidden_features.discard(feature_tool_name)
+                self._tool_context_hidden_features.discard(feature_key)
+                self._tool_context_hidden_features.discard(feature.__class__.__name__)
+            if isinstance(getattr(self, "_tool_context_hidden_tools", None), set):
+                self._tool_context_hidden_tools.difference_update(to_remove)
+        except Exception as exc:  # noqa: BLE001 - cleanup continues below
+            errors.append(exc)
+            logging.exception(
+                "Feature '%s' dynamic-tool teardown failed; "
+                "continuing with the remaining cleanup",
+                feature_key,
+            )
+
+        # Full unload drops the instance; soft-toggle keeps it re-enable-able.
+        if unload:
+            if feature_key is not None:
+                self.features.pop(feature_key, None)
+        else:
+            feature.enabled = False
+        self._cached_features_prompt = self._build_features_prompt_section()
+
+        # Surface the failure only AFTER every independent cleanup step ran.
+        if errors:
+            raise errors[0]
 
     async def _disable_feature(self, feature_name: str):
         """Disable a feature and remove its runtime registrations."""
@@ -3023,49 +3514,8 @@ class KestrelAgent(
                 "cannot be disabled",
             )
 
-        feature_key = next(
-            (key for key, value in self.features.items() if value is feature),
-            feature.name,
-        )
-        feature_tool_name = getattr(feature, "tool_name", feature_key)
-
-        # Call on_disable lifecycle hook
-        await feature.on_disable()
-        await feature.shutdown()
-
-        # Auto-unregister hooks from get_hooks()
-        if self.hooks_manager:
-            for hook in feature.get_hooks():
-                self.hooks_manager.unregister(hook)
-                logging.info(f"Auto-unregistered hook '{hook.name}' from feature '{feature_name}'")
-
-        if self.task_manager:
-            try:
-                self.task_manager.unregister_agent(feature.get_agent_card().name)
-            except Exception as exc:
-                logging.warning(
-                    "Failed to unregister feature '%s' from task manager: %s",
-                    feature_key,
-                    exc,
-                )
-
-        self.features.pop(feature_key, None)
-        # Capture the owned tool names before unregister mutates the maps;
-        # _tool_context_hidden_tools is reconciled against them below.
-        to_remove = [
-            name for name, owner in self._tool_to_feature.items()
-            if owner == feature_tool_name
-        ]
-        self.unregister_dynamic_tools(feature_tool_name)
-        if isinstance(getattr(self, "_tool_context_hidden_features", None), set):
-            self._tool_context_hidden_features.discard(feature_tool_name)
-            self._tool_context_hidden_features.discard(feature_key)
-            self._tool_context_hidden_features.discard(feature.__class__.__name__)
-        if isinstance(getattr(self, "_tool_context_hidden_tools", None), set):
-            self._tool_context_hidden_tools.difference_update(to_remove)
-        self._cached_features_prompt = self._build_features_prompt_section()
-
-        logging.info(f"Feature '{feature_key}' disabled and removed")
+        await self._unregister_feature_runtime(feature)
+        logging.info(f"Feature '{feature_name}' disabled and removed")
 
     # Solvency State
     _current_model_preference: Optional[str] = None

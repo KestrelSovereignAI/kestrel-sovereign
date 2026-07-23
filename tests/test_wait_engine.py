@@ -179,3 +179,157 @@ class TestWaitRegistry:
         reg = WaitRegistry()
         r = await reg.wait("garbage", timeout_seconds=10)
         assert r.status is ToolResultStatus.ERROR
+
+
+# ---------------------------------------------------------------------------
+# WaitRegistry.restore_if_current — identity-aware teardown (#2522 P3)
+# ---------------------------------------------------------------------------
+
+
+class _NamedProvider:
+    """Distinct providers of the SAME kind, told apart by object identity."""
+
+    kind = "demo"
+    signal = None
+
+    def __init__(self, tag):
+        self.tag = tag
+
+    async def poll(self, handle):  # pragma: no cover - never polled here
+        raise NotImplementedError
+
+
+class TestRestoreIfCurrent:
+    def test_restores_previous_when_still_current(self):
+        reg = WaitRegistry()
+        host = _NamedProvider("host")
+        reg.register(host)
+        mine = _NamedProvider("mine")
+        reg.register(mine, replace=True)
+        assert reg.get("demo") is mine
+
+        # Our provider is still current → restore the displaced host provider.
+        assert reg.restore_if_current("demo", mine, host) is True
+        assert reg.get("demo") is host
+
+    def test_removes_kind_when_no_previous(self):
+        reg = WaitRegistry()
+        mine = _NamedProvider("mine")
+        reg.register(mine)
+
+        # We installed into an empty slot → restoring means removing the kind.
+        assert reg.restore_if_current("demo", mine, None) is True
+        assert reg.get("demo") is None
+        assert reg.kinds() == []
+
+    def test_retains_newer_provider_untouched(self):
+        reg = WaitRegistry()
+        host = _NamedProvider("host")
+        reg.register(host)
+        mine = _NamedProvider("mine")
+        reg.register(mine, replace=True)
+        # A NEWER owner replaces ours after we installed.
+        newer = _NamedProvider("newer")
+        reg.register(newer, replace=True)
+        assert reg.get("demo") is newer
+
+        # Our provider is no longer current → leave the newer one in place,
+        # do NOT resurrect the stale host provider.
+        assert reg.restore_if_current("demo", mine, host) is False
+        assert reg.get("demo") is newer
+
+    def test_no_provider_registered_is_a_benign_false(self):
+        reg = WaitRegistry()
+        mine = _NamedProvider("mine")
+        assert reg.restore_if_current("demo", mine, None) is False
+        assert reg.get("demo") is None
+
+
+# ---------------------------------------------------------------------------
+# WaitRegistry per-kind ownership stack — the A→B disable-order regression
+# that a single-slot "save previous" design gets wrong (#2522 P3 redesign).
+# ---------------------------------------------------------------------------
+
+
+class TestOwnershipStack:
+    def test_middle_removal_leaves_current_untouched(self):
+        """host → A → B; removing A (middle) must NOT disturb current B."""
+        reg = WaitRegistry()
+        host = _NamedProvider("host")
+        reg.register(host)
+        a = _NamedProvider("A")
+        reg.register(a, replace=True)
+        b = _NamedProvider("B")
+        reg.register(b, replace=True)
+        assert reg.get("demo") is b
+
+        # A is superseded by B → its removal returns False and B stays current.
+        assert reg.deregister("demo", a) is False
+        assert reg.get("demo") is b
+
+    def test_disable_order_A_then_B_restores_host_not_disabled_A(self):
+        """The core bug: host → A → B, disable A then B must restore HOST.
+
+        The old single-slot design saved B's ``previous`` as A at registration
+        time, so tearing B down restored A — resurrecting the already-disabled
+        predecessor. The stack removes A when A is disabled, so B's teardown can
+        only fall through to the nearest STILL-LIVE predecessor (host).
+        """
+        reg = WaitRegistry()
+        host = _NamedProvider("host")
+        reg.register(host)
+        a = _NamedProvider("A")
+        reg.register(a, replace=True)
+        b = _NamedProvider("B")
+        reg.register(b, replace=True)
+
+        # Disable A first (it is currently in the MIDDLE, superseded by B).
+        assert reg.deregister("demo", a) is False
+        assert reg.get("demo") is b
+
+        # Now disable B (the current provider). The nearest live predecessor is
+        # host — A is gone and must never come back.
+        assert reg.deregister("demo", b) is True
+        assert reg.get("demo") is host
+        assert reg.kinds() == ["demo"]
+
+    def test_disable_top_then_next_walks_down_the_stack(self):
+        """Disabling B then A (reverse order) walks host ← A ← B correctly."""
+        reg = WaitRegistry()
+        host = _NamedProvider("host")
+        reg.register(host)
+        a = _NamedProvider("A")
+        reg.register(a, replace=True)
+        b = _NamedProvider("B")
+        reg.register(b, replace=True)
+
+        assert reg.deregister("demo", b) is True
+        assert reg.get("demo") is a
+        assert reg.deregister("demo", a) is True
+        assert reg.get("demo") is host
+
+    def test_reregistering_same_provider_is_idempotent(self):
+        """A feature whose init re-runs must not stack a duplicate of itself."""
+        reg = WaitRegistry()
+        host = _NamedProvider("host")
+        reg.register(host)
+        mine = _NamedProvider("mine")
+        reg.register(mine, replace=True)
+        reg.register(mine, replace=True)  # re-run in one live cycle
+        assert reg.get("demo") is mine
+
+        # One removal fully clears mine; the host underneath is restored once.
+        assert reg.deregister("demo", mine) is True
+        assert reg.get("demo") is host
+
+    def test_unregister_pops_only_the_current_provider(self):
+        reg = WaitRegistry()
+        host = _NamedProvider("host")
+        reg.register(host)
+        mine = _NamedProvider("mine")
+        reg.register(mine, replace=True)
+        assert reg.unregister("demo") is True
+        assert reg.get("demo") is host
+        assert reg.unregister("demo") is True
+        assert reg.get("demo") is None
+        assert reg.unregister("demo") is False

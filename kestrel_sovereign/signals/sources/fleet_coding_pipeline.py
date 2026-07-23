@@ -104,6 +104,10 @@ from kestrel_sdk.signals import (
     Trust,
 )
 
+from kestrel_sovereign.signals.registry import (
+    RegistrationPolicy,
+    RegistrationState,
+)
 from kestrel_sovereign.signals.sources.talon_pipeline import (
     SOURCE_NAME as TALON_PIPELINE_SOURCE,
 )
@@ -338,31 +342,29 @@ def build_fleet_coding_pipeline_registrations(
 def register_fleet_coding_pipeline_sources(
     registry: Any, coordinator: Any = None
 ) -> List[str]:
-    """Register the support sources on ``registry``, idempotently.
+    """Register the support sources on ``registry`` under the OPTIONAL policy.
 
     ``coordinator`` binds the ``fleet_ci_probe`` verify source so it can consult
     the dispatched run's output; the coordinator passes itself at init time.
-    Returns the names newly registered (already-present sources are skipped so a
-    second call — or a host that registered a richer implementation — is safe).
-    A single source's failure is logged and does not abort the rest.
+
+    These are feature sources whose absence is a degraded-but-tolerable state, so
+    registration uses :attr:`RegistrationPolicy.OPTIONAL` (#2522): an equivalent
+    re-registration is a no-op, a validation failure or a clash with a
+    *non-equivalent* existing contract is reported (logged loudly) rather than
+    silently equated, and nothing ever raises — one bad source cannot abort the
+    rest. Returns the names *newly* registered by this call.
     """
-    registered: List[str] = []
-    if registry is None or not hasattr(registry, "register"):
-        return registered
-    has_get = hasattr(registry, "get")
-    for registration in build_fleet_coding_pipeline_registrations(coordinator):
-        if has_get and registry.get(registration.name) is not None:
-            continue
-        try:
-            registry.register(registration)
-            registered.append(registration.name)
-        except Exception as exc:  # noqa: BLE001 - one bad source must not abort the rest
-            logger.warning(
-                "could not register fleet-coding-pipeline source %s: %s",
-                registration.name,
-                exc,
-            )
-    return registered
+    if registry is None or not hasattr(registry, "register_batch"):
+        return []
+    outcomes = registry.register_batch(
+        build_fleet_coding_pipeline_registrations(coordinator),
+        RegistrationPolicy.OPTIONAL,
+    )
+    return [
+        outcome.name
+        for outcome in outcomes
+        if outcome.state is RegistrationState.REGISTERED
+    ]
 
 
 # --------------------------------------------------------------------------

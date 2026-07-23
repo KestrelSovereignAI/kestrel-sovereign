@@ -48,6 +48,32 @@ def _make_feature(enabled=True):
 def _make_agent(features=None):
     agent = MagicMock()
     agent.features = features or {}
+
+    async def _unregister_feature_runtime(feature, *, unload=False):
+        await feature.on_disable()
+        if agent.hooks_manager:
+            for hook in feature.get_hooks() or []:
+                agent.hooks_manager.unregister(hook)
+        feature.enabled = False
+
+    async def _activate_feature_runtime(feature):
+        if agent.hooks_manager:
+            for hook in feature.get_hooks() or []:
+                agent.hooks_manager.register(hook)
+        try:
+            await feature.on_enable()
+        except Exception:
+            await _unregister_feature_runtime(feature, unload=False)
+            raise
+        feature.enabled = True
+
+    # Feature endpoints delegate lifecycle transitions to these canonical async
+    # agent helpers.  Keep the fixture faithful so UI capability assertions
+    # exercise the post-transition state rather than a non-awaitable mock.
+    agent._unregister_feature_runtime = AsyncMock(
+        side_effect=_unregister_feature_runtime
+    )
+    agent._activate_feature_runtime = AsyncMock(side_effect=_activate_feature_runtime)
     return agent
 
 

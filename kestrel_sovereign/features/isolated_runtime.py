@@ -291,6 +291,14 @@ class ProxyFeature(Feature):
         return self.runtime.config_schema
 
     async def initialize(self):
+        # Reset lifecycle state to the fresh-start baseline BEFORE the client or
+        # supervisor start. ``shutdown()`` latches ``_stopping=True`` to unwind
+        # the health supervisor; runtime re-enable re-runs this SAME instance's
+        # ``initialize()`` (``_activate_feature_runtime``), so without the reset
+        # the new ``_supervise()`` task sees a stale ``_stopping`` and exits on
+        # its first ``while not self._stopping`` check — leaving a re-enabled
+        # service with no health supervisor (kestrel-sovereign#2522 P2).
+        self._stopping = False
         self._venv_path, self._bin_path = self.resolve_runtime_paths()
         if self._bin_path is None:
             self.ensure_venv()

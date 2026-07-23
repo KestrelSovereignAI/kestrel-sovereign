@@ -468,25 +468,24 @@ class TalonCoordinatorFeature(Feature):
         # on a second initialize() since a duplicate registration
         # would otherwise raise and shadow real-failure warnings.
         registry = getattr(self.agent, "signal_registry", None)
-        if registry is not None and hasattr(registry, "register"):
+        if registry is not None and hasattr(registry, "register_with_policy"):
+            from kestrel_sovereign.signals import RegistrationPolicy
             from kestrel_sovereign.signals.sources.talon import (
-                SOURCE_NAME as _TALON_SOURCE_NAME,
                 build_talon_job_complete_registration,
             )
-            already = (
-                hasattr(registry, "get")
-                and registry.get(_TALON_SOURCE_NAME) is not None
+            # OPTIONAL policy (#2522): idempotent on a second initialize(); a
+            # talon.job_complete already present with a DIFFERENT contract is
+            # reported rather than silently accepted by a precheck-by-name skip.
+            # Never raises — one bad source must not abort feature init.
+            # Own the sources we newly register (here and below) so the
+            # base-class shutdown / boot rollback unregisters exactly them and
+            # never a host's pre-existing source (#2522 P2).
+            self._own_signal_sources(
+                registry.register_with_policy(
+                    build_talon_job_complete_registration(),
+                    RegistrationPolicy.OPTIONAL,
+                )
             )
-            if not already:
-                try:
-                    registry.register(
-                        build_talon_job_complete_registration()
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "TalonCoordinatorFeature could not register "
-                        "talon.job_complete signal source: %s", e,
-                    )
 
             # Register the host-provided sources the built-in
             # ``stalled_work_rescue`` workflow references (#2192). The rescue
@@ -507,6 +506,7 @@ class TalonCoordinatorFeature(Feature):
                 registry,
                 fleet_stalled_discover=self._survey_stalled_talon_jobs,
             )
+            self._own_signal_sources(registered)
             if registered:
                 logger.info(
                     "TalonCoordinatorFeature registered workflow-rescue "
@@ -523,6 +523,11 @@ class TalonCoordinatorFeature(Feature):
                 register_talon_pipeline_source,
             )
             if register_talon_pipeline_source(registry, self):
+                from kestrel_sovereign.signals.sources.talon_pipeline import (
+                    SOURCE_NAME as _TALON_PIPELINE_SOURCE,
+                )
+
+                self._own_signal_sources(_TALON_PIPELINE_SOURCE)
                 logger.info(
                     "TalonCoordinatorFeature registered the "
                     "talon_pipeline_dispatch signal source",
@@ -542,6 +547,7 @@ class TalonCoordinatorFeature(Feature):
             fleet_registered = register_fleet_coding_pipeline_sources(
                 registry, coordinator=self
             )
+            self._own_signal_sources(fleet_registered)
             if fleet_registered:
                 logger.info(
                     "TalonCoordinatorFeature registered fleet-coding-pipeline "
@@ -562,7 +568,8 @@ class TalonCoordinatorFeature(Feature):
         """
         registry = getattr(agent, "wait_registry", None)
         if registry is not None:
-            registry.register(TalonWaitable(self), replace=True)
+            # Record ownership so base shutdown()/boot rollback unregisters it.
+            self._register_wait_provider(registry, TalonWaitable(self), replace=True)
 
         # One-time migration of legacy talon_monitor dedup state into the
         # generic reconciler ledger. Pre-Wave-2 jobs.json rows carry

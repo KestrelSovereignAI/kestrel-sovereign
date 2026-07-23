@@ -1314,9 +1314,15 @@ class TestWebhookMultiAgentDispatch:
 
         # One shared dispatch router across both receivers — the shape server.py
         # mounts in multi-agent mode.
+        # The provider is request/scope-aware (#2522): it receives the
+        # request-scoped target agent (``None`` for this unprefixed
+        # ``/webhooks/{name}`` form) and returns the receivers to consider —
+        # here the aggregate across both agents, matching the unprefixed path.
         app = FastAPI()
         app.include_router(
-            build_webhook_dispatch_router(lambda: [feat_a.receiver, feat_b.receiver])
+            build_webhook_dispatch_router(
+                lambda _agent=None: [feat_a.receiver, feat_b.receiver]
+            )
         )
         client = TestClient(app)
 
@@ -1350,7 +1356,9 @@ class TestWebhookMultiAgentDispatch:
         await feat_a.initialize()
 
         app = FastAPI()
-        app.include_router(build_webhook_dispatch_router(lambda: [feat_a.receiver]))
+        app.include_router(
+            build_webhook_dispatch_router(lambda _agent=None: [feat_a.receiver])
+        )
         resp = TestClient(app).post("/webhooks/ghost", content=b"{}")
         assert resp.status_code == 404
 

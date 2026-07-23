@@ -76,9 +76,7 @@ class ToolRegistryMixin:
 
         for feature in self.features.values():
             try:
-                if self._feature_hidden_from_context(feature):
-                    continue
-                if not self._feature_supports_subagent_dispatch(feature):
+                if not self._feature_visible_to_llm(feature):
                     continue
                 # Skip subagent dispatcher for pre-explored features
                 # (their individual tools are already in the direct tool list)
@@ -157,8 +155,7 @@ class ToolRegistryMixin:
         return {
             feature.tool_name: feature
             for feature in self.features.values()
-            if not self._feature_hidden_from_context(feature)
-            and self._feature_supports_subagent_dispatch(feature)
+            if self._feature_visible_to_llm(feature)
         }
 
     def _visible_known_tool_names(self) -> set[str]:
@@ -338,9 +335,7 @@ class ToolRegistryMixin:
         hidden_tools = self._hidden_context_tools()
         for feature in self.features.values():
             try:
-                if self._feature_hidden_from_context(feature):
-                    continue
-                if not self._feature_supports_subagent_dispatch(feature):
+                if not self._feature_visible_to_llm(feature):
                     continue
                 # Feature name and description
                 feature_sections.append(f"\n### {feature.name}")
@@ -376,6 +371,34 @@ class ToolRegistryMixin:
         return (
             callable(getattr(feature, "to_orchestrator_tool", None))
             and callable(getattr(feature, "execute_as_subagent", None))
+        )
+
+    def _feature_visible_to_llm(self, feature: Any) -> bool:
+        """Whether a loaded feature is currently exposed to the orchestrator LLM.
+
+        Three gates, all required:
+
+        * **enabled** — a feature soft-disabled through the ``/disable`` endpoint
+          stays LOADED in ``self.features`` (so ``/enable`` can restore the same
+          instance) with ``enabled=False``, but it must NOT appear as a callable
+          dispatcher tool, in the features prompt, or in the visible-subagent map
+          while disabled (kestrel-sovereign#2522 P1). ``getattr(..., True)``
+          keeps features that never set the flag (the normal booted state)
+          visible.
+        * **not hidden by the active tool-context profile** — progressive
+          disclosure can hide a feature for the current turn.
+        * **supports subagent dispatch** — only features exposing both
+          ``to_orchestrator_tool`` and ``execute_as_subagent`` are dispatchable.
+
+        One source of truth shared by :meth:`_build_feature_tools`,
+        :meth:`_visible_features_by_tool_name`, and
+        :meth:`_build_features_prompt_section`, so the disabled/hidden gate can
+        never drift between the tool list, the subagent map, and the prompt.
+        """
+        return (
+            bool(getattr(feature, "enabled", True))
+            and not self._feature_hidden_from_context(feature)
+            and self._feature_supports_subagent_dispatch(feature)
         )
 
     def _hidden_context_features(self) -> set[str]:

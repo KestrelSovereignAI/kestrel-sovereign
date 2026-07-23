@@ -73,6 +73,10 @@ from kestrel_sdk.signals import (
     SourceRegistration,
     Trust,
 )
+from kestrel_sovereign.signals.registry import (
+    RegistrationPolicy,
+    RegistrationState,
+)
 from kestrel_sovereign.waits.engine import MAX_HANDLE_WAIT_SECONDS
 
 logger = logging.getLogger(__name__)
@@ -411,22 +415,20 @@ def build_talon_pipeline_dispatch_registration(
 
 
 def register_talon_pipeline_source(registry: Any, coordinator: Any) -> bool:
-    """Register the source on ``registry``, idempotently.
+    """Register the source on ``registry`` under the OPTIONAL policy.
 
-    Returns True when newly registered; False when the registry is absent,
-    the source already exists (a host may have registered a richer
-    implementation), or registration failed (logged, never raised — one bad
-    source must not abort feature init).
+    Returns True only when this call *newly* registered the source. Returns
+    False when the registry is absent, an equivalent registration already
+    exists, validation failed, or an existing registration carries a
+    *non-equivalent* contract. Under :attr:`RegistrationPolicy.OPTIONAL` (#2522)
+    a non-equivalent clash is reported (logged loudly) rather than silently
+    equated, and registration never raises — one bad source must not abort
+    feature init.
     """
-    if registry is None or not hasattr(registry, "register"):
+    if registry is None or not hasattr(registry, "register_with_policy"):
         return False
-    if hasattr(registry, "get") and registry.get(SOURCE_NAME) is not None:
-        return False
-    try:
-        registry.register(build_talon_pipeline_dispatch_registration(coordinator))
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "could not register %s signal source: %s", SOURCE_NAME, exc
-        )
-        return False
-    return True
+    outcome = registry.register_with_policy(
+        build_talon_pipeline_dispatch_registration(coordinator),
+        RegistrationPolicy.OPTIONAL,
+    )
+    return outcome.state is RegistrationState.REGISTERED

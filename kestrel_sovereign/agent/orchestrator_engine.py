@@ -1049,13 +1049,24 @@ class OrchestratorEngineMixin:
         expected to be globally unique within an agent's enabled-feature
         set.
 
-        Returns ``(None, None)`` when no feature exposes a tool by that
-        name; the public ``execute_named_tool`` turns that into a
+        A soft-disabled feature (kept LOADED with ``enabled=False`` by the
+        ``/disable`` endpoint so ``/enable`` can restore the same instance)
+        is skipped: its ``@tool`` methods must NOT resolve while disabled,
+        matching the "not registered with any enabled feature" contract
+        ``execute_named_tool`` documents (kestrel-sovereign#2522 P1). The
+        subagent-dispatcher fallback is gated the same way — it resolves
+        through ``_visible_features_by_tool_name``, which also honours
+        ``enabled``.
+
+        Returns ``(None, None)`` when no enabled feature exposes a tool by
+        that name; the public ``execute_named_tool`` turns that into a
         ``ValueError`` (or, for subagent-dispatcher names, falls through
         to ``_resolve_named_subagent``).
         """
         features = getattr(self, "features", {}) or {}
         for feature in features.values():
+            if not getattr(feature, "enabled", True):
+                continue
             get_tools = getattr(feature, "get_tools", None)
             if get_tools is None:
                 continue

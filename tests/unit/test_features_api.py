@@ -57,6 +57,14 @@ def _make_feature(
     feature.on_enable = AsyncMock()
     feature.on_disable = AsyncMock()
     feature.on_remove = AsyncMock()
+    # Async lifecycle surface the canonical activation/teardown drive
+    # (KestrelAgent._activate_feature_runtime / _unregister_feature_runtime).
+    feature.initialize = AsyncMock()
+    feature.shutdown = AsyncMock()
+    feature.post_all_features_loaded = AsyncMock()
+    # A concrete bool (not an auto-truthy MagicMock) so activation's
+    # startup-tool-promotion branch is deterministically skipped.
+    feature.promote_tools_on_startup = False
     feature.enabled = enabled
     return feature
 
@@ -73,6 +81,28 @@ def _make_app(agent=None):
 def _make_agent(features=None):
     """Create a mock agent with optional features dict."""
     agent = MagicMock()
+    agent.features = features or {}
+    return agent
+
+
+def _lifecycle_agent(features=None):
+    """A REAL KestrelAgent for the enable/disable production path (#2522).
+
+    The enable/disable endpoints delegate per-feature work to the agent's
+    canonical ``_activate_feature_runtime`` / ``_unregister_feature_runtime`` —
+    there is no endpoint-local teardown to mock, so these tests must drive the
+    real methods. Construction is cheap (``__init__`` opens no DB); the runtime
+    registries the teardown touches (signal / wait) are attached empty and the
+    A2A task manager left unset so mock features need no agent-card wiring.
+    """
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.signals.registry import SourceRegistry
+    from kestrel_sovereign.waits import WaitRegistry
+
+    agent = KestrelAgent(did="did:test:features", storage_path=":memory:")
+    agent.task_manager = None
+    agent.signal_registry = SourceRegistry()
+    agent.wait_registry = WaitRegistry()
     agent.features = features or {}
     return agent
 
@@ -252,7 +282,7 @@ class TestGetFeatureDetail:
 class TestEnableFeature:
     def test_enable_calls_on_enable(self):
         feature = _make_feature(enabled=False)
-        agent = _make_agent(features={"TestFeature": feature})
+        agent = _lifecycle_agent(features={"TestFeature": feature})
         app = _make_app(agent)
 
         with TestClient(app) as client:
@@ -261,6 +291,12 @@ class TestEnableFeature:
         assert resp.status_code == 200
         assert resp.json()["status"] == "enabled"
         feature.on_enable.assert_awaited_once()
+        # Canonical activation re-runs the full registration on the SAME
+        # instance (#2522): initialize (signal sources) + post_all_features_loaded
+        # (wait providers) ran too, and the feature is live again.
+        feature.initialize.assert_awaited_once()
+        feature.post_all_features_loaded.assert_awaited_once()
+        assert feature.enabled is True
 
     def test_enable_unknown_feature_returns_404(self):
         agent = _make_agent()
@@ -280,7 +316,9 @@ class TestEnableFeature:
             features=["FirstFeature", "SecondFeature"], description="multi",
         )
         mock_registry.return_value = {"multi-pkg": info}
-        agent = _make_agent(features={"FirstFeature": first, "SecondFeature": second})
+        agent = _lifecycle_agent(
+            features={"FirstFeature": first, "SecondFeature": second}
+        )
         app = _make_app(agent)
 
         with TestClient(app) as client:
@@ -302,13 +340,18 @@ class TestEnableFeature:
             features=["FirstFeature", "SecondFeature"], description="multi",
         )
         mock_registry.return_value = {"multi-pkg": info}
-        agent = _make_agent(features={"FirstFeature": first, "SecondFeature": second})
+        agent = _lifecycle_agent(
+            features={"FirstFeature": first, "SecondFeature": second}
+        )
         app = _make_app(agent)
 
         with TestClient(app, raise_server_exceptions=False) as client:
             resp = client.post("/api/features/multi-pkg/enable")
 
         assert resp.status_code == 500
+        # first was fully activated then rolled back (soft-disabled); second's
+        # atomic activation tore its own partial state down on the failed
+        # on_enable — so both members ran on_disable and both end disabled.
         first.on_disable.assert_awaited_once()
         second.on_disable.assert_awaited_once()
         assert first.enabled is False and second.enabled is False
@@ -325,13 +368,17 @@ class TestEnableFeature:
             features=["FirstFeature", "SecondFeature"], description="multi",
         )
         mock_registry.return_value = {"multi-pkg": info}
-        agent = _make_agent(features={"FirstFeature": first, "SecondFeature": second})
+        agent = _lifecycle_agent(
+            features={"FirstFeature": first, "SecondFeature": second}
+        )
         app = _make_app(agent)
 
         with TestClient(app, raise_server_exceptions=False) as client:
             resp = client.post("/api/features/multi-pkg/enable")
 
         assert resp.status_code == 500
+        # Even when the teardown lifecycle itself raises, the unconditional
+        # cleanup still flips ``enabled`` false on both members (#2522 P2).
         assert first.enabled is False and second.enabled is False
 
 
@@ -368,7 +415,7 @@ class TestDisableFeature:
 
     def test_disable_calls_on_disable(self):
         feature = _make_feature()
-        agent = _make_agent(features={"TestFeature": feature})
+        agent = _lifecycle_agent(features={"TestFeature": feature})
         app = _make_app(agent)
 
         with TestClient(app) as client:
@@ -377,6 +424,12 @@ class TestDisableFeature:
         assert resp.status_code == 200
         assert resp.json()["status"] == "disabled"
         feature.on_disable.assert_awaited_once()
+        # Canonical teardown detaches the feature's owned resources too (#2522):
+        # shutdown() (signal sources + wait providers) ran, and the SAME
+        # instance stays loaded (soft-toggle) so /enable can restore it.
+        feature.shutdown.assert_awaited_once()
+        assert feature.enabled is False
+        assert agent.features.get("TestFeature") is feature
 
     @patch("kestrel_sovereign.endpoints.features.get_registry")
     def test_disable_accepts_package_stable_id(self, mock_registry):
@@ -387,7 +440,9 @@ class TestDisableFeature:
             features=["FirstFeature", "SecondFeature"], description="multi",
         )
         mock_registry.return_value = {"multi-pkg": info}
-        agent = _make_agent(features={"FirstFeature": first, "SecondFeature": second})
+        agent = _lifecycle_agent(
+            features={"FirstFeature": first, "SecondFeature": second}
+        )
         app = _make_app(agent)
 
         with TestClient(app) as client:
@@ -409,18 +464,31 @@ class TestDisableFeature:
             features=["FirstFeature", "SecondFeature"], description="multi",
         )
         mock_registry.return_value = {"multi-pkg": info}
-        agent = _make_agent(features={"FirstFeature": first, "SecondFeature": second})
+        agent = _lifecycle_agent(
+            features={"FirstFeature": first, "SecondFeature": second}
+        )
         app = _make_app(agent)
 
         with TestClient(app, raise_server_exceptions=False) as client:
             resp = client.post("/api/features/multi-pkg/disable")
 
         assert resp.status_code == 500
+        # Group transaction rolled back: every attempted member (first, which
+        # tore down cleanly, AND second, whose teardown raised) is re-activated,
+        # so both are enabled again.
         first.on_enable.assert_awaited_once()
+        second.on_enable.assert_awaited_once()
         assert first.enabled is True and second.enabled is True
 
     @patch("kestrel_sovereign.endpoints.features.get_registry")
-    def test_disable_rollback_restores_flag_when_reenable_fails(self, mock_registry):
+    def test_disable_rollback_reenable_failure_leaves_member_disabled(
+        self, mock_registry
+    ):
+        # When the group rollback's re-enable ITSELF fails, the canonical
+        # activation is atomic: the member whose on_enable raised is torn back
+        # down rather than falsely reported enabled (#2522). This supersedes the
+        # old "restore the enabled flag regardless" behavior — an ``enabled``
+        # flag out of sync with a failed on_enable was a lie about live state.
         first = _make_feature(name="FirstFeature")
         first.on_enable.side_effect = RuntimeError("rollback failed")
         second = _make_feature(name="SecondFeature")
@@ -430,14 +498,18 @@ class TestDisableFeature:
             features=["FirstFeature", "SecondFeature"], description="multi",
         )
         mock_registry.return_value = {"multi-pkg": info}
-        agent = _make_agent(features={"FirstFeature": first, "SecondFeature": second})
+        agent = _lifecycle_agent(
+            features={"FirstFeature": first, "SecondFeature": second}
+        )
         app = _make_app(agent)
 
         with TestClient(app, raise_server_exceptions=False) as client:
             resp = client.post("/api/features/multi-pkg/disable")
 
         assert resp.status_code == 500
-        assert first.enabled is True and second.enabled is True
+        # second re-enabled cleanly; first's re-enable failed → left disabled.
+        assert second.enabled is True
+        assert first.enabled is False
 
 
 # ---------------------------------------------------------------------------
@@ -495,6 +567,39 @@ class TestRemoveFeature:
         assert resp.status_code == 400
         assert "core" in resp.json()["detail"].lower()
 
+    @pytest.mark.parametrize(
+        "feature_name",
+        ["ConstitutionFeature", "PeersFeature", "SecurityFeature"],
+    )
+    @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")
+    def test_remove_mandatory_feature_is_rejected_before_teardown(
+        self, mock_pkg, feature_name
+    ):
+        # A non-core package that (hypothetically) declares a mandatory feature
+        # must be refused with 409 BEFORE any teardown / on_remove runs — the
+        # canonical unload teardown would otherwise cripple the agent (#2522).
+        mock_pkg.return_value = FeaturePackageInfo(
+            name="rogue-pkg",
+            package="kestrel-feature-rogue",
+            git="",
+            features=[feature_name],
+            description="rogue package claiming a mandatory feature",
+            core=False,
+        )
+        feature = _make_feature(name=feature_name)
+        agent = _lifecycle_agent(features={feature_name: feature})
+        app = _make_app(agent)
+
+        with TestClient(app) as client:
+            resp = client.post(f"/api/features/{feature_name}/remove")
+
+        assert resp.status_code == 409
+        assert feature_name in resp.json()["detail"]
+        # Nothing was torn down and no stored-data cleanup ran.
+        feature.shutdown.assert_not_awaited()
+        feature.on_remove.assert_not_awaited()
+        assert agent.features.get(feature_name) is feature
+
     @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")
     def test_remove_unknown_returns_404(self, mock_pkg):
         mock_pkg.return_value = None
@@ -510,6 +615,9 @@ class TestRemoveFeature:
     @patch("kestrel_sovereign.endpoints.features.get_registry")
     @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")
     def test_remove_accepts_package_stable_id(self, mock_pkg, mock_registry, mock_run):
+        # REAL agent: removal delegates its per-member drain to the canonical
+        # ``_unregister_feature_runtime`` (#2522 P1), so this must drive the real
+        # method rather than a mocked-away teardown.
         mock_pkg.return_value = None
         info = FeaturePackageInfo(
             name="multi-pkg", package="kestrel-feature-multi", git="",
@@ -519,7 +627,9 @@ class TestRemoveFeature:
         mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
         first = _make_feature(name="FirstFeature")
         second = _make_feature(name="SecondFeature")
-        agent = _make_agent(features={"FirstFeature": first, "SecondFeature": second})
+        agent = _lifecycle_agent(
+            features={"FirstFeature": first, "SecondFeature": second}
+        )
         app = _make_app(agent)
 
         with TestClient(app) as client:
@@ -527,8 +637,14 @@ class TestRemoveFeature:
 
         assert resp.status_code == 200
         assert resp.json()["features"] == ["FirstFeature", "SecondFeature"]
+        # Canonical teardown drained each member (shutdown ran), the instances
+        # were unloaded, and on_remove ran AFTER teardown on the same instance.
+        first.shutdown.assert_awaited_once()
+        second.shutdown.assert_awaited_once()
         first.on_remove.assert_awaited_once()
         second.on_remove.assert_awaited_once()
+        assert "FirstFeature" not in agent.features
+        assert "SecondFeature" not in agent.features
         command = mock_run.call_args.args[0]
         assert command[-2:] == ["-y", "kestrel-feature-multi"]
 
@@ -543,16 +659,22 @@ class TestRemoveFeature:
         mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
         first = _make_feature(name="FirstFeature")
         second = _make_feature(name="SecondFeature")
-        agent = _make_agent(features={"FirstFeature": first, "SecondFeature": second})
+        agent = _lifecycle_agent(
+            features={"FirstFeature": first, "SecondFeature": second}
+        )
         app = _make_app(agent)
 
         with TestClient(app) as client:
             resp = client.post("/api/features/FirstFeature/remove")
 
         assert resp.status_code == 200
+        # Both package members drained (canonical teardown) then cleaned up.
+        first.shutdown.assert_awaited_once()
+        second.shutdown.assert_awaited_once()
         first.on_remove.assert_awaited_once()
         second.on_remove.assert_awaited_once()
         assert first.enabled is False and second.enabled is False
+        assert agent.features == {}
 
 
 # ---------------------------------------------------------------------------

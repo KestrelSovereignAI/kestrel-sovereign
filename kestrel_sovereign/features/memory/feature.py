@@ -120,13 +120,18 @@ class MemoryFeature(Feature):
         logger.info(f"MemoryFeature initialized for agent: {self.agent_id[:30]}...")
 
     async def post_all_features_loaded(self, agent):
-        """Subscribe memory application attestation to the sleep cycle."""
-        hooks = getattr(agent, "sleep_hooks", None)
-        if hooks is None:
-            agent.sleep_hooks = []
-            hooks = agent.sleep_hooks
+        """Subscribe memory application attestation to the sleep cycle.
+
+        Registers the hook through :meth:`_register_sleep_hook` so ownership is
+        tracked and ``Feature.shutdown()`` removes exactly this instance on
+        runtime disable / boot rollback / soft disable (kestrel-sovereign#2522
+        P1). The ``isinstance`` guard keeps re-activation idempotent — a
+        re-enable re-runs this method, and we must not stack a second
+        ReflectionSleepHook if one is already wired.
+        """
+        hooks = getattr(agent, "sleep_hooks", None) or []
         if not any(isinstance(hook, ReflectionSleepHook) for hook in hooks):
-            hooks.append(ReflectionSleepHook())
+            self._register_sleep_hook(agent, ReflectionSleepHook())
 
     @property
     def memory_system(self):
@@ -616,7 +621,15 @@ class MemoryFeature(Feature):
         )
 
     async def shutdown(self) -> None:
-        """Cancel and join the feature-owned background backfill task."""
+        """Cancel the backfill task, then run the base feature teardown.
+
+        The ``super().shutdown()`` call is load-bearing (kestrel-sovereign#2522
+        P1): it removes the ReflectionSleepHook this feature appended to
+        ``agent.sleep_hooks`` in :meth:`post_all_features_loaded` (plus any owned
+        signal sources / wait providers). Without it, runtime disable / boot
+        rollback / soft disable would leave a stale sleep hook wired to a
+        torn-down feature.
+        """
         task = getattr(self, "_lexical_backfill_task", None)
         if task is not None and not task.done():
             task.cancel()
@@ -624,6 +637,7 @@ class MemoryFeature(Feature):
                 await task
             except asyncio.CancelledError:
                 pass
+        await super().shutdown()
 
     @tool(
         name="memory_index_backfill",

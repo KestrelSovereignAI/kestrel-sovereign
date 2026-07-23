@@ -47,7 +47,13 @@ from kestrel_sovereign.signals.prompt_overrides import (
     SignalWithPromptTemplateOverride,
     SourceRegistrationWithPromptOverride,
 )
-from kestrel_sovereign.signals.registry import RegistrationError, SourceRegistry
+from kestrel_sovereign.signals.registry import (
+    RegistrationError,
+    RegistrationOutcome,
+    RegistrationPolicy,
+    RegistrationState,
+    SourceRegistry,
+)
 from kestrel_sovereign.signals.store import SignalLogStore
 
 __all__ = [
@@ -76,6 +82,9 @@ __all__ = [
     "DispatcherAgent",
     "OrderedLockManager",
     "RegistrationError",
+    "RegistrationOutcome",
+    "RegistrationPolicy",
+    "RegistrationState",
     "SignalDispatcher",
     "SignalLogStore",
     "SourceRegistry",

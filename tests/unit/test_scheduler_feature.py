@@ -53,6 +53,32 @@ def _make_mock_agent(db=None):
     return agent
 
 
+class _StubJobFeature:
+    """Minimal feature stand-in for the disabled-feature scheduler tests.
+
+    Exposes one tool named ``job``, a REAL boolean ``enabled`` flag (a
+    MagicMock's ``.enabled`` is a truthy Mock, which would mask the gate), and
+    an execution counter so a skipped tick is observable.
+    """
+
+    def __init__(self):
+        self.name = "JobFeature"
+        self.enabled = True
+        self.calls = 0
+
+        def _execute(**kwargs):
+            self.calls += 1
+            return {"success": True, "ran": self.calls}
+
+        tool = MagicMock()
+        tool.name = "job"
+        tool.execute = AsyncMock(side_effect=_execute)
+        self._tool = tool
+
+    def get_tools(self):
+        return [self._tool]
+
+
 # =========================================================================
 # Fixtures
 # =========================================================================
@@ -495,6 +521,32 @@ class TestScheduleAdd:
             task_name="wellness_check",
         )
         assert result.status is ToolResultStatus.OK
+
+    @pytest.mark.asyncio
+    async def test_add_rejects_disabled_feature_tool(self, feature):
+        """#2522: a soft-disabled feature's tool is not executable, so it is
+        not schedulable — ``schedule_add`` rejects it as an unknown task (a
+        persisted row would otherwise be skipped every tick). Re-enabling the
+        feature makes the same name schedulable again."""
+        job_feature = _StubJobFeature()
+        job_feature.enabled = False
+        feature.agent.features = {"JobFeature": job_feature}
+
+        result = await feature.schedule_add(
+            cron_expression="@daily", task_name="job",
+        )
+        assert result.status is ToolResultStatus.ERROR
+        assert "unknown scheduled task" in result.error.lower()
+        assert "job" not in set(result.data["valid_task_names"])
+        feature._db.execute.assert_not_called()
+
+        # Re-enable → the same tool name is now a valid scheduled task.
+        job_feature.enabled = True
+        result = await feature.schedule_add(
+            cron_expression="@daily", task_name="job",
+        )
+        assert result.status is ToolResultStatus.OK
+        assert result.data["task_name"] == "job"
 
     @pytest.mark.asyncio
     async def test_add_rejects_deny_listed_tool(self, feature):
@@ -1054,6 +1106,105 @@ class TestSchedulerRunner:
         # next_run_at should be set (not None)
         assert update_params[1] is not None  # next_run_at
 
+    @pytest.mark.asyncio
+    async def test_persisted_schedule_skips_disabled_feature_end_to_end(
+        self, tmp_path,
+    ):
+        """E2E (#2522): a schedule persisted BEFORE its feature is disabled must
+        not invoke the tool on a tick while the feature is disabled, and must
+        resume executing it once the feature is re-enabled.
+
+        Drives the whole scheduler path — real SQLite ``scheduled_tasks`` row →
+        ``SchedulerRunner._tick`` → ``_dispatch_scheduled_task`` →
+        ``_lookup_and_run_tool`` → the feature tool — with only the enablement
+        state changing between ticks.
+        """
+        raw_db = SQLiteBackend(str(tmp_path / "scheduler.db"))
+        await raw_db.connect()
+        db = AsyncDatabase(raw_db)
+
+        agent = _make_mock_agent(db)
+        agent.did = "did:test:scheduler-agent"
+        # Force the direct tool-execution path (no dispatcher) so the tick runs
+        # exactly the production `_lookup_and_run_tool` body under test.
+        agent.dispatcher = None
+        job_feature = _StubJobFeature()
+        agent.features = {"JobFeature": job_feature}
+        agent.hooks_manager = TestTaskExecutor._passthrough_hooks_manager()
+
+        sched = SchedulerFeature(agent)
+        sched._db = db
+        sched._agent_id = agent.did
+
+        runner = SchedulerRunner(db, agent.did, sched._dispatch_scheduled_task)
+
+        async def _make_due():
+            """Reset the persisted task so the next tick considers it due."""
+            due_at = (
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ).isoformat()
+            await db.execute(
+                "UPDATE scheduled_tasks SET next_run_at = ? WHERE id = ?",
+                (due_at, "job-task"),
+            )
+
+        async def _latest_log_status():
+            row = await db.fetchone(
+                "SELECT status, result_text FROM task_execution_log "
+                "WHERE task_id = ? ORDER BY rowid DESC LIMIT 1",
+                ("job-task",),
+            )
+            return row
+
+        try:
+            await runner._ensure_tables()
+            due_at = (
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ).isoformat()
+            await db.execute(
+                """
+                INSERT INTO scheduled_tasks
+                    (id, agent_id, task_name, cron_expression, args_json,
+                     enabled, next_run_at, created_at)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                """,
+                (
+                    "job-task", agent.did, "job", "* * * * *", "{}",
+                    due_at, due_at,
+                ),
+            )
+
+            # --- Phase 1: feature enabled → the tool executes on the tick.
+            await runner._tick()
+            assert job_feature.calls == 1
+            status, _text = await _latest_log_status()
+            assert status == "success"
+
+            # --- Phase 2: soft-disable, tick again → the tool is NOT invoked.
+            job_feature.enabled = False
+            await _make_due()
+            await runner._tick()
+            assert job_feature.calls == 1  # never ran while disabled
+            status, text = await _latest_log_status()
+            # Benign skip recorded as success, NOT a failure — no per-tick spam.
+            assert status == "success"
+            assert "disabled" in text
+            # The schedule itself stays enabled (a disable must not pause it).
+            row = await db.fetchone(
+                "SELECT enabled FROM scheduled_tasks WHERE id = ?", ("job-task",),
+            )
+            assert row[0] == 1
+
+            # --- Phase 3: re-enable, tick again → execution is restored.
+            job_feature.enabled = True
+            await _make_due()
+            await runner._tick()
+            assert job_feature.calls == 2
+            status, _text = await _latest_log_status()
+            assert status == "success"
+        finally:
+            await db.close()
+
 
 # =========================================================================
 # ScheduledTask dataclass
@@ -1225,6 +1376,55 @@ class TestTaskExecutor:
         result = await feature._lookup_and_run_tool("restart_coordinator", {})
         assert result.startswith("skipped:")
         assert "restart_coordinator" in result
+
+    @pytest.mark.asyncio
+    async def test_disabled_feature_tool_is_not_executed(self, feature):
+        """#2522: a soft-disabled feature stays in ``agent.features`` with
+        ``enabled=False`` but its tools are detached from every other surface.
+        A persisted schedule that names one of its tools must NOT execute on a
+        tick — the scheduler skips it benignly (no failure spam) — and
+        re-enabling the feature restores execution."""
+        job_feature = _StubJobFeature()
+        feature.agent.features = {"JobFeature": job_feature}
+        feature.agent.hooks_manager = self._passthrough_hooks_manager()
+
+        # Enabled → the tool runs.
+        result = await feature._lookup_and_run_tool("job", {})
+        assert job_feature.calls == 1
+        assert json.loads(result)["success"] is True
+
+        # Soft-disabled → the SAME tool is skipped, not executed, not raised.
+        job_feature.enabled = False
+        result = await feature._lookup_and_run_tool("job", {})
+        assert job_feature.calls == 1  # unchanged — never ran
+        assert result.startswith("skipped:")
+        assert "JobFeature" in result and "disabled" in result
+
+        # Re-enabled → execution is restored on the next tick.
+        job_feature.enabled = True
+        result = await feature._lookup_and_run_tool("job", {})
+        assert job_feature.calls == 2
+        assert json.loads(result)["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_enabled_owner_wins_over_disabled_same_name(self, feature):
+        """If both a disabled and an enabled feature expose the same tool name,
+        the enabled owner executes (the disabled scan runs only as a fallback)."""
+        disabled = _StubJobFeature()
+        disabled.name = "OldJobFeature"
+        disabled.enabled = False
+        enabled = _StubJobFeature()
+        enabled.name = "NewJobFeature"
+        feature.agent.features = {
+            "OldJobFeature": disabled,
+            "NewJobFeature": enabled,
+        }
+        feature.agent.hooks_manager = self._passthrough_hooks_manager()
+
+        result = await feature._lookup_and_run_tool("job", {})
+        assert enabled.calls == 1
+        assert disabled.calls == 0
+        assert json.loads(result)["success"] is True
 
 
 class TestTranslateSignalResult:
