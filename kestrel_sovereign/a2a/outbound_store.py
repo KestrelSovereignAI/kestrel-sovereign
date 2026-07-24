@@ -52,6 +52,7 @@ class OutboundTask:
     agent_id: str
     task_id: str
     recipient: str
+    recipient_agent_id: Optional[str]
     verb: str
     session_id: str
     skill_id: Optional[str]
@@ -89,6 +90,7 @@ async def ensure_a2a_outbound_tasks_table(db) -> None:
             agent_id TEXT NOT NULL,
             task_id TEXT NOT NULL,
             recipient TEXT NOT NULL,
+            recipient_agent_id TEXT,
             verb TEXT NOT NULL,
             session_id TEXT NOT NULL,
             skill_id TEXT,
@@ -100,6 +102,13 @@ async def ensure_a2a_outbound_tasks_table(db) -> None:
             error TEXT
         )
         """
+    )
+    # The outbound table is feature-owned, so it is created independently of
+    # AsyncDatabase's core schema.  Existing agent databases predate stable
+    # recipient identity; migrate them in the same backend-aware path used by
+    # core schema migrations.  NULL remains the explicit legacy marker.
+    await db._migrate_add_column(
+        "a2a_outbound_tasks", "recipient_agent_id", "TEXT DEFAULT NULL",
     )
     # Per-agent recency listing — the introspection surface, and the
     # multi-agent shared-backend safety guard (codex review #1576
@@ -153,6 +162,7 @@ async def record_outbound_dispatch(
     verb: str,
     session_id: str,
     dispatch_tool: str,
+    recipient_agent_id: Optional[str] = None,
     skill_id: Optional[str] = None,
     message: Optional[str] = None,
     error: Optional[str] = None,
@@ -176,14 +186,14 @@ async def record_outbound_dispatch(
     await db.execute(
         """
         INSERT INTO a2a_outbound_tasks (
-            id, agent_id, task_id, recipient, verb, session_id,
+            id, agent_id, task_id, recipient, recipient_agent_id, verb, session_id,
             skill_id, dispatch_tool, message_summary, created_at,
             terminal_state, terminal_at, error
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            row_id, agent_id, task_id, recipient, verb, session_id,
+            row_id, agent_id, task_id, recipient, recipient_agent_id, verb, session_id,
             skill_id, dispatch_tool, _summarize_message(message), now,
             terminal_state, terminal_at, error,
         ),
@@ -193,6 +203,7 @@ async def record_outbound_dispatch(
         agent_id=agent_id,
         task_id=task_id,
         recipient=recipient,
+        recipient_agent_id=recipient_agent_id,
         verb=verb,
         session_id=session_id,
         skill_id=skill_id,
@@ -242,6 +253,37 @@ async def update_outbound_terminal_state(
     return int(getattr(affected, "rowcount", 0) or 0)
 
 
+async def get_outbound_task(
+    db,
+    *,
+    agent_id: str,
+    task_id: str,
+) -> Optional[OutboundTask]:
+    """Return one sender-owned outbound task for retained-route recovery.
+
+    A task id can be supplied to a result fetch long after the display name
+    used at dispatch has changed.  The stored stable identity is intentionally
+    internal: callers receive the historical display recipient through the
+    normal public task view, while routing uses this field only after the
+    router reauthorizes it in the current requester scope.
+    """
+    rows = await db.fetchall(
+        """
+        SELECT id, agent_id, task_id, recipient, recipient_agent_id,
+               verb, session_id, skill_id, dispatch_tool, message_summary,
+               created_at, terminal_state, terminal_at, error
+        FROM a2a_outbound_tasks
+        WHERE agent_id = ? AND task_id = ?
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (agent_id, task_id),
+    )
+    if not rows:
+        return None
+    return _outbound_task_from_row(rows[0])
+
+
 async def list_outbound_tasks(
     db,
     *,
@@ -273,9 +315,9 @@ async def list_outbound_tasks(
     args.append(capped)
     rows = await db.fetchall(
         f"""
-        SELECT id, agent_id, task_id, recipient, verb, session_id,
-               skill_id, dispatch_tool, message_summary, created_at,
-               terminal_state, terminal_at, error
+        SELECT id, agent_id, task_id, recipient, recipient_agent_id,
+               verb, session_id, skill_id, dispatch_tool, message_summary,
+               created_at, terminal_state, terminal_at, error
         FROM a2a_outbound_tasks
         {where}
         ORDER BY created_at DESC
@@ -283,13 +325,15 @@ async def list_outbound_tasks(
         """,
         tuple(args),
     )
-    return [
-        OutboundTask(
-            id=r[0], agent_id=r[1], task_id=r[2], recipient=r[3],
-            verb=r[4], session_id=r[5], skill_id=r[6],
-            dispatch_tool=r[7], message_summary=r[8],
-            created_at=r[9], terminal_state=r[10], terminal_at=r[11],
-            error=r[12],
-        )
-        for r in rows
-    ]
+    return [_outbound_task_from_row(row) for row in rows]
+
+
+def _outbound_task_from_row(row) -> OutboundTask:
+    """Map the canonical outbound-task SELECT order to its value object."""
+    return OutboundTask(
+        id=row[0], agent_id=row[1], task_id=row[2], recipient=row[3],
+        recipient_agent_id=row[4], verb=row[5], session_id=row[6],
+        skill_id=row[7], dispatch_tool=row[8], message_summary=row[9],
+        created_at=row[10], terminal_state=row[11], terminal_at=row[12],
+        error=row[13],
+    )

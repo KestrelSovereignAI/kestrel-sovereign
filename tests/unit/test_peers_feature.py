@@ -44,7 +44,12 @@ async def test_list_peers_filters_out_self():
 
     assert result.status is ToolResultStatus.OK
     assert result.data["self"] == "emma"
-    assert result.data["peers"] == [{"name": "claw", "status": "online", "description": "peer"}]
+    assert result.data["peers"] == [{
+        "name": "claw",
+        "slug": "claw",
+        "status": "online",
+        "description": "peer",
+    }]
 
 
 @pytest.mark.asyncio

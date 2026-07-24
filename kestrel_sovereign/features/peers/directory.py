@@ -130,6 +130,18 @@ class PeerDirectoryRouter(Protocol):
     ) -> Optional[PeerIdentity]:
         """Resolve an automatic-directory name/slug, or return ``None``."""
 
+    async def resolve_peer_by_agent_id(
+        self, requester: PeerRequester, agent_id: str,
+    ) -> Optional[PeerIdentity]:
+        """Reauthorize one persisted automatic peer by its stable identity.
+
+        This method is intentionally for feature-owned retained state only
+        (outbound-task and pending-question records), never a public tool
+        input.  It lets a router recover a peer after its display name or slug
+        changes while still applying the requester's *current* authorization
+        scope before returning a current routing key.
+        """
+
     async def invoke(
         self, requester: PeerRequester, peer: PeerIdentity, message: str,
     ) -> Mapping[str, Any]:
@@ -315,6 +327,25 @@ class LocalHostPeerDirectory:
             peer for peer in peers if peer.name.casefold() == needle
         ]
         # An ambiguous display name must not select an arbitrary peer.
+        return matches[0] if len(matches) == 1 else None
+
+    async def resolve_peer_by_agent_id(
+        self, requester: PeerRequester, agent_id: str,
+    ) -> Optional[PeerIdentity]:
+        """Resolve persisted identity through the current local directory.
+
+        The caller supplies this value only from feature-owned durable state;
+        this adapter still reloads the directory so an access revocation,
+        deletion, or routing-key change takes effect before any URL is built.
+        """
+        if not isinstance(agent_id, str) or not agent_id.strip():
+            return None
+        matches = [
+            peer
+            for peer in await self._directory_entries(requester)
+            if peer.agent_id == agent_id
+        ]
+        # A stable identity must remain unique within a scoped directory.
         return matches[0] if len(matches) == 1 else None
 
     async def _authorize_peer(

@@ -31,6 +31,7 @@ async def test_insert_and_get(tmp_path):
     await store.insert(
         task_id="task-001",
         recipient="Meridian",
+        recipient_agent_id="did:test:meridian",
         original_question="What is 2+2?",
         origin_turn_id="turn-xyz",
         origin_session_id="sess-abc",
@@ -40,11 +41,14 @@ async def test_insert_and_get(tmp_path):
     assert row is not None
     assert row.task_id == "task-001"
     assert row.recipient == "Meridian"
+    assert row.recipient_agent_id == "did:test:meridian"
     assert row.original_question == "What is 2+2?"
     assert row.origin_turn_id == "turn-xyz"
     assert row.origin_session_id == "sess-abc"
     assert row.status == "WAITING"
     assert row.resolved_at is None
+    waiting = await store.list_waiting()
+    assert waiting[0].recipient_agent_id == "did:test:meridian"
 
 
 @pytest.mark.asyncio
@@ -261,6 +265,7 @@ async def test_mark_resolved_is_durable_across_reopen(tmp_path):
     store1 = PendingA2AQuestionStore(db1, agent_id="did:test:durable")
     await store1.insert(
         task_id="t-durable", recipient="Meridian",
+        recipient_agent_id="did:test:meridian",
         original_question="q", origin_turn_id=None, origin_session_id=None,
         deadline=datetime.now(timezone.utc) + timedelta(minutes=10),
     )
@@ -282,6 +287,7 @@ async def test_mark_resolved_is_durable_across_reopen(tmp_path):
         "double-fire the resumption signal (codex round 4 P2)."
     )
     assert row.resolved_at is not None
+    assert row.recipient_agent_id == "did:test:meridian"
     await db2.close()
 
 
@@ -367,15 +373,15 @@ async def test_insert_and_sweep_bind_datetime_not_string(tmp_path):
     assert insert_calls, "Insert path was not exercised."
     assert sweep_calls, "Sweep path was not exercised."
 
-    # Insert binds positional (agent_id, task_id, recipient, msg, turn,
-    # session, deadline). Deadline is the 7th element.
+    # Insert binds positional (agent_id, task_id, recipient, stable identity,
+    # msg, turn, session, deadline). Deadline is the 8th element.
     insert_params = insert_calls[0]
-    assert isinstance(insert_params[6], datetime), (
+    assert isinstance(insert_params[7], datetime), (
         f"Insert must bind a datetime to the TIMESTAMP column, not a "
-        f"string. Got {type(insert_params[6]).__name__}={insert_params[6]!r}. "
+        f"string. Got {type(insert_params[7]).__name__}={insert_params[7]!r}. "
         f"Postgres rejects strings here (codex round 6 P2)."
     )
-    assert insert_params[6].tzinfo is None, (
+    assert insert_params[7].tzinfo is None, (
         "Bind must be a NAIVE datetime — Postgres TIMESTAMP (without "
         "tz) rejects tz-aware values."
     )

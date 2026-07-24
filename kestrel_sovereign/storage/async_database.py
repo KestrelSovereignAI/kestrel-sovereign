@@ -561,6 +561,7 @@ CREATE TABLE IF NOT EXISTS pending_a2a_questions (
     agent_id TEXT NOT NULL DEFAULT '',
     task_id TEXT NOT NULL,
     recipient TEXT NOT NULL,
+    recipient_agent_id TEXT,
     original_question TEXT NOT NULL,
     origin_turn_id TEXT,
     origin_session_id TEXT,
@@ -843,6 +844,13 @@ class AsyncDatabase:
         )
         await self._migrate_add_column(
             "pending_a2a_questions", "retry_reply_text", "TEXT DEFAULT NULL"
+        )
+        # Retained A2A-question state must keep the scoped peer's stable
+        # identity, not only the display name/slug supplied when it was sent.
+        # Restart replay reauthorizes this identity before subscribing so a
+        # later name reassignment cannot retarget an in-flight question.
+        await self._migrate_add_column(
+            "pending_a2a_questions", "recipient_agent_id", "TEXT DEFAULT NULL"
         )
         # Decay-aware forgetting (#1674): memory_episodes need a decay signal
         # before they can be deleted by importance rather than raw age. Stamp

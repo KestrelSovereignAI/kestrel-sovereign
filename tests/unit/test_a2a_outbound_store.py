@@ -28,6 +28,7 @@ from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.a2a.outbound_store import (
     OutboundTask,
     ensure_a2a_outbound_tasks_table,
+    get_outbound_task,
     list_outbound_tasks,
     record_outbound_dispatch,
     update_outbound_terminal_state,
@@ -140,6 +141,7 @@ async def test_record_outbound_dispatch_returns_full_row(tmp_path):
         agent_id='emma',
         task_id="abc123",
         recipient="claw",
+        recipient_agent_id="did:test:claw",
         verb="task",
         session_id="s1",
         dispatch_tool="send_a2a_task",
@@ -149,12 +151,18 @@ async def test_record_outbound_dispatch_returns_full_row(tmp_path):
     assert isinstance(row, OutboundTask)
     assert row.task_id == "abc123"
     assert row.recipient == "claw"
+    assert row.recipient_agent_id == "did:test:claw"
     assert row.verb == "task"
     assert row.dispatch_tool == "send_a2a_task"
     assert row.skill_id == "soul_alignment"
     assert row.message_summary == "please align SOUL.md"
     assert row.terminal_state is None
     assert row.error is None
+    retained = await get_outbound_task(
+        db, agent_id="emma", task_id="abc123",
+    )
+    assert retained is not None
+    assert retained.recipient_agent_id == "did:test:claw"
 
 
 @pytest.mark.asyncio

@@ -34,6 +34,9 @@ class ScopedRouter:
     fetched_from: list[str] = field(default_factory=list)
     subscription_attempts: list[str] = field(default_factory=list)
     subscribed_to: list[str] = field(default_factory=list)
+    resolve_calls: list[str] = field(default_factory=list)
+    resolve_by_agent_id_calls: list[str] = field(default_factory=list)
+    scope_a_entries: Optional[dict[str, PeerIdentity]] = None
     deny_subscription: bool = False
     unexpected_resolution_failure: bool = False
     malformed_listing: bool = False
@@ -41,6 +44,8 @@ class ScopedRouter:
 
     def _directory(self, requester: PeerRequester) -> dict[str, PeerIdentity]:
         if requester.authorization_scope is self.scope_a:
+            if self.scope_a_entries is not None:
+                return self.scope_a_entries
             return {
                 "companion": PeerIdentity(
                     agent_id="did:tenant-a:companion",
@@ -74,9 +79,20 @@ class ScopedRouter:
     async def resolve_peer(
         self, requester: PeerRequester, peer_name_or_slug: str,
     ) -> Optional[PeerIdentity]:
+        self.resolve_calls.append(peer_name_or_slug)
         if self.unexpected_resolution_failure:
             raise RuntimeError("tenant-b connection diagnostic")
         return self._directory(requester).get(peer_name_or_slug.casefold())
+
+    async def resolve_peer_by_agent_id(
+        self, requester: PeerRequester, agent_id: str,
+    ) -> Optional[PeerIdentity]:
+        self.resolve_by_agent_id_calls.append(agent_id)
+        matches = [
+            peer for peer in self._directory(requester).values()
+            if peer.agent_id == agent_id
+        ]
+        return matches[0] if len(matches) == 1 else None
 
     async def invoke(
         self, requester: PeerRequester, peer: PeerIdentity, message: str,
@@ -154,18 +170,23 @@ def _feature_for_scope(router: ScopedRouter, scope: object) -> PeersFeature:
 
 
 @pytest.mark.asyncio
-async def test_hosted_router_requires_host_injected_requester_identity_and_scope():
+@pytest.mark.parametrize("inject_router", [True, False])
+async def test_hosted_router_and_requester_must_be_injected_as_a_pair(inject_router):
     scope_a, scope_b = object(), object()
     router = ScopedRouter(scope_a, scope_b)
     feature = PeersFeature(SimpleNamespace(
         _agent_name="caller",
         did="did:tenant-a:caller",
-        peer_directory_router=router,
-        peer_requester=None,
+        peer_directory_router=router if inject_router else None,
+        peer_requester=None if inject_router else PeerRequester(
+            identity="did:tenant-a:caller", authorization_scope=scope_a,
+        ),
     ))
 
     with pytest.raises(PeerDirectoryConfigurationError):
         await feature.initialize()
+    with pytest.raises(PeerDirectoryConfigurationError):
+        feature._peer_directory_context()
 
 
 @pytest.mark.asyncio
@@ -178,7 +199,12 @@ async def test_duplicate_peer_names_resolve_to_the_callers_scoped_stable_identit
     peers = await feature.list_peers()
     assert peers.status is ToolResultStatus.OK
     assert peers.data["peers"] == [
-        {"name": "Companion", "status": "online", "description": ""},
+        {
+            "name": "Companion",
+            "slug": "companion",
+            "status": "online",
+            "description": "",
+        },
     ]
 
     invoked = await feature.ask_agent("companion", "tenant-a question")
@@ -202,6 +228,61 @@ async def test_duplicate_peer_names_resolve_to_the_callers_scoped_stable_identit
 
 
 @pytest.mark.asyncio
+async def test_peer_listing_preserves_slug_and_uses_it_when_name_is_empty():
+    scope_a, scope_b = object(), object()
+    router = ScopedRouter(scope_a, scope_b)
+    router.scope_a_entries = {
+        "slug-only": PeerIdentity(
+            agent_id="did:tenant-a:slug-only",
+            slug="slug-only",
+            routing_key="a-slug-only",
+            name="",
+            status="online",
+        ),
+        "duplicate-one": PeerIdentity(
+            agent_id="did:tenant-a:duplicate-one",
+            slug="duplicate-one",
+            routing_key="a-duplicate-one",
+            name="Duplicate",
+            status="online",
+        ),
+        "duplicate-two": PeerIdentity(
+            agent_id="did:tenant-a:duplicate-two",
+            slug="duplicate-two",
+            routing_key="a-duplicate-two",
+            name="Duplicate",
+            status="online",
+        ),
+    }
+    feature = _feature_for_scope(router, scope_a)
+    await feature.initialize()
+
+    result = await feature.list_peers()
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["peers"] == [
+        {
+            "name": "slug-only",
+            "slug": "slug-only",
+            "status": "online",
+            "description": "",
+        },
+        {
+            "name": "Duplicate",
+            "slug": "duplicate-one",
+            "status": "online",
+            "description": "",
+        },
+        {
+            "name": "Duplicate",
+            "slug": "duplicate-two",
+            "status": "online",
+            "description": "",
+        },
+    ]
+
+
+@pytest.mark.asyncio
 async def test_cross_scope_name_and_did_probes_are_indistinguishable_and_unrouted():
     scope_a, scope_b = object(), object()
     router = ScopedRouter(scope_a, scope_b)
@@ -209,6 +290,7 @@ async def test_cross_scope_name_and_did_probes_are_indistinguishable_and_unroute
     await feature.initialize()
 
     by_name = await feature.ask_agent("other-tenant-private-name", "probe")
+    resolves_before_did_probes = list(router.resolve_calls)
     by_did = await feature.ask_agent("did:tenant-b:companion", "probe")
     result = await feature.get_peer_task_result("did:tenant-b:companion", "t-b")
 
@@ -217,6 +299,7 @@ async def test_cross_scope_name_and_did_probes_are_indistinguishable_and_unroute
     assert result.status is ToolResultStatus.ERROR
     assert by_name.error == by_did.error == "Peer is not available in the automatic directory"
     assert result.error == "Peer is not available in the automatic directory"
+    assert router.resolve_calls == resolves_before_did_probes
     assert router.sent_to == []
     assert router.fetched_from == []
 
@@ -294,6 +377,73 @@ async def test_subscription_reauthorizes_after_resolution_and_hides_revocation_d
     signal = feature.agent.dispatcher.enqueue_signal.await_args.args[0]
     assert signal.payload["state"] == "failed"
     assert signal.payload["reply_text"] == "Peer task subscription is no longer authorized."
+
+
+@pytest.mark.asyncio
+async def test_retained_question_identity_survives_name_reassignment():
+    """A replay/subscription must not re-resolve an old name onto a new peer."""
+    scope_a, scope_b = object(), object()
+    router = ScopedRouter(scope_a, scope_b)
+    original = PeerIdentity(
+        agent_id="did:tenant-a:original",
+        slug="companion",
+        routing_key="a-original-v1",
+        name="Companion",
+    )
+    router.scope_a_entries = {"companion": original}
+    feature = _feature_for_scope(router, scope_a)
+    await feature.initialize()
+
+    submitted = await feature.send_a2a_question("companion", "status?")
+    assert submitted.status is ToolResultStatus.OK
+    insert_args = feature.agent.pending_a2a_questions.insert.await_args.kwargs
+    assert insert_args["recipient_agent_id"] == original.agent_id
+
+    # The old display name now belongs to a replacement; the original peer was
+    # renamed but remains authorized in this scope under its stable identity.
+    replacement = PeerIdentity(
+        agent_id="did:tenant-a:replacement",
+        slug="companion",
+        routing_key="a-replacement",
+        name="Companion",
+    )
+    renamed_original = PeerIdentity(
+        agent_id=original.agent_id,
+        slug="original-renamed",
+        routing_key="a-original-v2",
+        name="Original renamed",
+    )
+    router.scope_a_entries = {
+        "companion": replacement,
+        "original-renamed": renamed_original,
+    }
+
+    # Result retrieval obtains the same persisted identity from outbound state;
+    # the caller's historical display name must not select the replacement.
+    feature._outbound_recipient_agent_id = AsyncMock(  # type: ignore[method-assign]
+        return_value=original.agent_id,
+    )
+    fetched = await feature.get_peer_task_result(
+        "companion", submitted.data["task_id"],
+    )
+    assert fetched.status is ToolResultStatus.OK
+    assert router.fetched_from == [original.agent_id]
+
+    await feature._supervise_a2a_question(
+        task_id=submitted.data["task_id"],
+        recipient="companion",
+        recipient_agent_id=insert_args["recipient_agent_id"],
+        original_question="status?",
+        sess_id=submitted.data["session_id"],
+        deadline_utc=datetime.now(timezone.utc) + timedelta(seconds=5),
+        causation_chain=None,
+    )
+
+    assert router.resolve_by_agent_id_calls == [
+        original.agent_id, original.agent_id,
+    ]
+    assert router.subscribed_to == [original.agent_id]
+    assert replacement.agent_id not in router.subscribed_to
 
 
 @pytest.mark.asyncio

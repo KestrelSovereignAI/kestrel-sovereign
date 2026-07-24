@@ -280,6 +280,11 @@ class PeersFeature(Feature):
         # backwards-compatible default.
         self._peer_router = getattr(self.agent, "peer_directory_router", None)
         self._peer_requester = getattr(self.agent, "peer_requester", None)
+        if (self._peer_router is None) != (self._peer_requester is None):
+            raise PeerDirectoryConfigurationError(
+                "Injected peer router and trusted requester identity must "
+                "be supplied together"
+            )
         if self._peer_router is not None:
             if not isinstance(self._peer_requester, PeerRequester):
                 raise PeerDirectoryConfigurationError(
@@ -372,6 +377,11 @@ class PeersFeature(Feature):
         """
         router = getattr(self, "_peer_router", None)
         requester = getattr(self, "_peer_requester", None)
+        if (router is None) != (requester is None):
+            raise PeerDirectoryConfigurationError(
+                "Injected peer router and trusted requester identity must "
+                "be supplied together"
+            )
         if router is not None:
             if not isinstance(requester, PeerRequester):
                 raise PeerDirectoryConfigurationError(
@@ -393,6 +403,16 @@ class PeersFeature(Feature):
         provider, never the caller-provided name.  This is the critical guard
         against cross-scope DID/name probing and recipient substitution.
         """
+        # Automatic peers are deliberately addressed only by their directory
+        # name or slug.  A DID is a stable identity returned *by* a directory,
+        # not an alternate automatic address.  Reject it before calling a
+        # provider so an overly-permissive implementation cannot turn the
+        # automatic shortcut into a cross-scope identity probe.
+        if (
+            not isinstance(recipient, str)
+            or recipient.strip().casefold().startswith("did:")
+        ):
+            raise PeerNotFoundError("Peer is not in the automatic directory")
         context = self._peer_directory_context()
         if context is None:
             raise PeerDirectoryConfigurationError(
@@ -415,6 +435,83 @@ class PeersFeature(Feature):
         if peer.agent_id == requester.identity:
             raise PeerSelfTargetError("Cannot route to the requesting agent")
         return router, requester, peer
+
+    async def _resolve_retained_automatic_peer(
+        self,
+        recipient: str,
+        recipient_agent_id: Optional[str],
+    ) -> Tuple[PeerDirectoryRouter, PeerRequester, PeerIdentity]:
+        """Resolve a persisted peer identity under the current scope.
+
+        ``recipient_agent_id`` is written only after a successful automatic
+        directory resolution.  Retained question/outbound-task state therefore
+        survives display-name or slug changes without promoting a DID to a
+        caller-addressable automatic-peer input.  The router must reauthorize
+        the stable identity and return a current route before it is used.
+
+        Legacy records predate the stable-id column and contain ``None``; they
+        retain the historical name/slug resolution behavior until they settle.
+        """
+        if not recipient_agent_id:
+            return await self._resolve_automatic_peer(recipient)
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
+            raise PeerProtocolError("Persisted peer identity is invalid")
+
+        context = self._peer_directory_context()
+        if context is None:
+            raise PeerDirectoryConfigurationError(
+                "Not running in a multi_agent environment — no peer router"
+            )
+        router, requester = context
+        try:
+            peer = await router.resolve_peer_by_agent_id(
+                requester, recipient_agent_id,
+            )
+        except PeerDirectoryError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - provider extension boundary
+            logger.exception("Peer router stable-identity resolution raised unexpectedly")
+            raise PeerTransportError("Peer directory resolution failed") from exc
+        if peer is None:
+            raise PeerNotFoundError("Peer is not in the automatic directory")
+        if not isinstance(peer, PeerIdentity):
+            raise PeerProtocolError(
+                "Peer directory returned an invalid peer identity"
+            )
+        if peer.agent_id != recipient_agent_id:
+            raise PeerProtocolError(
+                "Peer directory returned a different stable peer identity"
+            )
+        if peer.agent_id == requester.identity:
+            raise PeerSelfTargetError("Cannot route to the requesting agent")
+        return router, requester, peer
+
+    async def _outbound_recipient_agent_id(self, task_id: str) -> Optional[str]:
+        """Read the stable recipient retained for one sender-owned task.
+
+        The outbound audit is optional for early-init/legacy agents, so an
+        unavailable record is represented as ``None`` and uses the historical
+        name/slug route.  A present stable id is always preferred over the
+        caller-provided display recipient.
+        """
+        db = getattr(self, "_db", None)
+        if db is None:
+            return None
+        try:
+            from kestrel_sovereign.a2a.outbound_store import get_outbound_task
+
+            outbound = await get_outbound_task(
+                db,
+                agent_id=str(getattr(self.agent, "did", None) or self._own_name),
+                task_id=task_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort legacy audit read
+            logger.debug(
+                "outbound_store: retained recipient lookup failed for %s: %s",
+                task_id, exc,
+            )
+            return None
+        return outbound.recipient_agent_id if outbound is not None else None
 
     def _maybe_sign_outbound(
         self,
@@ -555,7 +652,8 @@ class PeersFeature(Feature):
                 continue
             if peer.agent_id != requester.identity:
                 peers.append({
-                    "name": peer.name,
+                    "name": peer.name or peer.slug,
+                    "slug": peer.slug,
                     "status": peer.status,
                     "description": peer.description,
                 })
@@ -688,19 +786,21 @@ class PeersFeature(Feature):
     ) -> Tuple[
         Optional[Dict[str, Any]],
         Optional[list],
+        Optional[str],
         Optional[ToolResult],
     ]:
         """Shared POST helper for all three a2a verbs.
 
-        Returns ``(task_data, chain, error_result)``. On success
+        Returns ``(task_data, chain, recipient_agent_id, error_result)``. On success
         ``task_data`` is the Task envelope from the recipient (with
         ``id``, ``status``, etc.) and ``chain`` is the serialized
         causation chain we attached to outbound metadata (or None when
-        no chain was active); on failure ``error_result`` is a
-        populated ToolResult.failed envelope the caller returns
-        directly. The chain is returned so question-supervisor wiring
-        can rehydrate it into the resumption signal without a second
-        ContextVar read after the spawn (#1444).
+        no chain was active). ``recipient_agent_id`` is the scoped stable
+        identity to persist with any durable follow-up state; on failure
+        ``error_result`` is a populated ToolResult.failed envelope the caller
+        returns directly. The chain is returned so question-supervisor wiring
+        can rehydrate it into the resumption signal without a second ContextVar
+        read after the spawn (#1444).
 
         Centralizing this means the three verbs (send_a2a_message,
         send_a2a_question, send_a2a_task) share identical wire
@@ -712,7 +812,7 @@ class PeersFeature(Feature):
         from uuid import uuid4
 
         if recipient.casefold() == self._own_name.casefold():
-            return None, None, ToolResult.failed(
+            return None, None, None, ToolResult.failed(
                 "Cannot send an A2A task to yourself",
                 data={"sent": False, "recipient": recipient},
             )
@@ -730,6 +830,7 @@ class PeersFeature(Feature):
         # helper swallows audit-store errors so dispatch can't be
         # broken by a DB hiccup.
         verb = str((extra_metadata or {}).get("a2a_verb") or "task")
+        resolved_peer_agent_id: Optional[str] = None
 
         async def _persist_outbound(
             error: Optional[str] = None,
@@ -764,6 +865,7 @@ class PeersFeature(Feature):
                     agent_id=str(audit_agent),
                     task_id=audit_id,
                     recipient=recipient,
+                    recipient_agent_id=resolved_peer_agent_id,
                     verb=verb,
                     session_id=sess_id,
                     skill_id=skill_id or None,
@@ -812,7 +914,7 @@ class PeersFeature(Feature):
                 artifacts, references,
             )
         except OutboundArtifactValidationError as exc:
-            return None, None, ToolResult.failed(
+            return None, None, None, ToolResult.failed(
                 f"Invalid A2A {exc.field}: {exc}",
                 data={
                     "sent": False,
@@ -837,7 +939,7 @@ class PeersFeature(Feature):
             # Record only a stable, non-secret code, and return before an HTTP
             # client exists so retries cannot reuse an unsigned payload (#2475).
             await _persist_outbound(error=f"signing_failed:{exc.code}")
-            return None, None, ToolResult.failed(
+            return None, None, None, ToolResult.failed(
                 "A2A dispatch aborted because hybrid envelope signing failed; "
                 "no network request was sent",
                 data={
@@ -858,33 +960,38 @@ class PeersFeature(Feature):
                 recipient,
             )
         except PeerDirectoryConfigurationError:
-            return None, None, ToolResult.failed(
+            return None, None, None, ToolResult.failed(
                 "Not running in a multi_agent environment — no host to proxy through",
                 data={"sent": False, "recipient": recipient},
             )
         except PeerSelfTargetError:
-            return None, None, ToolResult.failed(
+            return None, None, None, ToolResult.failed(
                 "Cannot send an A2A task to yourself",
                 data={"sent": False, "recipient": recipient},
             )
         except PeerAccessDeniedError:
-            return None, None, ToolResult.failed(
+            return None, None, None, ToolResult.failed(
                 "Peer is not available in the automatic directory",
                 data={"sent": False, "recipient": recipient},
             )
         except PeerNotFoundError:
             # Use the same response for absent, cross-scope, and ambiguous
             # names so the automatic shortcut is not a namespace oracle.
-            return None, None, ToolResult.failed(
+            return None, None, None, ToolResult.failed(
                 "Peer is not available in the automatic directory",
                 data={"sent": False, "recipient": recipient},
             )
         except PeerDirectoryError as exc:
             logger.error("Could not resolve A2A recipient %r: %s", recipient, exc)
-            return None, None, ToolResult.failed(
+            return None, None, None, ToolResult.failed(
                 "Peer is not available in the automatic directory",
                 data={"sent": False, "recipient": recipient},
             )
+
+        # This value came from the scoped router, not from a tool argument.
+        # Persist it with every later sender-side record so display-name/slug
+        # changes cannot retarget a pending question or task-result fetch.
+        resolved_peer_agent_id = peer.agent_id
 
         try:
             routed_task = await router.send_a2a_task(requester, peer, payload)
@@ -893,33 +1000,33 @@ class PeersFeature(Feature):
             task_data = dict(routed_task)
         except (PeerNotFoundError, PeerAccessDeniedError):
             await _persist_outbound(error="peer_not_in_automatic_directory")
-            return None, None, ToolResult.failed(
+            return None, None, None, ToolResult.failed(
                 "Peer is not available in the automatic directory",
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
             )
         except PeerUnavailableError:
             await _persist_outbound(error=f"peer_unavailable:{recipient}")
-            return None, None, ToolResult.failed(
+            return None, None, None, ToolResult.failed(
                 f"Agent '{recipient}' is offline or TaskManager unavailable",
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
             )
         except PeerTransportError:
             await _persist_outbound(error=f"connect_error:{recipient}")
-            return None, None, ToolResult.failed(
+            return None, None, None, ToolResult.failed(
                 f"Could not reach agent '{recipient}'",
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
             )
         except PeerDirectoryError as exc:
             logger.error("A2A send to %r failed: %s", recipient, exc)
             await _persist_outbound(error=f"peer_router_error:{type(exc).__name__}")
-            return None, None, ToolResult.failed(
+            return None, None, None, ToolResult.failed(
                 f"Could not send A2A task to '{recipient}'",
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
             )
         except Exception as exc:  # noqa: BLE001 - provider extension boundary
             logger.exception("A2A peer router raised unexpectedly for %r", recipient)
             await _persist_outbound(error=f"peer_router_error:{type(exc).__name__}")
-            return None, None, ToolResult.failed(
+            return None, None, None, ToolResult.failed(
                 f"Could not send A2A task to '{recipient}'",
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
             )
@@ -935,7 +1042,7 @@ class PeersFeature(Feature):
         await _persist_outbound(
             effective_task_id=str(task_data.get("id") or task_id),
         )
-        return task_data, chain, None
+        return task_data, chain, resolved_peer_agent_id, None
 
     @tool(
         name="send_a2a_message",
@@ -965,7 +1072,7 @@ class PeersFeature(Feature):
         wait or track. Same wire as send_a2a_task but no skill_id is
         attached (signals "informational, not work assignment").
         """
-        task_data, _chain, err = await self._post_a2a_task(
+        task_data, _chain, _recipient_agent_id, err = await self._post_a2a_task(
             recipient=recipient, message=message,
             skill_id="", session_id=session_id,
             extra_metadata={"a2a_verb": "message"},
@@ -1072,7 +1179,7 @@ class PeersFeature(Feature):
                 descriptor; carried as structured-data artifacts in the
                 ``references`` group.
         """
-        task_data, chain, err = await self._post_a2a_task(
+        task_data, chain, recipient_agent_id, err = await self._post_a2a_task(
             recipient=recipient, message=message,
             skill_id="", session_id=session_id,
             extra_metadata={
@@ -1121,6 +1228,7 @@ class PeersFeature(Feature):
             await store.insert(
                 task_id=task_id,
                 recipient=recipient,
+                recipient_agent_id=recipient_agent_id,
                 original_question=message,
                 origin_turn_id=self._safe_get_current_turn_id(),
                 origin_session_id=sess_id,
@@ -1173,6 +1281,7 @@ class PeersFeature(Feature):
             self._supervise_a2a_question(
                 task_id=task_id,
                 recipient=recipient,
+                recipient_agent_id=recipient_agent_id,
                 original_question=message,
                 sess_id=sess_id,
                 deadline_utc=deadline_utc,
@@ -1229,9 +1338,10 @@ class PeersFeature(Feature):
             task_id: The task id returned from
                 ``send_a2a_question`` / ``send_a2a_task``.
         """
+        retained_agent_id = await self._outbound_recipient_agent_id(task_id)
         try:
-            router, requester, peer = await self._resolve_automatic_peer(
-                recipient,
+            router, requester, peer = await self._resolve_retained_automatic_peer(
+                recipient, retained_agent_id,
             )
         except PeerDirectoryConfigurationError:
             return ToolResult.failed(
@@ -1560,6 +1670,7 @@ class PeersFeature(Feature):
         sess_id: str,
         deadline_utc: Any,
         causation_chain: Optional[list],
+        recipient_agent_id: Optional[str] = None,
     ) -> None:
         """Background coroutine: SSE-subscribe → fire signal on terminal.
 
@@ -1591,8 +1702,8 @@ class PeersFeature(Feature):
             if remaining < 0.5:
                 break
             try:
-                router, requester, peer = await self._resolve_automatic_peer(
-                    recipient,
+                router, requester, peer = await self._resolve_retained_automatic_peer(
+                    recipient, recipient_agent_id,
                 )
                 # Successful authorization/resolution — reset backoff before
                 # consuming the provider's stream.  The provider is still
@@ -2194,6 +2305,7 @@ class PeersFeature(Feature):
                 self._supervise_a2a_question(
                     task_id=row.task_id,
                     recipient=row.recipient,
+                    recipient_agent_id=getattr(row, "recipient_agent_id", None),
                     original_question=row.original_question,
                     sess_id=row.origin_session_id or "",
                     deadline_utc=deadline,
@@ -2381,7 +2493,7 @@ class PeersFeature(Feature):
                 descriptor; carried as structured-data artifacts in the
                 ``references`` group.
         """
-        task_data, _chain, err = await self._post_a2a_task(
+        task_data, _chain, _recipient_agent_id, err = await self._post_a2a_task(
             recipient=recipient, message=message,
             skill_id=skill_id, session_id=session_id,
             extra_metadata={"a2a_verb": "task"},
