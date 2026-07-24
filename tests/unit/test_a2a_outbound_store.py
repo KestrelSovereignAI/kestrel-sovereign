@@ -92,6 +92,20 @@ def _mock_post_response(task_id="t1", session_id="s1", state="submitted"):
     return response
 
 
+def _mock_directory_response():
+    response = MagicMock(status_code=200)
+    response.raise_for_status.return_value = None
+    response.json.return_value = {
+        "agents": [
+            {"id": "emma", "name": "emma", "routing_name": "emma"},
+            {"id": "claw", "name": "claw", "routing_name": "claw"},
+            {"id": "nellie", "name": "nellie", "routing_name": "nellie"},
+            {"id": "meridian", "name": "meridian", "routing_name": "meridian"},
+        ],
+    }
+    return response
+
+
 def _async_client_with(post_resp=None, get_resp=None):
     client = AsyncMock()
     client.__aenter__.return_value = client
@@ -99,7 +113,9 @@ def _async_client_with(post_resp=None, get_resp=None):
     if post_resp is not None:
         client.post.return_value = post_resp
     if get_resp is not None:
-        client.get.return_value = get_resp
+        client.get.side_effect = [_mock_directory_response(), get_resp]
+    else:
+        client.get.return_value = _mock_directory_response()
     return client
 
 
@@ -307,6 +323,7 @@ async def test_dispatch_transport_failure_writes_audit_row_with_error(
     client = AsyncMock()
     client.__aenter__.return_value = client
     client.__aexit__.return_value = False
+    client.get.return_value = _mock_directory_response()
     client.post.side_effect = httpx.ConnectError("peer down")
     with patch(
         "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",

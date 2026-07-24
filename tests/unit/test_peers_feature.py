@@ -76,6 +76,7 @@ async def test_ask_agent_reports_offline_peer():
     client.__aenter__.return_value = client
     client.__aexit__.return_value = False
     client.post.return_value = response
+    client.get.return_value = _mock_directory_response()
 
     with patch("kestrel_sovereign.features.peers.feature.httpx.AsyncClient", return_value=client):
         result = await feature.ask_agent("claw", "hello")
@@ -100,12 +101,54 @@ async def test_ask_agent_returns_peer_response():
     client.__aenter__.return_value = client
     client.__aexit__.return_value = False
     client.post.return_value = response
+    client.get.return_value = _mock_directory_response()
 
     with patch("kestrel_sovereign.features.peers.feature.httpx.AsyncClient", return_value=client):
         result = await feature.ask_agent("claw", "hello")
 
     assert result.status is ToolResultStatus.OK
     assert result.data == {"agent": "claw", "response": "hi from claw"}
+
+
+@pytest.mark.asyncio
+async def test_local_host_routes_resolved_routing_name_not_display_name():
+    """The local adapter resolves the public peer name before routing it."""
+    agent = SimpleNamespace(_agent_name="emma")
+    feature = PeersFeature(agent)
+    feature._host_url = "http://multi_agent"
+    feature._api_key = ""
+    feature._own_name = "emma"
+
+    directory = MagicMock(status_code=200)
+    directory.raise_for_status.return_value = None
+    directory.json.return_value = {
+        "agents": [
+            {"id": "emma", "name": "emma", "routing_name": "emma"},
+            {
+                "id": "did:test:claw",
+                "name": "Claw Display Name",
+                "routing_name": "claw-stable-route",
+            },
+        ],
+    }
+    response = MagicMock(status_code=200)
+    response.raise_for_status.return_value = None
+    response.json.return_value = {"response": "routed"}
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.__aexit__.return_value = False
+    client.get.return_value = directory
+    client.post.return_value = response
+
+    with patch(
+        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
+        return_value=client,
+    ):
+        result = await feature.ask_agent("Claw Display Name", "hello")
+
+    assert result.status is ToolResultStatus.OK
+    assert "/api/agents/claw-stable-route/api/agent/invoke" in client.post.call_args.args[0]
+    assert "Claw%20Display%20Name" not in client.post.call_args.args[0]
 
 
 def _make_a2a_feature(name="emma"):
@@ -158,6 +201,22 @@ def _mock_post_response(task_id="t1", session_id="s1", state="submitted"):
     return response
 
 
+def _mock_directory_response():
+    """Automatic directory used before each local peer route."""
+    response = MagicMock(status_code=200)
+    response.raise_for_status.return_value = None
+    response.json.return_value = {
+        "agents": [
+            {"id": "did:test:emma", "name": "emma", "routing_name": "emma"},
+            {"id": "did:test:claw", "name": "claw", "routing_name": "claw"},
+            {"id": "did:test:meridian", "name": "meridian", "routing_name": "meridian"},
+            {"id": "did:test:nellie", "name": "nellie", "routing_name": "nellie"},
+            {"id": "did:test:talon", "name": "talon", "routing_name": "talon"},
+        ],
+    }
+    return response
+
+
 def _async_client_with(post_resp=None, get_resp=None):
     client = AsyncMock()
     client.__aenter__.return_value = client
@@ -165,7 +224,9 @@ def _async_client_with(post_resp=None, get_resp=None):
     if post_resp is not None:
         client.post.return_value = post_resp
     if get_resp is not None:
-        client.get.return_value = get_resp
+        client.get.side_effect = [_mock_directory_response(), get_resp]
+    else:
+        client.get.return_value = _mock_directory_response()
     return client
 
 

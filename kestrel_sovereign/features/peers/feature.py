@@ -24,21 +24,33 @@ corresponding ``workflow.*`` skill id.
 import json
 import logging
 import os
+from collections.abc import Sequence as SequenceABC
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import httpx
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.peers.directory import (
+    LocalHostPeerDirectory,
+    PeerAccessDeniedError,
+    PeerDirectoryConfigurationError,
+    PeerDirectoryError,
+    PeerDirectoryRouter,
+    PeerIdentity,
+    PeerNotFoundError,
+    PeerProtocolError,
+    PeerRequester,
+    PeerSelfTargetError,
+    PeerSubscriptionUnavailableError,
+    PeerTransportError,
+    PeerUnavailableError,
+    iter_sse_events,
+)
 
 logger = logging.getLogger(__name__)
-
-# Timeout for inter-agent calls (seconds)
-PEER_CONNECT_TIMEOUT = 5.0
-PEER_READ_TIMEOUT = 300.0  # Local LLM responses (e.g. Kimi K2.5) can be very slow
-
 
 def _discover_host_url() -> Optional[str]:
     """Discover the multi_agent host URL.
@@ -261,6 +273,21 @@ class PeersFeature(Feature):
         self._host_url = _discover_host_url()
         self._api_key = os.environ.get("KESTREL_API_KEY", "")
         self._own_name = self._get_own_name()
+        # A hosted runtime injects both objects at agent construction.  The
+        # requester scope is host-authenticated, opaque to this feature, and
+        # never sourced from a tool argument or user-provided metadata.  When
+        # neither is supplied, retain the local host HTTP adapter as the
+        # backwards-compatible default.
+        self._peer_router = getattr(self.agent, "peer_directory_router", None)
+        self._peer_requester = getattr(self.agent, "peer_requester", None)
+        if self._peer_router is not None:
+            if not isinstance(self._peer_requester, PeerRequester):
+                raise PeerDirectoryConfigurationError(
+                    "Injected peer router requires a trusted requester "
+                    "identity and authorization scope"
+                )
+        elif self._host_url:
+            self._install_local_host_router()
 
         # #1576: every outbound A2A dispatch writes a sender-side audit
         # row. The receiver-side ``a2a_tasks`` row tells us what the
@@ -286,7 +313,14 @@ class PeersFeature(Feature):
                     "a2a_outbound_tasks table: %s", exc,
                 )
 
-        if self._host_url:
+        if self._peer_router is not None and not isinstance(
+            self._peer_router, LocalHostPeerDirectory,
+        ):
+            logger.info(
+                "PeersFeature initialized with injected scoped peer router "
+                "(self=%s)", self._own_name,
+            )
+        elif self._host_url:
             logger.info(f"PeersFeature initialized: host={self._host_url}, self={self._own_name}")
         else:
             logger.info("PeersFeature initialized but no multi_agent host found (standalone mode)")
@@ -304,12 +338,83 @@ class PeersFeature(Feature):
 
         return "unknown"
 
-    def _build_headers(self) -> dict:
-        """Build headers for inter-agent HTTP calls."""
-        headers = {"Content-Type": "application/json"}
-        if self._api_key:
-            headers["X-API-Key"] = self._api_key
-        return headers
+    def _install_local_host_router(self) -> None:
+        """Install the legacy local-host adapter with a private local scope."""
+        host_url = getattr(self, "_host_url", None)
+        if not host_url:
+            return
+        local_identity = str(getattr(self.agent, "did", None) or self._own_name)
+        self._peer_requester = PeerRequester(
+            identity=local_identity,
+            authorization_scope=object(),
+        )
+        # Late-bind the factory so a host's transport instrumentation (and the
+        # long-standing local test seam) applies to every operation, not only
+        # the first operation that installed this adapter.
+        self._peer_router = LocalHostPeerDirectory(
+            host_url,
+            api_key=getattr(self, "_api_key", ""),
+            client_factory=lambda *args, **kwargs: httpx.AsyncClient(
+                *args, **kwargs,
+            ),
+        )
+
+    def _peer_directory_context(
+        self,
+    ) -> Optional[Tuple[PeerDirectoryRouter, PeerRequester]]:
+        """Return the injected scoped router, lazily restoring local tests.
+
+        Tests and embedding code that construct a feature directly historically
+        set ``_host_url`` without running ``initialize``.  Lazily installing
+        the local adapter preserves that supported local behavior; an injected
+        router never falls back to host discovery when its mandatory requester
+        context is missing.
+        """
+        router = getattr(self, "_peer_router", None)
+        requester = getattr(self, "_peer_requester", None)
+        if router is not None:
+            if not isinstance(requester, PeerRequester):
+                raise PeerDirectoryConfigurationError(
+                    "Injected peer router requires a trusted requester "
+                    "identity and authorization scope"
+                )
+            return router, requester
+        if getattr(self, "_host_url", None):
+            self._install_local_host_router()
+            return self._peer_directory_context()
+        return None
+
+    async def _resolve_automatic_peer(
+        self, recipient: str,
+    ) -> Tuple[PeerDirectoryRouter, PeerRequester, PeerIdentity]:
+        """Resolve only within the current automatic peer directory.
+
+        The route receives the stable ``PeerIdentity`` returned by the scoped
+        provider, never the caller-provided name.  This is the critical guard
+        against cross-scope DID/name probing and recipient substitution.
+        """
+        context = self._peer_directory_context()
+        if context is None:
+            raise PeerDirectoryConfigurationError(
+                "Not running in a multi_agent environment — no peer router"
+            )
+        router, requester = context
+        try:
+            peer = await router.resolve_peer(requester, recipient)
+        except PeerDirectoryError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - provider extension boundary
+            logger.exception("Peer router resolution raised unexpectedly")
+            raise PeerTransportError("Peer directory resolution failed") from exc
+        if peer is None:
+            raise PeerNotFoundError("Peer is not in the automatic directory")
+        if not isinstance(peer, PeerIdentity):
+            raise PeerProtocolError(
+                "Peer directory returned an invalid peer identity"
+            )
+        if peer.agent_id == requester.identity:
+            raise PeerSelfTargetError("Cannot route to the requesting agent")
+        return router, requester, peer
 
     def _maybe_sign_outbound(
         self,
@@ -383,10 +488,17 @@ class PeersFeature(Feature):
     )
     async def list_peers(self) -> ToolResult:
         """
-        Discover available peer agents via the multi_agent host.
+        Discover available peer agents via the scoped peer directory.
         Returns their names, status, and capabilities.
         """
-        if not self._host_url:
+        try:
+            context = self._peer_directory_context()
+        except PeerDirectoryConfigurationError as exc:
+            return ToolResult.failed(
+                "Peer routing is not configured safely",
+                data={"peers": [], "error": str(exc)},
+            )
+        if context is None:
             # Honesty: standalone mode is not a failure (the listing
             # WAS performed and returned the truthful "0 peers"), but
             # the agent must speak that no host is configured rather
@@ -398,35 +510,54 @@ class PeersFeature(Feature):
                 data={"peers": [], "note": "Not running in a multi_agent environment"},
             )
 
+        router, requester = context
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    f"{self._host_url}/api/agents",
-                    headers=self._build_headers(),
-                    timeout=PEER_CONNECT_TIMEOUT,
-                )
-                resp.raise_for_status()
-                agents_data = resp.json()
-        except httpx.ConnectError:
+            directory = await router.list_peers(requester)
+        except PeerAccessDeniedError:
+            # Do not distinguish a denied scope from an empty/unknown peer
+            # directory.  In hosted mode either distinction can be used to
+            # probe another tenant's namespace.
+            return ToolResult.failed(
+                "Could not list peers in the current authorization scope",
+                data={"peers": [], "error": "Peer directory unavailable"},
+            )
+        except PeerTransportError:
             return ToolResult.failed(
                 "Could not connect to multi_agent host",
                 data={"peers": [], "error": "Could not connect to multi_agent host"},
             )
-        except Exception as e:
-            logger.error(f"Failed to list peers: {e}")
+        except PeerDirectoryError as exc:
+            logger.error("Failed to list peers: %s", exc)
             return ToolResult.failed(
-                str(e),
-                data={"peers": [], "error": str(e)},
+                "Could not list peers",
+                data={"peers": [], "error": "Could not list peers"},
+            )
+        except Exception:  # noqa: BLE001 - provider extension boundary
+            logger.exception("Peer router raised unexpectedly while listing peers")
+            return ToolResult.failed(
+                "Could not list peers",
+                data={"peers": [], "error": "Could not list peers"},
+            )
+
+        if not isinstance(directory, SequenceABC) or isinstance(
+            directory, (str, bytes, bytearray),
+        ):
+            logger.warning("Peer directory returned a non-sequence listing")
+            return ToolResult.failed(
+                "Could not list peers",
+                data={"peers": [], "error": "Could not list peers"},
             )
 
         peers = []
-        for agent in agents_data if isinstance(agents_data, list) else agents_data.get("agents", []):
-            name = agent.get("name", agent.get("id", ""))
-            if name.lower() != self._own_name.lower():
+        for peer in directory:
+            if not isinstance(peer, PeerIdentity):
+                logger.warning("Peer directory returned an invalid listing entry")
+                continue
+            if peer.agent_id != requester.identity:
                 peers.append({
-                    "name": name,
-                    "status": agent.get("status", "unknown"),
-                    "description": agent.get("description", ""),
+                    "name": peer.name,
+                    "status": peer.status,
+                    "description": peer.description,
                 })
 
         return ToolResult.ok(
@@ -448,67 +579,84 @@ class PeersFeature(Feature):
             agent_name: Name of the agent to message (e.g. "emma", "claw")
             message: The message or question to send
         """
-        if not self._host_url:
-            return ToolResult.failed(
-                "Not running in a multi_agent environment — no host to proxy through",
-                data={"response": None, "agent": agent_name},
-            )
-
-        if agent_name.lower() == self._own_name.lower():
+        # This is an assertion about the known local caller, not a directory
+        # lookup, so it neither probes nor depends on any tenant namespace.
+        if agent_name.casefold() == self._own_name.casefold():
             return ToolResult.failed(
                 "Cannot send a message to yourself",
                 data={"response": None, "agent": agent_name},
             )
 
-        url = f"{self._host_url}/api/agents/{agent_name}/api/agent/invoke"
+        try:
+            router, requester, peer = await self._resolve_automatic_peer(
+                agent_name,
+            )
+        except PeerDirectoryConfigurationError:
+            return ToolResult.failed(
+                "Not running in a multi_agent environment — no host to proxy through",
+                data={"response": None, "agent": agent_name},
+            )
+        except PeerSelfTargetError:
+            return ToolResult.failed(
+                "Cannot send a message to yourself",
+                data={"response": None, "agent": agent_name},
+            )
+        except PeerAccessDeniedError:
+            return ToolResult.failed(
+                "Peer is not available in the automatic directory",
+                data={"response": None, "agent": agent_name},
+            )
+        except PeerNotFoundError:
+            return ToolResult.failed(
+                "Peer is not available in the automatic directory",
+                data={"response": None, "agent": agent_name},
+            )
+        except PeerDirectoryError as exc:
+            logger.error("Could not resolve peer %r: %s", agent_name, exc)
+            return ToolResult.failed(
+                "Peer is not available in the automatic directory",
+                data={"response": None, "agent": agent_name},
+            )
 
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    url,
-                    json={"input": message},
-                    headers=self._build_headers(),
-                    timeout=httpx.Timeout(
-                        connect=PEER_CONNECT_TIMEOUT,
-                        read=PEER_READ_TIMEOUT,
-                        write=PEER_READ_TIMEOUT,
-                        pool=PEER_CONNECT_TIMEOUT,
-                    ),
-                )
-        except httpx.ConnectError:
+            data = await router.invoke(requester, peer, message)
+        except PeerNotFoundError:
             return ToolResult.failed(
-                f"Could not reach agent '{agent_name}' — multi_agent host unreachable",
+                "Peer is not available in the automatic directory",
                 data={"response": None, "agent": agent_name},
             )
-        except httpx.TimeoutException:
+        except PeerAccessDeniedError:
             return ToolResult.failed(
-                f"Agent '{agent_name}' took too long to respond",
+                "Peer is not available in the automatic directory",
                 data={"response": None, "agent": agent_name},
             )
-        except Exception as e:
-            logger.error(f"Failed to message agent '{agent_name}': {e}")
-            return ToolResult.failed(
-                str(e),
-                data={"response": None, "agent": agent_name},
-            )
-
-        if resp.status_code == 404:
-            return ToolResult.failed(
-                f"Agent '{agent_name}' not found in the multi_agent",
-                data={"response": None, "agent": agent_name},
-            )
-        if resp.status_code == 503:
+        except PeerUnavailableError:
             return ToolResult.failed(
                 f"Agent '{agent_name}' is offline",
                 data={"response": None, "agent": agent_name},
             )
-
-        try:
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
+        except PeerTransportError:
             return ToolResult.failed(
-                str(e),
+                f"Could not reach agent '{agent_name}' — multi_agent host unreachable",
+                data={"response": None, "agent": agent_name},
+            )
+        except PeerDirectoryError as exc:
+            logger.error("Failed to message peer %r: %s", agent_name, exc)
+            return ToolResult.failed(
+                f"Could not message agent '{agent_name}'",
+                data={"response": None, "agent": agent_name},
+            )
+        except Exception:  # noqa: BLE001 - provider extension boundary
+            logger.exception("Peer router raised unexpectedly while invoking %r", agent_name)
+            return ToolResult.failed(
+                f"Could not message agent '{agent_name}'",
+                data={"response": None, "agent": agent_name},
+            )
+
+        if not isinstance(data, Mapping):
+            logger.warning("Peer router returned a non-object invoke result")
+            return ToolResult.failed(
+                f"Could not message agent '{agent_name}'",
                 data={"response": None, "agent": agent_name},
             )
 
@@ -563,13 +711,7 @@ class PeersFeature(Feature):
         """
         from uuid import uuid4
 
-        if not self._host_url:
-            return None, None, ToolResult.failed(
-                "Not running in a multi_agent environment — no host to proxy through",
-                data={"sent": False, "recipient": recipient},
-            )
-
-        if recipient.lower() == self._own_name.lower():
+        if recipient.casefold() == self._own_name.casefold():
             return None, None, ToolResult.failed(
                 "Cannot send an A2A task to yourself",
                 data={"sent": False, "recipient": recipient},
@@ -577,7 +719,6 @@ class PeersFeature(Feature):
 
         task_id = uuid4().hex
         sess_id = session_id or uuid4().hex
-        url = f"{self._host_url}/api/agents/{recipient}/api/agent/tasks/send"
         outbound_metadata: Dict[str, Any] = {"sender": self._own_name}
         if skill_id:
             outbound_metadata["skill"] = skill_id
@@ -708,59 +849,78 @@ class PeersFeature(Feature):
                 },
             )
 
+        # Resolve only after local payload validation and required signing.
+        # A hybrid signing failure must make no network request at all; the
+        # resulting signed envelope is still routed only through a scoped
+        # resolution and never by interpolating ``recipient`` into an address.
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    url,
-                    json=payload,
-                    headers=self._build_headers(),
-                    timeout=httpx.Timeout(
-                        connect=PEER_CONNECT_TIMEOUT,
-                        read=PEER_READ_TIMEOUT,
-                        write=PEER_READ_TIMEOUT,
-                        pool=PEER_CONNECT_TIMEOUT,
-                    ),
-                )
-        except httpx.ConnectError:
+            router, requester, peer = await self._resolve_automatic_peer(
+                recipient,
+            )
+        except PeerDirectoryConfigurationError:
+            return None, None, ToolResult.failed(
+                "Not running in a multi_agent environment — no host to proxy through",
+                data={"sent": False, "recipient": recipient},
+            )
+        except PeerSelfTargetError:
+            return None, None, ToolResult.failed(
+                "Cannot send an A2A task to yourself",
+                data={"sent": False, "recipient": recipient},
+            )
+        except PeerAccessDeniedError:
+            return None, None, ToolResult.failed(
+                "Peer is not available in the automatic directory",
+                data={"sent": False, "recipient": recipient},
+            )
+        except PeerNotFoundError:
+            # Use the same response for absent, cross-scope, and ambiguous
+            # names so the automatic shortcut is not a namespace oracle.
+            return None, None, ToolResult.failed(
+                "Peer is not available in the automatic directory",
+                data={"sent": False, "recipient": recipient},
+            )
+        except PeerDirectoryError as exc:
+            logger.error("Could not resolve A2A recipient %r: %s", recipient, exc)
+            return None, None, ToolResult.failed(
+                "Peer is not available in the automatic directory",
+                data={"sent": False, "recipient": recipient},
+            )
+
+        try:
+            routed_task = await router.send_a2a_task(requester, peer, payload)
+            if not isinstance(routed_task, Mapping):
+                raise PeerProtocolError("Peer router returned an invalid task envelope")
+            task_data = dict(routed_task)
+        except (PeerNotFoundError, PeerAccessDeniedError):
+            await _persist_outbound(error="peer_not_in_automatic_directory")
+            return None, None, ToolResult.failed(
+                "Peer is not available in the automatic directory",
+                data={"sent": False, "recipient": recipient, "task_id": task_id},
+            )
+        except PeerUnavailableError:
+            await _persist_outbound(error=f"peer_unavailable:{recipient}")
+            return None, None, ToolResult.failed(
+                f"Agent '{recipient}' is offline or TaskManager unavailable",
+                data={"sent": False, "recipient": recipient, "task_id": task_id},
+            )
+        except PeerTransportError:
             await _persist_outbound(error=f"connect_error:{recipient}")
             return None, None, ToolResult.failed(
                 f"Could not reach agent '{recipient}'",
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
             )
-        except httpx.TimeoutException:
-            await _persist_outbound(error=f"timeout:{recipient}")
+        except PeerDirectoryError as exc:
+            logger.error("A2A send to %r failed: %s", recipient, exc)
+            await _persist_outbound(error=f"peer_router_error:{type(exc).__name__}")
             return None, None, ToolResult.failed(
-                f"Agent '{recipient}' timed out",
+                f"Could not send A2A task to '{recipient}'",
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
             )
-        except Exception as e:
-            logger.error(f"A2A send to '{recipient}' failed: {e}")
-            await _persist_outbound(error=str(e))
+        except Exception as exc:  # noqa: BLE001 - provider extension boundary
+            logger.exception("A2A peer router raised unexpectedly for %r", recipient)
+            await _persist_outbound(error=f"peer_router_error:{type(exc).__name__}")
             return None, None, ToolResult.failed(
-                str(e),
-                data={"sent": False, "recipient": recipient, "task_id": task_id},
-            )
-
-        if resp.status_code == 404:
-            await _persist_outbound(error=f"http_404:{recipient}")
-            return None, None, ToolResult.failed(
-                f"Agent '{recipient}' not found or A2A endpoint missing",
-                data={"sent": False, "recipient": recipient, "task_id": task_id},
-            )
-        if resp.status_code == 503:
-            await _persist_outbound(error=f"http_503:{recipient}")
-            return None, None, ToolResult.failed(
-                f"Agent '{recipient}' is offline or TaskManager unavailable",
-                data={"sent": False, "recipient": recipient, "task_id": task_id},
-            )
-
-        try:
-            resp.raise_for_status()
-            task_data = resp.json()
-        except Exception as e:
-            await _persist_outbound(error=str(e))
-            return None, None, ToolResult.failed(
-                str(e),
+                f"Could not send A2A task to '{recipient}'",
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
             )
 
@@ -1069,63 +1229,69 @@ class PeersFeature(Feature):
             task_id: The task id returned from
                 ``send_a2a_question`` / ``send_a2a_task``.
         """
-        if not self._host_url:
+        try:
+            router, requester, peer = await self._resolve_automatic_peer(
+                recipient,
+            )
+        except PeerDirectoryConfigurationError:
             return ToolResult.failed(
                 "Not running in a multi_agent environment — no host "
                 "to proxy through",
                 data={"recipient": recipient, "task_id": task_id},
             )
-        url = (
-            f"{self._host_url}/api/agents/{recipient}"
-            f"/api/agent/tasks/{task_id}"
-        )
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    url,
-                    headers=self._build_headers(),
-                    timeout=httpx.Timeout(
-                        connect=PEER_CONNECT_TIMEOUT,
-                        read=PEER_CONNECT_TIMEOUT,
-                        write=PEER_CONNECT_TIMEOUT,
-                        pool=PEER_CONNECT_TIMEOUT,
-                    ),
-                )
-        except (httpx.ConnectError, httpx.TimeoutException) as e:
+        except (PeerNotFoundError, PeerAccessDeniedError):
             return ToolResult.failed(
-                f"Could not reach peer '{recipient}' for task "
-                f"{task_id}: {e}",
+                "Peer is not available in the automatic directory",
                 data={"recipient": recipient, "task_id": task_id},
             )
-        except Exception as e:
+        except PeerSelfTargetError:
             return ToolResult.failed(
-                f"Error fetching peer task {task_id} from "
-                f"{recipient}: {e}",
+                "Peer is not available in the automatic directory",
+                data={"recipient": recipient, "task_id": task_id},
+            )
+        except PeerDirectoryError as exc:
+            logger.error(
+                "Could not resolve peer task recipient %r: %s", recipient, exc,
+            )
+            return ToolResult.failed(
+                "Peer is not available in the automatic directory",
                 data={"recipient": recipient, "task_id": task_id},
             )
 
-        if resp.status_code == 404:
+        try:
+            data = await router.get_a2a_task(requester, peer, task_id)
+        except (PeerNotFoundError, PeerAccessDeniedError, PeerSelfTargetError):
             return ToolResult.failed(
-                f"Task {task_id} not found on peer '{recipient}' "
-                f"(either the peer evicted it or task_id is wrong)",
+                "Peer is not available in the automatic directory",
                 data={"recipient": recipient, "task_id": task_id},
             )
-        if resp.status_code != 200:
+        except PeerTransportError:
             return ToolResult.failed(
-                f"Peer '{recipient}' returned HTTP {resp.status_code} "
-                f"for task {task_id}",
-                data={
-                    "recipient": recipient,
-                    "task_id": task_id,
-                    "status_code": resp.status_code,
-                },
+                f"Could not reach peer '{recipient}' for task {task_id}",
+                data={"recipient": recipient, "task_id": task_id},
             )
-        try:
-            data = resp.json()
-        except ValueError as e:
+        except PeerDirectoryError as exc:
+            logger.error(
+                "Error fetching peer task %s from %r: %s",
+                task_id, recipient, exc,
+            )
             return ToolResult.failed(
-                f"Peer '{recipient}' returned malformed JSON for "
-                f"task {task_id}: {e}",
+                f"Error fetching peer task {task_id} from {recipient}",
+                data={"recipient": recipient, "task_id": task_id},
+            )
+        except Exception:  # noqa: BLE001 - provider extension boundary
+            logger.exception(
+                "Peer router raised unexpectedly fetching task %s from %r",
+                task_id, recipient,
+            )
+            return ToolResult.failed(
+                f"Error fetching peer task {task_id} from {recipient}",
+                data={"recipient": recipient, "task_id": task_id},
+            )
+
+        if not isinstance(data, Mapping):
+            return ToolResult.failed(
+                f"Peer '{recipient}' returned an invalid task result",
                 data={"recipient": recipient, "task_id": task_id},
             )
 
@@ -1404,10 +1570,6 @@ class PeersFeature(Feature):
         import asyncio
         from datetime import datetime, timezone
 
-        subscribe_url = (
-            f"{self._host_url}/api/agents/{recipient}"
-            f"/api/agent/tasks/{task_id}/subscribe"
-        )
         terminal_states = ("completed", "failed", "canceled")
         backoffs = [1.0, 2.0, 5.0, 10.0]
         backoff_idx = 0
@@ -1421,101 +1583,97 @@ class PeersFeature(Feature):
             )
 
         while _remaining() > 0 and state not in terminal_states:
-            # Bound this connect attempt's timeouts by the remaining
-            # wall-clock so a peer/proxy that accepts the connection
-            # then stalls without yielding any frames cannot block
-            # ``aiter_lines()`` past the deadline (codex round 5 P2
-            # on PR #1453). Without these caps the ``async for sse_event``
-            # loop never wakes to see ``_remaining() <= 0`` and the
-            # deadline-accurate expired signal never fires for stalled
-            # streams. Allow a small floor so a fast deadline doesn't
-            # immediately raise on connect — anything below 0.5s, we
-            # just exit at the outer ``while`` check.
+            # Pass the remaining wall-clock to the router so its transport
+            # cannot block a stalled stream past the promised deadline.  The
+            # local HTTP adapter uses it for connect/read/pool timeouts;
+            # hosted adapters receive the same bounded contract.
             remaining = _remaining()
             if remaining < 0.5:
                 break
-            iter_timeout = httpx.Timeout(
-                connect=min(PEER_CONNECT_TIMEOUT, remaining),
-                read=remaining,
-                write=min(PEER_CONNECT_TIMEOUT, remaining),
-                pool=min(PEER_CONNECT_TIMEOUT, remaining),
-            )
             try:
-                async with httpx.AsyncClient(timeout=iter_timeout) as client:
-                    async with client.stream(
-                        "GET",
-                        subscribe_url,
-                        headers=self._build_headers(),
-                    ) as resp:
-                        if resp.status_code == 404:
-                            # Hard cut: recipient lacks the /subscribe
-                            # endpoint (legacy build). Don't burn the
-                            # whole deadline reconnecting.
-                            logger.error(
-                                "A2A question supervisor for task=%s "
-                                "recipient=%s: /subscribe returned 404. "
-                                "Recipient does not expose the async "
-                                "question protocol. Marking the pending "
-                                "row resolved with state=failed.",
-                                task_id, recipient,
-                            )
-                            state = "failed"
-                            reply_text = (
-                                f"Recipient '{recipient}' does not "
-                                f"expose /tasks/{{id}}/subscribe — "
-                                f"upgrade them to the build that ships "
-                                f"the fire-and-resume A2A question "
-                                f"protocol (#1444)."
-                            )
-                            break
-                        if resp.status_code != 200:
-                            raise httpx.RequestError(
-                                f"subscribe HTTP {resp.status_code}"
-                            )
-                        # Successful connect — reset backoff.
-                        backoff_idx = 0
-                        async for sse_event in self._iter_sse_events(resp):
-                            # Codex round 3 P2c on PR #1453: enforce
-                            # the deadline INSIDE the stream loop. On
-                            # a healthy long-running task the receiver
-                            # keeps the connection open emitting
-                            # status/keepalive frames; without this
-                            # check the supervisor blows past
-                            # ``timeout_seconds`` without firing the
-                            # deadline-accurate expired signal.
-                            if _remaining() <= 0:
-                                break
-                            event_name = sse_event.get("event") or "message"
-                            data_str = sse_event.get("data") or ""
-                            if event_name in ("keepalive", "ping"):
-                                continue
-                            if event_name != "status":
-                                continue
-                            parsed = self._parse_sse_status_data(data_str)
-                            if not parsed:
-                                continue
-                            event_state, event_reply = parsed
-                            if event_state in terminal_states:
-                                state = event_state
-                                reply_text = event_reply
-                                break
-                        # Stream ended cleanly — if we saw a terminal,
-                        # exit the outer loop; otherwise reconnect (or
-                        # the outer ``while`` will exit if the deadline
-                        # passed during the stream read).
-                        if state in terminal_states:
-                            break
-            except (httpx.RequestError, httpx.TimeoutException) as e:
+                router, requester, peer = await self._resolve_automatic_peer(
+                    recipient,
+                )
+                # Successful authorization/resolution — reset backoff before
+                # consuming the provider's stream.  The provider is still
+                # required to authorize the subscription itself, because a
+                # scope can change after resolution.
+                backoff_idx = 0
+                async for subscription_event in router.subscribe_a2a_task(
+                    requester,
+                    peer,
+                    task_id,
+                    timeout_seconds=remaining,
+                ):
+                    # Codex round 3 P2c on PR #1453: enforce the deadline
+                    # INSIDE the stream loop.  A provider can keep a healthy
+                    # stream open indefinitely, so its transport timeout alone
+                    # is not the deadline guarantee.
+                    if _remaining() <= 0:
+                        break
+                    event_name = subscription_event.event or "message"
+                    data_str = subscription_event.data or ""
+                    if event_name in ("keepalive", "ping"):
+                        continue
+                    if event_name != "status":
+                        continue
+                    parsed = self._parse_sse_status_data(data_str)
+                    if not parsed:
+                        continue
+                    event_state, event_reply = parsed
+                    if event_state in terminal_states:
+                        state = event_state
+                        reply_text = event_reply
+                        break
+                # Stream ended cleanly — if we saw a terminal, exit the outer
+                # loop; otherwise reconnect (or exit at the deadline).
+                if state in terminal_states:
+                    break
+            except PeerSubscriptionUnavailableError:
+                # Hard cut: recipient lacks the subscription surface.  Don't
+                # burn the whole deadline reconnecting to a legacy peer.
+                logger.error(
+                    "A2A question supervisor for task=%s recipient=%s: "
+                    "subscription unavailable. Marking pending row failed.",
+                    task_id, recipient,
+                )
+                state = "failed"
+                reply_text = (
+                    f"Recipient '{recipient}' does not expose "
+                    f"/tasks/{{id}}/subscribe — upgrade them to the build "
+                    f"that ships the fire-and-resume A2A question protocol "
+                    f"(#1444)."
+                )
+                break
+            except (PeerNotFoundError, PeerAccessDeniedError, PeerSelfTargetError):
+                # Scope changes and cross-scope probes must not reveal whether
+                # the recipient or task exists.  This sender had a prior task,
+                # so fail its resumption safely rather than retrying a route it
+                # is no longer authorized to observe.
+                state = "failed"
+                reply_text = "Peer task subscription is no longer authorized."
+                break
+            except PeerDirectoryConfigurationError:
+                state = "failed"
+                reply_text = "Peer routing is no longer configured safely."
+                break
+            except PeerTransportError as exc:
                 logger.debug(
                     "A2A subscription stream for task=%s recipient=%s "
                     "dropped (%s); backing off",
-                    task_id, recipient, e,
+                    task_id, recipient, exc,
                 )
-            except Exception as e:
+            except PeerDirectoryError as exc:
                 logger.warning(
                     "A2A subscription supervisor for task=%s "
-                    "recipient=%s unexpected error: %s",
-                    task_id, recipient, e,
+                    "recipient=%s router error: %s",
+                    task_id, recipient, exc,
+                )
+            except Exception as exc:  # noqa: BLE001 - provider extension boundary
+                logger.warning(
+                    "A2A subscription supervisor for task=%s "
+                    "recipient=%s unexpected router error: %s",
+                    task_id, recipient, type(exc).__name__,
                 )
 
             if state in terminal_states:
@@ -1854,27 +2012,10 @@ class PeersFeature(Feature):
         strips trailing newlines, so we accumulate ``event:`` and
         ``data:`` field values until the blank-line separator. Comment
         lines (``:`` prefix) are dropped silently."""
-        event_name = None
-        data_lines: List[str] = []
-        async for line in response.aiter_lines():
-            if line == "":
-                if event_name is not None or data_lines:
-                    yield {
-                        "event": event_name,
-                        "data": "\n".join(data_lines),
-                    }
-                event_name = None
-                data_lines = []
-                continue
-            if line.startswith(":"):
-                # Comment / heartbeat — ignore.
-                continue
-            if line.startswith("event:"):
-                event_name = line[len("event:"):].strip()
-            elif line.startswith("data:"):
-                data_lines.append(line[len("data:"):].lstrip())
-            # Other SSE fields (id:, retry:) are not used by our
-            # producer; ignore them.
+        async for event in iter_sse_events(response):
+            # Keep the historical test/support method's dict shape while the
+            # protocol-neutral parser remains the single implementation.
+            yield {"event": event.event, "data": event.data}
 
     def _parse_sse_status_data(
         self, data_str: str,
@@ -1954,8 +2095,8 @@ class PeersFeature(Feature):
         Called once after every feature has initialized — by that
         point the dispatcher and the ``pending_a2a_questions`` store
         are both wired on the agent. Skips silently when either is
-        absent (non-multi-agent mode, no DB) or when no host URL is
-        configured (no peers to subscribe to)."""
+        absent (standalone mode, no DB) or when no peer router is
+        configured."""
         store = getattr(agent, "pending_a2a_questions", None)
         if store is None:
             logger.debug(
@@ -1963,9 +2104,17 @@ class PeersFeature(Feature):
                 "pending_a2a_questions store wired."
             )
             return
-        if self._host_url is None:
+        try:
+            context = self._peer_directory_context()
+        except PeerDirectoryConfigurationError:
+            logger.error(
+                "Skipping a2a question startup-replay — peer router is "
+                "missing trusted requester context."
+            )
+            return
+        if context is None:
             logger.debug(
-                "Skipping a2a question startup-replay — no host URL."
+                "Skipping a2a question startup-replay — no peer router."
             )
             return
 

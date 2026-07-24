@@ -225,6 +225,19 @@ async def test_public_hybrid_dispatch_posts_envelope_verifying_both_halves():
     client.__aenter__.return_value = client
     client.__aexit__.return_value = False
     client.post.return_value = response
+    directory_response = MagicMock(status_code=200)
+    directory_response.raise_for_status.return_value = None
+    directory_response.json.return_value = {
+        "agents": [
+            {"id": "emma", "name": "emma", "routing_name": "emma"},
+            {
+                "id": "did:test:meridian",
+                "name": "meridian",
+                "routing_name": "meridian",
+            },
+        ],
+    }
+    client.get.return_value = directory_response
 
     with patch(
         "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",

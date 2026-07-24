@@ -51,6 +51,9 @@ class _FakeStreamResponse:
         self._lines = lines
         self.status_code = status_code
 
+    def raise_for_status(self):
+        return None
+
     async def __aenter__(self):
         return self
 
@@ -76,6 +79,19 @@ class _FakeAsyncClient:
 
     async def __aexit__(self, *exc):
         return False
+
+    async def get(self, url: str, headers: Optional[dict] = None, timeout=None):
+        """Directory lookup performed before every scoped subscription."""
+        response = MagicMock(status_code=200)
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "agents": [
+                {"id": "did:test:sender", "name": "Sender", "routing_name": "Sender"},
+                {"id": "did:test:meridian", "name": "Meridian", "routing_name": "Meridian"},
+                {"id": "did:test:legacy", "name": "LegacyAgent", "routing_name": "LegacyAgent"},
+            ],
+        }
+        return response
 
     def stream(self, method: str, url: str, headers: Optional[dict] = None):
         self.calls.append((method, url))
