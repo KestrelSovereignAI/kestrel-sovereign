@@ -40,7 +40,7 @@ import re
 import shutil
 import tomllib
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional, Tuple
 
 from .cancellation import (
     AuthCancellationToken,
@@ -83,6 +83,13 @@ _CODEX_DISABLED_NATIVE_FEATURES = (
     "unified_exec",
     "workspace_dependencies",
 )
+
+# Codex app-server frames are newline-delimited JSON, but a completed item can
+# include a full reasoning snapshot.  Keep an explicit ceiling so a malformed
+# peer cannot make the bridge retain unbounded stdout, while leaving enough
+# room for the large valid frames emitted by reasoning-heavy plan turns.
+CODEX_APP_SERVER_MAX_FRAME_BYTES = 64 * 1024 * 1024
+CODEX_APP_SERVER_READ_CHUNK_BYTES = 64 * 1024
 
 # Resolution order for the binary. It ships inside a desktop app bundle
 # and is deliberately NOT on PATH (reference: codex-cli-path), which is
@@ -139,6 +146,15 @@ class CodexAppServerConnectionClosed(CodexAppServerTransportError):
     """The app-server process is gone (exited / stdin closed). Modeled
     as a transport error: the connection died, which is what the
     fallback escalation rule cares about.
+    """
+
+
+class CodexAppServerFrameTooLarge(CodexAppServerError):
+    """A newline-delimited app-server frame exceeded Kestrel's bound.
+
+    The app-server can keep serving after this error: the reader discards the
+    malformed/oversized line through its newline boundary rather than exiting
+    the shared bridge process.
     """
 
 
@@ -457,21 +473,13 @@ class CodexAppServerClient:
             # which has higher precedence than ordinary config. Dynamic tools
             # advertised by Kestrel remain available through item/tool/call.
             #
-            # ``limit=16 MiB``: codex emits JSON-RPC frames as single
-            # newline-terminated lines on stdout. Streaming events for a
-            # turn carrying our typical ~20K-input-token prompt routinely
-            # exceed asyncio's default 64 KiB StreamReader buffer (e.g.
-            # a single Item-finished event echoing the full assistant
-            # text or a snapshot containing the cumulative reasoning
-            # trace). The default raises ``ValueError('Separator is
-            # found, but chunk is longer than limit')`` from
-            # ``StreamReader.__anext__``, the read loop dies before any
-            # frame is parsed, and ``_read_loop``'s finally reports
-            # ``codex app-server exited (rc=None)`` — silently masking
-            # a 64 KiB cap as a process death. 16 MiB matches the
-            # codex-rs internal frame budget; if anything ever exceeds
-            # it we want a real protocol error, not a quiet crash. See
-            # #1438.
+            # Codex emits JSON-RPC frames as single newline-terminated
+            # lines on stdout.  The reader below consumes stdout in fixed
+            # chunks rather than ``readline()`` so this is a backpressure
+            # setting, not a per-line kill switch.  Keep it aligned with the
+            # explicit frame ceiling: large valid reasoning snapshots can be
+            # parsed, while a peer still cannot grow the asyncio buffer
+            # without bound. See #1438 and #2711.
             codex_args = [self._binary]
             for feature in _CODEX_DISABLED_NATIVE_FEATURES:
                 codex_args.extend(("--disable", feature))
@@ -482,7 +490,7 @@ class CodexAppServerClient:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=spawn_env,
-                limit=16 * 1024 * 1024,
+                limit=CODEX_APP_SERVER_MAX_FRAME_BYTES,
             )
         except OSError as e:
             raise CodexAppServerError(f"Failed to spawn {self._binary}: {e}") from e
@@ -816,10 +824,83 @@ class CodexAppServerClient:
         except Exception:
             pass
 
+    def _fail_active_bridge_work(self, exc: BaseException) -> None:
+        """Fail in-flight RPCs/turns without declaring the process dead.
+
+        An oversized frame cannot be attributed safely before it is parsed,
+        so every active bridge operation gets the same bounded protocol
+        error.  Unlike :meth:`_fail_all`, this deliberately leaves
+        ``_closed_error`` unset: after discarding the rest of that line, the
+        same app-server process can serve a later request.
+        """
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(exc)
+        self._pending.clear()
+        for q in self._turn_sinks.values():
+            q.put_nowait({"__bridge_error__": exc})
+
+    async def _iter_stdout_frames(self) -> AsyncIterator[bytes]:
+        """Yield bounded newline-delimited stdout frames incrementally.
+
+        ``StreamReader.readline`` and async iteration apply the reader's
+        ``limit`` to one line.  A legitimate large Codex event therefore used
+        to raise ``ValueError`` and kill the only shared reader task.  Reading
+        fixed chunks lets us enforce the protocol's own explicit frame bound
+        and, on overflow, discard exactly one line before resynchronizing.
+        """
+        assert self._proc and self._proc.stdout
+        frame = bytearray()
+        discarding_oversized_frame = False
+
+        while raw := await self._proc.stdout.read(CODEX_APP_SERVER_READ_CHUNK_BYTES):
+            remaining = raw
+            while remaining:
+                newline = remaining.find(b"\n")
+                if newline < 0:
+                    segment = remaining
+                    remaining = b""
+                else:
+                    segment = remaining[:newline]
+                    remaining = remaining[newline + 1:]
+
+                if discarding_oversized_frame:
+                    if newline >= 0:
+                        discarding_oversized_frame = False
+                    continue
+
+                if len(frame) + len(segment) > CODEX_APP_SERVER_MAX_FRAME_BYTES:
+                    exc = CodexAppServerFrameTooLarge(
+                        "codex app-server JSON-RPC frame exceeded the "
+                        f"{CODEX_APP_SERVER_MAX_FRAME_BYTES // (1024 * 1024)} MiB "
+                        "bridge limit"
+                    )
+                    logger.error(
+                        "codex app-server discarded an oversized JSON-RPC "
+                        "frame (over %d MiB); failed active bridge work but "
+                        "the reader remains available",
+                        CODEX_APP_SERVER_MAX_FRAME_BYTES // (1024 * 1024),
+                    )
+                    self._fail_active_bridge_work(exc)
+                    frame.clear()
+                    discarding_oversized_frame = newline < 0
+                    continue
+
+                frame.extend(segment)
+                if newline >= 0:
+                    yield bytes(frame)
+                    frame.clear()
+
+        # ``readline`` yielded a final unterminated line at EOF. Preserve that
+        # behavior for a clean final response while still rejecting an
+        # unfinished oversized line above.
+        if frame and not discarding_oversized_frame:
+            yield bytes(frame)
+
     async def _read_loop(self) -> None:
         assert self._proc and self._proc.stdout
         try:
-            async for raw in self._proc.stdout:
+            async for raw in self._iter_stdout_frames():
                 line = raw.decode("utf-8", "replace").strip()
                 if not line:
                     continue
@@ -834,21 +915,20 @@ class CodexAppServerClient:
         except asyncio.CancelledError:
             pass
         except ValueError as e:
-            # ``StreamReader.__anext__`` raises ValueError when a single
-            # line exceeds the configured ``limit=`` on the subprocess
-            # spawn (asyncio's "Separator is found, but chunk is longer
-            # than limit" — see #1438). Pre-#1438 this fell through to
-            # the finally and the call site saw a generic "app-server
-            # exited (rc=None)" with no clue why. Surface the buffer
-            # cap explicitly so a future regression points at the spawn
-            # ``limit=`` argument instead of looking like an upstream
-            # crash. Server-log only; the call-site exception text stays
-            # neutral to avoid the cross-session leak boundary set in
-            # #1410/#1412.
+            # ``read()`` does not impose a delimiter-length limit. This is
+            # retained as a diagnostic for a future reader implementation so
+            # an accidental return to ``readline()`` does not masquerade as
+            # a process exit. The no-separator variant means the frame truly
+            # exceeded the reader cap; the other variant found a delimiter
+            # after exceeding it.
+            detail = (
+                "no newline before the reader cap (frame genuinely exceeds it)"
+                if "Separator is not found" in str(e)
+                else "newline found only after the reader cap"
+            )
             logger.error(
                 "codex app-server read_loop hit asyncio StreamReader limit "
-                "(spawn `limit=` argument too low for current frame): %s",
-                e,
+                "(%s): %s", detail, e,
             )
         except Exception as e:
             # Don't let an unexpected reader exception look like a clean
@@ -1431,6 +1511,9 @@ class CodexAppServerClient:
                 raise self._closed_error or CodexAppServerConnectionClosed(
                     "codex app-server closed mid-turn"
                 )
+            bridge_error = msg.get("__bridge_error__")
+            if bridge_error is not None:
+                raise bridge_error
             yield msg
             if msg.get("method") in ("turn/completed", "turn/failed"):
                 return

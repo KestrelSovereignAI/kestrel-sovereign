@@ -51,6 +51,8 @@ def _feature_package_to_dict(info: FeaturePackageInfo) -> Dict[str, Any]:
     """Serialize a FeaturePackageInfo to a JSON-safe dict."""
     d = asdict(info)
     d["status"] = info.status.value
+    d["boundary"] = info.boundary.value
+    d["installable"] = info.installable
     d["skills"] = [asdict(s) for s in info.skills]
     return d
 
@@ -172,6 +174,7 @@ async def list_installed_features(request: Request) -> Dict[str, Any]:
             entry["tags"] = pkg.tags
             entry["icon"] = pkg.icon
             entry["core"] = pkg.core
+            entry["boundary"] = pkg.boundary.value
         results.append(entry)
 
     return {"features": results, "count": len(results)}
@@ -251,6 +254,8 @@ async def get_feature_detail(request: Request, name: str) -> Dict[str, Any]:
             detail["tags"] = pkg.tags
             detail["icon"] = pkg.icon
             detail["core"] = pkg.core
+            detail["boundary"] = pkg.boundary.value
+            detail["installable"] = pkg.installable
             detail["skills"] = [asdict(s) for s in pkg.skills]
             detail["install_instructions"] = f"pip install {pkg.package}" if not pkg.core else None
         return detail

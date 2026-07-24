@@ -275,6 +275,20 @@ class RestartCoordinatorFeature(Feature):
         # FIRST wake attempt succeeds immediately. The cron tick remains the
         # backstop for undelivered wakes (#1809).
 
+    async def shutdown(self) -> None:
+        """Stop owned wake acknowledgements before shared storage shuts down.
+
+        The agent owns the dispatcher task and the shared database; this
+        feature owns only the acknowledgement task that observes delivery and
+        writes ``wake_delivered``.  Releasing the in-flight guard after the
+        owned tasks have been cancelled keeps a later enable/retry from seeing
+        a stale in-process acknowledgement.
+        """
+        await super().shutdown()
+        inflight = getattr(self, "_inflight_restart_acks", None)
+        if inflight is not None:
+            inflight.clear()
+
     def get_router(self):
         """Expose the restart status-event API for chat-history reload.
 
@@ -285,7 +299,7 @@ class RestartCoordinatorFeature(Feature):
         from kestrel_sovereign.endpoints.restart_events import router
         return router
 
-    async def on_agent_ready(self, agent=None) -> None:
+    async def on_agent_ready(self, agent=None) -> List[asyncio.Task[Any]]:
         """Agent fully initialized (memory + context manager + dispatcher up).
 
         The agent calls this at the very end of ``initialize()``. Running the
@@ -297,9 +311,10 @@ class RestartCoordinatorFeature(Feature):
         the wake.
         """
         try:
-            await self._reap_post_restart_rows()
+            return await self._reap_post_restart_rows()
         except Exception as e:  # never let readiness wiring break boot
             logger.warning("post-restart wake sweep on_agent_ready failed: %s", e)
+            return []
 
     @tool(
         name="request_restart",
@@ -1620,7 +1635,7 @@ class RestartCoordinatorFeature(Feature):
                 expected_current_status="updating",
             )
 
-    async def _reap_post_restart_rows(self) -> None:
+    async def _reap_post_restart_rows(self) -> List[asyncio.Task[Any]]:
         """Sweep ``executing`` rows this agent filed and wake the
         requesting agent with one ``restart.completed`` COGNITION signal
         per row.
@@ -1652,21 +1667,22 @@ class RestartCoordinatorFeature(Feature):
         process and given it a fresh id).
         """
         if self._db is None:
-            return
+            return []
         agent_id = getattr(self.agent, "did", "") or ""
         if not agent_id:
-            return
+            return []
         needing_wake = await list_requests_needing_wake(
             self._db, agent_id=str(agent_id),
         )
         if not needing_wake:
-            return
+            return []
 
         dispatcher = getattr(self.agent, "dispatcher", None)
         dispatcher_usable = (
             dispatcher is not None
             and hasattr(dispatcher, "enqueue_signal")
         )
+        wake_tasks: List[asyncio.Task[Any]] = []
         for row in needing_wake:
             # A row stamped by THIS process is a restart still in flight
             # (or a detached restart that failed to kill the parent), not
@@ -1692,13 +1708,16 @@ class RestartCoordinatorFeature(Feature):
                     if fresh is None or fresh.status != "completed":
                         continue
                     row = fresh
-            await self._deliver_restart_completed(
+            wake_task = await self._deliver_restart_completed(
                 row, str(agent_id), dispatcher, dispatcher_usable,
             )
+            if wake_task is not None:
+                wake_tasks.append(wake_task)
+        return wake_tasks
 
     async def _deliver_restart_completed(
         self, row, agent_id: str, dispatcher, dispatcher_usable: bool,
-    ) -> None:
+    ) -> Optional[asyncio.Task[Any]]:
         """Dispatch one ``restart.completed`` wake for an already-terminalized
         row and gate ``wake_delivered`` on the wake actually landing (#1819).
 
@@ -1720,13 +1739,13 @@ class RestartCoordinatorFeature(Feature):
         # to and no point retrying forever, so mark the wake delivered.
         if not dispatcher_usable:
             await self._mark_wake_delivered(row)
-            return
+            return None
 
         # A supervisor from this process is already awaiting this row's
         # wake — don't enqueue a duplicate (avoids a wake storm while a
         # long cognition turn is still running).
         if row.id in self._inflight_restart_acks:
-            return
+            return None
 
         try:
             from kestrel_sovereign.signals.sources.restart import (
@@ -1745,7 +1764,7 @@ class RestartCoordinatorFeature(Feature):
                 "restart sweep: failed to enqueue signal for %s: %s; "
                 "wake stays undelivered for next-sweep retry", row.id, e,
             )
-            return
+            return None
 
         waiter = getattr(handle, "wait", None)
         if not callable(waiter):
@@ -1753,14 +1772,14 @@ class RestartCoordinatorFeature(Feature):
             # awaitable handle — the signal was accepted onto the queue, so
             # treat the wake as delivered.
             await self._mark_wake_delivered(row)
-            return
+            return None
 
         # Delivery-gated: supervise the wake and only flag wake_delivered
         # once the COGNITION dispatch actually lands.
         self._inflight_restart_acks.add(row.id)
-        self._spawn_ack_supervisor(row, handle)
+        return self._spawn_ack_supervisor(row, handle)
 
-    def _spawn_ack_supervisor(self, row, handle) -> None:
+    def _spawn_ack_supervisor(self, row, handle) -> asyncio.Task[Any]:
         """Await the ``restart.completed`` dispatch and flag ``wake_delivered``
         only once the wake has actually been DELIVERED (``Status.OK``). A failed
         or dropped wake leaves ``wake_delivered=0`` so a later sweep retries it
@@ -1805,7 +1824,7 @@ class RestartCoordinatorFeature(Feature):
         # would outlive a disabled feature and later flag ``wake_delivered``
         # against torn-down state (kestrel-sovereign#2522 P2). Still
         # agent-tracked underneath, so full shutdown reaps it too.
-        self._track_owned_background_task(
+        return self._track_owned_background_task(
             _await_and_ack(), name=f"restart_completed_ack:{row.id}",
         )
 

@@ -12,6 +12,7 @@ import pytest
 from kestrel_sovereign.feature_registry import (
     FeaturePackageInfo,
     FeatureStatus,
+    PackageBoundary,
     SkillInfo,
 )
 from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
@@ -69,7 +70,7 @@ def _make_registry():
             description="TTS and STT",
             tags=["voice", "tts"],
             icon="microphone",
-            core=True,
+            core=False,
             skills=[
                 SkillInfo(name="speak", description="Text to speech", category="communication", tags=["voice", "tts"]),
             ],
@@ -187,11 +188,17 @@ class TestFeatureInstall:
             name="voice_xai",
             package="kestrel-voice-xai",
             git="https://github.com/example/voice-xai.git",
-            features=[
+            features=[],
+            provider_classes=[
                 "XAITTSProvider",
                 "XAISTTProvider",
                 "XAIRealtimeConversationProvider",
             ],
+            entry_point_groups=[
+                "kestrel_feature_voice_providers",
+                "kestrel_sovereign.conversation_providers",
+            ],
+            boundary=PackageBoundary.PROVIDER_PACKAGE,
             description="xAI voice providers",
             tags=["voice", "xai"],
             icon="microphone",

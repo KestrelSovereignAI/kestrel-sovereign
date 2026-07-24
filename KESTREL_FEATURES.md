@@ -21,6 +21,46 @@
 - Separate supported public surfaces from internal or partial surfaces.
 - Keep the canonical source austere enough that generated docs can safely transform it.
 
+<!-- BEGIN PROTECTED PACKAGE BOUNDARY CONTRACT -->
+## Package Ownership and Installation Boundaries
+
+These ownership statements are normative and must remain intact in every
+audience-specific derivative:
+
+<!-- NON_BUNDLED_SURFACE_ALIASES: voice; mcp; github integration|github app; wallet; observability; council; visual identity; legal feature; code editing|code edit; parametric self; whatsapp; runpod; vast.ai|vastai; gcp compute; elevenlabs; deepgram; kestrel-talon -->
+
+- **Bundled Feature lifecycle modules:** Feature subclasses discovered from
+  `kestrel_sovereign/features/` ship in the `kestrel-sovereign` distribution.
+  They need no separate package install. The generated inventory below is the
+  exact in-tree discovery snapshot.
+- **Bundled non-Feature components:** Some base-install runtime services, such
+  as `PrivacyAgent`, are shipped by `kestrel-sovereign` but are not Feature
+  lifecycle classes. The registry labels these `bundled-component` rather than
+  putting them in its `features` field.
+- **Not bundled — extracted Feature packages:** Voice, MCP, GitHub integration,
+  wallet, observability, reflection, council, visual identity, legal, code
+  editing, parametric self, and WhatsApp transport are separate install targets.
+  They register Feature subclasses through the `kestrel_sovereign.features`
+  entry-point group.
+- **Not bundled — provider packages:** ElevenLabs, Deepgram, OpenAI voice, xAI
+  voice/realtime, RunPod, Vast.ai, GCP Compute, and external storage backends
+  implement provider contracts. They use provider-specific entry-point groups;
+  installing one does not make that provider a Feature lifecycle class.
+- **Not bundled — standalone tool:** `kestrel-talon` is an independently
+  installed command-line issue processor. The in-tree `TalonCoordinatorFeature`
+  is only its bundled Kestrel control surface; the coordinator and the
+  standalone executable are separately named registry rows.
+
+The runtime catalog at `kestrel_sovereign/data/feature_registry.toml` encodes
+these distinctions in `boundary`. Its `package` field is always the owning
+distribution/install target for that row. The compatibility field `core` is
+`true` only for `bundled` and `bundled-component` rows. `features` contains
+Feature lifecycle class names only; provider implementations use
+`provider_classes` plus `entry_point_groups`, and standalone tools use
+`command`. Catalog status `available` means “known but not detected in this
+environment,” not a claim that an external distribution is publicly reachable.
+<!-- END PROTECTED PACKAGE BOUNDARY CONTRACT -->
+
 ## Maintained Surface
 
 ### Constitutional and sovereign foundation
@@ -99,12 +139,12 @@
 
 ## Feature Module Inventory
 
-Features come from two sources:
+Feature lifecycle classes come from two sources:
 
-1. **Core features** — discovered from `kestrel_sovereign/features/` via `discover_feature_modules()`.
-2. **Package features** — installed packages registered with the `kestrel_sovereign.features` entry point group at runtime.
+1. **Bundled Feature modules** — discovered from `kestrel_sovereign/features/` via `discover_feature_modules()`.
+2. **Extracted Feature packages** — installed packages registered with the `kestrel_sovereign.features` entry point group at runtime.
 
-The generated inventory below lists core features only: the in-tree surface discoverable from this checkout.
+The generated inventory below lists bundled Feature lifecycle modules only: the in-tree surface discoverable from this checkout.
 Installed entry point feature classes are included in JSON output when present in the active environment.
 Runtime security policy can still deny a discovered tool at call time; static generation marks source-discovered tools as enabled unless their feature is disabled.
 
