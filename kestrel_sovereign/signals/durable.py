@@ -538,16 +538,17 @@ class DurableSignalStore(UnifiedStoreBase):
             raise ValueError("retry_delay must not be negative")
         now = _as_utc(now or self.now_utc())
         retry_at = now + retry_delay
+        timestamp = self._timestamp_placeholder()
         updated = await self._backend.execute(
             f"""
             UPDATE {self.DELIVERIES}
             SET status = CASE WHEN ? OR attempts >= max_attempts THEN ? ELSE ? END,
                 lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
                 next_attempt_at = CASE
-                    WHEN ? OR attempts >= max_attempts THEN NULL ELSE ? END,
+                    WHEN ? OR attempts >= max_attempts THEN NULL ELSE {timestamp} END,
                 last_error = ?,
-                terminal_at = CASE
-                    WHEN ? OR attempts >= max_attempts THEN ? ELSE NULL END,
+                terminal_at = CASE WHEN ? OR attempts >= max_attempts
+                    THEN {timestamp} ELSE NULL END,
                 updated_at = ?
             WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
               AND status = ? AND lease_token = ? AND lease_expires_at > ?
@@ -744,14 +745,17 @@ class DurableSignalStore(UnifiedStoreBase):
     async def _recover_expired_leases(
         self, *, agent_id: str, consumer_id: str, now: datetime
     ) -> None:
+        timestamp = self._timestamp_placeholder()
         await self._backend.execute(
             f"""
             UPDATE {self.DELIVERIES}
             SET status = CASE WHEN attempts >= max_attempts THEN ? ELSE ? END,
                 lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
-                next_attempt_at = CASE WHEN attempts >= max_attempts THEN NULL ELSE ? END,
+                next_attempt_at = CASE WHEN attempts >= max_attempts
+                    THEN NULL ELSE {timestamp} END,
                 last_error = 'lease expired before acknowledgement',
-                terminal_at = CASE WHEN attempts >= max_attempts THEN ? ELSE NULL END,
+                terminal_at = CASE WHEN attempts >= max_attempts
+                    THEN {timestamp} ELSE NULL END,
                 updated_at = ?
             WHERE agent_id = ? AND consumer_id = ? AND status = ?
               AND lease_expires_at <= ?
@@ -768,6 +772,16 @@ class DurableSignalStore(UnifiedStoreBase):
                 self.to_timestamp_param(now),
             ),
         )
+
+    def _timestamp_placeholder(self) -> str:
+        """Return a timestamp parameter expression for the active dialect.
+
+        PostgreSQL cannot infer the type of a bind value in a ``CASE`` arm
+        whose other arm is ``NULL``.  Without the cast asyncpg treats it as
+        text and rejects the update against a ``TIMESTAMPTZ`` column.  SQLite
+        stores timestamps as text, so its ordinary placeholder is correct.
+        """
+        return "?::TIMESTAMPTZ" if self.is_postgres else "?"
 
     async def _backfill_consumer(
         self, registration: DurableConsumerRegistration, *, now: datetime

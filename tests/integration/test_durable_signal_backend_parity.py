@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
@@ -97,6 +98,75 @@ async def test_durable_delivery_claim_is_scoped_and_single_owner_on_both_backend
         delivery_id=delivery.delivery_id,
         lease_token=delivery.lease_token,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_durable_retry_and_lease_expiry_transitions_work_on_both_backends(
+    db_backend,
+):
+    """Timestamp-bearing failure transitions retain PostgreSQL type parity."""
+    store = DurableSignalStore(db_backend)
+    await store.initialize()
+    agent_id = f"did:test:durable-retry:{uuid4()}"
+    consumer_id = "workflow-wait"
+    await store.register_consumer(
+        DurableConsumerRegistration(
+            consumer_id=consumer_id,
+            source="provider.message",
+            agent_id=agent_id,
+            max_attempts=2,
+            lease_seconds=1,
+        )
+    )
+    await store.persist_signal(
+        _signal(agent_id),
+        agent_id=agent_id,
+        source_event_id=f"retry-{uuid4()}",
+        retention_days=7,
+    )
+    now = datetime.now(timezone.utc)
+    first = await store.claim_delivery(
+        agent_id=agent_id,
+        consumer_id=consumer_id,
+        executor_id="worker-a",
+        now=now,
+    )
+    assert first is not None
+    retried = await store.nack_delivery(
+        agent_id=agent_id,
+        consumer_id=consumer_id,
+        delivery_id=first.delivery_id,
+        lease_token=first.lease_token,
+        error="transient dependency outage",
+        retry_delay=timedelta(seconds=1),
+        now=now,
+    )
+    assert retried is not None
+    assert retried.status == "retry"
+
+    second = await store.claim_delivery(
+        agent_id=agent_id,
+        consumer_id=consumer_id,
+        executor_id="worker-b",
+        now=now + timedelta(seconds=1),
+    )
+    assert second is not None
+    assert second.attempts == 2
+    assert await store.claim_delivery(
+        agent_id=agent_id,
+        consumer_id=consumer_id,
+        executor_id="worker-c",
+        now=now + timedelta(seconds=2),
+    ) is None
+    terminal = await store.get_delivery(
+        agent_id=agent_id,
+        consumer_id=consumer_id,
+        delivery_id=second.delivery_id,
+    )
+    assert terminal is not None
+    assert terminal.status == "failed"
+    assert terminal.last_error == "lease expired before acknowledgement"
 
 
 @pytest.mark.asyncio
