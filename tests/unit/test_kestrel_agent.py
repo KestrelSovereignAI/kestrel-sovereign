@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from decimal import Decimal
 
+from kestrel_sovereign.features.peers.directory import PeerRequester
 from kestrel_sovereign.kestrel_agent import KestrelAgent, _load_prompt_file
 from kestrel_sovereign.agent.streaming import (
     StreamingMixin,
@@ -26,7 +27,6 @@ from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.features.privacy.feature import PrivacyTransitionDecision
-from kestrel_sovereign.features.peers.directory import PeerRequester
 
 
 def _no_confirm_evaluate():
