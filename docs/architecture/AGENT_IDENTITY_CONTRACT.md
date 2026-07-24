@@ -1,16 +1,17 @@
 ---
 type: Architecture Spec
 title: Agent Identity Contract
-description: 'Every Kestrel agent has a single canonical identity: its **DID** (`self.did`).'
+description: Kestrel separates the stable root/storage DID from the current signing
+  DID after a hybrid succession ceremony.
 resource: /docs/architecture/AGENT_IDENTITY_CONTRACT.md
 tags:
 - docs
 - architecture
 - architecture-spec
-timestamp: '2026-06-18T00:00:00Z'
-status: needs-revalidation
+timestamp: '2026-07-24T00:00:00Z'
+status: active
 owner: architecture
-canonical: false
+canonical: true
 generated: false
 privacy: public
 ---
@@ -19,14 +20,29 @@ privacy: public
 
 ## Summary
 
-Every Kestrel agent has a single canonical identity: its **DID** (`self.did`).
+Every Kestrel agent has a stable root/storage identity in `self.did`. A
+classical-only agent signs as that DID. After a hybrid succession ceremony,
+`self.did` remains the stable storage namespace and compatibility identity,
+while `self.signing_did` is the successor `did:web` identity used for new
+signed artifacts.
 
 ## Rules
 
-1. **`self.did` is the source of truth.** It is set once at construction and never reassigned.
-2. **`self.agent_id` is a read-only property** that returns `self.did`. It exists for backward compatibility with storage interfaces and feature packages that accept an `agent_id` parameter.
-3. **Do not independently set `agent_id`.** Any code that previously wrote `self.agent_id = ...` on a `KestrelAgent` instance must be removed; the property will raise `AttributeError` on assignment.
-4. **No `getattr` fallback chains.** Code like `getattr(self, 'agent_id', '') or getattr(self, 'did', '')` is banned. Use `self.did` (or `self.agent.did` from a feature) directly.
+1. **`self.did` is the stable root/storage DID.** It is set once at
+   construction and never reassigned.
+2. **`self.signing_did` is the current signing identity.** It returns the
+   successor `did:web` for a loaded hybrid identity and otherwise returns
+   `self.did`.
+3. **`self.agent_id` is a read-only compatibility property** that returns
+   `self.did`. Storage interfaces and feature packages that accept an
+   `agent_id` parameter therefore stay bound to the stable storage namespace.
+4. **Do not independently set `agent_id`.** Any code that previously wrote
+   `self.agent_id = ...` on a `KestrelAgent` instance must be removed; the
+   property will raise `AttributeError` on assignment.
+5. **No identity fallback chains.** Use `self.did` for the stable
+   root/storage identity and `self.signing_did` for new signatures. A fallback
+   such as `getattr(self, "agent_id", "") or getattr(self, "did", "")` hides
+   which identity contract the caller needs.
 
 ## For Feature Authors
 
@@ -43,6 +59,10 @@ When passing identity to storage layers, use the `agent_id` parameter name — t
 ```python
 store = AsyncConversationStore(db=db, agent_id=self.agent.did)
 ```
+
+When creating or verifying a newly signed artifact, use the runtime identity
+or `self.agent.signing_did`; do not assume the stable storage DID is still the
+active signing DID after succession.
 
 ## For Storage Authors
 
