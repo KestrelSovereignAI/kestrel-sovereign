@@ -370,6 +370,10 @@ async def test_wait_timeout_fails_closed_with_wait_ref():
 
 
 class _FakeAgent:
+    # SignalDispatcher's durable consumer contract scopes the ledger to the
+    # owning agent DID, just like the production DispatcherAgent protocol.
+    did = "did:web:k.example"
+
     def __init__(self):
         self.background_tasks: list = []
 

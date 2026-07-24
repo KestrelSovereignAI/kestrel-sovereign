@@ -1575,6 +1575,10 @@ class KestrelAgent(
             lock_manager=self._lock_manager,
             store=signal_log_store,
         )
+        # The outcome-only signal_log is initialized above.  Initialize the
+        # separate pending-delivery ledger during boot so external workflow
+        # consumers can safely register before the first signal arrives.
+        await self.dispatcher.initialize_durable_delivery()
 
         # Register the always-on core signal sources under an explicit
         # MANDATORY policy (#2522). These are boot-critical routing targets,

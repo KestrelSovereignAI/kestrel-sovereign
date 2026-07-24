@@ -41,6 +41,18 @@ from kestrel_sovereign.signals.dispatcher import (
     DispatcherAgent,
     SignalDispatcher,
 )
+from kestrel_sovereign.signals.durable import (
+    ACKNOWLEDGED,
+    FAILED,
+    LEASED,
+    PENDING,
+    RETRY,
+    DurableConsumerRegistration,
+    DurableDelivery,
+    DurableEventPersistence,
+    DurableSignalEvent,
+    DurableSignalStore,
+)
 from kestrel_sovereign.signals.handlers import template_artifact_handler
 from kestrel_sovereign.signals.lock_manager import OrderedLockManager
 from kestrel_sovereign.signals.prompt_overrides import (
@@ -80,13 +92,23 @@ __all__ = [
     "DEFAULT_COALESCING_WINDOW",
     "DEFAULT_TTL",
     "DispatcherAgent",
+    "DurableConsumerRegistration",
+    "DurableDelivery",
+    "DurableEventPersistence",
+    "DurableSignalEvent",
+    "DurableSignalStore",
+    "ACKNOWLEDGED",
+    "FAILED",
+    "LEASED",
     "OrderedLockManager",
+    "PENDING",
     "RegistrationError",
     "RegistrationOutcome",
     "RegistrationPolicy",
     "RegistrationState",
     "SignalDispatcher",
     "SignalLogStore",
+    "RETRY",
     "SourceRegistry",
     "template_artifact_handler",
 ]

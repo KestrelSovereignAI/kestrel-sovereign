@@ -114,6 +114,11 @@ from kestrel_sovereign.signals.constitution_metrics import (
 )
 from kestrel_sovereign.signals.lock_manager import OrderedLockManager
 from kestrel_sovereign.signals.registry import RegistrationError, SourceRegistry
+from kestrel_sovereign.signals.durable import (
+    DurableConsumerRegistration,
+    DurableDelivery,
+    DurableSignalStore,
+)
 from kestrel_sovereign.signals.store import SignalLogStore
 from kestrel_sovereign.storage.db.write_audit import (
     capture_write_queries,
@@ -338,6 +343,7 @@ class SignalDispatcher:
         registry: SourceRegistry,
         lock_manager: OrderedLockManager,
         store: SignalLogStore,
+        durable_store: Optional[DurableSignalStore] = None,
         ttl: int = DEFAULT_TTL,
         coalescing_window_default: timedelta = DEFAULT_COALESCING_WINDOW,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
@@ -346,6 +352,13 @@ class SignalDispatcher:
         self._registry = registry
         self._locks = lock_manager
         self._store = store
+        # Keep outcome/audit persistence and pending-delivery persistence
+        # distinct.  Existing embeddings/tests construct only SignalLogStore;
+        # deriving the durable store from its backend preserves that seam while
+        # retaining one database transaction domain for each agent.
+        self._durable_store = durable_store or DurableSignalStore(store.backend)
+        self._durable_initialized = False
+        self._durable_init_lock = asyncio.Lock()
         self._ttl = ttl
         self._default_window = coalescing_window_default
         self._clock = clock
@@ -375,7 +388,9 @@ class SignalDispatcher:
             gap_seconds,
         )
 
-    async def dispatch_signal(self, signal: Signal) -> SignalResult:
+    async def dispatch_signal(
+        self, signal: Signal, *, source_event_id: Optional[str] = None
+    ) -> SignalResult:
         """Awaits the full lifecycle. Used by callers that need the result
         (scheduler, heartbeat). Always returns a `SignalResult` — failures
         are encoded as `Status.FAILED` with `error` set, never raised."""
@@ -392,7 +407,15 @@ class SignalDispatcher:
 
         ctx_token = set_current_signal(signal)
         try:
-            return await self._run(signal, start)
+            return await self._run(
+                signal,
+                start,
+                source_event_id=(
+                    source_event_id
+                    if source_event_id is not None
+                    else getattr(signal, "source_event_id", None)
+                ),
+            )
         except Exception as e:
             # Defensive — every failure path inside _run should already
             # produce a SignalResult. If we land here, log it loudly.
@@ -412,21 +435,124 @@ class SignalDispatcher:
         finally:
             reset_current_signal(ctx_token)
 
-    async def enqueue_signal(self, signal: Signal) -> SignalHandle:
+    async def enqueue_signal(
+        self, signal: Signal, *, source_event_id: Optional[str] = None
+    ) -> SignalHandle:
         """Returns immediately with a tracked handle. The dispatch runs as
         an agent-owned background task; exceptions are logged not swallowed,
         and the task is cancellable via the agent's shutdown path."""
-        coro = self.dispatch_signal(signal)
+        coro = self.dispatch_signal(signal, source_event_id=source_event_id)
         task = self._agent._track_background_task(
             coro, name=f"signal_dispatch:{signal.source}:{signal.id}"
         )
         return SignalHandle(signal_id=signal.id, task=task)
 
+    async def initialize_durable_delivery(self) -> None:
+        """Initialize the durable consumer ledger exactly once.
+
+        Agent boot calls this eagerly, while the guard in ``_run`` preserves
+        compatibility for embedding/test dispatchers that predate the ledger.
+        Initialization is complete before the first event is persisted.
+        """
+        if self._durable_initialized:
+            return
+        async with self._durable_init_lock:
+            if not self._durable_initialized:
+                await self._durable_store.initialize()
+                self._durable_initialized = True
+
+    async def register_durable_consumer(
+        self, registration: DurableConsumerRegistration
+    ) -> None:
+        """Register a scoped durable consumer for normalized signals.
+
+        Agent scope is authorization, not an advisory filter: a dispatcher
+        owns one DID and refuses to register a consumer for any other tenant.
+        """
+        if registration.agent_id != self._agent.did:
+            raise PermissionError(
+                "Durable consumer agent_id must match this dispatcher's agent"
+            )
+        await self.initialize_durable_delivery()
+        await self._durable_store.register_consumer(registration)
+
+    async def claim_durable_delivery(
+        self, *, consumer_id: str, executor_id: str
+    ) -> Optional[DurableDelivery]:
+        """Atomically claim one delivery for this agent-scoped consumer."""
+        await self.initialize_durable_delivery()
+        return await self._durable_store.claim_delivery(
+            agent_id=self._agent.did,
+            consumer_id=consumer_id,
+            executor_id=executor_id,
+        )
+
+    async def ack_durable_delivery(
+        self, *, consumer_id: str, delivery_id: str, lease_token: str
+    ) -> bool:
+        """Acknowledge a claimed delivery owned by this dispatcher."""
+        await self.initialize_durable_delivery()
+        return await self._durable_store.ack_delivery(
+            agent_id=self._agent.did,
+            consumer_id=consumer_id,
+            delivery_id=delivery_id,
+            lease_token=lease_token,
+        )
+
+    async def nack_durable_delivery(
+        self,
+        *,
+        consumer_id: str,
+        delivery_id: str,
+        lease_token: str,
+        error: str,
+        retry_delay: timedelta = timedelta(),
+        terminal: bool = False,
+    ) -> Optional[DurableDelivery]:
+        """Release a claimed delivery for a bounded retry or terminal failure."""
+        await self.initialize_durable_delivery()
+        return await self._durable_store.nack_delivery(
+            agent_id=self._agent.did,
+            consumer_id=consumer_id,
+            delivery_id=delivery_id,
+            lease_token=lease_token,
+            error=error,
+            retry_delay=retry_delay,
+            terminal=terminal,
+        )
+
+    async def list_durable_deliveries(
+        self,
+        *,
+        consumer_id: Optional[str] = None,
+        statuses: Optional[List[str]] = None,
+        limit: int = 100,
+    ) -> List[DurableDelivery]:
+        """Observe durable delivery state for this agent only."""
+        await self.initialize_durable_delivery()
+        return await self._durable_store.list_deliveries(
+            agent_id=self._agent.did,
+            consumer_id=consumer_id,
+            statuses=statuses,
+            limit=limit,
+        )
+
+    async def purge_expired_durable_deliveries(self) -> int:
+        """Run the durable-ledger retention sweep (terminal history only)."""
+        await self.initialize_durable_delivery()
+        return await self._durable_store.purge_expired()
+
     # ------------------------------------------------------------------
     # Pipeline
     # ------------------------------------------------------------------
 
-    async def _run(self, signal: Signal, start: float) -> SignalResult:
+    async def _run(
+        self,
+        signal: Signal,
+        start: float,
+        *,
+        source_event_id: Optional[str],
+    ) -> SignalResult:
         # Step 1: validation
         registration = self._registry.get(signal.source)
         if registration is None:
@@ -506,6 +632,43 @@ class SignalDispatcher:
                 registration=registration,
             )
         signal.causation_chain.append(new_frame)
+
+        # Durable delivery has a stricter boundary than signal_log: commit the
+        # normalized/sanitized envelope and materialized consumer deliveries
+        # before any handler, cognition turn, or external workflow executor can
+        # observe it.  Thus a process loss after this point is replayable.
+        try:
+            await self.initialize_durable_delivery()
+            persisted = await self._durable_store.persist_signal(
+                signal,
+                agent_id=self._agent.did,
+                source_event_id=source_event_id,
+                retention_days=registration.retention_days,
+            )
+        except Exception as exc:
+            logger.exception(
+                "Failed to persist durable signal event %s (source=%s)",
+                signal.id,
+                signal.source,
+            )
+            return self._fail(
+                signal,
+                start,
+                Status.FAILED,
+                error=f"Durable signal persistence failed: {type(exc).__name__}: {exc}",
+                registration=registration,
+            )
+        if not persisted.created:
+            return self._fail(
+                signal,
+                start,
+                Status.COALESCED,
+                error=(
+                    "Duplicate source event ID already accepted as "
+                    f"{persisted.event_id}"
+                ),
+                registration=registration,
+            )
 
         # Step 3: quiet-hours
         if self._in_quiet_hours(signal, registration.attention_policy):

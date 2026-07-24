@@ -182,3 +182,20 @@ async def test_trash_retention_falls_back_to_default_when_no_config():
 
     payload = json.loads(result)
     assert payload["retention_days"] == 30
+
+
+@pytest.mark.asyncio
+async def test_trash_retention_sweeps_terminal_durable_signal_history():
+    feature, _storage = _make_feature(privacy_mode="normal")
+    feature.agent.dispatcher = SimpleNamespace(
+        purge_expired_durable_deliveries=AsyncMock(return_value=3)
+    )
+
+    with patch(
+        "kestrel_sovereign.storage.retention.load_trash_config",
+        return_value={"conversation_history_days": 30},
+    ):
+        result = await feature._run_trash_retention({})
+
+    feature.agent.dispatcher.purge_expired_durable_deliveries.assert_awaited_once()
+    assert json.loads(result)["durable_signal_events_purged"] == 3

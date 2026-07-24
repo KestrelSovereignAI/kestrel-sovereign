@@ -569,7 +569,10 @@ class ChannelFeature(Feature):
                     message,
                     target_agent=getattr(self.agent, "did", self._agent_id),
                 )
-                await dispatcher.enqueue_signal(signal)
+                # Provider retries reuse the channel message ID.  Pass it as
+                # the durable source-event key so a retry cannot wake a
+                # workflow consumer twice after process restart.
+                await dispatcher.enqueue_signal(signal, source_event_id=message.id)
                 dispatched_signal = True
             except Exception:
                 logger.exception(

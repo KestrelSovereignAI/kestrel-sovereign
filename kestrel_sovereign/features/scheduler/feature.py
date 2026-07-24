@@ -944,11 +944,38 @@ class SchedulerFeature(Feature):
             resolve_retention_days,
         )
 
+        # Durable signal history has a source-specific deadline rather than
+        # the conversation-trash policy below.  It shares this periodic
+        # maintenance rail, but never lets a delivery-ledger failure block the
+        # unrelated conversation sweep (or vice versa).
+        durable_purged: Optional[int] = None
+        dispatcher = getattr(self.agent, "dispatcher", None)
+        if dispatcher is not None:
+            purge_durable = getattr(
+                dispatcher, "purge_expired_durable_deliveries", None
+            )
+            if callable(purge_durable):
+                try:
+                    durable_purged = await purge_durable()
+                except Exception as exc:
+                    logger.warning(
+                        "[retention] durable signal cleanup failed for agent=%s: %s",
+                        self._agent_id,
+                        exc,
+                    )
+
+        durable_summary = (
+            {"durable_signal_events_purged": durable_purged}
+            if durable_purged is not None
+            else {}
+        )
+
         storage = getattr(self.agent, "storage", None)
         if storage is None or not hasattr(storage, "purge_trash_older_than"):
             return json.dumps({
                 "skipped": True,
                 "reason": "storage facade missing purge_trash_older_than",
+                **durable_summary,
             })
 
         config = load_trash_config()
@@ -966,6 +993,7 @@ class SchedulerFeature(Feature):
                 "skipped": True,
                 "reason": "non-positive retention window",
                 "privacy_mode": privacy_mode,
+                **durable_summary,
             })
 
         max_rows = int(args.get("max_rows") or DEFAULT_MAX_ROWS_PER_SWEEP)
@@ -980,7 +1008,7 @@ class SchedulerFeature(Feature):
             logger.warning(
                 "[retention] agent=%s sweep failed: %s", self._agent_id, e,
             )
-            return json.dumps({"error": str(e)})
+            return json.dumps({"error": str(e), **durable_summary})
 
         if purged:
             logger.info(
@@ -994,6 +1022,7 @@ class SchedulerFeature(Feature):
             "retention_days": retention_days,
             "cutoff": cutoff_iso,
             "max_rows": max_rows,
+            **durable_summary,
         })
 
     # ------------------------------------------------------------------
