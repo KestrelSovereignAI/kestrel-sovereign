@@ -317,14 +317,41 @@ class LocalHostPeerDirectory:
         # An ambiguous display name must not select an arbitrary peer.
         return matches[0] if len(matches) == 1 else None
 
+    async def _authorize_peer(
+        self, requester: PeerRequester, peer: PeerIdentity,
+    ) -> PeerIdentity:
+        """Re-resolve a peer immediately before an operation.
+
+        The local host has no tenant policy of its own, but it still must
+        honour the router contract: a caller can retain or forge a
+        ``PeerIdentity`` after a prior lookup.  Fetching the directory again
+        makes removal or routing-key changes take effect before the URL is
+        constructed, and returning the current entry ensures we never route
+        using caller-provided identity fields.
+        """
+        if not isinstance(peer, PeerIdentity):
+            raise PeerProtocolError("Peer route requires a valid peer identity")
+        matches = [
+            candidate
+            for candidate in await self._directory_entries(requester)
+            if (
+                candidate.agent_id == peer.agent_id
+                and candidate.routing_key == peer.routing_key
+            )
+        ]
+        if len(matches) != 1:
+            raise PeerNotFoundError("Peer is not in the automatic directory")
+        return matches[0]
+
     async def invoke(
         self, requester: PeerRequester, peer: PeerIdentity, message: str,
     ) -> Mapping[str, Any]:
         self._require_requester(requester)
         try:
+            authorized_peer = await self._authorize_peer(requester, peer)
             async with self._client_factory() as client:
                 response = await client.post(
-                    self._peer_url(peer, "api/agent/invoke"),
+                    self._peer_url(authorized_peer, "api/agent/invoke"),
                     json={"input": message},
                     headers=self._headers(),
                     timeout=httpx.Timeout(
@@ -349,9 +376,10 @@ class LocalHostPeerDirectory:
     ) -> Mapping[str, Any]:
         self._require_requester(requester)
         try:
+            authorized_peer = await self._authorize_peer(requester, peer)
             async with self._client_factory() as client:
                 response = await client.post(
-                    self._peer_url(peer, "api/agent/tasks/send"),
+                    self._peer_url(authorized_peer, "api/agent/tasks/send"),
                     json=dict(payload),
                     headers=self._headers(),
                     timeout=httpx.Timeout(
@@ -373,9 +401,13 @@ class LocalHostPeerDirectory:
     ) -> Mapping[str, Any]:
         self._require_requester(requester)
         try:
+            authorized_peer = await self._authorize_peer(requester, peer)
             async with self._client_factory() as client:
                 response = await client.get(
-                    self._peer_url(peer, f"api/agent/tasks/{quote(task_id, safe='')}"),
+                    self._peer_url(
+                        authorized_peer,
+                        f"api/agent/tasks/{quote(task_id, safe='')}",
+                    ),
                     headers=self._headers(),
                     timeout=httpx.Timeout(
                         connect=PEER_CONNECT_TIMEOUT,
@@ -400,6 +432,7 @@ class LocalHostPeerDirectory:
         timeout_seconds: float,
     ) -> AsyncIterator[PeerSubscriptionEvent]:
         self._require_requester(requester)
+        authorized_peer = await self._authorize_peer(requester, peer)
         timeout = httpx.Timeout(
             connect=min(PEER_CONNECT_TIMEOUT, timeout_seconds),
             read=timeout_seconds,
@@ -411,7 +444,7 @@ class LocalHostPeerDirectory:
                 async with client.stream(
                     "GET",
                     self._peer_url(
-                        peer,
+                        authorized_peer,
                         f"api/agent/tasks/{quote(task_id, safe='')}/subscribe",
                     ),
                     headers=self._headers(),

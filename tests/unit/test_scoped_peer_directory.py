@@ -12,9 +12,11 @@ import pytest
 
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.peers.directory import (
+    LocalHostPeerDirectory,
     PeerAccessDeniedError,
     PeerDirectoryConfigurationError,
     PeerIdentity,
+    PeerNotFoundError,
     PeerRequester,
     PeerSubscriptionEvent,
 )
@@ -292,3 +294,40 @@ async def test_subscription_reauthorizes_after_resolution_and_hides_revocation_d
     signal = feature.agent.dispatcher.enqueue_signal.await_args.args[0]
     assert signal.payload["state"] == "failed"
     assert signal.payload["reply_text"] == "Peer task subscription is no longer authorized."
+
+
+@pytest.mark.asyncio
+async def test_local_host_reauthorizes_before_routing_and_rejects_forged_route_key():
+    """The default adapter must meet the same stale-identity contract.
+
+    A direct adapter caller is not normally a tool caller, but accepting its
+    stale or forged route key would make the default implementation weaker
+    than the documented provider protocol.
+    """
+    directory_response = MagicMock(status_code=200)
+    directory_response.raise_for_status.return_value = None
+    directory_response.json.return_value = [{
+        "id": "did:local:companion",
+        "name": "companion",
+        "routing_name": "actual-route",
+    }]
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.__aexit__.return_value = False
+    client.get.return_value = directory_response
+
+    adapter = LocalHostPeerDirectory(
+        "http://host",
+        client_factory=lambda *args, **kwargs: client,
+    )
+    requester = PeerRequester("did:local:caller", object())
+    forged_peer = PeerIdentity(
+        agent_id="did:local:companion",
+        slug="companion",
+        routing_key="forged-route",
+    )
+
+    with pytest.raises(PeerNotFoundError):
+        await adapter.invoke(requester, forged_peer, "should not route")
+
+    client.post.assert_not_awaited()

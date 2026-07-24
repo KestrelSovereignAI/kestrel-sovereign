@@ -224,7 +224,11 @@ def _async_client_with(post_resp=None, get_resp=None):
     if post_resp is not None:
         client.post.return_value = post_resp
     if get_resp is not None:
-        client.get.side_effect = [_mock_directory_response(), get_resp]
+        # The local adapter resolves once for the tool input, then
+        # reauthorizes the stable identity before fetching a task result.
+        client.get.side_effect = [
+            _mock_directory_response(), _mock_directory_response(), get_resp,
+        ]
     else:
         client.get.return_value = _mock_directory_response()
     return client
