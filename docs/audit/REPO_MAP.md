@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-07-23
-**Scope:** 2134 tracked files (1414 `.py`, 338 `.md`, 382 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-07-24
+**Scope:** 2139 tracked files (1419 `.py`, 338 `.md`, 382 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -1294,6 +1294,8 @@ Repo entry points and standard project files.
   - `class QualityMetrics`; `def cosine(a, b)`; `def rank_query()`; `def summarize(query_results)`; `async def evaluate(args)`; `def build_parser()`; `def main()`
 - **scripts/build_docs_site.py** — Project the OKF docs corpus into a published documentation site.
   - `def select_pages(docs_root)`; `def rewrite_local_images(body, src_dir, url_prefix)`; `def rewrite_local_links(body, src_dir)`; `class StarlightEmitter`; `class MintlifyEmitter`; `def build_site()`; `def main()`
+- **scripts/check_docs_links.py** — Check repository-local relative Markdown links for broken targets.
+  - `class Link`; `class BrokenLink`; `def github_slug(text)`; `class GithubSlugger`; `def anchors_for(text)`; `def extract_links(text)`; `def resolve_link(source, raw_target)`; `def check_text(source, text)`; `…`
 - **scripts/ci/__init__.py** — —
 - **scripts/ci/analyze_and_comment.py** — Analyze test feedback and post PR comment with insights.
   - `def get_feedback_entries(db_path)`; `def analyze_patterns(entries)`; `def format_pr_comment(insights, failures)`; `def post_pr_comment(comment)`; `def main()`
@@ -1347,7 +1349,7 @@ Repo entry points and standard project files.
   - `async def provision_agent_key(db_path, agent_label, limit_usd, limit_reset)`; `def parse_args()`
 - **scripts/public_repo_files/.gitignore** — —
 - **scripts/public_repo_files/CODE_OF_CONDUCT.md** — Contributor Covenant Code of Conduct — ## Our Pledge
-- **scripts/public_repo_files/CONTRIBUTING.md** — Contributing to Kestrel — ## Code of Conduct
+- **scripts/public_repo_files/CONTRIBUTING.md** — Contributing to Kestrel — Thank you for your interest in contributing.
 - **scripts/public_repo_files/LICENSE** — —
 - **scripts/public_repo_files/SECURITY.md** — Security Policy — ## Reporting a Vulnerability
 - **scripts/quantum_destroy_legacy_key.py** — Secure-delete the legacy ECDSA private key for an agent that has completed the hybrid-rotation ceremony — the documented step 7 of ``docs/architecture/security/SUCCESSION_RUNBOOK.md``.
@@ -1370,6 +1372,8 @@ Repo entry points and standard project files.
   - `async def main()`
 - **scripts/submit_nurse_gen.py** — Submit generation jobs to Vertex AI using GCS LoRAs.
   - `async def main()`
+- **scripts/sync_public_repo_files.py** — Synchronize public-repository mirrors of contributor-facing documents.
+  - `def render_public_contributing()`; `def contributing_copy_is_current()`; `def sync_contributing_copy()`; `def main()`
 - **scripts/sync_session_to_agent.py** — Sync a Claude Code session transcript into a kestrel agent's memory.
   - `def extract_messages(jsonl_path)`; `def content_hash(text)`; `def sync_to_agent(messages, db_path, agent_id)`; `def main()`
 - **scripts/talon_daemon.example.toml** — (configuration)
@@ -2489,6 +2493,8 @@ Repo entry points and standard project files.
   - `class TestContinuationCursor`; `class TestInMemoryContinuationStore`
 - **tests/unit/test_continuity_verifier.py** — Unit tests for the Continuity Verifier module.
   - `class TestIdentityChallenge`; `class TestChallengeResult`; `class TestContinuityScore`; `class TestMigrationCertificate`; `class TestChallengeGenerator`; `class TestContinuityVerifier`; `class TestAuditTrail`; `class TestVerifyMigration`
+- **tests/unit/test_contributing_canonicality.py** — Guard the contributor guide's public-repository mirror.
+  - `def test_public_contributing_copy_matches_canonical_guide()`; `def test_public_contributing_copy_has_public_provenance()`
 - **tests/unit/test_conversation_fulltext_search.py** — Full-text search over conversations (conversations-pane server search).
   - `class TestSearchSessionSummaries`; `async def store()`; `async def encrypted_store(monkeypatch)`; `class TestStoreSearchSessions`; `class TestPrivacyWrappedSearch`; `def test_conversations_endpoint_q_dispatches_to_search()`; `def test_conversations_endpoint_q_redacts_snippets_when_decrypt_false()`; `def test_conversations_endpoint_without_q_lists_normally()`
 - **tests/unit/test_conversation_lifecycle_tools.py** — Session-grain navigation + lifecycle, store and memory-tool layers (#2019).
@@ -2573,6 +2579,8 @@ Repo entry points and standard project files.
   - `class TestIsDockerNetwork`
 - **tests/unit/test_docs_okf.py** — Tests for OKF documentation metadata tooling.
   - `def test_split_frontmatter_parses_yaml_mapping()`; `def test_validate_opt_in_okf_file(tmp_path)`; `def test_validate_all_requires_frontmatter(tmp_path)`; `def test_inventory_includes_okf_metadata(tmp_path)`; `def test_resolve_input_paths_expands_directories(tmp_path)`; `def test_render_index_lists_okf_and_pending_docs(tmp_path)`; `def test_render_log_lists_timestamped_okf_docs(tmp_path)`; `def test_write_or_check_generated_indexes(tmp_path)`; `…`
+- **tests/unit/test_docs_relative_links.py** — Tests for the repository-local relative-link checker.
+  - `def repo(tmp_path, monkeypatch)`; `def test_github_slug_matches_github_rules()`; `def test_anchors_for_collects_headings_and_html_ids_but_not_fenced()`; `def test_duplicate_headings_get_github_style_suffixes()`; `def test_extract_links_handles_angle_brackets_parens_and_ref_defs()`; `def test_missing_file_is_reported_with_all_fields(repo)`; `def test_missing_anchor_is_reported(repo)`; `def test_valid_file_anchor_and_self_anchor_links_resolve(repo)`; `…`
 - **tests/unit/test_docs_verify.py** — Tests for documentation verification and render routing.
   - `def test_report_links_wrap_space_containing_targets()`; `def test_doc_relative_markdown_links_are_not_missing_code_refs()`; `def test_verification_outputs_are_current()`; `def test_committed_outputs_carry_no_head_relative_activity_data()`; `def test_generated_docs_have_no_volatile_link_or_code_refs()`; `def test_activity_view_is_live_and_separate()`
 - **tests/unit/test_docstring_parser.py** — Unit tests for docstring parameter parsing in features/base.py.
@@ -2935,6 +2943,8 @@ Repo entry points and standard project files.
   - `async def test_dispatch_direct_tool_executes_with_pre_tool_use_rewrite()`; `async def test_dispatch_feature_tool_executes_with_pre_tool_use_rewrite()`
 - **tests/unit/test_orphan_marker_deletable.py** — Orphaned new_session marker must not make a session undeletable (#2027).
   - `async def store()`; `async def test_orphan_marker_session_lists_but_now_deletes(store)`; `async def test_delete_only_touches_tagged_rows(store)`; `async def test_delete_restore_round_trip_includes_marker(store)`; `async def test_purge_destroys_marker_too(store)`; `async def test_healthy_session_delete_unchanged(store)`
+- **tests/unit/test_otel_export_isolation.py** — Regression guard for #2704: the test suite must never ship real OTLP spans.
+  - `def network_export_sentinel(monkeypatch)`; `def test_autouse_fixture_disables_llm_tracing_by_default()`; `def test_llm_span_cycle_never_exports_over_network(network_export_sentinel)`; `def test_endpoint_set_run_uses_in_memory_exporter_not_network(monkeypatch, network_export_sentinel)`
 - **tests/unit/test_ownership_backfill_once.py** — Regression: #2649 ownership backfills must run once, not on every from_pool.
   - `async def db(tmp_path)`; `async def test_first_init_records_marker(db)`; `async def test_backfills_skip_when_marker_present(db, monkeypatch)`; `async def test_backfills_rerun_if_marker_absent(db, monkeypatch)`; `async def test_document_chunk_backfill_assigns_only_single_owner_files(db)`
 - **tests/unit/test_path_safety.py** — Tests for path-safety primitives (#834).
