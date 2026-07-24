@@ -301,7 +301,13 @@ the normal route executes**.  After restart an active registration backfills
 any retained event that lacks a delivery, then claims it normally.  This is
 implemented with ordinary conditional updates and scoped predicates, so it
 has the same contract on standalone SQLite and hosted PostgreSQL; the latter
-does not rely on an application-side lock.
+does not rely on a process-local application lock.
+
+Registration and persistence also serialize their handoff at the
+`(agent_id, source)` scope.  Thus an event racing a new workflow subscription
+is either committed first and backfilled by that registration, or sees the
+committed consumer and creates its delivery directly; it cannot fall between
+the two transactions.
 
 ```python
 @dataclass

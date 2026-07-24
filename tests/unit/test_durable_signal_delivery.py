@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -306,3 +307,40 @@ async def test_nack_retry_lease_expiry_terminal_failure_and_retention_are_observ
     assert await store.purge_expired(now=now + timedelta(days=2)) == 1
     assert await store.list_deliveries(agent_id=agent_id) == []
     await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_registration_handoff_uses_a_transaction_scoped_scope_lock():
+    """Pin the PostgreSQL primitive; concurrency belongs to integration tests."""
+
+    class _PostgresBackend:
+        backend_type = "postgres"
+        fetch_val = AsyncMock(return_value=None)
+
+    store = DurableSignalStore(_PostgresBackend())
+    await store._lock_scope_handoff(
+        agent_id="did:agent:one", source="provider.message"
+    )
+
+    _PostgresBackend.fetch_val.assert_awaited_once_with(
+        "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+        ("durable-signal:did:agent:one:provider.message",),
+    )
+
+
+@pytest.mark.asyncio
+async def test_sqlite_registration_handoff_reserves_the_writer_slot_before_reads():
+    """Pin the SQLite primitive used by the cross-instance integration race."""
+
+    class _SQLiteBackend:
+        backend_type = "sqlite"
+        execute = AsyncMock(return_value=0)
+
+    store = DurableSignalStore(_SQLiteBackend())
+    await store._lock_scope_handoff(
+        agent_id="did:agent:one", source="provider.message"
+    )
+
+    _SQLiteBackend.execute.assert_awaited_once_with(
+        "DELETE FROM durable_signal_consumers WHERE 0"
+    )

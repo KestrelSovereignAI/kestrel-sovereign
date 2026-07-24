@@ -246,6 +246,17 @@ class DurableSignalStore(UnifiedStoreBase):
         self._validate_registration(registration)
         now = self.now_utc()
         async with self._backend.transaction():
+            # Consumer registration and event persistence must share one
+            # serialization point.  Without it on PostgreSQL, an event can
+            # commit after this transaction fails to see it during backfill
+            # while that event's consumer lookup still cannot see this
+            # uncommitted registration — permanently losing the delivery.
+            # SQLite's transaction writer lock is reserved explicitly below;
+            # the advisory transaction lock gives hosted PostgreSQL identical
+            # handoff semantics at the narrow (agent, source) scope.
+            await self._lock_scope_handoff(
+                agent_id=registration.agent_id, source=registration.source
+            )
             row = await self._backend.fetch_one(
                 f"""
                 SELECT source, correlation_selector, max_attempts,
@@ -311,6 +322,7 @@ class DurableSignalStore(UnifiedStoreBase):
         if retention_days < 0:
             raise ValueError("retention_days must be >= 0")
         self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("source", signal.source)
         source_event_id = self._normalize_source_event_id(source_event_id)
         now = self.now_utc()
         retention_until = now + timedelta(days=retention_days)
@@ -318,6 +330,7 @@ class DurableSignalStore(UnifiedStoreBase):
         chain_json = _json_dump(_serialize_chain(signal.causation_chain))
 
         async with self._backend.transaction():
+            await self._lock_scope_handoff(agent_id=agent_id, source=signal.source)
             inserted = await self._backend.execute(
                 f"""
                 INSERT OR IGNORE INTO {self.EVENTS} (
@@ -688,6 +701,33 @@ class DurableSignalStore(UnifiedStoreBase):
         if row is None:
             raise RuntimeError("durable event insert conflicted without an existing event")
         return row[0]
+
+    async def _lock_scope_handoff(self, *, agent_id: str, source: str) -> None:
+        """Serialize registration and persistence for one subscription scope.
+
+        PostgreSQL transactions otherwise use independent snapshots: a new
+        registration could backfill before a concurrent event commits, while
+        that event's consumer query runs before the registration commits.
+        ``pg_advisory_xact_lock`` keeps those two atomic handoff paths in one
+        order and releases automatically on commit or rollback.  SQLite
+        transactions begin deferred, so a no-op write reserves its one writer
+        slot before either handoff path can read stale state.  This matters
+        across backend instances: each instance's in-memory write lock is
+        local to that instance.
+        """
+        if self.is_postgres:
+            await self._backend.fetch_val(
+                "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+                (f"durable-signal:{agent_id}:{source}",),
+            )
+            return
+        if self._backend.backend_type == "sqlite":
+            await self._backend.execute(f"DELETE FROM {self.CONSUMERS} WHERE 0")
+            return
+        raise RuntimeError(
+            "Durable signal handoff serialization does not support backend "
+            f"{self._backend.backend_type!r}"
+        )
 
     async def _get_consumer(
         self, agent_id: str, consumer_id: str
