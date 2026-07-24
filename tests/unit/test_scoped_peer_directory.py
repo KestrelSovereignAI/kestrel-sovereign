@@ -1448,6 +1448,133 @@ async def test_local_all_reservation_writes_failed_never_fall_back_to_replacemen
 
 
 @pytest.mark.asyncio
+async def test_local_route_store_initialization_failure_never_routes_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    """A configured but uninitialized store is never legacy no-store mode.
+
+    If startup fails while preparing retained outbound-route state, a later
+    fetch or supervisor replay has no trustworthy binding for any old task.
+    It must refuse before resolving the caller-supplied display name, including
+    after that name has been reassigned to a replacement peer.
+    """
+    replacement = PeerIdentity(
+        agent_id="did:local:replacement",
+        slug="companion",
+        routing_key="replacement-route",
+        name="Companion",
+    )
+    fetched_from: list[str] = []
+    subscribed_to: list[str] = []
+    adapter = LocalHostPeerDirectory("http://local-host")
+    adapter.resolve_peer = AsyncMock(return_value=replacement)
+    adapter.resolve_peer_by_agent_id = AsyncMock(return_value=replacement)
+
+    async def _get_task(_requester, peer, _task_id):
+        fetched_from.append(peer.agent_id)
+        return {"status": "completed"}
+
+    async def _subscribe_task(
+        _requester, peer, task_id, *, timeout_seconds,
+    ):
+        del timeout_seconds
+        subscribed_to.append(peer.agent_id)
+        yield PeerSubscriptionEvent(
+            event="status",
+            data=(
+                '{"id":"' + task_id + '","status":{"state":"completed",'
+                '"message":{"parts":[{"text":"done"}]}}}'
+            ),
+        )
+
+    adapter.get_a2a_task = AsyncMock(side_effect=_get_task)
+    adapter.subscribe_a2a_task = _subscribe_task
+    requester = PeerRequester("did:local:caller", object())
+
+    def _agent() -> SimpleNamespace:
+        return SimpleNamespace(
+            _agent_name="caller",
+            did="did:local:caller",
+            peer_directory_router=adapter,
+            peer_requester=requester,
+            identity=None,
+            _provide_causation_chain=lambda: None,
+            _get_current_turn_id=lambda: None,
+            pending_a2a_questions=MagicMock(
+                mark_resolved=AsyncMock(return_value=True),
+            ),
+            dispatcher=MagicMock(enqueue_signal=AsyncMock()),
+            _track_background_task=lambda coro, *, name="": coro.close() or MagicMock(),
+        )
+
+    backend = SQLiteBackend(str(tmp_path / "local-route-store-init-failure.db"))
+    await backend.connect()
+
+    async def _fail_route_store_initialization(_db):
+        raise OSError("injected outbound route store initialization failure")
+
+    monkeypatch.setattr(
+        outbound_store,
+        "ensure_a2a_outbound_tasks_table",
+        _fail_route_store_initialization,
+    )
+
+    agent = _agent()
+    agent._raw_storage = SimpleNamespace(db=AsyncDatabase(backend))
+    agent.storage = None
+    feature = PeersFeature(agent)
+    await feature.initialize()
+    assert feature._outbound_route_store_ready is False
+
+    try:
+        task_id = "unbound-task-after-init-failure"
+        fetched = await feature.get_peer_task_result("companion", task_id)
+        assert fetched.status is ToolResultStatus.ERROR
+
+        await feature._supervise_a2a_question(
+            task_id=task_id,
+            recipient="companion",
+            recipient_agent_id=None,
+            original_question="status?",
+            sess_id="session-1",
+            deadline_utc=datetime.now(timezone.utc) + timedelta(seconds=5),
+            causation_chain=None,
+        )
+
+        # Simulate process restart: the persistent database remains configured
+        # but route-store initialization keeps failing, and the current
+        # automatic name now resolves only to the replacement.
+        restarted_agent = _agent()
+        restarted_agent._raw_storage = agent._raw_storage
+        restarted_agent.storage = None
+        restarted = PeersFeature(restarted_agent)
+        await restarted.initialize()
+        assert restarted._outbound_route_store_ready is False
+
+        fetched_after_restart = await restarted.get_peer_task_result(
+            "companion", task_id,
+        )
+        assert fetched_after_restart.status is ToolResultStatus.ERROR
+        await restarted._supervise_a2a_question(
+            task_id=task_id,
+            recipient="companion",
+            recipient_agent_id=None,
+            original_question="status?",
+            sess_id="session-1",
+            deadline_utc=datetime.now(timezone.utc) + timedelta(seconds=5),
+            causation_chain=None,
+        )
+
+        adapter.resolve_peer.assert_not_awaited()
+        adapter.resolve_peer_by_agent_id.assert_not_awaited()
+        assert fetched_from == []
+        assert subscribed_to == []
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
 async def test_subscription_reauthorizes_after_resolution_and_hides_revocation_details(
     tmp_path,
 ):

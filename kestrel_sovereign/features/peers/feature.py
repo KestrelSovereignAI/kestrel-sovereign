@@ -518,22 +518,30 @@ class PeersFeature(Feature):
     async def _outbound_recipient_agent_id(self, task_id: str) -> Optional[str]:
         """Read the stable recipient retained for one sender-owned task.
 
-        The outbound audit is optional for early-init/legacy local-host
-        agents, so an unavailable record there is represented as ``None`` and
-        uses the historical name/slug route.  Hosted routes are different:
-        they fail closed when the durable binding is absent or unreadable, so
-        a replacement peer can never receive a retained result fetch.
+        The outbound audit is optional only for true no-store legacy
+        local-host agents, so an unavailable record there is represented as
+        ``None`` and uses the historical name/slug route.  A configured store
+        that failed initialization is not equivalent to no store: it may have
+        lost the stable binding for a delivered task, so every retained route
+        must fail closed.  Hosted routes likewise fail closed when the durable
+        binding is absent or unreadable, so a replacement peer can never
+        receive a retained result fetch.
         """
         db = getattr(self, "_db", None)
-        if db is None or (
-            self._requires_durable_peer_binding()
-            and not getattr(self, "_outbound_route_store_ready", False)
-        ):
+        if db is None:
             if self._requires_durable_peer_binding():
                 raise PeerNotFoundError(
                     "No durable stable identity exists for this peer task"
                 )
             return None
+        # A database was supplied, but its outbound route store could not be
+        # initialized.  This is authoritative failure, not legacy no-store
+        # compatibility: resolving ``recipient`` here could route an old task
+        # to a same-name replacement peer after a restart.
+        if not getattr(self, "_outbound_route_store_ready", False):
+            raise PeerNotFoundError(
+                "No durable stable identity exists for this peer task"
+            )
         try:
             from kestrel_sovereign.a2a.outbound_store import (
                 OutboundTaskRouteAmbiguousError,
