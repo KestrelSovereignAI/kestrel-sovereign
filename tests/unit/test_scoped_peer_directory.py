@@ -456,7 +456,7 @@ async def test_hosted_identity_write_failure_cannot_route_replacement_after_rest
 async def test_hosted_rekey_failure_fails_closed_with_the_peer_task_id(
     tmp_path, monkeypatch,
 ):
-    """A hosted result must identify the delivered task if its binding fails."""
+    """A failed hosted rekey must not publish an unbound peer task id."""
     scope_a, scope_b = object(), object()
     peer_task_id = "peer-assigned-task-id"
     router = ScopedRouter(
@@ -478,10 +478,187 @@ async def test_hosted_rekey_failure_fails_closed_with_the_peer_task_id(
 
         assert rejected.status is ToolResultStatus.ERROR
         assert rejected.data["sent"] is True
-        assert rejected.data["task_id"] == peer_task_id
-        assert rejected.data["sender_task_id"] != peer_task_id
+        assert rejected.data["task_id"] != peer_task_id
+        assert "sender_task_id" not in rejected.data
         assert rejected.data["error_type"] == "peer_identity_persistence_failed"
         assert router.sent_to == ["did:tenant-a:companion"]
+
+        # The retained provisional record is a failed audit entry, not a
+        # routable fallback to the mutable display name.
+        fetched = await feature.get_peer_task_result(
+            "companion", rejected.data["task_id"],
+        )
+        assert fetched.status is ToolResultStatus.ERROR
+        assert router.fetched_from == []
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "marker_behavior",
+    [
+        pytest.param(0, id="zero-row-marker"),
+        pytest.param(OSError("transient marker failure"), id="marker-exception"),
+    ],
+)
+async def test_hosted_rekey_rejection_stays_unroutable_when_failure_marker_does_not_land(
+    tmp_path,
+    monkeypatch,
+    marker_behavior,
+):
+    """A failed lifecycle marker cannot turn a reservation into a route.
+
+    This is intentionally a restart test.  The original sender returns a
+    delivery warning after a peer id collision; the restarted process must
+    still reject both result fetch and subscription without consulting the
+    replacement peer's mutable display name.
+    """
+    scope_a, scope_b = object(), object()
+    router = ScopedRouter(
+        scope_a,
+        scope_b,
+        recipient_task_id="peer-assigned-task-id",
+    )
+    feature, backend = await _durable_feature_for_scope(
+        router, scope_a, tmp_path, database_name="marker-failure.db",
+    )
+    if isinstance(marker_behavior, BaseException):
+        marker = AsyncMock(side_effect=marker_behavior)
+    else:
+        marker = AsyncMock(return_value=marker_behavior)
+    monkeypatch.setattr(
+        outbound_store,
+        "rekey_outbound_task",
+        AsyncMock(return_value=0),
+    )
+    monkeypatch.setattr(outbound_store, "update_outbound_terminal_state", marker)
+
+    try:
+        rejected = await feature.send_a2a_task("companion", "sensitive work")
+        assert rejected.status is ToolResultStatus.ERROR
+        assert rejected.data["task_id"] != "peer-assigned-task-id"
+        marker.assert_awaited_once()
+
+        router.scope_a_entries = {
+            "companion": PeerIdentity(
+                agent_id="did:tenant-a:replacement",
+                slug="companion",
+                routing_key="a-replacement",
+                name="Companion",
+            ),
+        }
+        restarted = _feature_for_scope(router, scope_a)
+        restarted.agent._raw_storage = feature.agent._raw_storage
+        restarted.agent.storage = None
+        await restarted.initialize()
+
+        fetched = await restarted.get_peer_task_result(
+            "companion", rejected.data["task_id"],
+        )
+        await restarted._supervise_a2a_question(
+            task_id=rejected.data["task_id"],
+            recipient="companion",
+            recipient_agent_id="did:tenant-a:companion",
+            original_question="status?",
+            sess_id="session-1",
+            deadline_utc=datetime.now(timezone.utc) + timedelta(seconds=5),
+            causation_chain=None,
+        )
+
+        assert fetched.status is ToolResultStatus.ERROR
+        assert router.fetched_from == []
+        assert router.subscription_attempts == []
+        assert router.subscribed_to == []
+        assert router.resolve_calls == ["companion"]
+        assert router.resolve_by_agent_id_calls == []
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_hosted_remote_task_id_collision_preserves_owner_across_retry_and_restart(
+    tmp_path,
+):
+    """A peer-returned id cannot steal another task's retained route.
+
+    The first peer owns ``shared-task-id``. A second peer returning that same
+    id must fail closed: retrying or restarting cannot make fetches or
+    subscriptions reach the second peer, while the first task remains routed
+    through its original stable identity.
+    """
+    scope_a, scope_b = object(), object()
+    router = ScopedRouter(scope_a, scope_b, recipient_task_id="shared-task-id")
+    first = PeerIdentity(
+        agent_id="did:tenant-a:first",
+        slug="first",
+        routing_key="a-first",
+        name="First",
+    )
+    second = PeerIdentity(
+        agent_id="did:tenant-a:second",
+        slug="second",
+        routing_key="a-second",
+        name="Second",
+    )
+    router.scope_a_entries = {"first": first, "second": second}
+    feature, backend = await _durable_feature_for_scope(
+        router, scope_a, tmp_path, database_name="remote-task-id-collision.db",
+    )
+    try:
+        owner = await feature.send_a2a_task("first", "first task")
+        collided = await feature.send_a2a_task("second", "second task")
+        replayed_collision = await feature.send_a2a_task(
+            "second", "second task retry",
+        )
+
+        assert owner.status is ToolResultStatus.OK
+        assert owner.data["task_id"] == "shared-task-id"
+        assert collided.status is ToolResultStatus.ERROR
+        assert replayed_collision.status is ToolResultStatus.ERROR
+        assert collided.data["task_id"] != "shared-task-id"
+        assert replayed_collision.data["task_id"] != "shared-task-id"
+        assert router.sent_to == [first.agent_id, second.agent_id, second.agent_id]
+
+        # The original task id continues to belong only to the first peer.
+        fetched_owner = await feature.get_peer_task_result(
+            "first", "shared-task-id",
+        )
+        assert fetched_owner.status is ToolResultStatus.OK
+
+        # Neither collision's provisional audit id is a retained route. This
+        # prevents a result lookup from reaching the second peer with a task it
+        # cannot safely identify.
+        for rejected in (collided, replayed_collision):
+            fetched_rejected = await feature.get_peer_task_result(
+                "second", rejected.data["task_id"],
+            )
+            assert fetched_rejected.status is ToolResultStatus.ERROR
+
+        # A recreated feature sees the same retained owner binding. The
+        # surviving result fetch and replay subscription both stay on first.
+        restarted = _feature_for_scope(router, scope_a)
+        restarted.agent._raw_storage = feature.agent._raw_storage
+        restarted.agent.storage = None
+        await restarted.initialize()
+        fetched_after_restart = await restarted.get_peer_task_result(
+            "first", "shared-task-id",
+        )
+        assert fetched_after_restart.status is ToolResultStatus.OK
+        await restarted._supervise_a2a_question(
+            task_id="shared-task-id",
+            recipient="first",
+            recipient_agent_id=first.agent_id,
+            original_question="status?",
+            sess_id="session-1",
+            deadline_utc=datetime.now(timezone.utc) + timedelta(seconds=5),
+            causation_chain=None,
+        )
+
+        assert router.fetched_from == [first.agent_id, first.agent_id]
+        assert router.subscribed_to == [first.agent_id]
+        assert second.agent_id not in router.fetched_from
+        assert second.agent_id not in router.subscribed_to
     finally:
         await backend.close()
 
@@ -539,28 +716,78 @@ async def test_local_rekey_failure_keeps_the_delivered_task_successful(
 
 
 @pytest.mark.asyncio
-async def test_subscription_reauthorizes_after_resolution_and_hides_revocation_details():
+async def test_subscription_reauthorizes_after_resolution_and_hides_revocation_details(
+    tmp_path,
+):
     scope_a, scope_b = object(), object()
     router = ScopedRouter(scope_a, scope_b, deny_subscription=True)
-    feature = _feature_for_scope(router, scope_a)
-    await feature.initialize()
-
-    await feature._supervise_a2a_question(
-        task_id="task-1",
-        recipient="companion",
-        recipient_agent_id="did:tenant-a:companion",
-        original_question="status?",
-        sess_id="session-1",
-        deadline_utc=datetime.now(timezone.utc) + timedelta(seconds=5),
-        causation_chain=None,
+    feature, backend = await _durable_feature_for_scope(
+        router, scope_a, tmp_path, database_name="subscription-reauthorization.db",
     )
+    try:
+        submitted = await feature.send_a2a_task("companion", "status?")
+        assert submitted.status is ToolResultStatus.OK
 
-    assert router.subscription_attempts == ["did:tenant-a:companion"]
-    assert router.subscribed_to == []
-    feature.agent.pending_a2a_questions.mark_resolved.assert_awaited_once_with("task-1")
-    signal = feature.agent.dispatcher.enqueue_signal.await_args.args[0]
-    assert signal.payload["state"] == "failed"
-    assert signal.payload["reply_text"] == "Peer task subscription is no longer authorized."
+        await feature._supervise_a2a_question(
+            task_id=submitted.data["task_id"],
+            recipient="companion",
+            recipient_agent_id="did:tenant-a:companion",
+            original_question="status?",
+            sess_id="session-1",
+            deadline_utc=datetime.now(timezone.utc) + timedelta(seconds=5),
+            causation_chain=None,
+        )
+
+        assert router.subscription_attempts == ["did:tenant-a:companion"]
+        assert router.subscribed_to == []
+        feature.agent.pending_a2a_questions.mark_resolved.assert_awaited_once_with(
+            submitted.data["task_id"],
+        )
+        signal = feature.agent.dispatcher.enqueue_signal.await_args.args[0]
+        assert signal.payload["state"] == "failed"
+        assert (
+            signal.payload["reply_text"]
+            == "Peer task subscription is no longer authorized."
+        )
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_hosted_subscription_ignores_mismatched_pending_recipient_identity(
+    tmp_path,
+):
+    """A pending row/input cannot override the activated outbound binding."""
+    scope_a, scope_b = object(), object()
+    router = ScopedRouter(scope_a, scope_b)
+    feature, backend = await _durable_feature_for_scope(
+        router, scope_a, tmp_path, database_name="subscription-binding-source.db",
+    )
+    try:
+        submitted = await feature.send_a2a_task("companion", "status?")
+        assert submitted.status is ToolResultStatus.OK
+
+        await feature._supervise_a2a_question(
+            task_id=submitted.data["task_id"],
+            recipient="companion",
+            recipient_agent_id="did:tenant-a:replacement",
+            original_question="status?",
+            sess_id="session-1",
+            deadline_utc=datetime.now(timezone.utc) + timedelta(seconds=5),
+            causation_chain=None,
+        )
+
+        assert router.subscription_attempts == []
+        assert router.subscribed_to == []
+        assert router.resolve_by_agent_id_calls == []
+        signal = feature.agent.dispatcher.enqueue_signal.await_args.args[0]
+        assert signal.payload["state"] == "failed"
+        assert (
+            signal.payload["reply_text"]
+            == "Peer task subscription is no longer authorized."
+        )
+    finally:
+        await backend.close()
 
 
 @pytest.mark.asyncio

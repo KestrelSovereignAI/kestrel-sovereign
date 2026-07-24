@@ -309,9 +309,14 @@ class PeersFeature(Feature):
             ensure_a2a_outbound_tasks_table,
         )
         self._db = resolve_feature_database(self.agent)
+        # A hosted retained route is security-sensitive.  Keep a separate
+        # readiness bit because a partially-created table without its canonical
+        # route index is not an acceptable substitute for durable ownership.
+        self._outbound_route_store_ready = False
         if self._db is not None:
             try:
                 await ensure_a2a_outbound_tasks_table(self._db)
+                self._outbound_route_store_ready = True
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "PeersFeature: failed to ensure "
@@ -519,14 +524,21 @@ class PeersFeature(Feature):
         a replacement peer can never receive a retained result fetch.
         """
         db = getattr(self, "_db", None)
-        if db is None:
+        if db is None or (
+            self._requires_durable_peer_binding()
+            and not getattr(self, "_outbound_route_store_ready", False)
+        ):
             if self._requires_durable_peer_binding():
                 raise PeerNotFoundError(
                     "No durable stable identity exists for this peer task"
                 )
             return None
         try:
-            from kestrel_sovereign.a2a.outbound_store import get_outbound_task
+            from kestrel_sovereign.a2a.outbound_store import (
+                ROUTE_STATE_AMBIGUOUS,
+                ROUTE_STATE_ROUTABLE,
+                get_outbound_task,
+            )
 
             outbound = await get_outbound_task(
                 db,
@@ -546,7 +558,29 @@ class PeersFeature(Feature):
         recipient_agent_id = (
             outbound.recipient_agent_id if outbound is not None else None
         )
-        if not recipient_agent_id and self._requires_durable_peer_binding():
+        if (
+            outbound is not None
+            and outbound.route_state == ROUTE_STATE_AMBIGUOUS
+        ):
+            # Historical collisions are retained for audit but are never route
+            # keys.  Do not allow even the local compatibility adapter to turn
+            # their historical display name into a replacement-peer lookup.
+            raise PeerNotFoundError(
+                "No durable stable identity exists for this peer task"
+            )
+        if (
+            self._requires_durable_peer_binding()
+            and (
+                outbound is None
+                or outbound.route_state != ROUTE_STATE_ROUTABLE
+                or not recipient_agent_id
+            )
+        ):
+            # A hosted reservation starts non-routable and becomes routable
+            # only when one atomic rekey/activation accepted the peer task id.
+            # This is intentionally independent of the best-effort terminal
+            # audit marker: a marker write can fail without making a rejected
+            # reservation eligible for retained routing after restart.
             raise PeerNotFoundError(
                 "No durable stable identity exists for this peer task"
             )
@@ -875,6 +909,7 @@ class PeersFeature(Feature):
         async def _persist_outbound(
             error: Optional[str] = None,
             effective_task_id: Optional[str] = None,
+            route_state: str = "routable",
         ) -> Optional[Any]:
             """Persist the audit row.
 
@@ -888,6 +923,11 @@ class PeersFeature(Feature):
             """
             db = getattr(self, "_db", None)
             if db is None:
+                return None
+            if (
+                self._requires_durable_peer_binding()
+                and not getattr(self, "_outbound_route_store_ready", False)
+            ):
                 return None
             audit_id = effective_task_id or task_id
             # Scope the audit row to THIS agent (DID preferred, name
@@ -912,6 +952,7 @@ class PeersFeature(Feature):
                     dispatch_tool=dispatch_tool,
                     message=message,
                     error=error,
+                    route_state=route_state,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.debug(
@@ -1040,8 +1081,19 @@ class PeersFeature(Feature):
         # from ``recipient`` after restart could hand a result/subscription to
         # a same-name replacement peer.  Local-host audit persistence remains
         # deliberately best-effort for backwards compatibility.
-        reserved_outbound = await _persist_outbound()
         require_durable_binding = self._requires_durable_peer_binding()
+        from kestrel_sovereign.a2a.outbound_store import (
+            ROUTE_STATE_RESERVED,
+            ROUTE_STATE_ROUTABLE,
+        )
+
+        reserved_outbound = await _persist_outbound(
+            route_state=(
+                ROUTE_STATE_RESERVED
+                if require_durable_binding
+                else ROUTE_STATE_ROUTABLE
+            ),
+        )
         if require_durable_binding and reserved_outbound is None:
             logger.error(
                 "Refusing hosted A2A dispatch for task=%s: stable peer "
@@ -1060,7 +1112,13 @@ class PeersFeature(Feature):
             )
 
         async def _mark_dispatch_failed(error: str) -> None:
-            """Close a reserved dispatch without duplicating its audit row."""
+            """Record a failed dispatch without duplicating its audit row.
+
+            The reservation remains ``route_state='reserved'`` regardless of
+            whether this audit stamp lands.  That non-routable state, rather
+            than this best-effort lifecycle annotation, is the retained-route
+            denial invariant.
+            """
             if reserved_outbound is None:
                 await _persist_outbound(error=error)
                 return
@@ -1132,11 +1190,15 @@ class PeersFeature(Feature):
         task_data.setdefault("sessionId", sess_id)
         # A compliant recipient echoes our envelope id.  Older recipients can
         # return a different id; move the already-reserved binding to that id
-        # atomically before exposing it to the caller.  If the move fails,
-        # the recipient may have accepted work but no retained route is
-        # allowed to degrade into a display-name lookup.
+        # atomically before exposing it to the caller.  Hosted reservations
+        # run this transition even for an echoed id, because it is the single
+        # durable ``reserved -> routable`` state change.  If it fails, the
+        # recipient may have accepted work but no retained route is allowed to
+        # degrade into a display-name lookup.
         effective_task_id = str(task_data.get("id") or task_id)
-        if reserved_outbound is not None and effective_task_id != task_id:
+        if reserved_outbound is not None and (
+            effective_task_id != task_id or require_durable_binding
+        ):
             try:
                 from kestrel_sovereign.a2a.outbound_store import (
                     rekey_outbound_task,
@@ -1150,6 +1212,8 @@ class PeersFeature(Feature):
                     ),
                     old_task_id=task_id,
                     new_task_id=effective_task_id,
+                    recipient_agent_id=resolved_peer_agent_id,
+                    activate=require_durable_binding,
                 )
             except Exception as exc:  # noqa: BLE001 - storage boundary
                 logger.error(
@@ -1168,12 +1232,14 @@ class PeersFeature(Feature):
                         data={
                             "sent": True,
                             "recipient": recipient,
-                            # The peer assigned this id and it is the only id
-                            # the caller can use to query the delivered task.
-                            "task_id": effective_task_id,
-                            # Keep the sender-generated correlation id for
-                            # diagnostics without misleading retained callers.
-                            "sender_task_id": task_id,
+                            # Do not expose the peer-returned id here. It may
+                            # already belong to a different retained task; a
+                            # caller who used it later would retrieve that
+                            # task through its valid, but unrelated, stable
+                            # recipient binding.  The provisional id is an
+                            # audit correlation only and remains non-routable
+                            # even when the best-effort failure stamp fails.
+                            "task_id": task_id,
                             "error_type": "peer_identity_persistence_failed",
                         },
                     )
@@ -1835,6 +1901,36 @@ class PeersFeature(Feature):
         backoff_idx = 0
         state: Optional[str] = None
         reply_text = ""
+
+        # Pending-question rows are correlation/audit state, not route
+        # authority.  In a hosted runtime the only retained-route authority is
+        # the outbound reservation that was atomically activated after peer
+        # acceptance.  Re-read it here rather than trusting a value passed by
+        # the immediate-send path or a restart replay row; otherwise a stale
+        # or tampered pending row could retarget the background subscription.
+        if self._requires_durable_peer_binding():
+            try:
+                durable_recipient_agent_id = (
+                    await self._outbound_recipient_agent_id(task_id)
+                )
+                if (
+                    recipient_agent_id is not None
+                    and recipient_agent_id != durable_recipient_agent_id
+                ):
+                    raise PeerNotFoundError(
+                        "Pending question recipient does not match outbound route"
+                    )
+                recipient_agent_id = durable_recipient_agent_id
+            except (
+                PeerNotFoundError,
+                PeerAccessDeniedError,
+                PeerSelfTargetError,
+            ):
+                state = "failed"
+                reply_text = "Peer task subscription is no longer authorized."
+            except PeerDirectoryConfigurationError:
+                state = "failed"
+                reply_text = "Peer routing is no longer configured safely."
 
         def _remaining() -> float:
             return max(

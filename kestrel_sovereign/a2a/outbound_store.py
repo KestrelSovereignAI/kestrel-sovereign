@@ -44,6 +44,24 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from kestrel_sovereign.storage.db.interface import QueryError
+
+
+ROUTE_STATE_RESERVED = "reserved"
+"""A hosted dispatch has a stable recipient but no accepted peer task id yet."""
+
+ROUTE_STATE_ROUTABLE = "routable"
+"""The stable recipient and peer task id form a safe retained route."""
+
+ROUTE_STATE_AMBIGUOUS = "ambiguous"
+"""A historical duplicate route which must never be selected for routing."""
+
+_ROUTE_STATES = frozenset({
+    ROUTE_STATE_RESERVED,
+    ROUTE_STATE_ROUTABLE,
+    ROUTE_STATE_AMBIGUOUS,
+})
+
 
 @dataclass(frozen=True)
 class OutboundTask:
@@ -60,6 +78,7 @@ class OutboundTask:
     dispatch_tool: str
     message_summary: Optional[str]
     created_at: str
+    route_state: str
     terminal_state: Optional[str]
     terminal_at: Optional[str]
     error: Optional[str]
@@ -76,6 +95,7 @@ class OutboundTask:
             "dispatch_tool": self.dispatch_tool,
             "message_summary": self.message_summary,
             "created_at": self.created_at,
+            "route_state": self.route_state,
             "terminal_state": self.terminal_state,
             "terminal_at": self.terminal_at,
             "error": self.error,
@@ -98,6 +118,9 @@ async def ensure_a2a_outbound_tasks_table(db) -> None:
             dispatch_tool TEXT NOT NULL,
             message_summary TEXT,
             created_at TEXT NOT NULL,
+            route_state TEXT NOT NULL DEFAULT 'routable' CHECK (
+                route_state IN ('reserved', 'routable', 'ambiguous')
+            ),
             terminal_state TEXT,
             terminal_at TEXT,
             error TEXT
@@ -110,6 +133,43 @@ async def ensure_a2a_outbound_tasks_table(db) -> None:
     # core schema migrations.  NULL remains the explicit legacy marker.
     await db._migrate_add_column(
         "a2a_outbound_tasks", "recipient_agent_id", "TEXT DEFAULT NULL",
+    )
+    # Older rows were created before retained-route authorization existed.
+    # Treat a unique historical task id as routable for local-host backwards
+    # compatibility, but quarantine every historical collision before adding
+    # the canonical-owner constraint below.  Keeping the rows preserves audit
+    # history; marking them ambiguous makes ``get_outbound_task`` fail closed.
+    await db._migrate_add_column(
+        "a2a_outbound_tasks",
+        "route_state",
+        "TEXT NOT NULL DEFAULT 'routable'",
+    )
+    await db.execute(
+        """
+        UPDATE a2a_outbound_tasks
+        SET route_state = 'ambiguous'
+        WHERE route_state = 'routable'
+          AND (agent_id, task_id) IN (
+              SELECT agent_id, task_id
+              FROM a2a_outbound_tasks
+              WHERE route_state = 'routable'
+              GROUP BY agent_id, task_id
+              HAVING COUNT(*) > 1
+          )
+        """
+    )
+    # ``NOT EXISTS`` in a rekey UPDATE is only a snapshot predicate.  It is
+    # not an ownership invariant under PostgreSQL's READ COMMITTED isolation:
+    # two concurrent rekeys can both observe no owner.  The partial unique
+    # index makes only one route canonical.  Reserved rows intentionally do
+    # not participate until their peer task id is accepted; ambiguous legacy
+    # rows remain preserved but non-routable.
+    await db.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_a2a_outbound_tasks_canonical_route
+        ON a2a_outbound_tasks(agent_id, task_id)
+        WHERE route_state = 'routable'
+        """
     )
     # Per-agent recency listing — the introspection surface, and the
     # multi-agent shared-backend safety guard (codex review #1576
@@ -167,6 +227,7 @@ async def record_outbound_dispatch(
     skill_id: Optional[str] = None,
     message: Optional[str] = None,
     error: Optional[str] = None,
+    route_state: str = ROUTE_STATE_ROUTABLE,
 ) -> OutboundTask:
     """Persist one outbound-dispatch audit row.
 
@@ -175,11 +236,24 @@ async def record_outbound_dispatch(
     Postgres (codex review #1576 round 3 P1). Without it, one agent
     would see / update another agent's outbound rows.
 
-    ``error`` is populated when the dispatch itself failed at the
-    transport layer (the peer was unreachable, returned 5xx, etc.);
-    in that case ``terminal_state`` is also set so the row is
-    self-describing.
+    ``error`` is populated when the dispatch itself failed at the transport
+    layer (the peer was unreachable, returned 5xx, etc.); in that case
+    ``terminal_state`` is also set so the row is self-describing.
+
+    Hosted callers reserve with ``route_state='reserved'`` before they send
+    anything.  A reservation is deliberately non-routable even though it has
+    a stable recipient: the peer has not yet accepted a canonical task id.
+    ``rekey_outbound_task(..., activate=True)`` is the only state transition
+    to ``'routable'``.
     """
+    if route_state not in _ROUTE_STATES:
+        raise ValueError(f"Unknown outbound route state: {route_state!r}")
+    if route_state == ROUTE_STATE_RESERVED and (
+        not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip()
+    ):
+        raise ValueError(
+            "A reserved outbound route requires a stable recipient identity"
+        )
     row_id = uuid.uuid4().hex
     now = datetime.now(timezone.utc).isoformat()
     terminal_state = "dispatch_failed" if error else None
@@ -188,15 +262,15 @@ async def record_outbound_dispatch(
         """
         INSERT INTO a2a_outbound_tasks (
             id, agent_id, task_id, recipient, recipient_agent_id, verb, session_id,
-            skill_id, dispatch_tool, message_summary, created_at,
+            skill_id, dispatch_tool, message_summary, created_at, route_state,
             terminal_state, terminal_at, error
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             row_id, agent_id, task_id, recipient, recipient_agent_id, verb, session_id,
             skill_id, dispatch_tool, _summarize_message(message), now,
-            terminal_state, terminal_at, error,
+            route_state, terminal_state, terminal_at, error,
         ),
     )
     return OutboundTask(
@@ -211,6 +285,7 @@ async def record_outbound_dispatch(
         dispatch_tool=dispatch_tool,
         message_summary=_summarize_message(message),
         created_at=now,
+        route_state=route_state,
         terminal_state=terminal_state,
         terminal_at=terminal_at,
         error=error,
@@ -261,41 +336,60 @@ async def rekey_outbound_task(
     agent_id: str,
     old_task_id: str,
     new_task_id: str,
+    recipient_agent_id: str,
+    activate: bool = False,
 ) -> int:
-    """Atomically associate a reserved route with a peer-echoed task id.
+    """Atomically move an outbound id and optionally activate its route.
 
     An A2A sender includes its UUID in the envelope and compliant peers echo
     it.  This narrow migration path preserves compatibility with older peers
-    that return a different id: the already-reserved stable recipient binding
-    moves only when the exact sender-owned row is still present.  A caller
-    must treat a zero-row result as a failed dispatch rather than route a
-    retained request by a display name.
+    that return a different id: the stable recipient binding moves only when
+    the exact sender-owned row still has the recipient identity that was
+    authorized for the delivery.  With ``activate=True`` (the hosted path),
+    this is also the sole ``reserved -> routable`` transition and therefore
+    runs even if the peer echoed ``old_task_id`` unchanged.  A caller must
+    treat a zero-row result as a failed dispatch rather than route a retained
+    request by a display name.
+
+    In particular, a peer-controlled response must not be able to reuse an id
+    already bound to another outbound task.  The unique canonical-route index
+    enforces that invariant under concurrency; a uniqueness conflict is a
+    failed rekey which leaves the source reservation intact.
     """
-    if new_task_id == old_task_id:
-        return 1
-    affected = await db.execute(
-        """
-        UPDATE a2a_outbound_tasks
-        SET task_id = ?
-        WHERE id = ? AND agent_id = ? AND task_id = ?
-          AND NOT EXISTS (
-              SELECT 1
-              FROM a2a_outbound_tasks AS existing
-              WHERE existing.agent_id = ?
-                AND existing.task_id = ?
-                AND existing.id <> ?
-          )
-        """,
-        (
-            new_task_id,
-            record_id,
-            agent_id,
-            old_task_id,
-            agent_id,
-            new_task_id,
-            record_id,
-        ),
+    if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
+        raise ValueError("recipient_agent_id must be a non-empty stable identity")
+    expected_route_state = (
+        ROUTE_STATE_RESERVED if activate else ROUTE_STATE_ROUTABLE
     )
+    try:
+        affected = await db.execute(
+            """
+            UPDATE a2a_outbound_tasks
+            SET task_id = ?, route_state = ?
+            WHERE id = ? AND agent_id = ? AND task_id = ?
+              AND recipient_agent_id = ? AND route_state = ?
+            """,
+            (
+                new_task_id,
+                ROUTE_STATE_ROUTABLE,
+                record_id,
+                agent_id,
+                old_task_id,
+                recipient_agent_id,
+                expected_route_state,
+            ),
+        )
+    except QueryError as exc:
+        # Backends wrap their native integrity errors differently.  The two
+        # supported forms share these substrings (SQLite: ``UNIQUE constraint
+        # failed``; PostgreSQL: ``duplicate key value violates unique
+        # constraint``).  A collision is an expected failed rekey, not a
+        # storage outage.  Other failures propagate so callers can report the
+        # failed durable binding without pretending it was a collision.
+        message = str(exc).lower()
+        if "unique constraint" in message or "duplicate key value" in message:
+            return 0
+        raise
     if isinstance(affected, int):
         return affected
     return int(getattr(affected, "rowcount", 0) or 0)
@@ -313,21 +407,28 @@ async def get_outbound_task(
     used at dispatch has changed.  The stored stable identity is intentionally
     internal: callers receive the historical display recipient through the
     normal public task view, while routing uses this field only after the
-    router reauthorizes it in the current requester scope.
+    router reauthorizes it in the current requester scope.  Returns ``None``
+    for a missing or ambiguous historical key so a fetch never picks an
+    arbitrary recipient.
     """
     rows = await db.fetchall(
         """
         SELECT id, agent_id, task_id, recipient, recipient_agent_id,
                verb, session_id, skill_id, dispatch_tool, message_summary,
-               created_at, terminal_state, terminal_at, error
+               created_at, route_state, terminal_state, terminal_at, error
         FROM a2a_outbound_tasks
         WHERE agent_id = ? AND task_id = ?
         ORDER BY created_at DESC
-        LIMIT 1
+        LIMIT 2
         """,
         (agent_id, task_id),
     )
-    if not rows:
+    # A retained task id is a capability-like route key.  A historical or
+    # externally-corrupted duplicate must never make us arbitrarily select a
+    # newer row and thereby redirect a result fetch to another peer.  New
+    # rekeys reject this state atomically; this guard protects old databases
+    # too without deleting either audit record.
+    if len(rows) != 1:
         return None
     return _outbound_task_from_row(rows[0])
 
@@ -365,7 +466,7 @@ async def list_outbound_tasks(
         f"""
         SELECT id, agent_id, task_id, recipient, recipient_agent_id,
                verb, session_id, skill_id, dispatch_tool, message_summary,
-               created_at, terminal_state, terminal_at, error
+               created_at, route_state, terminal_state, terminal_at, error
         FROM a2a_outbound_tasks
         {where}
         ORDER BY created_at DESC
@@ -382,6 +483,6 @@ def _outbound_task_from_row(row) -> OutboundTask:
         id=row[0], agent_id=row[1], task_id=row[2], recipient=row[3],
         recipient_agent_id=row[4], verb=row[5], session_id=row[6],
         skill_id=row[7], dispatch_tool=row[8], message_summary=row[9],
-        created_at=row[10], terminal_state=row[11], terminal_at=row[12],
-        error=row[13],
+        created_at=row[10], route_state=row[11], terminal_state=row[12],
+        terminal_at=row[13], error=row[14],
     )
