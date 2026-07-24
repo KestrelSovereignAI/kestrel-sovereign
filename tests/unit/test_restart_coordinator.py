@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import pytest_asyncio
 
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.restart_coordinator import (
@@ -96,6 +97,57 @@ class _StubRegistry:
         return self.by_name.get(name)
 
 
+_test_databases: list[tuple[AsyncDatabase, object]] = []
+_real_dispatch_lifecycles: list[tuple[object, object]] = []
+
+
+def _sqlite_worker_is_alive(connection: object) -> bool:
+    """Support both aiosqlite worker-thread ownership models.
+
+    aiosqlite 0.22 stores its worker on ``Connection._thread``; older releases
+    subclassed ``Thread`` directly.  The lifecycle contract is identical.
+    """
+    worker = getattr(connection, "_thread", connection)
+    return bool(worker.is_alive())
+
+
+def _track_test_database(db: AsyncDatabase) -> AsyncDatabase:
+    """Register a test-owned database for closure before its test loop ends."""
+    connection = db._backend._connection
+    assert connection is not None
+    _test_databases.append((db, connection))
+    return db
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _close_test_owned_resources():
+    """Model production ownership: stop wakes before closing their database.
+
+    ``SignalDispatcher`` owns the dispatch task through the agent and the
+    restart feature owns its acknowledgement task.  Closing SQLite first lets
+    either task submit work to an event loop that pytest has already torn down,
+    which is the same lifecycle inversion that made these tests flaky under
+    xdist.
+    """
+    _test_databases.clear()
+    _real_dispatch_lifecycles.clear()
+    try:
+        yield
+    finally:
+        for feature, agent in reversed(_real_dispatch_lifecycles):
+            await feature.shutdown()
+            await agent.shutdown()
+
+        for database, connection in reversed(_test_databases):
+            await database.close()
+            assert not _sqlite_worker_is_alive(connection), (
+                "test-owned aiosqlite worker survived database shutdown"
+            )
+
+        _test_databases.clear()
+        _real_dispatch_lifecycles.clear()
+
+
 async def _backend(tmp_path):
     """Wrap SQLiteBackend in AsyncDatabase to match the production
     surface ``resolve_feature_database`` returns. ``AsyncDatabase``
@@ -104,7 +156,7 @@ async def _backend(tmp_path):
     """
     raw = SQLiteBackend(str(tmp_path / "restart.db"))
     await raw.connect()
-    db = AsyncDatabase(raw)
+    db = _track_test_database(AsyncDatabase(raw))
     await ensure_restart_requests_table(db)
     return db
 
@@ -1062,6 +1114,16 @@ class _RealDispatchAgent:
                 break
             await asyncio.gather(*pending, return_exceptions=True)
 
+    async def shutdown(self):
+        """Mirror the production ordering: tasks first, storage second."""
+        tasks = set(self.background_tasks)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await self._raw_storage.db.close()
+
 
 async def _real_dispatch_feature(tmp_path, **kwargs):
     """Build a RestartCoordinatorFeature wired to a real SignalDispatcher.
@@ -1094,6 +1156,7 @@ async def _real_dispatch_feature(tmp_path, **kwargs):
     agent.dispatcher = dispatcher
 
     feat = RestartCoordinatorFeature(agent)
+    _real_dispatch_lifecycles.append((feat, agent))
     return feat, backend, agent
 
 
@@ -1116,14 +1179,15 @@ async def test_post_restart_wake_reaches_process_input_and_then_completes(
     )
 
     await feat.initialize()
-    await feat.on_agent_ready()  # fires the post-restart wake now the agent is ready
+    wake_tasks = await feat.on_agent_ready()
     # The restart is terminalized immediately (it provably happened); the wake
     # runs as a supervised background task, so wake_delivered is still 0.
     row_mid = await get_request(backend, req.id)
     assert row_mid.status == "completed"
     assert row_mid.wake_delivered is False
 
-    await agent.drain_background_tasks()
+    assert len(wake_tasks) == 1
+    await asyncio.gather(*wake_tasks)
 
     # The wake reached the agent's resuming turn...
     assert len(agent.process_input_calls) == 1
@@ -1152,12 +1216,30 @@ async def test_post_restart_wake_failure_leaves_row_retryable(tmp_path):
     )
 
     await feat.initialize()
-    await feat.on_agent_ready()
-    await agent.drain_background_tasks()
+    wake_tasks = await feat.on_agent_ready()
+    assert len(wake_tasks) == 1
+    await asyncio.gather(*wake_tasks)
 
     row = await get_request(backend, req.id)
     assert row.status == "completed"        # restart finished
     assert row.wake_delivered is False      # wake failed → retried later
+
+
+@pytest.mark.asyncio
+async def test_real_dispatch_shutdown_closes_database_worker_before_loop_teardown(
+    tmp_path,
+):
+    """Wake tasks finish before the agent releases its SQLite connection."""
+    feat, backend, _agent = await _real_dispatch_feature(tmp_path)
+    connection = backend._backend._connection
+    assert connection is not None and _sqlite_worker_is_alive(connection)
+
+    await feat.initialize()
+    await feat.shutdown()
+    await _agent.shutdown()
+
+    assert backend._backend.is_connected is False
+    assert not _sqlite_worker_is_alive(connection)
 
 
 @pytest.mark.asyncio
@@ -2222,7 +2304,7 @@ async def test_migration_backfills_wake_delivered_for_old_completed_rows(tmp_pat
     the new sweep doesn't re-wake all restart history on first boot."""
     raw = SQLiteBackend(str(tmp_path / "old.db"))
     await raw.connect()
-    db = AsyncDatabase(raw)
+    db = _track_test_database(AsyncDatabase(raw))
     # Pre-#1819 schema: every column EXCEPT wake_delivered.
     await db.execute(
         """
