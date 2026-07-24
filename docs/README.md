@@ -31,7 +31,7 @@ This directory holds detailed documentation for kestrel-sovereign. The top-level
 
 ## Architecture & engineering
 
-- **[`architecture/README.md`](architecture/README.md)** — full architecture index with status flags (Active / Experimental / Aspirational), grouped by Core / Memory / Security / Features / Cloud / Wallets / Tools / Testing
+- **[`architecture/README.md`](architecture/README.md)** — revalidated route map from architecture documents to current module/package owners, with implementation contracts separated from planning, strategy, and historical references
 - **[`audit/README.md`](audit/README.md)** — engineering quality program: feature proof matrices, seam campaigns, sync/async audit, issue-body archive. Actively maintained.
 - **[`SOVEREIGNTY.md`](SOVEREIGNTY.md)** — architectural context for the sovereignty model
 - **[`development/`](development/)** — developer environment, dev container, internal notes
