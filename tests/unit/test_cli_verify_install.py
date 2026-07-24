@@ -336,19 +336,19 @@ def test_install_targets_use_pypi_packages_not_dead_local_paths(monkeypatch):
 
     # Tests 3/4/5 are now driven by the feature registry instead of
     # hardcoding specific package names: every package registered with
-    # ``core = false`` must appear as a pip install target. This wires
+    # ``boundary = "feature-package"`` must appear as a pip install target. This wires
     # the verifier to whatever the registry currently considers
     # extracted, so a new extraction is auto-verified the moment its
     # registry entry flips and no extraction can quietly drift away
     # from CI coverage.
     extracted = mod._extracted_feature_packages()
     assert extracted, (
-        "feature_registry.toml must declare at least one core = false "
+        "feature_registry.toml must declare at least one feature-package "
         "package, otherwise Tests 3/4/5 have nothing to verify."
     )
     for package, _classes in extracted:
         assert package in pip_install_targets, (
-            f"registry says {package!r} is extracted (core = false) but "
+            f"registry says {package!r} is an extracted Feature package but "
             f"pip install was never invoked for it across Tests 3/4/5. "
             f"Check the registry-driven iteration in cli_verify_install."
         )

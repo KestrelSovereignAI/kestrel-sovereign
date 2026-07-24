@@ -28,6 +28,15 @@ Rules:
 - If the generated output is wrong, fix the canonical source or the generator prompts.
 - Check metadata with `uv run python scripts/generate_feature_docs.py --check`.
 
+Audience prose is an LLM transformation and therefore cannot be regenerated
+byte-for-byte in CI: it requires an external provider credential/model and
+records the generation time and selected model. Package ownership is different.
+The canonical protected boundary section is inserted verbatim by the generator,
+and `--check` deterministically rejects a missing/stale section or prose that
+promotes a named extracted Feature, provider, or standalone surface to bundled
+status. CI can therefore enforce ownership even though it cannot reproduce the
+surrounding audience prose.
+
 Files:
 
 - [`FEATURES_developer.md`](FEATURES_developer.md)

@@ -46,9 +46,10 @@ def _resolve_feature_name(name: str, registry: dict) -> Optional[str]:
         ):
             return pkg_name
 
-    # Feature class name match
+    # Feature lifecycle or provider implementation class-name match.
     for pkg_name, info in registry.items():
-        if name in info.features:
+        components = getattr(info, "runtime_components", info.features)
+        if name in components:
             return pkg_name
 
     return None
@@ -769,17 +770,18 @@ def cmd_feature_status(args) -> int:
             return 1
 
     # Resolve each manifest entry to its install action (shared with `sync`)
-    # plus whether it's a loadable Feature vs a provider. Feature-vs-provider
-    # is decided from the registry by class-name convention (Feature classes
-    # end in "Feature"; providers like OpenAITTSProvider do not) — independent
-    # of install state, so a not-yet-installed feature still gets an agent row.
+    # plus whether it participates in the Feature lifecycle. The registry's
+    # explicit package boundary owns this decision; class-name suffixes do not.
+    from kestrel_sovereign.feature_registry import PackageBoundary
+
     targets = []
     for entry in entries:
         info = _registry_info_for(entry["name"], registry)
         target, current, action = _resolve_manifest_action(entry, registry)
-        is_feature = bool(info) and any(
-            c.endswith("Feature") for c in (info.features or [])
-        )
+        is_feature = bool(info) and info.boundary in {
+            PackageBoundary.BUNDLED,
+            PackageBoundary.FEATURE_PACKAGE,
+        }
         targets.append(
             {
                 "display": info.name if info else entry["name"],
@@ -972,6 +974,7 @@ def cmd_feature_info(args) -> int:
     print(f"  {'─' * 40}")
     print(f"  Description:  {info.description}")
     print(f"  Package:      {info.package}")
+    print(f"  Boundary:     {info.boundary.value}")
     print(f"  Status:       {info.status.value}")
     print(f"  Core:         {'yes' if info.core else 'no'}")
     print(f"  Git:          {info.git}")
@@ -981,6 +984,10 @@ def cmd_feature_info(args) -> int:
 
     if info.features:
         print(f"  Features:     {', '.join(info.features)}")
+    if info.provider_classes:
+        print(f"  Providers:    {', '.join(info.provider_classes)}")
+    if info.command:
+        print(f"  Command:      {info.command}")
 
     if info.skills:
         print(f"\n  Skills:")

@@ -15,10 +15,22 @@ import types
 import pytest
 
 from kestrel_sovereign import cli
+from kestrel_sovereign.feature_registry import PackageBoundary
 
 
-def _info(name, package, features):
-    return types.SimpleNamespace(name=name, package=package, features=features, git="")
+def _info(
+    name,
+    package,
+    features,
+    boundary=PackageBoundary.FEATURE_PACKAGE,
+):
+    return types.SimpleNamespace(
+        name=name,
+        package=package,
+        features=features,
+        boundary=boundary,
+        git="",
+    )
 
 
 @pytest.fixture
@@ -26,11 +38,12 @@ def fake_registry(monkeypatch):
     registry = {
         "github": _info("github", "kestrel-feature-github", ["GitHubFeature"]),
         "voice": _info("voice", "kestrel-feature-voice", ["VoiceFeature"]),
-        # Provider: registry lists provider classes under `features`, none of
-        # which end in "Feature" — so it must NOT be treated as a per-agent feature.
+        # Provider implementations have their own explicit boundary and are
+        # never treated as per-agent Feature lifecycle classes.
         "voice_openai": _info(
             "voice_openai", "kestrel-voice-openai",
-            ["OpenAITTSProvider", "OpenAISTTProvider"],
+            [],
+            PackageBoundary.PROVIDER_PACKAGE,
         ),
     }
     import kestrel_sovereign.feature_registry as fr

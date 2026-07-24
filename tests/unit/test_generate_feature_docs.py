@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from datetime import datetime, timezone
 
+import pytest
 import yaml
 
 from scripts import generate_feature_docs
@@ -57,6 +58,67 @@ def test_okf_frontmatter_for_generated_docs_is_deterministic():
 
 def test_checked_in_generated_docs_have_okf_metadata():
     assert generate_feature_docs.check_generated_docs() == 0
+
+
+def test_compose_generated_body_preserves_boundary_contract_verbatim():
+    source = generate_feature_docs.SOURCE_FILE.read_text(encoding="utf-8")
+    contract = generate_feature_docs.extract_boundary_contract(source)
+    aliases = generate_feature_docs.extract_non_bundled_surface_aliases(
+        contract
+    )
+
+    body = generate_feature_docs.compose_generated_body(
+        source,
+        f"{contract}\n\n# Audience view\n\nA neutral capability summary.",
+    )
+
+    assert body.count(contract) == 1
+    assert body.startswith(contract)
+    assert "# Audience view" in body
+    assert aliases["voice"] == ("voice",)
+    assert aliases["github integration"] == (
+        "github integration",
+        "github app",
+    )
+
+
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "Voice is a built-in capability.",
+        "The core feature inventory includes Wallet.",
+        "RunPod is a native integration.",
+        "The kestrel-talon command ships with the base framework.",
+    ],
+)
+def test_generator_rejects_non_bundled_surface_promotions(claim):
+    source = generate_feature_docs.SOURCE_FILE.read_text(encoding="utf-8")
+
+    with pytest.raises(ValueError, match="contradicts package ownership"):
+        generate_feature_docs.compose_generated_body(source, claim)
+
+
+def test_checked_in_docs_copy_the_canonical_boundary_contract_verbatim():
+    source = generate_feature_docs.SOURCE_FILE.read_text(encoding="utf-8")
+    contract = generate_feature_docs.extract_boundary_contract(source)
+
+    for audience in generate_feature_docs.AUDIENCES:
+        path = (
+            generate_feature_docs.OUTPUT_DIR
+            / f"FEATURES_{audience}.md"
+        )
+        assert path.read_text(encoding="utf-8").count(contract) == 1
+
+
+def test_generated_docs_explain_why_full_regeneration_is_not_deterministic_ci():
+    readme = (
+        generate_feature_docs.OUTPUT_DIR / "README.md"
+    ).read_text(encoding="utf-8")
+
+    assert "cannot be regenerated" in readme
+    assert "byte-for-byte in CI" in readme
+    assert "requires an external provider credential/model" in readme
+    assert "--check" in readme
 
 
 def test_generator_uses_provider_default_resolution_for_anthropic():

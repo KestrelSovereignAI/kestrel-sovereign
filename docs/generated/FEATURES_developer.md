@@ -18,6 +18,46 @@ model: anthropic/claude-sonnet-4-6
 regenerate: uv run python scripts/generate_feature_docs.py --audience developer
 ---
 
+<!-- BEGIN PROTECTED PACKAGE BOUNDARY CONTRACT -->
+## Package Ownership and Installation Boundaries
+
+These ownership statements are normative and must remain intact in every
+audience-specific derivative:
+
+<!-- NON_BUNDLED_SURFACE_ALIASES: voice; mcp; github integration|github app; wallet; observability; council; visual identity; legal feature; code editing|code edit; parametric self; whatsapp; runpod; vast.ai|vastai; gcp compute; elevenlabs; deepgram; kestrel-talon -->
+
+- **Bundled Feature lifecycle modules:** Feature subclasses discovered from
+  `kestrel_sovereign/features/` ship in the `kestrel-sovereign` distribution.
+  They need no separate package install. The generated inventory below is the
+  exact in-tree discovery snapshot.
+- **Bundled non-Feature components:** Some base-install runtime services, such
+  as `PrivacyAgent`, are shipped by `kestrel-sovereign` but are not Feature
+  lifecycle classes. The registry labels these `bundled-component` rather than
+  putting them in its `features` field.
+- **Not bundled — extracted Feature packages:** Voice, MCP, GitHub integration,
+  wallet, observability, reflection, council, visual identity, legal, code
+  editing, parametric self, and WhatsApp transport are separate install targets.
+  They register Feature subclasses through the `kestrel_sovereign.features`
+  entry-point group.
+- **Not bundled — provider packages:** ElevenLabs, Deepgram, OpenAI voice, xAI
+  voice/realtime, RunPod, Vast.ai, GCP Compute, and external storage backends
+  implement provider contracts. They use provider-specific entry-point groups;
+  installing one does not make that provider a Feature lifecycle class.
+- **Not bundled — standalone tool:** `kestrel-talon` is an independently
+  installed command-line issue processor. The in-tree `TalonCoordinatorFeature`
+  is only its bundled Kestrel control surface; the coordinator and the
+  standalone executable are separately named registry rows.
+
+The runtime catalog at `kestrel_sovereign/data/feature_registry.toml` encodes
+these distinctions in `boundary`. Its `package` field is always the owning
+distribution/install target for that row. The compatibility field `core` is
+`true` only for `bundled` and `bundled-component` rows. `features` contains
+Feature lifecycle class names only; provider implementations use
+`provider_classes` plus `entry_point_groups`, and standalone tools use
+`command`. Catalog status `available` means “known but not detected in this
+environment,” not a claim that an external distribution is publicly reachable.
+<!-- END PROTECTED PACKAGE BOUNDARY CONTRACT -->
+
 # Kestrel Sovereign — Developer Feature Reference
 
 > **Source of truth:** [`KESTREL_FEATURES.md`](KESTREL_FEATURES.md)
@@ -111,19 +151,20 @@ Read or set the active preset at `GET /agent/privacy-mode` / `POST /agent/privac
 
 Features are discovered from two sources:
 
-1. **Core features** — modules under `kestrel_sovereign/features/` that export a `Feature` subclass (single-file modules, package `__init__.py`, or package `feature.py`). Only modules with a discoverable `Feature` subclass are retained.
-2. **Entrypoint features** — installed via pip and registered as `kestrel_sovereign.features` entry points. Discovered at runtime via `discover_entrypoint_feature_classes()`. On duplicate class names, core features win.
+1. **Bundled Feature modules** — modules under `kestrel_sovereign/features/` that export a `Feature` subclass (single-file modules, package `__init__.py`, or package `feature.py`). Only modules with a discoverable `Feature` subclass are retained.
+2. **Extracted Feature packages** — installed via pip and registered as `kestrel_sovereign.features` entry points. Discovered at runtime via `discover_entrypoint_feature_classes()`. On duplicate class names, bundled modules win.
 
 > **Note:** Some support packages reside under `kestrel_sovereign/features/` but are not discoverable features because they do not export a `Feature` subclass.
 
 > **Quick start:** Inspect the live feature inventory at `GET /api/features` and `GET /api/features/installed`. Manage individual features at `POST /api/features/{name}/enable` and `POST /api/features/{name}/disable`.
 
-### Core Feature Inventory
+### Bundled Feature Inventory
 
-Audited snapshot: **34** discoverable modules · **34** exported `Feature` subclasses.
+Audited snapshot: **37** discoverable modules · **37** exported `Feature` subclasses.
 
 | Module | Exported class |
 |---|---|
+| `attachments` | `AttachmentsFeature` |
 | `audit_anchor` | `AuditAnchorFeature` |
 | `bootstrap` | `BootstrapFeature` |
 | `bridge` | `BridgeFeature` |
@@ -143,20 +184,22 @@ Audited snapshot: **34** discoverable modules · **34** exported `Feature` subcl
 | `model` | `ModelAgent` |
 | `peers` | `PeersFeature` |
 | `response_audit` | `ResponseAuditFeature` |
+| `restart_coordinator` | `RestartCoordinatorFeature` |
 | `save` | `SaveFeature` |
 | `scheduler` | `SchedulerFeature` |
 | `security` | `SecurityFeature` |
+| `skills` | `SkillsFeature` |
 | `sovereignty` | `SovereigntyFeature` |
 | `spawn` | `SpawnFeature` |
 | `state_of_mind` | `StateOfMindFeature` |
 | `strategic_memory` | `StrategicMemoryFeature` |
 | `talon` | `TalonCoordinatorFeature` |
 | `tasks` | `TaskFeature` |
-| `voice` | `VoiceFeature` |
+| `todo` | `TodoFeature` |
+| `wait` | `WaitFeature` |
 | `web_search` | `WebSearchFeature` |
 | `webhooks` | `WebhookFeature` |
 | `wellness` | `WellnessFeature` |
-| `workflows` | `WorkflowsFeature` |
 
 ---
 
@@ -340,18 +383,6 @@ bearer JWT, or OAuth session and returns operator diagnostics.
 | `POST` | `/api/saved-items/structured` |
 | `POST` | `/api/saved-items/search` |
 | `POST` | `/api/saved-items/{item_id}/pin` |
-
-#### [`endpoints/voice.py`](endpoints/voice.py)
-
-| Method | Path |
-|---|---|
-| `GET` | `/voice/voices` |
-| `GET` | `/voice/config` |
-| `POST` | `/voice/config` |
-| `POST` | `/voice/tts` |
-| `POST` | `/voice/tts/stream` |
-| `POST` | `/voice/stt` |
-| `WebSocket` | `/voice/chat` |
 
 #### [`endpoints/features.py`](endpoints/features.py)
 

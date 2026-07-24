@@ -32,8 +32,16 @@ Before diving in, understand the hierarchy:
 | **Feature** | A skill bundle — a `Feature` subclass grouping related tools, hooks, and endpoints |
 | **Feature package** | A deployment unit — one or more features packaged as a pip-installable package and registered through the feature entry-point group |
 | **Provider package** | A backend implementation package registered through a provider-specific entry-point group, such as cloud, voice, or storage providers |
+| **Standalone tool** | An independently installed command or companion control surface with no Feature/provider entry point |
 
 A feature is the fundamental unit of extensibility in Kestrel. It groups related capabilities into a single class that the agent discovers and loads automatically.
+
+Do not infer ownership from a capability name. A lifecycle class can be bundled
+in `kestrel-sovereign` or supplied by an extracted Feature package; a provider
+implements a backend contract rather than the Feature lifecycle; and a
+standalone executable may only be controlled by a separate bundled Feature.
+The canonical taxonomy is in
+[`KESTREL_FEATURES.md`](../../KESTREL_FEATURES.md#package-ownership-and-installation-boundaries).
 
 ## The Feature Contract
 
@@ -654,13 +662,16 @@ Each feature directory should include a `SKILL.md` file — a human-readable and
 
 ## Submitting to the Feature Registry
 
-The feature registry at `kestrel_sovereign/data/feature_registry.toml` is the static catalog of all known features. To add your feature:
+The registry at `kestrel_sovereign/data/feature_registry.toml` is the static,
+boundary-typed catalog of known capabilities and related install targets. To
+add your Feature package:
 
 1. Open a PR to the `kestrel-sovereign` repository
 2. Add an entry to `feature_registry.toml`:
 
 ```toml
 [greeter]
+boundary = "feature-package"
 package = "kestrel-feature-greeter"
 git = "https://github.com/your-org/kestrel-feature-greeter.git"
 features = ["GreeterFeature"]
@@ -677,20 +688,31 @@ greet = { description = "Greet a user by name", category = "utility", tags = ["g
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `package` | Yes | pip package name |
+| `boundary` | Yes | Ownership/runtime category: `bundled`, `bundled-component`, `feature-package`, `provider-package`, or `standalone-tool` |
+| `package` | Yes | Owning distribution and install target for this row; never a merely related package |
 | `git` | Yes | Source repository URL |
-| `features` | Yes | List of Feature class names in this package |
+| `features` | Boundary-specific | Feature lifecycle class names; required for `bundled` and `feature-package`, empty otherwise |
+| `bundled_components` | Boundary-specific | Shipped non-Feature class names; required only for `bundled-component` |
+| `provider_classes` | Boundary-specific | Provider implementation class names; required only for `provider-package` |
+| `entry_point_groups` | Boundary-specific | Provider-specific discovery groups; required only for `provider-package` |
+| `command` | Boundary-specific | Installed executable; required only for `standalone-tool` |
+| `provider_for` | No | Stable registry ID of the Feature/provider contract this provider package serves |
+| `companion` | No | Stable registry ID of a separately modeled standalone companion |
 | `description` | Yes | Human-readable summary |
 | `tags` | Yes | List of tags for filtering/search |
 | `icon` | No | Icon identifier for UI rendering |
-| `core` | No | `true` if shipped with kestrel-sovereign itself |
+| `core` | Yes | Compatibility field: `true` exactly for `bundled`/`bundled-component`, `false` otherwise |
 | `skills` | No | Per-skill declarations for static discovery |
 
 **Runtime status** is computed automatically:
-- `available` — listed in registry but package not installed
-- `installed` — package installed via entry point but not enabled
+- `available` — known to the catalog but not detected in this environment; this is not a publication/reachability claim
+- `installed` — bundled, advertised by its declared extension entry point, or (for a standalone tool) present as a distribution
 - `enabled` — loaded and active
 - `disabled` — explicitly disabled via `KESTREL_DISABLED_FEATURES`
+
+`enabled` and `disabled` are Feature lifecycle states. Provider and standalone
+rows do not become Feature classes merely because their distribution is
+installed.
 
 ### Feature Packages vs Provider Packages
 
@@ -702,10 +724,9 @@ GreeterFeature = "kestrel_feature_greeter.feature:GreeterFeature"
 ```
 
 Provider packages are different: they implement an SDK provider contract and
-register with that provider's entry-point group. Do not add provider classes to
-`features = [...]` in `feature_registry.toml` unless they are actual
-`Feature` lifecycle classes. For example, cloud deployment providers register
-with:
+register with that provider's entry-point group. Put their implementation names
+in `provider_classes`, never in `features`. For example, a cloud deployment
+provider registers with:
 
 ```toml
 [project.entry-points."kestrel_sovereign.cloud_providers"]
@@ -731,6 +752,29 @@ MyRealtime = "my_voice_package.realtime:MyConversationProvider"
 The legacy `kestrel_sovereign.voice_providers` group is still discovered for
 already-published providers, but new TTS/STT packages should use
 `kestrel_feature_voice_providers`.
+
+A provider catalog row makes that ownership explicit:
+
+```toml
+[my_voice_backend]
+boundary = "provider-package"
+package = "my-voice-backend"
+git = "https://example.com/my-voice-backend.git"
+features = []
+provider_classes = ["MyTTSProvider"]
+entry_point_groups = ["kestrel_feature_voice_providers"]
+provider_for = "voice"
+description = "Example TTS backend"
+tags = ["voice", "provider"]
+icon = "microphone"
+core = false
+```
+
+Standalone tools have no lifecycle/provider classes. Model them separately
+from any bundled control surface. The registry’s Talon rows are the reference:
+`talon` owns the bundled `TalonCoordinatorFeature` and points to
+`companion = "talon_cli"`; `talon_cli` owns the independently installed
+`kestrel-talon` command.
 
 ## Complete Example
 
