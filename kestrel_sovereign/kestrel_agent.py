@@ -21,7 +21,7 @@ from kestrel_sovereign.llm.adapter import LLMResponse
 from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
 from kestrel_sovereign.config import TRUSTED_AGENTS_DIR
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
-from typing import Optional, Dict, List, Any, Union
+from typing import Optional, Dict, List, Any, TYPE_CHECKING, Union
 import re
 from pathlib import Path
 from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
@@ -82,6 +82,12 @@ from kestrel_sovereign.telemetry import (
     OI_SPAN_KIND_CHAIN,
     optional_span,
 )
+
+if TYPE_CHECKING:
+    from kestrel_sovereign.features.peers.directory import (
+        PeerDirectoryRouter,
+        PeerRequester,
+    )
 
 # Optional ollama import (not available in remote-only containers)
 try:
@@ -446,6 +452,8 @@ class KestrelAgent(
         sync_enabled: Optional[bool] = None,
         payer_policy=None,
         host_db=None,
+        peer_directory_router: Optional["PeerDirectoryRouter"] = None,
+        peer_requester: Optional["PeerRequester"] = None,
         sovereign_trust_root_path: Optional[str] = None,
         identity_export_dir: Optional[Path] = None,
     ):
@@ -478,6 +486,13 @@ class KestrelAgent(
                        a host on Postgres supply the host db directly (e.g.
                        ``AsyncDatabase.from_pool(pg_pool)``). The caller owns its
                        lifecycle; the agent does not close it.
+            peer_directory_router: Optional hosted peer-directory/router.  When
+                       supplied it replaces the local multi-agent HTTP adapter
+                       used by ``PeersFeature``.
+            peer_requester: Host-authenticated stable requester identity plus
+                       opaque authorization scope for ``peer_directory_router``.
+                       This is injected by the embedding runtime, never derived
+                       from a tool caller or user-id field.
             sovereign_trust_root_path: Optional operator-owned JSON DID-document
                        path used to authorize constitution reanchor artifacts.
                        When omitted, the shared resolver reads
@@ -510,6 +525,12 @@ class KestrelAgent(
         # on-disk host.db lookups during credential resolution at init.
         self._injected_payer_policy = payer_policy
         self._injected_host_db = host_db
+        # Scoped peer routing is an explicit dependency-injection seam for
+        # hosted multi-tenant runtimes.  PeersFeature validates the pair at
+        # initialization; keeping the opaque scope here avoids serializing it
+        # into agent state or accepting any caller-controlled substitute.
+        self.peer_directory_router = peer_directory_router
+        self.peer_requester = peer_requester
         self._sovereign_trust_root_path = sovereign_trust_root_path
         self.identity_export_dir = identity_export_dir
 

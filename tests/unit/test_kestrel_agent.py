@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from decimal import Decimal
 
+from kestrel_sovereign.features.peers.directory import PeerRequester
 from kestrel_sovereign.kestrel_agent import KestrelAgent, _load_prompt_file
 from kestrel_sovereign.storage import AsyncStorage, PrivacyEnforcingStorage
 from kestrel_sovereign.agent.streaming import (
@@ -216,6 +217,26 @@ class TestKestrelAgentInit:
         assert agent.storage_path == db_path
         assert agent._privacy_mode == PrivacyMode.ISOLATED
         assert agent.agent_id == did
+
+    def test_init_retains_injected_scoped_peer_dependencies(self, tmp_path):
+        """Hosted embedding supplies a router plus trusted opaque scope once."""
+        router = object()
+        scope = object()
+        requester = PeerRequester(
+            identity="did:test:caller",
+            authorization_scope=scope,
+        )
+
+        agent = KestrelAgent(
+            did="did:test:caller",
+            storage_path=str(tmp_path / "test.db"),
+            peer_directory_router=router,
+            peer_requester=requester,
+        )
+
+        assert agent.peer_directory_router is router
+        assert agent.peer_requester is requester
+        assert agent.peer_requester.authorization_scope is scope
 
     def test_init_defaults_to_normal_privacy_mode(self, tmp_path):
         """Default privacy mode is NORMAL."""
