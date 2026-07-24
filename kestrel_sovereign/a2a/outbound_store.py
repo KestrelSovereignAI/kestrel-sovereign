@@ -19,8 +19,9 @@ Each row carries the assertion Emma pinned in #1576:
 
 Lifecycle:
 
-* ``record_outbound_dispatch`` — write at the moment of successful
-  POST (or after a transport-layer failure with ``error`` populated).
+* ``record_outbound_dispatch`` — reserve the sender-owned task id and stable
+  recipient identity before a hosted router accepts delivery.  Local-host
+  callers may also use it as their best-effort outbound audit write.
 * ``update_outbound_terminal_state`` — invoked when the agent fetches
   the peer's result via ``get_peer_task_result`` and learns the final
   state, OR when the dispatch itself failed (we already know the
@@ -248,6 +249,53 @@ async def update_outbound_terminal_state(
     # AsyncDatabase.execute returns rows-affected as int. Older test
     # doubles may return a cursor-like object with .rowcount, or None;
     # bound defensively.
+    if isinstance(affected, int):
+        return affected
+    return int(getattr(affected, "rowcount", 0) or 0)
+
+
+async def rekey_outbound_task(
+    db,
+    *,
+    record_id: str,
+    agent_id: str,
+    old_task_id: str,
+    new_task_id: str,
+) -> int:
+    """Atomically associate a reserved route with a peer-echoed task id.
+
+    An A2A sender includes its UUID in the envelope and compliant peers echo
+    it.  This narrow migration path preserves compatibility with older peers
+    that return a different id: the already-reserved stable recipient binding
+    moves only when the exact sender-owned row is still present.  A caller
+    must treat a zero-row result as a failed dispatch rather than route a
+    retained request by a display name.
+    """
+    if new_task_id == old_task_id:
+        return 1
+    affected = await db.execute(
+        """
+        UPDATE a2a_outbound_tasks
+        SET task_id = ?
+        WHERE id = ? AND agent_id = ? AND task_id = ?
+          AND NOT EXISTS (
+              SELECT 1
+              FROM a2a_outbound_tasks AS existing
+              WHERE existing.agent_id = ?
+                AND existing.task_id = ?
+                AND existing.id <> ?
+          )
+        """,
+        (
+            new_task_id,
+            record_id,
+            agent_id,
+            old_task_id,
+            agent_id,
+            new_task_id,
+            record_id,
+        ),
+    )
     if isinstance(affected, int):
         return affected
     return int(getattr(affected, "rowcount", 0) or 0)

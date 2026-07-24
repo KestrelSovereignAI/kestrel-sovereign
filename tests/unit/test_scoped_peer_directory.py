@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from kestrel_sdk.tools.result import ToolResultStatus
+from kestrel_sovereign.a2a import outbound_store
 from kestrel_sovereign.features.peers.directory import (
     LocalHostPeerDirectory,
     PeerAccessDeniedError,
@@ -21,6 +22,8 @@ from kestrel_sovereign.features.peers.directory import (
     PeerSubscriptionEvent,
 )
 from kestrel_sovereign.features.peers.feature import PeersFeature
+from kestrel_sovereign.storage.async_database import AsyncDatabase
+from kestrel_sovereign.storage.db import SQLiteBackend
 
 
 @dataclass
@@ -41,6 +44,7 @@ class ScopedRouter:
     unexpected_resolution_failure: bool = False
     malformed_listing: bool = False
     malformed_invoke_result: bool = False
+    recipient_task_id: Optional[str] = None
 
     def _directory(self, requester: PeerRequester) -> dict[str, PeerIdentity]:
         if requester.authorization_scope is self.scope_a:
@@ -112,7 +116,7 @@ class ScopedRouter:
         self._authorize(requester, peer)
         self.sent_to.append(peer.agent_id)
         return {
-            "id": payload["id"],
+            "id": self.recipient_task_id or payload["id"],
             "sessionId": payload["sessionId"],
             "status": {"state": "submitted"},
         }
@@ -169,6 +173,23 @@ def _feature_for_scope(router: ScopedRouter, scope: object) -> PeersFeature:
     return feature
 
 
+async def _durable_feature_for_scope(
+    router: ScopedRouter,
+    scope: object,
+    tmp_path,
+    *,
+    database_name: str,
+) -> tuple[PeersFeature, SQLiteBackend]:
+    """Build a hosted feature with the durable outbound-route store it needs."""
+    feature = _feature_for_scope(router, scope)
+    backend = SQLiteBackend(str(tmp_path / database_name))
+    await backend.connect()
+    feature.agent._raw_storage = SimpleNamespace(db=AsyncDatabase(backend))
+    feature.agent.storage = None
+    await feature.initialize()
+    return feature, backend
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("inject_router", [True, False])
 async def test_hosted_router_and_requester_must_be_injected_as_a_pair(inject_router):
@@ -190,41 +211,47 @@ async def test_hosted_router_and_requester_must_be_injected_as_a_pair(inject_rou
 
 
 @pytest.mark.asyncio
-async def test_duplicate_peer_names_resolve_to_the_callers_scoped_stable_identity():
+async def test_duplicate_peer_names_resolve_to_the_callers_scoped_stable_identity(tmp_path):
     scope_a, scope_b = object(), object()
     router = ScopedRouter(scope_a, scope_b)
-    feature = _feature_for_scope(router, scope_a)
-    await feature.initialize()
-
-    peers = await feature.list_peers()
-    assert peers.status is ToolResultStatus.OK
-    assert peers.data["peers"] == [
-        {
-            "name": "Companion",
-            "slug": "companion",
-            "status": "online",
-            "description": "",
-        },
-    ]
-
-    invoked = await feature.ask_agent("companion", "tenant-a question")
-    fetched = await feature.get_peer_task_result("companion", "result-a")
-
-    result = await feature.send_a2a_task("companion", "tenant-a work")
-    other_scope_feature = _feature_for_scope(router, scope_b)
-    await other_scope_feature.initialize()
-    other_scope_result = await other_scope_feature.send_a2a_task(
-        "companion", "tenant-b work",
+    feature, backend_a = await _durable_feature_for_scope(
+        router, scope_a, tmp_path, database_name="tenant-a.db",
     )
+    other_scope_feature, backend_b = await _durable_feature_for_scope(
+        router, scope_b, tmp_path, database_name="tenant-b.db",
+    )
+    try:
+        peers = await feature.list_peers()
+        assert peers.status is ToolResultStatus.OK
+        assert peers.data["peers"] == [
+            {
+                "name": "Companion",
+                "slug": "companion",
+                "status": "online",
+                "description": "",
+            },
+        ]
 
-    assert invoked.status is ToolResultStatus.OK
-    assert fetched.status is ToolResultStatus.OK
-    assert result.status is ToolResultStatus.OK
-    assert other_scope_result.status is ToolResultStatus.OK
-    assert router.invoked_on == ["did:tenant-a:companion"]
-    assert router.fetched_from == ["did:tenant-a:companion"]
-    assert router.sent_to == ["did:tenant-a:companion", "did:tenant-b:companion"]
-    assert "did:tenant-b:companion" not in str(result.data)
+        invoked = await feature.ask_agent("companion", "tenant-a question")
+        result = await feature.send_a2a_task("companion", "tenant-a work")
+        fetched = await feature.get_peer_task_result(
+            "companion", result.data["task_id"],
+        )
+        other_scope_result = await other_scope_feature.send_a2a_task(
+            "companion", "tenant-b work",
+        )
+
+        assert invoked.status is ToolResultStatus.OK
+        assert fetched.status is ToolResultStatus.OK
+        assert result.status is ToolResultStatus.OK
+        assert other_scope_result.status is ToolResultStatus.OK
+        assert router.invoked_on == ["did:tenant-a:companion"]
+        assert router.fetched_from == ["did:tenant-a:companion"]
+        assert router.sent_to == ["did:tenant-a:companion", "did:tenant-b:companion"]
+        assert "did:tenant-b:companion" not in str(result.data)
+    finally:
+        await backend_a.close()
+        await backend_b.close()
 
 
 @pytest.mark.asyncio
@@ -339,20 +366,176 @@ async def test_malformed_hosted_router_results_fail_without_crashing_or_leaking(
 
 
 @pytest.mark.asyncio
-async def test_scope_and_recipient_substitution_cannot_retarget_a2a_send():
+async def test_scope_and_recipient_substitution_cannot_retarget_a2a_send(tmp_path):
     scope_a, scope_b = object(), object()
     router = ScopedRouter(scope_a, scope_b)
-    feature = _feature_for_scope(router, scope_a)
+    feature, backend = await _durable_feature_for_scope(
+        router, scope_a, tmp_path, database_name="scope-substitution.db",
+    )
+    try:
+        # The tool has no scope/user-id argument to replace.  Even though another
+        # tenant owns the same slug, the router receives the injected scope and the
+        # stable identity it resolved in that scope.
+        result = await feature.send_a2a_task("companion", "do not retarget")
+
+        assert result.status is ToolResultStatus.OK
+        assert router.sent_to == ["did:tenant-a:companion"]
+        assert feature.agent.peer_requester.authorization_scope is scope_a
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_hosted_identity_write_failure_cannot_route_replacement_after_restart(
+    tmp_path,
+):
+    """A rejected hosted send leaves no name-based retained-route escape hatch."""
+    scope_a, scope_b = object(), object()
+    router = ScopedRouter(scope_a, scope_b)
+    feature, backend = await _durable_feature_for_scope(
+        router, scope_a, tmp_path, database_name="identity-write-failure.db",
+    )
+
+    class FailingOutboundWriteDatabase:
+        async def execute(self, *_args, **_kwargs):
+            raise OSError("durable identity write failed")
+
+    try:
+        # Failure injection is deliberately before the router delivery call.
+        # The previous implementation sent first, swallowed this error, then
+        # allowed a later retained lookup to resolve the mutable name.
+        feature._db = FailingOutboundWriteDatabase()
+        rejected = await feature.send_a2a_task("companion", "sensitive work")
+
+        assert rejected.status is ToolResultStatus.ERROR
+        assert rejected.data["sent"] is False
+        assert rejected.data["error_type"] == "peer_identity_persistence_failed"
+        assert router.sent_to == []
+
+        # Simulate a restart after the name has been reassigned.  The real
+        # backing database is empty because the reserve write failed.
+        router.scope_a_entries = {
+            "companion": PeerIdentity(
+                agent_id="did:tenant-a:replacement",
+                slug="companion",
+                routing_key="a-replacement",
+                name="Companion",
+            ),
+        }
+        restarted = _feature_for_scope(router, scope_a)
+        restarted.agent._raw_storage = feature.agent._raw_storage
+        restarted.agent.storage = None
+        await restarted.initialize()
+
+        fetched = await restarted.get_peer_task_result(
+            "companion", rejected.data["task_id"],
+        )
+        await restarted._supervise_a2a_question(
+            task_id=rejected.data["task_id"],
+            recipient="companion",
+            recipient_agent_id=None,
+            original_question="status?",
+            sess_id="session-1",
+            deadline_utc=datetime.now(timezone.utc) + timedelta(seconds=5),
+            causation_chain=None,
+        )
+
+        assert fetched.status is ToolResultStatus.ERROR
+        assert fetched.error == "Peer is not available in the automatic directory"
+        assert router.fetched_from == []
+        assert router.subscription_attempts == []
+        assert router.subscribed_to == []
+        # Only the original send performed directory resolution.  The restart
+        # did not ask the provider to resolve the replacement display name.
+        assert router.resolve_calls == ["companion"]
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_hosted_rekey_failure_fails_closed_with_the_peer_task_id(
+    tmp_path, monkeypatch,
+):
+    """A hosted result must identify the delivered task if its binding fails."""
+    scope_a, scope_b = object(), object()
+    peer_task_id = "peer-assigned-task-id"
+    router = ScopedRouter(
+        scope_a,
+        scope_b,
+        recipient_task_id=peer_task_id,
+    )
+    feature, backend = await _durable_feature_for_scope(
+        router, scope_a, tmp_path, database_name="hosted-rekey-failure.db",
+    )
+    monkeypatch.setattr(
+        outbound_store,
+        "rekey_outbound_task",
+        AsyncMock(return_value=0),
+    )
+
+    try:
+        rejected = await feature.send_a2a_task("companion", "sensitive work")
+
+        assert rejected.status is ToolResultStatus.ERROR
+        assert rejected.data["sent"] is True
+        assert rejected.data["task_id"] == peer_task_id
+        assert rejected.data["sender_task_id"] != peer_task_id
+        assert rejected.data["error_type"] == "peer_identity_persistence_failed"
+        assert router.sent_to == ["did:tenant-a:companion"]
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_local_rekey_failure_keeps_the_delivered_task_successful(
+    tmp_path, monkeypatch, caplog,
+):
+    """Local-host audit rekeys are best effort after successful delivery."""
+    peer = PeerIdentity(
+        agent_id="did:local:companion",
+        slug="companion",
+        routing_key="companion",
+        name="Companion",
+    )
+    adapter = LocalHostPeerDirectory("http://local-host")
+    adapter.resolve_peer = AsyncMock(return_value=peer)
+    adapter.send_a2a_task = AsyncMock(return_value={
+        "id": "peer-assigned-task-id",
+        "sessionId": "peer-session-id",
+        "status": {"state": "submitted"},
+    })
+    requester = PeerRequester("did:local:caller", object())
+    agent = SimpleNamespace(
+        _agent_name="caller",
+        did="did:local:caller",
+        peer_directory_router=adapter,
+        peer_requester=requester,
+        identity=None,
+        _provide_causation_chain=lambda: None,
+        _get_current_turn_id=lambda: None,
+    )
+    feature = PeersFeature(agent)
+    backend = SQLiteBackend(str(tmp_path / "local-rekey-failure.db"))
+    await backend.connect()
+    agent._raw_storage = SimpleNamespace(db=AsyncDatabase(backend))
+    agent.storage = None
     await feature.initialize()
+    monkeypatch.setattr(
+        outbound_store,
+        "rekey_outbound_task",
+        AsyncMock(return_value=0),
+    )
 
-    # The tool has no scope/user-id argument to replace.  Even though another
-    # tenant owns the same slug, the router receives the injected scope and the
-    # stable identity it resolved in that scope.
-    result = await feature.send_a2a_task("companion", "do not retarget")
+    try:
+        delivered = await feature.send_a2a_task("companion", "local work")
 
-    assert result.status is ToolResultStatus.OK
-    assert router.sent_to == ["did:tenant-a:companion"]
-    assert feature.agent.peer_requester.authorization_scope is scope_a
+        assert delivered.status is ToolResultStatus.OK
+        assert delivered.data["sent"] is True
+        assert delivered.data["task_id"] == "peer-assigned-task-id"
+        adapter.send_a2a_task.assert_awaited_once()
+        assert "could not rekey its best-effort outbound audit record" in caplog.text
+    finally:
+        await backend.close()
 
 
 @pytest.mark.asyncio
@@ -365,6 +548,7 @@ async def test_subscription_reauthorizes_after_resolution_and_hides_revocation_d
     await feature._supervise_a2a_question(
         task_id="task-1",
         recipient="companion",
+        recipient_agent_id="did:tenant-a:companion",
         original_question="status?",
         sess_id="session-1",
         deadline_utc=datetime.now(timezone.utc) + timedelta(seconds=5),
@@ -380,7 +564,7 @@ async def test_subscription_reauthorizes_after_resolution_and_hides_revocation_d
 
 
 @pytest.mark.asyncio
-async def test_retained_question_identity_survives_name_reassignment():
+async def test_retained_question_identity_survives_name_reassignment(tmp_path):
     """A replay/subscription must not re-resolve an old name onto a new peer."""
     scope_a, scope_b = object(), object()
     router = ScopedRouter(scope_a, scope_b)
@@ -391,59 +575,59 @@ async def test_retained_question_identity_survives_name_reassignment():
         name="Companion",
     )
     router.scope_a_entries = {"companion": original}
-    feature = _feature_for_scope(router, scope_a)
-    await feature.initialize()
-
-    submitted = await feature.send_a2a_question("companion", "status?")
-    assert submitted.status is ToolResultStatus.OK
-    insert_args = feature.agent.pending_a2a_questions.insert.await_args.kwargs
-    assert insert_args["recipient_agent_id"] == original.agent_id
-
-    # The old display name now belongs to a replacement; the original peer was
-    # renamed but remains authorized in this scope under its stable identity.
-    replacement = PeerIdentity(
-        agent_id="did:tenant-a:replacement",
-        slug="companion",
-        routing_key="a-replacement",
-        name="Companion",
+    feature, backend = await _durable_feature_for_scope(
+        router, scope_a, tmp_path, database_name="retained-question.db",
     )
-    renamed_original = PeerIdentity(
-        agent_id=original.agent_id,
-        slug="original-renamed",
-        routing_key="a-original-v2",
-        name="Original renamed",
-    )
-    router.scope_a_entries = {
-        "companion": replacement,
-        "original-renamed": renamed_original,
-    }
+    try:
+        submitted = await feature.send_a2a_question("companion", "status?")
+        assert submitted.status is ToolResultStatus.OK
+        insert_args = feature.agent.pending_a2a_questions.insert.await_args.kwargs
+        assert insert_args["recipient_agent_id"] == original.agent_id
 
-    # Result retrieval obtains the same persisted identity from outbound state;
-    # the caller's historical display name must not select the replacement.
-    feature._outbound_recipient_agent_id = AsyncMock(  # type: ignore[method-assign]
-        return_value=original.agent_id,
-    )
-    fetched = await feature.get_peer_task_result(
-        "companion", submitted.data["task_id"],
-    )
-    assert fetched.status is ToolResultStatus.OK
-    assert router.fetched_from == [original.agent_id]
+        # The old display name now belongs to a replacement; the original peer was
+        # renamed but remains authorized in this scope under its stable identity.
+        replacement = PeerIdentity(
+            agent_id="did:tenant-a:replacement",
+            slug="companion",
+            routing_key="a-replacement",
+            name="Companion",
+        )
+        renamed_original = PeerIdentity(
+            agent_id=original.agent_id,
+            slug="original-renamed",
+            routing_key="a-original-v2",
+            name="Original renamed",
+        )
+        router.scope_a_entries = {
+            "companion": replacement,
+            "original-renamed": renamed_original,
+        }
 
-    await feature._supervise_a2a_question(
-        task_id=submitted.data["task_id"],
-        recipient="companion",
-        recipient_agent_id=insert_args["recipient_agent_id"],
-        original_question="status?",
-        sess_id=submitted.data["session_id"],
-        deadline_utc=datetime.now(timezone.utc) + timedelta(seconds=5),
-        causation_chain=None,
-    )
+        # Result retrieval obtains the same persisted identity from outbound state;
+        # the caller's historical display name must not select the replacement.
+        fetched = await feature.get_peer_task_result(
+            "companion", submitted.data["task_id"],
+        )
+        assert fetched.status is ToolResultStatus.OK
+        assert router.fetched_from == [original.agent_id]
 
-    assert router.resolve_by_agent_id_calls == [
-        original.agent_id, original.agent_id,
-    ]
-    assert router.subscribed_to == [original.agent_id]
-    assert replacement.agent_id not in router.subscribed_to
+        await feature._supervise_a2a_question(
+            task_id=submitted.data["task_id"],
+            recipient="companion",
+            recipient_agent_id=insert_args["recipient_agent_id"],
+            original_question="status?",
+            sess_id=submitted.data["session_id"],
+            deadline_utc=datetime.now(timezone.utc) + timedelta(seconds=5),
+            causation_chain=None,
+        )
+
+        assert router.resolve_by_agent_id_calls == [
+            original.agent_id, original.agent_id,
+        ]
+        assert router.subscribed_to == [original.agent_id]
+        assert replacement.agent_id not in router.subscribed_to
+    finally:
+        await backend.close()
 
 
 @pytest.mark.asyncio

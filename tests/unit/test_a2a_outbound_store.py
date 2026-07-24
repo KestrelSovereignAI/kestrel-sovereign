@@ -31,6 +31,7 @@ from kestrel_sovereign.a2a.outbound_store import (
     get_outbound_task,
     list_outbound_tasks,
     record_outbound_dispatch,
+    rekey_outbound_task,
     update_outbound_terminal_state,
 )
 from kestrel_sovereign.features.peers.feature import PeersFeature
@@ -221,6 +222,76 @@ async def test_update_terminal_state_idempotent(tmp_path):
     rows = await list_outbound_tasks(db,         agent_id='emma',
 limit=10)
     assert rows[0].terminal_state == "completed"
+
+
+@pytest.mark.asyncio
+async def test_rekey_outbound_task_moves_only_its_reserved_stable_binding(tmp_path):
+    db = await _backend(tmp_path)
+    reserved = await record_outbound_dispatch(
+        db,
+        agent_id="emma",
+        task_id="local-task-id",
+        recipient="companion",
+        recipient_agent_id="did:tenant-a:companion",
+        verb="task",
+        session_id="s",
+        dispatch_tool="send_a2a_task",
+    )
+
+    rekeyed = await rekey_outbound_task(
+        db,
+        record_id=reserved.id,
+        agent_id="emma",
+        old_task_id="local-task-id",
+        new_task_id="peer-echoed-id",
+    )
+
+    assert rekeyed == 1
+    retained = await get_outbound_task(
+        db, agent_id="emma", task_id="peer-echoed-id",
+    )
+    assert retained is not None
+    assert retained.recipient_agent_id == "did:tenant-a:companion"
+
+
+@pytest.mark.asyncio
+async def test_rekey_outbound_task_rejects_existing_task_id_collision(tmp_path):
+    db = await _backend(tmp_path)
+    reserved = await record_outbound_dispatch(
+        db,
+        agent_id="emma",
+        task_id="local-task-id",
+        recipient="companion",
+        recipient_agent_id="did:tenant-a:companion",
+        verb="task",
+        session_id="s",
+        dispatch_tool="send_a2a_task",
+    )
+    await record_outbound_dispatch(
+        db,
+        agent_id="emma",
+        task_id="claimed-id",
+        recipient="replacement",
+        recipient_agent_id="did:tenant-a:replacement",
+        verb="task",
+        session_id="s",
+        dispatch_tool="send_a2a_task",
+    )
+
+    rekeyed = await rekey_outbound_task(
+        db,
+        record_id=reserved.id,
+        agent_id="emma",
+        old_task_id="local-task-id",
+        new_task_id="claimed-id",
+    )
+
+    assert rekeyed == 0
+    retained = await get_outbound_task(
+        db, agent_id="emma", task_id="local-task-id",
+    )
+    assert retained is not None
+    assert retained.recipient_agent_id == "did:tenant-a:companion"
 
 
 @pytest.mark.asyncio

@@ -394,6 +394,22 @@ class PeersFeature(Feature):
             return self._peer_directory_context()
         return None
 
+    def _requires_durable_peer_binding(self) -> bool:
+        """Whether retained routes must have a durable stable identity.
+
+        The local host adapter is a compatibility transport for one
+        operator's fleet, where the historical task-id/name route remains
+        available.  An injected router represents a hosted, scoped directory:
+        permitting a retained operation to fall back to a mutable name there
+        could retarget a task to a replacement peer after restart.  Hosted
+        sends therefore reserve their stable binding before delivery, and
+        every later result/subscription/replay route requires that binding.
+        """
+        router = getattr(self, "_peer_router", None)
+        return router is not None and not isinstance(
+            router, LocalHostPeerDirectory,
+        )
+
     async def _resolve_automatic_peer(
         self, recipient: str,
     ) -> Tuple[PeerDirectoryRouter, PeerRequester, PeerIdentity]:
@@ -449,10 +465,17 @@ class PeersFeature(Feature):
         caller-addressable automatic-peer input.  The router must reauthorize
         the stable identity and return a current route before it is used.
 
-        Legacy records predate the stable-id column and contain ``None``; they
-        retain the historical name/slug resolution behavior until they settle.
+        Legacy local-host records predate the stable-id column and retain the
+        historical name/slug resolution behavior until they settle.  Injected
+        hosted routers never get that fallback: a missing binding must deny
+        the retained route rather than let a replacement peer claim the old
+        display name.
         """
         if not recipient_agent_id:
+            if self._requires_durable_peer_binding():
+                raise PeerNotFoundError(
+                    "No durable stable identity exists for this peer task"
+                )
             return await self._resolve_automatic_peer(recipient)
         if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
             raise PeerProtocolError("Persisted peer identity is invalid")
@@ -489,13 +512,18 @@ class PeersFeature(Feature):
     async def _outbound_recipient_agent_id(self, task_id: str) -> Optional[str]:
         """Read the stable recipient retained for one sender-owned task.
 
-        The outbound audit is optional for early-init/legacy agents, so an
-        unavailable record is represented as ``None`` and uses the historical
-        name/slug route.  A present stable id is always preferred over the
-        caller-provided display recipient.
+        The outbound audit is optional for early-init/legacy local-host
+        agents, so an unavailable record there is represented as ``None`` and
+        uses the historical name/slug route.  Hosted routes are different:
+        they fail closed when the durable binding is absent or unreadable, so
+        a replacement peer can never receive a retained result fetch.
         """
         db = getattr(self, "_db", None)
         if db is None:
+            if self._requires_durable_peer_binding():
+                raise PeerNotFoundError(
+                    "No durable stable identity exists for this peer task"
+                )
             return None
         try:
             from kestrel_sovereign.a2a.outbound_store import get_outbound_task
@@ -510,8 +538,19 @@ class PeersFeature(Feature):
                 "outbound_store: retained recipient lookup failed for %s: %s",
                 task_id, exc,
             )
+            if self._requires_durable_peer_binding():
+                raise PeerNotFoundError(
+                    "No durable stable identity exists for this peer task"
+                ) from exc
             return None
-        return outbound.recipient_agent_id if outbound is not None else None
+        recipient_agent_id = (
+            outbound.recipient_agent_id if outbound is not None else None
+        )
+        if not recipient_agent_id and self._requires_durable_peer_binding():
+            raise PeerNotFoundError(
+                "No durable stable identity exists for this peer task"
+            )
+        return recipient_agent_id
 
     def _maybe_sign_outbound(
         self,
@@ -825,17 +864,18 @@ class PeersFeature(Feature):
         if extra_metadata:
             outbound_metadata.update(extra_metadata)
 
-        # #1576: capture the audit-row write so it fires before EVERY
-        # post-task_id return path (success or transport failure). The
-        # helper swallows audit-store errors so dispatch can't be
-        # broken by a DB hiccup.
+        # #1576: capture the audit-row write so it fires before every
+        # post-task-id return path (success or transport failure).  The local
+        # host adapter treats it as best-effort audit state; a hosted scoped
+        # router upgrades it to a delivery reservation below, so a task can
+        # never be accepted without a durable stable-recipient binding.
         verb = str((extra_metadata or {}).get("a2a_verb") or "task")
         resolved_peer_agent_id: Optional[str] = None
 
         async def _persist_outbound(
             error: Optional[str] = None,
             effective_task_id: Optional[str] = None,
-        ) -> None:
+        ) -> Optional[Any]:
             """Persist the audit row.
 
             ``effective_task_id`` lets the success path pass the
@@ -848,7 +888,7 @@ class PeersFeature(Feature):
             """
             db = getattr(self, "_db", None)
             if db is None:
-                return
+                return None
             audit_id = effective_task_id or task_id
             # Scope the audit row to THIS agent (DID preferred, name
             # fallback) so a shared-backend Postgres deployment can't
@@ -860,7 +900,7 @@ class PeersFeature(Feature):
                 from kestrel_sovereign.a2a.outbound_store import (
                     record_outbound_dispatch,
                 )
-                await record_outbound_dispatch(
+                return await record_outbound_dispatch(
                     db,
                     agent_id=str(audit_agent),
                     task_id=audit_id,
@@ -878,6 +918,7 @@ class PeersFeature(Feature):
                     "outbound_store: record failed for task %s → %s: %s",
                     audit_id, recipient, exc,
                 )
+                return None
         # Attach the in-flight signal-driven turn's causation chain so
         # the receiving agent's a2a.task_submitted signal carries the
         # lineage. Without this, A→B→A ping-pong loops bypass the
@@ -993,39 +1034,93 @@ class PeersFeature(Feature):
         # changes cannot retarget a pending question or task-result fetch.
         resolved_peer_agent_id = peer.agent_id
 
+        # Reserve the sender-owned task id and the router-issued stable peer
+        # identity *before* delivery.  A hosted router is multi-tenant: if
+        # this write fails, sending first and trying to reconstruct the route
+        # from ``recipient`` after restart could hand a result/subscription to
+        # a same-name replacement peer.  Local-host audit persistence remains
+        # deliberately best-effort for backwards compatibility.
+        reserved_outbound = await _persist_outbound()
+        require_durable_binding = self._requires_durable_peer_binding()
+        if require_durable_binding and reserved_outbound is None:
+            logger.error(
+                "Refusing hosted A2A dispatch for task=%s: stable peer "
+                "identity could not be persisted before delivery",
+                task_id,
+            )
+            return None, None, None, ToolResult.failed(
+                "Could not safely send A2A task because the peer identity "
+                "could not be persisted",
+                data={
+                    "sent": False,
+                    "recipient": recipient,
+                    "task_id": task_id,
+                    "error_type": "peer_identity_persistence_failed",
+                },
+            )
+
+        async def _mark_dispatch_failed(error: str) -> None:
+            """Close a reserved dispatch without duplicating its audit row."""
+            if reserved_outbound is None:
+                await _persist_outbound(error=error)
+                return
+            db = getattr(self, "_db", None)
+            if db is None:
+                return
+            try:
+                from kestrel_sovereign.a2a.outbound_store import (
+                    update_outbound_terminal_state,
+                )
+
+                await update_outbound_terminal_state(
+                    db,
+                    agent_id=str(
+                        getattr(self.agent, "did", None) or self._own_name
+                    ),
+                    task_id=task_id,
+                    terminal_state="dispatch_failed",
+                    error=error,
+                )
+            except Exception as exc:  # noqa: BLE001 - audit failure must not mask route error
+                logger.debug(
+                    "outbound_store: failed to close dispatch %s: %s",
+                    task_id,
+                    exc,
+                )
+
         try:
             routed_task = await router.send_a2a_task(requester, peer, payload)
             if not isinstance(routed_task, Mapping):
                 raise PeerProtocolError("Peer router returned an invalid task envelope")
             task_data = dict(routed_task)
         except (PeerNotFoundError, PeerAccessDeniedError):
-            await _persist_outbound(error="peer_not_in_automatic_directory")
+            await _mark_dispatch_failed("peer_not_in_automatic_directory")
             return None, None, None, ToolResult.failed(
                 "Peer is not available in the automatic directory",
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
             )
         except PeerUnavailableError:
-            await _persist_outbound(error=f"peer_unavailable:{recipient}")
+            await _mark_dispatch_failed(f"peer_unavailable:{recipient}")
             return None, None, None, ToolResult.failed(
                 f"Agent '{recipient}' is offline or TaskManager unavailable",
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
             )
         except PeerTransportError:
-            await _persist_outbound(error=f"connect_error:{recipient}")
+            await _mark_dispatch_failed(f"connect_error:{recipient}")
             return None, None, None, ToolResult.failed(
                 f"Could not reach agent '{recipient}'",
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
             )
         except PeerDirectoryError as exc:
             logger.error("A2A send to %r failed: %s", recipient, exc)
-            await _persist_outbound(error=f"peer_router_error:{type(exc).__name__}")
+            await _mark_dispatch_failed(f"peer_router_error:{type(exc).__name__}")
             return None, None, None, ToolResult.failed(
                 f"Could not send A2A task to '{recipient}'",
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
             )
         except Exception as exc:  # noqa: BLE001 - provider extension boundary
             logger.exception("A2A peer router raised unexpectedly for %r", recipient)
-            await _persist_outbound(error=f"peer_router_error:{type(exc).__name__}")
+            await _mark_dispatch_failed(f"peer_router_error:{type(exc).__name__}")
             return None, None, None, ToolResult.failed(
                 f"Could not send A2A task to '{recipient}'",
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
@@ -1035,13 +1130,67 @@ class PeersFeature(Feature):
         # echo only one or the other).
         task_data.setdefault("id", task_id)
         task_data.setdefault("sessionId", sess_id)
-        # Audit success — terminal_state stays NULL until a later
-        # ``get_peer_task_result`` fetch learns the peer's final state.
-        # Use the surfaced (peer-echoed) id so the audit row matches
-        # what the caller sees in ``result.data["task_id"]``.
-        await _persist_outbound(
-            effective_task_id=str(task_data.get("id") or task_id),
-        )
+        # A compliant recipient echoes our envelope id.  Older recipients can
+        # return a different id; move the already-reserved binding to that id
+        # atomically before exposing it to the caller.  If the move fails,
+        # the recipient may have accepted work but no retained route is
+        # allowed to degrade into a display-name lookup.
+        effective_task_id = str(task_data.get("id") or task_id)
+        if reserved_outbound is not None and effective_task_id != task_id:
+            try:
+                from kestrel_sovereign.a2a.outbound_store import (
+                    rekey_outbound_task,
+                )
+
+                rekeyed = await rekey_outbound_task(
+                    getattr(self, "_db", None),
+                    record_id=reserved_outbound.id,
+                    agent_id=str(
+                        getattr(self.agent, "did", None) or self._own_name
+                    ),
+                    old_task_id=task_id,
+                    new_task_id=effective_task_id,
+                )
+            except Exception as exc:  # noqa: BLE001 - storage boundary
+                logger.error(
+                    "Failed to persist peer task-id binding %s -> %s: %s",
+                    task_id,
+                    effective_task_id,
+                    exc,
+                )
+                rekeyed = 0
+            if rekeyed != 1:
+                if require_durable_binding:
+                    await _mark_dispatch_failed("peer_identity_rekey_failed")
+                    return None, None, None, ToolResult.failed(
+                        "A2A task may have been delivered, but its peer identity "
+                        "could not be persisted safely for retained routing",
+                        data={
+                            "sent": True,
+                            "recipient": recipient,
+                            # The peer assigned this id and it is the only id
+                            # the caller can use to query the delivered task.
+                            "task_id": effective_task_id,
+                            # Keep the sender-generated correlation id for
+                            # diagnostics without misleading retained callers.
+                            "sender_task_id": task_id,
+                            "error_type": "peer_identity_persistence_failed",
+                        },
+                    )
+                # The local host adapter retains historical best-effort audit
+                # semantics.  The peer accepted the task, so a transient audit
+                # rekey failure must not misreport delivery as a tool failure.
+                logger.warning(
+                    "Delivered local A2A task %s (sender id %s), but could "
+                    "not rekey its best-effort outbound audit record",
+                    effective_task_id,
+                    task_id,
+                )
+        elif reserved_outbound is None:
+            # Local-host/early-init compatibility: an audit failure must not
+            # turn a delivered local task into a failed tool call.  Hosted
+            # sends returned above before the network operation.
+            await _persist_outbound(effective_task_id=effective_task_id)
         return task_data, chain, resolved_peer_agent_id, None
 
     @tool(
@@ -1338,8 +1487,8 @@ class PeersFeature(Feature):
             task_id: The task id returned from
                 ``send_a2a_question`` / ``send_a2a_task``.
         """
-        retained_agent_id = await self._outbound_recipient_agent_id(task_id)
         try:
+            retained_agent_id = await self._outbound_recipient_agent_id(task_id)
             router, requester, peer = await self._resolve_retained_automatic_peer(
                 recipient, retained_agent_id,
             )
