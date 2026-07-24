@@ -7,10 +7,10 @@ tags:
 - docs
 - architecture
 - architecture-spec
-timestamp: '2026-06-18T00:00:00Z'
-status: needs-revalidation
+timestamp: '2026-07-24T00:00:00Z'
+status: active
 owner: architecture
-canonical: false
+canonical: true
 generated: false
 privacy: public
 ---
@@ -87,8 +87,9 @@ provider route when that route advertises embedding support:
 - OpenAI defaults to `text-embedding-3-small` at 1536 dimensions.
 - Google/Gemini and Vertex default to `text-embedding-004` at 768 dimensions.
 - Ollama defaults to `nomic-embed-text` at 768 dimensions.
-- Anthropic and OpenRouter currently advertise no embedding API, so storage
-  falls back to text/BM25/LIKE search.
+- Anthropic advertises no embedding API. OpenRouter is disabled by default and
+  advertises embeddings only for a route with an explicit `embedding_model`
+  and `embedding_dim`; otherwise storage falls back to text/BM25/LIKE search.
 
 The provider adapter boundary is a common Python shape, not a common semantic
 space: `Optional[list[float]]` for one embedding and one batch result slot per

@@ -9,10 +9,10 @@ tags:
 - docs
 - architecture
 - architecture-spec
-timestamp: '2026-06-18T00:00:00Z'
-status: needs-revalidation
+timestamp: '2026-07-24T00:00:00Z'
+status: active
 owner: architecture
-canonical: false
+canonical: true
 generated: false
 privacy: public
 ---
@@ -309,8 +309,10 @@ Current execution truth as of 2026-05-31:
   Ollama-backed `EmbeddingService`, but saved-items and RAG now use
   `ProviderEmbeddingService` through `LLMService.get_embedding_service()`.
 - OpenAI, Google/Gemini, Vertex, and Ollama advertise embedding capability in
-  tree. Anthropic and OpenRouter do not; storage falls back to keyword/BM25/LIKE
-  search rather than silently using an unrelated embedding service.
+  tree. Anthropic does not. OpenRouter is disabled by default and advertises
+  embeddings only when its route explicitly configures `embedding_model` and
+  `embedding_dim`; otherwise storage falls back to keyword/BM25/LIKE search
+  rather than silently using an unrelated embedding service.
 - RAG and saved-item vector search consume embeddings through storage/vector
   backends once embeddings are written.
 - `conversation_history.embedding_vec` exists as SQLAlchemy/vector storage
