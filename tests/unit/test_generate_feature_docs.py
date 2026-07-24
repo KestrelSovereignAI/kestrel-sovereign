@@ -80,12 +80,14 @@ def test_compose_generated_body_preserves_boundary_contract_verbatim():
         "github integration",
         "github app",
     )
+    assert aliases["github"] == ("github",)
 
 
 @pytest.mark.parametrize(
     "claim",
     [
         "Voice is a built-in capability.",
+        "GitHub is a built-in capability.",
         "The core feature inventory includes Wallet.",
         "RunPod is a native integration.",
         "The kestrel-talon command ships with the base framework.",

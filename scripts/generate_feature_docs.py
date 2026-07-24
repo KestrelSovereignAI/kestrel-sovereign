@@ -191,7 +191,14 @@ def extract_boundary_contract(source: str) -> str:
 def extract_non_bundled_surface_aliases(
     boundary_contract: str,
 ) -> dict[str, tuple[str, ...]]:
-    """Read promotion-check aliases from the canonical protected contract."""
+    """Read protected aliases and every non-bundled registry identifier.
+
+    The canonical contract carries audience-friendly aliases (for example,
+    ``"GitHub integration"``).  Registry keys are authoritative for the
+    complete catalog, though, so include each external row's stable key as an
+    additional alias.  Otherwise a transformation can evade the guard merely
+    by shortening an extracted surface's name (for example, ``"GitHub"``).
+    """
     match = NON_BUNDLED_ALIASES_PATTERN.search(boundary_contract)
     if match is None:
         raise ValueError(
@@ -211,6 +218,22 @@ def extract_non_bundled_surface_aliases(
     if not aliases:
         raise ValueError(
             "Protected package boundary contract declares no non-bundled aliases"
+        )
+
+    from kestrel_sovereign.feature_registry import PackageBoundary, load_registry
+
+    non_bundled_boundaries = {
+        PackageBoundary.FEATURE_PACKAGE,
+        PackageBoundary.PROVIDER_PACKAGE,
+        PackageBoundary.STANDALONE_TOOL,
+    }
+    for info in load_registry().values():
+        if info.boundary not in non_bundled_boundaries:
+            continue
+        stable_id = info.name.casefold()
+        aliases.setdefault(
+            stable_id,
+            tuple(dict.fromkeys((stable_id, stable_id.replace("_", " ")))),
         )
     return aliases
 

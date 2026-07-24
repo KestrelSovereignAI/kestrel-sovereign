@@ -4148,6 +4148,7 @@
     },
     {
       "existing_code_refs": [
+        "KESTREL_FEATURES.md",
         "kestrel_sovereign/cli_extension_example.py",
         "kestrel_sovereign/data/feature_registry.toml",
         "pyproject.toml",
