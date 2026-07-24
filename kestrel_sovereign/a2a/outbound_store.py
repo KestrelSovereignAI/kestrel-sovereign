@@ -20,8 +20,9 @@ Each row carries the assertion Emma pinned in #1576:
 Lifecycle:
 
 * ``record_outbound_dispatch`` — reserve the sender-owned task id and stable
-  recipient identity before a hosted router accepts delivery.  Local-host
-  callers may also use it as their best-effort outbound audit write.
+  recipient identity before a router accepts delivery.  The local-host
+  adapter keeps no-store operation as a best-effort compatibility path, but a
+  persisted local route follows the same reserve-to-activate transition.
 * ``update_outbound_terminal_state`` — invoked when the agent fetches
   the peer's result via ``get_peer_task_result`` and learns the final
   state, OR when the dispatch itself failed (we already know the
@@ -61,6 +62,17 @@ _ROUTE_STATES = frozenset({
     ROUTE_STATE_ROUTABLE,
     ROUTE_STATE_AMBIGUOUS,
 })
+
+
+class OutboundTaskRouteAmbiguousError(RuntimeError):
+    """A retained task id has multiple historical outbound owners.
+
+    ``None`` means that no sender-side audit row exists at all, which is the
+    legacy local-host compatibility case.  A duplicate key is materially
+    different: it is known to be unsafe and callers must never convert it
+    into a display-name lookup.  Keeping that distinction explicit avoids
+    routing a retained fetch to a same-name replacement peer.
+    """
 
 
 @dataclass(frozen=True)
@@ -240,9 +252,9 @@ async def record_outbound_dispatch(
     layer (the peer was unreachable, returned 5xx, etc.); in that case
     ``terminal_state`` is also set so the row is self-describing.
 
-    Hosted callers reserve with ``route_state='reserved'`` before they send
-    anything.  A reservation is deliberately non-routable even though it has
-    a stable recipient: the peer has not yet accepted a canonical task id.
+    Routers reserve with ``route_state='reserved'`` before they send anything.
+    A reservation is deliberately non-routable even though it has a stable
+    recipient: the peer has not yet accepted a canonical task id.
     ``rekey_outbound_task(..., activate=True)`` is the only state transition
     to ``'routable'``.
     """
@@ -408,8 +420,9 @@ async def get_outbound_task(
     internal: callers receive the historical display recipient through the
     normal public task view, while routing uses this field only after the
     router reauthorizes it in the current requester scope.  Returns ``None``
-    for a missing or ambiguous historical key so a fetch never picks an
-    arbitrary recipient.
+    only when the key is absent.  Raises ``OutboundTaskRouteAmbiguousError``
+    when historical rows disagree, so callers can fail closed rather than
+    treating known-unsafe history as a no-record legacy route.
     """
     rows = await db.fetchall(
         """
@@ -428,8 +441,12 @@ async def get_outbound_task(
     # newer row and thereby redirect a result fetch to another peer.  New
     # rekeys reject this state atomically; this guard protects old databases
     # too without deleting either audit record.
-    if len(rows) != 1:
+    if not rows:
         return None
+    if len(rows) > 1:
+        raise OutboundTaskRouteAmbiguousError(
+            "Multiple outbound task records share this retained route key"
+        )
     return _outbound_task_from_row(rows[0])
 
 

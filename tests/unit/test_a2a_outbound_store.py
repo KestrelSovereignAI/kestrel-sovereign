@@ -29,6 +29,7 @@ import pytest
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.a2a.outbound_store import (
     OutboundTask,
+    OutboundTaskRouteAmbiguousError,
     ROUTE_STATE_AMBIGUOUS,
     ROUTE_STATE_RESERVED,
     ROUTE_STATE_ROUTABLE,
@@ -396,9 +397,10 @@ async def test_outbound_lookup_fails_closed_for_historical_duplicate_task_ids(tm
         route_state=ROUTE_STATE_AMBIGUOUS,
     )
 
-    assert await get_outbound_task(
-        db, agent_id="emma", task_id="historical-collision",
-    ) is None
+    with pytest.raises(OutboundTaskRouteAmbiguousError):
+        await get_outbound_task(
+            db, agent_id="emma", task_id="historical-collision",
+        )
 
 
 @pytest.mark.asyncio
@@ -444,9 +446,10 @@ async def test_ensure_quarantines_legacy_duplicate_canonical_routes(tmp_path):
             """
         )
         assert states == [(ROUTE_STATE_AMBIGUOUS,), (ROUTE_STATE_AMBIGUOUS,)]
-        assert await get_outbound_task(
-            db, agent_id="emma", task_id="legacy-collision",
-        ) is None
+        with pytest.raises(OutboundTaskRouteAmbiguousError):
+            await get_outbound_task(
+                db, agent_id="emma", task_id="legacy-collision",
+            )
     finally:
         await raw.close()
 

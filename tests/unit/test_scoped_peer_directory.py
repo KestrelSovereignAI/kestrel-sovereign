@@ -664,53 +664,484 @@ async def test_hosted_remote_task_id_collision_preserves_owner_across_retry_and_
 
 
 @pytest.mark.asyncio
-async def test_local_rekey_failure_keeps_the_delivered_task_successful(
-    tmp_path, monkeypatch, caplog,
+async def test_local_colliding_remote_task_id_is_delivered_but_untrackable_after_restart(
+    tmp_path,
 ):
-    """Local-host audit rekeys are best effort after successful delivery."""
-    peer = PeerIdentity(
-        agent_id="did:local:companion",
-        slug="companion",
-        routing_key="companion",
-        name="Companion",
+    """A local peer cannot redirect retained routes with a colliding task id.
+
+    The first peer owns the returned remote id.  A second local peer returning
+    that same id has received its work, but the sender must not expose the id,
+    route a fetch/subscription to either peer for the failed dispatch, or
+    resurrect that path after restart.  The first task remains routable through
+    its original stable identity.
+    """
+    first = PeerIdentity(
+        agent_id="did:local:first",
+        slug="first",
+        routing_key="first",
+        name="First",
     )
+    second = PeerIdentity(
+        agent_id="did:local:second",
+        slug="second",
+        routing_key="second",
+        name="Second",
+    )
+    peers = {"first": first, "second": second}
+    fetched_from: list[str] = []
+    subscribed_to: list[str] = []
     adapter = LocalHostPeerDirectory("http://local-host")
-    adapter.resolve_peer = AsyncMock(return_value=peer)
-    adapter.send_a2a_task = AsyncMock(return_value={
-        "id": "peer-assigned-task-id",
-        "sessionId": "peer-session-id",
+    adapter.resolve_peer = AsyncMock(
+        side_effect=lambda _requester, name: peers.get(name.casefold()),
+    )
+    adapter.resolve_peer_by_agent_id = AsyncMock(
+        side_effect=lambda _requester, agent_id: next(
+            (peer for peer in peers.values() if peer.agent_id == agent_id),
+            None,
+        ),
+    )
+    adapter.send_a2a_task = AsyncMock(side_effect=lambda _requester, _peer, payload: {
+        # Both recipients (including a duplicate response/retry from second)
+        # return the same remote id.
+        "id": "shared-peer-task-id",
+        "sessionId": payload["sessionId"],
         "status": {"state": "submitted"},
     })
+
+    async def _get_task(_requester, peer, task_id):
+        fetched_from.append(peer.agent_id)
+        return {"id": task_id, "status": "completed", "message": "done"}
+
+    async def _subscribe_task(
+        _requester, peer, task_id, *, timeout_seconds,
+    ):
+        del timeout_seconds
+        subscribed_to.append(peer.agent_id)
+        yield PeerSubscriptionEvent(
+            event="status",
+            data=(
+                '{"id":"' + task_id + '","status":{"state":"completed",'
+                '"message":{"parts":[{"text":"done"}]}}}'
+            ),
+        )
+
+    adapter.get_a2a_task = AsyncMock(side_effect=_get_task)
+    adapter.subscribe_a2a_task = _subscribe_task
     requester = PeerRequester("did:local:caller", object())
-    agent = SimpleNamespace(
-        _agent_name="caller",
-        did="did:local:caller",
-        peer_directory_router=adapter,
-        peer_requester=requester,
-        identity=None,
-        _provide_causation_chain=lambda: None,
-        _get_current_turn_id=lambda: None,
-    )
-    feature = PeersFeature(agent)
-    backend = SQLiteBackend(str(tmp_path / "local-rekey-failure.db"))
+
+    def _agent() -> SimpleNamespace:
+        return SimpleNamespace(
+            _agent_name="caller",
+            did="did:local:caller",
+            peer_directory_router=adapter,
+            peer_requester=requester,
+            identity=None,
+            _provide_causation_chain=lambda: None,
+            _get_current_turn_id=lambda: None,
+            pending_a2a_questions=MagicMock(
+                mark_resolved=AsyncMock(return_value=True),
+            ),
+            dispatcher=MagicMock(enqueue_signal=AsyncMock()),
+            _track_background_task=lambda coro, *, name="": coro.close() or MagicMock(),
+        )
+
+    backend = SQLiteBackend(str(tmp_path / "local-task-id-collision.db"))
     await backend.connect()
+    agent = _agent()
     agent._raw_storage = SimpleNamespace(db=AsyncDatabase(backend))
     agent.storage = None
+    feature = PeersFeature(agent)
     await feature.initialize()
+
+    try:
+        owner = await feature.send_a2a_task("first", "first task")
+        collided = await feature.send_a2a_task("second", "second task")
+        replayed_collision = await feature.send_a2a_task(
+            "second", "second task retry",
+        )
+
+        assert owner.status is ToolResultStatus.OK
+        assert owner.data["task_id"] == "shared-peer-task-id"
+        for delivered_but_untrackable in (collided, replayed_collision):
+            assert delivered_but_untrackable.status is ToolResultStatus.ERROR
+            assert delivered_but_untrackable.data["sent"] is True
+            assert (
+                delivered_but_untrackable.data["task_id"]
+                != "shared-peer-task-id"
+            )
+            assert (
+                delivered_but_untrackable.data["error_type"]
+                == "peer_identity_persistence_failed"
+            )
+
+            # The provisional id was never activated.  It must not fetch or
+            # subscribe to second, even if a caller/replay carries second's
+            # previously resolved stable identity.
+            fetched = await feature.get_peer_task_result(
+                "second", delivered_but_untrackable.data["task_id"],
+            )
+            assert fetched.status is ToolResultStatus.ERROR
+            await feature._supervise_a2a_question(
+                task_id=delivered_but_untrackable.data["task_id"],
+                recipient="second",
+                recipient_agent_id=second.agent_id,
+                original_question="status?",
+                sess_id="session-1",
+                deadline_utc=datetime.now(timezone.utc) + timedelta(seconds=5),
+                causation_chain=None,
+            )
+
+        assert adapter.send_a2a_task.await_count == 3
+        assert fetched_from == []
+        assert subscribed_to == []
+
+        # Recreate the feature over the same durable sender store.  The
+        # reservations must remain non-routable after restart, while the first
+        # peer's canonical binding still owns the shared remote task id.
+        restarted_agent = _agent()
+        restarted_agent._raw_storage = agent._raw_storage
+        restarted_agent.storage = None
+        restarted = PeersFeature(restarted_agent)
+        await restarted.initialize()
+        for delivered_but_untrackable in (collided, replayed_collision):
+            fetched = await restarted.get_peer_task_result(
+                "second", delivered_but_untrackable.data["task_id"],
+            )
+            assert fetched.status is ToolResultStatus.ERROR
+            await restarted._supervise_a2a_question(
+                task_id=delivered_but_untrackable.data["task_id"],
+                recipient="second",
+                recipient_agent_id=second.agent_id,
+                original_question="status?",
+                sess_id="session-1",
+                deadline_utc=datetime.now(timezone.utc) + timedelta(seconds=5),
+                causation_chain=None,
+            )
+
+        fetched_owner = await restarted.get_peer_task_result(
+            "first", "shared-peer-task-id",
+        )
+        assert fetched_owner.status is ToolResultStatus.OK
+        await restarted._supervise_a2a_question(
+            task_id="shared-peer-task-id",
+            recipient="first",
+            recipient_agent_id=first.agent_id,
+            original_question="status?",
+            sess_id="session-1",
+            deadline_utc=datetime.now(timezone.utc) + timedelta(seconds=5),
+            causation_chain=None,
+        )
+
+        assert fetched_from == [first.agent_id]
+        assert subscribed_to == [first.agent_id]
+        assert second.agent_id not in fetched_from
+        assert second.agent_id not in subscribed_to
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_local_ambiguous_historical_route_never_falls_back_to_replacement(
+    tmp_path,
+):
+    """A known-ambiguous local task id is not a missing legacy record.
+
+    Local compatibility may resolve a genuinely absent pre-store task by its
+    old display name.  A duplicate historical outbound route is instead
+    positive evidence that no recipient can safely be selected.  This covers
+    both a direct result fetch and a startup-style subscription replay after
+    that display name has been reassigned.
+    """
+    replacement = PeerIdentity(
+        agent_id="did:local:replacement",
+        slug="companion",
+        routing_key="replacement",
+        name="Companion",
+    )
+    fetched_from: list[str] = []
+    subscribed_to: list[str] = []
+    adapter = LocalHostPeerDirectory("http://local-host")
+    adapter.resolve_peer = AsyncMock(return_value=replacement)
+    adapter.resolve_peer_by_agent_id = AsyncMock(return_value=replacement)
+
+    async def _get_task(_requester, peer, _task_id):
+        fetched_from.append(peer.agent_id)
+        return {"status": "completed"}
+
+    async def _subscribe_task(
+        _requester, peer, task_id, *, timeout_seconds,
+    ):
+        del timeout_seconds
+        subscribed_to.append(peer.agent_id)
+        yield PeerSubscriptionEvent(
+            event="status",
+            data=(
+                '{"id":"' + task_id + '","status":{"state":"completed",'
+                '"message":{"parts":[{"text":"done"}]}}}'
+            ),
+        )
+
+    adapter.get_a2a_task = AsyncMock(side_effect=_get_task)
+    adapter.subscribe_a2a_task = _subscribe_task
+    requester = PeerRequester("did:local:caller", object())
+
+    def _agent() -> SimpleNamespace:
+        return SimpleNamespace(
+            _agent_name="caller",
+            did="did:local:caller",
+            peer_directory_router=adapter,
+            peer_requester=requester,
+            identity=None,
+            _provide_causation_chain=lambda: None,
+            _get_current_turn_id=lambda: None,
+            pending_a2a_questions=MagicMock(
+                mark_resolved=AsyncMock(return_value=True),
+            ),
+            dispatcher=MagicMock(enqueue_signal=AsyncMock()),
+            _track_background_task=lambda coro, *, name="": coro.close() or MagicMock(),
+        )
+
+    backend = SQLiteBackend(str(tmp_path / "local-ambiguous-route.db"))
+    await backend.connect()
+    agent = _agent()
+    agent._raw_storage = SimpleNamespace(db=AsyncDatabase(backend))
+    agent.storage = None
+    feature = PeersFeature(agent)
+    await feature.initialize()
+    task_id = "ambiguous-historical-task"
+
+    try:
+        for recipient, stable_id in (
+            ("original", "did:local:original"),
+            ("other", "did:local:other"),
+        ):
+            await outbound_store.record_outbound_dispatch(
+                feature._db,
+                agent_id="did:local:caller",
+                task_id=task_id,
+                recipient=recipient,
+                recipient_agent_id=stable_id,
+                verb="question",
+                session_id="session-1",
+                dispatch_tool="send_a2a_question",
+                route_state=outbound_store.ROUTE_STATE_AMBIGUOUS,
+            )
+
+        fetched = await feature.get_peer_task_result("companion", task_id)
+        assert fetched.status is ToolResultStatus.ERROR
+        await feature._supervise_a2a_question(
+            task_id=task_id,
+            recipient="companion",
+            recipient_agent_id=None,
+            original_question="status?",
+            sess_id="session-1",
+            deadline_utc=datetime.now(timezone.utc) + timedelta(seconds=5),
+            causation_chain=None,
+        )
+
+        restarted_agent = _agent()
+        restarted_agent._raw_storage = agent._raw_storage
+        restarted_agent.storage = None
+        restarted = PeersFeature(restarted_agent)
+        await restarted.initialize()
+        fetched_after_restart = await restarted.get_peer_task_result(
+            "companion", task_id,
+        )
+        assert fetched_after_restart.status is ToolResultStatus.ERROR
+        await restarted._supervise_a2a_question(
+            task_id=task_id,
+            recipient="companion",
+            recipient_agent_id=None,
+            original_question="status?",
+            sess_id="session-1",
+            deadline_utc=datetime.now(timezone.utc) + timedelta(seconds=5),
+            causation_chain=None,
+        )
+
+        assert fetched_from == []
+        assert subscribed_to == []
+        adapter.resolve_peer.assert_not_awaited()
+        adapter.resolve_peer_by_agent_id.assert_not_awaited()
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_local_reservation_write_failure_never_exposes_colliding_peer_id(
+    tmp_path,
+    monkeypatch,
+):
+    """A failed local reservation is delivered but remains non-routable.
+
+    The first peer owns the remote id.  The second send loses its initial
+    reservation write and receives that same id from an older peer.  It must
+    return only the sender provisional id, persist a denied reservation when
+    the store recovers, and stay denied across result fetch, subscription, and
+    restart.
+    """
+    first = PeerIdentity(
+        agent_id="did:local:first",
+        slug="first",
+        routing_key="first",
+        name="First",
+    )
+    second = PeerIdentity(
+        agent_id="did:local:second",
+        slug="second",
+        routing_key="second",
+        name="Second",
+    )
+    peers = {"first": first, "second": second}
+    fetched_from: list[str] = []
+    subscribed_to: list[str] = []
+    adapter = LocalHostPeerDirectory("http://local-host")
+    adapter.resolve_peer = AsyncMock(
+        side_effect=lambda _requester, name: peers.get(name.casefold()),
+    )
+    adapter.resolve_peer_by_agent_id = AsyncMock(
+        side_effect=lambda _requester, agent_id: next(
+            (peer for peer in peers.values() if peer.agent_id == agent_id),
+            None,
+        ),
+    )
+    adapter.send_a2a_task = AsyncMock(side_effect=lambda _requester, _peer, payload: {
+        "id": "shared-peer-task-id",
+        "sessionId": payload["sessionId"],
+        "status": {"state": "submitted"},
+    })
+
+    async def _get_task(_requester, peer, task_id):
+        fetched_from.append(peer.agent_id)
+        return {"id": task_id, "status": "completed", "message": "done"}
+
+    async def _subscribe_task(
+        _requester, peer, task_id, *, timeout_seconds,
+    ):
+        del timeout_seconds
+        subscribed_to.append(peer.agent_id)
+        yield PeerSubscriptionEvent(
+            event="status",
+            data=(
+                '{"id":"' + task_id + '","status":{"state":"completed",'
+                '"message":{"parts":[{"text":"done"}]}}}'
+            ),
+        )
+
+    adapter.get_a2a_task = AsyncMock(side_effect=_get_task)
+    adapter.subscribe_a2a_task = _subscribe_task
+    requester = PeerRequester("did:local:caller", object())
+
+    def _agent() -> SimpleNamespace:
+        return SimpleNamespace(
+            _agent_name="caller",
+            did="did:local:caller",
+            peer_directory_router=adapter,
+            peer_requester=requester,
+            identity=None,
+            _provide_causation_chain=lambda: None,
+            _get_current_turn_id=lambda: None,
+            pending_a2a_questions=MagicMock(
+                mark_resolved=AsyncMock(return_value=True),
+            ),
+            dispatcher=MagicMock(enqueue_signal=AsyncMock()),
+            _track_background_task=lambda coro, *, name="": coro.close() or MagicMock(),
+        )
+
+    backend = SQLiteBackend(str(tmp_path / "local-reservation-failure.db"))
+    await backend.connect()
+    agent = _agent()
+    agent._raw_storage = SimpleNamespace(db=AsyncDatabase(backend))
+    agent.storage = None
+    feature = PeersFeature(agent)
+    await feature.initialize()
+    original_record = outbound_store.record_outbound_dispatch
+    failed_second_reservation = False
+
+    async def _fail_second_reservation(*args, **kwargs):
+        nonlocal failed_second_reservation
+        if (
+            kwargs["recipient"] == "second"
+            and kwargs["route_state"] == outbound_store.ROUTE_STATE_RESERVED
+            and not failed_second_reservation
+        ):
+            failed_second_reservation = True
+            raise OSError("injected reservation-write failure")
+        return await original_record(*args, **kwargs)
+
     monkeypatch.setattr(
-        outbound_store,
-        "rekey_outbound_task",
-        AsyncMock(return_value=0),
+        outbound_store, "record_outbound_dispatch", _fail_second_reservation,
     )
 
     try:
-        delivered = await feature.send_a2a_task("companion", "local work")
+        owner = await feature.send_a2a_task("first", "first task")
+        delivered_but_untrackable = await feature.send_a2a_task(
+            "second", "second task",
+        )
 
-        assert delivered.status is ToolResultStatus.OK
-        assert delivered.data["sent"] is True
-        assert delivered.data["task_id"] == "peer-assigned-task-id"
-        adapter.send_a2a_task.assert_awaited_once()
-        assert "could not rekey its best-effort outbound audit record" in caplog.text
+        assert owner.status is ToolResultStatus.OK
+        assert owner.data["task_id"] == "shared-peer-task-id"
+        assert delivered_but_untrackable.status is ToolResultStatus.ERROR
+        assert delivered_but_untrackable.data["sent"] is True
+        assert (
+            delivered_but_untrackable.data["task_id"]
+            != "shared-peer-task-id"
+        )
+        assert (
+            delivered_but_untrackable.data["error_type"]
+            == "peer_identity_persistence_failed"
+        )
+
+        failed_task_id = delivered_but_untrackable.data["task_id"]
+        fetched = await feature.get_peer_task_result("second", failed_task_id)
+        assert fetched.status is ToolResultStatus.ERROR
+        await feature._supervise_a2a_question(
+            task_id=failed_task_id,
+            recipient="second",
+            recipient_agent_id=second.agent_id,
+            original_question="status?",
+            sess_id="session-1",
+            deadline_utc=datetime.now(timezone.utc) + timedelta(seconds=5),
+            causation_chain=None,
+        )
+
+        restarted_agent = _agent()
+        restarted_agent._raw_storage = agent._raw_storage
+        restarted_agent.storage = None
+        restarted = PeersFeature(restarted_agent)
+        await restarted.initialize()
+        fetched_after_restart = await restarted.get_peer_task_result(
+            "second", failed_task_id,
+        )
+        assert fetched_after_restart.status is ToolResultStatus.ERROR
+        await restarted._supervise_a2a_question(
+            task_id=failed_task_id,
+            recipient="second",
+            recipient_agent_id=second.agent_id,
+            original_question="status?",
+            sess_id="session-1",
+            deadline_utc=datetime.now(timezone.utc) + timedelta(seconds=5),
+            causation_chain=None,
+        )
+
+        fetched_owner = await restarted.get_peer_task_result(
+            "first", "shared-peer-task-id",
+        )
+        assert fetched_owner.status is ToolResultStatus.OK
+        await restarted._supervise_a2a_question(
+            task_id="shared-peer-task-id",
+            recipient="first",
+            recipient_agent_id=first.agent_id,
+            original_question="status?",
+            sess_id="session-1",
+            deadline_utc=datetime.now(timezone.utc) + timedelta(seconds=5),
+            causation_chain=None,
+        )
+
+        assert adapter.send_a2a_task.await_count == 2
+        assert fetched_from == [first.agent_id]
+        assert subscribed_to == [first.agent_id]
+        assert second.agent_id not in fetched_from
+        assert second.agent_id not in subscribed_to
     finally:
         await backend.close()
 
