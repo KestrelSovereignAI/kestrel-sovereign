@@ -554,23 +554,40 @@ class PeersFeature(Feature):
             raise PeerNotFoundError(
                 "No durable stable identity exists for this peer task"
             ) from exc
-        except Exception as exc:  # noqa: BLE001 - best-effort legacy audit read
+        except Exception as exc:  # noqa: BLE001 - database backend boundary
             logger.debug(
                 "outbound_store: retained recipient lookup failed for %s: %s",
                 task_id, exc,
             )
-            if self._requires_durable_peer_binding():
+            # Once initialization has established the route store, an
+            # unreadable lookup is not distinguishable from a missing or
+            # unsafe binding.  In either case, falling back to ``recipient``
+            # would let a same-name replacement peer receive a retained
+            # result fetch or subscription.  ``None`` is reserved exclusively
+            # for the true legacy no-store path.
+            if getattr(self, "_outbound_route_store_ready", False):
                 raise PeerNotFoundError(
                     "No durable stable identity exists for this peer task"
                 ) from exc
             return None
-        recipient_agent_id = (
-            outbound.recipient_agent_id if outbound is not None else None
-        )
-        if (
-            outbound is not None
-            and outbound.route_state != ROUTE_STATE_ROUTABLE
-        ):
+        if outbound is None:
+            # ``None`` means two very different things depending on whether a
+            # route store was ready.  Without a store, this is the narrow
+            # historical local-host compatibility path: there was nowhere to
+            # retain an outbound binding.  With a ready store, however, it is
+            # affirmative evidence that this task has no durable owner (for
+            # example, every reservation retry failed before and after
+            # delivery).  Falling back to ``recipient`` in the latter case
+            # would let a same-name replacement peer receive a retained fetch
+            # or subscription after restart.
+            if getattr(self, "_outbound_route_store_ready", False):
+                raise PeerNotFoundError(
+                    "No durable stable identity exists for this peer task"
+                )
+            return None
+
+        recipient_agent_id = outbound.recipient_agent_id
+        if outbound.route_state != ROUTE_STATE_ROUTABLE:
             # A reservation becomes routable only when its exact owner safely
             # accepts the peer's task id.  This includes local-host sends:
             # when an older peer returns a colliding id, keeping the sender's
@@ -583,8 +600,7 @@ class PeersFeature(Feature):
         if (
             self._requires_durable_peer_binding()
             and (
-                outbound is None
-                or outbound.route_state != ROUTE_STATE_ROUTABLE
+                outbound.route_state != ROUTE_STATE_ROUTABLE
                 or not recipient_agent_id
             )
         ):

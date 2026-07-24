@@ -453,6 +453,60 @@ async def test_hosted_identity_write_failure_cannot_route_replacement_after_rest
 
 
 @pytest.mark.asyncio
+async def test_hosted_route_store_read_failure_cannot_route_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    """A ready hosted store must fail closed when a retained lookup raises."""
+    scope_a, scope_b = object(), object()
+    router = ScopedRouter(scope_a, scope_b)
+    feature, backend = await _durable_feature_for_scope(
+        router, scope_a, tmp_path, database_name="hosted-route-read-failure.db",
+    )
+    try:
+        submitted = await feature.send_a2a_task("companion", "sensitive work")
+        assert submitted.status is ToolResultStatus.OK
+        assert feature._outbound_route_store_ready is True
+
+        router.scope_a_entries = {
+            "companion": PeerIdentity(
+                agent_id="did:tenant-a:replacement",
+                slug="companion",
+                routing_key="a-replacement",
+                name="Companion",
+            ),
+        }
+        monkeypatch.setattr(
+            outbound_store,
+            "get_outbound_task",
+            AsyncMock(side_effect=OSError("durable route lookup failed")),
+        )
+
+        fetched = await feature.get_peer_task_result(
+            "companion", submitted.data["task_id"],
+        )
+        await feature._supervise_a2a_question(
+            task_id=submitted.data["task_id"],
+            recipient="companion",
+            recipient_agent_id=None,
+            original_question="status?",
+            sess_id="session-1",
+            deadline_utc=datetime.now(timezone.utc) + timedelta(seconds=5),
+            causation_chain=None,
+        )
+
+        assert fetched.status is ToolResultStatus.ERROR
+        assert router.fetched_from == []
+        assert router.subscription_attempts == []
+        assert router.subscribed_to == []
+        # The send is the only operation allowed to resolve the mutable name.
+        assert router.resolve_calls == ["companion"]
+        assert router.resolve_by_agent_id_calls == []
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
 async def test_hosted_rekey_failure_fails_closed_with_the_peer_task_id(
     tmp_path, monkeypatch,
 ):
@@ -967,6 +1021,104 @@ async def test_local_ambiguous_historical_route_never_falls_back_to_replacement(
 
 
 @pytest.mark.asyncio
+async def test_local_route_store_read_failure_cannot_route_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    """A ready local store must fail closed when a retained lookup raises."""
+    replacement = PeerIdentity(
+        agent_id="did:local:replacement",
+        slug="companion",
+        routing_key="replacement",
+        name="Companion",
+    )
+    fetched_from: list[str] = []
+    subscribed_to: list[str] = []
+    adapter = LocalHostPeerDirectory("http://local-host")
+    adapter.resolve_peer = AsyncMock(return_value=replacement)
+    adapter.resolve_peer_by_agent_id = AsyncMock(return_value=replacement)
+
+    async def _get_task(_requester, peer, _task_id):
+        fetched_from.append(peer.agent_id)
+        return {"status": "completed"}
+
+    async def _subscribe_task(
+        _requester, peer, task_id, *, timeout_seconds,
+    ):
+        del timeout_seconds
+        subscribed_to.append(peer.agent_id)
+        yield PeerSubscriptionEvent(
+            event="status",
+            data=(
+                '{"id":"' + task_id + '","status":{"state":"completed",'
+                '"message":{"parts":[{"text":"done"}]}}}'
+            ),
+        )
+
+    adapter.get_a2a_task = AsyncMock(side_effect=_get_task)
+    adapter.subscribe_a2a_task = _subscribe_task
+    requester = PeerRequester("did:local:caller", object())
+    agent = SimpleNamespace(
+        _agent_name="caller",
+        did="did:local:caller",
+        peer_directory_router=adapter,
+        peer_requester=requester,
+        identity=None,
+        _provide_causation_chain=lambda: None,
+        _get_current_turn_id=lambda: None,
+        pending_a2a_questions=MagicMock(
+            mark_resolved=AsyncMock(return_value=True),
+        ),
+        dispatcher=MagicMock(enqueue_signal=AsyncMock()),
+        _track_background_task=lambda coro, *, name="": coro.close() or MagicMock(),
+    )
+    backend = SQLiteBackend(str(tmp_path / "local-route-read-failure.db"))
+    await backend.connect()
+    agent._raw_storage = SimpleNamespace(db=AsyncDatabase(backend))
+    agent.storage = None
+    feature = PeersFeature(agent)
+    await feature.initialize()
+    task_id = "retained-local-task"
+
+    try:
+        await outbound_store.record_outbound_dispatch(
+            feature._db,
+            agent_id="did:local:caller",
+            task_id=task_id,
+            recipient="companion",
+            recipient_agent_id="did:local:original",
+            verb="question",
+            session_id="session-1",
+            dispatch_tool="send_a2a_question",
+        )
+        assert feature._outbound_route_store_ready is True
+        monkeypatch.setattr(
+            outbound_store,
+            "get_outbound_task",
+            AsyncMock(side_effect=OSError("durable route lookup failed")),
+        )
+
+        fetched = await feature.get_peer_task_result("companion", task_id)
+        await feature._supervise_a2a_question(
+            task_id=task_id,
+            recipient="companion",
+            recipient_agent_id=None,
+            original_question="status?",
+            sess_id="session-1",
+            deadline_utc=datetime.now(timezone.utc) + timedelta(seconds=5),
+            causation_chain=None,
+        )
+
+        assert fetched.status is ToolResultStatus.ERROR
+        assert fetched_from == []
+        assert subscribed_to == []
+        adapter.resolve_peer.assert_not_awaited()
+        adapter.resolve_peer_by_agent_id.assert_not_awaited()
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
 async def test_local_reservation_write_failure_never_exposes_colliding_peer_id(
     tmp_path,
     monkeypatch,
@@ -1142,6 +1294,155 @@ async def test_local_reservation_write_failure_never_exposes_colliding_peer_id(
         assert subscribed_to == [first.agent_id]
         assert second.agent_id not in fetched_from
         assert second.agent_id not in subscribed_to
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_local_all_reservation_writes_failed_never_fall_back_to_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    """A ready local store with no route row is not a legacy no-store send.
+
+    If the initial reservation plus every post-delivery denial write fails,
+    restart cannot know which stable peer accepted the task.  It must refuse
+    fetch and replay rather than resolving a same-name replacement peer.
+    """
+    original = PeerIdentity(
+        agent_id="did:local:original",
+        slug="companion",
+        routing_key="original-route",
+        name="Companion",
+    )
+    replacement = PeerIdentity(
+        agent_id="did:local:replacement",
+        slug="companion",
+        routing_key="replacement-route",
+        name="Companion",
+    )
+    peers = {"companion": original}
+    fetched_from: list[str] = []
+    subscribed_to: list[str] = []
+    adapter = LocalHostPeerDirectory("http://local-host")
+    adapter.resolve_peer = AsyncMock(
+        side_effect=lambda _requester, name: peers.get(name.casefold()),
+    )
+    adapter.resolve_peer_by_agent_id = AsyncMock(
+        side_effect=lambda _requester, agent_id: next(
+            (peer for peer in peers.values() if peer.agent_id == agent_id),
+            None,
+        ),
+    )
+    adapter.send_a2a_task = AsyncMock(
+        side_effect=lambda _requester, _peer, payload: {
+            "id": payload["id"],
+            "sessionId": payload["sessionId"],
+            "status": {"state": "submitted"},
+        },
+    )
+
+    async def _get_task(_requester, peer, _task_id):
+        fetched_from.append(peer.agent_id)
+        return {"status": "completed"}
+
+    async def _subscribe_task(
+        _requester, peer, task_id, *, timeout_seconds,
+    ):
+        del timeout_seconds
+        subscribed_to.append(peer.agent_id)
+        yield PeerSubscriptionEvent(
+            event="status",
+            data=(
+                '{"id":"' + task_id + '","status":{"state":"completed",'
+                '"message":{"parts":[{"text":"done"}]}}}'
+            ),
+        )
+
+    adapter.get_a2a_task = AsyncMock(side_effect=_get_task)
+    adapter.subscribe_a2a_task = _subscribe_task
+    requester = PeerRequester("did:local:caller", object())
+
+    def _agent() -> SimpleNamespace:
+        return SimpleNamespace(
+            _agent_name="caller",
+            did="did:local:caller",
+            peer_directory_router=adapter,
+            peer_requester=requester,
+            identity=None,
+            _provide_causation_chain=lambda: None,
+            _get_current_turn_id=lambda: None,
+            pending_a2a_questions=MagicMock(
+                mark_resolved=AsyncMock(return_value=True),
+            ),
+            dispatcher=MagicMock(enqueue_signal=AsyncMock()),
+            _track_background_task=lambda coro, *, name="": coro.close() or MagicMock(),
+        )
+
+    backend = SQLiteBackend(str(tmp_path / "local-all-reservation-failures.db"))
+    await backend.connect()
+    agent = _agent()
+    agent._raw_storage = SimpleNamespace(db=AsyncDatabase(backend))
+    agent.storage = None
+    feature = PeersFeature(agent)
+    await feature.initialize()
+
+    async def _always_fail_reservation(*_args, **_kwargs):
+        raise OSError("injected persistent reservation-write failure")
+
+    monkeypatch.setattr(
+        outbound_store, "record_outbound_dispatch", _always_fail_reservation,
+    )
+
+    try:
+        delivered_but_untrackable = await feature.send_a2a_task(
+            "companion", "sensitive work",
+        )
+
+        assert feature._outbound_route_store_ready is True
+        assert delivered_but_untrackable.status is ToolResultStatus.ERROR
+        assert delivered_but_untrackable.data["sent"] is True
+        assert (
+            delivered_but_untrackable.data["error_type"]
+            == "peer_identity_persistence_failed"
+        )
+        failed_task_id = delivered_but_untrackable.data["task_id"]
+        assert await outbound_store.get_outbound_task(
+            feature._db,
+            agent_id="did:local:caller",
+            task_id=failed_task_id,
+        ) is None
+
+        # The original automatic name is now assigned to another peer.  A
+        # reconstructed feature must not turn the missing route row into a
+        # mutable-name lookup for result fetch or subscription replay.
+        peers["companion"] = replacement
+        restarted_agent = _agent()
+        restarted_agent._raw_storage = agent._raw_storage
+        restarted_agent.storage = None
+        restarted = PeersFeature(restarted_agent)
+        await restarted.initialize()
+
+        fetched = await restarted.get_peer_task_result(
+            "companion", failed_task_id,
+        )
+        assert fetched.status is ToolResultStatus.ERROR
+        await restarted._supervise_a2a_question(
+            task_id=failed_task_id,
+            recipient="companion",
+            recipient_agent_id=None,
+            original_question="status?",
+            sess_id="session-1",
+            deadline_utc=datetime.now(timezone.utc) + timedelta(seconds=5),
+            causation_chain=None,
+        )
+
+        assert adapter.send_a2a_task.await_count == 1
+        assert adapter.resolve_peer.await_count == 1
+        assert adapter.resolve_peer.await_args.args == (requester, "companion")
+        adapter.resolve_peer_by_agent_id.assert_not_awaited()
+        assert fetched_from == []
+        assert subscribed_to == []
     finally:
         await backend.close()
 
