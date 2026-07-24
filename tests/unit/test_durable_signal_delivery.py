@@ -40,6 +40,8 @@ class _Agent:
         self._did = did
         self.tasks: list[asyncio.Task] = []
         self.action_calls = 0
+        self.action_payloads: list[dict] = []
+        self._privacy_transition_lock = asyncio.Lock()
 
     @property
     def did(self) -> str:
@@ -47,6 +49,10 @@ class _Agent:
 
     async def process_input(self, prompt: str):  # pragma: no cover - ACTION only
         return prompt
+
+    def _get_privacy_transition_lock(self):
+        """Mirror the production agent seam used by durable persistence."""
+        return self._privacy_transition_lock
 
     def _track_background_task(self, coro, *, name: str):
         task = asyncio.create_task(coro, name=name)
@@ -57,6 +63,7 @@ class _Agent:
 def _registration(agent: _Agent, source: str = "provider.message") -> SourceRegistration:
     async def handler(payload):
         agent.action_calls += 1
+        agent.action_payloads.append(dict(payload))
         return {"handled": payload["message"]}
 
     def normalize(payload):
@@ -362,6 +369,345 @@ async def test_dispatcher_retention_sweep_preserves_other_agents_history(tmp_pat
     finally:
         await _close(backend_a, agent_a)
         await _close(backend_b, agent_b)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("privacy_preset", "storage_marker"),
+    (
+        ("ephemeral", "none"),
+        ("isolated", "temp"),
+        ("deidentified", "deidentified"),
+    ),
+)
+async def test_volatile_privacy_materializes_payload_correlated_wait_without_persisting_payload(
+    tmp_path, privacy_preset, storage_marker
+):
+    """A volatile payload selector matches once, then replays only its safe row."""
+    from kestrel_sovereign.privacy import get_privacy_preset
+
+    path = tmp_path / f"volatile-wait-{privacy_preset}.db"
+    agent_id = "did:agent:volatile"
+    workflow_id = f"workflow-{privacy_preset}-42"
+    secret = f"customer-{privacy_preset}@example.com"
+    consumer = DurableConsumerRegistration(
+        consumer_id="workflow-wait",
+        source="provider.message",
+        agent_id=agent_id,
+        correlation_selector=f"payload.workflow={workflow_id}",
+    )
+
+    backend, agent, dispatcher = await _dispatcher(path, agent_id)
+    agent.privacy_config = get_privacy_preset(privacy_preset)
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        live_signal = _signal(
+            agent_id=agent_id,
+            message=f" {secret} ",
+            workflow=workflow_id,
+        )
+        result = await dispatcher.dispatch_signal(
+            live_signal,
+            source_event_id=f"volatile-{privacy_preset}",
+        )
+
+        assert result.status is Status.OK
+        # The durable selector, normal source handler, and an immediate durable
+        # claim receive the normalized signal, not the privacy projection used
+        # for the durable event row.
+        assert agent.action_payloads == [
+            {"message": secret, "workflow": workflow_id}
+        ]
+        live_delivery = await dispatcher.claim_durable_delivery(
+            consumer_id=consumer.consumer_id,
+            executor_id="live-workflow-runner",
+        )
+        assert live_delivery is not None
+        assert live_delivery.event.payload == {
+            "message": secret,
+            "workflow": workflow_id,
+        }
+        # A non-terminal retry leaves the same process's live handoff intact;
+        # after shutdown, only the durable marker can be replayed.
+        retry = await dispatcher.nack_durable_delivery(
+            consumer_id=consumer.consumer_id,
+            delivery_id=live_delivery.delivery_id,
+            lease_token=live_delivery.lease_token,
+            error="simulate process restart before retry",
+        )
+        assert retry is not None and retry.status == RETRY
+        assert live_delivery.delivery_id in dispatcher._transient_durable_handoffs
+        assert [delivery.event_id for delivery in await dispatcher.list_durable_deliveries()] == [
+            result.signal_id
+        ]
+        row = await backend.fetch_one(
+            "SELECT payload FROM durable_signal_events WHERE agent_id = ?",
+            (agent_id,),
+        )
+        assert row is not None
+        assert json.loads(row[0]) == {"_privacy_gated": storage_marker}
+        assert secret not in row[0]
+        assert workflow_id not in row[0]
+        dispatcher.shutdown()
+        assert dispatcher._transient_durable_handoffs == {}
+    finally:
+        await _close(backend, agent)
+
+    # Restart registration backfills from the projected row (which cannot
+    # satisfy the payload selector), but the already-materialized delivery is
+    # durable and therefore remains replayable exactly once.
+    backend2, agent2, dispatcher2 = await _dispatcher(path, agent_id)
+    agent2.privacy_config = get_privacy_preset(privacy_preset)
+    try:
+        await dispatcher2.register_durable_consumer(consumer)
+        replayed = await dispatcher2.claim_durable_delivery(
+            consumer_id=consumer.consumer_id,
+            executor_id="workflow-runner",
+        )
+        assert replayed is not None
+        assert replayed.event.payload == {"_privacy_gated": storage_marker}
+        assert await dispatcher2.ack_durable_delivery(
+            consumer_id=consumer.consumer_id,
+            delivery_id=replayed.delivery_id,
+            lease_token=replayed.lease_token,
+        )
+    finally:
+        await _close(backend2, agent2)
+
+
+@pytest.mark.asyncio
+async def test_live_handoff_is_discarded_on_terminal_ack_and_lease_expiry(tmp_path):
+    """Volatile payloads cannot outlive their terminal or leased delivery."""
+    from kestrel_sovereign.privacy import get_privacy_preset
+
+    backend, agent, dispatcher = await _dispatcher(tmp_path / "handoff-clear.db", "did:agent:one")
+    agent.privacy_config = get_privacy_preset("ephemeral")
+    consumer = DurableConsumerRegistration(
+        consumer_id="workflow-wait",
+        source="provider.message",
+        agent_id=agent.did,
+    )
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        assert (await dispatcher.dispatch_signal(
+            _signal(agent_id=agent.did, message="terminal-secret"),
+            source_event_id="terminal-handoff",
+        )).status is Status.OK
+        acknowledged = await dispatcher.claim_durable_delivery(
+            consumer_id=consumer.consumer_id,
+            executor_id="live-workflow-runner",
+        )
+        assert acknowledged is not None
+        assert acknowledged.delivery_id in dispatcher._transient_durable_handoffs
+        assert await dispatcher.ack_durable_delivery(
+            consumer_id=consumer.consumer_id,
+            delivery_id=acknowledged.delivery_id,
+            lease_token=acknowledged.lease_token,
+        )
+        assert acknowledged.delivery_id not in dispatcher._transient_durable_handoffs
+
+        assert (await dispatcher.dispatch_signal(
+            _signal(agent_id=agent.did, message="expired-secret"),
+            source_event_id="expired-handoff",
+        )).status is Status.OK
+        expiring = await dispatcher.claim_durable_delivery(
+            consumer_id=consumer.consumer_id,
+            executor_id="live-workflow-runner",
+        )
+        assert expiring is not None
+        handoff = dispatcher._transient_durable_handoffs[expiring.delivery_id]
+        handoff.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        dispatcher._expire_transient_durable_handoff(
+            expiring.delivery_id, handoff.expires_at
+        )
+        assert expiring.delivery_id not in dispatcher._transient_durable_handoffs
+    finally:
+        dispatcher.shutdown()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_privacy_transition_waits_for_projection_and_durable_commit(tmp_path):
+    """A NORMAL projection cannot commit after an EPHEMERAL transition wins."""
+    from kestrel_sovereign.privacy import get_privacy_preset
+
+    backend, agent, dispatcher = await _dispatcher(tmp_path / "privacy-race.db", "did:agent:one")
+    agent.privacy_config = get_privacy_preset("normal")
+    secret = "normal-before-transition@example.com"
+    persist_entered = asyncio.Event()
+    allow_persist = asyncio.Event()
+    persist_committed = asyncio.Event()
+    original_execute = backend.execute
+
+    async def stall_event_insert(query, params=()):
+        if "INSERT OR IGNORE INTO durable_signal_events" in query:
+            persist_entered.set()
+            await allow_persist.wait()
+            result = await original_execute(query, params)
+            persist_committed.set()
+            return result
+        return await original_execute(query, params)
+
+    backend.execute = stall_event_insert
+
+    async def transition_to_ephemeral():
+        async with agent._get_privacy_transition_lock():
+            # This point is reachable only after the dispatch's projection and
+            # durable INSERT completed under the same transition lock.
+            assert persist_committed.is_set()
+            agent.privacy_config = get_privacy_preset("ephemeral")
+
+    try:
+        dispatch_task = asyncio.create_task(
+            dispatcher.dispatch_signal(
+                _signal(agent_id=agent.did, message=secret),
+                source_event_id="normal-to-ephemeral-race",
+            )
+        )
+        await asyncio.wait_for(persist_entered.wait(), timeout=2)
+        transition_task = asyncio.create_task(transition_to_ephemeral())
+        await asyncio.sleep(0)
+        assert not transition_task.done()
+
+        allow_persist.set()
+        result = await dispatch_task
+        await transition_task
+        assert result.status is Status.OK
+        assert agent.privacy_config.is_ephemeral()
+
+        row = await backend.fetch_one(
+            "SELECT payload FROM durable_signal_events WHERE agent_id = ?",
+            (agent.did,),
+        )
+        assert row is not None
+        # The event was committed while the old NORMAL policy still held the
+        # transition lock; the mode change was not allowed to overtake it.
+        assert secret in row[0]
+    finally:
+        backend.execute = original_execute
+        dispatcher.shutdown()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_volatile_payload_selector_is_scoped_to_its_shared_database_tenant(tmp_path):
+    """Transient matching cannot materialize another tenant's durable wait."""
+    from kestrel_sovereign.privacy import get_privacy_preset
+
+    path = tmp_path / "volatile-tenant-scope.db"
+    backend_a, agent_a, dispatcher_a = await _dispatcher(path, "did:agent:a")
+    backend_b, agent_b, dispatcher_b = await _dispatcher(path, "did:agent:b")
+    agent_a.privacy_config = get_privacy_preset("ephemeral")
+    agent_b.privacy_config = get_privacy_preset("ephemeral")
+    workflow_id = "shared-workflow-42"
+    secret = "tenant-a-customer@example.com"
+    try:
+        for agent, dispatcher in (
+            (agent_a, dispatcher_a),
+            (agent_b, dispatcher_b),
+        ):
+            await dispatcher.register_durable_consumer(
+                DurableConsumerRegistration(
+                    consumer_id="workflow-wait",
+                    source="provider.message",
+                    agent_id=agent.did,
+                    correlation_selector=f"payload.workflow={workflow_id}",
+                )
+            )
+
+        # A foreign envelope target does not change the owner of the durable
+        # scope. The payload match belongs only to dispatcher A's tenant.
+        result = await dispatcher_a.dispatch_signal(
+            _signal(
+                agent_id=agent_b.did,
+                message=secret,
+                workflow=workflow_id,
+            ),
+            source_event_id="tenant-a-volatile-event",
+        )
+        assert result.status is Status.OK
+        assert [delivery.event_id for delivery in await dispatcher_a.list_durable_deliveries()] == [
+            result.signal_id
+        ]
+        assert await dispatcher_b.claim_durable_delivery(
+            consumer_id="workflow-wait", executor_id="tenant-b-runner"
+        ) is None
+
+        rows = await backend_a.fetch_all(
+            "SELECT agent_id, payload FROM durable_signal_events ORDER BY agent_id"
+        )
+        assert rows == [(agent_a.did, '{"_privacy_gated": "none"}')]
+        assert secret not in rows[0][1]
+        assert workflow_id not in rows[0][1]
+    finally:
+        await _close(backend_a, agent_a)
+        await _close(backend_b, agent_b)
+
+
+@pytest.mark.asyncio
+async def test_anonymous_selector_uses_the_persisted_redacted_payload_before_and_after_restart(
+    tmp_path,
+):
+    """ANONYMOUS selector matching is identical for initial and replayed delivery."""
+    from kestrel_sovereign.privacy import get_privacy_preset
+
+    path = tmp_path / "anonymous-selector.db"
+    agent_id = "did:agent:anonymous"
+    secret = "customer@example.com"
+    consumer = DurableConsumerRegistration(
+        consumer_id="workflow-wait",
+        source="provider.message",
+        agent_id=agent_id,
+        correlation_selector="payload.message=[EMAIL_REDACTED]",
+    )
+
+    backend, agent, dispatcher = await _dispatcher(path, agent_id)
+    agent.privacy_config = get_privacy_preset("anonymous")
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        result = await dispatcher.dispatch_signal(
+            _signal(agent_id=agent_id, message=secret),
+            source_event_id="anonymous-selector-event",
+        )
+
+        assert result.status is Status.OK
+        # The selector is evaluated against the anonymized event during the
+        # persistence transaction, so its delivery exists before any claim.
+        deliveries = await dispatcher.list_durable_deliveries()
+        assert len(deliveries) == 1
+        assert deliveries[0].event_id == result.signal_id
+        assert deliveries[0].event.payload == {
+            "message": "[EMAIL_REDACTED]",
+            "workflow": "wf-1",
+        }
+        row = await backend.fetch_one(
+            "SELECT payload FROM durable_signal_events WHERE agent_id = ?",
+            (agent_id,),
+        )
+        assert row is not None
+        assert secret not in row[0]
+        assert json.loads(row[0]) == deliveries[0].event.payload
+    finally:
+        await _close(backend, agent)
+
+    # Registering after a restart sees the same redacted payload.  It must not
+    # backfill a second delivery or change the event a worker claims.
+    backend2, agent2, dispatcher2 = await _dispatcher(path, agent_id)
+    agent2.privacy_config = get_privacy_preset("anonymous")
+    try:
+        await dispatcher2.register_durable_consumer(consumer)
+        assert len(await dispatcher2.list_durable_deliveries()) == 1
+        replayed = await dispatcher2.claim_durable_delivery(
+            consumer_id=consumer.consumer_id,
+            executor_id="workflow-runner",
+        )
+        assert replayed is not None
+        assert replayed.event.payload == {
+            "message": "[EMAIL_REDACTED]",
+            "workflow": "wf-1",
+        }
+    finally:
+        await _close(backend2, agent2)
 
 
 @pytest.mark.asyncio

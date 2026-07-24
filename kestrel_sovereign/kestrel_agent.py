@@ -6020,6 +6020,14 @@ Expected Duration: {expected_duration}
             self._shutdown_background_tasks(), _step_guard(), "background-tasks"
         )
 
+        # Durable signal events retain only their policy-safe projection, but
+        # the dispatcher can briefly hold a same-process live payload handoff
+        # for a worker that claims before restart.  It is never durable and
+        # must not outlive this agent instance.
+        dispatcher = getattr(self, "dispatcher", None)
+        if dispatcher is not None:
+            dispatcher.shutdown()
+
         # Stop memory-owned bookkeeping before storage/sync shutdown.
         if run_memory:
             await _bounded(memory_system.shutdown(), _step_guard(), "memory-system")

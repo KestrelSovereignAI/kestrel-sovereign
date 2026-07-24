@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Optional
 
@@ -36,6 +36,7 @@ FAILED = "failed"
 _TERMINAL_STATUSES = frozenset({ACKNOWLEDGED, FAILED})
 _CLAIMABLE_STATUSES = frozenset({PENDING, RETRY})
 _SELECTOR_KEY = re.compile(r"^(?:payload\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*|session_id|kind)=(.+)$")
+_PERSISTED_PAYLOAD = object()
 
 
 @dataclass(frozen=True)
@@ -88,11 +89,17 @@ class DurableEventPersistence:
     ``created`` is false when the source event ID had already been accepted
     for the same source and agent/tenant.  The original ``event_id`` is
     returned so callers can record a useful audit result without creating a
-    duplicate delivery.
+    duplicate delivery.  ``delivery_ids`` identifies only the initial
+    deliveries inserted by this persistence transaction.  The dispatcher uses
+    that narrow result to associate a process-local live handoff with exactly
+    the consumers whose selectors matched the normalized signal; it is never
+    stored in the event row.
     """
 
     event_id: str
     created: bool
+    delivery_ids: tuple[str, ...] = ()
+    retention_until: Optional[datetime] = None
 
 
 @dataclass(frozen=True)
@@ -324,12 +331,20 @@ class DurableSignalStore(UnifiedStoreBase):
         agent_id: str,
         source_event_id: Optional[str],
         retention_days: int,
+        transient_selector_payload: Any = _PERSISTED_PAYLOAD,
     ) -> DurableEventPersistence:
-        """Commit a canonical signal and all matching initial deliveries.
+        """Commit a persisted signal and all matching initial deliveries.
 
         This is the durable boundary called by the dispatcher *after*
         sanitization/schema normalization and causation validation, but before
-        handlers, cognition, or any durable consumer can execute.
+        handlers, cognition, or any durable consumer can execute.  When a
+        privacy projection fully elides payload content, ``signal`` is that
+        safe persisted projection while ``transient_selector_payload`` is the
+        normalized in-memory payload used only to materialize deliveries for
+        consumers already registered in this transaction.  It is never
+        serialized, returned, or used for restart backfill.  Projections that
+        retain a replayable payload, including ANONYMOUS redaction, leave this
+        argument unset so initial and replayed selector behavior is identical.
         """
         if retention_days < 0:
             raise ValueError("retention_days must be >= 0")
@@ -391,16 +406,29 @@ class DurableSignalStore(UnifiedStoreBase):
                 committed_at=now,
                 retention_until=retention_until,
             )
+            selector_event = (
+                event
+                if transient_selector_payload is _PERSISTED_PAYLOAD
+                else replace(event, payload=transient_selector_payload)
+            )
+            delivery_ids: list[str] = []
             for consumer_id, selector, max_attempts in consumer_rows:
-                if self._matches_selector(event, selector):
-                    await self._insert_delivery_locked(
+                if self._matches_selector(selector_event, selector):
+                    delivery_id = await self._insert_delivery_locked(
                         agent_id=agent_id,
                         consumer_id=consumer_id,
                         event_id=signal.id,
                         max_attempts=int(max_attempts),
                         now=now,
                     )
-        return DurableEventPersistence(event_id=signal.id, created=True)
+                    if delivery_id is not None:
+                        delivery_ids.append(delivery_id)
+        return DurableEventPersistence(
+            event_id=signal.id,
+            created=True,
+            delivery_ids=tuple(delivery_ids),
+            retention_until=retention_until,
+        )
 
     # ------------------------------------------------------------------
     # Claim / lease / acknowledgement API
@@ -837,8 +865,9 @@ class DurableSignalStore(UnifiedStoreBase):
         event_id: str,
         max_attempts: int,
         now: datetime,
-    ) -> None:
-        await self._backend.execute(
+    ) -> Optional[str]:
+        delivery_id = secrets.token_urlsafe(18)
+        inserted = await self._backend.execute(
             f"""
             INSERT OR IGNORE INTO {self.DELIVERIES} (
                 delivery_id, agent_id, consumer_id, event_id, status,
@@ -846,7 +875,7 @@ class DurableSignalStore(UnifiedStoreBase):
             ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
             """,
             (
-                secrets.token_urlsafe(18),
+                delivery_id,
                 agent_id,
                 consumer_id,
                 event_id,
@@ -856,6 +885,7 @@ class DurableSignalStore(UnifiedStoreBase):
                 self.to_timestamp_param(now),
             ),
         )
+        return delivery_id if inserted == 1 else None
 
     def _event_from_signal(
         self,

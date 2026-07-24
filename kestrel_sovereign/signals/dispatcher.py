@@ -76,6 +76,7 @@ enforces this for the whole repo.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import inspect
 import logging
@@ -113,9 +114,14 @@ from kestrel_sovereign.signals.constitution_metrics import (
     record_echo_verified,
 )
 from kestrel_sovereign.features.storage_access import resolve_agent_privacy_config
+from kestrel_sovereign.storage.privacy_wrapper import (
+    _resolve_transition_lock,
+    optional_transition_lock,
+)
 from kestrel_sovereign.signals.lock_manager import OrderedLockManager
 from kestrel_sovereign.signals.registry import RegistrationError, SourceRegistry
 from kestrel_sovereign.signals.durable import (
+    FAILED,
     DurableConsumerRegistration,
     DurableDelivery,
     DurableSignalStore,
@@ -176,6 +182,37 @@ class _ConstitutionAudit:
     # post-dispatch with a fresh nonce would race the model against
     # a moving target.
     canary: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class _DurableSignalProjection:
+    """The durable event representation and its initial selector contract.
+
+    Payload-eliding privacy modes deliberately retain no selector-visible
+    payload in their durable event.  Existing waits still need their
+    normalized in-memory event to be materialized atomically at dispatch
+    time; later registrations and restart backfill must see only the durable
+    representation.  Anonymized payloads, conversely, are replayable and so
+    selectors must use that stored projection from the first delivery.
+    """
+
+    signal: Signal
+    payload_elided: bool = False
+
+
+@dataclass
+class _TransientDurableHandoff:
+    """Process-local payload for one initially matched volatile delivery.
+
+    Volatile privacy modes retain only a marker in ``durable_signal_events``.
+    This handoff lets a worker in the same live dispatcher receive the
+    normalized payload that selected it, while retries after a lease expiry or
+    a process restart correctly fall back to the durable marker.
+    """
+
+    payload: Any
+    retention_until: datetime
+    expires_at: datetime
 
 
 def _agent_accepts_kwarg(callable_: Any, name: str) -> bool:
@@ -366,6 +403,11 @@ class SignalDispatcher:
         self._durable_store = durable_store or DurableSignalStore(store.backend)
         self._durable_initialized = False
         self._durable_init_lock = asyncio.Lock()
+        # This is intentionally dispatcher-local.  It is not a second durable
+        # queue and must disappear on shutdown/restart; ``delivery_id`` is
+        # globally unique and every dispatcher owns exactly one agent scope.
+        self._transient_durable_handoffs: dict[str, _TransientDurableHandoff] = {}
+        self._transient_durable_handoff_timers: dict[str, asyncio.TimerHandle] = {}
         self._ttl = ttl
         self._default_window = coalescing_window_default
         self._clock = clock
@@ -488,10 +530,29 @@ class SignalDispatcher:
     ) -> Optional[DurableDelivery]:
         """Atomically claim one delivery for this agent-scoped consumer."""
         await self.initialize_durable_delivery()
-        return await self._durable_store.claim_delivery(
+        self._discard_expired_transient_durable_handoffs()
+        delivery = await self._durable_store.claim_delivery(
             agent_id=self._agent.did,
             consumer_id=consumer_id,
             executor_id=executor_id,
+        )
+        if delivery is None:
+            return None
+        handoff = self._transient_durable_handoffs.get(delivery.delivery_id)
+        if handoff is None:
+            return delivery
+        # A claim is the live consumer handoff.  Retain the payload through a
+        # retry, but never past the lease it was handed to this executor.
+        if delivery.lease_expires_at is not None:
+            handoff.expires_at = min(
+                handoff.retention_until, delivery.lease_expires_at
+            )
+            self._schedule_transient_durable_handoff_expiry(
+                delivery.delivery_id, handoff.expires_at
+            )
+        return replace(
+            delivery,
+            event=replace(delivery.event, payload=copy.deepcopy(handoff.payload)),
         )
 
     async def ack_durable_delivery(
@@ -499,12 +560,15 @@ class SignalDispatcher:
     ) -> bool:
         """Acknowledge a claimed delivery owned by this dispatcher."""
         await self.initialize_durable_delivery()
-        return await self._durable_store.ack_delivery(
+        acknowledged = await self._durable_store.ack_delivery(
             agent_id=self._agent.did,
             consumer_id=consumer_id,
             delivery_id=delivery_id,
             lease_token=lease_token,
         )
+        if acknowledged:
+            self._discard_transient_durable_handoff(delivery_id)
+        return acknowledged
 
     async def nack_durable_delivery(
         self,
@@ -518,7 +582,7 @@ class SignalDispatcher:
     ) -> Optional[DurableDelivery]:
         """Release a claimed delivery for a bounded retry or terminal failure."""
         await self.initialize_durable_delivery()
-        return await self._durable_store.nack_delivery(
+        delivery = await self._durable_store.nack_delivery(
             agent_id=self._agent.did,
             consumer_id=consumer_id,
             delivery_id=delivery_id,
@@ -527,6 +591,9 @@ class SignalDispatcher:
             retry_delay=retry_delay,
             terminal=terminal,
         )
+        if delivery is not None and delivery.status == FAILED:
+            self._discard_transient_durable_handoff(delivery_id)
+        return delivery
 
     async def list_durable_deliveries(
         self,
@@ -547,9 +614,62 @@ class SignalDispatcher:
     async def purge_expired_durable_deliveries(self) -> int:
         """Run the durable-ledger retention sweep (terminal history only)."""
         await self.initialize_durable_delivery()
-        return await self._durable_store.purge_expired(agent_id=self._agent.did)
+        purged = await self._durable_store.purge_expired(agent_id=self._agent.did)
+        self._discard_expired_transient_durable_handoffs()
+        return purged
 
-    def _signal_for_durable_persistence(self, signal: Signal) -> Signal:
+    def shutdown(self) -> None:
+        """Discard non-durable live payload handoffs before agent teardown."""
+        for timer in self._transient_durable_handoff_timers.values():
+            timer.cancel()
+        self._transient_durable_handoff_timers.clear()
+        self._transient_durable_handoffs.clear()
+
+    def _discard_expired_transient_durable_handoffs(self) -> None:
+        """Drop raw payloads after their live lease or retention deadline."""
+        now = datetime.now(timezone.utc)
+        expired = [
+            delivery_id
+            for delivery_id, handoff in self._transient_durable_handoffs.items()
+            if handoff.expires_at <= now
+        ]
+        for delivery_id in expired:
+            self._discard_transient_durable_handoff(delivery_id)
+
+    def _schedule_transient_durable_handoff_expiry(
+        self, delivery_id: str, expires_at: datetime
+    ) -> None:
+        """Schedule removal without retaining the payload in a task closure."""
+        previous = self._transient_durable_handoff_timers.pop(delivery_id, None)
+        if previous is not None:
+            previous.cancel()
+        delay = max(0.0, (expires_at - datetime.now(timezone.utc)).total_seconds())
+        self._transient_durable_handoff_timers[delivery_id] = (
+            asyncio.get_running_loop().call_later(
+                delay,
+                self._expire_transient_durable_handoff,
+                delivery_id,
+                expires_at,
+            )
+        )
+
+    def _expire_transient_durable_handoff(
+        self, delivery_id: str, expires_at: datetime
+    ) -> None:
+        """Remove only the handoff whose currently scheduled deadline fired."""
+        handoff = self._transient_durable_handoffs.get(delivery_id)
+        if handoff is not None and handoff.expires_at == expires_at:
+            self._discard_transient_durable_handoff(delivery_id)
+
+    def _discard_transient_durable_handoff(self, delivery_id: str) -> None:
+        self._transient_durable_handoffs.pop(delivery_id, None)
+        timer = self._transient_durable_handoff_timers.pop(delivery_id, None)
+        if timer is not None:
+            timer.cancel()
+
+    def _signal_for_durable_persistence(
+        self, signal: Signal
+    ) -> _DurableSignalProjection:
         """Return the privacy-safe event projection for the durable ledger.
 
         Signal handlers and cognition run against ``signal`` itself: source
@@ -565,7 +685,7 @@ class SignalDispatcher:
         """
         config = resolve_agent_privacy_config(self._agent)
         if config is None:
-            return signal
+            return _DurableSignalProjection(signal=signal)
         try:
             if any(
                 getattr(config, name)()
@@ -575,23 +695,28 @@ class SignalDispatcher:
                     "requires_deidentification",
                 )
             ):
-                return replace(
-                    signal,
-                    payload={
-                        _DURABLE_PRIVACY_GATED_MARKER: getattr(
-                            config, "storage", "restricted"
-                        )
-                    },
+                return _DurableSignalProjection(
+                    signal=replace(
+                        signal,
+                        payload={
+                            _DURABLE_PRIVACY_GATED_MARKER: getattr(
+                                config, "storage", "restricted"
+                            )
+                        },
+                    ),
+                    payload_elided=True,
                 )
             if config.requires_anonymization():
                 from kestrel_sovereign.features.privacy.pii_detector import (
                     anonymize_text,
                 )
 
-                return replace(
-                    signal,
-                    payload=self._anonymize_durable_value(
-                        signal.payload, anonymize_text
+                return _DurableSignalProjection(
+                    signal=replace(
+                        signal,
+                        payload=self._anonymize_durable_value(
+                            signal.payload, anonymize_text
+                        ),
                     ),
                 )
         except Exception as exc:  # Privacy persistence must fail closed.
@@ -601,11 +726,14 @@ class SignalDispatcher:
                 signal.id,
                 exc,
             )
-            return replace(
-                signal,
-                payload={_DURABLE_PRIVACY_GATED_MARKER: "projection_error"},
+            return _DurableSignalProjection(
+                signal=replace(
+                    signal,
+                    payload={_DURABLE_PRIVACY_GATED_MARKER: "projection_error"},
+                ),
+                payload_elided=True,
             )
-        return signal
+        return _DurableSignalProjection(signal=signal)
 
     @classmethod
     def _anonymize_durable_value(
@@ -741,12 +869,62 @@ class SignalDispatcher:
         # observe it.  Thus a process loss after this point is replayable.
         try:
             await self.initialize_durable_delivery()
-            persisted = await self._durable_store.persist_signal(
-                self._signal_for_durable_persistence(signal),
-                agent_id=self._agent.did,
-                source_event_id=source_event_id,
-                retention_days=registration.retention_days,
-            )
+            # A transition and a durable write must share the same critical
+            # section.  Otherwise a NORMAL projection can be computed, the
+            # mode can change to EPHEMERAL while persistence is blocked, and
+            # the stale plaintext projection can commit after the transition.
+            # KestrelAgent provides a task-reentrant lock; lightweight
+            # embeddings with no transition machinery intentionally run
+            # unguarded through ``optional_transition_lock``.
+            async with optional_transition_lock(
+                _resolve_transition_lock(self._agent)
+            ):
+                durable_projection = self._signal_for_durable_persistence(signal)
+                # Snapshot the normalized payload before the durable commit so
+                # a deepcopy failure cannot leave a committed marker with no
+                # corresponding live handoff.
+                transient_payload = (
+                    copy.deepcopy(signal.payload)
+                    if durable_projection.payload_elided
+                    else None
+                )
+                transient_selector_payload = (
+                    {"transient_selector_payload": signal.payload}
+                    if durable_projection.payload_elided
+                    else {}
+                )
+                persisted = await self._durable_store.persist_signal(
+                    durable_projection.signal,
+                    agent_id=self._agent.did,
+                    source_event_id=source_event_id,
+                    retention_days=registration.retention_days,
+                    # A volatile privacy projection must never make a
+                    # pre-existing payload-correlated wait miss its normalized
+                    # live signal.  DurableSignalStore consumes this only while
+                    # materializing the initial deliveries; its event row and
+                    # every later replay retain the projected payload above.
+                    **transient_selector_payload,
+                )
+                if persisted.created and durable_projection.payload_elided:
+                    # The delivery IDs come from the same transaction that
+                    # matched selectors.  The pre-commit snapshot keeps later
+                    # handler mutation from altering live worker input.
+                    assert transient_payload is not None
+                    retention_until = persisted.retention_until or datetime.now(
+                        timezone.utc
+                    )
+                    for delivery_id in persisted.delivery_ids:
+                        self._transient_durable_handoffs[delivery_id] = (
+                            _TransientDurableHandoff(
+                                payload=transient_payload,
+                                retention_until=retention_until,
+                                expires_at=retention_until,
+                            )
+                        )
+                        self._schedule_transient_durable_handoff_expiry(
+                            delivery_id,
+                            self._transient_durable_handoffs[delivery_id].expires_at,
+                        )
         except Exception as exc:
             logger.exception(
                 "Failed to persist durable signal event %s (source=%s)",
