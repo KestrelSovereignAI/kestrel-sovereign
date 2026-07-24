@@ -60,11 +60,12 @@ ollama pull nomic-embed-text
 
 If you prefer a cloud route, export one or more supported credentials before
 Step 4: `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or
-`GOOGLE_API_KEY`. Quickstart detects usable cloud credentials and a reachable
+`GOOGLE_API_KEY`. Quickstart detects non-empty cloud credentials and a reachable
 Ollama service, then writes their ordered routes to `kestrel.toml`. Models stay
 on `auto`; Kestrel discovers an available model using the route's selection
-hints. If nothing is available, setup still writes an Ollama route, but
-`kestrel doctor` will remain the readiness gate until Ollama is running.
+hints. If none are detected, setup still writes an Ollama route so the local
+configuration is complete; Ollama must be running with a suitable model before
+the agent can answer.
 
 ## Step 4 — Run non-interactive setup
 
@@ -93,9 +94,10 @@ Setup is idempotent. Keep `.env` private and backed up: losing or changing
 uv run kestrel doctor
 ```
 
-Doctor is read-only. Resolve any reported blocker before starting the agent;
-for the Ollama path, make sure Ollama is reachable and `llama3.2:3b` is
-installed.
+Doctor is read-only. It validates persisted configuration and local integrity;
+it deliberately does not contact LLM providers. Resolve any reported blocker
+before starting the agent. For the Ollama path, separately make sure Ollama is
+reachable and `llama3.2:3b` is installed.
 
 ## Step 6 — Start the multi-agent host
 

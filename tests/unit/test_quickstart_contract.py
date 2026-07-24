@@ -24,6 +24,10 @@ def _quickstart_text() -> str:
     return QUICKSTART.read_text(encoding="utf-8")
 
 
+def _normalized_quickstart_text() -> str:
+    return " ".join(_quickstart_text().split())
+
+
 def test_supported_python_display_tracks_package_metadata():
     with (PROJECT_ROOT / "pyproject.toml").open("rb") as file:
         requires_python = tomllib.load(file)["project"]["requires-python"]
@@ -41,22 +45,23 @@ def test_supported_python_display_tracks_package_metadata():
     assert displayed_range in _quickstart_text()
 
 
-def test_agent_name_ports_and_routes_track_runtime_constants():
+def test_happy_path_uses_host_start_and_documents_named_start_alternative():
     text = _quickstart_text()
+    normalized = _normalized_quickstart_text()
     name = DEFAULT_QUICKSTART_AGENT_NAME
 
-    assert f"agent named `{name}`" in text
-    assert f"`uv run kestrel start {name}`" in text
-    assert f"port `{DEFAULT_HOST_PORT}`" in text
-    assert f"port `{DEFAULT_AGENT_START_PORT}`" in text
+    assert f"agent named `{name}`" in normalized
+    assert f"port `{DEFAULT_HOST_PORT}`" in normalized
+    assert f"port `{DEFAULT_AGENT_START_PORT}`" in normalized
     assert (
         f"http://localhost:{DEFAULT_HOST_PORT}/api/agents/{name}"
         in text
     )
 
-    setup_position = text.index("uv run kestrel setup --quickstart")
-    named_start_position = text.index(f"uv run kestrel start {name}")
-    assert setup_position < named_start_position
+    setup_position = text.index("\nuv run kestrel setup --quickstart\n")
+    host_start_position = text.index("\nuv run kestrel start\n")
+    named_start_position = text.index(f"\nuv run kestrel start {name}\n")
+    assert setup_position < host_start_position < named_start_position
 
     extra_create_position = text.index("uv run kestrel create MyAgent")
     extra_start_position = text.index("uv run kestrel start MyAgent")
@@ -75,8 +80,16 @@ def test_health_and_api_examples_match_public_and_authenticated_contracts():
     assert "The minimal readiness probe is intentionally public" in text
 
 
+def test_doctor_is_not_described_as_a_live_provider_probe():
+    text = _normalized_quickstart_text()
+
+    assert "Doctor is read-only" in text
+    assert "it deliberately does not contact LLM providers" in text
+    assert "doctor` will remain the readiness gate until Ollama is running" not in text
+
+
 def test_privacy_and_encryption_boundaries_are_not_overstated():
-    text = _quickstart_text()
+    text = _normalized_quickstart_text()
 
     assert "does not promise that every interaction is remembered forever" in text
     assert "Saved-item bodies (`saved_items.content`)" in text
