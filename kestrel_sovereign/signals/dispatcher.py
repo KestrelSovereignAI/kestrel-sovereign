@@ -211,8 +211,11 @@ class _TransientDurableHandoff:
     """
 
     payload: Any
+    consumer_id: str
+    created_at: datetime
     retention_until: datetime
     expires_at: datetime
+    initial_lease_token: Optional[str] = None
 
 
 def _agent_accepts_kwarg(callable_: Any, name: str) -> bool:
@@ -408,6 +411,20 @@ class SignalDispatcher:
         # globally unique and every dispatcher owns exactly one agent scope.
         self._transient_durable_handoffs: dict[str, _TransientDurableHandoff] = {}
         self._transient_durable_handoff_timers: dict[str, asyncio.TimerHandle] = {}
+        # The durable lease transfer is atomic, but its raw sidecar is shared
+        # by local claimants. A payload-elided persistence holds this lock
+        # from pre-commit sidecar installation through commit; a local initial
+        # claim then takes the same lock before it can transfer the lease. A
+        # PostgreSQL claimant can otherwise query on a separate transaction
+        # between those points, not see the uncommitted row, and mistakenly
+        # discard the valid raw sidecar.
+        self._transient_durable_initial_claim_lock = asyncio.Lock()
+        # This opaque process-local identity is persisted only as a delivery
+        # lease owner.  Its matching lease token remains in the live sidecar,
+        # so another dispatcher sharing this database cannot consume an
+        # initial payload-elided delivery before this instance can hand it to
+        # its worker.
+        self._durable_delivery_owner = f"dispatcher:{secrets.token_urlsafe(24)}"
         self._ttl = ttl
         self._default_window = coalescing_window_default
         self._clock = clock
@@ -426,12 +443,23 @@ class SignalDispatcher:
         repeat signal fires again) while the monotonic rate-limit window is
         frozen (quotas look saturated though the hour really elapsed).
         Clearing both restores a consistent, correct post-sleep baseline.
+        Any volatile durable-delivery sidecars are also reconciled against
+        their wall-clock lease deadlines because their ``call_later`` timers
+        use the suspended monotonic clock.
 
-        Invoked by the ``system.resumed`` ACTION handler, which the
-        ResumeMonitor dispatches once per detected suspend.
+        Invoked directly by the ``ResumeMonitor`` callback before it emits a
+        ``system.resumed`` audit signal for each detected suspend.
         """
         self._rate.reset()
         self._coalescing.reset()
+        # ``call_later`` runs against a monotonic clock, which pauses during
+        # system suspend. Reconcile raw sidecars against UTC immediately, then
+        # rebuild every live timer from its wall-clock deadline.
+        self._discard_expired_transient_durable_handoffs()
+        for delivery_id, handoff in list(self._transient_durable_handoffs.items()):
+            self._schedule_transient_durable_handoff_expiry(
+                delivery_id, handoff.expires_at
+            )
         logger.info(
             "Dispatcher throttling windows re-anchored after ~%.0fs host suspend",
             gap_seconds,
@@ -536,10 +564,60 @@ class SignalDispatcher:
             consumer_id=consumer_id,
             executor_id=executor_id,
         )
-        if delivery is None:
-            return None
+        if delivery is not None:
+            return self._delivery_with_transient_handoff(delivery)
+
+        # A payload-elided event is initially LEASED, rather than pending, in
+        # the transaction that writes its durable privacy marker.  Ordinary
+        # claims above therefore cannot race ahead of the emitting dispatcher
+        # while its process-local sidecar is installed.  Only this dispatcher,
+        # which holds the reservation token outside the durable payload, may
+        # transfer it to the requested worker.
+        async with self._transient_durable_initial_claim_lock:
+            # A prior local claimant may have transferred the reservation while
+            # this claimant waited. Re-read the sidecar state inside the lock;
+            # a cleared token means there is no initial reservation left here.
+            self._discard_expired_transient_durable_handoffs()
+            reservations = sorted(
+                (
+                    (delivery_id, handoff)
+                    for delivery_id, handoff in self._transient_durable_handoffs.items()
+                    if (
+                        handoff.consumer_id == consumer_id
+                        and handoff.initial_lease_token is not None
+                    )
+                ),
+                key=lambda item: (item[1].created_at, item[0]),
+            )
+            for delivery_id, handoff in reservations:
+                assert handoff.initial_lease_token is not None
+                delivery = await self._durable_store.claim_initial_delivery(
+                    agent_id=self._agent.did,
+                    consumer_id=consumer_id,
+                    delivery_id=delivery_id,
+                    initial_lease_owner=self._durable_delivery_owner,
+                    initial_lease_token=handoff.initial_lease_token,
+                    executor_id=executor_id,
+                )
+                if delivery is None:
+                    # A reservation can fail only after it was released,
+                    # expired, or otherwise became terminal. Retaining raw
+                    # data in that case would violate its lease-bound lifetime.
+                    self._discard_transient_durable_handoff(delivery_id)
+                    continue
+                handoff.initial_lease_token = None
+                return self._delivery_with_transient_handoff(delivery)
+        return None
+
+    def _delivery_with_transient_handoff(
+        self, delivery: DurableDelivery
+    ) -> DurableDelivery:
+        """Attach a still-live payload sidecar to this dispatcher's claim."""
         handoff = self._transient_durable_handoffs.get(delivery.delivery_id)
         if handoff is None:
+            return delivery
+        if handoff.expires_at <= datetime.now(timezone.utc):
+            self._discard_transient_durable_handoff(delivery.delivery_id)
             return delivery
         # A claim is the live consumer handoff.  Retain the payload through a
         # retry, but never past the lease it was handed to this executor.
@@ -893,38 +971,78 @@ class SignalDispatcher:
                     if durable_projection.payload_elided
                     else {}
                 )
-                persisted = await self._durable_store.persist_signal(
-                    durable_projection.signal,
-                    agent_id=self._agent.did,
-                    source_event_id=source_event_id,
-                    retention_days=registration.retention_days,
-                    # A volatile privacy projection must never make a
-                    # pre-existing payload-correlated wait miss its normalized
-                    # live signal.  DurableSignalStore consumes this only while
-                    # materializing the initial deliveries; its event row and
-                    # every later replay retain the projected payload above.
-                    **transient_selector_payload,
-                )
-                if persisted.created and durable_projection.payload_elided:
-                    # The delivery IDs come from the same transaction that
-                    # matched selectors.  The pre-commit snapshot keeps later
-                    # handler mutation from altering live worker input.
+                def install_transient_handoffs(persisted) -> None:
+                    """Install raw sidecars before the event transaction commits."""
                     assert transient_payload is not None
                     retention_until = persisted.retention_until or datetime.now(
                         timezone.utc
                     )
-                    for delivery_id in persisted.delivery_ids:
-                        self._transient_durable_handoffs[delivery_id] = (
+                    for lease in persisted.initial_leases:
+                        self._transient_durable_handoffs[lease.delivery_id] = (
                             _TransientDurableHandoff(
-                                payload=transient_payload,
+                                payload=copy.deepcopy(transient_payload),
+                                consumer_id=lease.consumer_id,
+                                created_at=lease.created_at,
                                 retention_until=retention_until,
-                                expires_at=retention_until,
+                                expires_at=min(
+                                    retention_until, lease.lease_expires_at
+                                ),
+                                initial_lease_token=lease.lease_token,
                             )
                         )
                         self._schedule_transient_durable_handoff_expiry(
-                            delivery_id,
-                            self._transient_durable_handoffs[delivery_id].expires_at,
+                            lease.delivery_id,
+                            self._transient_durable_handoffs[
+                                lease.delivery_id
+                            ].expires_at,
                         )
+
+                def discard_rolled_back_handoffs(persisted) -> None:
+                    for lease in persisted.initial_leases:
+                        self._discard_transient_durable_handoff(lease.delivery_id)
+
+                persistence_kwargs = {
+                    "agent_id": self._agent.did,
+                    "source_event_id": source_event_id,
+                    "retention_days": registration.retention_days,
+                    # A volatile privacy projection must never make a
+                    # pre-existing payload-correlated wait miss its normalized
+                    # live signal. DurableSignalStore consumes this only while
+                    # materializing the initial deliveries; its event row and
+                    # every later replay retain the projected payload above.
+                    **transient_selector_payload,
+                    "initial_lease_owner": (
+                        self._durable_delivery_owner
+                        if durable_projection.payload_elided
+                        else None
+                    ),
+                    "before_commit": (
+                        install_transient_handoffs
+                        if durable_projection.payload_elided
+                        else None
+                    ),
+                    "on_rollback": (
+                        discard_rolled_back_handoffs
+                        if durable_projection.payload_elided
+                        else None
+                    ),
+                }
+                if durable_projection.payload_elided:
+                    # Keep a local initial claimant outside the store's
+                    # uncommitted-transaction window. The synchronous
+                    # ``before_commit`` callback has already installed raw
+                    # sidecars by the time this await reaches commit, and the
+                    # same lock remains held until the row is visible.
+                    async with self._transient_durable_initial_claim_lock:
+                        persisted = await self._durable_store.persist_signal(
+                            durable_projection.signal,
+                            **persistence_kwargs,
+                        )
+                else:
+                    persisted = await self._durable_store.persist_signal(
+                        durable_projection.signal,
+                        **persistence_kwargs,
+                    )
         except Exception as exc:
             logger.exception(
                 "Failed to persist durable signal event %s (source=%s)",

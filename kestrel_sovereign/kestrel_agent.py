@@ -2404,12 +2404,12 @@ class KestrelAgent(
 
         # Host sleep/wake resilience (#1545). The ResumeMonitor watches
         # for a wall-clock-vs-monotonic divergence (a host suspend) and
-        # dispatches one `system.resumed` ACTION signal; its handler
-        # re-anchors the dispatcher's throttling windows, which otherwise
-        # disagree about elapsed time across a sleep. The scheduler and
-        # heartbeat detect staleness on their own ticks, so they self-heal
-        # independently of this signal — the monitor is the observable
-        # spine plus the dispatcher's re-anchor trigger.
+        # re-anchors the dispatcher before it emits one auditable
+        # `system.resumed` ACTION signal. Reconciliation of volatile durable-
+        # delivery sidecars must not depend on that signal persisting.
+        # The scheduler and heartbeat detect staleness on their own ticks, so
+        # they self-heal independently of this signal — the monitor is the
+        # observable spine plus the dispatcher's re-anchor trigger.
         from kestrel_sovereign.resume_monitor import (
             ResumeMonitor,
             ResumeMonitorConfig,
@@ -2421,8 +2421,7 @@ class KestrelAgent(
 
         async def _resume_action_handler(payload: dict):
             gap = float(payload.get("gap_seconds", 0.0))
-            self.dispatcher.notify_resume(gap)
-            return {"re_anchored": True, "gap_seconds": gap}
+            return {"recorded": True, "gap_seconds": gap}
 
         self.signal_registry.register_with_policy(
             build_system_resumed_registration(handler=_resume_action_handler),
@@ -2438,6 +2437,11 @@ class KestrelAgent(
         async def _on_resume(gap_seconds: float) -> None:
             from kestrel_sdk.signals import Signal, SignalMode, Visibility
 
+            # This cleanup is safety-critical for volatile raw sidecars. A
+            # durable persistence failure is reported by dispatch_signal as a
+            # failed result rather than raised, so doing it in the ACTION
+            # handler would leave expiry timers frozen across a host suspend.
+            self.dispatcher.notify_resume(gap_seconds)
             signal = Signal(
                 source=RESUME_SOURCE_NAME,
                 kind="resumed",

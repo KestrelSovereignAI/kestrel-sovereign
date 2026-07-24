@@ -17,6 +17,7 @@ uses) and assert the #2522 boot-state-machine contract end to end:
 
 import asyncio
 import contextlib
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -156,6 +157,54 @@ async def test_second_initialize_when_ready_is_a_noop(tmp_path):
         # before touching AsyncStorage, so this neither raises nor re-runs.
         await agent.initialize()
         assert agent._boot_state is BootPhaseState.READY
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+async def test_resume_callback_reconciles_sidecars_when_audit_persistence_fails(tmp_path):
+    """Volatile handoff expiry cannot depend on `system.resumed` persistence."""
+    from kestrel_sdk.signals import Status
+    from kestrel_sovereign.signals.dispatcher import _TransientDurableHandoff
+
+    agent = _make_agent(tmp_path)
+    try:
+        with _boot_mocks():
+            await agent.initialize()
+
+        dispatcher = agent.dispatcher
+        now = datetime.now(timezone.utc)
+        dispatcher._transient_durable_handoffs["expired-resume-handoff"] = (
+            _TransientDurableHandoff(
+                payload={"raw": "must-not-survive-resume"},
+                consumer_id="workflow-wait",
+                created_at=now - timedelta(minutes=2),
+                retention_until=now + timedelta(days=1),
+                expires_at=now - timedelta(seconds=1),
+                initial_lease_token="live-only-capability",
+            )
+        )
+        dispatcher._durable_store.persist_signal = AsyncMock(
+            side_effect=RuntimeError("forced resumed-signal persistence failure")
+        )
+        original_dispatch_signal = dispatcher.dispatch_signal
+        results = []
+
+        async def capture_failed_dispatch(*args, **kwargs):
+            result = await original_dispatch_signal(*args, **kwargs)
+            results.append(result)
+            return result
+
+        dispatcher.dispatch_signal = capture_failed_dispatch
+
+        # `dispatch_signal` encodes this persistence error as Status.FAILED;
+        # it does not raise to the resume callback. The sidecar must already
+        # be reconciled by the direct callback path.
+        await agent.resume_monitor._on_resume(3600.0)
+
+        assert "expired-resume-handoff" not in dispatcher._transient_durable_handoffs
+        dispatcher._durable_store.persist_signal.assert_awaited_once()
+        assert [result.status for result in results] == [Status.FAILED]
     finally:
         await _cleanup(agent)
 

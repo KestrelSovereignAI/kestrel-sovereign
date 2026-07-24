@@ -303,6 +303,20 @@ implemented with ordinary conditional updates and scoped predicates, so it
 has the same contract on standalone SQLite and hosted PostgreSQL; the latter
 does not rely on a process-local application lock.
 
+For payload-eliding privacy modes, the durable event contains only the privacy
+marker.  Its initially matched deliveries are instead inserted as leases owned
+by the emitting dispatcher in that same transaction.  Before commit makes
+those leases visible, the dispatcher installs a process-local raw-payload
+sidecar and holds its local handoff lock through the commit boundary; an
+initial local claim takes that same lock before it can transfer the lease to a
+worker. A peer sharing the database therefore cannot steal a just-emitted
+marker-only delivery before its owner consumes the live payload, and a local
+PostgreSQL claimant cannot mistake an uncommitted delivery for a lost
+reservation. The sidecar is discarded on rollback, acknowledgement, terminal
+failure, lease expiry, and shutdown; after a crash or expired lease, normal
+replay intentionally receives only the persisted marker. Raw payload is never
+written to the durable ledger.
+
 Registration and persistence also serialize their handoff at the
 `(agent_id, source)` scope.  Thus an event racing a new workflow subscription
 is either committed first and backfilled by that registration, or sees the

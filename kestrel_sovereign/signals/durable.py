@@ -19,7 +19,7 @@ import re
 import secrets
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from kestrel_sdk.signals import Signal
 
@@ -90,16 +90,34 @@ class DurableEventPersistence:
     for the same source and agent/tenant.  The original ``event_id`` is
     returned so callers can record a useful audit result without creating a
     duplicate delivery.  ``delivery_ids`` identifies only the initial
-    deliveries inserted by this persistence transaction.  The dispatcher uses
-    that narrow result to associate a process-local live handoff with exactly
-    the consumers whose selectors matched the normalized signal; it is never
-    stored in the event row.
+    deliveries inserted by this persistence transaction.  ``initial_leases``
+    is populated only for a payload-elided live dispatch: those rows were
+    atomically reserved to the emitting dispatcher before commit, so another
+    worker cannot claim the marker-only delivery during the sidecar handoff.
     """
 
     event_id: str
     created: bool
     delivery_ids: tuple[str, ...] = ()
     retention_until: Optional[datetime] = None
+    initial_leases: tuple["DurableInitialDeliveryLease", ...] = ()
+
+
+@dataclass(frozen=True)
+class DurableInitialDeliveryLease:
+    """An initial live-delivery reservation created with its event row.
+
+    The token is a lease capability, never user payload.  It lets the
+    emitting dispatcher transfer this reservation to its chosen executor
+    without exposing a newly committed marker-only delivery to another store
+    instance first.
+    """
+
+    delivery_id: str
+    consumer_id: str
+    lease_token: str
+    lease_expires_at: datetime
+    created_at: datetime
 
 
 @dataclass(frozen=True)
@@ -332,6 +350,9 @@ class DurableSignalStore(UnifiedStoreBase):
         source_event_id: Optional[str],
         retention_days: int,
         transient_selector_payload: Any = _PERSISTED_PAYLOAD,
+        initial_lease_owner: Optional[str] = None,
+        before_commit: Optional[Callable[[DurableEventPersistence], None]] = None,
+        on_rollback: Optional[Callable[[DurableEventPersistence], None]] = None,
     ) -> DurableEventPersistence:
         """Commit a persisted signal and all matching initial deliveries.
 
@@ -345,90 +366,184 @@ class DurableSignalStore(UnifiedStoreBase):
         serialized, returned, or used for restart backfill.  Projections that
         retain a replayable payload, including ANONYMOUS redaction, leave this
         argument unset so initial and replayed selector behavior is identical.
+
+        ``initial_lease_owner`` reserves each initially matched delivery to
+        one live dispatcher in the same transaction as the event insert.  The
+        dispatcher installs its process-local raw-payload sidecars through
+        ``before_commit`` before this transaction becomes visible.  A rollback
+        invokes ``on_rollback`` so those sidecars cannot outlive rows that did
+        not commit.  Both callbacks are synchronous deliberately: yielding
+        between installing the sidecar and committing would reopen the very
+        visibility race this handoff closes.
         """
         if retention_days < 0:
             raise ValueError("retention_days must be >= 0")
         self._require_nonempty("agent_id", agent_id)
         self._require_nonempty("source", signal.source)
+        if initial_lease_owner is not None:
+            self._require_nonempty("initial_lease_owner", initial_lease_owner)
         source_event_id = self._normalize_source_event_id(source_event_id)
-        now = self.now_utc()
-        retention_until = now + timedelta(days=retention_days)
         payload_json = _json_dump(signal.payload)
         chain_json = _json_dump(_serialize_chain(signal.causation_chain))
-
-        async with self._backend.transaction():
-            await self._lock_scope_handoff(agent_id=agent_id, source=signal.source)
-            inserted = await self._backend.execute(
-                f"""
-                INSERT OR IGNORE INTO {self.EVENTS} (
-                    event_id, source_event_id, agent_id, target_agent, source, kind, mode,
-                    payload, session_id, visibility, urgency, dedupe_key,
-                    causation_chain, arrived_at, committed_at, retention_until
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    signal.id,
-                    source_event_id,
-                    agent_id,
-                    signal.target_agent,
-                    signal.source,
-                    signal.kind,
-                    signal.mode.value,
-                    payload_json,
-                    signal.session_id,
-                    signal.visibility.value,
-                    signal.urgency.value,
-                    signal.dedupe_key,
-                    chain_json,
-                    self.to_timestamp_param(signal.arrived_at),
-                    self.to_timestamp_param(now),
-                    self.to_timestamp_param(retention_until),
-                ),
-            )
-            if inserted == 0:
-                existing = await self._find_existing_event_locked(
-                    agent_id, signal, source_event_id
+        persistence: Optional[DurableEventPersistence] = None
+        try:
+            async with self._backend.transaction():
+                await self._lock_scope_handoff(agent_id=agent_id, source=signal.source)
+                # The transaction may have waited behind the cross-instance
+                # handoff lock. Start persisted event timing only after that
+                # contention has cleared, never from method entry.
+                now = self.now_utc()
+                retention_until = now + timedelta(days=retention_days)
+                inserted = await self._backend.execute(
+                    f"""
+                    INSERT OR IGNORE INTO {self.EVENTS} (
+                        event_id, source_event_id, agent_id, target_agent, source, kind, mode,
+                        payload, session_id, visibility, urgency, dedupe_key,
+                        causation_chain, arrived_at, committed_at, retention_until
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        signal.id,
+                        source_event_id,
+                        agent_id,
+                        signal.target_agent,
+                        signal.source,
+                        signal.kind,
+                        signal.mode.value,
+                        payload_json,
+                        signal.session_id,
+                        signal.visibility.value,
+                        signal.urgency.value,
+                        signal.dedupe_key,
+                        chain_json,
+                        self.to_timestamp_param(signal.arrived_at),
+                        self.to_timestamp_param(now),
+                        self.to_timestamp_param(retention_until),
+                    ),
                 )
-                return DurableEventPersistence(event_id=existing, created=False)
+                if inserted == 0:
+                    existing = await self._find_existing_event_locked(
+                        agent_id, signal, source_event_id
+                    )
+                    return DurableEventPersistence(event_id=existing, created=False)
 
-            consumer_rows = await self._backend.fetch_all(
-                f"""
-                SELECT consumer_id, correlation_selector, max_attempts
-                FROM {self.CONSUMERS}
-                WHERE agent_id = ? AND source = ? AND active = ?
-                """,
-                (agent_id, signal.source, self.to_bool_param(True)),
-            )
-            event = self._event_from_signal(
-                signal,
-                agent_id=agent_id,
-                source_event_id=source_event_id,
-                committed_at=now,
-                retention_until=retention_until,
-            )
-            selector_event = (
-                event
-                if transient_selector_payload is _PERSISTED_PAYLOAD
-                else replace(event, payload=transient_selector_payload)
-            )
-            delivery_ids: list[str] = []
-            for consumer_id, selector, max_attempts in consumer_rows:
-                if self._matches_selector(selector_event, selector):
+                consumer_rows = await self._backend.fetch_all(
+                    f"""
+                    SELECT consumer_id, correlation_selector, max_attempts, lease_seconds
+                    FROM {self.CONSUMERS}
+                    WHERE agent_id = ? AND source = ? AND active = ?
+                    """,
+                    (agent_id, signal.source, self.to_bool_param(True)),
+                )
+                event = self._event_from_signal(
+                    signal,
+                    agent_id=agent_id,
+                    source_event_id=source_event_id,
+                    committed_at=now,
+                    retention_until=retention_until,
+                )
+                selector_event = (
+                    event
+                    if transient_selector_payload is _PERSISTED_PAYLOAD
+                    else replace(event, payload=transient_selector_payload)
+                )
+                delivery_ids: list[str] = []
+                initial_lease_specs: list[tuple[str, str, str, int]] = []
+                for consumer_id, selector, max_attempts, lease_seconds in consumer_rows:
+                    if not self._matches_selector(selector_event, selector):
+                        continue
+                    lease_token = None
+                    lease_expires_at = None
+                    if initial_lease_owner is not None:
+                        lease_token = secrets.token_urlsafe(24)
+                        lease_expires_at = now + timedelta(seconds=int(lease_seconds))
                     delivery_id = await self._insert_delivery_locked(
                         agent_id=agent_id,
                         consumer_id=consumer_id,
                         event_id=signal.id,
                         max_attempts=int(max_attempts),
                         now=now,
+                        initial_lease_owner=initial_lease_owner,
+                        initial_lease_token=lease_token,
+                        initial_lease_expires_at=lease_expires_at,
                     )
                     if delivery_id is not None:
                         delivery_ids.append(delivery_id)
-        return DurableEventPersistence(
-            event_id=signal.id,
-            created=True,
-            delivery_ids=tuple(delivery_ids),
-            retention_until=retention_until,
-        )
+                        if lease_token is not None and lease_expires_at is not None:
+                            initial_lease_specs.append(
+                                (
+                                    delivery_id,
+                                    consumer_id,
+                                    lease_token,
+                                    int(lease_seconds),
+                                )
+                            )
+
+                # The provisional lease values above are private to this
+                # transaction. Refresh them immediately before the synchronous
+                # pre-commit sidecar callback, after consumer matching and
+                # delivery materialization. Thus lock contention cannot make a
+                # newly committed initial reservation already expired.
+                initial_leases: list[DurableInitialDeliveryLease] = []
+                if initial_lease_specs:
+                    reservation_now = self.now_utc()
+                    for (
+                        delivery_id,
+                        consumer_id,
+                        lease_token,
+                        lease_seconds,
+                    ) in initial_lease_specs:
+                        lease_expires_at = reservation_now + timedelta(
+                            seconds=lease_seconds
+                        )
+                        refreshed = await self._backend.execute(
+                            f"""
+                            UPDATE {self.DELIVERIES}
+                            SET lease_expires_at = ?, updated_at = ?
+                            WHERE delivery_id = ? AND agent_id = ?
+                              AND consumer_id = ? AND status = ?
+                              AND lease_owner = ? AND lease_token = ?
+                            """,
+                            (
+                                self.to_timestamp_param(lease_expires_at),
+                                self.to_timestamp_param(reservation_now),
+                                delivery_id,
+                                agent_id,
+                                consumer_id,
+                                LEASED,
+                                initial_lease_owner,
+                                lease_token,
+                            ),
+                        )
+                        if refreshed != 1:
+                            raise RuntimeError(
+                                "initial durable delivery reservation disappeared "
+                                "before commit"
+                            )
+                        initial_leases.append(
+                            DurableInitialDeliveryLease(
+                                delivery_id=delivery_id,
+                                consumer_id=consumer_id,
+                                lease_token=lease_token,
+                                lease_expires_at=lease_expires_at,
+                                created_at=reservation_now,
+                            )
+                        )
+                persistence = DurableEventPersistence(
+                    event_id=signal.id,
+                    created=True,
+                    delivery_ids=tuple(delivery_ids),
+                    retention_until=retention_until,
+                    initial_leases=tuple(initial_leases),
+                )
+                if before_commit is not None:
+                    before_commit(persistence)
+        except BaseException:
+            if persistence is not None and on_rollback is not None:
+                on_rollback(persistence)
+            raise
+        assert persistence is not None
+        return persistence
 
     # ------------------------------------------------------------------
     # Claim / lease / acknowledgement API
@@ -509,6 +624,67 @@ class DurableSignalStore(UnifiedStoreBase):
                 self.to_timestamp_param(now),
                 agent_id,
                 consumer_id,
+                self.to_timestamp_param(now),
+            ),
+        )
+        if updated == 0:
+            return None
+        return await self._delivery_for_lease_locked(
+            agent_id=agent_id,
+            consumer_id=consumer_id,
+            lease_token=lease_token,
+        )
+
+    async def claim_initial_delivery(
+        self,
+        *,
+        agent_id: str,
+        consumer_id: str,
+        delivery_id: str,
+        initial_lease_owner: str,
+        initial_lease_token: str,
+        executor_id: str,
+        now: Optional[datetime] = None,
+    ) -> Optional[DurableDelivery]:
+        """Transfer one emitting-dispatcher's initial reservation to a worker.
+
+        Initial payload-elided deliveries are inserted as ``LEASED`` before
+        their event transaction commits.  A normal claimant cannot see them as
+        due.  Only the dispatcher holding this unpersisted capability may make
+        the first worker claim; after that, ordinary retry/lease rules apply.
+        """
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("consumer_id", consumer_id)
+        self._require_nonempty("delivery_id", delivery_id)
+        self._require_nonempty("initial_lease_owner", initial_lease_owner)
+        self._require_nonempty("initial_lease_token", initial_lease_token)
+        self._require_nonempty("executor_id", executor_id)
+        now = _as_utc(now or self.now_utc())
+        consumer = await self._get_consumer(agent_id, consumer_id)
+        if consumer is None or not consumer[4]:
+            return None
+        lease_token = secrets.token_urlsafe(24)
+        lease_expires_at = now + timedelta(seconds=int(consumer[3]))
+        updated = await self._backend.execute(
+            f"""
+            UPDATE {self.DELIVERIES}
+            SET attempts = attempts + 1, lease_owner = ?, lease_token = ?,
+                lease_expires_at = ?, next_attempt_at = NULL, updated_at = ?
+            WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
+              AND status = ? AND lease_owner = ? AND lease_token = ?
+              AND lease_expires_at > ?
+            """,
+            (
+                executor_id,
+                lease_token,
+                self.to_timestamp_param(lease_expires_at),
+                self.to_timestamp_param(now),
+                agent_id,
+                consumer_id,
+                delivery_id,
+                LEASED,
+                initial_lease_owner,
+                initial_lease_token,
                 self.to_timestamp_param(now),
             ),
         )
@@ -865,22 +1041,38 @@ class DurableSignalStore(UnifiedStoreBase):
         event_id: str,
         max_attempts: int,
         now: datetime,
+        initial_lease_owner: Optional[str] = None,
+        initial_lease_token: Optional[str] = None,
+        initial_lease_expires_at: Optional[datetime] = None,
     ) -> Optional[str]:
+        initial_lease = initial_lease_owner is not None
+        if initial_lease != (initial_lease_token is not None):
+            raise ValueError("initial lease owner and token must be set together")
+        if initial_lease != (initial_lease_expires_at is not None):
+            raise ValueError("initial lease owner and expiry must be set together")
         delivery_id = secrets.token_urlsafe(18)
         inserted = await self._backend.execute(
             f"""
             INSERT OR IGNORE INTO {self.DELIVERIES} (
                 delivery_id, agent_id, consumer_id, event_id, status,
-                attempts, max_attempts, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
+                attempts, max_attempts, lease_owner, lease_token,
+                lease_expires_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
             """,
             (
                 delivery_id,
                 agent_id,
                 consumer_id,
                 event_id,
-                PENDING,
+                LEASED if initial_lease else PENDING,
                 max_attempts,
+                initial_lease_owner,
+                initial_lease_token,
+                (
+                    self.to_timestamp_param(initial_lease_expires_at)
+                    if initial_lease_expires_at is not None
+                    else None
+                ),
                 self.to_timestamp_param(now),
                 self.to_timestamp_param(now),
             ),
@@ -1029,6 +1221,7 @@ __all__ = [
     "DurableConsumerRegistration",
     "DurableDelivery",
     "DurableEventPersistence",
+    "DurableInitialDeliveryLease",
     "DurableSignalEvent",
     "DurableSignalStore",
 ]

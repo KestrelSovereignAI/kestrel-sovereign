@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
@@ -205,6 +206,392 @@ async def test_two_executors_cannot_claim_the_same_delivery(tmp_path):
     assert claimed[0].status == LEASED
     await _close(backend_a, agent_a)
     await _close(backend_b, agent_b)
+
+
+@pytest.mark.asyncio
+async def test_volatile_sidecar_is_installed_before_commit_and_reserved_from_peer(tmp_path):
+    """A peer cannot steal a just-committed marker before its owner claims raw data."""
+    from kestrel_sovereign.privacy import get_privacy_preset
+
+    path = tmp_path / "volatile-commit-boundary.db"
+    backend_a, agent_a, dispatcher_a = await _dispatcher(path, "did:agent:one")
+    backend_b, agent_b, dispatcher_b = await _dispatcher(path, "did:agent:one")
+    agent_a.privacy_config = get_privacy_preset("ephemeral")
+    agent_b.privacy_config = get_privacy_preset("ephemeral")
+    consumer = DurableConsumerRegistration(
+        consumer_id="workflow-wait", source="provider.message", agent_id=agent_a.did
+    )
+    secret = "commit-boundary-customer@example.com"
+    await dispatcher_a.register_durable_consumer(consumer)
+    await dispatcher_b.register_durable_consumer(consumer)
+
+    original_transaction = backend_a.transaction
+    original_schedule = dispatcher_a._schedule_transient_durable_handoff_expiry
+    sidecar_installed = asyncio.Event()
+    commit_boundary = asyncio.Event()
+    release_commit = asyncio.Event()
+
+    @asynccontextmanager
+    async def pause_after_sidecar_before_commit():
+        async with original_transaction():
+            yield
+            # ``persist_signal`` has returned from its before-commit callback,
+            # but the event row is not visible to the peer connection yet.
+            commit_boundary.set()
+            await release_commit.wait()
+
+    def note_sidecar_install(delivery_id, expires_at):
+        original_schedule(delivery_id, expires_at)
+        sidecar_installed.set()
+
+    backend_a.transaction = pause_after_sidecar_before_commit
+    dispatcher_a._schedule_transient_durable_handoff_expiry = note_sidecar_install
+
+    peer_ready = asyncio.Event()
+    allow_peer_claim = asyncio.Event()
+    original_peer_fetch_one = backend_b.fetch_one
+
+    async def pause_peer_after_consumer_read(query, params=()):
+        row = await original_peer_fetch_one(query, params)
+        if (
+            "FROM durable_signal_consumers" in query
+            and "consumer_id" in query
+        ):
+            peer_ready.set()
+            await allow_peer_claim.wait()
+        return row
+
+    backend_b.fetch_one = pause_peer_after_consumer_read
+    try:
+        dispatch_task = asyncio.create_task(
+            dispatcher_a.dispatch_signal(
+                _signal(agent_id=agent_a.did, message=secret),
+                source_event_id="volatile-commit-boundary",
+            )
+        )
+        await asyncio.wait_for(commit_boundary.wait(), timeout=2)
+        await asyncio.wait_for(sidecar_installed.wait(), timeout=2)
+        assert len(dispatcher_a._transient_durable_handoffs) == 1
+
+        peer_claim_task = asyncio.create_task(
+            dispatcher_b.claim_durable_delivery(
+                consumer_id=consumer.consumer_id, executor_id="peer-worker"
+            )
+        )
+        await asyncio.wait_for(peer_ready.wait(), timeout=2)
+        assert not peer_claim_task.done()
+
+        # Force the peer's actual lease attempt to run only after the emitting
+        # transaction commits.  The row is already leased to dispatcher A, so
+        # worker B must not see a claimable marker-only delivery.
+        release_commit.set()
+        assert (await dispatch_task).status is Status.OK
+        allow_peer_claim.set()
+        assert await peer_claim_task is None
+
+        owned = await dispatcher_a.claim_durable_delivery(
+            consumer_id=consumer.consumer_id, executor_id="owner-worker"
+        )
+        assert owned is not None
+        assert owned.event.payload == {"message": secret, "workflow": "wf-1"}
+        durable_event = await backend_a.fetch_one(
+            "SELECT payload FROM durable_signal_events WHERE event_id = ?",
+            (owned.event_id,),
+        )
+        durable_delivery = await backend_a.fetch_one(
+            "SELECT lease_owner, lease_token FROM durable_signal_deliveries "
+            "WHERE delivery_id = ?",
+            (owned.delivery_id,),
+        )
+        assert durable_event is not None and secret not in durable_event[0]
+        assert durable_delivery is not None and secret not in repr(durable_delivery)
+    finally:
+        backend_a.transaction = original_transaction
+        dispatcher_a._schedule_transient_durable_handoff_expiry = original_schedule
+        backend_b.fetch_one = original_peer_fetch_one
+        dispatcher_a.shutdown()
+        dispatcher_b.shutdown()
+        await _close(backend_a, agent_a)
+        await _close(backend_b, agent_b)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_local_initial_claims_preserve_the_winner_payload(tmp_path):
+    """A losing local reservation transfer cannot erase the winner's sidecar."""
+    from kestrel_sovereign.privacy import get_privacy_preset
+
+    backend, agent, dispatcher = await _dispatcher(
+        tmp_path / "volatile-local-claim-race.db", "did:agent:one"
+    )
+    agent.privacy_config = get_privacy_preset("ephemeral")
+    consumer = DurableConsumerRegistration(
+        consumer_id="workflow-wait", source="provider.message", agent_id=agent.did
+    )
+    transferred = asyncio.Event()
+    allow_winner_return = asyncio.Event()
+    original_claim_initial = dispatcher._durable_store.claim_initial_delivery
+
+    async def pause_successful_transfer(**kwargs):
+        delivery = await original_claim_initial(**kwargs)
+        if delivery is not None:
+            transferred.set()
+            await allow_winner_return.wait()
+        return delivery
+
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        secret = "local-claim-race-customer@example.com"
+        assert (
+            await dispatcher.dispatch_signal(
+                _signal(agent_id=agent.did, message=secret),
+                source_event_id="volatile-local-claim-race",
+            )
+        ).status is Status.OK
+        dispatcher._durable_store.claim_initial_delivery = pause_successful_transfer
+
+        winner_task = asyncio.create_task(
+            dispatcher.claim_durable_delivery(
+                consumer_id=consumer.consumer_id, executor_id="worker-a"
+            )
+        )
+        await asyncio.wait_for(transferred.wait(), timeout=2)
+
+        loser_task = asyncio.create_task(
+            dispatcher.claim_durable_delivery(
+                consumer_id=consumer.consumer_id, executor_id="worker-b"
+            )
+        )
+        # The second claimant has made its ordinary durable poll, but cannot
+        # reach the initial transfer while the first owns the local handoff.
+        await asyncio.sleep(0)
+        assert not loser_task.done()
+        assert len(dispatcher._transient_durable_handoffs) == 1
+
+        allow_winner_return.set()
+        winner = await winner_task
+        loser = await loser_task
+        assert winner is not None
+        assert winner.event.payload == {"message": secret, "workflow": "wf-1"}
+        assert loser is None
+    finally:
+        dispatcher._durable_store.claim_initial_delivery = original_claim_initial
+        dispatcher.shutdown()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_initial_reservation_starts_after_sqlite_handoff_contention(tmp_path):
+    """A blocked writer cannot commit an initial lease that has already expired."""
+    from kestrel_sovereign.privacy import get_privacy_preset
+
+    path = tmp_path / "volatile-reservation-contention.db"
+    backend, agent, dispatcher = await _dispatcher(path, "did:agent:one")
+    peer_backend = SQLiteBackend(str(path))
+    await peer_backend.connect()
+    agent.privacy_config = get_privacy_preset("ephemeral")
+    consumer = DurableConsumerRegistration(
+        consumer_id="workflow-wait",
+        source="provider.message",
+        agent_id=agent.did,
+        lease_seconds=1,
+    )
+    writer_acquired = asyncio.Event()
+    release_writer = asyncio.Event()
+
+    async def hold_sqlite_writer() -> None:
+        async with peer_backend.transaction():
+            # This is the same no-op write DurableSignalStore uses to acquire
+            # its cross-connection SQLite handoff lock.
+            await peer_backend.execute("DELETE FROM durable_signal_consumers WHERE 0")
+            writer_acquired.set()
+            await release_writer.wait()
+
+    holder = None
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        holder = asyncio.create_task(hold_sqlite_writer())
+        await asyncio.wait_for(writer_acquired.wait(), timeout=2)
+        dispatch_task = asyncio.create_task(
+            dispatcher.dispatch_signal(
+                _signal(
+                    agent_id=agent.did,
+                    message="contended-reservation-customer@example.com",
+                ),
+                source_event_id="volatile-reservation-contention",
+            )
+        )
+        # The old method-entry timestamp would now be more than a full lease
+        # old before it could acquire the handoff writer lock.
+        await asyncio.sleep(1.1)
+        release_writer.set()
+        await holder
+        assert (await dispatch_task).status is Status.OK
+
+        owned = await dispatcher.claim_durable_delivery(
+            consumer_id=consumer.consumer_id, executor_id="owner-worker"
+        )
+        assert owned is not None
+        assert owned.event.payload == {
+            "message": "contended-reservation-customer@example.com",
+            "workflow": "wf-1",
+        }
+    finally:
+        release_writer.set()
+        if holder is not None:
+            await asyncio.gather(holder, return_exceptions=True)
+        dispatcher.shutdown()
+        await _close(backend, agent)
+        await peer_backend.close()
+
+
+@pytest.mark.asyncio
+async def test_notify_resume_expires_and_reschedules_volatile_handoffs(tmp_path):
+    """Host resume reconciles sidecars against UTC, not frozen monotonic timers."""
+    from kestrel_sovereign.privacy import get_privacy_preset
+
+    backend, agent, dispatcher = await _dispatcher(
+        tmp_path / "volatile-resume-reconciliation.db", "did:agent:one"
+    )
+    agent.privacy_config = get_privacy_preset("ephemeral")
+    consumer = DurableConsumerRegistration(
+        consumer_id="workflow-wait", source="provider.message", agent_id=agent.did
+    )
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        for event_id, message in (
+            ("resume-expired", "expired-on-resume@example.com"),
+            ("resume-live", "live-on-resume@example.com"),
+        ):
+            assert (
+                await dispatcher.dispatch_signal(
+                    _signal(agent_id=agent.did, message=message),
+                    source_event_id=event_id,
+                )
+            ).status is Status.OK
+
+        expired = await dispatcher.claim_durable_delivery(
+            consumer_id=consumer.consumer_id, executor_id="worker-expired"
+        )
+        live = await dispatcher.claim_durable_delivery(
+            consumer_id=consumer.consumer_id, executor_id="worker-live"
+        )
+        assert expired is not None and live is not None
+        expired_handoff = dispatcher._transient_durable_handoffs[expired.delivery_id]
+        live_handoff = dispatcher._transient_durable_handoffs[live.delivery_id]
+        expired_handoff.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        live_handoff.expires_at = datetime.now(timezone.utc) + timedelta(seconds=30)
+        prior_live_timer = dispatcher._transient_durable_handoff_timers[live.delivery_id]
+
+        dispatcher.notify_resume(3600.0)
+
+        assert expired.delivery_id not in dispatcher._transient_durable_handoffs
+        assert live.delivery_id in dispatcher._transient_durable_handoffs
+        assert prior_live_timer.cancelled()
+        assert (
+            dispatcher._transient_durable_handoff_timers[live.delivery_id]
+            is not prior_live_timer
+        )
+    finally:
+        dispatcher.shutdown()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_volatile_sidecars_are_discarded_when_the_event_transaction_rolls_back(tmp_path):
+    """Pre-commit sidecars cannot survive a failed event transaction."""
+    from kestrel_sovereign.privacy import get_privacy_preset
+
+    backend, agent, dispatcher = await _dispatcher(tmp_path / "volatile-rollback.db", "did:agent:one")
+    agent.privacy_config = get_privacy_preset("ephemeral")
+    await dispatcher.register_durable_consumer(
+        DurableConsumerRegistration(
+            consumer_id="workflow-wait", source="provider.message", agent_id=agent.did
+        )
+    )
+    original_transaction = backend.transaction
+    sidecar_installed = asyncio.Event()
+    original_schedule = dispatcher._schedule_transient_durable_handoff_expiry
+
+    @asynccontextmanager
+    async def rollback_after_before_commit():
+        async with original_transaction():
+            yield
+            # This runs after the store invokes its pre-commit sidecar hook.
+            raise RuntimeError("force durable event rollback")
+
+    def note_sidecar_install(delivery_id, expires_at):
+        original_schedule(delivery_id, expires_at)
+        sidecar_installed.set()
+
+    backend.transaction = rollback_after_before_commit
+    dispatcher._schedule_transient_durable_handoff_expiry = note_sidecar_install
+    try:
+        result = await dispatcher.dispatch_signal(
+            _signal(agent_id=agent.did, message="rollback-secret@example.com"),
+            source_event_id="volatile-rollback",
+        )
+        assert result.status is Status.FAILED
+        assert sidecar_installed.is_set()
+        assert dispatcher._transient_durable_handoffs == {}
+        assert await backend.fetch_one(
+            "SELECT event_id FROM durable_signal_events WHERE agent_id = ?",
+            (agent.did,),
+        ) is None
+    finally:
+        backend.transaction = original_transaction
+        dispatcher._schedule_transient_durable_handoff_expiry = original_schedule
+        dispatcher.shutdown()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_expired_volatile_reservation_replays_only_the_durable_marker_after_restart(tmp_path):
+    """A crashed initial owner yields marker-only replay once its lease expires."""
+    from kestrel_sovereign.privacy import get_privacy_preset
+
+    path = tmp_path / "volatile-expired-restart.db"
+    backend_a, agent_a, dispatcher_a = await _dispatcher(path, "did:agent:one")
+    agent_a.privacy_config = get_privacy_preset("ephemeral")
+    consumer = DurableConsumerRegistration(
+        consumer_id="workflow-wait",
+        source="provider.message",
+        agent_id=agent_a.did,
+        lease_seconds=1,
+    )
+    secret = "expired-owner-customer@example.com"
+    try:
+        await dispatcher_a.register_durable_consumer(consumer)
+        assert (await dispatcher_a.dispatch_signal(
+            _signal(agent_id=agent_a.did, message=secret),
+            source_event_id="volatile-expired-restart",
+        )).status is Status.OK
+        reserved = (await dispatcher_a.list_durable_deliveries())[0]
+        assert reserved.status == LEASED
+        assert reserved.lease_expires_at is not None
+
+        # A process death drops raw state but cannot synchronously rewrite its
+        # durable lease. A fresh worker must wait for that lease to expire.
+        dispatcher_a.shutdown()
+        assert dispatcher_a._transient_durable_handoffs == {}
+    finally:
+        await _close(backend_a, agent_a)
+
+    backend_b, agent_b, dispatcher_b = await _dispatcher(path, "did:agent:one")
+    agent_b.privacy_config = get_privacy_preset("ephemeral")
+    try:
+        await dispatcher_b.register_durable_consumer(consumer)
+        replayed = await dispatcher_b._durable_store.claim_delivery(
+            agent_id=agent_b.did,
+            consumer_id=consumer.consumer_id,
+            executor_id="restart-worker",
+            now=reserved.lease_expires_at + timedelta(microseconds=1),
+        )
+        assert replayed is not None
+        assert replayed.event.payload == {"_privacy_gated": "none"}
+        assert secret not in json.dumps(replayed.event.payload)
+    finally:
+        dispatcher_b.shutdown()
+        await _close(backend_b, agent_b)
 
 
 @pytest.mark.asyncio
@@ -476,8 +863,8 @@ async def test_volatile_privacy_materializes_payload_correlated_wait_without_per
 
 
 @pytest.mark.asyncio
-async def test_live_handoff_is_discarded_on_terminal_ack_and_lease_expiry(tmp_path):
-    """Volatile payloads cannot outlive their terminal or leased delivery."""
+async def test_live_handoff_is_discarded_on_terminal_outcomes_and_lease_expiry(tmp_path):
+    """Volatile payloads cannot outlive terminal or leased delivery state."""
     from kestrel_sovereign.privacy import get_privacy_preset
 
     backend, agent, dispatcher = await _dispatcher(tmp_path / "handoff-clear.db", "did:agent:one")
@@ -505,6 +892,26 @@ async def test_live_handoff_is_discarded_on_terminal_ack_and_lease_expiry(tmp_pa
             lease_token=acknowledged.lease_token,
         )
         assert acknowledged.delivery_id not in dispatcher._transient_durable_handoffs
+
+        assert (await dispatcher.dispatch_signal(
+            _signal(agent_id=agent.did, message="terminal-failure-secret"),
+            source_event_id="terminal-failure-handoff",
+        )).status is Status.OK
+        terminal_failure = await dispatcher.claim_durable_delivery(
+            consumer_id=consumer.consumer_id,
+            executor_id="live-workflow-runner",
+        )
+        assert terminal_failure is not None
+        assert terminal_failure.delivery_id in dispatcher._transient_durable_handoffs
+        failed = await dispatcher.nack_durable_delivery(
+            consumer_id=consumer.consumer_id,
+            delivery_id=terminal_failure.delivery_id,
+            lease_token=terminal_failure.lease_token,
+            error="terminal worker failure",
+            terminal=True,
+        )
+        assert failed is not None and failed.status == FAILED
+        assert terminal_failure.delivery_id not in dispatcher._transient_durable_handoffs
 
         assert (await dispatcher.dispatch_signal(
             _signal(agent_id=agent.did, message="expired-secret"),

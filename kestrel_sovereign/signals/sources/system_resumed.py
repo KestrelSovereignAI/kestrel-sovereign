@@ -4,16 +4,17 @@ The ``ResumeMonitor`` (``kestrel_sovereign/resume_monitor.py``) detects a
 host sleep/wake gap and dispatches one ``system.resumed`` signal through
 the SignalDispatcher. This source is the routing target.
 
-It is an ACTION source — deterministic, no LLM cost — whose handler
-re-anchors the dispatcher's throttling windows (coalescing + rate-limit),
-which otherwise disagree about elapsed time across a suspend. Routing it
-through the dispatcher (rather than a bespoke side channel) gives the event
-a durable, redaction-policed audit row in ``signal_log`` with the measured
-gap, exactly like every other signal.
+It is an ACTION source — deterministic, no LLM cost — that records a detected
+resume after the ``ResumeMonitor`` callback has already re-anchored the
+dispatcher's throttling windows (coalescing + rate-limit) and reconciled
+volatile durable-delivery sidecars against their wall-clock lease deadlines.
+Those timers otherwise disagree about elapsed time across a suspend because
+``call_later`` uses a frozen monotonic clock. Routing the audit event through
+the dispatcher gives it a durable, redaction-policed row in ``signal_log``
+with the measured gap, exactly like every other signal.
 
-The handler is supplied by the wiring in ``KestrelAgent.initialize`` (it
-needs the live dispatcher to call ``notify_resume``); this module owns the
-schema, redaction, and throttling contract.
+The handler is supplied by the wiring in ``KestrelAgent.initialize``; this
+module owns the schema, redaction, and throttling contract.
 """
 
 from __future__ import annotations
@@ -69,8 +70,7 @@ def build_system_resumed_registration(
 
     Args:
         handler: async callable receiving the validated payload
-            (``{"gap_seconds": float}``). Wired in the agent so it can
-            re-anchor the live dispatcher's throttling windows.
+            (``{"gap_seconds": float}``) to record the audit event.
     """
     return SourceRegistration(
         name=SOURCE_NAME,

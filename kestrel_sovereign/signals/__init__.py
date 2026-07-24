@@ -50,6 +50,7 @@ from kestrel_sovereign.signals.durable import (
     DurableConsumerRegistration,
     DurableDelivery,
     DurableEventPersistence,
+    DurableInitialDeliveryLease,
     DurableSignalEvent,
     DurableSignalStore,
 )
@@ -95,6 +96,7 @@ __all__ = [
     "DurableConsumerRegistration",
     "DurableDelivery",
     "DurableEventPersistence",
+    "DurableInitialDeliveryLease",
     "DurableSignalEvent",
     "DurableSignalStore",
     "ACKNOWLEDGED",
