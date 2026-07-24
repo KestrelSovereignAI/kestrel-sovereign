@@ -613,12 +613,20 @@ def discover_features(agent, allowed_features: Optional[Set[str]] = None) -> Lis
         discovered_names.add(class_name)
         logger.info(f"Discovered feature: {class_name} from {source}")
 
+    from kestrel_sovereign.features.isolated_runtime import (
+        IsolatedRuntimeNamespaceError,
+        ProxyFeature,
+    )
+
     def _try_add_isolated(runtime, source: str) -> None:
         class_name = runtime.class_name
         if not _feature_allowed(class_name):
             return
-        from kestrel_sovereign.features.isolated_runtime import ProxyFeature
 
+        # Resolve the scope while discovering, before this optional feature can
+        # be downgraded to a logged discovery error. A hosted agent that selected
+        # an isolated feature without an explicit namespace must fail its boot
+        # instead of falling back to a shared CWD directory.
         feature = ProxyFeature(agent, runtime)
         features.append(feature)
         discovered_names.add(class_name)
@@ -679,8 +687,12 @@ def discover_features(agent, allowed_features: Optional[Set[str]] = None) -> Lis
                 continue
             try:
                 _try_add_isolated(runtime, f"entry_point:{runtime.entry_point}")
+            except IsolatedRuntimeNamespaceError:
+                raise
             except Exception as e:
                 logger.error(f"Error loading isolated entry_point feature {class_name}: {e}")
+    except IsolatedRuntimeNamespaceError:
+        raise
     except Exception as e:
         logger.warning("Failed to inspect entry_point feature runtime metadata: %s", e)
 

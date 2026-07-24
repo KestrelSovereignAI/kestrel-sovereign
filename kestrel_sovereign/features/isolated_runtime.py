@@ -22,6 +22,7 @@ import os
 import re
 import shutil
 import subprocess
+from dataclasses import dataclass
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
@@ -97,11 +98,120 @@ def _env_key(feature_name: str, suffix: str) -> str:
     return f"KESTREL_FEATURE_{normalized}_{suffix}"
 
 
-def _agent_data_dir(agent: Any) -> Path:
+class IsolatedRuntimeNamespaceError(ValueError):
+    """Raised when a hosted agent has no safe isolated-runtime namespace."""
+
+
+@dataclass(frozen=True)
+class IsolatedRuntimeNamespace:
+    """Canonical, agent-owned location for mutable isolated-feature runtime data.
+
+    A hosted factory supplies a host-owned root plus a tenant/agent namespace.
+    Resolving both together here keeps the containment rule in one place rather
+    than trusting every feature caller to join and sanitize path fragments.
+    """
+
+    root: Path
+    namespace: Path
+    path: Path
+
+
+def resolve_isolated_runtime_namespace(
+    root: str | os.PathLike[str],
+    namespace: str | os.PathLike[str],
+) -> IsolatedRuntimeNamespace:
+    """Validate and canonicalize a hosted agent's runtime namespace.
+
+    ``namespace`` is deliberately relative to the configured host root.  Reject
+    traversal components even when normalization would remain inside that root:
+    accepting them makes a tenant identifier's meaning depend on path parsing
+    and invites future callers to join it unsafely.
+    """
+    if not isinstance(root, (str, os.PathLike)):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated features require an explicit runtime root."
+        )
+    if not isinstance(namespace, (str, os.PathLike)):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated features require an explicit runtime namespace."
+        )
+
+    namespace_text = os.fspath(namespace)
+    if not namespace_text or not namespace_text.strip():
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime namespace must not be empty."
+        )
+    relative_namespace = Path(namespace_text)
+    if (
+        not relative_namespace.parts
+        or relative_namespace.is_absolute()
+        or os.fspath(relative_namespace) != namespace_text
+        or any(part in {".", ".."} for part in relative_namespace.parts)
+    ):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime namespace must be a relative, "
+            "traversal-free path."
+        )
+
+    canonical_root = Path(root).expanduser().resolve()
+    if canonical_root.exists() and not canonical_root.is_dir():
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime root must be a directory."
+        )
+    canonical_path = (canonical_root / relative_namespace).resolve()
+    try:
+        canonical_path.relative_to(canonical_root)
+    except ValueError as exc:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature runtime namespace escapes its configured root."
+        ) from exc
+
+    return IsolatedRuntimeNamespace(
+        root=canonical_root,
+        namespace=relative_namespace,
+        path=canonical_path,
+    )
+
+
+def _runtime_scope_value(agent: Any, attribute: str) -> Optional[str | Path]:
+    """Read an explicitly declared path value without mistaking a Mock for one."""
+    value = getattr(agent, attribute, None)
+    if isinstance(value, (str, Path)):
+        return value
+    return None
+
+
+def agent_runtime_dir(agent: Any) -> Path:
+    """Return the agent-owned root for mutable isolated-feature runtime data.
+
+    Standalone agents keep the existing storage-derived layout.  Hosted agents
+    must opt into an explicit root plus relative namespace; they never fall back
+    to the process CWD because that would collapse tenants onto one directory.
+    """
+    runtime_root = _runtime_scope_value(agent, "isolated_runtime_root")
+    runtime_namespace = _runtime_scope_value(agent, "isolated_runtime_namespace")
+    if runtime_root is not None or runtime_namespace is not None:
+        return resolve_isolated_runtime_namespace(
+            runtime_root, runtime_namespace
+        ).path
+
+    hosted = getattr(agent, "isolated_runtime_hosted", False)
+    if isinstance(hosted, bool) and hosted:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted agent has an isolated feature but no explicit runtime "
+            "root and namespace."
+        )
+
     storage_path = getattr(agent, "storage_path", None)
-    if storage_path:
+    if isinstance(storage_path, (str, Path)) and storage_path:
         return Path(storage_path).expanduser().resolve().parent
     return (Path.cwd() / "agent_data" / "default").resolve()
+
+
+# Backward-compatible private spelling for the channel-artifact call sites in
+# this module. New callers should use ``agent_runtime_dir`` to make the scope
+# purpose explicit.
+_agent_data_dir = agent_runtime_dir
 
 
 def _venv_bin_dir(venv_path: Path) -> Path:
@@ -116,31 +226,81 @@ def _venv_python(venv_path: Path) -> Path:
 
 # Interpreter-behavior env vars that would let the HOST Python installation
 # shadow the isolated venv's packages, defeating the isolation the runtime
-# exists for (F023). Feature config/secrets ride through the general environment
-# intentionally (KESTREL_FEATURE_* is the documented config channel), so we STRIP
-# these specific interpreter vars rather than allowlisting the whole environment.
+# exists for (F023). Standalone feature config/secrets ride through the general
+# environment for backwards compatibility, so only these interpreter variables
+# are stripped there; hosted mode uses the restrictive allowlist below.
 _SHADOWING_ENV_VARS = ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "VIRTUAL_ENV")
 
+# Hosted services must not inherit a co-hosted agent's process-wide credentials
+# or feature configuration. These are the only host variables a child needs to
+# execute; agent-specific configuration (including secrets) travels through the
+# isolated-feature initialize handshake instead.
+_HOSTED_CHILD_ENV_BASE_KEYS = (
+    "PATH",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+)
 
-def _isolated_child_env(venv_path: Optional[Path]) -> Dict[str, str]:
+
+def _isolated_child_env(
+    venv_path: Optional[Path],
+    *,
+    runtime_dir: Optional[Path] = None,
+    hosted: bool = False,
+) -> Dict[str, str]:
     """Build the launch environment for the isolated service subprocess.
 
-    Inherits the host environment (so feature config/secrets pass through) but
-    strips the interpreter-behavior vars in ``_SHADOWING_ENV_VARS`` so a stray
-    host ``PYTHONPATH``/``VIRTUAL_ENV`` can't resolve the service's imports
-    against host site-packages. When a venv is used, re-point ``VIRTUAL_ENV`` at
-    it and prepend its bin dir to ``PATH`` so child processes bind to the
-    isolated venv.
+    Standalone services inherit feature variables for backwards compatibility.
+    Hosted services deliberately drop those process-wide variables and receive
+    agent-scoped configuration through their initialize handshake. In both
+    modes interpreter-behavior vars in ``_SHADOWING_ENV_VARS`` are stripped so
+    a stray host ``PYTHONPATH``/``VIRTUAL_ENV`` cannot defeat venv isolation.
+    When a runtime workspace is supplied, child homes, cache, data, and temp
+    paths are rooted there.
     """
     env = dict(os.environ)
     for var in _SHADOWING_ENV_VARS:
         env.pop(var, None)
+    if hosted:
+        # A process environment is host scoped, so inherited variables cannot
+        # safely represent a tenant's configuration or credentials. Keep only
+        # execution/locale/CA variables; feature config and secrets arrive in
+        # the per-agent initialize handshake.
+        env = {
+            key: env[key]
+            for key in _HOSTED_CHILD_ENV_BASE_KEYS
+            if key in env
+        }
     if venv_path is not None:
         env["VIRTUAL_ENV"] = str(venv_path)
         bin_dir = str(_venv_bin_dir(venv_path))
         env["PATH"] = os.pathsep.join(
             [bin_dir, env.get("PATH", "")]
         ).rstrip(os.pathsep)
+    if runtime_dir is not None:
+        # Child libraries commonly write relative files, XDG state, or temp
+        # files. Point all of those at the feature's agent-owned workspace.
+        # ``KESTREL_ISOLATED_RUNTIME_DIR`` is Kestrel's generic canonical
+        # variable. ``KESTREL_ISOLATED_FEATURE_DATA_DIR`` is the established
+        # isolated-service contract (including kestrel-channel-whatsapp), so
+        # export both while feature packages migrate to the canonical spelling.
+        env["KESTREL_ISOLATED_RUNTIME_DIR"] = str(runtime_dir)
+        env["KESTREL_ISOLATED_FEATURE_DATA_DIR"] = str(runtime_dir)
+        env["HOME"] = str(runtime_dir / "home")
+        env["TMPDIR"] = str(runtime_dir / "tmp")
+        env["XDG_CONFIG_HOME"] = str(runtime_dir / "config")
+        env["XDG_DATA_HOME"] = str(runtime_dir / "data")
+        env["XDG_CACHE_HOME"] = str(runtime_dir / "cache")
     return env
 
 
@@ -268,6 +428,9 @@ class ProxyFeature(Feature):
         self._reloading = False
         self._reload_lock = asyncio.Lock()
         self._reload_gen = 0
+        # Resolve at construction, before feature startup/discovery can turn a
+        # missing hosted scope into an optional-feature warning and continue.
+        self._agent_runtime_dir = agent_runtime_dir(agent)
         self._venv_path: Optional[Path] = None
         self._bin_path: Optional[Path] = None
         self._host_config: Dict[str, Any] = {}
@@ -299,6 +462,7 @@ class ProxyFeature(Feature):
         # its first ``while not self._stopping`` check — leaving a re-enabled
         # service with no health supervisor (kestrel-sovereign#2522 P2).
         self._stopping = False
+        self._prepare_runtime_workspace()
         self._venv_path, self._bin_path = self.resolve_runtime_paths()
         if self._bin_path is None:
             self.ensure_venv()
@@ -622,7 +786,30 @@ class ProxyFeature(Feature):
         )
 
     def _default_venv_path(self) -> Path:
-        return _agent_data_dir(self.agent) / "feature_venvs" / self.name / ".venv"
+        return self._feature_runtime_dir() / ".venv"
+
+    def _feature_runtime_dir(self) -> Path:
+        """Return this feature's mutable, agent-scoped runtime directory."""
+        return self._agent_runtime_dir / "feature_venvs" / self.name
+
+    def _prepare_runtime_workspace(self) -> Path:
+        """Create the per-feature child-process workspace without touching its venv.
+
+        This intentionally lives beside, rather than inside, ``.venv`` so an
+        operator-provided prebuilt environment remains immutable while service
+        state, temp files, and user-home/XDG writes stay agent scoped.
+        """
+        runtime_dir = self._feature_runtime_dir()
+        for directory in (
+            runtime_dir / "work",
+            runtime_dir / "home",
+            runtime_dir / "tmp",
+            runtime_dir / "config",
+            runtime_dir / "data",
+            runtime_dir / "cache",
+        ):
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        return runtime_dir
 
     def _provision_manifest_path(self) -> Path:
         # Inside the venv dir, not its parent: explicit venv overrides can share
@@ -761,18 +948,25 @@ class ProxyFeature(Feature):
 
             factory = SubprocessIsolatedFeatureClient
 
+        runtime_dir = self._feature_runtime_dir()
+        hosted = getattr(self.agent, "isolated_runtime_hosted", False)
         kwargs = {
             "feature_name": self.name,
             "service": self.runtime.service,
             "venv_path": str(self._venv_path) if self._venv_path else None,
             "python": str(_venv_python(self._venv_path)) if self._venv_path else None,
             "executable": str(self._bin_path) if self._bin_path else None,
+            "cwd": str(runtime_dir / "work"),
             "event_handler": self._handle_event,
             "notification_handler": self._handle_event,
             "config": self._host_config or None,
             # Launch env with interpreter-shadowing vars stripped (F023) so the
             # host PYTHONPATH/VIRTUAL_ENV can't defeat the venv isolation.
-            "env": _isolated_child_env(self._venv_path),
+            "env": _isolated_child_env(
+                self._venv_path,
+                runtime_dir=runtime_dir,
+                hosted=isinstance(hosted, bool) and hosted,
+            ),
         }
         kwargs = {key: value for key, value in kwargs.items() if value}
 

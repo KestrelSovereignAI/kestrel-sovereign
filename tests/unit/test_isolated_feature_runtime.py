@@ -2,12 +2,18 @@
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
-from kestrel_sovereign.features.isolated_runtime import ProxyFeature
+from kestrel_sovereign.features.isolated_runtime import (
+    IsolatedRuntimeNamespaceError,
+    ProxyFeature,
+    resolve_isolated_runtime_namespace,
+)
+from kestrel_sovereign.kestrel_agent import KestrelAgent
 
 
 class FakeIsolatedClient:
@@ -540,6 +546,154 @@ def test_proxy_feature_resolves_default_per_agent_venv(tmp_path):
         == Path(agent.storage_path).parent / "feature_venvs" / "VoiceFeature" / ".venv"
     )
     assert bin_path is None
+
+
+def _hosted_postgres_agent(runtime_root: Path, namespace: str) -> KestrelAgent:
+    """Construct only: Postgres-backed hosted agents intentionally lack SQLite paths."""
+    llm_service = Mock()
+    llm_service.providers = []
+    return KestrelAgent(
+        did=f"did:test:{namespace.replace('/', ':')}",
+        storage_path=None,
+        llm_service=llm_service,
+        database_url="postgresql://hosted.example/kestrel",
+        db_backend="postgres",
+        isolated_runtime_root=runtime_root,
+        isolated_runtime_namespace=namespace,
+        isolated_runtime_hosted=True,
+    )
+
+
+def test_postgres_agents_get_distinct_explicit_runtime_namespaces(tmp_path):
+    """Postgres storage must never collapse isolated venvs into CWD/default."""
+    runtime_root = tmp_path / "hosted-runtime"
+    agent_a = _hosted_postgres_agent(runtime_root, "tenant-a/agent-a")
+    agent_b = _hosted_postgres_agent(runtime_root, "tenant-b/agent-b")
+    runtime = _isolated_runtime()
+
+    venv_a, _ = ProxyFeature(
+        agent_a, runtime, client_factory=FakeIsolatedClient
+    ).resolve_runtime_paths()
+    venv_b, _ = ProxyFeature(
+        agent_b, runtime, client_factory=FakeIsolatedClient
+    ).resolve_runtime_paths()
+
+    assert agent_a.storage_path is None
+    assert agent_b.storage_path is None
+    assert venv_a != venv_b
+    assert venv_a == (
+        runtime_root.resolve()
+        / "tenant-a"
+        / "agent-a"
+        / "feature_venvs"
+        / runtime.class_name
+        / ".venv"
+    )
+    assert venv_b == (
+        runtime_root.resolve()
+        / "tenant-b"
+        / "agent-b"
+        / "feature_venvs"
+        / runtime.class_name
+        / ".venv"
+    )
+
+
+def test_hosted_agent_without_runtime_namespace_fails_before_feature_starts(tmp_path):
+    agent = SimpleNamespace(
+        storage_path=None,
+        isolated_runtime_hosted=True,
+        isolated_runtime_root=tmp_path / "hosted-runtime",
+        isolated_runtime_namespace=None,
+        features={},
+    )
+
+    with pytest.raises(IsolatedRuntimeNamespaceError, match="runtime namespace"):
+        ProxyFeature(agent, _isolated_runtime(), client_factory=FakeIsolatedClient)
+
+
+def test_postgres_agent_without_filesystem_scope_fails_closed_before_feature_starts():
+    """Legacy hosted factories cannot silently regain the shared CWD fallback."""
+    llm_service = Mock()
+    llm_service.providers = []
+    agent = KestrelAgent(
+        did="did:test:legacy-postgres-host",
+        storage_path=None,
+        llm_service=llm_service,
+        database_url="postgresql://hosted.example/kestrel",
+        db_backend="postgres",
+    )
+
+    assert agent.isolated_runtime_hosted is True
+    with pytest.raises(IsolatedRuntimeNamespaceError, match="no explicit runtime"):
+        ProxyFeature(agent, _isolated_runtime(), client_factory=FakeIsolatedClient)
+
+
+@pytest.mark.parametrize("namespace", ["../other-agent", "tenant/../other", "/outside"])
+def test_hosted_runtime_namespace_rejects_traversal_and_absolute_paths(tmp_path, namespace):
+    with pytest.raises(IsolatedRuntimeNamespaceError, match="relative, traversal-free"):
+        resolve_isolated_runtime_namespace(tmp_path / "runtime-root", namespace)
+
+
+def test_hosted_runtime_namespace_rejects_aliases_that_can_cause_collisions(tmp_path):
+    """The accepted namespace has one unambiguous, root-contained spelling."""
+    scope = resolve_isolated_runtime_namespace(
+        tmp_path / "runtime-root", "tenant-a/agent-a"
+    )
+    assert scope.path == (tmp_path / "runtime-root" / "tenant-a" / "agent-a").resolve()
+
+    with pytest.raises(IsolatedRuntimeNamespaceError, match="relative, traversal-free"):
+        resolve_isolated_runtime_namespace(
+            tmp_path / "runtime-root", "tenant-a/agent-a/../agent-b"
+        )
+    with pytest.raises(IsolatedRuntimeNamespaceError, match="relative, traversal-free"):
+        resolve_isolated_runtime_namespace(
+            tmp_path / "runtime-root", "tenant-a//agent-a"
+        )
+
+
+def test_hosted_child_launch_uses_agent_scoped_workspace_config_and_environment(
+    monkeypatch, tmp_path
+):
+    """Same feature on two hosted agents gets isolated state and launch inputs."""
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_TOKEN", "host-wide-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "another-tenants-key")
+    runtime_root = tmp_path / "hosted-runtime"
+    shared_prebuilt_venv = runtime_root / "prebuilt" / ".venv"
+    captured = []
+
+    def client_factory(**kwargs):
+        captured.append(kwargs)
+        return FakeIsolatedClient(**kwargs)
+
+    for namespace, token in (("tenant-a/agent-a", "a-secret"), ("tenant-b/agent-b", "b-secret")):
+        agent = _hosted_postgres_agent(runtime_root, namespace)
+        feature = ProxyFeature(agent, _cfg_runtime(), client_factory=client_factory)
+        # A host may deliberately share an immutable prebuilt venv.  Its
+        # mutable WhatsApp state must still follow the agent-scoped data-dir
+        # contract rather than resolve beside this venv.
+        feature._venv_path = shared_prebuilt_venv
+        feature._host_config = {"token": token}
+        workspace = feature._prepare_runtime_workspace()
+        feature._build_client()
+
+        launch = captured[-1]
+        assert launch["cwd"] == str(workspace / "work")
+        assert launch["config"] == {"token": token}
+        assert launch["env"]["KESTREL_ISOLATED_RUNTIME_DIR"] == str(workspace)
+        assert launch["env"]["KESTREL_ISOLATED_FEATURE_DATA_DIR"] == str(workspace)
+        assert launch["env"]["HOME"] == str(workspace / "home")
+        assert launch["env"]["TMPDIR"] == str(workspace / "tmp")
+        assert "KESTREL_FEATURE_TESTFEATURE_TOKEN" not in launch["env"]
+        assert "OPENAI_API_KEY" not in launch["env"]
+
+    assert captured[0]["cwd"] != captured[1]["cwd"]
+    assert captured[0]["config"]["token"] != captured[1]["config"]["token"]
+    assert captured[0]["venv_path"] == captured[1]["venv_path"]
+    assert (
+        captured[0]["env"]["KESTREL_ISOLATED_FEATURE_DATA_DIR"]
+        != captured[1]["env"]["KESTREL_ISOLATED_FEATURE_DATA_DIR"]
+    )
 
 
 @pytest.mark.asyncio

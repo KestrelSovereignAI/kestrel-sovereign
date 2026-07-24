@@ -10,6 +10,7 @@ available for local dev (separate OS processes per agent).
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 from decimal import Decimal
@@ -67,7 +68,11 @@ class AgentManager:
         # child_name -> (DelegatedWallet, parent_wallet) for budgeted children, so
         # termination can release the unspent hold back to the parent (#2113).
         self._child_budgets: dict[str, tuple] = {}
-        self._base_data_dir = base_data_dir or Path.cwd()
+        self._base_data_dir = (base_data_dir or Path.cwd()).expanduser().resolve()
+        # A multi-agent host owns one mutable isolated-feature root.  The
+        # per-agent namespace is derived below from the stable DID rather than
+        # accepting the routing name as a path component.
+        self._isolated_runtime_root = self._base_data_dir / "isolated_feature_runtime"
         self._lock = asyncio.Lock()
         # Reserved-port allocator (#1729 → #2358 codex rounds 4-6). A bare
         # monotonic counter avoided unload-reuse but couldn't express "this
@@ -95,6 +100,19 @@ class AgentManager:
         # LocalAgentConfig per agent created at runtime via create_agent —
         # consumed by the create-agent endpoint to persist registrations.
         self._created_configs: dict[str, "LocalAgentConfig"] = {}
+
+    def _isolated_runtime_scope(self, agent_did: str) -> tuple[Path, str]:
+        """Return this host's canonical mutable runtime scope for one agent.
+
+        DIDs are stable across an agent rename, but their punctuation is not a
+        portable directory name.  A SHA-256 namespace is deterministic,
+        traversal-free, and collision-resistant, while KestrelAgent still
+        performs the authoritative root-containment validation.
+        """
+        namespace = "agent-" + hashlib.sha256(
+            agent_did.encode("utf-8")
+        ).hexdigest()
+        return self._isolated_runtime_root, namespace
 
     async def _initialize_agent(
         self, name: str, config: LocalAgentConfig
@@ -144,6 +162,9 @@ class AgentManager:
         agent: Optional[KestrelAgent] = None
         try:
             if db_backend.lower() == "postgres" and database_url:
+                runtime_root, runtime_namespace = self._isolated_runtime_scope(
+                    agent_did
+                )
                 agent = KestrelAgent(
                     did=agent_did,
                     storage_path=db_path,
@@ -152,6 +173,9 @@ class AgentManager:
                     db_backend="postgres",
                     allowed_features=allowed_features,
                     identity_export_dir=identity_export_dir,
+                    isolated_runtime_root=runtime_root,
+                    isolated_runtime_namespace=runtime_namespace,
+                    isolated_runtime_hosted=True,
                 )
             else:
                 agent = KestrelAgent(

@@ -36,13 +36,33 @@ def channel_artifact_path(agent, channel_type: str, name: str) -> Path | None:
 
     Isolated channel features (e.g. WhatsApp) push their pairing QR PNG to the
     host, which persists it here so the chat UI can render it over http (the
-    sanitizer blocks ``data:`` image URIs). Mirrors ``_agent_data_dir`` in
-    ``features/isolated_runtime`` (agent data dir = storage DB's parent).
+    sanitizer blocks ``data:`` image URIs). Mirrors the canonical isolated
+    feature runtime scope: storage-backed standalone agents use the DB parent;
+    hosted agents use their explicitly validated runtime namespace.
     """
+    from kestrel_sovereign.features.isolated_runtime import (
+        IsolatedRuntimeNamespaceError,
+        agent_runtime_dir,
+    )
+
+    # The proxy's legacy no-storage fallback exists solely to preserve its
+    # standalone provisioning behavior. This HTTP endpoint historically had no
+    # artifact location without a filesystem agent, so expose one only for an
+    # explicitly scoped hosted runtime.
     storage_path = getattr(agent, "storage_path", None)
-    if not storage_path:
+    runtime_root = getattr(agent, "isolated_runtime_root", None)
+    runtime_namespace = getattr(agent, "isolated_runtime_namespace", None)
+    has_storage_root = isinstance(storage_path, (str, Path)) and bool(storage_path)
+    has_explicit_runtime_scope = isinstance(runtime_root, (str, Path)) or isinstance(
+        runtime_namespace, (str, Path)
+    )
+    if not has_storage_root and not has_explicit_runtime_scope:
         return None
-    base = Path(storage_path).expanduser().resolve().parent
+
+    try:
+        base = agent_runtime_dir(agent)
+    except IsolatedRuntimeNamespaceError:
+        return None
     return base / "channel_link_artifacts" / f"{channel_type}_{name}"
 
 

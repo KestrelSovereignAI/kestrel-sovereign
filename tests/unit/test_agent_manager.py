@@ -1,6 +1,7 @@
 """Unit tests for the in-process AgentManager."""
 
 import asyncio
+import hashlib
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from pathlib import Path
@@ -260,6 +261,49 @@ class TestLoadFromConfig:
 
         agent_root = (tmp_path / "agent_data" / "claw").resolve()
         assert mock_agent_cls.call_args.kwargs["identity_export_dir"] == agent_root
+
+    @pytest.mark.asyncio
+    @patch(
+        "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+        new_callable=AsyncMock,
+    )
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
+    async def test_postgres_host_factory_supplies_distinct_isolated_runtime_scopes(
+        self,
+        mock_llm_cls,
+        mock_agent_cls,
+        mock_get_did,
+        monkeypatch,
+        tmp_path,
+    ):
+        """The real in-process factory owns scoped mutable feature state."""
+        agent_a = _make_mock_agent("did:tenant-a")
+        agent_b = _make_mock_agent("did:tenant-b")
+        mock_agent_cls.side_effect = [agent_a, agent_b]
+        mock_get_did.side_effect = ["did:tenant-a", "did:tenant-b"]
+        monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+        monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://host/kestrel")
+        manager = AgentManager(base_data_dir=tmp_path)
+        config = LocalAgentConfig(data_dir=Path("agent_data/companion"), port=8801)
+
+        with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
+            await manager._initialize_agent("Companion A", config)
+            await manager._initialize_agent("Companion B", config)
+
+        first, second = (call.kwargs for call in mock_agent_cls.call_args_list)
+        expected_root = (tmp_path / "isolated_feature_runtime").resolve()
+        assert first["isolated_runtime_root"] == expected_root
+        assert second["isolated_runtime_root"] == expected_root
+        assert first["isolated_runtime_hosted"] is True
+        assert second["isolated_runtime_hosted"] is True
+        assert first["isolated_runtime_namespace"] == (
+            "agent-" + hashlib.sha256(b"did:tenant-a").hexdigest()
+        )
+        assert second["isolated_runtime_namespace"] == (
+            "agent-" + hashlib.sha256(b"did:tenant-b").hexdigest()
+        )
+        assert first["isolated_runtime_namespace"] != second["isolated_runtime_namespace"]
 
     @pytest.mark.asyncio
     @patch("kestrel_sovereign.multi_agent.agent_manager._get_agent_did", new_callable=AsyncMock)

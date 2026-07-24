@@ -355,6 +355,9 @@ class KestrelAgent(
         host_db=None,
         sovereign_trust_root_path: Optional[str] = None,
         identity_export_dir: Optional[Path] = None,
+        isolated_runtime_root: Optional[Union[str, Path]] = None,
+        isolated_runtime_namespace: Optional[Union[str, Path]] = None,
+        isolated_runtime_hosted: bool = False,
     ):
         """
         Initializes the agent with memory and reasoning capabilities.
@@ -393,10 +396,54 @@ class KestrelAgent(
             identity_export_dir: Optional per-agent local identity export
                        directory. Multi-agent hosts resolve this before agent
                        construction so it never depends on process CWD.
+            isolated_runtime_root: Host-owned root for isolated-feature mutable
+                       runtime state. Hosted factories must pair this with
+                       ``isolated_runtime_namespace``.
+            isolated_runtime_namespace: Relative tenant/agent namespace below
+                       ``isolated_runtime_root``. It is canonicalized and
+                       containment-checked before use.
+            isolated_runtime_hosted: Declares that this agent is hosted in a
+                       shared runtime. An isolated feature then fails closed if
+                       no explicit root and namespace were supplied.
         """
         self.did = did
         self._privacy_mode = privacy_mode
         self.storage_path = storage_path
+        effective_db_backend = db_backend or os.environ.get(
+            "KESTREL_DB_BACKEND", "sqlite"
+        )
+        # PostgreSQL hosts commonly have no agent-local filesystem database.
+        # Treat that construction shape as hosted even if its factory predates
+        # the explicit runtime-scope arguments.  An isolated feature then fails
+        # before startup instead of silently collapsing into agent_data/default.
+        # A factory which knows its host-owned root and namespace can (and must)
+        # supply them below to make the feature usable.
+        self.isolated_runtime_hosted = bool(
+            isolated_runtime_hosted
+            or (
+                storage_path is None
+                and effective_db_backend.lower() == "postgres"
+            )
+        )
+        self.isolated_runtime_root: Optional[Path] = None
+        self.isolated_runtime_namespace: Optional[Path] = None
+        self.isolated_runtime_path: Optional[Path] = None
+        if isolated_runtime_root is not None or isolated_runtime_namespace is not None:
+            # Keep the hosted runtime boundary owned by the isolated-runtime
+            # module. This validates path traversal once at construction and
+            # the proxy reuses the same canonical scope when it launches a
+            # feature, rather than deriving mutable placement from database
+            # storage (which PostgreSQL-backed hosted agents deliberately lack).
+            from kestrel_sovereign.features.isolated_runtime import (
+                resolve_isolated_runtime_namespace,
+            )
+
+            runtime_scope = resolve_isolated_runtime_namespace(
+                isolated_runtime_root, isolated_runtime_namespace
+            )
+            self.isolated_runtime_root = runtime_scope.root
+            self.isolated_runtime_namespace = runtime_scope.namespace
+            self.isolated_runtime_path = runtime_scope.path
         # Human display name for observability span attribution (#2602). Set to
         # a best-effort floor at construction so EVERY agent object carries the
         # attribute from birth — no construction path (fleet load, spawn /
@@ -600,7 +647,7 @@ class KestrelAgent(
                     raise IdentityReadinessError.from_load_error(exc) from None
 
         # Determine database backend
-        self._db_backend = db_backend or os.environ.get("KESTREL_DB_BACKEND", "sqlite")
+        self._db_backend = effective_db_backend
         self._database_url = database_url or os.environ.get("KESTREL_DATABASE_URL")
 
         # Storage will be initialized asynchronously.
