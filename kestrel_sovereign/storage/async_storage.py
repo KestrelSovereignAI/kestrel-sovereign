@@ -192,6 +192,25 @@ class AsyncStorage:
         """Get the backend type: 'sqlite' or 'postgres'."""
         return self._backend.backend_type if self._backend else "unknown"
 
+    @property
+    def minimum_close_timeout_s(self) -> float:
+        """Minimum time an outer guard must reserve for storage close.
+
+        Backends may opt into this narrow shutdown contract when their close
+        lifecycle owns resources that outlive a public close acknowledgement
+        (SQLite's aiosqlite worker is one example).  Backends without that
+        requirement retain the prior zero-extra-budget behavior.
+        """
+        value = getattr(self._backend, "minimum_close_timeout_s", 0.0)
+        return value if isinstance(value, (int, float)) and value > 0 else 0.0
+
+    @property
+    def minimum_sqla_factory_close_timeout_s(self) -> float:
+        """Reservation for the optional cached SQLAlchemy pre-close phase."""
+        if self.db is None:
+            return 0.0
+        return self.db.minimum_sqla_factory_close_timeout_s
+
     def _now_sql(self) -> str:
         """Get SQL expression for current timestamp based on backend type."""
         if self.backend_type == "postgres":
@@ -233,6 +252,17 @@ class AsyncStorage:
         if self.db:
             await self.db.close()
         self._initialized = False
+
+    async def dispose_cached_sqla_factory(self) -> None:
+        """Dispose the optional SQLAlchemy engine before backend close.
+
+        This is intentionally separate from :meth:`close` for whole-agent
+        shutdown: its bounded pre-close phase cannot consume the reservation
+        that SQLite needs to drain its primary aiosqlite worker.  Ordinary
+        callers still get both phases by calling ``close()`` alone.
+        """
+        if self.db:
+            await self.db.dispose_cached_sqla_factory()
     
     async def __aenter__(self):
         await self.initialize()

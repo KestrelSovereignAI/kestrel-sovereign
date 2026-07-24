@@ -37,6 +37,16 @@ AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S = max(
 _AIOSQLITE_WORKER_SHUTDOWN_POLL_S = 0.01
 
 
+def _minimum_close_timeout_s() -> float:
+    """Return the outer-guard budget required by :meth:`close`.
+
+    The worker deadline starts only after ``aiosqlite.Connection.close()`` has
+    handed its stop sentinel to the worker.  Reserve one poll interval as well
+    so an outer guard cannot win a scheduling tie with that internal deadline.
+    """
+    return AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S + _AIOSQLITE_WORKER_SHUTDOWN_POLL_S
+
+
 async def _wait_for_aiosqlite_worker_shutdown(
     connection: aiosqlite.Connection,
 ) -> None:
@@ -74,8 +84,28 @@ async def _close_aiosqlite_connection(connection: aiosqlite.Connection) -> None:
     close and worker-termination wait together prevents a short-lived backup
     or snapshot connection from bypassing the shutdown contract.
     """
-    await connection.close()
-    await _wait_for_aiosqlite_worker_shutdown(connection)
+    try:
+        await connection.close()
+    except asyncio.CancelledError:
+        # ``Connection.close`` queues its stop sentinel from a ``finally``
+        # block.  Once that happens, cancellation must not let the caller
+        # tear down its event loop while the worker is still returning.
+        try:
+            await _wait_for_aiosqlite_worker_shutdown(connection)
+        finally:
+            raise
+
+    try:
+        await _wait_for_aiosqlite_worker_shutdown(connection)
+    except asyncio.CancelledError:
+        # The caller still receives its cancellation, but only after the
+        # owned worker has exited (or the bounded worker deadline has failed
+        # explicitly).  This same helper covers primary, backup, and snapshot
+        # connections.
+        try:
+            await _wait_for_aiosqlite_worker_shutdown(connection)
+        finally:
+            raise
 
 
 class SQLiteBackend(DatabaseBackend):
@@ -117,6 +147,17 @@ class SQLiteBackend(DatabaseBackend):
     @property
     def is_connected(self) -> bool:
         return self._connection is not None
+
+    @property
+    def minimum_close_timeout_s(self) -> float:
+        """Minimum budget an outer shutdown guard must reserve for ``close``.
+
+        This is intentionally an optional backend extension rather than a
+        change to the SDK's generic backend interface: non-SQLite backends do
+        not own an aiosqlite worker and therefore have no equivalent lifecycle
+        requirement.
+        """
+        return _minimum_close_timeout_s()
     
     async def connect(self) -> None:
         """Connect to SQLite database."""

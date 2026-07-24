@@ -4,6 +4,7 @@ import os
 import asyncio
 import hashlib
 import inspect
+import math
 import time
 from dataclasses import dataclass, replace as _replace_dataclass
 from datetime import datetime
@@ -231,7 +232,9 @@ KESTREL_SHUTDOWN_AUDIT_TAIL_FRACTION = float(
 )
 
 
-def _resolve_shutdown_budget() -> tuple[float, float]:
+def _resolve_shutdown_budget(
+    minimum_tail_reserve: float = 0.0,
+) -> tuple[float, float]:
     """Resolve ``(prefix_budget, tail_reserve)`` for whole-agent shutdown.
 
     Both values are clamped and validated against the production outer
@@ -242,12 +245,22 @@ def _resolve_shutdown_budget() -> tuple[float, float]:
       An override above it would let the outer ``wait_for`` (not our own
       composition) be what stops us, starving later steps and the durable
       tail; the mismatch is logged at WARNING and reconciled by clamping.
-    * The durable-tail reserve is clamped into ``[min_step, total / 2]`` so
-      the tail always has a nonzero, honest window and the fallible prefix
-      always keeps the majority of the budget. ``reserve >= total`` is an
-      explicit, safe clamp (logged), not a zero-budget prefix.
+    * The configured durable-tail reserve is clamped into
+      ``[min_step, total / 2]`` so the tail always has a nonzero, honest
+      window and the fallible prefix normally keeps the majority of the
+      budget.  A backend may require a larger minimum reservation for an
+      owned resource to complete shutdown safely; that declared requirement
+      wins, while the total remains bounded by the production outer deadline.
 
-    Returns ``(prefix_budget, tail_reserve)`` with both strictly > 0.
+    ``minimum_tail_reserve`` is an optional, backend-owned contract such as
+    SQLite's aiosqlite worker termination window.  It is deliberately not
+    part of the generic SDK storage interface: a backend that does not expose
+    it keeps the existing shutdown allocation unchanged.
+
+    Returns ``(prefix_budget, tail_reserve)``.  The prefix can be zero only
+    when an operator configures an outer budget too small to leave time for a
+    safety-critical backend close; the total still never exceeds the outer
+    deadline.
     """
     outer = float(SHUTDOWN_TIMEOUT)
     total = KESTREL_AGENT_SHUTDOWN_TIMEOUT_S
@@ -279,8 +292,65 @@ def _resolve_shutdown_budget() -> tuple[float, float]:
     if reserve <= 0.0:
         reserve = min(KESTREL_SHUTDOWN_TAIL_MIN_STEP_S, max_reserve)
 
+    required_tail = max(0.0, minimum_tail_reserve)
+    if required_tail > total:
+        logging.warning(
+            "Storage close requires %.2fs but the production shutdown "
+            "budget is %.2fs; reserving the complete bounded budget for the "
+            "durable tail.",
+            required_tail,
+            total,
+        )
+        required_tail = total
+    reserve = max(reserve, required_tail)
+
     prefix_budget = max(0.0, total - reserve)
     return prefix_budget, reserve
+
+
+def _minimum_storage_close_timeout(storage: Any) -> float:
+    """Read an optional backend-owned storage-close reservation safely.
+
+    Generic and non-SQLite storages deliberately do not need to implement the
+    extension.  Treat malformed values as no reservation rather than letting a
+    mock/proxy attribute change the shutdown budget or make it unbounded.
+    """
+    try:
+        value = getattr(storage, "minimum_close_timeout_s", 0.0)
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    value = float(value)
+    return value if math.isfinite(value) and value > 0.0 else 0.0
+
+
+def _storage_preclose(storage: Any):
+    """Return storage's optional bounded pre-close operation, if available.
+
+    ``AsyncStorage`` uses this hook to dispose a cached SQLAlchemy engine
+    before closing its primary backend connection.  Keeping that unbounded
+    external-resource work out of the primary close step preserves SQLite's
+    aiosqlite worker-drain reservation.  Generic storage implementations keep
+    their existing one-step close behavior.
+    """
+    try:
+        dispose = getattr(storage, "dispose_cached_sqla_factory", None)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return dispose if callable(dispose) else None
+
+
+def _minimum_storage_preclose_timeout(storage: Any) -> float:
+    """Read the optional cached-SQLAlchemy close reservation safely."""
+    try:
+        value = getattr(storage, "minimum_sqla_factory_close_timeout_s", 0.0)
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    value = float(value)
+    return value if math.isfinite(value) and value > 0.0 else 0.0
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -5334,7 +5404,13 @@ Expected Duration: {expected_duration}
         own slice and cannot starve a later feature — or the durable tail.
         """
         loop = asyncio.get_running_loop()
-        prefix_budget, tail_reserve = _resolve_shutdown_budget()
+        storage_close_timeout = _minimum_storage_close_timeout(self.storage)
+        storage_preclose_timeout = _minimum_storage_preclose_timeout(self.storage)
+        prefix_budget, tail_reserve = _resolve_shutdown_budget(
+            self._durable_tail_minimum_budget(
+                storage_close_timeout, storage_preclose_timeout
+            )
+        )
         # Shared deadline for the fallible prefix. Reserve headroom so the
         # durable tail runs WITHIN the outer deadline rather than relying on
         # the outer wait_for cancellation to trigger it.
@@ -5569,7 +5645,9 @@ Expected Duration: {expected_duration}
             # branch unreachable. Returns whether cancellation was observed
             # and whether any step degraded (abandoned/errored).
             tail_cancelled, tail_degraded = await self._run_durable_shutdown_tail(
-                tail_reserve
+                tail_reserve,
+                storage_close_timeout=storage_close_timeout,
+                storage_preclose_timeout=storage_preclose_timeout,
             )
             if tail_cancelled:
                 shutdown_cancelled = True
@@ -5601,8 +5679,51 @@ Expected Duration: {expected_duration}
         else:
             logging.info("Kestrel Agent async shutdown complete.")
 
+    def _durable_tail_minimum_budget(
+        self,
+        storage_close_timeout: float,
+        storage_preclose_timeout: float = 0.0,
+    ) -> float:
+        """Return the durable-tail floor needed for a storage close contract.
+
+        SQLite's close must retain enough time for its aiosqlite worker to
+        exit.  The preceding durable operations retain their existing minimum
+        attempts, and this reservation makes their aggregate guards plus the
+        SQLite requirement fit inside the same bounded tail deadline.
+        """
+        if storage_close_timeout <= 0.0:
+            return 0.0
+
+        memory_system = getattr(self, "memory_system", None)
+        run_memory = bool(memory_system and hasattr(memory_system, "shutdown"))
+        sync_service = getattr(self, "_sync_service", None)
+        run_sync = bool(sync_service and sync_service.is_running)
+        run_storage = hasattr(self.storage, "close")
+        if not run_storage:
+            return 0.0
+
+        # The cached SQLAlchemy factory is a separate, bounded pre-close
+        # operation.  Its own SQLite driver workers need their own declared
+        # reservation; it must not consume the primary close's reservation.
+        run_storage_preclose = _storage_preclose(self.storage) is not None
+        preceding_steps = 1 + int(run_memory) + 2 * int(run_sync)
+        preclose_minimum = (
+            max(KESTREL_SHUTDOWN_TAIL_MIN_STEP_S, storage_preclose_timeout)
+            if run_storage_preclose
+            else 0.0
+        )
+        return (
+            preceding_steps * KESTREL_SHUTDOWN_TAIL_MIN_STEP_S
+            + preclose_minimum
+            + storage_close_timeout
+        )
+
     async def _run_durable_shutdown_tail(
-        self, tail_reserve: float
+        self,
+        tail_reserve: float,
+        *,
+        storage_close_timeout: float | None = None,
+        storage_preclose_timeout: float | None = None,
     ) -> tuple[bool, bool]:
         """Run the safety-critical durable shutdown steps.
 
@@ -5630,9 +5751,6 @@ Expected Duration: {expected_duration}
           the caller must NOT describe the cleanup as "completed".
         """
         loop = asyncio.get_running_loop()
-        tail_deadline = loop.time() + max(
-            KESTREL_SHUTDOWN_TAIL_MIN_STEP_S, tail_reserve
-        )
 
         state = {"cancelled": False, "degraded": False}
 
@@ -5643,15 +5761,61 @@ Expected Duration: {expected_duration}
         sync_service = getattr(self, "_sync_service", None)
         run_sync = bool(sync_service and sync_service.is_running)
         run_storage = hasattr(self.storage, "close")
+        if storage_close_timeout is None:
+            storage_close_timeout = _minimum_storage_close_timeout(self.storage)
+        if storage_preclose_timeout is None:
+            storage_preclose_timeout = _minimum_storage_preclose_timeout(self.storage)
+        if not run_storage:
+            storage_close_timeout = 0.0
+            storage_preclose_timeout = 0.0
+
+        tail_minimum = self._durable_tail_minimum_budget(
+            storage_close_timeout, storage_preclose_timeout
+        )
+        # The normal (non-SQLite) path retains its existing fair-share
+        # allocation.  SQLite adds a declared reservation, which includes the
+        # preceding tail-step floors, so a short fair share cannot cancel the
+        # worker-exit wait before its own deadline.
+        # ``tail_reserve`` was already resolved and clamped against the
+        # production outer deadline.  It is the one authoritative tail
+        # deadline: never recompute a larger deadline here from a backend
+        # requirement, because that would silently discard the outer-budget
+        # clamp when a configuration cannot fit.
+        tail_deadline = loop.time() + max(0.0, tail_reserve)
         # The sync path makes TWO guarded steps (snapshot + stop), so it must
         # count as two in the fair-division denominator — otherwise sync-stop
         # runs at pending_steps==1 and claims the entire remaining budget,
         # starving the data-critical storage-close of its fair share.
-        pending_steps = 1 + int(run_memory) + 2 * int(run_sync) + int(run_storage)
+        storage_preclose = _storage_preclose(self.storage)
+        run_storage_preclose = storage_preclose is not None
+        pending_steps = (
+            1
+            + int(run_memory)
+            + 2 * int(run_sync)
+            + int(run_storage_preclose)
+            + int(run_storage)
+        )
+        reserved_minimum = tail_minimum
 
-        def _step_guard() -> float:
-            nonlocal pending_steps
+        def _step_guard(minimum: float = KESTREL_SHUTDOWN_TAIL_MIN_STEP_S) -> float:
+            nonlocal pending_steps, reserved_minimum
             remaining = max(0.0, tail_deadline - loop.time())
+            if storage_close_timeout > 0.0:
+                # Preserve every later step's minimum.  Giving an earlier tail
+                # operation an ordinary fair share could otherwise consume the
+                # SQLite close reservation before storage is reached.
+                excess = max(0.0, remaining - reserved_minimum)
+                share = excess / pending_steps if pending_steps > 0 else 0.0
+                # A required close reservation can exceed the total shutdown
+                # budget.  In that incoherent configuration the resolver
+                # gives the durable tail all available time; this live clamp
+                # keeps every individual guard inside that same deadline
+                # rather than creating a second, larger one here.
+                guard = min(remaining, max(0.0, minimum) + share)
+                reserved_minimum = max(0.0, reserved_minimum - minimum)
+                if pending_steps > 0:
+                    pending_steps -= 1
+                return guard
             share = remaining / pending_steps if pending_steps > 1 else remaining
             if pending_steps > 0:
                 pending_steps -= 1
@@ -5713,6 +5877,10 @@ Expected Duration: {expected_duration}
             ``force_snapshot`` so cancellation neither aborts it nor skips the
             following ``stop()``); it is still bounded by ``guard``.
             """
+            # Every guard and any cancellation grace shares the one live tail
+            # deadline.  In particular, an externally-cancelled shielded
+            # close must not receive a fresh full guard after the deadline.
+            guard = min(max(0.0, guard), max(0.0, tail_deadline - loop.time()))
             task = asyncio.ensure_future(coro)
             try:
                 done, _pending = await asyncio.wait({task}, timeout=guard)
@@ -5723,8 +5891,13 @@ Expected Duration: {expected_duration}
                 # steps are not aborted, then propagate via state["cancelled"].
                 state["cancelled"] = True
                 if shielded:
+                    cancellation_grace = min(
+                        guard, max(0.0, tail_deadline - loop.time())
+                    )
                     try:
-                        done, _pending = await asyncio.wait({task}, timeout=guard)
+                        done, _pending = await asyncio.wait(
+                            {task}, timeout=cancellation_grace
+                        )
                     except asyncio.CancelledError:
                         _abandon(task)
                         state["degraded"] = True
@@ -5777,8 +5950,28 @@ Expected Duration: {expected_duration}
             if status == "ok":
                 logging.info("Sync service: final snapshot flushed")
 
-        # Close storage — data-critical, gets its own nonzero guard.
+        # Dispose an optional cached SQLAlchemy engine as its own bounded
+        # phase.  Otherwise a slow engine disposal can consume the guard that
+        # the following primary SQLite close requires to drain its worker.
+        if storage_preclose is not None:
+            await _bounded(
+                storage_preclose(),
+                _step_guard(
+                    max(KESTREL_SHUTDOWN_TAIL_MIN_STEP_S, storage_preclose_timeout)
+                ),
+                "storage-sqla-pre-close",
+                shielded=storage_preclose_timeout > 0.0,
+            )
+
+        # Close storage — SQLite gets its declared worker-exit reservation and
+        # keeps running through an external cancellation until that bounded
+        # contract completes.  Other backends retain the existing behavior.
         if run_storage:
-            await _bounded(self.storage.close(), _step_guard(), "storage-close")
+            await _bounded(
+                self.storage.close(),
+                _step_guard(storage_close_timeout),
+                "storage-close",
+                shielded=storage_close_timeout > 0.0,
+            )
 
         return state["cancelled"], state["degraded"]

@@ -19,13 +19,20 @@ matters.
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from typing import Any
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
+)
+
+from kestrel_sovereign.storage.db.sqlite import (
+    _minimum_close_timeout_s,
+    _wait_for_aiosqlite_worker_shutdown,
 )
 
 
@@ -56,10 +63,33 @@ class SovereignSqlaSessionFactory:
         self._async_session = async_sessionmaker(
             engine, class_=AsyncSession, expire_on_commit=False
         )
+        # SQLAlchemy's aiosqlite dialect acknowledges ``engine.dispose()``
+        # after each driver's ``Connection.close()`` returns, which has the
+        # same final-worker-turn gap as our primary SQLite backend.  Track the
+        # raw driver connections at the engine boundary so this factory owns
+        # their complete lifecycle too.
+        self._sqlite_connections: list[Any] = []
+        if getattr(engine.dialect, "name", None) == "sqlite":
+            event.listen(
+                engine.sync_engine, "connect", self._track_sqlite_connection
+            )
 
     @property
     def engine(self) -> Any:
         return self._engine
+
+    @property
+    def minimum_close_timeout_s(self) -> float:
+        """Worker-drain reservation required by a SQLite-backed factory."""
+        if getattr(self._engine.dialect, "name", None) != "sqlite":
+            return 0.0
+        return _minimum_close_timeout_s()
+
+    def _track_sqlite_connection(self, dbapi_connection: Any, _record: Any) -> None:
+        """Remember one raw aiosqlite connection opened by this engine."""
+        connection = getattr(dbapi_connection, "driver_connection", None)
+        if connection is not None and connection not in self._sqlite_connections:
+            self._sqlite_connections.append(connection)
 
     @asynccontextmanager
     async def read_session(self):
@@ -77,8 +107,23 @@ class SovereignSqlaSessionFactory:
                 raise
 
     async def close(self) -> None:
-        """Dispose the engine. Long-lived services should call this on shutdown."""
-        await self._engine.dispose()
+        """Dispose the engine and drain every SQLite worker it opened."""
+        try:
+            await self._engine.dispose()
+            await self._drain_sqlite_workers()
+        except asyncio.CancelledError:
+            # SQLAlchemy may already have handed close sentinels to one or
+            # more drivers.  Do not let cancellation close the event loop in
+            # the final worker-return interval; report it after draining.
+            try:
+                await self._drain_sqlite_workers()
+            finally:
+                raise
+
+    async def _drain_sqlite_workers(self) -> None:
+        """Wait for raw SQLite driver workers after engine disposal."""
+        for connection in self._sqlite_connections:
+            await _wait_for_aiosqlite_worker_shutdown(connection)
 
 
 # Attribute name used to cache the session factory on the
