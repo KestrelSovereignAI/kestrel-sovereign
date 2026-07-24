@@ -1,30 +1,26 @@
-"""Codex app-server spawn must use a buffer ``limit`` large enough for
-typical JSON-RPC frames (#1438).
+"""Codex app-server stdout framing stays bounded without line-reader failure.
 
-asyncio's default ``StreamReader`` line limit is 64 KiB. Codex routinely
-emits single-line JSON-RPC frames that exceed this — e.g. an
-Item-finished event echoing the full assistant text on a ~20K-input-
-token turn, or a snapshot containing the cumulative reasoning trace.
-When the limit is exceeded, ``StreamReader.__anext__`` raises
-``ValueError('Separator is found, but chunk is longer than limit')``;
-``_read_loop`` dies before any frame is parsed; the call site reports
-``codex app-server exited (rc=None)`` with no clue that a buffer cap
-was the cause.
-
-Pin the spawn kwarg so a future refactor can't quietly drop it.
+Codex can emit one large newline-delimited JSON-RPC event for a reasoning
+snapshot.  ``StreamReader.readline`` treats its ``limit`` as a per-line cap,
+so a single valid frame used to kill the shared bridge reader.  These tests
+pin incremental framing: valid frames beyond the legacy 16 MiB cap parse,
+and a genuinely oversized frame fails only active bridge work while the
+reader resynchronizes for later output (#2711).
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from unittest.mock import MagicMock
 
 import pytest
 
 from kestrel_sovereign.llm.codex_app_server import (
+    CODEX_APP_SERVER_MAX_FRAME_BYTES,
     CodexAppServerClient,
-    CodexAppServerError,
+    CodexAppServerFrameTooLarge,
 )
 
 
@@ -41,11 +37,33 @@ class _AsyncIterableMock:
         return self._items.pop(0)
 
 
+class _ChunkReader:
+    """In-memory ``StreamReader.read`` stand-in with optional held EOF."""
+
+    def __init__(self, data: bytes, *, hold_eof: bool = False):
+        self._data = data
+        self._release_eof = asyncio.Event()
+        if not hold_eof:
+            self._release_eof.set()
+
+    async def read(self, size: int = -1) -> bytes:
+        if self._data:
+            if size < 0:
+                out, self._data = self._data, b""
+            else:
+                out, self._data = self._data[:size], self._data[size:]
+            return out
+        await self._release_eof.wait()
+        return b""
+
+    def release_eof(self) -> None:
+        self._release_eof.set()
+
+
 @pytest.mark.asyncio
-async def test_spawn_passes_large_streamreader_limit(monkeypatch):
-    """``_spawn`` must pass a ``limit=`` of at least 1 MiB to
-    ``asyncio.create_subprocess_exec``. Default (64 KiB) crashes on
-    realistic codex turn frames — see #1438."""
+async def test_spawn_passes_large_streamreader_limit(monkeypatch, tmp_path):
+    """Spawn retains an explicit, frame-ceiling-aligned reader limit."""
+    monkeypatch.setenv("HOME", str(tmp_path))
 
     c = CodexAppServerClient.__new__(CodexAppServerClient)
     c._binary = "/usr/bin/true"
@@ -78,12 +96,10 @@ async def test_spawn_passes_large_streamreader_limit(monkeypatch):
         "frames (#1438). Did a refactor drop the kwarg?"
     )
     limit = captured["kwargs"]["limit"]
-    assert limit >= 1024 * 1024, (
-        f"`limit={limit}` is too low. Codex frames routinely exceed 1 MiB "
-        f"on typical turn payloads; spawning with this limit would crash "
-        f"the read loop with `ValueError('Separator is found, but chunk "
-        f"is longer than limit')` and report a spurious `app-server exited "
-        f"(rc=None)`. See #1438."
+    assert limit == CODEX_APP_SERVER_MAX_FRAME_BYTES, (
+        "the subprocess reader limit must stay aligned with the bounded "
+        "JSON-RPC frame ceiling; a lower limit reintroduces the #2711 "
+        "large-frame failure mode"
     )
 
     # Cleanup
@@ -94,33 +110,29 @@ async def test_spawn_passes_large_streamreader_limit(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_read_loop_logs_streamreader_limit_explicitly(monkeypatch, caplog):
-    """If ``_read_loop`` ever hits the StreamReader limit (regression
-    of the spawn arg, or a frame even bigger than 16 MiB), the server
-    log must say "asyncio StreamReader limit" rather than letting the
-    error masquerade as a clean exit."""
+async def test_read_loop_accepts_frame_larger_than_legacy_limit():
+    """A >16 MiB valid item frame is parsed instead of killing the loop."""
 
     c = CodexAppServerClient.__new__(CodexAppServerClient)
     c._pending = {}
-    c._turn_sinks = {}
+    sink: asyncio.Queue = asyncio.Queue()
+    c._turn_sinks = {"thread-1": sink}
     c._stderr_tail = []
     c._closed_error = None
     c._initialized = True
     c._reader_task = None
     c._stderr_task = None
 
-    # Mock proc whose stdout raises the exact asyncio limit error.
-    class _OverflowStdout:
-        def __aiter__(self):
-            return self
-
-        async def __anext__(self):
-            raise ValueError("Separator is found, but chunk is longer than limit")
+    payload = "x" * (16 * 1024 * 1024 + 1)
+    raw = (json.dumps({
+        "method": "turn/completed",
+        "params": {"threadId": "thread-1", "payload": payload},
+    }) + "\n").encode()
 
     fake_proc = MagicMock()
-    fake_proc.stdout = _OverflowStdout()
+    fake_proc.stdout = _ChunkReader(raw)
     fake_proc.stderr = _AsyncIterableMock([])
-    fake_proc.returncode = None
+    fake_proc.returncode = 0
 
     async def fake_wait():
         return 0
@@ -128,11 +140,69 @@ async def test_read_loop_logs_streamreader_limit_explicitly(monkeypatch, caplog)
     fake_proc.wait = fake_wait
     c._proc = fake_proc
 
-    with caplog.at_level(logging.ERROR, logger="kestrel_sovereign.llm.codex_app_server"):
-        await c._read_loop()
+    await c._read_loop()
 
-    messages = " ".join(rec.getMessage() for rec in caplog.records)
-    assert "asyncio StreamReader limit" in messages, (
-        f"Expected a log line naming the StreamReader limit so operators "
-        f"can grep for it. Got log messages: {messages!r}"
+    message = sink.get_nowait()
+    assert message["method"] == "turn/completed"
+    assert len(message["params"]["payload"]) == len(payload)
+
+
+@pytest.mark.asyncio
+async def test_oversized_frame_fails_active_work_but_reader_resynchronizes(
+    monkeypatch, caplog,
+):
+    """An over-ceiling frame is discarded through its newline, not fatal."""
+    import kestrel_sovereign.llm.codex_app_server as codex_app_server
+
+    max_frame_bytes = 1024 * 1024
+    monkeypatch.setattr(
+        codex_app_server, "CODEX_APP_SERVER_MAX_FRAME_BYTES", max_frame_bytes,
     )
+    c = CodexAppServerClient.__new__(CodexAppServerClient)
+    pending = asyncio.get_running_loop().create_future()
+    c._pending = {7: pending}
+    sink: asyncio.Queue = asyncio.Queue()
+    c._turn_sinks = {"thread-1": sink}
+    c._stderr_tail = []
+    c._closed_error = None
+    c._initialized = True
+    c._reader_task = None
+    c._stderr_task = None
+
+    oversized = (json.dumps({
+        "method": "item/completed",
+        "params": {"threadId": "thread-1", "payload": "x" * max_frame_bytes},
+    }) + "\n").encode()
+    next_frame = (json.dumps({
+        "method": "turn/completed",
+        "params": {"threadId": "thread-1"},
+    }) + "\n").encode()
+
+    fake_proc = MagicMock()
+    fake_proc.stdout = _ChunkReader(oversized + next_frame, hold_eof=True)
+    fake_proc.stderr = _AsyncIterableMock([])
+    fake_proc.returncode = 0
+
+    async def fake_wait():
+        return 0
+
+    fake_proc.wait = fake_wait
+    c._proc = fake_proc
+
+    with caplog.at_level(
+        logging.ERROR, logger="kestrel_sovereign.llm.codex_app_server",
+    ):
+        task = asyncio.create_task(c._read_loop())
+        bridge_error = await asyncio.wait_for(sink.get(), timeout=2)
+        next_message = await asyncio.wait_for(sink.get(), timeout=2)
+
+    assert isinstance(bridge_error["__bridge_error__"], CodexAppServerFrameTooLarge)
+    with pytest.raises(CodexAppServerFrameTooLarge, match="frame exceeded"):
+        pending.result()
+    assert next_message["method"] == "turn/completed"
+    assert not task.done(), "the reader must remain alive after discarding one frame"
+    assert c._proc is fake_proc
+    assert "discarded an oversized JSON-RPC frame" in caplog.text
+
+    fake_proc.stdout.release_eof()
+    await task

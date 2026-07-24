@@ -161,6 +161,11 @@ class TestListFeatures:
         data = resp.json()
         assert "features" in data
         assert data["count"] == 2
+        by_name = {item["name"]: item for item in data["features"]}
+        assert by_name["test-pkg"]["boundary"] == "feature-package"
+        assert by_name["test-pkg"]["installable"] is True
+        assert by_name["core-pkg"]["boundary"] == "bundled"
+        assert by_name["core-pkg"]["installable"] is False
 
     @patch("kestrel_sovereign.endpoints.features.get_registry")
     def test_filter_by_tag(self, mock_registry):
@@ -209,6 +214,7 @@ class TestListInstalledFeatures:
         data = resp.json()
         assert data["count"] == 1
         assert data["features"][0]["name"] == "TestFeature"
+        assert data["features"][0]["boundary"] == "feature-package"
         assert len(data["features"][0]["tools"]) == 1
         assert data["features"][0]["tools"][0]["name"] == "test_tool"
 

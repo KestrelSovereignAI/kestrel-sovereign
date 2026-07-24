@@ -21,6 +21,7 @@ import pytest
 from kestrel_sovereign.llm.codex_app_server import (
     CodexAppServerConnectionClosed,
     CodexAppServerError,
+    CodexAppServerFrameTooLarge,
     CodexAppServerTransportError,
 )
 from kestrel_sovereign.llm.streaming import (
@@ -69,6 +70,11 @@ def test_is_harness_owned_false_for_non_transport_codex_error():
     )
     assert not _is_harness_owned_transport_error(
         CodexAppServerError("thread/start returned no thread id: None")
+    )
+    assert not _is_harness_owned_transport_error(
+        CodexAppServerFrameTooLarge(
+            "codex app-server JSON-RPC frame exceeded the 64 MiB bridge limit"
+        )
     )
 
 

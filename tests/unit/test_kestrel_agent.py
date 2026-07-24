@@ -10,11 +10,14 @@ import asyncio
 import contextlib
 import inspect
 import os
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from decimal import Decimal
 
+from kestrel_sovereign.features.peers.directory import PeerRequester
 from kestrel_sovereign.kestrel_agent import KestrelAgent, _load_prompt_file
+from kestrel_sovereign.storage import AsyncStorage, PrivacyEnforcingStorage
 from kestrel_sovereign.agent.streaming import (
     StreamingMixin,
     resolve_turn_invocation_context,
@@ -26,6 +29,11 @@ from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.features.privacy.feature import PrivacyTransitionDecision
+from tests.utils.aiosqlite_workers import (
+    aiosqlite_worker,
+    delay_aiosqlite_worker_exit,
+    wait_until_aiosqlite_worker_exit_is_delayed,
+)
 
 
 def _no_confirm_evaluate():
@@ -209,6 +217,26 @@ class TestKestrelAgentInit:
         assert agent.storage_path == db_path
         assert agent._privacy_mode == PrivacyMode.ISOLATED
         assert agent.agent_id == did
+
+    def test_init_retains_injected_scoped_peer_dependencies(self, tmp_path):
+        """Hosted embedding supplies a router plus trusted opaque scope once."""
+        router = object()
+        scope = object()
+        requester = PeerRequester(
+            identity="did:test:caller",
+            authorization_scope=scope,
+        )
+
+        agent = KestrelAgent(
+            did="did:test:caller",
+            storage_path=str(tmp_path / "test.db"),
+            peer_directory_router=router,
+            peer_requester=requester,
+        )
+
+        assert agent.peer_directory_router is router
+        assert agent.peer_requester is requester
+        assert agent.peer_requester.authorization_scope is scope
 
     def test_init_defaults_to_normal_privacy_mode(self, tmp_path):
         """Default privacy mode is NORMAL."""
@@ -1625,6 +1653,277 @@ class TestLifecycle:
         # abandoned.
         assert storage_started.is_set()
         mock_storage.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_sqlite_storage_close_reserves_worker_deadline_under_short_tail_guard(
+        self, tmp_path
+    ):
+        """A delayed SQLAlchemy disposal cannot steal SQLite's worker guard.
+
+        This drives the production file-backed agent → privacy wrapper →
+        async storage → cached SQLAlchemy factory → SQLite path.  The
+        SQLAlchemy pre-close consumes and exceeds its own fair share, but the
+        following primary close retains the backend's declared worker-drain
+        reservation and leaves no late callback for a closed event loop.
+        """
+        from kestrel_sovereign.storage.sqla import make_session_factory
+
+        release_worker = threading.Event()
+        worker_exit_delayed = threading.Event()
+        factory_disposal_started = asyncio.Event()
+        allow_factory_disposal = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        prior_handler = loop.get_exception_handler()
+        loop_errors = []
+        worker = None
+        shutdown_task = None
+
+        def capture_loop_error(active_loop, context):
+            loop_errors.append(context)
+            if prior_handler is not None:
+                prior_handler(active_loop, context)
+
+        loop.set_exception_handler(capture_loop_error)
+        try:
+            with delay_aiosqlite_worker_exit(
+                release_worker,
+                worker_exit_delayed,
+                should_delay=lambda candidate: candidate is worker,
+            ) as workers, patch(
+                "kestrel_sovereign.storage.db.sqlite."
+                "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
+                0.20,
+            ), patch(
+                "kestrel_sovereign.kestrel_agent."
+                "KESTREL_AGENT_SHUTDOWN_TIMEOUT_S",
+                0.50,
+            ), patch(
+                "kestrel_sovereign.kestrel_agent."
+                "KESTREL_SHUTDOWN_DURABLE_RESERVE_S",
+                0.02,
+            ), patch(
+                "kestrel_sovereign.kestrel_agent."
+                "KESTREL_SHUTDOWN_TAIL_MIN_STEP_S",
+                0.01,
+            ):
+                raw_storage = AsyncStorage(str(tmp_path / "agent.db"))
+                await raw_storage.initialize()
+                connection = raw_storage._backend._connection
+                assert connection is not None
+                worker = aiosqlite_worker(connection)
+
+                # Populate the production cache with a real file-backed
+                # SQLAlchemy factory, then delay its disposal.  Cancellation
+                # of this pre-close still disposes the engine in ``finally``;
+                # the test is about preserving the *next* SQLite close guard.
+                factory = make_session_factory(raw_storage.db)
+                factory_close = factory.close
+
+                async def delayed_factory_close():
+                    factory_disposal_started.set()
+                    try:
+                        await allow_factory_disposal.wait()
+                    finally:
+                        await factory_close()
+
+                factory.close = delayed_factory_close
+
+                agent = KestrelAgent(did="did:test:sqlite-shutdown")
+                agent.features = {}
+                agent.llm_service = None
+                agent.task_manager = None
+                agent.memory_system = None
+                agent._sync_service = None
+                agent.storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
+
+                shutdown_task = asyncio.create_task(agent.shutdown())
+                await asyncio.wait_for(factory_disposal_started.wait(), timeout=1.0)
+                await asyncio.wait_for(
+                    wait_until_aiosqlite_worker_exit_is_delayed(
+                        worker_exit_delayed,
+                    ),
+                    timeout=1.0,
+                )
+                assert workers == [worker]
+                assert not shutdown_task.done()
+
+                # The old single storage guard would spend its 0.02s fair
+                # share in factory disposal and abandon this close.  The
+                # split phases keep the primary worker close pending instead.
+                await asyncio.sleep(0.04)
+                assert not shutdown_task.done()
+
+                release_worker.set()
+                allow_factory_disposal.set()
+                await asyncio.wait_for(shutdown_task, timeout=1.0)
+                assert not worker.is_alive()
+        finally:
+            release_worker.set()
+            allow_factory_disposal.set()
+            if shutdown_task is not None and not shutdown_task.done():
+                await asyncio.wait_for(shutdown_task, timeout=1.0)
+            if worker is not None:
+                worker.join(timeout=1.0)
+            loop.set_exception_handler(prior_handler)
+
+        assert worker is not None and not worker.is_alive()
+        assert not any(
+            "Event loop is closed" in str(context) for context in loop_errors
+        )
+
+    @pytest.mark.asyncio
+    async def test_feature_shutdown_late_sqla_factory_keeps_both_worker_reservations(
+        self, tmp_path
+    ):
+        """A factory created by feature shutdown cannot steal primary-close time.
+
+        This drives the real file-backed path where the cache is empty when
+        ``KestrelAgent.shutdown`` composes its deadline, then a feature lazily
+        creates and opens a SQLAlchemy SQLite factory during the prefix.  Both
+        the factory worker and the primary worker must terminate before the
+        agent reports shutdown complete.
+        """
+        from sqlalchemy import text
+
+        from kestrel_sovereign.storage.sqla import make_session_factory
+
+        release_worker = threading.Event()
+        worker_exit_delayed = threading.Event()
+        factory_created = asyncio.Event()
+        factory_worker = None
+        primary_worker = None
+        shutdown_task = None
+
+        raw_storage = AsyncStorage(str(tmp_path / "late-factory-agent.db"))
+        await raw_storage.initialize()
+        primary_connection = raw_storage._backend._connection
+        assert primary_connection is not None
+        primary_worker = aiosqlite_worker(primary_connection)
+
+        async def feature_shutdown():
+            nonlocal factory_worker
+            factory = make_session_factory(raw_storage.db)
+            async with factory.read_session() as session:
+                await session.execute(text("SELECT 1"))
+            factory_worker = aiosqlite_worker(factory._sqlite_connections[0])
+            factory_created.set()
+
+        feature = MagicMock()
+        feature.shutdown = feature_shutdown
+        agent = KestrelAgent(did="did:test:late-sqla-factory")
+        agent.features = {"LateSqlaFactoryFeature": feature}
+        agent.llm_service = None
+        agent.task_manager = None
+        agent.memory_system = None
+        agent._sync_service = None
+        agent.storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
+
+        try:
+            with delay_aiosqlite_worker_exit(
+                release_worker,
+                worker_exit_delayed,
+                should_delay=lambda candidate: candidate is factory_worker,
+            ) as workers, patch(
+                "kestrel_sovereign.storage.db.sqlite."
+                "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
+                0.12,
+            ), patch(
+                "kestrel_sovereign.kestrel_agent."
+                "KESTREL_AGENT_SHUTDOWN_TIMEOUT_S",
+                0.50,
+            ), patch(
+                "kestrel_sovereign.kestrel_agent."
+                "KESTREL_SHUTDOWN_DURABLE_RESERVE_S",
+                0.02,
+            ), patch(
+                "kestrel_sovereign.kestrel_agent."
+                "KESTREL_SHUTDOWN_TAIL_MIN_STEP_S",
+                0.01,
+            ):
+                shutdown_task = asyncio.create_task(agent.shutdown())
+                await asyncio.wait_for(factory_created.wait(), timeout=1.0)
+                await asyncio.wait_for(
+                    wait_until_aiosqlite_worker_exit_is_delayed(
+                        worker_exit_delayed,
+                    ),
+                    timeout=1.0,
+                )
+                assert factory_worker is not None
+                assert workers == [factory_worker]
+                assert factory_worker.is_alive()
+                assert primary_worker.is_alive()
+                assert not shutdown_task.done()
+
+                # The tail is waiting in the late-created factory's own
+                # reservation, not reporting a false success or abandoning
+                # the primary backend's subsequent worker close.
+                await asyncio.sleep(0.03)
+                assert not shutdown_task.done()
+
+                release_worker.set()
+                await asyncio.wait_for(shutdown_task, timeout=1.0)
+                assert not factory_worker.is_alive()
+                assert not primary_worker.is_alive()
+        finally:
+            release_worker.set()
+            if shutdown_task is not None and not shutdown_task.done():
+                await asyncio.wait_for(shutdown_task, timeout=1.0)
+            if factory_worker is not None:
+                factory_worker.join(timeout=1.0)
+            primary_worker.join(timeout=1.0)
+
+        assert not factory_worker.is_alive()
+        assert not primary_worker.is_alive()
+
+    @pytest.mark.asyncio
+    async def test_durable_tail_never_extends_past_clamped_storage_requirement(
+        self, tmp_path
+    ):
+        """An oversized SQLite requirement uses the live outer remainder.
+
+        A backend may honestly report a worker-drain requirement larger than
+        an operator's total shutdown budget.  The resolver gives that tail all
+        available time, but execution must not recompute the original larger
+        value and silently run beyond the outer deadline.
+        """
+        agent = KestrelAgent(
+            did="did:test:sqlite-requirement-clamp",
+            storage_path=str(tmp_path / "agent.db"),
+        )
+        close_started = asyncio.Event()
+
+        class OversizedCloseStorage:
+            minimum_close_timeout_s = 1.11
+
+            async def close(self):
+                close_started.set()
+                await asyncio.Event().wait()
+
+        agent.features = {}
+        agent.llm_service = None
+        agent.task_manager = None
+        agent.memory_system = None
+        agent._sync_service = None
+        agent.storage = OversizedCloseStorage()
+
+        with patch(
+            "kestrel_sovereign.kestrel_agent.KESTREL_AGENT_SHUTDOWN_TIMEOUT_S",
+            0.50,
+        ), patch(
+            "kestrel_sovereign.kestrel_agent.KESTREL_SHUTDOWN_DURABLE_RESERVE_S",
+            0.02,
+        ), patch(
+            "kestrel_sovereign.kestrel_agent.KESTREL_SHUTDOWN_TAIL_MIN_STEP_S",
+            0.01,
+        ):
+            started_at = asyncio.get_running_loop().time()
+            await agent.shutdown()
+            elapsed = asyncio.get_running_loop().time() - started_at
+
+        assert close_started.is_set()
+        # A little scheduler tolerance is enough; the old recomputed 1.11s
+        # tail would exceed this substantially.
+        assert elapsed < 0.75
 
     @pytest.mark.asyncio
     async def test_cancellation_during_force_snapshot_completes_it_and_stops(

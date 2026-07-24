@@ -1,13 +1,25 @@
 """
 Tests for database backend abstraction layer.
 """
+import asyncio
+import threading
+from contextlib import suppress
+from unittest.mock import AsyncMock, patch
+
+import aiosqlite
 import pytest
 from kestrel_sovereign.storage.db import (
+    ConnectionError,
     DatabaseBackend,
     SQLiteBackend,
     sqlite_to_postgres,
     postgres_to_sqlite,
     normalize_schema,
+)
+from tests.utils.aiosqlite_workers import (
+    aiosqlite_worker,
+    delay_aiosqlite_worker_exit,
+    wait_until_aiosqlite_worker_exit_is_delayed,
 )
 
 
@@ -324,9 +336,570 @@ class TestSQLiteBackend:
         await backend.close()
         assert not backend.is_connected
 
+    @pytest.mark.asyncio
+    async def test_close_waits_for_delayed_aiosqlite_worker_exit(self, tmp_path):
+        """Close must not return after aiosqlite merely acknowledges its stop.
+
+        aiosqlite resolves ``close()`` before its worker thread's target has
+        returned.  Delay that final return to reproduce the xdist teardown
+        race, then prove SQLiteBackend waits for the actual thread exit.
+        """
+        release_worker = threading.Event()
+        worker_exit_delayed = threading.Event()
+        with delay_aiosqlite_worker_exit(release_worker, worker_exit_delayed) as workers:
+            backend = SQLiteBackend(str(tmp_path / "delayed-worker.db"))
+            await backend.connect()
+
+        connection = backend._connection
+        assert connection is not None
+        worker = aiosqlite_worker(connection)
+        close_task = asyncio.create_task(backend.close())
+
+        try:
+            await asyncio.wait_for(
+                wait_until_aiosqlite_worker_exit_is_delayed(worker_exit_delayed), timeout=1.0,
+            )
+            assert workers == [worker]
+            assert not close_task.done()
+
+            release_worker.set()
+            await close_task
+            assert not worker.is_alive()
+        finally:
+            release_worker.set()
+            if not close_task.done():
+                await close_task
+            worker.join(timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_close_waits_for_delayed_aiosqlite_worker_exit(
+        self, tmp_path,
+    ):
+        """Cancellation propagates only after the owned worker has stopped."""
+        release_worker = threading.Event()
+        worker_exit_delayed = threading.Event()
+        with delay_aiosqlite_worker_exit(
+            release_worker, worker_exit_delayed,
+        ) as workers:
+            backend = SQLiteBackend(str(tmp_path / "cancelled-worker.db"))
+            await backend.connect()
+            connection = backend._connection
+            assert connection is not None
+            worker = aiosqlite_worker(connection)
+            close_task = asyncio.create_task(backend.close())
+
+            try:
+                await asyncio.wait_for(
+                    wait_until_aiosqlite_worker_exit_is_delayed(
+                        worker_exit_delayed,
+                    ),
+                    timeout=1.0,
+                )
+                assert workers == [worker]
+                close_task.cancel()
+                await asyncio.sleep(0)
+                assert not close_task.done()
+
+                release_worker.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await close_task
+                assert not worker.is_alive()
+            finally:
+                release_worker.set()
+                if not close_task.done():
+                    with suppress(asyncio.CancelledError):
+                        await close_task
+                worker.join(timeout=1.0)
+
+        assert not worker.is_alive()
+
+    @pytest.mark.asyncio
+    async def test_close_fails_if_aiosqlite_worker_misses_shutdown_deadline(
+        self, tmp_path,
+    ):
+        """A worker that cannot exit must fail close within its bounded wait."""
+        release_worker = threading.Event()
+        worker_exit_delayed = threading.Event()
+        with delay_aiosqlite_worker_exit(
+            release_worker, worker_exit_delayed,
+        ) as workers, patch(
+            "kestrel_sovereign.storage.db.sqlite."
+            "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
+            0.01,
+        ):
+            backend = SQLiteBackend(str(tmp_path / "stuck-worker.db"))
+            await backend.connect()
+            connection = backend._connection
+            assert connection is not None
+            worker = aiosqlite_worker(connection)
+            try:
+                with pytest.raises(ConnectionError, match="worker did not terminate"):
+                    await backend.close()
+                assert not backend.is_connected
+                assert worker.is_alive()
+                assert workers == [worker]
+            finally:
+                release_worker.set()
+                worker.join(timeout=1.0)
+
+        assert not worker.is_alive()
+
+    @pytest.mark.asyncio
+    async def test_backup_waits_for_destination_worker_exit(self, tmp_path):
+        """A backup is not complete until its owned destination worker exits."""
+        backend = SQLiteBackend(str(tmp_path / "source.db"))
+        await backend.connect()
+        release_worker = threading.Event()
+        worker_exit_delayed = threading.Event()
+
+        with delay_aiosqlite_worker_exit(release_worker, worker_exit_delayed) as workers:
+            backup_task = asyncio.create_task(backend.backup_to(str(tmp_path / "backup.db")))
+            try:
+                await asyncio.wait_for(
+                    wait_until_aiosqlite_worker_exit_is_delayed(worker_exit_delayed), timeout=1.0,
+                )
+                assert len(workers) == 1
+                worker = workers[0]
+                assert not backup_task.done()
+
+                release_worker.set()
+                await backup_task
+                assert not worker.is_alive()
+            finally:
+                release_worker.set()
+                if not backup_task.done():
+                    await backup_task
+                for worker in workers:
+                    worker.join(timeout=1.0)
+                await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_snapshot_read_waits_for_one_shot_worker_exit(self, tmp_path):
+        """A sibling read waits for its snapshot connection worker to exit."""
+        backend = SQLiteBackend(str(tmp_path / "snapshot.db"))
+        await backend.connect()
+        await backend.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        release_worker = threading.Event()
+        worker_exit_delayed = threading.Event()
+
+        try:
+            async with backend.transaction():
+                with delay_aiosqlite_worker_exit(
+                    release_worker, worker_exit_delayed,
+                ) as workers:
+                    read_task = asyncio.create_task(backend.fetch_all("SELECT id FROM t"))
+                    try:
+                        await asyncio.wait_for(
+                            wait_until_aiosqlite_worker_exit_is_delayed(worker_exit_delayed),
+                            timeout=1.0,
+                        )
+                        assert len(workers) == 1
+                        worker = workers[0]
+                        assert not read_task.done()
+
+                        release_worker.set()
+                        assert await read_task == []
+                        assert not worker.is_alive()
+                    finally:
+                        release_worker.set()
+                        if not read_task.done():
+                            await read_task
+                        for worker in workers:
+                            worker.join(timeout=1.0)
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_snapshot_setup_failure_waits_for_one_shot_worker_exit(self, tmp_path):
+        """A failed snapshot setup closes and waits for its owned worker."""
+        backend = SQLiteBackend(str(tmp_path / "snapshot-setup-failure.db"))
+        await backend.connect()
+        release_worker = threading.Event()
+        worker_exit_delayed = threading.Event()
+
+        try:
+            with delay_aiosqlite_worker_exit(
+                release_worker, worker_exit_delayed,
+            ) as workers, patch.object(
+                aiosqlite.Connection,
+                "execute",
+                AsyncMock(side_effect=RuntimeError("snapshot setup failed")),
+            ):
+                open_task = asyncio.create_task(backend._open_snapshot_read_connection())
+                try:
+                    await asyncio.wait_for(
+                        wait_until_aiosqlite_worker_exit_is_delayed(worker_exit_delayed),
+                        timeout=1.0,
+                    )
+                    assert len(workers) == 1
+                    worker = workers[0]
+                    assert not open_task.done()
+
+                    release_worker.set()
+                    with pytest.raises(RuntimeError, match="snapshot setup failed"):
+                        await open_task
+                    assert not worker.is_alive()
+                finally:
+                    release_worker.set()
+                    if not open_task.done():
+                        with suppress(RuntimeError):
+                            await open_task
+                    for worker in workers:
+                        worker.join(timeout=1.0)
+        finally:
+            await backend.close()
+
 
 class TestAsyncDatabase:
     """Test the AsyncDatabase facade."""
+
+    @pytest.mark.asyncio
+    async def test_cancelled_cached_sqla_disposal_still_closes_primary_worker(
+        self, tmp_path,
+    ):
+        """The public close lifecycle cannot skip SQLite after pre-close cancellation."""
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.storage.sqla import make_session_factory
+
+        release_worker = threading.Event()
+        worker_exit_delayed = threading.Event()
+        allow_factory_disposal = asyncio.Event()
+        with delay_aiosqlite_worker_exit(
+            release_worker, worker_exit_delayed,
+        ) as workers:
+            db = await AsyncDatabase.sqlite(str(tmp_path / "cached-factory.db"))
+            connection = db.backend._connection
+            assert connection is not None
+            worker = aiosqlite_worker(connection)
+
+            factory = make_session_factory(db)
+            factory_close = factory.close
+            factory_disposal_started = asyncio.Event()
+
+            async def delayed_factory_close():
+                factory_disposal_started.set()
+                try:
+                    await allow_factory_disposal.wait()
+                finally:
+                    await factory_close()
+
+            factory.close = delayed_factory_close
+            close_task = asyncio.create_task(db.close())
+
+            try:
+                await asyncio.wait_for(factory_disposal_started.wait(), timeout=1.0)
+                close_task.cancel()
+                await asyncio.wait_for(
+                    wait_until_aiosqlite_worker_exit_is_delayed(
+                        worker_exit_delayed,
+                    ),
+                    timeout=1.0,
+                )
+                assert workers == [worker]
+                assert not close_task.done()
+
+                release_worker.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await close_task
+                assert not worker.is_alive()
+            finally:
+                allow_factory_disposal.set()
+                release_worker.set()
+                if not close_task.done():
+                    with suppress(asyncio.CancelledError):
+                        await close_task
+                worker.join(timeout=1.0)
+
+        assert not worker.is_alive()
+
+    @pytest.mark.asyncio
+    async def test_factory_close_timeout_fails_database_close_after_primary_attempt(
+        self, tmp_path,
+    ):
+        """A timed-out cached factory cannot make ``AsyncDatabase.close`` lie.
+
+        The factory uses a real file-backed SQLAlchemy/aiosqlite connection.
+        Its worker is held after the close sentinel so the factory's bounded
+        drain raises, while the primary backend still receives its own close
+        chance before that failure reaches the caller.
+        """
+        from sqlalchemy import text
+
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.storage.sqla import make_session_factory
+
+        db = await AsyncDatabase.sqlite(str(tmp_path / "factory-timeout.db"))
+        primary_connection = db.backend._connection
+        assert primary_connection is not None
+        primary_worker = aiosqlite_worker(primary_connection)
+        release_worker = threading.Event()
+        worker_exit_delayed = threading.Event()
+        factory_worker = None
+
+        try:
+            with delay_aiosqlite_worker_exit(
+                release_worker,
+                worker_exit_delayed,
+                should_delay=lambda candidate: candidate is factory_worker,
+            ) as workers, patch(
+                "kestrel_sovereign.storage.db.sqlite."
+                "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
+                0.01,
+            ):
+                factory = make_session_factory(db)
+                async with factory.read_session() as session:
+                    await session.execute(text("SELECT 1"))
+                factory_worker = aiosqlite_worker(factory._sqlite_connections[0])
+
+                with pytest.raises(ConnectionError, match="worker did not terminate"):
+                    await db.close()
+
+                # The factory timeout is observable, but only after the
+                # primary backend close was attempted and its worker exited.
+                assert not db.backend.is_connected
+                assert not primary_worker.is_alive()
+                assert factory_worker.is_alive()
+                assert workers == [factory_worker]
+        finally:
+            release_worker.set()
+            if factory_worker is not None:
+                factory_worker.join(timeout=1.0)
+            primary_worker.join(timeout=1.0)
+
+        assert factory_worker is not None and not factory_worker.is_alive()
+        assert not primary_worker.is_alive()
+
+    @pytest.mark.asyncio
+    async def test_factory_dispose_error_preserves_cleanup_timeout_for_checked_out_worker(
+        self, tmp_path,
+    ):
+        """A pre-disposal error cannot strand or hide a checked-out worker error."""
+        from sqlalchemy import text
+
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.storage.sqla import make_session_factory
+
+        db = await AsyncDatabase.sqlite(str(tmp_path / "factory-error.db"))
+        primary_connection = db.backend._connection
+        assert primary_connection is not None
+        primary_worker = aiosqlite_worker(primary_connection)
+        release_worker = threading.Event()
+        worker_exit_delayed = threading.Event()
+        factory_worker = None
+        close_task = None
+        session = None
+
+        try:
+            with delay_aiosqlite_worker_exit(
+                release_worker,
+                worker_exit_delayed,
+                should_delay=lambda candidate: candidate is factory_worker,
+            ) as workers, patch(
+                "kestrel_sovereign.storage.db.sqlite."
+                "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
+                0.01,
+            ):
+                factory = make_session_factory(db)
+                # Keep the SQLAlchemy connection checked out.  Engine disposal
+                # intentionally leaves this connection alone, so this drives
+                # the fallback that explicitly closes tracked raw drivers.
+                session = factory._async_session()
+                await session.execute(text("SELECT 1"))
+                factory_worker = aiosqlite_worker(factory._sqlite_connections[0])
+
+                async def fail_before_dispose(_engine, close=True):
+                    raise RuntimeError("injected factory dispose error")
+
+                with patch.object(
+                    type(factory.engine), "dispose", fail_before_dispose,
+                ):
+                    close_task = asyncio.create_task(db.close())
+
+                    await asyncio.wait_for(
+                        wait_until_aiosqlite_worker_exit_is_delayed(
+                            worker_exit_delayed,
+                        ),
+                        timeout=1.0,
+                    )
+                    assert workers == [factory_worker]
+                    assert factory_worker.is_alive()
+                    # The fallback sends the close sentinel to the checked-out
+                    # driver.  Its bounded drain fails while that worker is
+                    # deliberately held, but preserves the original disposal
+                    # failure as context instead of hiding either error.
+                    with pytest.raises(
+                        ConnectionError, match="worker did not terminate",
+                    ) as close_error:
+                        await close_task
+                    assert isinstance(close_error.value.__cause__, RuntimeError)
+                    assert "injected factory dispose error" in str(
+                        close_error.value.__cause__
+                    )
+
+                    assert not db.backend.is_connected
+                    assert factory_worker.is_alive()
+                    assert not primary_worker.is_alive()
+        finally:
+            release_worker.set()
+            if close_task is not None and not close_task.done():
+                with suppress(ConnectionError):
+                    await close_task
+            if session is not None:
+                with suppress(Exception):
+                    await session.close()
+            if db.backend.is_connected:
+                await db.close()
+            if factory_worker is not None:
+                factory_worker.join(timeout=1.0)
+            primary_worker.join(timeout=1.0)
+
+        assert factory_worker is not None and not factory_worker.is_alive()
+        assert not primary_worker.is_alive()
+
+    @pytest.mark.asyncio
+    async def test_async_storage_reinitializes_after_factory_close_failure(
+        self, tmp_path,
+    ):
+        """A propagated factory-close failure cannot leave the facade initialized."""
+        from sqlalchemy import text
+
+        from kestrel_sovereign.storage.async_storage import AsyncStorage
+        from kestrel_sovereign.storage.sqla import make_session_factory
+
+        storage = AsyncStorage(str(tmp_path / "storage-reinitialize.db"))
+        await storage.initialize()
+        first_db = storage.db
+        assert first_db is not None
+        factory = make_session_factory(first_db)
+        async with factory.read_session() as session:
+            await session.execute(text("SELECT 1"))
+        factory_worker = aiosqlite_worker(factory._sqlite_connections[0])
+
+        async def fail_before_dispose(_engine, close=True):
+            raise RuntimeError("injected factory dispose error")
+
+        try:
+            with patch.object(type(factory.engine), "dispose", fail_before_dispose):
+                with pytest.raises(RuntimeError, match="injected factory dispose error"):
+                    await storage.close()
+
+            assert not storage._initialized
+            assert not first_db._initialized
+            assert not storage._backend.is_connected
+            assert not factory_worker.is_alive()
+
+            await storage.initialize()
+            assert storage._initialized
+            assert storage.db is not first_db
+            assert await storage.db.fetchval("SELECT 1") == 1
+        finally:
+            if storage._initialized:
+                await storage.close()
+            factory_worker.join(timeout=1.0)
+
+        assert not factory_worker.is_alive()
+
+    @pytest.mark.asyncio
+    async def test_sqla_factory_close_waits_for_its_aiosqlite_worker(self, tmp_path):
+        """A cached file-backed SQLAlchemy engine owns its driver's last turn."""
+        from sqlalchemy import text
+
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.storage.sqla import make_session_factory
+
+        db = await AsyncDatabase.sqlite(str(tmp_path / "sqla-worker.db"))
+        release_worker = threading.Event()
+        worker_exit_delayed = threading.Event()
+        worker = None
+
+        try:
+            with delay_aiosqlite_worker_exit(
+                release_worker,
+                worker_exit_delayed,
+                should_delay=lambda candidate: candidate is worker,
+            ) as workers:
+                factory = make_session_factory(db)
+                async with factory.read_session() as session:
+                    await session.execute(text("SELECT 1"))
+
+                connection = factory._sqlite_connections[0]
+                worker = aiosqlite_worker(connection)
+                close_task = asyncio.create_task(factory.close())
+                try:
+                    await asyncio.wait_for(
+                        wait_until_aiosqlite_worker_exit_is_delayed(
+                            worker_exit_delayed,
+                        ),
+                        timeout=1.0,
+                    )
+                    assert workers == [worker]
+                    assert not close_task.done()
+
+                    release_worker.set()
+                    await close_task
+                    assert not worker.is_alive()
+                finally:
+                    release_worker.set()
+                    if not close_task.done():
+                        await close_task
+                    worker.join(timeout=1.0)
+        finally:
+            await db.close()
+
+        assert worker is not None and not worker.is_alive()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_sqla_factory_close_waits_for_its_worker(self, tmp_path):
+        """Cancellation reaches the caller only after the SQLAlchemy worker exits."""
+        from sqlalchemy import text
+
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.storage.sqla import make_session_factory
+
+        db = await AsyncDatabase.sqlite(str(tmp_path / "sqla-cancelled-worker.db"))
+        release_worker = threading.Event()
+        worker_exit_delayed = threading.Event()
+        worker = None
+
+        try:
+            with delay_aiosqlite_worker_exit(
+                release_worker,
+                worker_exit_delayed,
+                should_delay=lambda candidate: candidate is worker,
+            ) as workers:
+                factory = make_session_factory(db)
+                async with factory.read_session() as session:
+                    await session.execute(text("SELECT 1"))
+
+                connection = factory._sqlite_connections[0]
+                worker = aiosqlite_worker(connection)
+                close_task = asyncio.create_task(factory.close())
+                try:
+                    await asyncio.wait_for(
+                        wait_until_aiosqlite_worker_exit_is_delayed(
+                            worker_exit_delayed,
+                        ),
+                        timeout=1.0,
+                    )
+                    assert workers == [worker]
+                    close_task.cancel()
+                    await asyncio.sleep(0)
+                    assert not close_task.done()
+
+                    release_worker.set()
+                    with pytest.raises(asyncio.CancelledError):
+                        await close_task
+                    assert not worker.is_alive()
+                finally:
+                    release_worker.set()
+                    if not close_task.done():
+                        with suppress(asyncio.CancelledError):
+                            await close_task
+                    worker.join(timeout=1.0)
+        finally:
+            await db.close()
+
+        assert worker is not None and not worker.is_alive()
     
     @pytest.mark.asyncio
     async def test_sqlite_factory(self, tmp_path):

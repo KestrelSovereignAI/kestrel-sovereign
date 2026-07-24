@@ -51,6 +51,9 @@ class _FakeStreamResponse:
         self._lines = lines
         self.status_code = status_code
 
+    def raise_for_status(self):
+        return None
+
     async def __aenter__(self):
         return self
 
@@ -76,6 +79,19 @@ class _FakeAsyncClient:
 
     async def __aexit__(self, *exc):
         return False
+
+    async def get(self, url: str, headers: Optional[dict] = None, timeout=None):
+        """Directory lookup performed before every scoped subscription."""
+        response = MagicMock(status_code=200)
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "agents": [
+                {"id": "did:test:sender", "name": "Sender", "routing_name": "Sender"},
+                {"id": "did:test:meridian", "name": "Meridian", "routing_name": "Meridian"},
+                {"id": "did:test:legacy", "name": "LegacyAgent", "routing_name": "LegacyAgent"},
+            ],
+        }
+        return response
 
     def stream(self, method: str, url: str, headers: Optional[dict] = None):
         self.calls.append((method, url))
@@ -398,6 +414,55 @@ class TestSupervisor404HardCut:
             "Failed-state reply must cite #1444 so the operator can "
             "find the upgrade ticket."
         )
+
+
+class TestSupervisorBackoff:
+    @pytest.mark.asyncio
+    async def test_subscription_transport_failures_keep_exponential_backoff(
+        self, monkeypatch,
+    ):
+        """Resolving a peer does not prove its subscription path is healthy."""
+        terminal = json.dumps({
+            "id": "t-backoff",
+            "status": {
+                "state": "completed",
+                "message": {"parts": [{"type": "text", "text": "done"}]},
+            },
+        })
+        feature, _agent, enqueue, fake_client = _make_feature(
+            sse_responses=[
+                httpx.RequestError("subscription host unavailable"),
+                httpx.RequestError("subscription host unavailable"),
+                httpx.RequestError("subscription host unavailable"),
+                httpx.RequestError("subscription host unavailable"),
+                _FakeStreamResponse([
+                    "event: status",
+                    f"data: {terminal}",
+                    "",
+                ]),
+            ],
+            monkeypatch=monkeypatch,
+        )
+        delays: List[float] = []
+
+        async def _record_sleep(seconds: float):
+            delays.append(seconds)
+
+        monkeypatch.setattr(asyncio, "sleep", _record_sleep)
+
+        await feature._supervise_a2a_question(
+            task_id="t-backoff",
+            recipient="Meridian",
+            original_question="?",
+            sess_id="s-backoff",
+            deadline_utc=datetime.now(timezone.utc) + timedelta(minutes=5),
+            causation_chain=None,
+        )
+
+        assert delays == [1.0, 2.0, 5.0, 10.0]
+        assert len(fake_client.calls) == 5
+        enqueue.assert_awaited_once()
+        assert enqueue.await_args.args[0].payload["state"] == "completed"
 
 
 class TestSupervisorDeadlineAccurateExpiry:

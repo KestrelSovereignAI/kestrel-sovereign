@@ -1,252 +1,295 @@
-# Kestrel Quickstart — Sovereign Agent in 30 Minutes
+# Kestrel Quickstart — a Sovereign Agent in 30 Minutes
 
-By the end of this guide you will have a running Kestrel agent with all three sovereignty pillars active:
-- A cryptographic DID identity (yours, portable, no platform owns it)
-- A persistent memory store that survives across sessions — conversations and file blobs encrypt at rest when you set `KESTREL_DATA_KEY` (see [Encryption at rest](#encryption-at-rest))
-- A constitutional governance layer enforced above the LLM
+This guide takes a fresh source checkout to one running agent named `Kestrel`.
+The setup creates a cryptographic identity, privacy-aware local storage,
+constitutional governance, and an LLM route. What Kestrel retains depends on
+the active privacy mode, and application-layer encryption does not cover every
+database column; the exact boundaries are summarized below.
 
-**Time:** ~30 minutes (most of that is downloading Ollama + the model)
-**Prerequisites:** Python 3.11–3.13, internet connection for initial setup
+**Prerequisites:** Python 3.11–3.14, an internet connection for installation,
+and either Ollama or a supported cloud-provider API key.
 
----
+## Step 1 — Install uv
 
-## Step 1 — Install uv (fast Python package manager)
+Kestrel uses [uv](https://docs.astral.sh/uv/) for Python and dependency
+management. Skip this step if `uv` is already installed.
 
-Kestrel uses [uv](https://github.com/astral-sh/uv) for dependency management. If you already have it, skip this step.
+macOS or Linux:
 
-**macOS / Linux:**
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-**Windows (PowerShell):**
+Windows PowerShell:
+
 ```powershell
 powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-Restart your terminal after installing.
-
----
+Restart the terminal if the installer asks you to update `PATH`.
 
 ## Step 2 — Clone and install Kestrel
 
 ```bash
 git clone https://github.com/KestrelSovereignAI/kestrel-sovereign.git
 cd kestrel-sovereign
-uv sync   # creates .venv and installs all dependencies
+uv sync
 ```
 
-> **Updating later:** this `uv sync` is only for the first install. To refresh Kestrel
-> afterward, use **`kestrel update`** — plain `uv sync` prunes installed feature packages
-> (`kestrel-feature-*`), while `kestrel update` pulls, installs, and restores them together.
-> Details in the [README update guide](README.md#pulling-in-upstream-changes-kestrel-update).
+`uv sync` creates `.venv` and installs the source checkout. It is the
+first-install command; use `kestrel update` for later refreshes so separately
+installed feature packages are reconciled too. See the
+[update guide](README.md#pulling-in-upstream-changes-kestrel-update).
 
----
+## Step 3 — Make an LLM available
 
-## Step 3 — Install Ollama (local LLM — no API key needed)
-
-Download and install from [ollama.ai](https://ollama.ai), then:
+The simplest key-free path is Ollama. Install it from
+[ollama.ai](https://ollama.ai), ensure the Ollama app or `ollama serve` is
+running, and pull the same model tag used by the main README:
 
 ```bash
-ollama serve                    # start Ollama (keep this terminal open)
-ollama pull llama3.2            # installs llama3.2:latest used by the default config
-ollama pull nomic-embed-text    # embedding model for RAG / semantic memory (#657)
+ollama pull llama3.2:3b
 ```
 
-> **Want OpenAI or Anthropic instead?** Pick it in the wizard at Step 4. You can also re-run `kestrel setup llm` later.
-
----
-
-## Step 4 — Run the setup wizard
+Semantic-memory embeddings are optional. To make the usual local embedding
+model available too:
 
 ```bash
-uv run kestrel setup
+ollama pull nomic-embed-text
 ```
 
-The wizard:
-1. Generates `.env` with a fresh `KESTREL_DATA_KEY` (Fernet) that encrypts conversation history and file blobs at rest (see [Encryption at rest](#encryption-at-rest))
-2. Writes `[llm]` into `kestrel.toml` with the providers you choose
-3. Runs the **Inception Service**: generates a secp256k1 keypair, derives a cryptographic DID, creates the SQLite store at `./agent_data/<name>/`, anchors the Kestrel Constitution as the agent's first memory, and runs a genesis integrity audit
-4. Registers the new agent in `multi_agent.toml` and prints a readiness report
+If you prefer a cloud route, export one or more supported credentials before
+Step 4: `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or
+`GOOGLE_API_KEY`. Quickstart detects non-empty cloud credentials and a reachable
+Ollama service, then writes their ordered routes to `kestrel.toml`. Models stay
+on `auto`; Kestrel discovers an available model using the route's selection
+hints. If none are detected, setup still writes an Ollama route so the local
+configuration is complete; Ollama must be running with a suitable model before
+the agent can answer.
 
-Skip the prompts and accept Ollama defaults:
+## Step 4 — Run non-interactive setup
 
 ```bash
 uv run kestrel setup --quickstart
 ```
 
-Diagnose without making any changes:
+On a fresh checkout, quickstart:
+
+1. Generates `KESTREL_DATA_KEY` and `KESTREL_API_KEY` in the gitignored
+   `.env` file.
+2. Writes the detected LLM routes to `kestrel.toml`.
+3. Creates the first agent as `Kestrel` under `agent_data/Kestrel/`, including
+   its DID, database, identity keys, constitution, and genesis audit state.
+4. Registers `Kestrel` for autostart in `multi_agent.toml`. The first agent is
+   assigned port `8801`; if that port is already allocated, setup uses the next
+   available agent port and reports it.
+
+Setup is idempotent. Keep `.env` private and backed up: losing or changing
+`KESTREL_DATA_KEY` can make encrypted data unreadable, and
+`KESTREL_API_KEY` authenticates clients to the server.
+
+## Step 5 — Check readiness
 
 ```bash
 uv run kestrel doctor
 ```
 
-You'll see output like:
-```
-Created agent 'Kestrel' with DID did:pkh:eip155:1:0x8955b8...
-Registered 'Kestrel' in multi_agent.toml on port 8801 (autostart)
-✅ Ready. Start with: kestrel start
-```
+Doctor is read-only. It validates persisted configuration and local integrity;
+it deliberately does not contact LLM providers. Resolve any reported blocker
+before starting the agent. For the Ollama path, separately make sure Ollama is
+reachable and `llama3.2:3b` is installed.
 
-> **That DID is yours.** It's cryptographically unique, not stored on any platform, and travels with the `kestrel_prime.db` file wherever you take it.
+## Step 6 — Start the multi-agent host
 
-> Re-running the wizard is safe: every step is idempotent, and any file change is preceded by a timestamped backup (`.env.backup-YYYYMMDD-HHMMSS`). `KESTREL_DATA_KEY` is *never* regenerated once set — that would brick existing encrypted data.
-
----
-
-## Step 6 — Start your agent
+The recommended first run starts the host because quickstart registered
+`Kestrel` with autostart enabled:
 
 ```bash
-uv run kestrel start MyAgent
+uv run kestrel start
 ```
 
-Your agent is now running at `http://localhost:8888`.
+With the default fresh configuration, the CLI prints:
 
-Open it in a browser to access the **Sovereign Console** — a full web UI with Chat, Identity, Constitution, Memories, Security, and more.
+```text
+URL:      http://localhost:8888
+MultiAgent ready: http://localhost:8888
+```
 
-Or use the CLI chat interface:
+Open <http://localhost:8888> for the Sovereign Console. In this mode, port
+`8888` belongs to the in-process host. The configured agent port (`8801` for
+the first fresh agent) is not a second listener; it is used when that agent is
+started by name instead.
+
+The host's public readiness URL is top-level, while agent APIs are namespaced:
+
+```text
+Console and public health: http://localhost:8888
+Kestrel API base:          http://localhost:8888/api/agents/Kestrel
+```
+
+## Step 7 — Verify health and call the API
+
+For the following macOS/Linux examples, set the two non-secret URLs and load
+the generated keys into the current shell without printing them:
 
 ```bash
-uv run kestrel shell MyAgent
+export KESTREL_URL="http://localhost:8888"
+export KESTREL_AGENT_API="$KESTREL_URL/api/agents/Kestrel"
+set -a
+. ./.env
+set +a
 ```
 
-Type anything to start:
-
-```
-You: Hello — who are you?
-Agent: I'm MyAgent, a sovereign AI agent. I have a persistent memory, a cryptographic
-       identity, and I operate under a constitutional governance framework...
-```
-
-Stop and restart anytime:
+The minimal readiness probe is intentionally public:
 
 ```bash
-uv run kestrel stop MyAgent
-uv run kestrel start MyAgent
+curl -sS "$KESTREL_URL/health"
+# {"status":"ok","agent_initialized":true}
 ```
 
-Your agent remembers every previous conversation. It always will, until you tell it not to.
-
----
-
-## Step 7 — Explore what your agent knows about itself
-
-From the Sovereign Console at `http://localhost:8888`:
-
-| Tab | What you'll find |
-|-----|-----------------|
-| **Identity** | DID, cryptographic keys, agent metadata |
-| **Constitution** | The governing rules — what the agent can and cannot do |
-| **Memories** | Knowledge graph, conversation history, stored documents |
-| **Security** | Permissions, audit log, session management |
-
-Check agent status from the CLI:
+Detailed health is for operators and requires authentication:
 
 ```bash
-uv run kestrel status
+curl -sS \
+  -H "X-API-Key: $KESTREL_API_KEY" \
+  "$KESTREL_URL/health/detailed"
 ```
 
----
+OpenAI-compatible endpoints require the same authentication. In host mode,
+use the agent-prefixed API base:
 
-## Privacy Modes
+```bash
+curl -sS \
+  -H "X-API-Key: $KESTREL_API_KEY" \
+  "$KESTREL_AGENT_API/v1/models"
 
-Kestrel has five privacy levels that control what your agent stores. The default is `NORMAL` (full persistence). Privacy modes govern *what* is stored, not *how* it is encrypted — see [Encryption at rest](#encryption-at-rest) for the at-rest coverage matrix.
+curl -sS \
+  -H "X-API-Key: $KESTREL_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"kestrel-local","messages":[{"role":"user","content":"Hello — who are you?"}]}' \
+  "$KESTREL_AGENT_API/v1/chat/completions"
+```
 
-| Mode | What it means |
-|------|--------------|
-| `NORMAL` (default) | Full memory, full history; conversations and file blobs encrypt at rest when `KESTREL_DATA_KEY` is set |
-| `ANONYMOUS` | Stored but stripped of identifying information |
-| `ISOLATED` | Remembers within this session only — not across sessions |
-| `EPHEMERAL` | Nothing stored — true off-the-record mode |
-| `PUBLIC` | Stored with sharing enabled |
+`Authorization: Bearer $KESTREL_API_KEY` is also accepted. Never put the
+generated key in a URL, committed file, screenshot, or command example with a
+literal value.
 
-See [docs/architecture/security/PRIVACY_MODES.md](docs/architecture/security/PRIVACY_MODES.md) for the full reference.
+Stop the host when you are finished:
 
----
+```bash
+uv run kestrel stop
+```
 
-## Encryption at rest
+## Alternative — start only the named agent
 
-`KESTREL_DATA_KEY` is **application-layer** encryption, not whole-database encryption. When it is set, Kestrel encrypts conversation history, file blobs, identity private keys, and agent-resource bodies. Saved-item and RAG document-chunk bodies are plaintext columns with no at-rest encryption today — application-layer coverage is tracked in [#2677](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2677). Whole-DB SQLCipher is **not wired** in this release, so `KESTREL_DB_KEY` does not encrypt anything today.
+Use this form instead of the host when you want one standalone agent process:
 
-| Data at rest | Encrypted at rest today? |
+```bash
+uv run kestrel start Kestrel
+```
+
+The CLI prints `Starting Kestrel on :<port>...`; use that reported port. In a
+fresh quickstart it is normally `8801`, but `multi_agent.toml` is authoritative
+if another allocation was needed. The console, `/health`, `/health/detailed`,
+and `/v1/...` endpoints are all top-level on the named agent's URL—there is no
+`/api/agents/Kestrel` prefix in standalone mode.
+
+Do not run the host and a standalone process for the same agent at once. If the
+host is already running, stop it first with `uv run kestrel stop`.
+
+## Optional — create an additional agent
+
+`Kestrel` already exists after quickstart. Creating another agent is optional:
+
+```bash
+uv run kestrel create MyAgent
+uv run kestrel list
+```
+
+`create` prints the new agent's assigned port and registers it for autostart.
+If the host is running, restart it to load the new agent:
+
+```bash
+uv run kestrel restart
+```
+
+The new host API is namespaced as
+`http://localhost:8888/api/agents/MyAgent`. Alternatively, stop the host and
+run `uv run kestrel start MyAgent`, then use the standalone port printed by the
+CLI.
+
+## Privacy and memory boundaries
+
+`NORMAL` is the default. It permits persistent storage; it does not promise
+that every interaction is remembered forever. Retention depends on the active
+mode and on the storage path used by the feature handling the data.
+
+| Mode | Storage and processing contract |
 |---|---|
-| Conversation-history rows | Yes, when `KESTREL_DATA_KEY` is set (Fernet, app-layer) |
-| Stored file blobs | Yes, when `KESTREL_DATA_KEY` is set (Fernet, app-layer) |
-| Agent identity private keys | Yes, when `KESTREL_DATA_KEY` is set (`SecureKeyStorage`, AES-256-GCM) |
-| Agent-resource bodies (e.g. SOUL) | Yes, when `KESTREL_DATA_KEY` is set (`AgentResourceStore`, Fernet) |
-| Saved-item bodies (`saved_items.content`) | No — plaintext column; app-layer coverage tracked in [#2677](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2677) |
-| RAG document-chunk bodies (`document_chunks.content`) | No — plaintext column; same gap ([#2677](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2677)) |
-| Embeddings (vectors) | No — numeric vectors, not reversible ciphertext |
-| Remote backups (IPFS/Filecoin export) | Yes, by default — derived from `KESTREL_DATA_KEY` (export fails if unset) |
-| Local export (`storage_tier="local"`) | No — written unencrypted |
-| Whole database file (SQLCipher) | No — not wired; `KESTREL_DB_KEY` is not read by the runtime |
+| `NORMAL` | Full persistent storage; cloud processing allowed; private sharing |
+| `ANONYMOUS` | PII-redacted persistent storage; local processing; private sharing |
+| `DEIDENTIFIED` | Deidentified persistent storage; trusted processing; research sharing; audit required |
+| `ISOLATED` | Temporary session storage only; local processing; private sharing |
+| `EPHEMERAL` | No storage; local processing; private sharing |
+| `PUBLIC` | Full persistent storage; cloud processing allowed; public sharing |
 
-Directory and file permissions (`0700` / `0600`) are access control, not encryption. See the [README encryption section](README.md#-encryption-at-rest) for the full runbook.
+See the [privacy modes reference](docs/architecture/security/PRIVACY_MODES.md)
+for enforcement details and mode transitions.
 
----
+## Encryption boundaries
 
-## Optional: Connect an external client
+Quickstart generates `KESTREL_DATA_KEY`, which enables application-layer
+encryption for conversation-history rows, stored file blobs, identity private
+keys, and agent-resource bodies such as the SOUL. It is not whole-database
+encryption.
 
-Kestrel exposes an OpenAI-compatible REST API at `/v1/chat/completions`. Connect any OpenAI-compatible tool — [Open WebUI](https://github.com/open-webui/open-webui), Cursor, etc. — by pointing it at `http://localhost:8888`.
+Saved-item bodies (`saved_items.content`) and RAG document-chunk bodies
+(`document_chunks.content`) remain plaintext columns today. Embeddings are
+unencrypted numeric vectors. SQLCipher is not wired, and setting
+`KESTREL_DB_KEY` does not encrypt the database. Directory permissions are
+access control, not encryption.
 
-Verify it's running:
-```bash
-curl http://localhost:8888/health
-# → {"status": "ok"}
-```
+See the [README encryption coverage matrix](README.md#-encryption-at-rest) for
+the current per-data-type contract.
 
----
+## What’s next
 
-## CLI reference
+Keep the 30-minute path small and use the focused runbooks for advanced
+operations:
 
-```bash
-uv run kestrel setup                          # run the setup wizard
-uv run kestrel setup --quickstart             # accept defaults; only prompt for missing secrets
-uv run kestrel setup --check                  # report readiness; no changes
-uv run kestrel setup llm                      # re-run only the LLM step
-uv run kestrel setup --reset                  # back up and regenerate .env + kestrel.toml
-uv run kestrel doctor                         # diagnose readiness
-uv run kestrel create MyAgent                 # create a new agent
-uv run kestrel create MyAgent --port 8899     # create with custom port
-uv run kestrel start MyAgent                  # start an agent
-uv run kestrel stop MyAgent                   # stop an agent
-uv run kestrel shell MyAgent                  # CLI chat
-uv run kestrel status                         # show all running agents
-uv run kestrel list                           # list available agents
-uv run kestrel config ./agent_data/MyAgent    # show agent config
-```
-
----
-
-## What's next
-
-| Guide | What it covers |
-|-------|---------------|
-| [docs/architecture/security/PRIVACY_MODES.md](docs/architecture/security/PRIVACY_MODES.md) | Privacy mode internals |
-| [docs/architecture/security/CRYPTOGRAPHIC_ANCHORING.md](docs/architecture/security/CRYPTOGRAPHIC_ANCHORING.md) | DID identity and integrity anchoring |
-| [docs/principles/KESTREL_CONSTITUTION.md](docs/principles/KESTREL_CONSTITUTION.md) | The default constitutional framework — and how to write your own |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | How to contribute to Kestrel |
-
----
+| Guide | Topic |
+|---|---|
+| [Identity export custody](docs/architecture/security/IDENTITY_EXPORT_CUSTODY.md) | Export permissions and fresh-target trust |
+| [Host runtime storage custody](docs/architecture/security/HOST_RUNTIME_STORAGE_CUSTODY.md) | Host-owned feature-state storage |
+| [Phoenix trace custody](docs/architecture/security/PHOENIX_TRACE_CUSTODY.md) | Optional tracing data and supervisor state |
+| [Cryptographic anchoring](docs/architecture/security/CRYPTOGRAPHIC_ANCHORING.md) | Integrity anchors and verification boundaries |
+| [Update guide](README.md#pulling-in-upstream-changes-kestrel-update) | Pull, install, feature reconciliation, and restart |
+| [Deployment runbook](docs/deployment/README.md) | Cloud Run build and deployment |
+| [Kestrel Constitution](docs/principles/KESTREL_CONSTITUTION.md) | Constitutional framework |
 
 ## Troubleshooting
 
-**`ollama: command not found`**
-Ollama isn't in your PATH after install. Restart your terminal or follow the [Ollama install guide](https://ollama.ai).
+**Doctor reports Ollama unavailable**
 
-**`No agent found`**
-You're pointing at a directory that hasn't been initialized yet. Run `kestrel create` first.
+Start the Ollama app or run `ollama serve` in another terminal, then confirm
+`ollama list` includes `llama3.2:3b`.
 
-**Ollama is slow on first response**
-The first response loads the model into memory — takes 10–30 seconds depending on hardware. Subsequent responses are fast.
+**`Agent 'Kestrel' not found`**
 
-**Windows: `Activate.ps1 cannot be loaded`**
-```powershell
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
-```
+Run `uv run kestrel list`. On a clean checkout, rerun
+`uv run kestrel setup --quickstart` to create and register `Kestrel`.
 
 **Port already in use**
-Edit `agent_data/MyAgent/kestrel.toml` and change the port, or pass `--port 8899` to `kestrel create`.
+
+Run `uv run kestrel status` and stop an existing Kestrel process. Host port
+configuration lives under `[host]` in `multi_agent.toml`; agent ports live in
+their `[agents.<name>]` entries. `kestrel start` does not accept a `--port`
+override.
+
+**The first response is slow**
+
+Ollama loads the model into memory on first use. Later responses are normally
+faster.
 
 ---
 

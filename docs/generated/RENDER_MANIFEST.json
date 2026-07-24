@@ -792,6 +792,18 @@
       "type": "Architecture Spec"
     },
     {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/core/SCOPED_PEER_DIRECTORY.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "active",
+      "title": "Scoped peer directories",
+      "type": "Architecture Note"
+    },
+    {
       "existing_code_refs": [
         "server.py"
       ],
@@ -4148,6 +4160,7 @@
     },
     {
       "existing_code_refs": [
+        "KESTREL_FEATURES.md",
         "kestrel_sovereign/cli_extension_example.py",
         "kestrel_sovereign/data/feature_registry.toml",
         "pyproject.toml",

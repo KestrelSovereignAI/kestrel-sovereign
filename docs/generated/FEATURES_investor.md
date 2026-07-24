@@ -18,6 +18,46 @@ model: anthropic/claude-sonnet-4-6
 regenerate: uv run python scripts/generate_feature_docs.py --audience investor
 ---
 
+<!-- BEGIN PROTECTED PACKAGE BOUNDARY CONTRACT -->
+## Package Ownership and Installation Boundaries
+
+These ownership statements are normative and must remain intact in every
+audience-specific derivative:
+
+<!-- NON_BUNDLED_SURFACE_ALIASES: voice; mcp; github integration|github app; wallet; observability; council; visual identity; legal feature; code editing|code edit; parametric self; whatsapp; runpod; vast.ai|vastai; gcp compute; elevenlabs; deepgram; kestrel-talon -->
+
+- **Bundled Feature lifecycle modules:** Feature subclasses discovered from
+  `kestrel_sovereign/features/` ship in the `kestrel-sovereign` distribution.
+  They need no separate package install. The generated inventory below is the
+  exact in-tree discovery snapshot.
+- **Bundled non-Feature components:** Some base-install runtime services, such
+  as `PrivacyAgent`, are shipped by `kestrel-sovereign` but are not Feature
+  lifecycle classes. The registry labels these `bundled-component` rather than
+  putting them in its `features` field.
+- **Not bundled — extracted Feature packages:** Voice, MCP, GitHub integration,
+  wallet, observability, reflection, council, visual identity, legal, code
+  editing, parametric self, and WhatsApp transport are separate install targets.
+  They register Feature subclasses through the `kestrel_sovereign.features`
+  entry-point group.
+- **Not bundled — provider packages:** ElevenLabs, Deepgram, OpenAI voice, xAI
+  voice/realtime, RunPod, Vast.ai, GCP Compute, and external storage backends
+  implement provider contracts. They use provider-specific entry-point groups;
+  installing one does not make that provider a Feature lifecycle class.
+- **Not bundled — standalone tool:** `kestrel-talon` is an independently
+  installed command-line issue processor. The in-tree `TalonCoordinatorFeature`
+  is only its bundled Kestrel control surface; the coordinator and the
+  standalone executable are separately named registry rows.
+
+The runtime catalog at `kestrel_sovereign/data/feature_registry.toml` encodes
+these distinctions in `boundary`. Its `package` field is always the owning
+distribution/install target for that row. The compatibility field `core` is
+`true` only for `bundled` and `bundled-component` rows. `features` contains
+Feature lifecycle class names only; provider implementations use
+`provider_classes` plus `entry_point_groups`, and standalone tools use
+`command`. Catalog status `available` means “known but not detected in this
+environment,” not a claim that an external distribution is publicly reachable.
+<!-- END PROTECTED PACKAGE BOUNDARY CONTRACT -->
+
 # Kestrel Sovereign: Platform Feature Overview
 
 > **Prepared for:** Investors & Business Stakeholders
@@ -27,7 +67,12 @@ regenerate: uv run python scripts/generate_feature_docs.py --audience investor
 
 ## Executive Summary
 
-Kestrel Sovereign is a full-stack, sovereign AI agent platform that combines a governance framework with no industry equivalent, vendor-independent LLM routing, and portable decentralized identity — giving users and enterprises genuine ownership of their AI rather than dependency on any single provider. The platform ships with enterprise-grade privacy controls from day one, a deeply extensible plugin architecture, and a documented surface spanning authentication, agent orchestration, voice, memory, security, observability, and more. With 42 independently discoverable capability modules in its current audited snapshot and adapters for every major LLM provider, Kestrel Sovereign is positioned as the infrastructure layer for AI deployments where trust, portability, and control are non-negotiable requirements.
+Kestrel Sovereign is a full-stack, sovereign AI agent platform that combines a governance framework with no industry equivalent, vendor-independent LLM routing, and portable decentralized identity — giving users and enterprises genuine ownership of their AI rather than dependency on any single provider. The base platform provides enterprise-grade privacy controls and a deeply extensible package architecture.
+
+Its current audited snapshot contains 37 bundled Feature lifecycle modules.
+
+Voice, observability, and other specialized surfaces remain separately installed
+extensions available through explicit Feature and provider contracts.
 
 ---
 
@@ -86,7 +131,9 @@ The platform includes layered memory systems — session memory, persistent memo
 
 ### Voice
 
-Native voice capabilities are integrated at the platform level, including text-to-speech, streaming text-to-speech, speech-to-text, and a full-duplex WebSocket voice chat channel. This is not a third-party integration shim — voice is a documented, maintained surface of the platform.
+Voice is delivered by an extracted Feature package. When installed, it supplies
+text-to-speech, speech-to-text, streaming, and realtime surfaces while cloud
+voice backends remain separate provider packages.
 
 ### Web Search and Tool Use
 
@@ -166,7 +213,11 @@ The LLM mandate system allows operators to route inference to local models (via 
 
 ### Cloud Compute Integrations
 
-The platform includes native integrations for GPU compute provisioning across multiple cloud environments, enabling deployments that require scalable inference infrastructure to manage that resource allocation through the same platform that manages agent behavior and governance.
+Separately installed provider packages supply GPU compute backends such as
+RunPod, Vast.ai, and GCP Compute.
+
+The in-tree deployment/compute contracts let operators select those backends
+without representing providers as Features.
 
 ### Standards-Compliant API Surface
 
@@ -182,25 +233,29 @@ Native webhook support, a Stripe crypto payment webhook endpoint, and a Rasa pro
 
 ### Extensible Platform Architecture
 
-Kestrel Sovereign's capability system is built around a discoverable feature module architecture. The platform's current audited snapshot includes 42 core capability modules, spanning governance, identity, memory, voice, security, compute, scheduling, web search, wallet management, observability, and more.
+Kestrel Sovereign's capability system is built around a discoverable Feature
+module architecture. The current audited snapshot includes 37 bundled Feature
+lifecycle modules spanning governance, identity, memory, security, compute,
+scheduling, web search, communication coordination, and operations.
 
 Beyond the core inventory, the platform supports installable feature packages — third-party or proprietary capability modules that are registered at runtime and extend the platform without modifying its core. This is the extensibility model that enterprise platform buyers require: a stable, governed core with a documented, safe extension surface.
 
 The features API allows administrators to discover, install, enable, disable, configure, and remove capability modules at runtime, without service interruption. Feature-level skill schemas are introspectable via the API, enabling client applications and integration tooling to adapt dynamically to the agent's current capability set.
 
-### Current Core Capability Modules
+### Current Bundled Capability Modules
 
-The 42 modules in the current audited snapshot span the following capability domains:
+The 37 bundled Feature lifecycle modules in the current audited snapshot span
+the following capability domains:
 
 | Domain | Capabilities |
 |---|---|
-| **Governance & Identity** | Constitutional governance, consent management, audit anchoring, identity, keys, visual identity |
-| **Memory & Context** | Session memory, persistent memory, strategic memory, memory agency, context management, reflection |
-| **Communication** | Voice, channels, delivery, webhooks, peers, bridge, mesh |
-| **Compute & Deployment** | General compute, GCP compute, RunPod, Vast.ai, deployment management |
-| **Productivity & Tools** | Tasks, scheduler, code editing, web search, file saving, GitHub |
-| **Operations** | Observability, security, heartbeat, wellness, state of mind |
-| **Platform** | Bootstrap, sovereignty, spawn, model/LLM management, wallet, response audit, Talon coordination |
+| **Governance & Identity** | Constitutional governance, consent management, audit anchoring, identity, keys, response audit |
+| **Memory & Context** | Persistent memory, strategic memory, memory agency, context management |
+| **Communication** | Generic channels, delivery, webhooks, peers, bridge |
+| **Compute & Deployment** | Guarded compute, computer use, deployment management |
+| **Productivity & Tools** | Attachments, tasks, todos, scheduler, web search, file saving, CLI and skills |
+| **Operations** | Security, health, wellness, state of mind, restart coordination |
+| **Platform** | Bootstrap, sovereignty, spawn, model/LLM management, wait coordination, the Talon control surface |
 
 Third-party and enterprise-proprietary modules can be added to this inventory without modifying the core platform.
 
@@ -257,7 +312,7 @@ inherent browser constraints — are handled explicitly.
 | **Vendor Independence** | Multi-LLM routing with adapters for all major providers; no platform lock-in |
 | **Identity Portability** | DID-based portable identity; users and enterprises own their AI across providers |
 | **Privacy** | Five structured privacy presets enforced at the platform level from day one |
-| **Extensibility** | 42-module core with runtime-installable third-party capability packages |
+| **Extensibility** | 37 bundled Feature modules plus explicitly classified Feature, provider, and standalone packages |
 | **Standards Compliance** | OpenAI-compatible API surface for drop-in integration |
 | **Audit & Trust** | Tamper-evident audit infrastructure aligned with enterprise governance requirements |
 | **Deployment Range** | Local inference to multi-cloud GPU compute; single platform, full spectrum |

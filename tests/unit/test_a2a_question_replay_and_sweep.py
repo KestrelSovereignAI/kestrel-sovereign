@@ -138,6 +138,33 @@ class TestStartupReplay:
         assert "a2a_question_expiry_sweep" in spawn_names
 
     @pytest.mark.asyncio
+    async def test_replay_passes_persisted_stable_recipient_identity(self):
+        """A restart must route by the dispatched peer, not an old display name."""
+        feature, _agent, _tracked = _make_feature_for_replay()
+        future = datetime.now(timezone.utc) + timedelta(minutes=10)
+        row = PendingA2AQuestion(
+            task_id="task-stable-recipient",
+            recipient="Companion",
+            recipient_agent_id="did:test:original-companion",
+            original_question="q",
+            origin_turn_id=None,
+            origin_session_id="sess-1",
+            deadline=future.isoformat(),
+            status="WAITING",
+            created_at=datetime.now(timezone.utc).isoformat(),
+            resolved_at=None,
+        )
+        store = MagicMock()
+        store.list_waiting = AsyncMock(return_value=[row])
+        feature._supervise_a2a_question = AsyncMock()
+
+        await feature._replay_pending_a2a_questions(store)
+
+        assert feature._supervise_a2a_question.call_args.kwargs[
+            "recipient_agent_id"
+        ] == "did:test:original-companion"
+
+    @pytest.mark.asyncio
     async def test_retry_payload_row_refires_captured_answer(self):
         feature, agent, tracked = _make_feature_for_replay()
         future = datetime.now(timezone.utc) + timedelta(minutes=10)

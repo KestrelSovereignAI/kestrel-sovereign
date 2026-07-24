@@ -14,6 +14,7 @@ Usage:
 import argparse
 import asyncio
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -110,6 +111,27 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SOURCE_FILE = PROJECT_ROOT / "KESTREL_FEATURES.md"
 OUTPUT_DIR = PROJECT_ROOT / "docs" / "generated"
 _DISCOVERY_REFRESH_CACHE: dict[str, list[ModelInfo]] = {}
+BOUNDARY_START = "<!-- BEGIN PROTECTED PACKAGE BOUNDARY CONTRACT -->"
+BOUNDARY_END = "<!-- END PROTECTED PACKAGE BOUNDARY CONTRACT -->"
+NON_BUNDLED_ALIASES_PATTERN = re.compile(
+    r"<!-- NON_BUNDLED_SURFACE_ALIASES:\s*(.*?)\s*-->",
+    re.DOTALL,
+)
+OWNERSHIP_PROMOTION_TERMS = (
+    "built-in",
+    "built in",
+    "bundled",
+    "core feature",
+    "core capability",
+    "core module",
+    "native voice",
+    "native wallet",
+    "native integration",
+    "ships with",
+    "part of the base install",
+    "included in the base install",
+    "no separate install",
+)
 
 
 def build_okf_frontmatter(
@@ -154,9 +176,144 @@ def parse_okf_frontmatter(path: Path) -> dict | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def extract_boundary_contract(source: str) -> str:
+    """Return the canonical protected package-boundary block verbatim."""
+    start = source.find(BOUNDARY_START)
+    end = source.find(BOUNDARY_END)
+    if start == -1 or end == -1 or end < start:
+        raise ValueError(
+            "Canonical feature inventory is missing the protected package "
+            "boundary contract"
+        )
+    return source[start : end + len(BOUNDARY_END)]
+
+
+def extract_non_bundled_surface_aliases(
+    boundary_contract: str,
+) -> dict[str, tuple[str, ...]]:
+    """Read protected aliases and every non-bundled registry identifier.
+
+    The canonical contract carries audience-friendly aliases (for example,
+    ``"GitHub integration"``).  Registry keys are authoritative for the
+    complete catalog, though, so include each external row's stable key as an
+    additional alias.  Otherwise a transformation can evade the guard merely
+    by shortening an extracted surface's name (for example, ``"GitHub"``).
+    """
+    match = NON_BUNDLED_ALIASES_PATTERN.search(boundary_contract)
+    if match is None:
+        raise ValueError(
+            "Protected package boundary contract is missing its "
+            "NON_BUNDLED_SURFACE_ALIASES declaration"
+        )
+
+    aliases: dict[str, tuple[str, ...]] = {}
+    for group in match.group(1).split(";"):
+        values = tuple(
+            value.strip().casefold()
+            for value in group.split("|")
+            if value.strip()
+        )
+        if values:
+            aliases[values[0]] = values
+    if not aliases:
+        raise ValueError(
+            "Protected package boundary contract declares no non-bundled aliases"
+        )
+
+    from kestrel_sovereign.feature_registry import PackageBoundary, load_registry
+
+    non_bundled_boundaries = {
+        PackageBoundary.FEATURE_PACKAGE,
+        PackageBoundary.PROVIDER_PACKAGE,
+        PackageBoundary.STANDALONE_TOOL,
+    }
+    for info in load_registry().values():
+        if info.boundary not in non_bundled_boundaries:
+            continue
+        stable_id = info.name.casefold()
+        aliases.setdefault(
+            stable_id,
+            tuple(dict.fromkeys((stable_id, stable_id.replace("_", " ")))),
+        )
+    return aliases
+
+
+def _strip_boundary_contract(text: str) -> str:
+    """Remove an LLM-echoed protected block before deterministic insertion."""
+    pattern = re.compile(
+        rf"{re.escape(BOUNDARY_START)}.*?{re.escape(BOUNDARY_END)}",
+        re.DOTALL,
+    )
+    return pattern.sub("", text).strip()
+
+
+def find_boundary_promotions(
+    text: str,
+    non_bundled_aliases: dict[str, tuple[str, ...]],
+) -> list[str]:
+    """Find prose that promotes a non-bundled surface to bundled/core.
+
+    This intentionally targets ownership claims, not ordinary capability
+    descriptions. The exact boundary contract is inserted separately and is
+    not passed to this validator.
+    """
+    violations: list[str] = []
+    blocks = [
+        block.strip()
+        for block in re.split(r"\n\s*\n|(?<=[.!?])\s+", text)
+        if block.strip()
+    ]
+    for block in blocks:
+        normalized = block.casefold()
+        promotion = next(
+            (term for term in OWNERSHIP_PROMOTION_TERMS if term in normalized),
+            None,
+        )
+        if promotion is None:
+            continue
+        for surface, aliases in non_bundled_aliases.items():
+            if any(alias in normalized for alias in aliases):
+                violations.append(
+                    f"{surface}: ownership promotion using {promotion!r}: "
+                    f"{block[:180]}"
+                )
+                break
+
+    core_section = re.compile(
+        r"(?ims)^#{2,6}\s+[^\n]*(?:core|bundled)[^\n]*"
+        r"(?:feature|capabilit|module)[^\n]*\n"
+        r"(.*?)(?=^#{1,6}\s|\Z)"
+    )
+    for section in core_section.findall(text):
+        normalized = section.casefold()
+        for surface, aliases in non_bundled_aliases.items():
+            if any(alias in normalized for alias in aliases):
+                violations.append(
+                    f"{surface}: listed inside a core/bundled inventory section"
+                )
+    return violations
+
+
+def compose_generated_body(source: str, transformed: str) -> str:
+    """Validate audience prose and prepend the canonical boundary contract."""
+    boundary_contract = extract_boundary_contract(source)
+    aliases = extract_non_bundled_surface_aliases(boundary_contract)
+    transformed = _strip_boundary_contract(transformed)
+    violations = find_boundary_promotions(transformed, aliases)
+    if violations:
+        raise ValueError(
+            "Generated audience document contradicts package ownership:\n- "
+            + "\n- ".join(violations)
+        )
+    return f"{boundary_contract}\n\n{transformed}\n"
+
+
 def check_generated_docs() -> int:
-    """Validate checked-in generated docs have OKF generation metadata."""
+    """Validate metadata and deterministic package-boundary invariants."""
     failures: list[str] = []
+    source = SOURCE_FILE.read_text(encoding="utf-8")
+    boundary_contract = extract_boundary_contract(source)
+    aliases = extract_non_bundled_surface_aliases(boundary_contract)
     for audience in AUDIENCES:
         path = OUTPUT_DIR / f"FEATURES_{audience}.md"
         metadata = parse_okf_frontmatter(path)
@@ -176,11 +333,22 @@ def check_generated_docs() -> int:
                 failures.append(
                     f"{path.relative_to(PROJECT_ROOT)}: expected {key}={value!r}, got {metadata.get(key)!r}"
                 )
+        text = path.read_text(encoding="utf-8")
+        if text.count(boundary_contract) != 1:
+            failures.append(
+                f"{path.relative_to(PROJECT_ROOT)}: protected package-boundary "
+                "contract is missing, duplicated, or stale"
+            )
+        body = text.replace(boundary_contract, "", 1)
+        for violation in find_boundary_promotions(body, aliases):
+            failures.append(
+                f"{path.relative_to(PROJECT_ROOT)}: {violation}"
+            )
     if failures:
         for failure in failures:
             print(f"ERROR: {failure}", file=sys.stderr)
         return 1
-    print("Generated feature docs metadata is current.")
+    print("Generated feature docs metadata and package boundaries are current.")
     return 0
 
 
@@ -292,6 +460,16 @@ def generate(
 
     profile = AUDIENCES[audience]
     source = SOURCE_FILE.read_text()
+    protected_rules = (
+        "\n\nPackage-boundary invariants:\n"
+        f"- The source section between {BOUNDARY_START} and {BOUNDARY_END} is "
+        "normative; do not contradict it.\n"
+        "- Never describe an extracted Feature package, provider package, or "
+        "standalone tool as bundled, built-in, native, core, or included in "
+        "the base install.\n"
+        "- The generator inserts the protected section verbatim; do not rely "
+        "on paraphrase to preserve ownership."
+    )
 
     user_prompt = (
         f"Transform the following canonical feature document for the "
@@ -302,7 +480,7 @@ def generate(
     if dry_run:
         print(f"=== DRY RUN: {audience} ===")
         print(f"System prompt ({len(profile['system'])} chars):")
-        print(profile["system"])
+        print(profile["system"] + protected_rules)
         print(f"\nUser prompt: {len(user_prompt)} chars ({len(source)} from source)")
         print(f"Output would go to: {OUTPUT_DIR / f'FEATURES_{audience}.md'}")
         return OUTPUT_DIR / f"FEATURES_{audience}.md"
@@ -320,7 +498,8 @@ def generate(
     )
 
     print(f"Generating {audience} version via {provider}/{model_name}...")
-    result = call_fn(profile["system"], user_prompt)
+    result = call_fn(profile["system"] + protected_rules, user_prompt)
+    body = compose_generated_body(source, result)
 
     # Write output
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -332,8 +511,8 @@ def generate(
     )
 
     out_path = OUTPUT_DIR / f"FEATURES_{audience}.md"
-    out_path.write_text(header + result)
-    print(f"Wrote {out_path} ({len(result)} chars)")
+    out_path.write_text(header + body)
+    print(f"Wrote {out_path} ({len(body)} chars)")
     return out_path
 
 
