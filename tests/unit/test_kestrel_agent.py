@@ -1751,6 +1751,110 @@ class TestLifecycle:
         )
 
     @pytest.mark.asyncio
+    async def test_feature_shutdown_late_sqla_factory_keeps_both_worker_reservations(
+        self, tmp_path
+    ):
+        """A factory created by feature shutdown cannot steal primary-close time.
+
+        This drives the real file-backed path where the cache is empty when
+        ``KestrelAgent.shutdown`` composes its deadline, then a feature lazily
+        creates and opens a SQLAlchemy SQLite factory during the prefix.  Both
+        the factory worker and the primary worker must terminate before the
+        agent reports shutdown complete.
+        """
+        from sqlalchemy import text
+
+        from kestrel_sovereign.storage.sqla import make_session_factory
+
+        release_worker = threading.Event()
+        worker_exit_delayed = threading.Event()
+        factory_created = asyncio.Event()
+        factory_worker = None
+        primary_worker = None
+        shutdown_task = None
+
+        raw_storage = AsyncStorage(str(tmp_path / "late-factory-agent.db"))
+        await raw_storage.initialize()
+        primary_connection = raw_storage._backend._connection
+        assert primary_connection is not None
+        primary_worker = aiosqlite_worker(primary_connection)
+
+        async def feature_shutdown():
+            nonlocal factory_worker
+            factory = make_session_factory(raw_storage.db)
+            async with factory.read_session() as session:
+                await session.execute(text("SELECT 1"))
+            factory_worker = aiosqlite_worker(factory._sqlite_connections[0])
+            factory_created.set()
+
+        feature = MagicMock()
+        feature.shutdown = feature_shutdown
+        agent = KestrelAgent(did="did:test:late-sqla-factory")
+        agent.features = {"LateSqlaFactoryFeature": feature}
+        agent.llm_service = None
+        agent.task_manager = None
+        agent.memory_system = None
+        agent._sync_service = None
+        agent.storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
+
+        try:
+            with delay_aiosqlite_worker_exit(
+                release_worker,
+                worker_exit_delayed,
+                should_delay=lambda candidate: candidate is factory_worker,
+            ) as workers, patch(
+                "kestrel_sovereign.storage.db.sqlite."
+                "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
+                0.12,
+            ), patch(
+                "kestrel_sovereign.kestrel_agent."
+                "KESTREL_AGENT_SHUTDOWN_TIMEOUT_S",
+                0.50,
+            ), patch(
+                "kestrel_sovereign.kestrel_agent."
+                "KESTREL_SHUTDOWN_DURABLE_RESERVE_S",
+                0.02,
+            ), patch(
+                "kestrel_sovereign.kestrel_agent."
+                "KESTREL_SHUTDOWN_TAIL_MIN_STEP_S",
+                0.01,
+            ):
+                shutdown_task = asyncio.create_task(agent.shutdown())
+                await asyncio.wait_for(factory_created.wait(), timeout=1.0)
+                await asyncio.wait_for(
+                    wait_until_aiosqlite_worker_exit_is_delayed(
+                        worker_exit_delayed,
+                    ),
+                    timeout=1.0,
+                )
+                assert factory_worker is not None
+                assert workers == [factory_worker]
+                assert factory_worker.is_alive()
+                assert primary_worker.is_alive()
+                assert not shutdown_task.done()
+
+                # The tail is waiting in the late-created factory's own
+                # reservation, not reporting a false success or abandoning
+                # the primary backend's subsequent worker close.
+                await asyncio.sleep(0.03)
+                assert not shutdown_task.done()
+
+                release_worker.set()
+                await asyncio.wait_for(shutdown_task, timeout=1.0)
+                assert not factory_worker.is_alive()
+                assert not primary_worker.is_alive()
+        finally:
+            release_worker.set()
+            if shutdown_task is not None and not shutdown_task.done():
+                await asyncio.wait_for(shutdown_task, timeout=1.0)
+            if factory_worker is not None:
+                factory_worker.join(timeout=1.0)
+            primary_worker.join(timeout=1.0)
+
+        assert not factory_worker.is_alive()
+        assert not primary_worker.is_alive()
+
+    @pytest.mark.asyncio
     async def test_durable_tail_never_extends_past_clamped_storage_requirement(
         self, tmp_path
     ):

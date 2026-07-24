@@ -3426,6 +3426,15 @@ class PrivacyEnforcingStorage:
         return getattr(self._storage, "minimum_sqla_factory_close_timeout_s", 0.0)
 
     @property
+    def minimum_potential_sqla_factory_close_timeout_s(self) -> float:
+        """Preserve a late-created SQLAlchemy factory's reservation."""
+        return getattr(
+            self._storage,
+            "minimum_potential_sqla_factory_close_timeout_s",
+            0.0,
+        )
+
+    @property
     def graph_store(self):
         """Privacy-governing view of the graph store (#2672).
 

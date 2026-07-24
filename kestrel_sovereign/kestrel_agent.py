@@ -353,6 +353,29 @@ def _minimum_storage_preclose_timeout(storage: Any) -> float:
     return value if math.isfinite(value) and value > 0.0 else 0.0
 
 
+def _minimum_storage_potential_preclose_timeout(storage: Any) -> float:
+    """Read a late-created SQLAlchemy factory's close reservation safely.
+
+    Feature shutdown may lazily construct a factory after whole-agent
+    shutdown has allocated its durable-tail deadline.  SQLite storage exposes
+    this potential reservation independently of the current cache; older or
+    generic storage implementations fall back to the currently cached value.
+    """
+    try:
+        value = getattr(
+            storage,
+            "minimum_potential_sqla_factory_close_timeout_s",
+            0.0,
+        )
+    except (AttributeError, TypeError, ValueError):
+        value = 0.0
+    if not isinstance(value, bool) and isinstance(value, (int, float)):
+        value = float(value)
+        if math.isfinite(value) and value > 0.0:
+            return value
+    return _minimum_storage_preclose_timeout(storage)
+
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
@@ -5405,10 +5428,15 @@ Expected Duration: {expected_duration}
         """
         loop = asyncio.get_running_loop()
         storage_close_timeout = _minimum_storage_close_timeout(self.storage)
-        storage_preclose_timeout = _minimum_storage_preclose_timeout(self.storage)
+        # A feature may lazily create a file-backed SQLAlchemy factory during
+        # its shutdown.  Reserve that backend-declared *potential* close
+        # window now, before the feature sweep can populate the cache.
+        storage_preclose_reservation = (
+            _minimum_storage_potential_preclose_timeout(self.storage)
+        )
         prefix_budget, tail_reserve = _resolve_shutdown_budget(
             self._durable_tail_minimum_budget(
-                storage_close_timeout, storage_preclose_timeout
+                storage_close_timeout, storage_preclose_reservation
             )
         )
         # Shared deadline for the fallible prefix. Reserve headroom so the
@@ -5638,6 +5666,16 @@ Expected Duration: {expected_duration}
         except asyncio.CancelledError:
             shutdown_cancelled = True
         finally:
+            # Re-read the actual cache at the tail boundary.  The original
+            # potential reservation remains the floor, so a factory created
+            # by feature shutdown cannot spend the primary backend's worker
+            # close window.  This stays inside ``tail_reserve`` — and thus the
+            # production outer shutdown bound — because that reservation was
+            # composed before the prefix started.
+            storage_preclose_timeout = max(
+                storage_preclose_reservation,
+                _minimum_storage_preclose_timeout(self.storage),
+            )
             # Durable cleanup tail — safety-critical, always runs even under
             # cancellation. It has its OWN finite, honest deadline
             # (``tail_reserve``) so a tail step that hangs or suppresses
@@ -5764,7 +5802,10 @@ Expected Duration: {expected_duration}
         if storage_close_timeout is None:
             storage_close_timeout = _minimum_storage_close_timeout(self.storage)
         if storage_preclose_timeout is None:
-            storage_preclose_timeout = _minimum_storage_preclose_timeout(self.storage)
+            storage_preclose_timeout = max(
+                _minimum_storage_potential_preclose_timeout(self.storage),
+                _minimum_storage_preclose_timeout(self.storage),
+            )
         if not run_storage:
             storage_close_timeout = 0.0
             storage_preclose_timeout = 0.0
@@ -5821,7 +5862,12 @@ Expected Duration: {expected_duration}
                 pending_steps -= 1
             return max(KESTREL_SHUTDOWN_TAIL_MIN_STEP_S, share)
 
-        def _harvest(task, label: str) -> str:
+        def _harvest(
+            task,
+            label: str,
+            *,
+            defer_failure_report: bool = False,
+        ) -> str:
             """Read a completed task's outcome, recording degradation."""
             if task.cancelled():
                 state["cancelled"] = True
@@ -5829,13 +5875,14 @@ Expected Duration: {expected_duration}
             exc = task.exception()
             if exc is None:
                 return "ok"
-            logging.warning(
-                "Durable shutdown step '%s' failed: %s",
-                label,
-                exc,
-                exc_info=(type(exc), exc, exc.__traceback__),
-            )
-            state["degraded"] = True
+            if not defer_failure_report:
+                logging.warning(
+                    "Durable shutdown step '%s' failed: %s",
+                    label,
+                    exc,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+                state["degraded"] = True
             return "error"
 
         def _abandon(task) -> None:
@@ -5862,7 +5909,14 @@ Expected Duration: {expected_duration}
                 lambda t: None if t.cancelled() else t.exception()
             )
 
-        async def _bounded(coro, guard: float, label: str, *, shielded: bool = False):
+        async def _bounded(
+            coro,
+            guard: float,
+            label: str,
+            *,
+            shielded: bool = False,
+            defer_failure_report: bool = False,
+        ):
             """Run one tail step bounded by ``guard``.
 
             The coroutine is scheduled as a task and awaited only up to
@@ -5900,12 +5954,18 @@ Expected Duration: {expected_duration}
                         )
                     except asyncio.CancelledError:
                         _abandon(task)
-                        state["degraded"] = True
+                        if not defer_failure_report:
+                            state["degraded"] = True
                         return "abandoned"
                     if task in done:
-                        return _harvest(task, label)
+                        return _harvest(
+                            task,
+                            label,
+                            defer_failure_report=defer_failure_report,
+                        )
                     _abandon(task)
-                    state["degraded"] = True
+                    if not defer_failure_report:
+                        state["degraded"] = True
                     return "abandoned"
                 _abandon(task)  # do NOT await — may suppress cancel
                 return "cancelled"
@@ -5914,16 +5974,21 @@ Expected Duration: {expected_duration}
                 # Exceeded the guard. Hard-terminate but do NOT await — the step
                 # may suppress cancellation and would otherwise hang us.
                 _abandon(task)
-                logging.warning(
-                    "Durable shutdown step '%s' exceeded %.2fs; abandoned "
-                    "(shutdown degraded).",
-                    label,
-                    guard,
-                )
-                state["degraded"] = True
+                if not defer_failure_report:
+                    logging.warning(
+                        "Durable shutdown step '%s' exceeded %.2fs; abandoned "
+                        "(shutdown degraded).",
+                        label,
+                        guard,
+                    )
+                    state["degraded"] = True
                 return "abandoned"
 
-            return _harvest(task, label)
+            return _harvest(
+                task,
+                label,
+                defer_failure_report=defer_failure_report,
+            )
 
         # Cancel agent-owned background work before storage/sync shutdown.
         await _bounded(
@@ -5953,14 +6018,19 @@ Expected Duration: {expected_duration}
         # Dispose an optional cached SQLAlchemy engine as its own bounded
         # phase.  Otherwise a slow engine disposal can consume the guard that
         # the following primary SQLite close requires to drain its worker.
+        storage_preclose_status = None
         if storage_preclose is not None:
-            await _bounded(
+            storage_preclose_status = await _bounded(
                 storage_preclose(),
                 _step_guard(
                     max(KESTREL_SHUTDOWN_TAIL_MIN_STEP_S, storage_preclose_timeout)
                 ),
                 "storage-sqla-pre-close",
                 shielded=storage_preclose_timeout > 0.0,
+                # The primary SQLite backend owns an independent worker.  It
+                # must receive its reserved close chance before a pre-close
+                # timeout/error is reported as degraded.
+                defer_failure_report=True,
             )
 
         # Close storage — SQLite gets its declared worker-exit reservation and
@@ -5973,5 +6043,14 @@ Expected Duration: {expected_duration}
                 "storage-close",
                 shielded=storage_close_timeout > 0.0,
             )
+
+        if storage_preclose_status in {"error", "abandoned"}:
+            logging.warning(
+                "Durable shutdown step 'storage-sqla-pre-close' %s; primary "
+                "storage close was attempted before reporting shutdown "
+                "degraded.",
+                storage_preclose_status,
+            )
+            state["degraded"] = True
 
         return state["cancelled"], state["degraded"]

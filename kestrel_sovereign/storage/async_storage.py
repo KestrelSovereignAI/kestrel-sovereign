@@ -211,6 +211,13 @@ class AsyncStorage:
             return 0.0
         return self.db.minimum_sqla_factory_close_timeout_s
 
+    @property
+    def minimum_potential_sqla_factory_close_timeout_s(self) -> float:
+        """Reservation if feature shutdown creates a SQLite factory late."""
+        if self.db is None:
+            return 0.0
+        return self.db.minimum_potential_sqla_factory_close_timeout_s
+
     def _now_sql(self) -> str:
         """Get SQL expression for current timestamp based on backend type."""
         if self.backend_type == "postgres":
@@ -249,9 +256,15 @@ class AsyncStorage:
     
     async def close(self) -> None:
         """Close the storage connection."""
-        if self.db:
-            await self.db.close()
-        self._initialized = False
+        try:
+            if self.db:
+                await self.db.close()
+        finally:
+            # ``AsyncDatabase.close`` closes the primary backend before it
+            # reports a cached SQLAlchemy-factory failure.  Reset the facade
+            # even when that failure propagates so a later initialize() opens
+            # a fresh backend instead of reusing a closed one.
+            self._initialized = False
 
     async def dispose_cached_sqla_factory(self) -> None:
         """Dispose the optional SQLAlchemy engine before backend close.
