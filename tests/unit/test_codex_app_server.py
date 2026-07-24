@@ -14,6 +14,7 @@ from kestrel_sovereign.llm.codex_app_server import (
     CodexAppServerClient,
     CodexAppServerConnectionClosed,
     CodexAppServerError,
+    CodexAppServerFrameTooLarge,
     _CODEX_DISABLED_NATIVE_FEATURES,
     _extract_safe_user_config_defaults,
     _parse_user_agent_version,
@@ -347,6 +348,21 @@ class TestTurnIteration:
             async for _ in c.iter_turn_events(q, idle_timeout=2):
                 pass
 
+    async def test_iter_raises_on_bridge_protocol_error(self):
+        import asyncio
+
+        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c._closed_error = None
+        q: asyncio.Queue = asyncio.Queue()
+        q.put_nowait({
+            "__bridge_error__": CodexAppServerFrameTooLarge(
+                "codex app-server JSON-RPC frame exceeded the 64 MiB bridge limit"
+            )
+        })
+        with pytest.raises(CodexAppServerFrameTooLarge, match="frame exceeded"):
+            async for _ in c.iter_turn_events(q, idle_timeout=2):
+                pass
+
 
 @pytest.mark.asyncio
 class TestIdleWatchdogInflightServerRequest:
@@ -663,8 +679,12 @@ class TestInvoluntaryExitRecovery:
         )
 
     @pytest.mark.asyncio
-    async def test_spawn_clears_prior_instance_closed_error(self, monkeypatch):
+    async def test_spawn_clears_prior_instance_closed_error(
+        self, monkeypatch, tmp_path,
+    ):
         import asyncio
+
+        monkeypatch.setenv("HOME", str(tmp_path))
 
         c = CodexAppServerClient.__new__(CodexAppServerClient)
         c._binary = "/usr/bin/true"  # cheap, exits immediately
@@ -782,6 +802,11 @@ class _AsyncIterableMock:
     async def __anext__(self):
         if not self._items:
             raise StopAsyncIteration
+        return self._items.pop(0)
+
+    async def read(self, _size=-1):
+        if not self._items:
+            return b""
         return self._items.pop(0)
 
 

@@ -65,6 +65,7 @@ from kestrel_sdk.llm import (
 from .codex_app_server import (
     CodexAppServerClient,
     CodexAppServerError,
+    CodexAppServerFrameTooLarge,
     CodexAppServerTransportError,
     _CODEX_DISABLED_NATIVE_FEATURES,
 )
@@ -3167,7 +3168,7 @@ class CodexAdapter(LLMAdapter):
                 # pre-tool evidence the streaming path already captures.
                 "pre_tool_prose": pre_tool_prose_snapshot,
             }
-        except CodexAppServerTransportError as e:
+        except (CodexAppServerTransportError, CodexAppServerFrameTooLarge) as e:
             # Invalidate the session→thread cache BEFORE the ``finally``
             # below releases the per-thread lock, so a same-session call
             # queued on ``_session_locks[session_id]`` sees the popped
@@ -3177,22 +3178,21 @@ class CodexAdapter(LLMAdapter):
             # queued caller — it could grab the still-hung thread before
             # our pop ran. See #1411 codex review round 2.
             #
-            # Only pop on the assistant-stage idle marker. A
-            # ``turn/start`` RPC timeout or a connection drop don't
-            # leave codex-rs with an in-flight turn on this thread;
-            # popping there would just lose conversation context for
-            # no safety gain.
+            # Assistant-stage idle timeouts and discarded oversized frames
+            # both leave the remote turn's state unknown: Codex can still
+            # consider the original thread active after Kestrel has stopped
+            # consuming it. Reusing that thread risks a rejected turn/start
+            # or stale events. Other transport errors do not carry that
+            # evidence, so preserve their session history.
             msg = str(e)
+            poisoned_turn = isinstance(e, CodexAppServerFrameTooLarge) or (
+                "idle for" in msg and "no completion" in msg
+            )
             # Match ``_ensure_thread``'s truthy session_id semantics —
             # empty-string session_ids never write to ``_session_threads``,
-            # so popping them is a no-op but also signals intent.
-            if (
-                session_id
-                and "idle for" in msg
-                and "no completion" in msg
-            ):
-                self._session_threads.pop(session_id, None)
-                self._forget_thread_usage(session_id)
+            # so resetting them is a no-op but also signals intent.
+            if session_id and poisoned_turn:
+                self.reset_thread(session_id)
             raise
         finally:
             app.close_turn_sink(thread_id)
