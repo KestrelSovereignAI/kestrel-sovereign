@@ -4,6 +4,7 @@ Async Database for Kestrel Storage.
 Unified async database interface supporting SQLite and PostgreSQL.
 All queries use SQLite-style ? placeholders - automatically converted for PostgreSQL.
 """
+import asyncio
 import hashlib
 import logging
 from contextlib import asynccontextmanager
@@ -1580,8 +1581,17 @@ class AsyncDatabase:
         # Backend handles commits automatically per-query outside transactions
         pass
     
-    async def close(self) -> None:
-        """Close the database connection."""
+    async def dispose_cached_sqla_factory(self) -> None:
+        """Dispose the optional cached SQLAlchemy engine.
+
+        The SQLAlchemy engine is an independent resource from the primary
+        :class:`DatabaseBackend` connection.  Keep this phase separately
+        callable so shutdown orchestration can bound engine disposal without
+        stealing the primary SQLite connection's worker-drain reservation.
+        Clearing the cache *before* the await makes a timed-out disposal a
+        one-shot attempt: a later backend close must not repeat the same
+        unbounded pre-close work and starve the primary connection.
+        """
         # If the SQLA helper ever cached a session factory on us
         # (``kestrel_sovereign.storage.sqla.make_session_factory``),
         # dispose its engine first so the underlying connection pool
@@ -1589,17 +1599,86 @@ class AsyncDatabase:
         # shuts down. The cache is best-effort and may be absent in
         # tests / fresh DBs — guard with ``getattr``.
         sqla_factory = getattr(self, "_sovereign_sqla_factory", None)
+        self._sovereign_sqla_factory = None
         if sqla_factory is not None:
-            try:
-                await sqla_factory.close()
-            except Exception as e:
-                logger.warning(
-                    "Failed to close cached SQLAlchemy session factory: %s", e
-                )
-            self._sovereign_sqla_factory = None
+            # The caller owns the ordering between this independent engine and
+            # the primary backend.  Do not turn a failed engine close into a
+            # false success here: ``close()`` still gives the primary backend
+            # its close chance before reporting this failure, and whole-agent
+            # shutdown records it as degraded after that same primary close.
+            await sqla_factory.close()
 
-        await self._backend.close()
-        self._initialized = False
+    @property
+    def minimum_sqla_factory_close_timeout_s(self) -> float:
+        """Return the cached SQLAlchemy factory's optional close reservation."""
+        factory = getattr(self, "_sovereign_sqla_factory", None)
+        value = getattr(factory, "minimum_close_timeout_s", 0.0)
+        return value if isinstance(value, (int, float)) and value > 0 else 0.0
+
+    @property
+    def minimum_potential_sqla_factory_close_timeout_s(self) -> float:
+        """Return the reservation needed if a SQLite factory is created later.
+
+        Features may first use vector storage during their own shutdown and
+        create the cached factory after the agent has already composed its
+        durable-tail budget.  A file-backed SQLite factory owns the same
+        aiosqlite worker-drain window as this database's primary backend, so
+        expose that *potential* lifecycle requirement even while no factory is
+        cached yet.  Other backends retain their zero-reservation behavior.
+        """
+        cached = self.minimum_sqla_factory_close_timeout_s
+        if cached > 0.0:
+            return cached
+        if self.backend_type != "sqlite":
+            return 0.0
+        value = getattr(self._backend, "minimum_close_timeout_s", 0.0)
+        return value if isinstance(value, (int, float)) and value > 0 else 0.0
+
+    async def close(self) -> None:
+        """Close the SQLAlchemy factory and primary backend connection.
+
+        A cancellation during optional SQLAlchemy disposal must not skip the
+        primary backend close.  In particular, SQLite owns an aiosqlite worker
+        whose shutdown has to run before the caller tears down its event loop.
+        Propagate cancellation only after that owned backend lifecycle has had
+        its chance to complete.
+        """
+        cancelled = False
+        factory_error: Exception | None = None
+        try:
+            await self.dispose_cached_sqla_factory()
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception as exc:
+            # Keep going: the primary backend owns a separate aiosqlite worker
+            # and must always receive its close opportunity.  The failure is
+            # surfaced only after that attempt so callers never observe a
+            # successful close with an abandoned cached factory.
+            factory_error = exc
+
+        try:
+            await self._backend.close()
+        except Exception as backend_error:
+            if factory_error is not None:
+                logger.error(
+                    "Cached SQLAlchemy session factory close failed after "
+                    "the primary backend close was attempted: %s",
+                    factory_error,
+                )
+            raise backend_error from factory_error
+        finally:
+            self._initialized = False
+
+        if cancelled:
+            raise asyncio.CancelledError()
+        if factory_error is not None:
+            logger.error(
+                "Cached SQLAlchemy session factory close failed after the "
+                "primary backend close completed: %s",
+                factory_error,
+            )
+            raise factory_error
+
         logger.debug("Database connection closed")
     
     async def __aenter__(self):

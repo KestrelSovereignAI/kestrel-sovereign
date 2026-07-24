@@ -3416,6 +3416,25 @@ class PrivacyEnforcingStorage:
         return getattr(self._storage, "llm_service", None)
 
     @property
+    def minimum_close_timeout_s(self) -> float:
+        """Preserve the underlying storage's optional close-budget contract."""
+        return getattr(self._storage, "minimum_close_timeout_s", 0.0)
+
+    @property
+    def minimum_sqla_factory_close_timeout_s(self) -> float:
+        """Preserve the cached SQLAlchemy pre-close reservation."""
+        return getattr(self._storage, "minimum_sqla_factory_close_timeout_s", 0.0)
+
+    @property
+    def minimum_potential_sqla_factory_close_timeout_s(self) -> float:
+        """Preserve a late-created SQLAlchemy factory's reservation."""
+        return getattr(
+            self._storage,
+            "minimum_potential_sqla_factory_close_timeout_s",
+            0.0,
+        )
+
+    @property
     def graph_store(self):
         """Privacy-governing view of the graph store (#2672).
 
@@ -3455,6 +3474,12 @@ class PrivacyEnforcingStorage:
     async def close(self):
         """Close the underlying storage."""
         await self._storage.close()
+
+    async def dispose_cached_sqla_factory(self):
+        """Bound SQLAlchemy pre-close without hiding the storage contract."""
+        dispose = getattr(self._storage, "dispose_cached_sqla_factory", None)
+        if callable(dispose):
+            await dispose()
     
     async def __aenter__(self):
         return self

@@ -6,6 +6,7 @@ Implementation of DatabaseBackend using aiosqlite.
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, List, Optional, Sequence
@@ -23,6 +24,88 @@ from .interface import (
 from .write_audit import record_write_query, record_write_script
 
 logger = logging.getLogger(__name__)
+
+
+# ``aiosqlite.Connection.close()`` acknowledges its stop sentinel from the
+# worker before that thread has necessarily returned.  Do not let the caller
+# tear down its event loop in that narrow interval: wait for the worker itself
+# and fail explicitly if it remains alive beyond this bounded window.
+AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S = max(
+    float(os.environ.get("KESTREL_AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S", "1.0")),
+    0.01,
+)
+_AIOSQLITE_WORKER_SHUTDOWN_POLL_S = 0.01
+
+
+def _minimum_close_timeout_s() -> float:
+    """Return the outer-guard budget required by :meth:`close`.
+
+    The worker deadline starts only after ``aiosqlite.Connection.close()`` has
+    handed its stop sentinel to the worker.  Reserve one poll interval as well
+    so an outer guard cannot win a scheduling tie with that internal deadline.
+    """
+    return AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S + _AIOSQLITE_WORKER_SHUTDOWN_POLL_S
+
+
+async def _wait_for_aiosqlite_worker_shutdown(
+    connection: aiosqlite.Connection,
+) -> None:
+    """Wait until ``connection``'s worker has actually terminated.
+
+    aiosqlite 0.22 keeps the worker on ``_thread``; older supported releases
+    subclassed ``Thread`` directly.  Its public close awaitable confirms that
+    the stop sentinel ran, which can precede the worker's final return by one
+    scheduling turn.  The bounded wait closes that lifecycle gap without
+    changing who owns the connection.
+    """
+    worker = getattr(connection, "_thread", connection)
+    is_alive = getattr(worker, "is_alive", None)
+    if not callable(is_alive) or not is_alive():
+        return
+
+    try:
+        async with asyncio.timeout(AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S):
+            while is_alive():
+                await asyncio.sleep(_AIOSQLITE_WORKER_SHUTDOWN_POLL_S)
+    except TimeoutError as exc:
+        # Avoid a false failure if the worker exits as the timeout fires.
+        if not is_alive():
+            return
+        raise ConnectionError(
+            "SQLite worker did not terminate within "
+            f"{AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S:.2f}s after close"
+        ) from exc
+
+
+async def _close_aiosqlite_connection(connection: aiosqlite.Connection) -> None:
+    """Close an owned aiosqlite connection through its full lifecycle.
+
+    Every connection this backend opens owns an aiosqlite worker.  Keeping the
+    close and worker-termination wait together prevents a short-lived backup
+    or snapshot connection from bypassing the shutdown contract.
+    """
+    try:
+        await connection.close()
+    except asyncio.CancelledError:
+        # ``Connection.close`` queues its stop sentinel from a ``finally``
+        # block.  Once that happens, cancellation must not let the caller
+        # tear down its event loop while the worker is still returning.
+        try:
+            await _wait_for_aiosqlite_worker_shutdown(connection)
+        finally:
+            raise
+
+    try:
+        await _wait_for_aiosqlite_worker_shutdown(connection)
+    except asyncio.CancelledError:
+        # The caller still receives its cancellation, but only after the
+        # owned worker has exited (or the bounded worker deadline has failed
+        # explicitly).  This same helper covers primary, backup, and snapshot
+        # connections.
+        try:
+            await _wait_for_aiosqlite_worker_shutdown(connection)
+        finally:
+            raise
 
 
 class SQLiteBackend(DatabaseBackend):
@@ -64,6 +147,17 @@ class SQLiteBackend(DatabaseBackend):
     @property
     def is_connected(self) -> bool:
         return self._connection is not None
+
+    @property
+    def minimum_close_timeout_s(self) -> float:
+        """Minimum budget an outer shutdown guard must reserve for ``close``.
+
+        This is intentionally an optional backend extension rather than a
+        change to the SDK's generic backend interface: non-SQLite backends do
+        not own an aiosqlite worker and therefore have no equivalent lifecycle
+        requirement.
+        """
+        return _minimum_close_timeout_s()
     
     async def connect(self) -> None:
         """Connect to SQLite database."""
@@ -100,7 +194,7 @@ class SQLiteBackend(DatabaseBackend):
         if self._connection is not None:
             conn = self._connection
             try:
-                await conn.close()
+                await _close_aiosqlite_connection(conn)
                 logger.debug(f"Closed SQLite connection: {self.db_path}")
             finally:
                 self._connection = None
@@ -128,7 +222,7 @@ class SQLiteBackend(DatabaseBackend):
             try:
                 await conn.backup(dest)
             finally:
-                await dest.close()
+                await _close_aiosqlite_connection(dest)
 
     async def _open_snapshot_read_connection(self) -> aiosqlite.Connection:
         """Open a one-shot connection for committed reads during another task's txn."""
@@ -139,8 +233,8 @@ class SQLiteBackend(DatabaseBackend):
             await conn.execute("PRAGMA query_only=ON")
             conn.row_factory = aiosqlite.Row
             return conn
-        except Exception:
-            await conn.close()
+        except BaseException:
+            await _close_aiosqlite_connection(conn)
             raise
 
     @asynccontextmanager
@@ -163,7 +257,7 @@ class SQLiteBackend(DatabaseBackend):
             try:
                 yield read_conn
             finally:
-                await read_conn.close()
+                await _close_aiosqlite_connection(read_conn)
             return
 
         yield conn
