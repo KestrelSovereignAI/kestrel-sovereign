@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
@@ -27,6 +28,9 @@ from kestrel_sovereign.signals import (
     SignalDispatcher,
     SignalLogStore,
     SourceRegistry,
+)
+from kestrel_sovereign.signals.sources.channels import (
+    build_channel_message_registration,
 )
 from kestrel_sovereign.storage.db import SQLiteBackend
 
@@ -304,9 +308,130 @@ async def test_nack_retry_lease_expiry_terminal_failure_and_retention_are_observ
     assert "lease expired" in terminal.last_error
     # Retention does not erase non-terminal work, but it removes retained
     # terminal history after its configured lifetime.
-    assert await store.purge_expired(now=now + timedelta(days=2)) == 1
+    assert await store.purge_expired(
+        agent_id=agent_id, now=now + timedelta(days=2)
+    ) == 1
     assert await store.list_deliveries(agent_id=agent_id) == []
     await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_retention_sweep_preserves_other_agents_history(tmp_path):
+    """A shared backend must never let agent A purge agent B's ledger."""
+    path = tmp_path / "tenant-retention.db"
+    backend_a, agent_a, dispatcher_a = await _dispatcher(path, "did:agent:a")
+    backend_b, agent_b, dispatcher_b = await _dispatcher(path, "did:agent:b")
+    try:
+        for agent, dispatcher in (
+            (agent_a, dispatcher_a),
+            (agent_b, dispatcher_b),
+        ):
+            await dispatcher.register_durable_consumer(
+                DurableConsumerRegistration(
+                    consumer_id="workflow-wait",
+                    source="provider.message",
+                    agent_id=agent.did,
+                )
+            )
+            result = await dispatcher.dispatch_signal(
+                _signal(agent_id=agent.did),
+                source_event_id=f"expired-{agent.did}",
+            )
+            assert result.status is Status.OK
+            delivery = await dispatcher.claim_durable_delivery(
+                consumer_id="workflow-wait", executor_id="worker"
+            )
+            assert delivery is not None
+            assert await dispatcher.ack_durable_delivery(
+                consumer_id="workflow-wait",
+                delivery_id=delivery.delivery_id,
+                lease_token=delivery.lease_token,
+            )
+
+        past = datetime.now(timezone.utc) - timedelta(seconds=1)
+        await backend_a.execute(
+            "UPDATE durable_signal_events SET retention_until = ?",
+            (past,),
+        )
+
+        assert await dispatcher_a.purge_expired_durable_deliveries() == 1
+        remaining = await backend_b.fetch_all(
+            "SELECT agent_id FROM durable_signal_events ORDER BY agent_id"
+        )
+        assert remaining == [(agent_b.did,)]
+    finally:
+        await _close(backend_a, agent_a)
+        await _close(backend_b, agent_b)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("privacy_preset", "expected_storage", "expects_anonymization"),
+    (
+        ("ephemeral", "none", False),
+        ("isolated", "temp", False),
+        ("deidentified", "deidentified", False),
+        ("anonymous", None, True),
+        ("normal", None, False),
+        ("public", None, False),
+    ),
+)
+async def test_channel_signal_durable_payload_honors_agent_privacy_contract(
+    tmp_path, privacy_preset, expected_storage, expects_anonymization
+):
+    """The real dispatcher must not bypass channel privacy at its DB boundary."""
+    from kestrel_sovereign.privacy import get_privacy_preset
+
+    backend = SQLiteBackend(str(tmp_path / f"privacy-{privacy_preset}.db"))
+    await backend.connect()
+    agent = _Agent("did:agent:privacy")
+    agent.privacy_config = get_privacy_preset(privacy_preset)
+    store = SignalLogStore(backend)
+    await store.initialize()
+    registry = SourceRegistry()
+    registry.register(build_channel_message_registration())
+    dispatcher = SignalDispatcher(
+        agent=agent,
+        registry=registry,
+        lock_manager=OrderedLockManager(),
+        store=store,
+    )
+    try:
+        result = await dispatcher.dispatch_signal(
+            Signal(
+                source="channel.message",
+                kind="inbound",
+                mode=SignalMode.COGNITION,
+                payload={
+                    "message_id": "channel-event-1",
+                    "channel_type": "telegram",
+                    "sender": "alice@example.com",
+                    "recipient": "bot",
+                    "content": "Contact alice@example.com for the secret",
+                    "metadata": {"reply_to": "alice@example.com"},
+                },
+                target_agent=agent.did,
+            ),
+            source_event_id="channel-event-1",
+        )
+        assert result.status is Status.OK
+        row = await backend.fetch_one(
+            "SELECT payload FROM durable_signal_events WHERE agent_id = ?",
+            (agent.did,),
+        )
+        assert row is not None
+        persisted_payload = json.loads(row[0])
+        if expected_storage is not None:
+            assert persisted_payload == {"_privacy_gated": expected_storage}
+            assert "alice@example.com" not in row[0]
+        elif expects_anonymization:
+            assert "alice@example.com" not in row[0]
+            assert "[EMAIL_REDACTED]" in row[0]
+        else:
+            assert persisted_payload["content"] == "Contact alice@example.com for the secret"
+            assert persisted_payload["sender"] == "alice@example.com"
+    finally:
+        await _close(backend, agent)
 
 
 @pytest.mark.asyncio

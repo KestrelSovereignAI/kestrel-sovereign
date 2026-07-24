@@ -83,7 +83,7 @@ import os
 import secrets
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Coroutine, List, Optional, Protocol
@@ -112,6 +112,7 @@ from kestrel_sovereign.signals.constitution_metrics import (
     record_echo_missing,
     record_echo_verified,
 )
+from kestrel_sovereign.features.storage_access import resolve_agent_privacy_config
 from kestrel_sovereign.signals.lock_manager import OrderedLockManager
 from kestrel_sovereign.signals.registry import RegistrationError, SourceRegistry
 from kestrel_sovereign.signals.durable import (
@@ -133,6 +134,12 @@ from kestrel_sovereign.telemetry import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Durable event payloads are intentionally distinct from the runtime signal
+# envelope.  This marker preserves an observable event/consumer handoff while
+# proving that a volatile privacy mode did not retain user-authored content.
+_DURABLE_PRIVACY_GATED_MARKER = "_privacy_gated"
 
 
 _PROMPT_TEMPLATE_HASH_ATTR = "_kestrel_prompt_template_hash"
@@ -540,7 +547,102 @@ class SignalDispatcher:
     async def purge_expired_durable_deliveries(self) -> int:
         """Run the durable-ledger retention sweep (terminal history only)."""
         await self.initialize_durable_delivery()
-        return await self._durable_store.purge_expired()
+        return await self._durable_store.purge_expired(agent_id=self._agent.did)
+
+    def _signal_for_durable_persistence(self, signal: Signal) -> Signal:
+        """Return the privacy-safe event projection for the durable ledger.
+
+        Signal handlers and cognition run against ``signal`` itself: source
+        schemas have already normalized it, and changing it here would make a
+        storage policy silently alter live delivery.  The ledger instead gets
+        a copy with either an elided payload (EPHEMERAL, ISOLATED, and the
+        not-yet-supported DEIDENTIFIED safe-harbor mode) or the same PII
+        anonymization primitive used by channel storage (ANONYMOUS).
+
+        A failure while reading or applying the privacy policy must never
+        downgrade into a plaintext durable write, so this boundary fails
+        closed by persisting only the marker.
+        """
+        config = resolve_agent_privacy_config(self._agent)
+        if config is None:
+            return signal
+        try:
+            if any(
+                getattr(config, name)()
+                for name in (
+                    "is_ephemeral",
+                    "uses_temp_storage",
+                    "requires_deidentification",
+                )
+            ):
+                return replace(
+                    signal,
+                    payload={
+                        _DURABLE_PRIVACY_GATED_MARKER: getattr(
+                            config, "storage", "restricted"
+                        )
+                    },
+                )
+            if config.requires_anonymization():
+                from kestrel_sovereign.features.privacy.pii_detector import (
+                    anonymize_text,
+                )
+
+                return replace(
+                    signal,
+                    payload=self._anonymize_durable_value(
+                        signal.payload, anonymize_text
+                    ),
+                )
+        except Exception as exc:  # Privacy persistence must fail closed.
+            logger.warning(
+                "Failed to project signal %s for durable privacy storage; "
+                "persisting only a privacy marker: %s",
+                signal.id,
+                exc,
+            )
+            return replace(
+                signal,
+                payload={_DURABLE_PRIVACY_GATED_MARKER: "projection_error"},
+            )
+        return signal
+
+    @classmethod
+    def _anonymize_durable_value(
+        cls, value: Any, anonymize: Callable[[str], str]
+    ) -> Any:
+        """Apply the channel PII anonymizer to every persisted string value.
+
+        The source payload is a nested JSON document.  Retaining its shape
+        keeps durable correlation selectors replayable while applying the
+        policy to content in metadata as well as the obvious ``content``
+        field.  Overly deep input is elided rather than left unredacted.
+        """
+        return cls._anonymize_durable_value_at_depth(value, anonymize, depth=0)
+
+    @classmethod
+    def _anonymize_durable_value_at_depth(
+        cls, value: Any, anonymize: Callable[[str], str], *, depth: int
+    ) -> Any:
+        if depth > 8:
+            return _DURABLE_PRIVACY_GATED_MARKER
+        if isinstance(value, dict):
+            return {
+                anonymize(str(key)): cls._anonymize_durable_value_at_depth(
+                    item, anonymize, depth=depth + 1
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [
+                cls._anonymize_durable_value_at_depth(
+                    item, anonymize, depth=depth + 1
+                )
+                for item in value
+            ]
+        if isinstance(value, str):
+            return anonymize(value)
+        return value
 
     # ------------------------------------------------------------------
     # Pipeline
@@ -640,7 +742,7 @@ class SignalDispatcher:
         try:
             await self.initialize_durable_delivery()
             persisted = await self._durable_store.persist_signal(
-                signal,
+                self._signal_for_durable_persistence(signal),
                 agent_id=self._agent.did,
                 source_event_id=source_event_id,
                 retention_days=registration.retention_days,

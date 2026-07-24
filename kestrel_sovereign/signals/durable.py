@@ -148,7 +148,19 @@ class DurableSignalStore(UnifiedStoreBase):
     DELIVERIES = "durable_signal_deliveries"
 
     def __init__(self, backend: DatabaseBackend):
-        super().__init__(backend)
+        # ``SignalLogStore`` historically accepts the ``AsyncDatabase``
+        # compatibility facade as well as a native ``DatabaseBackend``.  The
+        # dispatcher derives this ledger from that store, so unwrap only the
+        # legacy facade (which exposes ``fetchall`` but not ``fetch_all``)
+        # rather than requiring every existing signal-store embedding to
+        # migrate its construction path. Durable delivery uses the native
+        # ``fetch_one`` / ``fetch_all`` contract and must share the same
+        # transaction domain as the signal log. The capability check leaves
+        # native backends and test doubles untouched.
+        native_backend = backend
+        if not hasattr(backend, "fetch_all") and hasattr(backend, "backend"):
+            native_backend = backend.backend
+        super().__init__(native_backend)
 
     async def initialize(self) -> None:
         ts_type = self.timestamp_type()
@@ -619,24 +631,30 @@ class DurableSignalStore(UnifiedStoreBase):
         )
         return [self._row_to_delivery(row) for row in rows]
 
-    async def purge_expired(self, *, now: Optional[datetime] = None) -> int:
-        """Delete only retained, terminal event histories.
+    async def purge_expired(
+        self, *, agent_id: str, now: Optional[datetime] = None
+    ) -> int:
+        """Delete only this agent's retained, terminal event histories.
 
         Pending, retriable, and leased work is never cleaned up by retention;
         operators must first resolve it to an observable terminal state.
+        ``agent_id`` is mandatory because the periodic sweep is owned by one
+        dispatcher even when multiple agents share a PostgreSQL database.
         """
+        self._require_nonempty("agent_id", agent_id)
         now = _as_utc(now or self.now_utc())
         return await self._backend.execute(
             f"""
             DELETE FROM {self.EVENTS}
-            WHERE retention_until < ?
+            WHERE agent_id = ?
+              AND retention_until < ?
               AND NOT EXISTS (
                   SELECT 1 FROM {self.DELIVERIES} d
                   WHERE d.event_id = {self.EVENTS}.event_id
                     AND d.status NOT IN ('{ACKNOWLEDGED}', '{FAILED}')
               )
             """,
-            (self.to_timestamp_param(now),),
+            (agent_id, self.to_timestamp_param(now)),
         )
 
     # ------------------------------------------------------------------
