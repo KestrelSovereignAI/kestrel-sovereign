@@ -403,7 +403,7 @@ def _extracted_feature_packages() -> List[Tuple[str, List[str]]]:
     those would couple sovereign to specific extensions, which the
     open-core split (epic #462) explicitly forbids. Driving off the
     registry means new extracted features are auto-verified the moment
-    they're registered with ``core = false``, and a feature that's
+    they're registered with ``boundary = "feature-package"``, and a feature that's
     claimed extracted but can't be ``pip install``ed surfaces as a
     real verification failure.
 
@@ -412,39 +412,25 @@ def _extracted_feature_packages() -> List[Tuple[str, List[str]]]:
     ``kestrel-feature-intelligence``). Dedupe by package name and
     union the Feature class lists.
 
-    **Filtered to ``kestrel-feature-*`` packages only.** The registry
-    also lists provider plugins (``kestrel-voice-elevenlabs``,
-    ``kestrel-voice-deepgram``, ``kestrel-voice-openai``,
-    ``kestrel-voice-xai``) under
-    ``core = false``, but those register under a different entry-point
-    group (``kestrel_feature_voice_providers``) and implement
-    provider interfaces, not ``kestrel_sdk.features.base.Feature``.
-    Running Tests 4 and 5 against them would fail spuriously
-    (Feature-subclass and ``kestrel_sovereign.features`` entry-point
-    assertions both miss). The naming convention is the discriminator
-    here; if a future Feature package adopts a non-default name it
-    must register under the conventional prefix to be picked up.
+    Provider and standalone rows are excluded by their explicit boundary
+    category, not by a package-name convention.
     """
-    from kestrel_sovereign.feature_registry import get_registry
+    from kestrel_sovereign.feature_registry import PackageBoundary, get_registry
 
     by_package: Dict[str, Set[str]] = {}
     for info in get_registry().values():
-        if info.core:
-            continue
-        if not info.package or info.package == "kestrel-sovereign":
-            continue
-        if not info.package.startswith("kestrel-feature-"):
+        if info.boundary is not PackageBoundary.FEATURE_PACKAGE:
             continue
         by_package.setdefault(info.package, set()).update(info.features)
     return [(pkg, sorted(classes)) for pkg, classes in sorted(by_package.items())]
 
 
 # ---------------------------------------------------------------------------
-# Test 3 — Feature package install (each `core = false` package)
+# Test 3 — Feature package install (each explicit feature-package row)
 # ---------------------------------------------------------------------------
 
 def _test_3_feature_package(work_dir: Path) -> List[VerifyResult]:
-    """For every package registered as ``core = false`` in
+    """For every package registered as ``boundary = "feature-package"`` in
     ``feature_registry.toml``: ``pip install $REPO`` +
     ``pip install <package>`` (from PyPI) + verify each declared
     Feature class imports.

@@ -16,7 +16,21 @@ Kestrel is a pre-1.0 framework for creating autonomous AI agents with cryptograp
 
 `pip install kestrel-sovereign` gives you a complete, working sovereign agent: identity, memory, constitution, privacy modes, multi-LLM support, local guarded compute, and a Cloud Run deployment path. Everything you need to run an agent locally with zero cloud commitment.
 
-Voice, MCP, GitHub App, wallet, council, observability, and similar specialized capabilities are **installable feature packages**. RunPod, Vast.ai, GCP Compute, voice cloud backends, and storage backends are **provider packages** that register with provider-specific entry points rather than the feature entry-point group. This split is being completed across [#462](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/462) and [#560](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/560); current state is documented in [`KESTREL_FEATURES.md`](KESTREL_FEATURES.md).
+Package ownership has four distinct runtime forms:
+
+| Boundary | Ownership and install behavior |
+|---|---|
+| **Bundled Feature** | A Feature lifecycle class discovered from `kestrel_sovereign/features/`; it ships in `kestrel-sovereign` and needs no separate install. |
+| **Extracted Feature package** | A separate distribution, such as voice, MCP, GitHub, wallet, council, or observability, that registers Feature classes through `kestrel_sovereign.features`. |
+| **Provider package** | A separate backend distribution, such as RunPod, Vast.ai, GCP Compute, a voice cloud backend, or a storage backend, that implements a provider contract through a provider-specific entry point. It is not a Feature lifecycle package. |
+| **Standalone tool** | An independent control surface. `kestrel-talon`, for example, is installed separately; the bundled `TalonCoordinatorFeature` is only its in-agent coordinator. |
+
+The base install also contains runtime components that are not Feature
+lifecycle classes—for example, `PrivacyAgent`. The registry calls these
+`bundled-component` rather than pretending they are Feature packages. The
+canonical ownership contract and live in-tree inventory are in
+[`KESTREL_FEATURES.md`](KESTREL_FEATURES.md); the machine-readable catalog is
+[`kestrel_sovereign/data/feature_registry.toml`](kestrel_sovereign/data/feature_registry.toml).
 
 ## 🚀 Quick Start
 
@@ -257,7 +271,14 @@ kestrel feature disable <name>         # Disable without uninstalling
 kestrel feature scaffold <name>        # Generate a new feature package skeleton
 ```
 
-The canonical inventory of features lives in [`KESTREL_FEATURES.md`](KESTREL_FEATURES.md); the runtime registry is in [`kestrel_sovereign/data/feature_registry.toml`](kestrel_sovereign/data/feature_registry.toml).
+The canonical inventory and package-boundary contract live in
+[`KESTREL_FEATURES.md`](KESTREL_FEATURES.md). The runtime registry records the
+same taxonomy in `boundary`: `bundled`, `bundled-component`,
+`feature-package`, `provider-package`, or `standalone-tool`. Its `package` is
+always the owning distribution/install target for that row; `core` remains a
+compatibility flag and is true only for the two bundled categories. Catalog
+status `available` means “known but not detected in this environment,” not that
+an external distribution was verified reachable.
 
 #### Keeping features installed across `uv sync` (`kestrel feature sync`)
 
@@ -480,7 +501,7 @@ into stale release metrics.
 
 ### Optional or actively evolving surfaces
 
-- **Voice, wallets/economics, channels, observability, and specialized provider backends** are feature or provider packages, not guarantees of the base install.
+- **Voice, wallets/economics, observability, channel transports, and specialized provider backends** are feature or provider packages, not guarantees of the base install. The generic `ChannelFeature` coordination surface itself is bundled.
 - **RunPod, Vast.ai, and GCP Compute** are provider integrations whose live behavior depends on credentials and the selected package.
 - **Training/LoRA** supplies core protocol and local-adapter seams; cloud adapters are evolving separately.
 - **GitHub code introspection** supports its shipped retrieval and issue-tool surface. The deeper static-analysis design in [`docs/architecture/GITHUB_FEATURE_DESIGN.md`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/architecture/GITHUB_FEATURE_DESIGN.md) is not an implementation claim.

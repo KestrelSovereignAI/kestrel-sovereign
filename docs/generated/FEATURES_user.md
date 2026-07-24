@@ -18,6 +18,46 @@ model: anthropic/claude-sonnet-4-6
 regenerate: uv run python scripts/generate_feature_docs.py --audience user
 ---
 
+<!-- BEGIN PROTECTED PACKAGE BOUNDARY CONTRACT -->
+## Package Ownership and Installation Boundaries
+
+These ownership statements are normative and must remain intact in every
+audience-specific derivative:
+
+<!-- NON_BUNDLED_SURFACE_ALIASES: voice; mcp; github integration|github app; wallet; observability; council; visual identity; legal feature; code editing|code edit; parametric self; whatsapp; runpod; vast.ai|vastai; gcp compute; elevenlabs; deepgram; kestrel-talon -->
+
+- **Bundled Feature lifecycle modules:** Feature subclasses discovered from
+  `kestrel_sovereign/features/` ship in the `kestrel-sovereign` distribution.
+  They need no separate package install. The generated inventory below is the
+  exact in-tree discovery snapshot.
+- **Bundled non-Feature components:** Some base-install runtime services, such
+  as `PrivacyAgent`, are shipped by `kestrel-sovereign` but are not Feature
+  lifecycle classes. The registry labels these `bundled-component` rather than
+  putting them in its `features` field.
+- **Not bundled — extracted Feature packages:** Voice, MCP, GitHub integration,
+  wallet, observability, reflection, council, visual identity, legal, code
+  editing, parametric self, and WhatsApp transport are separate install targets.
+  They register Feature subclasses through the `kestrel_sovereign.features`
+  entry-point group.
+- **Not bundled — provider packages:** ElevenLabs, Deepgram, OpenAI voice, xAI
+  voice/realtime, RunPod, Vast.ai, GCP Compute, and external storage backends
+  implement provider contracts. They use provider-specific entry-point groups;
+  installing one does not make that provider a Feature lifecycle class.
+- **Not bundled — standalone tool:** `kestrel-talon` is an independently
+  installed command-line issue processor. The in-tree `TalonCoordinatorFeature`
+  is only its bundled Kestrel control surface; the coordinator and the
+  standalone executable are separately named registry rows.
+
+The runtime catalog at `kestrel_sovereign/data/feature_registry.toml` encodes
+these distinctions in `boundary`. Its `package` field is always the owning
+distribution/install target for that row. The compatibility field `core` is
+`true` only for `bundled` and `bundled-component` rows. `features` contains
+Feature lifecycle class names only; provider implementations use
+`provider_classes` plus `entry_point_groups`, and standalone tools use
+`command`. Catalog status `available` means “known but not detected in this
+environment,” not a claim that an external distribution is publicly reachable.
+<!-- END PROTECTED PACKAGE BOUNDARY CONTRACT -->
+
 # Kestrel — What It Can Do For You
 
 > A friendly, scannable overview of everything Kestrel offers — no technical jargon required.
@@ -109,7 +149,8 @@ Kestrel remembers — so you don't have to repeat yourself.
 
 ## What Your Agent Can Do
 
-Kestrel comes packed with capabilities out of the box. Here's what your agent can get up to on your behalf.
+Kestrel combines a capable base install with optional Feature and provider
+packages. Here is what your agent can do when the named capability is installed.
 
 ### Everyday Productivity
 
@@ -120,20 +161,20 @@ Kestrel comes packed with capabilities out of the box. Here's what your agent ca
 
 ### Code and Technical Work
 
-- **Code editing.** Your agent can help you write and edit code directly.
-- **GitHub integration.** Connect to GitHub to work with repositories, issues, and pull requests from your conversations.
+- **Code editing (optional Feature package).** Your agent can help you write and edit code directly.
+- **GitHub integration (optional Feature package).** Connect to GitHub to work with repositories, issues, and pull requests from your conversations.
 - **Compute on demand.** Your agent can spin up cloud compute when it needs more power, with support for several cloud GPU providers.
 
 ### Reflection and Wellbeing
 
-- **Reflection.** Your agent can look back on recent activity and surface insights — like a thoughtful review of what's been happening.
+- **Reflection (optional Feature package).** Your agent can look back on recent activity and surface insights — like a thoughtful review of what's been happening.
 - **State of mind.** Your agent has an awareness of its own condition and can report on how it's doing.
 - **Wellness.** There are built-in mechanisms to keep your agent healthy and well-functioning over time.
 - **Heartbeat.** Your agent regularly checks in on itself — you can see its heartbeat status and trigger a manual check at any time.
 
 ### Identity and Appearance
 
-- **Visual identity.** Your agent can have an avatar — you can upload one or have it generated automatically.
+- **Visual identity (optional Feature package).** Your agent can have an avatar — you can upload one or have it generated automatically.
 - **Constitution.** You can read your agent's governing constitution at any time to understand its principles.
 
 ### Peer-to-Peer and Mesh
@@ -151,15 +192,15 @@ Kestrel comes packed with capabilities out of the box. Here's what your agent ca
 
 ### Cloud and Deployment
 
-- **GCP Compute, RunPod, Vast.ai.** Your agent can work with several cloud compute providers for tasks that need serious horsepower.
-- **Talon coordination.** Your agent can coordinate complex multi-step operations through the Talon coordinator.
+- **GCP Compute, RunPod, Vast.ai (optional provider packages).** Your agent can work with these cloud compute backends after the corresponding provider is installed.
+- **Talon coordination.** The in-tree coordinator can dispatch complex issue-processing work after the standalone `kestrel-talon` tool is installed.
 - **IPFS status.** Your agent is aware of its decentralised storage status and can report on it.
 
 ---
 
 ## Your Agent's Voice
 
-Kestrel can speak and listen — not just type.
+The optional extracted voice Feature package lets Kestrel speak and listen.
 
 - **Text to speech.** Your agent can read its responses aloud, with support for streaming audio for a natural, real-time feel.
 - **Speech to text.** Speak to your agent and it will transcribe your words into text.
@@ -198,7 +239,7 @@ Your agent is also a personal knowledge base.
 
 Kestrel keeps your credentials and financial tools organised and secure.
 
-- **Wallet.** Your agent has a built-in wallet for managing any on-chain or payment-related activity.
+- **Wallet (optional Feature package).** Add on-chain and payment tooling by installing the wallet Feature package.
 - **API key management.** Add, update, or remove keys for each AI provider from one place. You can also check usage per provider.
 
 ---
@@ -209,14 +250,16 @@ Kestrel doesn't live in isolation — it's designed to work within a wider ecosy
 
 - **Sovereignty and data portability.** Your agent's data is yours. You can export it, import it, and browse your sovereignty files — including previews. Your data never gets locked in.
 - **Storage stats.** See how much your agent is storing and where.
-- **Council.** Your agent can participate in council-style deliberation — bringing multiple perspectives together for better decisions.
-- **Observability.** See a live feed of events and a summary of what your agent has been doing — full transparency into its activity.
+- **Council (optional Feature package).** Your agent can participate in council-style deliberation — bringing multiple perspectives together for better decisions.
+- **Observability (optional Feature package).** See a live feed of events and a summary of what your agent has been doing — full transparency into its activity.
 
 ---
 
 ## Extending Your Agent with Features
 
-Kestrel is modular. Every capability is a feature that can be enabled, disabled, configured, or extended.
+Kestrel is modular. Feature lifecycle packages can be enabled, disabled, and
+configured; provider packages and standalone tools keep their own distinct
+runtime contracts.
 
 - **Browse available features.** See everything that's available, whether it's already installed or ready to add.
 - **Enable or disable on the fly.** Turn features on or off without restarting anything.

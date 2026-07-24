@@ -1,12 +1,17 @@
 # Kestrel Feature Registry
 #
-# Static catalog of Kestrel capabilities. It includes bundled core features,
-# optional feature packages, and a few provider package entries surfaced by the
-# Feature Store UI. Feature packages register Feature classes through
-# kestrel_sovereign.features; provider packages use provider-specific entry
-# points such as kestrel_sovereign.cloud_providers or
-# kestrel_feature_voice_providers or
-# kestrel_sovereign.conversation_providers.
+# Static catalog of Kestrel capabilities and related install targets. Every row
+# has exactly one package boundary:
+#   bundled          - Feature lifecycle class discovered from this distribution
+#                      under kestrel_sovereign/features; no separate install
+#   bundled-component - non-Feature runtime component shipped in this
+#                       distribution; no separate install
+#   feature-package  - independently installed distribution that registers
+#                      Feature lifecycle classes under kestrel_sovereign.features
+#   provider-package - independently installed backend implementation registered
+#                      under one or more provider-specific entry-point groups
+#   standalone-tool  - independent command/control surface with no Feature or
+#                      provider entry point (it may be related by `companion`)
 #
 # Status levels (computed at runtime by feature_registry.py):
 #   available  - listed here but not installed / not bundled
@@ -16,14 +21,23 @@
 #   disabled   - explicitly disabled via KESTREL_DISABLED_FEATURES
 #
 # Each feature entry supports:
-#   package     - pip package name
+#   boundary    - one of the package-boundary values above (required)
+#   package     - distribution that OWNS this row and is installed for it;
+#                 never the name of a merely related package
 #   git         - source repository URL
-#   features    - list of Feature class names in this package
+#   features    - Feature lifecycle class names; bundled/feature-package only
+#   bundled_components - shipped non-Feature class names; bundled-component only
+#   provider_classes   - provider implementation class names; providers only
+#   entry_point_groups - provider-specific groups; providers only
+#   command     - installed executable name; standalone tools only
+#   provider_for - related registry ID whose provider contract is implemented
+#   companion   - separately named related standalone-tool registry ID
 #   description - human-readable summary
 #   tags        - list of tags for filtering
 #   icon        - icon identifier for UI rendering
-#   core        - true if this entry is bundled/available in kestrel-sovereign
-#                 without an external entry point
+#   core        - compatibility field for existing CLI/API/UI consumers; it MUST
+#                 be true exactly for bundled/bundled-component rows, and false
+#                 otherwise
 #   skills      - per-feature skill declarations for static discovery
 
 # =============================================================================
@@ -31,6 +45,7 @@
 # =============================================================================
 
 [identity]
+boundary = "bundled"
 package = "kestrel-sovereign"
 git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["IdentityFeature"]
@@ -45,6 +60,7 @@ update_identity = { description = "Update agent display name or metadata", categ
 verify_identity = { description = "Verify agent identity integrity", category = "system", tags = ["identity", "did"] }
 
 [security]
+boundary = "bundled"
 package = "kestrel-sovereign"
 git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["SecurityFeature"]
@@ -57,6 +73,7 @@ core = true
 ui_capabilities = ["audit", "permissions"]
 
 [peers]
+boundary = "bundled"
 package = "kestrel-sovereign"
 git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["PeersFeature"]
@@ -70,6 +87,7 @@ discover_peers = { description = "Discover other agents on the network", categor
 send_message = { description = "Send a message to a peer agent", category = "communication", tags = ["peers", "messaging"] }
 
 [constitution]
+boundary = "bundled"
 package = "kestrel-sovereign"
 git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["ConstitutionFeature"]
@@ -82,6 +100,7 @@ core = true
 view_constitution = { description = "View the agent's constitutional principles", category = "system", tags = ["constitution", "governance"] }
 
 [memory]
+boundary = "bundled"
 package = "kestrel-sovereign"
 git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["MemoryFeature", "MemoryAgencyFeature", "StrategicMemoryFeature"]
@@ -96,6 +115,7 @@ recall_memory = { description = "Recall stored memories by query", category = "m
 strategic_reflect = { description = "Perform strategic memory consolidation", category = "memory", tags = ["memory", "reflection"] }
 
 [model]
+boundary = "bundled"
 package = "kestrel-sovereign"
 git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["ModelAgent"]
@@ -110,6 +130,7 @@ set_model = { description = "Change active LLM model", category = "model_managem
 model_info = { description = "Get details about a specific model", category = "model_management", tags = ["model", "llm"] }
 
 [bootstrap]
+boundary = "bundled"
 package = "kestrel-sovereign"
 git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["BootstrapFeature"]
@@ -119,6 +140,7 @@ icon = "rocket"
 core = true
 
 [health]
+boundary = "bundled"
 package = "kestrel-sovereign"
 git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["HealthFeature"]
@@ -128,6 +150,7 @@ icon = "heart-pulse"
 core = true
 
 [context]
+boundary = "bundled"
 package = "kestrel-sovereign"
 git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["ContextFeature"]
@@ -141,6 +164,7 @@ context_status = { description = "Show context window utilization", category = "
 context_resize = { description = "Adjust context budget allocation", category = "system", tags = ["context", "tokens"] }
 
 [cli]
+boundary = "bundled"
 package = "kestrel-sovereign"
 git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["CliFeature"]
@@ -158,6 +182,7 @@ git_show_file = { description = "Read a local repository file from a git ref", c
 git_merge_base = { description = "Read the merge-base for two local git refs", category = "data_access", tags = ["git", "local", "ref"] }
 
 [tasks]
+boundary = "bundled"
 package = "kestrel-sovereign"
 git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["TaskFeature"]
@@ -167,6 +192,7 @@ icon = "list-checks"
 core = true
 
 [sovereignty]
+boundary = "bundled"
 package = "kestrel-sovereign"
 git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["SovereigntyFeature"]
@@ -176,6 +202,7 @@ icon = "crown"
 core = true
 
 [keys]
+boundary = "bundled"
 package = "kestrel-sovereign"
 git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["KeyManagementFeature"]
@@ -185,6 +212,7 @@ icon = "key"
 core = true
 
 [save]
+boundary = "bundled"
 package = "kestrel-sovereign"
 git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["SaveFeature"]
@@ -198,6 +226,56 @@ save_item = { description = "Save an item from conversation", category = "utilit
 list_saved = { description = "List saved items", category = "utility", tags = ["save", "bookmark"] }
 search_saved = { description = "Search saved items", category = "utility", tags = ["save", "search"] }
 
+[attachments]
+boundary = "bundled"
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+features = ["AttachmentsFeature"]
+description = "Conversation attachment inspection and retrieval"
+tags = ["core", "attachments", "files"]
+icon = "paperclip"
+core = true
+
+[computer_use]
+boundary = "bundled"
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+features = ["ComputerUseFeature"]
+description = "Governed local computer-use execution"
+tags = ["core", "computer-use", "security"]
+icon = "monitor"
+core = true
+
+[restart_coordinator]
+boundary = "bundled"
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+features = ["RestartCoordinatorFeature"]
+description = "Coordinated agent restart and update lifecycle"
+tags = ["core", "restart", "operations"]
+icon = "refresh-cw"
+core = true
+
+[todo]
+boundary = "bundled"
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+features = ["TodoFeature"]
+description = "Persistent todo tracking and workflow support"
+tags = ["core", "todo", "tasks"]
+icon = "list-todo"
+core = true
+
+[wait]
+boundary = "bundled"
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+features = ["WaitFeature"]
+description = "Mandatory wait and resumable-work coordination"
+tags = ["core", "wait", "coordination"]
+icon = "hourglass"
+core = true
+
 # =============================================================================
 # OPTIONAL CAPABILITY CATALOG
 # Some entries here are installable feature packages. Others are core capability
@@ -205,6 +283,7 @@ search_saved = { description = "Search saved items", category = "utility", tags 
 # =============================================================================
 
 [cloud]
+boundary = "bundled"
 package = "kestrel-sovereign"
 git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["DeployFeature", "ComputeFeature"]
@@ -226,6 +305,7 @@ get_compute_capabilities = { description = "List available guarded compute execu
 # feature package entry.
 
 [voice]
+boundary = "feature-package"
 package = "kestrel-feature-voice"
 git = "https://github.com/KestrelSovereignAI/kestrel-feature-voice.git"
 features = ["VoiceFeature"]
@@ -239,42 +319,59 @@ speak = { description = "Convert text to speech audio", category = "communicatio
 transcribe = { description = "Convert speech audio to text", category = "communication", tags = ["voice", "stt"] }
 
 [voice_elevenlabs]
+boundary = "provider-package"
 package = "kestrel-voice-elevenlabs"
 git = "https://github.com/KestrelSovereignAI/kestrel-voice-elevenlabs.git"
-features = ["ElevenLabsTTSProvider"]
+features = []
+provider_classes = ["ElevenLabsTTSProvider"]
+entry_point_groups = ["kestrel_feature_voice_providers"]
+provider_for = "voice"
 description = "ElevenLabs cloud TTS voice provider"
 tags = ["communication", "voice", "tts", "cloud", "elevenlabs"]
 icon = "microphone"
 core = false
 
 [voice_deepgram]
+boundary = "provider-package"
 package = "kestrel-voice-deepgram"
 git = "https://github.com/KestrelSovereignAI/kestrel-voice-deepgram.git"
-features = ["DeepgramSTTProvider"]
+features = []
+provider_classes = ["DeepgramSTTProvider"]
+entry_point_groups = ["kestrel_feature_voice_providers"]
+provider_for = "voice"
 description = "Deepgram cloud STT voice provider"
 tags = ["communication", "voice", "stt", "cloud", "deepgram"]
 icon = "microphone"
 core = false
 
 [voice_openai]
+boundary = "provider-package"
 package = "kestrel-voice-openai"
 git = "https://github.com/KestrelSovereignAI/kestrel-voice-openai.git"
-features = ["OpenAITTSProvider", "OpenAISTTProvider"]
+features = []
+provider_classes = ["OpenAITTSProvider", "OpenAISTTProvider"]
+entry_point_groups = ["kestrel_feature_voice_providers"]
+provider_for = "voice"
 description = "OpenAI cloud TTS + STT voice providers"
 tags = ["communication", "voice", "tts", "stt", "cloud", "openai"]
 icon = "microphone"
 core = false
 
 [voice_xai]
+boundary = "provider-package"
 package = "kestrel-voice-xai"
 git = "https://github.com/KestrelSovereignAI/kestrel-voice-xai.git"
-features = ["XAITTSProvider", "XAISTTProvider", "XAIRealtimeConversationProvider"]
+features = []
+provider_classes = ["XAITTSProvider", "XAISTTProvider", "XAIRealtimeConversationProvider"]
+entry_point_groups = ["kestrel_feature_voice_providers", "kestrel_sovereign.conversation_providers"]
+provider_for = "voice"
 description = "xAI cloud realtime voice agent + TTS + STT providers"
 tags = ["communication", "voice", "tts", "stt", "realtime", "cloud", "xai"]
 icon = "microphone"
 core = false
 
 [mcp]
+boundary = "feature-package"
 package = "kestrel-feature-mcp"
 git = "https://github.com/KestrelSovereignAI/kestrel-feature-mcp.git"
 features = ["MCPAgent"]
@@ -289,6 +386,7 @@ connect_server = { description = "Connect to an MCP server", category = "system"
 call_tool = { description = "Call a tool on a connected MCP server", category = "utility", tags = ["mcp", "tools"] }
 
 [github]
+boundary = "feature-package"
 package = "kestrel-feature-github"
 git = "https://github.com/KestrelSovereignAI/kestrel-feature-github.git"
 features = ["GitHubFeature"]
@@ -305,8 +403,9 @@ create_pr = { description = "Create a pull request", category = "data_access", t
 get_repo_info = { description = "Get arbitrary repository metadata including visibility (avoids gh CLI fallback)", category = "data_access", tags = ["github", "metadata"] }
 
 [web_search]
-package = "kestrel-feature-web-search"
-git = "https://github.com/KestrelSovereignAI/kestrel-feature-web-search.git"
+boundary = "bundled"
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["WebSearchFeature"]
 description = "Web search via Brave, SearXNG, or DuckDuckGo"
 tags = ["search", "web", "research"]
@@ -317,8 +416,9 @@ core = true
 web_search = { description = "Search the web for information", category = "web_search", tags = ["search", "web"] }
 
 [channels]
-package = "kestrel-feature-channels"
-git = "https://github.com/KestrelSovereignAI/kestrel-feature-channels.git"
+boundary = "bundled"
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["ChannelFeature"]
 description = "Multi-channel messaging (WhatsApp, Telegram, Discord, Slack)"
 tags = ["communication", "messaging", "channels"]
@@ -330,6 +430,7 @@ send_channel_message = { description = "Send a message to a channel", category =
 list_channels = { description = "List configured channels", category = "communication", tags = ["channels"] }
 
 [channel_whatsapp]
+boundary = "feature-package"
 package = "kestrel-channel-whatsapp"
 git = "https://github.com/KestrelSovereignAI/kestrel-channel-whatsapp.git"
 features = ["WhatsAppFeature"]
@@ -339,6 +440,7 @@ icon = "message-square"
 core = false
 
 [spawn]
+boundary = "bundled"
 package = "kestrel-sovereign"
 git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["SpawnFeature"]
@@ -353,15 +455,18 @@ list_children = { description = "List spawned child agents", category = "agent_m
 terminate_child = { description = "Terminate a child agent", category = "agent_management", tags = ["spawn", "agents"] }
 
 [privacy]
-package = "kestrel-feature-privacy"
-git = "https://github.com/KestrelSovereignAI/kestrel-feature-privacy.git"
-features = ["PrivacyAgent"]
+boundary = "bundled-component"
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+features = []
+bundled_components = ["PrivacyAgent"]
 description = "5-level privacy modes (EPHEMERAL to PUBLIC)"
 tags = ["privacy", "security", "data-protection"]
 icon = "eye-off"
 core = true
 
 [wallet]
+boundary = "feature-package"
 package = "kestrel-feature-wallet"
 git = "https://github.com/KestrelSovereignAI/kestrel-feature-wallet.git"
 features = ["WalletFeature"]
@@ -379,6 +484,7 @@ wallet_send = { description = "Send native tokens on EVM chains", category = "sy
 wallet_networks = { description = "List available blockchain networks", category = "system", tags = ["wallet", "networks"] }
 
 [observability]
+boundary = "feature-package"
 package = "kestrel-feature-observability"
 git = "https://github.com/KestrelSovereignAI/kestrel-feature-observability.git"
 features = ["ObservabilityFeature"]
@@ -391,8 +497,9 @@ core = false
 ui_capabilities = ["metrics"]
 
 [scheduler]
-package = "kestrel-feature-scheduler"
-git = "https://github.com/KestrelSovereignAI/kestrel-feature-scheduler.git"
+boundary = "bundled"
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["SchedulerFeature"]
 description = "Cron-style task scheduling and recurring jobs"
 tags = ["automation", "scheduling", "cron"]
@@ -404,6 +511,7 @@ schedule_task = { description = "Schedule a recurring task", category = "utility
 list_schedules = { description = "List scheduled tasks", category = "utility", tags = ["scheduler", "cron"] }
 
 [reflection]
+boundary = "feature-package"
 package = "kestrel-feature-reflection"
 git = "https://github.com/KestrelSovereignAI/kestrel-feature-reflection.git"
 features = ["ReflectionFeature"]
@@ -417,6 +525,7 @@ reflect = { description = "Trigger self-reflection cycle", category = "system", 
 personality_status = { description = "View personality evolution state", category = "system", tags = ["reflection", "personality"] }
 
 [skills]
+boundary = "bundled"
 package = "kestrel-sovereign"
 git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["SkillsFeature"]
@@ -433,10 +542,12 @@ skill_save = { description = "Promote an insight into a saved skill", category =
 skill_delete = { description = "Delete a saved skill", category = "utility", tags = ["skills"] }
 
 [talon]
-package = "kestrel-talon"
-git = "https://github.com/KestrelSovereignAI/kestrel-talon.git"
+boundary = "bundled"
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["TalonCoordinatorFeature"]
-description = "In-agent coordinator for the standalone kestrel-talon GitHub issue processor"
+companion = "talon_cli"
+description = "Bundled in-agent coordinator for the standalone kestrel-talon GitHub issue processor"
 tags = ["automation", "github", "devtools"]
 icon = "bot"
 core = true
@@ -445,9 +556,21 @@ core = true
 claim_issue = { description = "Claim and process a GitHub issue", category = "utility", tags = ["talon", "github"] }
 batch_process = { description = "Batch process issues from a PRD", category = "utility", tags = ["talon", "github"] }
 
+[talon_cli]
+boundary = "standalone-tool"
+package = "kestrel-talon"
+git = "https://github.com/KestrelSovereignAI/kestrel-talon.git"
+features = []
+command = "kestrel-talon"
+description = "Standalone GitHub issue processor used by the bundled Talon coordinator"
+tags = ["automation", "github", "devtools", "standalone"]
+icon = "bot"
+core = false
+
 [webhooks]
-package = "kestrel-feature-webhooks"
-git = "https://github.com/KestrelSovereignAI/kestrel-feature-webhooks.git"
+boundary = "bundled"
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["WebhookFeature"]
 description = "Inbound/outbound webhook management and event routing"
 tags = ["integration", "webhooks", "events"]
@@ -459,8 +582,9 @@ register_webhook = { description = "Register a new webhook endpoint", category =
 list_webhooks = { description = "List registered webhooks", category = "communication", tags = ["webhooks"] }
 
 [wellness]
-package = "kestrel-feature-wellness"
-git = "https://github.com/KestrelSovereignAI/kestrel-feature-wellness.git"
+boundary = "bundled"
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["WellnessFeature"]
 description = "Health monitoring, wellness checks, and eldercare support"
 tags = ["health", "wellness", "eldercare"]
@@ -468,6 +592,7 @@ icon = "heart"
 core = true
 
 [visual_identity]
+boundary = "feature-package"
 package = "kestrel-feature-visual"
 git = "https://github.com/KestrelSovereignAI/kestrel-feature-visual.git"
 features = ["VisualIdentityFeature"]
@@ -477,6 +602,7 @@ icon = "palette"
 core = false
 
 [legal]
+boundary = "feature-package"
 package = "kestrel-feature-legal"
 git = "https://github.com/KestrelSovereignAI/kestrel-feature-legal.git"
 features = ["LegalFeature"]
@@ -486,8 +612,9 @@ icon = "scale"
 core = false
 
 [consent]
-package = "kestrel-feature-consent"
-git = "https://github.com/KestrelSovereignAI/kestrel-feature-consent.git"
+boundary = "bundled"
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["ConsentFeature"]
 description = "User consent tracking and data processing agreements"
 tags = ["privacy", "consent", "compliance"]
@@ -495,6 +622,7 @@ icon = "check-square"
 core = true
 
 [council]
+boundary = "feature-package"
 package = "kestrel-feature-council"
 git = "https://github.com/KestrelSovereignAI/kestrel-feature-council.git"
 features = ["CouncilFeature"]
@@ -504,6 +632,7 @@ icon = "users"
 core = false
 
 [bridge]
+boundary = "bundled"
 package = "kestrel-sovereign"
 git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["BridgeFeature"]
@@ -513,6 +642,7 @@ icon = "arrow-left-right"
 core = true
 
 [code_edit]
+boundary = "feature-package"
 package = "kestrel-feature-code"
 git = "https://github.com/KestrelSovereignAI/kestrel-feature-code.git"
 features = ["CodeEditFeature"]
@@ -522,6 +652,7 @@ icon = "code"
 core = false
 
 [parametric_self]
+boundary = "feature-package"
 package = "kestrel-feature-parametric-self"
 git = "https://github.com/KestrelSovereignAI/kestrel-feature-parametric-self.git"
 features = ["ParametricSelfFeature"]
@@ -531,8 +662,9 @@ icon = "brain"
 core = false
 
 [delivery]
-package = "kestrel-feature-delivery"
-git = "https://github.com/KestrelSovereignAI/kestrel-feature-delivery.git"
+boundary = "bundled"
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["DeliveryFeature"]
 description = "Physical mail delivery and notary services"
 tags = ["delivery", "mail", "notary"]
@@ -540,8 +672,9 @@ icon = "mail"
 core = true
 
 [response_audit]
-package = "kestrel-feature-response-audit"
-git = "https://github.com/KestrelSovereignAI/kestrel-feature-response-audit.git"
+boundary = "bundled"
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["ResponseAuditFeature"]
 description = "Per-response constitutional audit and compliance checking"
 tags = ["governance", "audit", "compliance"]
@@ -549,8 +682,9 @@ icon = "clipboard-check"
 core = true
 
 [audit_anchor]
-package = "kestrel-feature-audit-anchor"
-git = "https://github.com/KestrelSovereignAI/kestrel-feature-audit-anchor.git"
+boundary = "bundled"
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["AuditAnchorFeature"]
 description = "Blockchain-anchored audit trail for cryptographic integrity"
 tags = ["governance", "blockchain", "audit"]
@@ -558,8 +692,9 @@ icon = "anchor"
 core = true
 
 [state_of_mind]
-package = "kestrel-feature-state-of-mind"
-git = "https://github.com/KestrelSovereignAI/kestrel-feature-state-of-mind.git"
+boundary = "bundled"
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["StateOfMindFeature"]
 description = "Emotional state tracking and mood-aware responses"
 tags = ["ai", "emotions", "personality"]
