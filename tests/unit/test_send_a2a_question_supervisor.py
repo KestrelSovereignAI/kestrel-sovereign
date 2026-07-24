@@ -416,6 +416,55 @@ class TestSupervisor404HardCut:
         )
 
 
+class TestSupervisorBackoff:
+    @pytest.mark.asyncio
+    async def test_subscription_transport_failures_keep_exponential_backoff(
+        self, monkeypatch,
+    ):
+        """Resolving a peer does not prove its subscription path is healthy."""
+        terminal = json.dumps({
+            "id": "t-backoff",
+            "status": {
+                "state": "completed",
+                "message": {"parts": [{"type": "text", "text": "done"}]},
+            },
+        })
+        feature, _agent, enqueue, fake_client = _make_feature(
+            sse_responses=[
+                httpx.RequestError("subscription host unavailable"),
+                httpx.RequestError("subscription host unavailable"),
+                httpx.RequestError("subscription host unavailable"),
+                httpx.RequestError("subscription host unavailable"),
+                _FakeStreamResponse([
+                    "event: status",
+                    f"data: {terminal}",
+                    "",
+                ]),
+            ],
+            monkeypatch=monkeypatch,
+        )
+        delays: List[float] = []
+
+        async def _record_sleep(seconds: float):
+            delays.append(seconds)
+
+        monkeypatch.setattr(asyncio, "sleep", _record_sleep)
+
+        await feature._supervise_a2a_question(
+            task_id="t-backoff",
+            recipient="Meridian",
+            original_question="?",
+            sess_id="s-backoff",
+            deadline_utc=datetime.now(timezone.utc) + timedelta(minutes=5),
+            causation_chain=None,
+        )
+
+        assert delays == [1.0, 2.0, 5.0, 10.0]
+        assert len(fake_client.calls) == 5
+        enqueue.assert_awaited_once()
+        assert enqueue.await_args.args[0].payload["state"] == "completed"
+
+
 class TestSupervisorDeadlineAccurateExpiry:
     @pytest.mark.asyncio
     async def test_deadline_passes_without_terminal_fires_expired_signal_now(

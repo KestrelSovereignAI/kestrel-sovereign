@@ -20,6 +20,7 @@ from kestrel_sovereign.features.peers.directory import (
     PeerNotFoundError,
     PeerRequester,
     PeerSubscriptionEvent,
+    PeerTransportError,
 )
 from kestrel_sovereign.features.peers.feature import PeersFeature
 from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -255,6 +256,53 @@ async def test_duplicate_peer_names_resolve_to_the_callers_scoped_stable_identit
 
 
 @pytest.mark.asyncio
+async def test_same_name_peer_routes_by_stable_identity_while_self_is_rejected(
+    tmp_path,
+):
+    """A scoped directory, not a display name, defines the self boundary."""
+    scope_a, scope_b = object(), object()
+    router = ScopedRouter(scope_a, scope_b)
+    same_name_peer = PeerIdentity(
+        agent_id="did:tenant-a:other-caller",
+        slug="caller",
+        routing_key="other-caller-route",
+        name="Caller",
+    )
+    router.scope_a_entries = {"caller": same_name_peer}
+    feature, backend = await _durable_feature_for_scope(
+        router, scope_a, tmp_path, database_name="same-name-peer.db",
+    )
+    try:
+        invoked = await feature.ask_agent("CALLER", "hello")
+        dispatched = await feature.send_a2a_task("caller", "do work")
+
+        assert invoked.status is ToolResultStatus.OK
+        assert dispatched.status is ToolResultStatus.OK
+        assert router.invoked_on == [same_name_peer.agent_id]
+        assert router.sent_to == [same_name_peer.agent_id]
+
+        # The identical display name becomes self only when the directory's
+        # stable identity equals the trusted requester identity.
+        router.scope_a_entries = {
+            "caller": PeerIdentity(
+                agent_id=feature.agent.did,
+                slug="caller",
+                routing_key="caller-route",
+                name="Caller",
+            ),
+        }
+        self_message = await feature.ask_agent("caller", "hello")
+        self_task = await feature.send_a2a_task("caller", "do work")
+
+        assert self_message.status is ToolResultStatus.ERROR
+        assert self_message.error == "Cannot send a message to yourself"
+        assert self_task.status is ToolResultStatus.ERROR
+        assert self_task.error == "Cannot send an A2A task to yourself"
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
 async def test_peer_listing_preserves_slug_and_uses_it_when_name_is_empty():
     scope_a, scope_b = object(), object()
     router = ScopedRouter(scope_a, scope_b)
@@ -343,6 +391,63 @@ async def test_unexpected_router_resolution_error_does_not_disclose_provider_det
     assert result.status is ToolResultStatus.ERROR
     assert result.error == "Peer is not available in the automatic directory"
     assert "tenant-b connection diagnostic" not in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_local_host_resolution_transport_failure_is_reported_as_unreachable():
+    """Resolution outages stay distinct from authorization/name denials."""
+    scope_a, scope_b = object(), object()
+    feature = _feature_for_scope(ScopedRouter(scope_a, scope_b), scope_a)
+    await feature.initialize()
+    adapter = LocalHostPeerDirectory("http://local-host")
+    adapter.resolve_peer = AsyncMock(
+        side_effect=PeerTransportError("local host connection refused"),
+    )
+    feature._peer_router = adapter
+    feature._peer_requester = PeerRequester(
+        identity=feature.agent.did,
+        authorization_scope=scope_a,
+    )
+
+    invoked = await feature.ask_agent("companion", "hello")
+    dispatched = await feature.send_a2a_task("companion", "do work")
+
+    expected = "Could not reach agent 'companion' — multi_agent host unreachable"
+    assert invoked.status is ToolResultStatus.ERROR
+    assert invoked.error == expected
+    assert dispatched.status is ToolResultStatus.ERROR
+    assert dispatched.error == expected
+    assert adapter.resolve_peer.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_retained_task_result_resolution_transport_failure_is_reported_as_unreachable():
+    """A stable-ID resolution outage must not be reported as a missing peer."""
+    scope_a, scope_b = object(), object()
+    feature = _feature_for_scope(ScopedRouter(scope_a, scope_b), scope_a)
+    await feature.initialize()
+    adapter = LocalHostPeerDirectory("http://local-host")
+    adapter.resolve_peer_by_agent_id = AsyncMock(
+        side_effect=PeerTransportError("local host connection refused"),
+    )
+    adapter.get_a2a_task = AsyncMock()
+    feature._peer_router = adapter
+    feature._peer_requester = PeerRequester(
+        identity=feature.agent.did,
+        authorization_scope=scope_a,
+    )
+    feature._outbound_recipient_agent_id = AsyncMock(
+        return_value="did:tenant-a:companion",
+    )
+
+    result = await feature.get_peer_task_result("companion", "task-123")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.error == "Could not reach peer 'companion' for task task-123"
+    adapter.resolve_peer_by_agent_id.assert_awaited_once_with(
+        feature._peer_requester, "did:tenant-a:companion",
+    )
+    adapter.get_a2a_task.assert_not_awaited()
 
 
 @pytest.mark.asyncio

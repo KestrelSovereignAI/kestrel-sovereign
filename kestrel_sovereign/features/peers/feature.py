@@ -447,7 +447,7 @@ class PeersFeature(Feature):
             raise
         except Exception as exc:  # noqa: BLE001 - provider extension boundary
             logger.exception("Peer router resolution raised unexpectedly")
-            raise PeerTransportError("Peer directory resolution failed") from exc
+            raise PeerProtocolError("Peer directory resolution failed") from exc
         if peer is None:
             raise PeerNotFoundError("Peer is not in the automatic directory")
         if not isinstance(peer, PeerIdentity):
@@ -500,7 +500,7 @@ class PeersFeature(Feature):
             raise
         except Exception as exc:  # noqa: BLE001 - provider extension boundary
             logger.exception("Peer router stable-identity resolution raised unexpectedly")
-            raise PeerTransportError("Peer directory resolution failed") from exc
+            raise PeerProtocolError("Peer directory resolution failed") from exc
         if peer is None:
             raise PeerNotFoundError("Peer is not in the automatic directory")
         if not isinstance(peer, PeerIdentity):
@@ -786,14 +786,6 @@ class PeersFeature(Feature):
             agent_name: Name of the agent to message (e.g. "emma", "claw")
             message: The message or question to send
         """
-        # This is an assertion about the known local caller, not a directory
-        # lookup, so it neither probes nor depends on any tenant namespace.
-        if agent_name.casefold() == self._own_name.casefold():
-            return ToolResult.failed(
-                "Cannot send a message to yourself",
-                data={"response": None, "agent": agent_name},
-            )
-
         try:
             router, requester, peer = await self._resolve_automatic_peer(
                 agent_name,
@@ -816,6 +808,11 @@ class PeersFeature(Feature):
         except PeerNotFoundError:
             return ToolResult.failed(
                 "Peer is not available in the automatic directory",
+                data={"response": None, "agent": agent_name},
+            )
+        except PeerTransportError:
+            return ToolResult.failed(
+                f"Could not reach agent '{agent_name}' — multi_agent host unreachable",
                 data={"response": None, "agent": agent_name},
             )
         except PeerDirectoryError as exc:
@@ -919,12 +916,6 @@ class PeersFeature(Feature):
         task_id).
         """
         from uuid import uuid4
-
-        if recipient.casefold() == self._own_name.casefold():
-            return None, None, None, ToolResult.failed(
-                "Cannot send an A2A task to yourself",
-                data={"sent": False, "recipient": recipient},
-            )
 
         task_id = uuid4().hex
         sess_id = session_id or uuid4().hex
@@ -1099,6 +1090,11 @@ class PeersFeature(Feature):
             # names so the automatic shortcut is not a namespace oracle.
             return None, None, None, ToolResult.failed(
                 "Peer is not available in the automatic directory",
+                data={"sent": False, "recipient": recipient},
+            )
+        except PeerTransportError:
+            return None, None, None, ToolResult.failed(
+                f"Could not reach agent '{recipient}' — multi_agent host unreachable",
                 data={"sent": False, "recipient": recipient},
             )
         except PeerDirectoryError as exc:
@@ -1628,6 +1624,11 @@ class PeersFeature(Feature):
                 "Peer is not available in the automatic directory",
                 data={"recipient": recipient, "task_id": task_id},
             )
+        except PeerTransportError:
+            return ToolResult.failed(
+                f"Could not reach peer '{recipient}' for task {task_id}",
+                data={"recipient": recipient, "task_id": task_id},
+            )
         except PeerDirectoryError as exc:
             logger.error(
                 "Could not resolve peer task recipient %r: %s", recipient, exc,
@@ -2006,17 +2007,18 @@ class PeersFeature(Feature):
                 router, requester, peer = await self._resolve_retained_automatic_peer(
                     recipient, recipient_agent_id,
                 )
-                # Successful authorization/resolution — reset backoff before
-                # consuming the provider's stream.  The provider is still
-                # required to authorize the subscription itself, because a
-                # scope can change after resolution.
-                backoff_idx = 0
                 async for subscription_event in router.subscribe_a2a_task(
                     requester,
                     peer,
                     task_id,
                     timeout_seconds=remaining,
                 ):
+                    # Resolution alone does not prove the subscription path
+                    # is healthy: a local host can fail immediately while
+                    # opening the stream.  Reset only after the provider has
+                    # yielded an event, so repeated transport failures retain
+                    # the 1/2/5/10-second progression.
+                    backoff_idx = 0
                     # Codex round 3 P2c on PR #1453: enforce the deadline
                     # INSIDE the stream loop.  A provider can keep a healthy
                     # stream open indefinitely, so its transport timeout alone
@@ -2037,6 +2039,9 @@ class PeersFeature(Feature):
                         state = event_state
                         reply_text = event_reply
                         break
+                # A cleanly exhausted stream also proves that subscription
+                # setup succeeded, even when the peer emitted no event.
+                backoff_idx = 0
                 # Stream ended cleanly — if we saw a terminal, exit the outer
                 # loop; otherwise reconnect (or exit at the deadline).
                 if state in terminal_states:

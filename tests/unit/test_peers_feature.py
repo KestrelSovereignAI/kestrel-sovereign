@@ -54,16 +54,26 @@ async def test_list_peers_filters_out_self():
 
 @pytest.mark.asyncio
 async def test_ask_agent_rejects_self_target():
-    agent = SimpleNamespace(_agent_name="emma")
+    agent = SimpleNamespace(_agent_name="emma", did="did:test:emma")
     feature = PeersFeature(agent)
     feature._host_url = "http://multi_agent"
     feature._api_key = ""
     feature._own_name = "emma"
 
-    result = await feature.ask_agent("emma", "hello")
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.__aexit__.return_value = False
+    client.get.return_value = _mock_directory_response()
+
+    with patch(
+        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
+        return_value=client,
+    ):
+        result = await feature.ask_agent("emma", "hello")
 
     assert result.status is ToolResultStatus.ERROR
     assert "yourself" in result.error
+    client.post.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -268,9 +278,16 @@ async def test_send_a2a_message_fire_and_forget():
 @pytest.mark.asyncio
 async def test_send_a2a_message_rejects_self_target():
     feature = _make_a2a_feature("emma")
-    result = await feature.send_a2a_message("emma", "test")
+    client = _async_client_with()
+    with patch(
+        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
+        return_value=client,
+    ):
+        result = await feature.send_a2a_message("emma", "test")
+
     assert result.status is ToolResultStatus.ERROR
     assert "yourself" in result.error.lower()
+    client.post.assert_not_awaited()
 
 
 @pytest.mark.asyncio
