@@ -1689,6 +1689,11 @@ class KestrelAgent(
             lock_manager=self._lock_manager,
             store=signal_log_store,
         )
+        # Register teardown before durable initialization's first await.  That
+        # initialization starts owner liveness before it finishes startup
+        # recovery; a later boot-phase failure must cancel it and release even
+        # a partially registered owner before storage rolls back.
+        ctx.on_rollback("signal_dispatcher", self._boot_teardown_dispatcher)
         # The outcome-only signal_log is initialized above.  Initialize the
         # separate pending-delivery ledger during boot so external workflow
         # consumers can safely register before the first signal arrives.
@@ -2562,6 +2567,15 @@ class KestrelAgent(
         self._sync_service = None
         if svc is not None and getattr(svc, "is_running", False):
             await svc.stop()
+
+    async def _boot_teardown_dispatcher(self) -> None:
+        """Stop durable dispatcher liveness before its storage is released."""
+        dispatcher = getattr(self, "dispatcher", None)
+        # Clear the public handle first: no rollback tail can route new work to
+        # a dispatcher whose backing storage is about to close.
+        self.dispatcher = None
+        if dispatcher is not None:
+            await dispatcher.shutdown_durable_delivery()
 
     async def _boot_teardown_features(self) -> None:
         """Reverse every feature registration made before the failure, LIFO.
@@ -6030,7 +6044,11 @@ Expected Duration: {expected_duration}
         # must not outlive this agent instance.
         dispatcher = getattr(self, "dispatcher", None)
         if dispatcher is not None:
-            dispatcher.shutdown()
+            await _bounded(
+                dispatcher.shutdown_durable_delivery(),
+                _step_guard(),
+                "durable-signal-dispatcher",
+            )
 
         # Stop memory-owned bookkeeping before storage/sync shutdown.
         if run_memory:

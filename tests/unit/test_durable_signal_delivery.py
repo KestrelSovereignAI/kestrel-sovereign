@@ -185,7 +185,9 @@ async def test_two_executors_cannot_claim_the_same_delivery(tmp_path):
     backend_a, agent_a, dispatcher_a = await _dispatcher(path, "did:agent:one")
     backend_b, agent_b, dispatcher_b = await _dispatcher(path, "did:agent:one")
     consumer = DurableConsumerRegistration(
-        consumer_id="workflow-wait", source="provider.message", agent_id=agent_a.did
+        consumer_id="workflow-wait",
+        source="provider.message",
+        agent_id=agent_a.did,
     )
     await dispatcher_a.register_durable_consumer(consumer)
     await dispatcher_b.register_durable_consumer(consumer)
@@ -219,15 +221,16 @@ async def test_volatile_sidecar_is_installed_before_commit_and_reserved_from_pee
     agent_a.privacy_config = get_privacy_preset("ephemeral")
     agent_b.privacy_config = get_privacy_preset("ephemeral")
     consumer = DurableConsumerRegistration(
-        consumer_id="workflow-wait", source="provider.message", agent_id=agent_a.did
+        consumer_id="workflow-wait",
+        source="provider.message",
+        agent_id=agent_a.did,
+        lease_seconds=1,
     )
     secret = "commit-boundary-customer@example.com"
     await dispatcher_a.register_durable_consumer(consumer)
     await dispatcher_b.register_durable_consumer(consumer)
 
     original_transaction = backend_a.transaction
-    original_schedule = dispatcher_a._schedule_transient_durable_handoff_expiry
-    sidecar_installed = asyncio.Event()
     commit_boundary = asyncio.Event()
     release_commit = asyncio.Event()
 
@@ -240,12 +243,7 @@ async def test_volatile_sidecar_is_installed_before_commit_and_reserved_from_pee
             commit_boundary.set()
             await release_commit.wait()
 
-    def note_sidecar_install(delivery_id, expires_at):
-        original_schedule(delivery_id, expires_at)
-        sidecar_installed.set()
-
     backend_a.transaction = pause_after_sidecar_before_commit
-    dispatcher_a._schedule_transient_durable_handoff_expiry = note_sidecar_install
 
     peer_ready = asyncio.Event()
     allow_peer_claim = asyncio.Event()
@@ -270,8 +268,13 @@ async def test_volatile_sidecar_is_installed_before_commit_and_reserved_from_pee
             )
         )
         await asyncio.wait_for(commit_boundary.wait(), timeout=2)
-        await asyncio.wait_for(sidecar_installed.wait(), timeout=2)
         assert len(dispatcher_a._transient_durable_handoffs) == 1
+
+        # The old implementation would have published a one-second lease that
+        # expired while this transaction remained uncommitted. The reservation
+        # carries no lease deadline here, so a pause longer than that duration
+        # cannot make the post-commit owner activation stale.
+        await asyncio.sleep(1.1)
 
         peer_claim_task = asyncio.create_task(
             dispatcher_b.claim_durable_delivery(
@@ -307,7 +310,6 @@ async def test_volatile_sidecar_is_installed_before_commit_and_reserved_from_pee
         assert durable_delivery is not None and secret not in repr(durable_delivery)
     finally:
         backend_a.transaction = original_transaction
-        dispatcher_a._schedule_transient_durable_handoff_expiry = original_schedule
         backend_b.fetch_one = original_peer_fetch_one
         dispatcher_a.shutdown()
         dispatcher_b.shutdown()
@@ -509,8 +511,6 @@ async def test_volatile_sidecars_are_discarded_when_the_event_transaction_rolls_
         )
     )
     original_transaction = backend.transaction
-    sidecar_installed = asyncio.Event()
-    original_schedule = dispatcher._schedule_transient_durable_handoff_expiry
 
     @asynccontextmanager
     async def rollback_after_before_commit():
@@ -519,19 +519,13 @@ async def test_volatile_sidecars_are_discarded_when_the_event_transaction_rolls_
             # This runs after the store invokes its pre-commit sidecar hook.
             raise RuntimeError("force durable event rollback")
 
-    def note_sidecar_install(delivery_id, expires_at):
-        original_schedule(delivery_id, expires_at)
-        sidecar_installed.set()
-
     backend.transaction = rollback_after_before_commit
-    dispatcher._schedule_transient_durable_handoff_expiry = note_sidecar_install
     try:
         result = await dispatcher.dispatch_signal(
             _signal(agent_id=agent.did, message="rollback-secret@example.com"),
             source_event_id="volatile-rollback",
         )
         assert result.status is Status.FAILED
-        assert sidecar_installed.is_set()
         assert dispatcher._transient_durable_handoffs == {}
         assert await backend.fetch_one(
             "SELECT event_id FROM durable_signal_events WHERE agent_id = ?",
@@ -539,8 +533,282 @@ async def test_volatile_sidecars_are_discarded_when_the_event_transaction_rolls_
         ) is None
     finally:
         backend.transaction = original_transaction
-        dispatcher._schedule_transient_durable_handoff_expiry = original_schedule
         dispatcher.shutdown()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_graceful_shutdown_requeues_unactivated_volatile_reservation_as_marker(
+    tmp_path,
+):
+    """Shutdown drops raw state before releasing its own reservation to retry."""
+    from kestrel_sovereign.privacy import get_privacy_preset
+    from kestrel_sovereign.signals.dispatcher import _TransientDurableHandoff
+
+    backend, agent, dispatcher = await _dispatcher(
+        tmp_path / "volatile-graceful-shutdown.db", "did:agent:one"
+    )
+    agent.privacy_config = get_privacy_preset("ephemeral")
+    consumer = DurableConsumerRegistration(
+        consumer_id="workflow-wait", source="provider.message", agent_id=agent.did
+    )
+    secret = "graceful-shutdown-customer@example.com"
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        marker_event = _signal(agent_id=agent.did)
+        marker_event.payload = {"_privacy_gated": "none"}
+        persisted = await dispatcher._durable_store.persist_signal(
+            marker_event,
+            agent_id=agent.did,
+            source_event_id="volatile-graceful-shutdown",
+            retention_days=7,
+            transient_selector_payload={"workflow": "wf-1", "message": secret},
+            initial_lease_owner=dispatcher._durable_delivery_owner,
+        )
+        reservation = persisted.initial_reservations[0]
+        retention_until = persisted.retention_until
+        assert retention_until is not None
+        dispatcher._transient_durable_handoffs[reservation.delivery_id] = (
+            _TransientDurableHandoff(
+                payload={"workflow": "wf-1", "message": secret},
+                consumer_id=consumer.consumer_id,
+                created_at=reservation.created_at,
+                retention_until=retention_until,
+                expires_at=retention_until,
+                initial_lease_token=reservation.reservation_token,
+            )
+        )
+
+        await dispatcher.shutdown_durable_delivery()
+
+        assert dispatcher._transient_durable_handoffs == {}
+        released = await dispatcher._durable_store.get_delivery(
+            agent_id=agent.did,
+            consumer_id=consumer.consumer_id,
+            delivery_id=reservation.delivery_id,
+        )
+        assert released is not None
+        assert released.status == RETRY
+        replay = await dispatcher._durable_store.claim_delivery(
+            agent_id=agent.did,
+            consumer_id=consumer.consumer_id,
+            executor_id="restart-worker",
+        )
+        assert replay is not None
+        assert replay.event.payload == {"_privacy_gated": "none"}
+        assert secret not in json.dumps(replay.event.payload)
+    finally:
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_phase", ("before_update", "after_update"))
+async def test_committed_initial_activation_failure_requeues_only_marker_and_drops_sidecar(
+    tmp_path, failure_phase
+):
+    """A committed event cannot strand its raw sidecar when activation fails.
+
+    The after-update case simulates the activation's conditional UPDATE
+    committing before the following delivery readback fails.  That row is
+    briefly ``LEASED`` to its initial owner/token and must still be released
+    as marker-only retry work.
+    """
+    from kestrel_sovereign.privacy import get_privacy_preset
+
+    backend, agent, dispatcher = await _dispatcher(
+        tmp_path / f"volatile-activation-{failure_phase}.db", "did:agent:one"
+    )
+    agent.privacy_config = get_privacy_preset("ephemeral")
+    consumer = DurableConsumerRegistration(
+        consumer_id="workflow-wait", source="provider.message", agent_id=agent.did
+    )
+    secret = f"activation-{failure_phase}-customer@example.com"
+    original_activate = dispatcher._durable_store.activate_initial_delivery
+    original_readback = dispatcher._durable_store._delivery_for_lease_locked
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        if failure_phase == "before_update":
+
+            async def fail_before_activation(**_kwargs):
+                raise RuntimeError("injected activation write failure")
+
+            dispatcher._durable_store.activate_initial_delivery = fail_before_activation
+        else:
+
+            async def fail_after_activation_update(**_kwargs):
+                raise RuntimeError("injected activation readback failure")
+
+            dispatcher._durable_store._delivery_for_lease_locked = (
+                fail_after_activation_update
+            )
+
+        result = await dispatcher.dispatch_signal(
+            _signal(agent_id=agent.did, message=secret),
+            source_event_id=f"volatile-activation-{failure_phase}",
+        )
+        assert result.status is Status.FAILED
+        assert "activation failed after commit" in (result.error or "")
+        assert dispatcher._transient_durable_handoffs == {}
+
+        stored = await dispatcher.list_durable_deliveries(
+            consumer_id=consumer.consumer_id
+        )
+        assert len(stored) == 1
+        assert stored[0].status == RETRY
+        assert stored[0].lease_owner is None
+        assert stored[0].lease_token is None
+        assert stored[0].lease_expires_at is None
+
+        # The injected readback fault is specific to activation; restore the
+        # normal store read path before asserting ordinary marker replay.
+        dispatcher._durable_store._delivery_for_lease_locked = original_readback
+        replay = await dispatcher.claim_durable_delivery(
+            consumer_id=consumer.consumer_id, executor_id="recovery-worker"
+        )
+        assert replay is not None
+        assert replay.event.payload == {"_privacy_gated": "none"}
+        assert secret not in json.dumps(replay.event.payload)
+    finally:
+        dispatcher._durable_store.activate_initial_delivery = original_activate
+        dispatcher._durable_store._delivery_for_lease_locked = original_readback
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_recovers_reservation_that_becomes_stale_after_restart(tmp_path):
+    """A fresh crash is retried after its owner becomes stale, without restart.
+
+    The first recovery pass deliberately leaves the just-crashed owner's
+    reservation alone.  The restarted dispatcher must sweep it on a later
+    owner heartbeat; generic delivery claims continue to ignore the reserved
+    row until that owner-aware recovery makes it marker-only retry work.
+    """
+    path = tmp_path / "volatile-recovery-after-stale.db"
+    backend = SQLiteBackend(str(path))
+    await backend.connect()
+    log_store = SignalLogStore(backend)
+    await log_store.initialize()
+    crashed_store = DurableSignalStore(backend)
+    await crashed_store.initialize()
+    agent = _Agent("did:agent:one")
+    registry = SourceRegistry()
+    registry.register(_registration(agent))
+    dispatcher = SignalDispatcher(
+        agent=agent,
+        registry=registry,
+        lock_manager=OrderedLockManager(),
+        store=log_store,
+        durable_store=DurableSignalStore(backend),
+        runtime_owner_stale_after=timedelta(minutes=2),
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id="workflow-wait", source="provider.message", agent_id=agent.did
+    )
+    crashed_owner = "crashed-dispatcher"
+    try:
+        await crashed_store.register_consumer(consumer)
+        await crashed_store.register_runtime_owner(
+            agent_id=agent.did, owner_id=crashed_owner
+        )
+        marker_event = _signal(agent_id=agent.did)
+        marker_event.payload = {"_privacy_gated": "none"}
+        persisted = await crashed_store.persist_signal(
+            marker_event,
+            agent_id=agent.did,
+            source_event_id="fresh-crash-before-activation",
+            retention_days=7,
+            initial_lease_owner=crashed_owner,
+        )
+        reservation = persisted.initial_reservations[0]
+
+        # This is the immediate restart: the old heartbeat is still fresh, so
+        # startup recovery correctly preserves the unactivated reservation.
+        await dispatcher.initialize_durable_delivery()
+        initial = await crashed_store.get_delivery(
+            agent_id=agent.did,
+            consumer_id=consumer.consumer_id,
+            delivery_id=reservation.delivery_id,
+        )
+        assert initial is not None and initial.status == "initial_reserved"
+        assert await dispatcher.claim_durable_delivery(
+            consumer_id=consumer.consumer_id, executor_id="before-stale"
+        ) is None
+
+        # No second dispatcher restart occurs. Advance the crashed owner's
+        # persisted liveness past the threshold, then drive the same coroutine
+        # the scheduled heartbeat invokes. This avoids a wall-clock sleep while
+        # exercising recovery after the initially-fresh startup pass.
+        stale_at = datetime.now(timezone.utc) - timedelta(minutes=3)
+        await backend.execute(
+            "UPDATE durable_signal_runtime_owners SET heartbeat_at = ? "
+            "WHERE agent_id = ? AND owner_id = ?",
+            (
+                crashed_store.to_timestamp_param(stale_at),
+                agent.did,
+                crashed_owner,
+            ),
+        )
+        await dispatcher._heartbeat_runtime_owner()
+        recovered = await crashed_store.get_delivery(
+            agent_id=agent.did,
+            consumer_id=consumer.consumer_id,
+            delivery_id=reservation.delivery_id,
+        )
+        assert recovered is not None and recovered.status == RETRY
+        replay = await dispatcher.claim_durable_delivery(
+            consumer_id=consumer.consumer_id, executor_id="after-stale"
+        )
+        assert replay is not None
+        assert replay.event.payload == {"_privacy_gated": "none"}
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_partial_durable_init_marks_registered_owner_stopped_on_teardown(tmp_path):
+    """Recovery failure after registration cannot leak a live owner record."""
+    backend = SQLiteBackend(str(tmp_path / "partial-owner-init.db"))
+    await backend.connect()
+    log_store = SignalLogStore(backend)
+    await log_store.initialize()
+    agent = _Agent("did:agent:one")
+    registry = SourceRegistry()
+    registry.register(_registration(agent))
+    dispatcher = SignalDispatcher(
+        agent=agent,
+        registry=registry,
+        lock_manager=OrderedLockManager(),
+        store=log_store,
+    )
+    original_recovery = dispatcher._durable_store.recover_abandoned_initial_reservations
+
+    async def fail_startup_recovery(**_kwargs):
+        raise RuntimeError("injected startup recovery failure")
+
+    dispatcher._durable_store.recover_abandoned_initial_reservations = (
+        fail_startup_recovery
+    )
+    try:
+        with pytest.raises(RuntimeError, match="injected startup recovery failure"):
+            await dispatcher.initialize_durable_delivery()
+        assert dispatcher._durable_initialized is False
+        assert dispatcher._durable_runtime_owner_registered is True
+
+        await dispatcher.shutdown_durable_delivery()
+
+        owner = await backend.fetch_one(
+            "SELECT stopped_at FROM durable_signal_runtime_owners "
+            "WHERE agent_id = ? AND owner_id = ?",
+            (agent.did, dispatcher._durable_delivery_owner),
+        )
+        assert owner is not None and owner[0] is not None
+        assert dispatcher._durable_runtime_owner_registered is False
+    finally:
+        dispatcher._durable_store.recover_abandoned_initial_reservations = (
+            original_recovery
+        )
         await _close(backend, agent)
 
 

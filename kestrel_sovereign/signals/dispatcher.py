@@ -84,6 +84,7 @@ import os
 import secrets
 import time
 from collections import deque
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
@@ -215,6 +216,9 @@ class _TransientDurableHandoff:
     created_at: datetime
     retention_until: datetime
     expires_at: datetime
+    # Kept as the historical field name for in-process test/embedding
+    # compatibility. It is a reservation capability until post-commit
+    # activation, never a pre-commit lease token.
     initial_lease_token: Optional[str] = None
 
 
@@ -393,6 +397,7 @@ class SignalDispatcher:
         durable_store: Optional[DurableSignalStore] = None,
         ttl: int = DEFAULT_TTL,
         coalescing_window_default: timedelta = DEFAULT_COALESCING_WINDOW,
+        runtime_owner_stale_after: timedelta = timedelta(minutes=2),
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         self._agent = agent
@@ -405,7 +410,18 @@ class SignalDispatcher:
         # retaining one database transaction domain for each agent.
         self._durable_store = durable_store or DurableSignalStore(store.backend)
         self._durable_initialized = False
+        # ``initialize_durable_delivery`` registers this owner before its
+        # startup recovery runs.  Keep that fact separate from full
+        # initialization: recovery itself can fail, and boot rollback must
+        # still mark the partly-registered owner stopped before storage closes.
+        self._durable_runtime_owner_registered = False
         self._durable_init_lock = asyncio.Lock()
+        if runtime_owner_stale_after.total_seconds() <= 0:
+            raise ValueError("runtime_owner_stale_after must be positive")
+        self._runtime_owner_stale_after = runtime_owner_stale_after
+        self._runtime_owner_heartbeat_timer: Optional[asyncio.TimerHandle] = None
+        self._runtime_owner_heartbeat_task: Optional[asyncio.Task] = None
+        self._durable_shutdown = False
         # This is intentionally dispatcher-local.  It is not a second durable
         # queue and must disappear on shutdown/restart; ``delivery_id`` is
         # globally unique and every dispatcher owns exactly one agent scope.
@@ -419,11 +435,12 @@ class SignalDispatcher:
         # between those points, not see the uncommitted row, and mistakenly
         # discard the valid raw sidecar.
         self._transient_durable_initial_claim_lock = asyncio.Lock()
-        # This opaque process-local identity is persisted only as a delivery
-        # lease owner.  Its matching lease token remains in the live sidecar,
-        # so another dispatcher sharing this database cannot consume an
-        # initial payload-elided delivery before this instance can hand it to
-        # its worker.
+        # This opaque runtime generation is persisted as the initial
+        # reservation owner. Its matching capability remains in the live
+        # sidecar, so another dispatcher sharing this database cannot consume
+        # an initial payload-elided delivery before this instance activates and
+        # hands it to its worker. A separate runtime heartbeat makes startup
+        # recovery distinguish a crashed owner from a concurrent live one.
         self._durable_delivery_owner = f"dispatcher:{secrets.token_urlsafe(24)}"
         self._ttl = ttl
         self._default_window = coalescing_window_default
@@ -536,7 +553,17 @@ class SignalDispatcher:
         async with self._durable_init_lock:
             if not self._durable_initialized:
                 await self._durable_store.initialize()
+                await self._durable_store.register_runtime_owner(
+                    agent_id=self._agent.did,
+                    owner_id=self._durable_delivery_owner,
+                )
+                self._durable_runtime_owner_registered = True
+                # Registration can wait behind another database writer.  Do
+                # not carry a pre-wait timestamp into recovery: that could
+                # immediately classify an otherwise live owner as stale.
+                await self._recover_abandoned_initial_reservations()
                 self._durable_initialized = True
+                self._schedule_runtime_owner_heartbeat()
 
     async def register_durable_consumer(
         self, registration: DurableConsumerRegistration
@@ -567,12 +594,13 @@ class SignalDispatcher:
         if delivery is not None:
             return self._delivery_with_transient_handoff(delivery)
 
-        # A payload-elided event is initially LEASED, rather than pending, in
-        # the transaction that writes its durable privacy marker.  Ordinary
-        # claims above therefore cannot race ahead of the emitting dispatcher
-        # while its process-local sidecar is installed.  Only this dispatcher,
-        # which holds the reservation token outside the durable payload, may
-        # transfer it to the requested worker.
+        # A payload-elided event is initially an unclaimable reservation in
+        # the transaction that writes its durable privacy marker. It becomes a
+        # real owner lease only after that transaction commits. Ordinary claims
+        # above therefore cannot race ahead of the emitting dispatcher while
+        # its process-local sidecar is installed. Only this dispatcher, which
+        # holds the reservation capability outside the durable payload, may
+        # transfer the activated lease to the requested worker.
         async with self._transient_durable_initial_claim_lock:
             # A prior local claimant may have transferred the reservation while
             # this claimant waited. Re-read the sidecar state inside the lock;
@@ -696,12 +724,204 @@ class SignalDispatcher:
         self._discard_expired_transient_durable_handoffs()
         return purged
 
+    async def shutdown_durable_delivery(self) -> None:
+        """Discard live raw sidecars, then release unactivated reservations."""
+        self._durable_shutdown = True
+        await self._stop_runtime_owner_heartbeat()
+        async with self._transient_durable_initial_claim_lock:
+            # Drop the raw capability before the durable state becomes retry
+            # work. A concurrent worker can therefore receive only the marker
+            # once shutdown releases an unactivated reservation.
+            for timer in self._transient_durable_handoff_timers.values():
+                timer.cancel()
+            self._transient_durable_handoff_timers.clear()
+            self._transient_durable_handoffs.clear()
+            if self._durable_runtime_owner_registered:
+                await self._durable_store.release_initial_reservations(
+                    agent_id=self._agent.did,
+                    owner_id=self._durable_delivery_owner,
+                )
+                self._durable_runtime_owner_registered = False
+
     def shutdown(self) -> None:
-        """Discard non-durable live payload handoffs before agent teardown."""
+        """Compatibility teardown for embeddings that cannot await shutdown.
+
+        Production agent shutdown uses :meth:`shutdown_durable_delivery` and
+        awaits the owner-scoped durable release. This legacy synchronous seam
+        still drops raw sidecars immediately and schedules the same release on
+        the agent-owned task tracker when an event loop is available.
+        """
+        if self._durable_shutdown:
+            return
+        self._durable_shutdown = True
+        if self._runtime_owner_heartbeat_timer is not None:
+            self._runtime_owner_heartbeat_timer.cancel()
+            self._runtime_owner_heartbeat_timer = None
+        if self._runtime_owner_heartbeat_task is not None:
+            self._runtime_owner_heartbeat_task.cancel()
+            self._runtime_owner_heartbeat_task = None
+        if self._durable_runtime_owner_registered:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                logger.warning(
+                    "Could not schedule durable initial-reservation release "
+                    "during synchronous dispatcher shutdown"
+                )
+            else:
+                self._agent._track_background_task(
+                    self._durable_store.release_initial_reservations(
+                        agent_id=self._agent.did,
+                        owner_id=self._durable_delivery_owner,
+                    ),
+                    name=f"durable_signal_owner_release:{self._agent.did}",
+                )
+                self._durable_runtime_owner_registered = False
         for timer in self._transient_durable_handoff_timers.values():
             timer.cancel()
         self._transient_durable_handoff_timers.clear()
         self._transient_durable_handoffs.clear()
+
+    async def _activate_transient_reservations(self, persisted) -> None:
+        """Activate post-commit reservations without stranding raw sidecars.
+
+        ``persist_signal`` has committed before this method runs.  An
+        activation can therefore fail after the event exists, including after
+        its conditional state update commits but before its readback returns.
+        Each failed handoff must consequently drop its raw sidecar and turn
+        only that owner/token-bound initial capability into marker-only retry
+        work.  Continue cleaning later reservations before surfacing failure
+        so a multi-consumer event cannot leave an earlier raw sidecar behind.
+        """
+        activation_errors: list[Exception] = []
+        for reservation in persisted.initial_reservations:
+            handoff = self._transient_durable_handoffs.get(reservation.delivery_id)
+            try:
+                if handoff is None:
+                    raise RuntimeError("initial reservation sidecar is unavailable")
+                delivery = await self._durable_store.activate_initial_delivery(
+                    agent_id=self._agent.did,
+                    consumer_id=reservation.consumer_id,
+                    delivery_id=reservation.delivery_id,
+                    initial_lease_owner=self._durable_delivery_owner,
+                    initial_lease_token=reservation.reservation_token,
+                )
+                if delivery is None or delivery.lease_expires_at is None:
+                    raise RuntimeError("initial reservation could not be activated")
+            except Exception as exc:
+                # Discard the process-local capability before publishing its
+                # marker as retryable work.  ``abandon_initial_reservation``
+                # also recognizes the owner/token-bound LEASED state, which
+                # covers an activation update that committed before readback
+                # raised.
+                self._discard_transient_durable_handoff(reservation.delivery_id)
+                try:
+                    abandoned = await self._durable_store.abandon_initial_reservation(
+                        agent_id=self._agent.did,
+                        consumer_id=reservation.consumer_id,
+                        delivery_id=reservation.delivery_id,
+                        owner_id=self._durable_delivery_owner,
+                        reservation_token=reservation.reservation_token,
+                    )
+                    if not abandoned:
+                        logger.warning(
+                            "Initial durable reservation %s was no longer "
+                            "owned while cleaning an activation failure",
+                            reservation.delivery_id,
+                        )
+                except Exception as cleanup_exc:
+                    logger.exception(
+                        "Could not requeue committed initial reservation %s "
+                        "after activation failure",
+                        reservation.delivery_id,
+                    )
+                    activation_errors.append(cleanup_exc)
+                activation_errors.append(exc)
+                continue
+            handoff.expires_at = min(
+                handoff.retention_until, delivery.lease_expires_at
+            )
+            self._schedule_transient_durable_handoff_expiry(
+                reservation.delivery_id, handoff.expires_at
+            )
+        if activation_errors:
+            raise RuntimeError(
+                "Durable event committed, but one or more initial "
+                "reservations could not be activated"
+            ) from activation_errors[0]
+
+    def _schedule_runtime_owner_heartbeat(self) -> None:
+        """Keep owner liveness separate from delivery lease countdowns."""
+        if self._durable_shutdown:
+            return
+        if self._runtime_owner_heartbeat_timer is not None:
+            self._runtime_owner_heartbeat_timer.cancel()
+        interval = max(0.01, self._runtime_owner_stale_after.total_seconds() / 3)
+        self._runtime_owner_heartbeat_timer = asyncio.get_running_loop().call_later(
+            interval, self._start_runtime_owner_heartbeat
+        )
+
+    async def _stop_runtime_owner_heartbeat(self) -> None:
+        """Cancel and drain owner liveness work before closing its store.
+
+        A timer may already have spawned its agent-owned task when boot starts
+        rolling back.  Merely cancelling the next ``TimerHandle`` leaves that
+        in-flight task free to touch storage after the rollback has closed it.
+        """
+        if self._runtime_owner_heartbeat_timer is not None:
+            self._runtime_owner_heartbeat_timer.cancel()
+            self._runtime_owner_heartbeat_timer = None
+        task = self._runtime_owner_heartbeat_task
+        self._runtime_owner_heartbeat_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    def _start_runtime_owner_heartbeat(self) -> None:
+        self._runtime_owner_heartbeat_timer = None
+        if self._durable_shutdown:
+            return
+        task = self._agent._track_background_task(
+            self._heartbeat_runtime_owner(),
+            name=f"durable_signal_owner_heartbeat:{self._agent.did}",
+        )
+        self._runtime_owner_heartbeat_task = task
+        task.add_done_callback(self._finish_runtime_owner_heartbeat)
+
+    async def _heartbeat_runtime_owner(self) -> None:
+        await self._durable_store.heartbeat_runtime_owner(
+            agent_id=self._agent.did,
+            owner_id=self._durable_delivery_owner,
+        )
+        # Startup cannot know whether a recently crashed runtime will cross
+        # the stale threshold moments later.  Sweep on every owner heartbeat
+        # so such unactivated reservations eventually become marker-only
+        # retry work without another process restart.
+        await self._recover_abandoned_initial_reservations()
+
+    async def _recover_abandoned_initial_reservations(self) -> int:
+        """Requeue stale foreign initial reservations for this tenant."""
+        recovery_now = datetime.now(timezone.utc)
+        return await self._durable_store.recover_abandoned_initial_reservations(
+            agent_id=self._agent.did,
+            recovering_owner_id=self._durable_delivery_owner,
+            stale_before=recovery_now - self._runtime_owner_stale_after,
+            now=recovery_now,
+        )
+
+    def _finish_runtime_owner_heartbeat(self, task: asyncio.Task) -> None:
+        if self._runtime_owner_heartbeat_task is task:
+            self._runtime_owner_heartbeat_task = None
+        if self._durable_shutdown:
+            return
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception:
+            logger.exception("Durable signal runtime-owner heartbeat failed")
+        self._schedule_runtime_owner_heartbeat()
 
     def _discard_expired_transient_durable_handoffs(self) -> None:
         """Drop raw payloads after their live lease or retention deadline."""
@@ -977,29 +1197,29 @@ class SignalDispatcher:
                     retention_until = persisted.retention_until or datetime.now(
                         timezone.utc
                     )
-                    for lease in persisted.initial_leases:
-                        self._transient_durable_handoffs[lease.delivery_id] = (
+                    for reservation in persisted.initial_reservations:
+                        self._transient_durable_handoffs[reservation.delivery_id] = (
                             _TransientDurableHandoff(
                                 payload=copy.deepcopy(transient_payload),
-                                consumer_id=lease.consumer_id,
-                                created_at=lease.created_at,
+                                consumer_id=reservation.consumer_id,
+                                created_at=reservation.created_at,
                                 retention_until=retention_until,
-                                expires_at=min(
-                                    retention_until, lease.lease_expires_at
+                                # Do not start any volatile lease countdown
+                                # before the event commit. Post-commit
+                                # activation replaces this retention bound with
+                                # the actual lease deadline.
+                                expires_at=retention_until,
+                                initial_lease_token=(
+                                    reservation.reservation_token
                                 ),
-                                initial_lease_token=lease.lease_token,
                             )
-                        )
-                        self._schedule_transient_durable_handoff_expiry(
-                            lease.delivery_id,
-                            self._transient_durable_handoffs[
-                                lease.delivery_id
-                            ].expires_at,
                         )
 
                 def discard_rolled_back_handoffs(persisted) -> None:
-                    for lease in persisted.initial_leases:
-                        self._discard_transient_durable_handoff(lease.delivery_id)
+                    for reservation in persisted.initial_reservations:
+                        self._discard_transient_durable_handoff(
+                            reservation.delivery_id
+                        )
 
                 persistence_kwargs = {
                     "agent_id": self._agent.did,
@@ -1038,6 +1258,32 @@ class SignalDispatcher:
                             durable_projection.signal,
                             **persistence_kwargs,
                         )
+                        if persisted.created:
+                            try:
+                                await self._activate_transient_reservations(persisted)
+                            except Exception as exc:
+                                # The event transaction has already committed.
+                                # _activate_transient_reservations has dropped
+                                # every unresolved raw sidecar and converted
+                                # its owner/token-bound reservation to a
+                                # marker-only retry, so this is materially
+                                # different from a failed persistence.
+                                logger.exception(
+                                    "Durable signal event %s committed but "
+                                    "initial delivery activation failed",
+                                    signal.id,
+                                )
+                                return self._fail(
+                                    signal,
+                                    start,
+                                    Status.FAILED,
+                                    error=(
+                                        "Durable signal delivery activation "
+                                        "failed after commit: "
+                                        f"{type(exc).__name__}: {exc}"
+                                    ),
+                                    registration=registration,
+                                )
                 else:
                     persisted = await self._durable_store.persist_signal(
                         durable_projection.signal,

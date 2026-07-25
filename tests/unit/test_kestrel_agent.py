@@ -42,6 +42,23 @@ def _no_confirm_evaluate():
     return MagicMock(side_effect=lambda m: PrivacyTransitionDecision(target=m, requires_confirmation=False))
 
 
+def _durable_backend_double() -> MagicMock:
+    """Provide the transactional backend contract used during signal boot."""
+    backend = MagicMock()
+    backend.backend_type = "sqlite"
+    backend.execute_script = AsyncMock()
+    backend.execute = AsyncMock(return_value=1)
+    backend.fetch_one = AsyncMock(return_value=None)
+    backend.fetch_all = AsyncMock(return_value=[])
+
+    @contextlib.asynccontextmanager
+    async def transaction():
+        yield
+
+    backend.transaction = transaction
+    return backend
+
+
 def _mandatory_feature_double(
     feature_name: str,
     *,
@@ -107,6 +124,7 @@ async def _initialize_with_features(
                     mock_storage.get_node = AsyncMock(return_value=None)
                     mock_storage.add_node = AsyncMock()
                     mock_storage.db = MagicMock()
+                    mock_storage._backend = _durable_backend_double()
                     MockStorage.return_value = mock_storage
 
                     mock_memory_system = AsyncMock()
@@ -2125,6 +2143,7 @@ class TestInitialize:
                         mock_storage_instance.get_node = AsyncMock(return_value=None)
                         mock_storage_instance.add_node = AsyncMock()
                         mock_storage_instance.db = MagicMock()
+                        mock_storage_instance._backend = _durable_backend_double()
                         MockStorage.return_value = mock_storage_instance
 
                         mock_memory_system = AsyncMock()
@@ -2167,6 +2186,7 @@ class TestInitialize:
                         mock_storage_instance.get_node = AsyncMock(return_value=None)
                         mock_storage_instance.add_node = AsyncMock()
                         mock_storage_instance.db = MagicMock()
+                        mock_storage_instance._backend = _durable_backend_double()
                         MockStorage.return_value = mock_storage_instance
 
                         mock_memory_system = AsyncMock()
@@ -2203,6 +2223,7 @@ class TestInitialize:
                         mock_storage.get_node = AsyncMock(return_value=None)
                         mock_storage.add_node = AsyncMock()
                         mock_storage.db = MagicMock()
+                        mock_storage._backend = _durable_backend_double()
                         MockStorage.return_value = mock_storage
 
                         mock_memory_system = AsyncMock()
@@ -2240,6 +2261,7 @@ class TestInitialize:
                         mock_storage.get_node = AsyncMock(return_value=None)  # No existing node
                         mock_storage.add_node = AsyncMock()
                         mock_storage.db = MagicMock()
+                        mock_storage._backend = _durable_backend_double()
                         MockStorage.return_value = mock_storage
 
                         mock_memory_system = AsyncMock()
@@ -2296,6 +2318,7 @@ class TestInitialize:
                         mock_storage.get_node = AsyncMock(return_value=None)
                         mock_storage.add_node = AsyncMock()
                         mock_storage.db = MagicMock()
+                        mock_storage._backend = _durable_backend_double()
                         MockStorage.return_value = mock_storage
 
                         mock_memory_system = AsyncMock()

@@ -29,6 +29,7 @@ from kestrel_sovereign.storage.db.interface import DatabaseBackend
 
 
 PENDING = "pending"
+INITIAL_RESERVED = "initial_reserved"
 LEASED = "leased"
 RETRY = "retry"
 ACKNOWLEDGED = "acknowledged"
@@ -90,33 +91,33 @@ class DurableEventPersistence:
     for the same source and agent/tenant.  The original ``event_id`` is
     returned so callers can record a useful audit result without creating a
     duplicate delivery.  ``delivery_ids`` identifies only the initial
-    deliveries inserted by this persistence transaction.  ``initial_leases``
-    is populated only for a payload-elided live dispatch: those rows were
-    atomically reserved to the emitting dispatcher before commit, so another
-    worker cannot claim the marker-only delivery during the sidecar handoff.
+    deliveries inserted by this persistence transaction.
+    ``initial_reservations`` is populated only for a payload-elided live
+    dispatch: those rows are atomically reserved to the emitting dispatcher
+    before commit, but deliberately have no delivery lease deadline until the
+    dispatcher activates them after the commit is visible.
     """
 
     event_id: str
     created: bool
     delivery_ids: tuple[str, ...] = ()
     retention_until: Optional[datetime] = None
-    initial_leases: tuple["DurableInitialDeliveryLease", ...] = ()
+    initial_reservations: tuple["DurableInitialDeliveryReservation", ...] = ()
 
 
 @dataclass(frozen=True)
-class DurableInitialDeliveryLease:
-    """An initial live-delivery reservation created with its event row.
+class DurableInitialDeliveryReservation:
+    """A non-claimable initial reservation created with its event row.
 
-    The token is a lease capability, never user payload.  It lets the
-    emitting dispatcher transfer this reservation to its chosen executor
-    without exposing a newly committed marker-only delivery to another store
-    instance first.
+    The token is a reservation capability, never user payload.  It lets the
+    emitting dispatcher activate this row *after* commit, then transfer the
+    resulting live lease to its chosen executor without exposing a newly
+    committed marker-only delivery to another store instance first.
     """
 
     delivery_id: str
     consumer_id: str
-    lease_token: str
-    lease_expires_at: datetime
+    reservation_token: str
     created_at: datetime
 
 
@@ -171,6 +172,7 @@ class DurableSignalStore(UnifiedStoreBase):
     EVENTS = "durable_signal_events"
     CONSUMERS = "durable_signal_consumers"
     DELIVERIES = "durable_signal_deliveries"
+    RUNTIME_OWNERS = "durable_signal_runtime_owners"
 
     def __init__(self, backend: DatabaseBackend):
         # ``SignalLogStore`` historically accepts the ``AsyncDatabase``
@@ -251,6 +253,16 @@ class DurableSignalStore(UnifiedStoreBase):
                     REFERENCES {self.CONSUMERS}(agent_id, consumer_id)
                     ON DELETE RESTRICT
             );
+
+            CREATE TABLE IF NOT EXISTS {self.RUNTIME_OWNERS} (
+                agent_id TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                heartbeat_at {ts_type} NOT NULL,
+                stopped_at {ts_type},
+                created_at {ts_type} {ts_default},
+                updated_at {ts_type} {ts_default},
+                PRIMARY KEY (agent_id, owner_id)
+            );
             """
         )
         await self._backend.execute(
@@ -264,6 +276,10 @@ class DurableSignalStore(UnifiedStoreBase):
         await self._backend.execute(
             f"CREATE INDEX IF NOT EXISTS idx_{self.DELIVERIES}_lease "
             f"ON {self.DELIVERIES}(agent_id, consumer_id, lease_expires_at)"
+        )
+        await self._backend.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{self.RUNTIME_OWNERS}_liveness "
+            f"ON {self.RUNTIME_OWNERS}(agent_id, heartbeat_at, stopped_at)"
         )
 
     # ------------------------------------------------------------------
@@ -368,13 +384,16 @@ class DurableSignalStore(UnifiedStoreBase):
         argument unset so initial and replayed selector behavior is identical.
 
         ``initial_lease_owner`` reserves each initially matched delivery to
-        one live dispatcher in the same transaction as the event insert.  The
-        dispatcher installs its process-local raw-payload sidecars through
-        ``before_commit`` before this transaction becomes visible.  A rollback
-        invokes ``on_rollback`` so those sidecars cannot outlive rows that did
-        not commit.  Both callbacks are synchronous deliberately: yielding
-        between installing the sidecar and committing would reopen the very
-        visibility race this handoff closes.
+        one live dispatcher in the same transaction as the event insert.  It
+        creates an ``INITIAL_RESERVED`` capability, not a lease: there is no
+        countdown to expire before the transaction is visible.  The dispatcher
+        installs its process-local raw-payload sidecars through
+        ``before_commit`` before this transaction becomes visible, then
+        activates the reservation after this method returns from commit.  A
+        rollback invokes ``on_rollback`` so those sidecars cannot outlive rows
+        that did not commit.  Both callbacks are synchronous deliberately:
+        yielding between installing the sidecar and committing would reopen
+        the very visibility race this handoff closes.
         """
         if retention_days < 0:
             raise ValueError("retention_days must be >= 0")
@@ -448,93 +467,39 @@ class DurableSignalStore(UnifiedStoreBase):
                     else replace(event, payload=transient_selector_payload)
                 )
                 delivery_ids: list[str] = []
-                initial_lease_specs: list[tuple[str, str, str, int]] = []
+                initial_reservations: list[DurableInitialDeliveryReservation] = []
                 for consumer_id, selector, max_attempts, lease_seconds in consumer_rows:
                     if not self._matches_selector(selector_event, selector):
                         continue
-                    lease_token = None
-                    lease_expires_at = None
+                    reservation_token = None
                     if initial_lease_owner is not None:
-                        lease_token = secrets.token_urlsafe(24)
-                        lease_expires_at = now + timedelta(seconds=int(lease_seconds))
+                        reservation_token = secrets.token_urlsafe(24)
                     delivery_id = await self._insert_delivery_locked(
                         agent_id=agent_id,
                         consumer_id=consumer_id,
                         event_id=signal.id,
                         max_attempts=int(max_attempts),
                         now=now,
-                        initial_lease_owner=initial_lease_owner,
-                        initial_lease_token=lease_token,
-                        initial_lease_expires_at=lease_expires_at,
+                        initial_reservation_owner=initial_lease_owner,
+                        initial_reservation_token=reservation_token,
                     )
                     if delivery_id is not None:
                         delivery_ids.append(delivery_id)
-                        if lease_token is not None and lease_expires_at is not None:
-                            initial_lease_specs.append(
-                                (
-                                    delivery_id,
-                                    consumer_id,
-                                    lease_token,
-                                    int(lease_seconds),
+                        if reservation_token is not None:
+                            initial_reservations.append(
+                                DurableInitialDeliveryReservation(
+                                    delivery_id=delivery_id,
+                                    consumer_id=consumer_id,
+                                    reservation_token=reservation_token,
+                                    created_at=now,
                                 )
                             )
-
-                # The provisional lease values above are private to this
-                # transaction. Refresh them immediately before the synchronous
-                # pre-commit sidecar callback, after consumer matching and
-                # delivery materialization. Thus lock contention cannot make a
-                # newly committed initial reservation already expired.
-                initial_leases: list[DurableInitialDeliveryLease] = []
-                if initial_lease_specs:
-                    reservation_now = self.now_utc()
-                    for (
-                        delivery_id,
-                        consumer_id,
-                        lease_token,
-                        lease_seconds,
-                    ) in initial_lease_specs:
-                        lease_expires_at = reservation_now + timedelta(
-                            seconds=lease_seconds
-                        )
-                        refreshed = await self._backend.execute(
-                            f"""
-                            UPDATE {self.DELIVERIES}
-                            SET lease_expires_at = ?, updated_at = ?
-                            WHERE delivery_id = ? AND agent_id = ?
-                              AND consumer_id = ? AND status = ?
-                              AND lease_owner = ? AND lease_token = ?
-                            """,
-                            (
-                                self.to_timestamp_param(lease_expires_at),
-                                self.to_timestamp_param(reservation_now),
-                                delivery_id,
-                                agent_id,
-                                consumer_id,
-                                LEASED,
-                                initial_lease_owner,
-                                lease_token,
-                            ),
-                        )
-                        if refreshed != 1:
-                            raise RuntimeError(
-                                "initial durable delivery reservation disappeared "
-                                "before commit"
-                            )
-                        initial_leases.append(
-                            DurableInitialDeliveryLease(
-                                delivery_id=delivery_id,
-                                consumer_id=consumer_id,
-                                lease_token=lease_token,
-                                lease_expires_at=lease_expires_at,
-                                created_at=reservation_now,
-                            )
-                        )
                 persistence = DurableEventPersistence(
                     event_id=signal.id,
                     created=True,
                     delivery_ids=tuple(delivery_ids),
                     retention_until=retention_until,
-                    initial_leases=tuple(initial_leases),
+                    initial_reservations=tuple(initial_reservations),
                 )
                 if before_commit is not None:
                     before_commit(persistence)
@@ -646,12 +611,14 @@ class DurableSignalStore(UnifiedStoreBase):
         executor_id: str,
         now: Optional[datetime] = None,
     ) -> Optional[DurableDelivery]:
-        """Transfer one emitting-dispatcher's initial reservation to a worker.
+        """Transfer one activated emitting-dispatcher lease to a worker.
 
-        Initial payload-elided deliveries are inserted as ``LEASED`` before
-        their event transaction commits.  A normal claimant cannot see them as
-        due.  Only the dispatcher holding this unpersisted capability may make
-        the first worker claim; after that, ordinary retry/lease rules apply.
+        An initial reservation first becomes a real ``LEASED`` row through
+        :meth:`activate_initial_delivery`, which runs only after the event
+        transaction has committed.  A normal claimant cannot claim either the
+        reservation or the activated owner lease.  Only the dispatcher holding
+        this unpersisted capability may make the first worker claim; after
+        that, ordinary retry/lease rules apply.
         """
         self._require_nonempty("agent_id", agent_id)
         self._require_nonempty("consumer_id", consumer_id)
@@ -659,35 +626,58 @@ class DurableSignalStore(UnifiedStoreBase):
         self._require_nonempty("initial_lease_owner", initial_lease_owner)
         self._require_nonempty("initial_lease_token", initial_lease_token)
         self._require_nonempty("executor_id", executor_id)
-        now = _as_utc(now or self.now_utc())
         consumer = await self._get_consumer(agent_id, consumer_id)
         if consumer is None or not consumer[4]:
             return None
-        lease_token = secrets.token_urlsafe(24)
-        lease_expires_at = now + timedelta(seconds=int(consumer[3]))
-        updated = await self._backend.execute(
-            f"""
-            UPDATE {self.DELIVERIES}
-            SET attempts = attempts + 1, lease_owner = ?, lease_token = ?,
-                lease_expires_at = ?, next_attempt_at = NULL, updated_at = ?
-            WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
-              AND status = ? AND lease_owner = ? AND lease_token = ?
-              AND lease_expires_at > ?
-            """,
-            (
-                executor_id,
-                lease_token,
-                self.to_timestamp_param(lease_expires_at),
-                self.to_timestamp_param(now),
-                agent_id,
-                consumer_id,
-                delivery_id,
-                LEASED,
-                initial_lease_owner,
-                initial_lease_token,
-                self.to_timestamp_param(now),
-            ),
-        )
+        requested_now = _as_utc(now) if now is not None else None
+        async with self._backend.transaction():
+            # Acquire the delivery's write/row serialization point before
+            # observing time.  SQLite transactions begin deferred, so the
+            # targeted no-op update reserves the actual writer slot; PostgreSQL
+            # locks this row with ``FOR UPDATE``.  Sampling first can publish a
+            # worker lease that has already expired while waiting here.
+            initial = await self._lock_initial_delivery_transfer(
+                agent_id=agent_id,
+                consumer_id=consumer_id,
+                delivery_id=delivery_id,
+            )
+            if initial is None:
+                return None
+            status, owner, token, expires_at = initial
+            transfer_now = requested_now or self.now_utc()
+            if (
+                status != LEASED
+                or owner != initial_lease_owner
+                or token != initial_lease_token
+                or expires_at is None
+                or _as_utc(self.from_timestamp_field(expires_at)) <= transfer_now
+            ):
+                return None
+            lease_token = secrets.token_urlsafe(24)
+            lease_expires_at = transfer_now + timedelta(seconds=int(consumer[3]))
+            updated = await self._backend.execute(
+                f"""
+                UPDATE {self.DELIVERIES}
+                SET attempts = attempts + 1, lease_owner = ?, lease_token = ?,
+                    lease_expires_at = ?, next_attempt_at = NULL, updated_at = ?
+                WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
+                  AND status = ? AND lease_owner = ? AND lease_token = ?
+                  AND lease_expires_at > ?
+                """,
+                (
+                    executor_id,
+                    lease_token,
+                    self.to_timestamp_param(lease_expires_at),
+                    self.to_timestamp_param(transfer_now),
+                    agent_id,
+                    consumer_id,
+                    delivery_id,
+                    LEASED,
+                    initial_lease_owner,
+                    initial_lease_token,
+                    self.to_timestamp_param(transfer_now),
+                ),
+            )
         if updated == 0:
             return None
         return await self._delivery_for_lease_locked(
@@ -695,6 +685,274 @@ class DurableSignalStore(UnifiedStoreBase):
             consumer_id=consumer_id,
             lease_token=lease_token,
         )
+
+    async def activate_initial_delivery(
+        self,
+        *,
+        agent_id: str,
+        consumer_id: str,
+        delivery_id: str,
+        initial_lease_owner: str,
+        initial_lease_token: str,
+        now: Optional[datetime] = None,
+    ) -> Optional[DurableDelivery]:
+        """Start a reservation's first real lease after its event commits.
+
+        ``persist_signal`` inserts an ``INITIAL_RESERVED`` row with no lease
+        deadline.  This conditional transition is intentionally a separate
+        post-commit operation: it is the first place a live lease countdown is
+        calculated, so a paused commit can never publish an already-expired
+        delivery.  The runtime-owner heartbeat and this transition share a
+        transaction so stale-owner recovery cannot take a live emitter that is
+        actively activating its own reservation.
+        """
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("consumer_id", consumer_id)
+        self._require_nonempty("delivery_id", delivery_id)
+        self._require_nonempty("initial_lease_owner", initial_lease_owner)
+        self._require_nonempty("initial_lease_token", initial_lease_token)
+        consumer = await self._get_consumer(agent_id, consumer_id)
+        if consumer is None or not consumer[4]:
+            return None
+        requested_now = _as_utc(now) if now is not None else None
+        async with self._backend.transaction():
+            # The transaction may wait behind a real database writer. Sample
+            # time only after that contention has cleared and immediately
+            # before the activation write; this is the first live delivery
+            # deadline and must not inherit any pre-commit delay.
+            activation_now = requested_now or self.now_utc()
+            await self._touch_runtime_owner_locked(
+                agent_id=agent_id,
+                owner_id=initial_lease_owner,
+                now=activation_now,
+            )
+            activation_now = requested_now or self.now_utc()
+            lease_expires_at = activation_now + timedelta(
+                seconds=int(consumer[3])
+            )
+            updated = await self._backend.execute(
+                f"""
+                UPDATE {self.DELIVERIES}
+                SET status = ?, lease_expires_at = ?, updated_at = ?
+                WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
+                  AND status = ? AND lease_owner = ? AND lease_token = ?
+                  AND lease_expires_at IS NULL
+                """,
+                (
+                    LEASED,
+                    self.to_timestamp_param(lease_expires_at),
+                    self.to_timestamp_param(activation_now),
+                    agent_id,
+                    consumer_id,
+                    delivery_id,
+                    INITIAL_RESERVED,
+                    initial_lease_owner,
+                    initial_lease_token,
+                ),
+            )
+        if updated == 0:
+            return None
+        return await self._delivery_for_lease_locked(
+            agent_id=agent_id,
+            consumer_id=consumer_id,
+            lease_token=initial_lease_token,
+        )
+
+    async def register_runtime_owner(
+        self,
+        *,
+        agent_id: str,
+        owner_id: str,
+        now: Optional[datetime] = None,
+    ) -> None:
+        """Record a live dispatcher generation before it can reserve work."""
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("owner_id", owner_id)
+        requested_now = _as_utc(now) if now is not None else None
+        async with self._backend.transaction():
+            # Entering this transaction may wait behind a real writer.  A
+            # default timestamp is liveness evidence, so sample it only after
+            # that contention clears rather than publishing an old heartbeat.
+            touch_now = requested_now or self.now_utc()
+            await self._touch_runtime_owner_locked(
+                agent_id=agent_id, owner_id=owner_id, now=touch_now
+            )
+
+    async def heartbeat_runtime_owner(
+        self,
+        *,
+        agent_id: str,
+        owner_id: str,
+        now: Optional[datetime] = None,
+    ) -> None:
+        """Refresh one dispatcher generation's liveness record."""
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("owner_id", owner_id)
+        requested_now = _as_utc(now) if now is not None else None
+        async with self._backend.transaction():
+            # See register_runtime_owner: a heartbeat taken before waiting on
+            # this transaction is not trustworthy liveness evidence.
+            touch_now = requested_now or self.now_utc()
+            await self._touch_runtime_owner_locked(
+                agent_id=agent_id, owner_id=owner_id, now=touch_now
+            )
+
+    async def release_initial_reservations(
+        self,
+        *,
+        agent_id: str,
+        owner_id: str,
+        now: Optional[datetime] = None,
+    ) -> int:
+        """Gracefully turn this runtime's unactivated rows into marker replay.
+
+        This is deliberately scoped to one runtime owner.  A concurrent live
+        dispatcher cannot release another emitter's raw-payload reservation.
+        """
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("owner_id", owner_id)
+        now = _as_utc(now or self.now_utc())
+        async with self._backend.transaction():
+            released = await self._backend.execute(
+                f"""
+                UPDATE {self.DELIVERIES}
+                SET status = ?, lease_owner = NULL, lease_token = NULL,
+                    lease_expires_at = NULL, next_attempt_at = ?,
+                    last_error = 'initial reservation owner stopped before activation',
+                    updated_at = ?
+                WHERE agent_id = ? AND status = ? AND lease_owner = ?
+                """,
+                (
+                    RETRY,
+                    self.to_timestamp_param(now),
+                    self.to_timestamp_param(now),
+                    agent_id,
+                    INITIAL_RESERVED,
+                    owner_id,
+                ),
+            )
+            await self._backend.execute(
+                f"""
+                UPDATE {self.RUNTIME_OWNERS}
+                SET heartbeat_at = ?, stopped_at = ?, updated_at = ?
+                WHERE agent_id = ? AND owner_id = ?
+                """,
+                (
+                    self.to_timestamp_param(now),
+                    self.to_timestamp_param(now),
+                    self.to_timestamp_param(now),
+                    agent_id,
+                    owner_id,
+                ),
+            )
+        return released
+
+    async def abandon_initial_reservation(
+        self,
+        *,
+        agent_id: str,
+        consumer_id: str,
+        delivery_id: str,
+        owner_id: str,
+        reservation_token: str,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        """Release one initial capability whose raw handoff cannot complete.
+
+        The owner/token pair identifies both an unactivated reservation and
+        its just-activated first lease.  The latter case is possible only if
+        the activation write committed before its readback failed; no worker
+        can own it yet because the dispatcher still holds its local handoff
+        lock.  Both forms must become marker-only retry work.
+        """
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("consumer_id", consumer_id)
+        self._require_nonempty("delivery_id", delivery_id)
+        self._require_nonempty("owner_id", owner_id)
+        self._require_nonempty("reservation_token", reservation_token)
+        now = _as_utc(now or self.now_utc())
+        async with self._backend.transaction():
+            released = await self._backend.execute(
+                f"""
+                UPDATE {self.DELIVERIES}
+                SET status = ?, lease_owner = NULL, lease_token = NULL,
+                    lease_expires_at = NULL, next_attempt_at = ?,
+                    last_error = 'initial reservation activation unavailable',
+                    updated_at = ?
+                WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
+                  AND status IN (?, ?) AND lease_owner = ? AND lease_token = ?
+                """,
+                (
+                    RETRY,
+                    self.to_timestamp_param(now),
+                    self.to_timestamp_param(now),
+                    agent_id,
+                    consumer_id,
+                    delivery_id,
+                    INITIAL_RESERVED,
+                    LEASED,
+                    owner_id,
+                    reservation_token,
+                ),
+            )
+        return released == 1
+
+    async def recover_abandoned_initial_reservations(
+        self,
+        *,
+        agent_id: str,
+        recovering_owner_id: str,
+        stale_before: datetime,
+        now: Optional[datetime] = None,
+    ) -> int:
+        """Requeue only reservations whose distinct runtime owner is gone.
+
+        Generic claim/retry recovery intentionally never touches
+        ``INITIAL_RESERVED``.  Startup uses this owner-aware path instead;
+        another live dispatcher remains protected by its heartbeat even when
+        it shares the same tenant and consumer IDs.
+        """
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("recovering_owner_id", recovering_owner_id)
+        stale_before = _as_utc(stale_before)
+        now = _as_utc(now or self.now_utc())
+        async with self._backend.transaction():
+            released = await self._backend.execute(
+                f"""
+                UPDATE {self.DELIVERIES}
+                SET status = ?, lease_owner = NULL, lease_token = NULL,
+                    lease_expires_at = NULL, next_attempt_at = ?,
+                    last_error = 'initial reservation owner unavailable before activation',
+                    updated_at = ?
+                WHERE agent_id = ? AND status = ? AND lease_owner <> ?
+                  AND (
+                      NOT EXISTS (
+                          SELECT 1 FROM {self.RUNTIME_OWNERS} owner
+                          WHERE owner.agent_id = {self.DELIVERIES}.agent_id
+                            AND owner.owner_id = {self.DELIVERIES}.lease_owner
+                      )
+                      OR EXISTS (
+                          SELECT 1 FROM {self.RUNTIME_OWNERS} owner
+                          WHERE owner.agent_id = {self.DELIVERIES}.agent_id
+                            AND owner.owner_id = {self.DELIVERIES}.lease_owner
+                            AND (
+                                owner.stopped_at IS NOT NULL
+                                OR owner.heartbeat_at < ?
+                            )
+                      )
+                  )
+                """,
+                (
+                    RETRY,
+                    self.to_timestamp_param(now),
+                    self.to_timestamp_param(now),
+                    agent_id,
+                    INITIAL_RESERVED,
+                    recovering_owner_id,
+                    self.to_timestamp_param(stale_before),
+                ),
+            )
+        return released
 
     async def ack_delivery(
         self,
@@ -823,7 +1081,11 @@ class DurableSignalStore(UnifiedStoreBase):
             params.append(consumer_id)
         if statuses is not None:
             wanted = tuple(statuses)
-            valid = _CLAIMABLE_STATUSES | {LEASED} | _TERMINAL_STATUSES
+            valid = (
+                _CLAIMABLE_STATUSES
+                | {INITIAL_RESERVED, LEASED}
+                | _TERMINAL_STATUSES
+            )
             if not wanted or any(status not in valid for status in wanted):
                 raise ValueError("statuses must be durable delivery states")
             where.append("d.status IN (" + ", ".join("?" for _ in wanted) + ")")
@@ -952,6 +1214,51 @@ class DurableSignalStore(UnifiedStoreBase):
             f"{self._backend.backend_type!r}"
         )
 
+    async def _lock_initial_delivery_transfer(
+        self, *, agent_id: str, consumer_id: str, delivery_id: str
+    ) -> Optional[tuple[Any, ...]]:
+        """Lock an activated initial delivery before starting its worker lease.
+
+        This deliberately uses the narrow delivery row rather than the
+        registration/persistence scope lock: all we need here is stable
+        ownership and a current lease deadline for one post-commit handoff.
+        """
+        params = (agent_id, consumer_id, delivery_id)
+        if self.is_postgres:
+            return await self._backend.fetch_one(
+                f"""
+                SELECT status, lease_owner, lease_token, lease_expires_at
+                FROM {self.DELIVERIES}
+                WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
+                FOR UPDATE
+                """,
+                params,
+            )
+        if self._backend.backend_type == "sqlite":
+            # ``BEGIN`` is deferred in SQLite. Updating the exact delivery to
+            # its current value claims the writer slot before the following
+            # read/time sample, while preserving every persisted field.
+            await self._backend.execute(
+                f"""
+                UPDATE {self.DELIVERIES}
+                SET updated_at = updated_at
+                WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
+                """,
+                params,
+            )
+            return await self._backend.fetch_one(
+                f"""
+                SELECT status, lease_owner, lease_token, lease_expires_at
+                FROM {self.DELIVERIES}
+                WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
+                """,
+                params,
+            )
+        raise RuntimeError(
+            "Durable signal initial-delivery transfer does not support backend "
+            f"{self._backend.backend_type!r}"
+        )
+
     async def _get_consumer(
         self, agent_id: str, consumer_id: str
     ) -> Optional[tuple[Any, ...]]:
@@ -963,6 +1270,50 @@ class DurableSignalStore(UnifiedStoreBase):
             """,
             (agent_id, consumer_id),
         )
+
+    async def _touch_runtime_owner_locked(
+        self, *, agent_id: str, owner_id: str, now: datetime
+    ) -> None:
+        """Upsert an active owner while the caller holds a transaction.
+
+        A delayed heartbeat can finish after a newer activation or heartbeat.
+        Preserve the newest liveness evidence rather than regressing it and
+        allowing another dispatcher to misclassify this owner as stale.
+        """
+        updated = await self._backend.execute(
+            f"""
+            UPDATE {self.RUNTIME_OWNERS}
+            SET heartbeat_at = CASE
+                    WHEN heartbeat_at >= ? THEN heartbeat_at ELSE ? END,
+                stopped_at = NULL,
+                updated_at = CASE
+                    WHEN heartbeat_at >= ? THEN heartbeat_at ELSE ? END
+            WHERE agent_id = ? AND owner_id = ?
+            """,
+            (
+                self.to_timestamp_param(now),
+                self.to_timestamp_param(now),
+                self.to_timestamp_param(now),
+                self.to_timestamp_param(now),
+                agent_id,
+                owner_id,
+            ),
+        )
+        if updated == 0:
+            await self._backend.execute(
+                f"""
+                INSERT OR IGNORE INTO {self.RUNTIME_OWNERS} (
+                    agent_id, owner_id, heartbeat_at, stopped_at, created_at, updated_at
+                ) VALUES (?, ?, ?, NULL, ?, ?)
+                """,
+                (
+                    agent_id,
+                    owner_id,
+                    self.to_timestamp_param(now),
+                    self.to_timestamp_param(now),
+                    self.to_timestamp_param(now),
+                ),
+            )
 
     async def _recover_expired_leases(
         self, *, agent_id: str, consumer_id: str, now: datetime
@@ -1041,15 +1392,14 @@ class DurableSignalStore(UnifiedStoreBase):
         event_id: str,
         max_attempts: int,
         now: datetime,
-        initial_lease_owner: Optional[str] = None,
-        initial_lease_token: Optional[str] = None,
-        initial_lease_expires_at: Optional[datetime] = None,
+        initial_reservation_owner: Optional[str] = None,
+        initial_reservation_token: Optional[str] = None,
     ) -> Optional[str]:
-        initial_lease = initial_lease_owner is not None
-        if initial_lease != (initial_lease_token is not None):
-            raise ValueError("initial lease owner and token must be set together")
-        if initial_lease != (initial_lease_expires_at is not None):
-            raise ValueError("initial lease owner and expiry must be set together")
+        initial_reservation = initial_reservation_owner is not None
+        if initial_reservation != (initial_reservation_token is not None):
+            raise ValueError(
+                "initial reservation owner and token must be set together"
+            )
         delivery_id = secrets.token_urlsafe(18)
         inserted = await self._backend.execute(
             f"""
@@ -1064,15 +1414,11 @@ class DurableSignalStore(UnifiedStoreBase):
                 agent_id,
                 consumer_id,
                 event_id,
-                LEASED if initial_lease else PENDING,
+                INITIAL_RESERVED if initial_reservation else PENDING,
                 max_attempts,
-                initial_lease_owner,
-                initial_lease_token,
-                (
-                    self.to_timestamp_param(initial_lease_expires_at)
-                    if initial_lease_expires_at is not None
-                    else None
-                ),
+                initial_reservation_owner,
+                initial_reservation_token,
+                None,
                 self.to_timestamp_param(now),
                 self.to_timestamp_param(now),
             ),
@@ -1215,13 +1561,14 @@ class DurableSignalStore(UnifiedStoreBase):
 __all__ = [
     "ACKNOWLEDGED",
     "FAILED",
+    "INITIAL_RESERVED",
     "LEASED",
     "PENDING",
     "RETRY",
     "DurableConsumerRegistration",
     "DurableDelivery",
     "DurableEventPersistence",
-    "DurableInitialDeliveryLease",
+    "DurableInitialDeliveryReservation",
     "DurableSignalEvent",
     "DurableSignalStore",
 ]

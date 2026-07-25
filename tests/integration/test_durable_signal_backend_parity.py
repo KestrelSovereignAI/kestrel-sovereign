@@ -94,7 +94,7 @@ async def _ephemeral_dispatcher(db_backend, *, agent_id: str):
 
 async def _finish_dispatcher(agent: _DispatcherAgent, dispatcher: SignalDispatcher):
     """Drain audit tasks before the shared backend fixture is torn down."""
-    dispatcher.shutdown()
+    await dispatcher.shutdown_durable_delivery()
     if agent.tasks:
         await asyncio.gather(*agent.tasks, return_exceptions=True)
 
@@ -278,8 +278,8 @@ async def test_initial_volatile_reservation_blocks_a_peer_on_both_backends(db_ba
             before_commit=installed_before_commit.append,
         )
         assert installed_before_commit == [persisted]
-        assert len(persisted.initial_leases) == 1
-        reservation = persisted.initial_leases[0]
+        assert len(persisted.initial_reservations) == 1
+        reservation = persisted.initial_reservations[0]
 
         # A separate store sees the committed row but not a claimable
         # delivery. It must wait for the owning dispatcher to transfer or for
@@ -289,12 +289,20 @@ async def test_initial_volatile_reservation_blocks_a_peer_on_both_backends(db_ba
             consumer_id=consumer_id,
             executor_id="peer-worker",
         ) is None
+        activated = await emitting_store.activate_initial_delivery(
+            agent_id=agent_id,
+            consumer_id=consumer_id,
+            delivery_id=reservation.delivery_id,
+            initial_lease_owner="emitting-dispatcher",
+            initial_lease_token=reservation.reservation_token,
+        )
+        assert activated is not None
         owned = await emitting_store.claim_initial_delivery(
             agent_id=agent_id,
             consumer_id=consumer_id,
             delivery_id=reservation.delivery_id,
             initial_lease_owner="emitting-dispatcher",
-            initial_lease_token=reservation.lease_token,
+            initial_lease_token=reservation.reservation_token,
             executor_id="owner-worker",
         )
         assert owned is not None
@@ -305,6 +313,316 @@ async def test_initial_volatile_reservation_blocks_a_peer_on_both_backends(db_ba
         )
         assert row is not None
         assert secret not in str(row[0])
+    finally:
+        await peer_backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_unactivated_reservation_survives_a_long_paused_commit_and_owner_activation_wins(
+    db_backend,
+):
+    """No delivery lease exists until the post-commit owner activation."""
+    peer_backend = await _independent_backend(db_backend)
+    release_commit = asyncio.Event()
+    persistence_task = None
+    original_transaction = db_backend.transaction
+    try:
+        emitting_store = DurableSignalStore(db_backend)
+        peer_store = DurableSignalStore(peer_backend)
+        await emitting_store.initialize()
+        await peer_store.initialize()
+        agent_id = f"did:test:durable-paused-commit:{uuid4()}"
+        consumer_id = "workflow-wait"
+        owner_id = "emitting-dispatcher"
+        await emitting_store.register_consumer(
+            DurableConsumerRegistration(
+                consumer_id=consumer_id,
+                source="provider.message",
+                agent_id=agent_id,
+                lease_seconds=1,
+            )
+        )
+        await emitting_store.register_runtime_owner(
+            agent_id=agent_id, owner_id=owner_id
+        )
+        sidecar_installed = asyncio.Event()
+        commit_paused = asyncio.Event()
+
+        @asynccontextmanager
+        async def pause_after_precommit_callback():
+            async with original_transaction():
+                yield
+                commit_paused.set()
+                await release_commit.wait()
+
+        db_backend.transaction = pause_after_precommit_callback
+        marker_event = _signal(agent_id)
+        marker_event.payload = {"_privacy_gated": "none"}
+        persistence_task = asyncio.create_task(
+            emitting_store.persist_signal(
+                marker_event,
+                agent_id=agent_id,
+                source_event_id=f"paused-commit-{uuid4()}",
+                retention_days=7,
+                transient_selector_payload={
+                    "workflow": "wf-1",
+                    "message": "commit-paused-customer@example.com",
+                },
+                initial_lease_owner=owner_id,
+                before_commit=lambda _persisted: sidecar_installed.set(),
+            )
+        )
+        await asyncio.wait_for(sidecar_installed.wait(), timeout=2)
+        await asyncio.wait_for(commit_paused.wait(), timeout=2)
+        # The event transaction is still invisible. Sleeping beyond the
+        # consumer's one-second lease cannot expire a reservation because it
+        # does not have a lease deadline yet.
+        await asyncio.sleep(1.1)
+        release_commit.set()
+        persisted = await persistence_task
+        reservation = persisted.initial_reservations[0]
+        unactivated = await emitting_store.get_delivery(
+            agent_id=agent_id,
+            consumer_id=consumer_id,
+            delivery_id=reservation.delivery_id,
+        )
+        assert unactivated is not None
+        assert unactivated.status == "initial_reserved"
+        assert unactivated.lease_expires_at is None
+
+        peer_claim, activated = await asyncio.gather(
+            peer_store.claim_delivery(
+                agent_id=agent_id,
+                consumer_id=consumer_id,
+                executor_id="peer-after-visibility",
+            ),
+            emitting_store.activate_initial_delivery(
+                agent_id=agent_id,
+                consumer_id=consumer_id,
+                delivery_id=reservation.delivery_id,
+                initial_lease_owner=owner_id,
+                initial_lease_token=reservation.reservation_token,
+            ),
+        )
+        assert peer_claim is None
+        assert activated is not None
+        assert activated.lease_expires_at > datetime.now(timezone.utc)
+    finally:
+        release_commit.set()
+        db_backend.transaction = original_transaction
+        if persistence_task is not None:
+            await asyncio.gather(persistence_task, return_exceptions=True)
+        await peer_backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_startup_recovers_only_a_stale_unactivated_owner_as_marker_work(
+    db_backend,
+):
+    """A crash before activation replays only the durable privacy marker."""
+    peer_backend = await _independent_backend(db_backend)
+    recovering_agent = None
+    recovering_dispatcher = None
+    try:
+        emitting_store = DurableSignalStore(db_backend)
+        await emitting_store.initialize()
+        agent_id = f"did:test:durable-stale-owner:{uuid4()}"
+        consumer_id = "workflow-wait"
+        owner_id = "crashed-dispatcher"
+        now = datetime.now(timezone.utc)
+        await emitting_store.register_consumer(
+            DurableConsumerRegistration(
+                consumer_id=consumer_id,
+                source="provider.message",
+                agent_id=agent_id,
+            )
+        )
+        await emitting_store.register_runtime_owner(
+            agent_id=agent_id,
+            owner_id=owner_id,
+            now=now - timedelta(minutes=10),
+        )
+        marker_event = _signal(agent_id)
+        marker_event.payload = {"_privacy_gated": "none"}
+        secret = "crash-before-activation@example.com"
+        persisted = await emitting_store.persist_signal(
+            marker_event,
+            agent_id=agent_id,
+            source_event_id=f"stale-owner-{uuid4()}",
+            retention_days=7,
+            transient_selector_payload={"workflow": "wf-1", "message": secret},
+            initial_lease_owner=owner_id,
+        )
+        reservation = persisted.initial_reservations[0]
+        # Startup initializes a distinct runtime owner and invokes the
+        # owner-aware recovery path. The old owner heartbeat is ten minutes
+        # stale, so the marker becomes ordinary retry work before any generic
+        # worker can claim it.
+        recovering_agent, recovering_dispatcher = await _ephemeral_dispatcher(
+            peer_backend, agent_id=agent_id
+        )
+        recovered = await recovering_dispatcher._durable_store.get_delivery(
+            agent_id=agent_id,
+            consumer_id=consumer_id,
+            delivery_id=reservation.delivery_id,
+        )
+        assert recovered is not None
+        assert recovered.status == "retry"
+        replay = await recovering_dispatcher.claim_durable_delivery(
+            consumer_id=consumer_id,
+            executor_id="restart-worker",
+        )
+        assert replay is not None
+        assert replay.event.payload == {"_privacy_gated": "none"}
+        assert secret not in str(replay.event.payload)
+    finally:
+        if recovering_agent is not None and recovering_dispatcher is not None:
+            await _finish_dispatcher(recovering_agent, recovering_dispatcher)
+        await peer_backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_live_runtime_owner_cannot_be_recovered_by_a_concurrent_dispatcher(
+    db_backend,
+):
+    """Owner-aware recovery never steals a contemporaneously live emitter."""
+    peer_backend = await _independent_backend(db_backend)
+    try:
+        emitting_store = DurableSignalStore(db_backend)
+        peer_store = DurableSignalStore(peer_backend)
+        await emitting_store.initialize()
+        await peer_store.initialize()
+        agent_id = f"did:test:durable-live-owner:{uuid4()}"
+        consumer_id = "workflow-wait"
+        owner_id = "live-dispatcher"
+        peer_owner_id = "other-live-dispatcher"
+        now = datetime.now(timezone.utc)
+        await emitting_store.register_consumer(
+            DurableConsumerRegistration(
+                consumer_id=consumer_id,
+                source="provider.message",
+                agent_id=agent_id,
+            )
+        )
+        await emitting_store.register_runtime_owner(
+            agent_id=agent_id, owner_id=owner_id, now=now
+        )
+        await peer_store.register_runtime_owner(
+            agent_id=agent_id, owner_id=peer_owner_id, now=now
+        )
+        marker_event = _signal(agent_id)
+        marker_event.payload = {"_privacy_gated": "none"}
+        persisted = await emitting_store.persist_signal(
+            marker_event,
+            agent_id=agent_id,
+            source_event_id=f"live-owner-{uuid4()}",
+            retention_days=7,
+            initial_lease_owner=owner_id,
+        )
+        reservation = persisted.initial_reservations[0]
+        assert await peer_store.recover_abandoned_initial_reservations(
+            agent_id=agent_id,
+            recovering_owner_id=peer_owner_id,
+            stale_before=now - timedelta(seconds=1),
+            now=now,
+        ) == 0
+        assert await peer_store.claim_delivery(
+            agent_id=agent_id,
+            consumer_id=consumer_id,
+            executor_id="peer-worker",
+        ) is None
+        assert await emitting_store.activate_initial_delivery(
+            agent_id=agent_id,
+            consumer_id=consumer_id,
+            delivery_id=reservation.delivery_id,
+            initial_lease_owner=owner_id,
+            initial_lease_token=reservation.reservation_token,
+            now=now,
+        ) is not None
+    finally:
+        await peer_backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_delayed_runtime_heartbeat_cannot_regress_owner_liveness_or_release_work(
+    db_backend,
+):
+    """A heartbeat sampled before a wait must not undo newer liveness.
+
+    Explicit times model a heartbeat which sampled ``older`` before blocking,
+    while a newer owner touch completed first.  It then completes late on the
+    same owner row.  Recovery from a concurrent dispatcher must still see the
+    newer heartbeat and leave the initial reservation untouched.
+    """
+    peer_backend = await _independent_backend(db_backend)
+    try:
+        emitting_store = DurableSignalStore(db_backend)
+        peer_store = DurableSignalStore(peer_backend)
+        await emitting_store.initialize()
+        await peer_store.initialize()
+        agent_id = f"did:test:durable-monotonic-heartbeat:{uuid4()}"
+        consumer_id = "workflow-wait"
+        owner_id = "emitting-dispatcher"
+        recovering_owner_id = "concurrent-dispatcher"
+        base = datetime(2040, 1, 1, tzinfo=timezone.utc)
+        older = base + timedelta(seconds=1)
+        newer = base + timedelta(seconds=10)
+        recovery_now = base + timedelta(seconds=11)
+        await emitting_store.register_consumer(
+            DurableConsumerRegistration(
+                consumer_id=consumer_id,
+                source="provider.message",
+                agent_id=agent_id,
+            )
+        )
+        await emitting_store.register_runtime_owner(
+            agent_id=agent_id, owner_id=owner_id, now=base
+        )
+        await peer_store.register_runtime_owner(
+            agent_id=agent_id, owner_id=recovering_owner_id, now=newer
+        )
+        marker_event = _signal(agent_id)
+        marker_event.payload = {"_privacy_gated": "none"}
+        persisted = await emitting_store.persist_signal(
+            marker_event,
+            agent_id=agent_id,
+            source_event_id=f"monotonic-heartbeat-{uuid4()}",
+            retention_days=7,
+            initial_lease_owner=owner_id,
+        )
+        reservation = persisted.initial_reservations[0]
+
+        # A newer activation/heartbeat touch wins; the delayed heartbeat that
+        # was sampled earlier must not overwrite it at commit time.
+        await emitting_store.heartbeat_runtime_owner(
+            agent_id=agent_id, owner_id=owner_id, now=newer
+        )
+        await emitting_store.heartbeat_runtime_owner(
+            agent_id=agent_id, owner_id=owner_id, now=older
+        )
+
+        assert await peer_store.recover_abandoned_initial_reservations(
+            agent_id=agent_id,
+            recovering_owner_id=recovering_owner_id,
+            stale_before=base + timedelta(seconds=5),
+            now=recovery_now,
+        ) == 0
+        remaining = await peer_store.get_delivery(
+            agent_id=agent_id,
+            consumer_id=consumer_id,
+            delivery_id=reservation.delivery_id,
+        )
+        assert remaining is not None
+        assert remaining.status == "initial_reserved"
+        assert await peer_store.claim_delivery(
+            agent_id=agent_id,
+            consumer_id=consumer_id,
+            executor_id="peer-worker",
+        ) is None
     finally:
         await peer_backend.close()
 
@@ -331,10 +649,8 @@ async def test_same_dispatcher_initial_claim_waits_for_postgres_commit_boundary(
     original_transaction = db_backend.transaction
     original_claim_delivery = dispatcher._durable_store.claim_delivery
     commit_boundary = asyncio.Event()
-    sidecar_installed = asyncio.Event()
     ordinary_claim_missed = asyncio.Event()
     release_commit = asyncio.Event()
-    original_schedule = dispatcher._schedule_transient_durable_handoff_expiry
 
     @asynccontextmanager
     async def pause_after_before_commit():
@@ -345,10 +661,6 @@ async def test_same_dispatcher_initial_claim_waits_for_postgres_commit_boundary(
             commit_boundary.set()
             await release_commit.wait()
 
-    def note_sidecar_install(delivery_id, expires_at):
-        original_schedule(delivery_id, expires_at)
-        sidecar_installed.set()
-
     async def note_uncommitted_ordinary_claim(**kwargs):
         delivery = await original_claim_delivery(**kwargs)
         if delivery is None:
@@ -356,7 +668,6 @@ async def test_same_dispatcher_initial_claim_waits_for_postgres_commit_boundary(
         return delivery
 
     db_backend.transaction = pause_after_before_commit
-    dispatcher._schedule_transient_durable_handoff_expiry = note_sidecar_install
     dispatcher._durable_store.claim_delivery = note_uncommitted_ordinary_claim
     try:
         await dispatcher.register_durable_consumer(
@@ -377,8 +688,8 @@ async def test_same_dispatcher_initial_claim_waits_for_postgres_commit_boundary(
                 source_event_id=f"same-dispatcher-commit-race:{uuid4()}",
             )
         )
-        await asyncio.wait_for(sidecar_installed.wait(), timeout=5)
         await asyncio.wait_for(commit_boundary.wait(), timeout=5)
+        assert len(dispatcher._transient_durable_handoffs) == 1
 
         claim_task = asyncio.create_task(
             dispatcher.claim_durable_delivery(
@@ -405,17 +716,16 @@ async def test_same_dispatcher_initial_claim_waits_for_postgres_commit_boundary(
     finally:
         release_commit.set()
         db_backend.transaction = original_transaction
-        dispatcher._schedule_transient_durable_handoff_expiry = original_schedule
         dispatcher._durable_store.claim_delivery = original_claim_delivery
         await _finish_dispatcher(agent, dispatcher)
 
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
-async def test_initial_reservation_lease_starts_after_handoff_contention_on_both_backends(
+async def test_initial_reservation_lease_starts_only_after_post_commit_activation_on_both_backends(
     db_backend,
 ):
-    """The initial owner retains a live lease after a blocked handoff lock."""
+    """A delayed persistence publishes no lease until the owner activates it."""
     peer_backend = await _independent_backend(db_backend)
     release_handoff = asyncio.Event()
     holder = None
@@ -458,21 +768,43 @@ async def test_initial_reservation_lease_starts_after_handoff_contention_on_both
                 initial_lease_owner="emitting-dispatcher",
             )
         )
-        # The pre-fix method-entry timestamp is now older than the whole
-        # initial lease while this transaction waits for the handoff lock.
+        # The old implementation could spend a full lease duration before it
+        # even acquired this handoff lock. A reservation must still carry no
+        # live deadline when its transaction later commits.
         await asyncio.sleep(1.1)
         release_handoff.set()
         await holder
         persisted = await persistence_task
-        assert len(persisted.initial_leases) == 1
-        reservation = persisted.initial_leases[0]
-        assert reservation.lease_expires_at > datetime.now(timezone.utc)
+        assert len(persisted.initial_reservations) == 1
+        reservation = persisted.initial_reservations[0]
+        unactivated = await emitting_store.get_delivery(
+            agent_id=agent_id,
+            consumer_id=consumer_id,
+            delivery_id=reservation.delivery_id,
+        )
+        assert unactivated is not None
+        assert unactivated.status == "initial_reserved"
+        assert unactivated.lease_expires_at is None
+        assert await blocking_store.claim_delivery(
+            agent_id=agent_id,
+            consumer_id=consumer_id,
+            executor_id="peer-before-activation",
+        ) is None
+        activated = await emitting_store.activate_initial_delivery(
+            agent_id=agent_id,
+            consumer_id=consumer_id,
+            delivery_id=reservation.delivery_id,
+            initial_lease_owner="emitting-dispatcher",
+            initial_lease_token=reservation.reservation_token,
+        )
+        assert activated is not None
+        assert activated.lease_expires_at > datetime.now(timezone.utc)
         assert await emitting_store.claim_initial_delivery(
             agent_id=agent_id,
             consumer_id=consumer_id,
             delivery_id=reservation.delivery_id,
             initial_lease_owner="emitting-dispatcher",
-            initial_lease_token=reservation.lease_token,
+            initial_lease_token=reservation.reservation_token,
             executor_id="owner-worker",
         ) is not None
     finally:
@@ -481,6 +813,143 @@ async def test_initial_reservation_lease_starts_after_handoff_contention_on_both
             await asyncio.gather(holder, return_exceptions=True)
         if persistence_task is not None:
             await asyncio.gather(persistence_task, return_exceptions=True)
+        await peer_backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_initial_worker_transfer_does_not_publish_an_expired_lease_after_contention(
+    db_backend,
+):
+    """The initial owner lease is rechecked after the real write/row lock.
+
+    A deterministic clock advances while another connection holds the exact
+    serialization point.  The old transfer sampled before waiting and returned
+    a worker lease already expired at the advanced clock; the fixed path sees
+    the initial owner lease expired and declines the handoff.
+    """
+    peer_backend = await _independent_backend(db_backend)
+    release_lock = asyncio.Event()
+    lock_acquired = asyncio.Event()
+    transfer_waiting = asyncio.Event()
+    holder = None
+    try:
+        store = DurableSignalStore(db_backend)
+        peer_store = DurableSignalStore(peer_backend)
+        await store.initialize()
+        await peer_store.initialize()
+        agent_id = f"did:test:durable-initial-transfer:{uuid4()}"
+        consumer_id = "workflow-wait"
+        owner_id = "emitting-dispatcher"
+        base = datetime(2040, 1, 1, tzinfo=timezone.utc)
+        current_time = {"value": base}
+        store.now_utc = lambda: current_time["value"]
+        await store.register_consumer(
+            DurableConsumerRegistration(
+                consumer_id=consumer_id,
+                source="provider.message",
+                agent_id=agent_id,
+                lease_seconds=1,
+            )
+        )
+        await store.register_runtime_owner(
+            agent_id=agent_id, owner_id=owner_id, now=base
+        )
+        marker_event = _signal(agent_id)
+        marker_event.payload = {"_privacy_gated": "none"}
+        persisted = await store.persist_signal(
+            marker_event,
+            agent_id=agent_id,
+            source_event_id=f"initial-transfer-contention:{uuid4()}",
+            retention_days=7,
+            initial_lease_owner=owner_id,
+        )
+        reservation = persisted.initial_reservations[0]
+        assert await store.activate_initial_delivery(
+            agent_id=agent_id,
+            consumer_id=consumer_id,
+            delivery_id=reservation.delivery_id,
+            initial_lease_owner=owner_id,
+            initial_lease_token=reservation.reservation_token,
+            now=base,
+        ) is not None
+
+        async def hold_transfer_serialization_point() -> None:
+            async with peer_backend.transaction():
+                if peer_backend.backend_type == "postgres":
+                    await peer_backend.fetch_one(
+                        "SELECT delivery_id FROM durable_signal_deliveries "
+                        "WHERE delivery_id = ? FOR UPDATE",
+                        (reservation.delivery_id,),
+                    )
+                else:
+                    await peer_backend.execute(
+                        "UPDATE durable_signal_deliveries "
+                        "SET updated_at = updated_at WHERE delivery_id = ?",
+                        (reservation.delivery_id,),
+                    )
+                lock_acquired.set()
+                await release_lock.wait()
+
+        holder = asyncio.create_task(hold_transfer_serialization_point())
+        await asyncio.wait_for(lock_acquired.wait(), timeout=5)
+
+        if db_backend.backend_type == "postgres":
+            original_fetch_one = db_backend.fetch_one
+
+            async def observe_transfer_lock(query, params=()):
+                if "FOR UPDATE" in query and "durable_signal_deliveries" in query:
+                    transfer_waiting.set()
+                return await original_fetch_one(query, params)
+
+            db_backend.fetch_one = observe_transfer_lock
+        else:
+            original_execute = db_backend.execute
+
+            async def observe_transfer_lock(query, params=()):
+                if (
+                    "UPDATE durable_signal_deliveries" in query
+                    and "SET updated_at = updated_at" in query
+                ):
+                    transfer_waiting.set()
+                return await original_execute(query, params)
+
+            db_backend.execute = observe_transfer_lock
+
+        try:
+            transfer_task = asyncio.create_task(
+                store.claim_initial_delivery(
+                    agent_id=agent_id,
+                    consumer_id=consumer_id,
+                    delivery_id=reservation.delivery_id,
+                    initial_lease_owner=owner_id,
+                    initial_lease_token=reservation.reservation_token,
+                    executor_id="owner-worker",
+                )
+            )
+            await asyncio.wait_for(transfer_waiting.wait(), timeout=5)
+            current_time["value"] = base + timedelta(seconds=2)
+            release_lock.set()
+            assert await transfer_task is None
+        finally:
+            if db_backend.backend_type == "postgres":
+                db_backend.fetch_one = original_fetch_one
+            else:
+                db_backend.execute = original_execute
+
+        row = await store.get_delivery(
+            agent_id=agent_id,
+            consumer_id=consumer_id,
+            delivery_id=reservation.delivery_id,
+        )
+        assert row is not None
+        assert row.status == "leased"
+        assert row.lease_owner == owner_id
+        assert row.attempts == 0
+    finally:
+        release_lock.set()
+        if holder is not None:
+            await asyncio.gather(holder, return_exceptions=True)
         await peer_backend.close()
 
 

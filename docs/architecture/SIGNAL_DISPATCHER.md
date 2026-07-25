@@ -292,8 +292,8 @@ lease transition and returns an unguessable `lease_token`; only that live
 token can ack or nack.  A crash after a side effect but before ack causes a
 lease-expiry retry, so workflow side effects must be idempotent on
 `event_id`/`delivery_id`.  Bounded attempts move exhausted deliveries to the
-observable terminal `failed` state.  `pending`, `leased`, `retry`,
-`acknowledged`, and `failed` are observable through
+observable terminal `failed` state.  `pending`, `initial_reserved`, `leased`,
+`retry`, `acknowledged`, and `failed` are observable through
 `list_durable_deliveries`.
 
 The normalized envelope and matching delivery rows commit atomically **before
@@ -304,14 +304,25 @@ has the same contract on standalone SQLite and hosted PostgreSQL; the latter
 does not rely on a process-local application lock.
 
 For payload-eliding privacy modes, the durable event contains only the privacy
-marker.  Its initially matched deliveries are instead inserted as leases owned
-by the emitting dispatcher in that same transaction.  Before commit makes
-those leases visible, the dispatcher installs a process-local raw-payload
-sidecar and holds its local handoff lock through the commit boundary; an
-initial local claim takes that same lock before it can transfer the lease to a
-worker. A peer sharing the database therefore cannot steal a just-emitted
-marker-only delivery before its owner consumes the live payload, and a local
-PostgreSQL claimant cannot mistake an uncommitted delivery for a lost
+marker. Its initially matched deliveries are instead inserted as
+`initial_reserved` capabilities owned by the emitting dispatcher in that same
+transaction. An initial reservation has **no delivery lease deadline** and is
+not eligible for generic claim or lease recovery. Before commit makes it
+visible, the dispatcher installs a process-local raw-payload sidecar and holds
+its local handoff lock through the commit boundary. Only after
+`persist_signal` returns from that actual commit does the owner atomically
+activate the reservation into a real lease and calculate its deadline; an
+initial local claim can then transfer that lease to a worker. A peer sharing
+the database therefore cannot steal a just-emitted marker-only delivery before
+its owner consumes the live payload, even if commit was paused longer than the
+consumer lease.
+
+Runtime-owner heartbeats make recovery owner-aware: graceful shutdown releases
+only that dispatcher's unactivated reservations to ordinary marker-only retry
+work. Startup recovery and later owner-heartbeat sweeps do the same only for a
+stopped, missing, or stale runtime generation; a just-crashed owner that is
+still fresh at restart is reconsidered after it crosses the stale threshold.
+Recovery never releases a concurrent live dispatcher's
 reservation. The sidecar is discarded on rollback, acknowledgement, terminal
 failure, lease expiry, and shutdown; after a crash or expired lease, normal
 replay intentionally receives only the persisted marker. Raw payload is never

@@ -48,6 +48,23 @@ PHASE_NAMES = [
 ]
 
 
+def _durable_backend_double() -> MagicMock:
+    """Provide the transactional backend contract used during signal boot."""
+    backend = MagicMock()
+    backend.backend_type = "sqlite"
+    backend.execute_script = AsyncMock()
+    backend.execute = AsyncMock(return_value=1)
+    backend.fetch_one = AsyncMock(return_value=None)
+    backend.fetch_all = AsyncMock(return_value=[])
+
+    @contextlib.asynccontextmanager
+    async def transaction():
+        yield
+
+    backend.transaction = transaction
+    return backend
+
+
 @contextlib.contextmanager
 def _boot_mocks():
     """Patch the heavy boot collaborators; yield handles for leak assertions.
@@ -71,6 +88,7 @@ def _boot_mocks():
         storage.add_node = AsyncMock()
         storage.db = MagicMock()
         storage.close = AsyncMock()
+        storage._backend = _durable_backend_double()
         MockStorage.return_value = storage
 
         memory = AsyncMock()
@@ -277,6 +295,43 @@ async def test_failed_boot_never_started_periodic_services(tmp_path):
         # Phase 6 never ran → no periodic services exist.
         assert getattr(agent, "heartbeat_runner", None) is None
         assert getattr(agent, "resume_monitor", None) is None
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+async def test_later_boot_failure_tears_down_durable_dispatcher_before_storage(tmp_path):
+    """Phase-2 owner liveness cannot outlive a phase-3 boot failure."""
+    agent = _make_agent(tmp_path)
+    captured = {}
+
+    async def fail_after_dispatcher(_ctx: BootContext) -> None:
+        captured["dispatcher"] = agent.dispatcher
+        raise RuntimeError("injected after dispatcher initialization")
+
+    try:
+        with _boot_mocks() as mocks:
+            with patch.object(
+                agent, "_boot_phase_providers_payer_sync", fail_after_dispatcher
+            ):
+                with pytest.raises(RuntimeError, match="after dispatcher"):
+                    await agent.initialize()
+
+            dispatcher = captured["dispatcher"]
+            assert agent._boot_state is BootPhaseState.FAILED
+            assert agent.dispatcher is None
+            assert dispatcher._runtime_owner_heartbeat_timer is None
+            assert dispatcher._durable_runtime_owner_registered is False
+            # The owner release happens before the phase-1 storage close in
+            # LIFO rollback order, rather than leaving timer work on a closed
+            # database backend.
+            release_calls = [
+                call
+                for call in mocks.storage._backend.execute.await_args_list
+                if "stopped_at" in str(call)
+            ]
+            assert release_calls
+            mocks.storage.close.assert_awaited()
     finally:
         await _cleanup(agent)
 
