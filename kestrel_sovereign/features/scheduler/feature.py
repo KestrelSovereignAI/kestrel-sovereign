@@ -71,7 +71,11 @@ from kestrel_sovereign.features.scheduler.cron import (
     next_run,
     parse,
 )
-from kestrel_sovereign.features.scheduler.runner import SchedulerRunner
+from kestrel_sovereign.features.scheduler.runner import (
+    SCHEDULER_PROTOCOL_VERSION,
+    SchedulerRunner,
+    validate_schedule_idempotency_base,
+)
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 
 logger = logging.getLogger(__name__)
@@ -110,6 +114,26 @@ class SchedulerFeature(Feature):
             "Manage scheduled tasks - add, remove, pause, resume cron-based "
             "tasks for memory consolidation, wellness checks, audit anchoring, "
             "and custom operations"
+        )
+
+    @staticmethod
+    def _scheduler_mutation_wrote(result: Any) -> bool:
+        """Interpret real rowcounts while keeping lightweight DB doubles usable."""
+
+        if isinstance(result, bool):
+            return result
+        if isinstance(result, int):
+            return result > 0
+        return True
+
+    @staticmethod
+    def _rollout_mutation_error() -> ToolResult:
+        """Return the fail-closed response for an unacknowledged rollout."""
+
+        return ToolResult.failed(
+            "Scheduler protocol rollout is not active for this agent. "
+            "Do not create, resume, or change schedules until legacy "
+            "scheduler replicas are drained and the rollout nonce is acknowledged."
         )
 
     async def initialize(self):
@@ -1749,22 +1773,42 @@ class SchedulerFeature(Feature):
         # callers that do not supply one.  The runner derives a deterministic
         # occurrence key from this base and exposes it to the target tool.
         base_idempotency = str(idempotency_key).strip() if idempotency_key else f"schedule:{task_id}"
+        idempotency_error = validate_schedule_idempotency_base(base_idempotency)
+        if idempotency_error is not None:
+            return ToolResult.failed(f"idempotency_key {idempotency_error}")
         try:
-            await self._db.execute(
-                """
-                INSERT INTO scheduled_tasks
-                    (id, agent_id, task_name, cron_expression, args_json, enabled,
-                     last_run_at, next_run_at, created_at, schedule_kind, run_at,
-                     timezone_name, misfire_policy, misfire_grace_seconds,
-                     idempotency_key, attempt_count)
-                VALUES (?, ?, ?, ?, ?, 1, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-                """,
-                (
-                    task_id, self._agent_id, task_name, cron_expression, args_json,
-                    next_run_at, now_iso, schedule_kind, run_at, timezone_name,
-                    misfire_policy, misfire_grace_seconds, base_idempotency,
-                ),
-            )
+            # Hold the same durable control row used by rollout activation.
+            # ``EXISTS (state = active)`` alone is a snapshot check: a legacy
+            # row can force active -> quiescing between that check and this
+            # insert.  Updating the active control row inside the schedule
+            # transaction serializes the writer with that transition on both
+            # PostgreSQL and SQLite, so a newly runnable row is either fenced
+            # by the transition or never inserted.
+            async with self._schedule_transaction():
+                if not await self._lock_active_scheduler_rollout():
+                    return self._rollout_mutation_error()
+                inserted = await self._db.execute(
+                    """
+                    INSERT INTO scheduled_tasks
+                        (id, agent_id, task_name, cron_expression, args_json, enabled,
+                         last_run_at, next_run_at, created_at, schedule_kind, run_at,
+                         timezone_name, misfire_policy, misfire_grace_seconds,
+                         idempotency_key, attempt_count, scheduler_protocol_version,
+                         scheduler_rollout_fenced, scheduler_claim_fenced)
+                    VALUES (?, ?, ?, ?, ?, 1, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, 0)
+                    """,
+                    (
+                        task_id, self._agent_id, task_name, cron_expression, args_json,
+                        next_run_at, now_iso, schedule_kind, run_at, timezone_name,
+                        misfire_policy, misfire_grace_seconds, base_idempotency,
+                        SCHEDULER_PROTOCOL_VERSION,
+                    ),
+                )
+                if not self._scheduler_mutation_wrote(inserted):
+                    # A real DB should never return zero after holding the
+                    # control-row lock; fail closed instead of claiming a
+                    # schedule exists when persistence did not happen.
+                    return ToolResult.failed("Failed to persist scheduled task")
         except Exception as e:
             logger.error("Failed to add scheduled task: %s", e)
             return ToolResult.failed(str(e))
@@ -1851,33 +1895,48 @@ class SchedulerFeature(Feature):
             return ToolResult.failed("Database not available")
 
         try:
-            row = await self._db.fetchone(
-                "SELECT id, enabled FROM scheduled_tasks WHERE id = ? AND agent_id = ?",
-                (task_id, self._agent_id),
-            )
-            if not row:
-                return ToolResult.failed(
-                    f"Task {task_id} not found",
-                    data={"task_id": task_id},
-                )
-
-            if not row[1]:
-                return ToolResult.ok(
-                    confirmation=f"Task {task_id} was already paused (no-op)",
-                    data={"success": True, "task_id": task_id, "status": "already_paused"},
-                )
-
             async with self._schedule_transaction():
-                await self._db.execute(
+                # Unlike create/resume/update, pausing is safe and necessary
+                # during a quiescing rollout. Lock whichever v2 control state
+                # currently owns the DID before deciding whether an enabled=0
+                # row is an intentional pause or a rollout fence.
+                await self._lock_scheduler_rollout_for_pause()
+                row = await self._db.fetchone(
+                    """
+                    SELECT id, enabled, scheduler_claim_fenced,
+                           scheduler_rollout_fenced
+                    FROM scheduled_tasks WHERE id = ? AND agent_id = ?
+                    """,
+                    (task_id, self._agent_id),
+                )
+                if not row:
+                    return ToolResult.failed(
+                        f"Task {task_id} not found",
+                        data={"task_id": task_id},
+                    )
+
+                claim_fenced = bool(row[2]) if len(row) > 2 else False
+                rollout_fenced = bool(row[3]) if len(row) > 3 else False
+                if not row[1] and not claim_fenced and not rollout_fenced:
+                    return ToolResult.ok(
+                        confirmation=f"Task {task_id} was already paused (no-op)",
+                        data={"success": True, "task_id": task_id, "status": "already_paused"},
+                    )
+
+                paused = await self._db.execute(
                     """
                     UPDATE scheduled_tasks
                     SET enabled = 0, lease_owner = NULL, lease_expires_at = NULL,
                         claim_token = NULL, claim_execution_id = NULL,
-                        claim_scheduled_for = NULL
+                        claim_scheduled_for = NULL, scheduler_claim_fenced = 0,
+                        scheduler_rollout_fenced = 0,
+                        scheduler_rollout_fenced_at = NULL
                     WHERE id = ? AND agent_id = ?
                     """,
                     (task_id, self._agent_id),
                 )
+                if not self._scheduler_mutation_wrote(paused):
+                    return ToolResult.failed("Failed to pause scheduled task")
                 await self._cancel_claimed_executions(
                     task_id, "schedule paused before outcome commit"
                 )
@@ -1908,60 +1967,79 @@ class SchedulerFeature(Feature):
             return ToolResult.failed("Database not available")
 
         try:
-            row = await self._db.fetchone(
-                """
-                SELECT id, enabled, cron_expression, schedule_kind, run_at,
-                       timezone_name, terminal_status
-                FROM scheduled_tasks WHERE id = ? AND agent_id = ?
-                """,
-                (task_id, self._agent_id),
-            )
-            if not row:
-                return ToolResult.failed(
-                    f"Task {task_id} not found",
-                    data={"task_id": task_id},
+            # The state decision belongs under the active control-row lock.
+            # Otherwise a concurrent pause can land between this read and the
+            # resume write, and be silently undone by stale enabled=0 data.
+            async with self._schedule_transaction():
+                if not await self._lock_active_scheduler_rollout():
+                    return self._rollout_mutation_error()
+                row = await self._db.fetchone(
+                    """
+                    SELECT id, enabled, cron_expression, schedule_kind, run_at,
+                           timezone_name, terminal_status, scheduler_claim_fenced,
+                           scheduler_rollout_fenced
+                    FROM scheduled_tasks WHERE id = ? AND agent_id = ?
+                    """,
+                    (task_id, self._agent_id),
                 )
+                if not row:
+                    return ToolResult.failed(
+                        f"Task {task_id} not found",
+                        data={"task_id": task_id},
+                    )
 
-            if row[1]:
-                return ToolResult.ok(
-                    confirmation=f"Task {task_id} was already running (no-op)",
-                    data={"success": True, "task_id": task_id, "status": "already_running"},
+                claim_fenced = bool(row[7]) if len(row) > 7 else False
+                rollout_fenced = bool(row[8]) if len(row) > 8 else False
+                if rollout_fenced:
+                    return self._rollout_mutation_error()
+                if row[1] or claim_fenced:
+                    return ToolResult.ok(
+                        confirmation=f"Task {task_id} was already running (no-op)",
+                        data={"success": True, "task_id": task_id, "status": "already_running"},
+                    )
+
+                cron_expr = row[2]
+                schedule_kind = row[3] if len(row) > 3 and row[3] else "cron"
+                run_at = row[4] if len(row) > 4 else None
+                timezone_name = row[5] if len(row) > 5 and row[5] else "UTC"
+                terminal_status = row[6] if len(row) > 6 else None
+                if schedule_kind == "one_shot" and terminal_status:
+                    return ToolResult.failed(
+                        f"Task {task_id} is a terminal one-shot deadline ({terminal_status}) and cannot be resumed"
+                    )
+                now = datetime.now(timezone.utc)
+                cron_now_invalid = False
+                if schedule_kind == "one_shot":
+                    next_run_at = run_at
+                    if not next_run_at:
+                        return ToolResult.failed(f"One-shot task {task_id} has no run_at deadline")
+                else:
+                    try:
+                        nxt = next_run(cron_expr, after=now, timezone_name=timezone_name)
+                        next_run_at = nxt.isoformat()
+                    except CronParseError:
+                        next_run_at = None
+                        cron_now_invalid = True
+
+                resumed = await self._db.execute(
+                    """
+                    UPDATE scheduled_tasks
+                    SET enabled = 1, next_run_at = ?, terminal_status = NULL,
+                        terminal_at = NULL, lease_owner = NULL, lease_expires_at = NULL,
+                        claim_token = NULL, claim_execution_id = NULL,
+                        claim_scheduled_for = NULL, scheduler_claim_fenced = 0,
+                        scheduler_rollout_fenced = 0,
+                        scheduler_rollout_fenced_at = NULL,
+                        scheduler_protocol_version = ?
+                    WHERE id = ? AND agent_id = ?
+                    """,
+                    (
+                        next_run_at, SCHEDULER_PROTOCOL_VERSION, task_id,
+                        self._agent_id,
+                    ),
                 )
-
-            cron_expr = row[2]
-            schedule_kind = row[3] if len(row) > 3 and row[3] else "cron"
-            run_at = row[4] if len(row) > 4 else None
-            timezone_name = row[5] if len(row) > 5 and row[5] else "UTC"
-            terminal_status = row[6] if len(row) > 6 else None
-            if schedule_kind == "one_shot" and terminal_status:
-                return ToolResult.failed(
-                    f"Task {task_id} is a terminal one-shot deadline ({terminal_status}) and cannot be resumed"
-                )
-            now = datetime.now(timezone.utc)
-            cron_now_invalid = False
-            if schedule_kind == "one_shot":
-                next_run_at = run_at
-                if not next_run_at:
-                    return ToolResult.failed(f"One-shot task {task_id} has no run_at deadline")
-            else:
-                try:
-                    nxt = next_run(cron_expr, after=now, timezone_name=timezone_name)
-                    next_run_at = nxt.isoformat()
-                except CronParseError:
-                    next_run_at = None
-                    cron_now_invalid = True
-
-            await self._db.execute(
-                """
-                UPDATE scheduled_tasks
-                SET enabled = 1, next_run_at = ?, terminal_status = NULL,
-                    terminal_at = NULL, lease_owner = NULL, lease_expires_at = NULL,
-                    claim_token = NULL, claim_execution_id = NULL,
-                    claim_scheduled_for = NULL
-                WHERE id = ? AND agent_id = ?
-                """,
-                (next_run_at, task_id, self._agent_id),
-            )
+                if not self._scheduler_mutation_wrote(resumed):
+                    return ToolResult.failed("Failed to resume scheduled task")
         except Exception as e:
             logger.error("Failed to resume task %s: %s", task_id, e)
             return ToolResult.failed(str(e))
@@ -2028,62 +2106,86 @@ class SchedulerFeature(Feature):
             return ToolResult.failed(f"Invalid cron expression: {e}")
 
         try:
-            row = await self._db.fetchone(
-                """
-                SELECT cron_expression, enabled, schedule_kind, timezone_name
-                FROM scheduled_tasks WHERE id = ? AND agent_id = ?
-                """,
-                (task_id, self._agent_id),
-            )
-            if not row:
-                return ToolResult.failed(
-                    f"Task {task_id} not found",
-                    data={"task_id": task_id},
-                )
-
-            old_cron = row[0]
-            enabled = bool(row[1])
-            schedule_kind = row[2] if len(row) > 2 and row[2] else "cron"
-            current_timezone = row[3] if len(row) > 3 and row[3] else "UTC"
-            if schedule_kind != "cron":
-                return ToolResult.failed("One-shot deadlines do not have a cron expression to update")
-            effective_timezone = timezone_name or current_timezone
-
-            if old_cron == cron_expression and effective_timezone == current_timezone:
-                return ToolResult.ok(
-                    confirmation=(
-                        f"Task {task_id} cron unchanged ({cron_expression}); no-op"
-                    ),
-                    data={
-                        "success": True,
-                        "task_id": task_id,
-                        "status": "unchanged",
-                        "cron_expression": cron_expression,
-                    },
-                )
-
-            now = datetime.now(timezone.utc)
-            next_run_at: Optional[str] = None
-            if enabled:
-                try:
-                    next_run_at = next_run(
-                        cron_expression, after=now, timezone_name=effective_timezone
-                    ).isoformat()
-                except CronParseError as e:
-                    return ToolResult.failed(f"Cannot compute next run: {e}")
-
+            # Read the row only after the same control-row lock that guards
+            # the write. Reading enabled outside this transaction let a
+            # concurrent pause/resume be overwritten by a stale update.
             async with self._schedule_transaction():
-                await self._db.execute(
+                if not await self._lock_active_scheduler_rollout():
+                    return self._rollout_mutation_error()
+                row = await self._db.fetchone(
+                    """
+                    SELECT cron_expression, enabled, schedule_kind, timezone_name,
+                           scheduler_claim_fenced, scheduler_rollout_fenced
+                    FROM scheduled_tasks WHERE id = ? AND agent_id = ?
+                    """,
+                    (task_id, self._agent_id),
+                )
+                if not row:
+                    return ToolResult.failed(
+                        f"Task {task_id} not found",
+                        data={"task_id": task_id},
+                    )
+
+                old_cron = row[0]
+                claim_fenced = bool(row[4]) if len(row) > 4 else False
+                rollout_fenced = bool(row[5]) if len(row) > 5 else False
+                if rollout_fenced:
+                    # An active control row plus a fenced row is corrupt or a
+                    # concurrent transition; never clear its safety fence from
+                    # a stale definition update.
+                    return self._rollout_mutation_error()
+                enabled = bool(row[1]) or claim_fenced
+                schedule_kind = row[2] if len(row) > 2 and row[2] else "cron"
+                current_timezone = row[3] if len(row) > 3 and row[3] else "UTC"
+                if schedule_kind != "cron":
+                    return ToolResult.failed(
+                        "One-shot deadlines do not have a cron expression to update"
+                    )
+                effective_timezone = timezone_name or current_timezone
+
+                if old_cron == cron_expression and effective_timezone == current_timezone:
+                    return ToolResult.ok(
+                        confirmation=(
+                            f"Task {task_id} cron unchanged ({cron_expression}); no-op"
+                        ),
+                        data={
+                            "success": True,
+                            "task_id": task_id,
+                            "status": "unchanged",
+                            "cron_expression": cron_expression,
+                        },
+                    )
+
+                now = datetime.now(timezone.utc)
+                next_run_at: Optional[str] = None
+                if enabled:
+                    try:
+                        next_run_at = next_run(
+                            cron_expression, after=now, timezone_name=effective_timezone
+                        ).isoformat()
+                    except CronParseError as e:
+                        return ToolResult.failed(f"Cannot compute next run: {e}")
+
+                updated = await self._db.execute(
                     """
                     UPDATE scheduled_tasks
                     SET cron_expression = ?, timezone_name = ?, next_run_at = ?,
+                        enabled = ?, scheduler_protocol_version = ?,
                         lease_owner = NULL, lease_expires_at = NULL,
                         claim_token = NULL, claim_execution_id = NULL,
-                        claim_scheduled_for = NULL
+                        claim_scheduled_for = NULL, scheduler_claim_fenced = 0,
+                        scheduler_rollout_fenced = 0,
+                        scheduler_rollout_fenced_at = NULL
                     WHERE id = ? AND agent_id = ?
                     """,
-                    (cron_expression, effective_timezone, next_run_at, task_id, self._agent_id),
+                    (
+                        cron_expression, effective_timezone, next_run_at,
+                        1 if enabled else 0, SCHEDULER_PROTOCOL_VERSION,
+                        task_id, self._agent_id,
+                    ),
                 )
+                if not self._scheduler_mutation_wrote(updated):
+                    return ToolResult.failed("Failed to update scheduled task")
                 await self._cancel_claimed_executions(
                     task_id,
                     "schedule definition updated before outcome commit",
@@ -2148,6 +2250,46 @@ class SchedulerFeature(Feature):
             return
         async with context:
             yield
+
+    async def _lock_active_scheduler_rollout(self) -> bool:
+        """Lock this DID's active rollout epoch for a runnable mutation.
+
+        The no-op assignment is intentional.  PostgreSQL takes a row lock,
+        SQLite serializes the write transaction, and the predicate rejects a
+        DID that is quiescing or has no v2 protocol control row.  This must be
+        called *inside* :meth:`_schedule_transaction` before adding, resuming,
+        or otherwise making a schedule runnable.
+        """
+
+        locked = await self._db.execute(
+            """
+            UPDATE scheduler_protocol_rollout
+            SET updated_at = updated_at
+            WHERE agent_id = ? AND protocol_version = ? AND state = 'active'
+            """,
+            (self._agent_id, SCHEDULER_PROTOCOL_VERSION),
+        )
+        return self._scheduler_mutation_wrote(locked)
+
+    async def _lock_scheduler_rollout_for_pause(self) -> bool:
+        """Serialize a safe pause with active *or* quiescing rollout state.
+
+        Pausing never makes work runnable, so it remains authorized during a
+        rollout drain. The no-op control-row update makes activation wait for
+        the pause's durable intent; clearing ``scheduler_rollout_fenced`` then
+        prevents activation from restoring that row to enabled=1.
+        """
+
+        locked = await self._db.execute(
+            """
+            UPDATE scheduler_protocol_rollout
+            SET updated_at = updated_at
+            WHERE agent_id = ? AND protocol_version = ?
+              AND state IN ('active', 'quiescing')
+            """,
+            (self._agent_id, SCHEDULER_PROTOCOL_VERSION),
+        )
+        return self._scheduler_mutation_wrote(locked)
 
     @tool(
         "schedule_record_outcome",

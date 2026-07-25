@@ -220,6 +220,111 @@ def _identity_readiness_failure_record(
     }
 
 
+def _scheduler_readiness_failure_record(
+    scope: str,
+    error: BaseException,
+    *,
+    agent_name: Optional[str] = None,
+) -> dict:
+    """Return a non-sensitive scheduler readiness failure record.
+
+    Scheduler identity/database errors often carry a local path or connection
+    string.  They belong in logs, not in health output.  The authenticated
+    endpoint receives the affected configured agent (when known), a stable
+    operator action code, and exception class; public readiness receives only
+    the aggregate 503 contract.
+    """
+    record = {
+        "scope": scope,
+        "state": "unavailable",
+        "error_code": f"scheduler_{scope}_unavailable",
+        "cause_type": type(error).__name__,
+    }
+    if agent_name is not None:
+        record["agent"] = agent_name
+    return record
+
+
+def _latch_scheduler_readiness_failure(
+    app: FastAPI,
+    scope: str,
+    error: BaseException,
+    *,
+    agent_name: Optional[str] = None,
+) -> None:
+    """Latch a scheduler safety outage until a new host lifecycle starts."""
+    record = _scheduler_readiness_failure_record(
+        scope,
+        error,
+        agent_name=agent_name,
+    )
+    failures = list(getattr(app.state, "scheduler_readiness_failures", ()))
+    is_new = record not in failures
+    if is_new:
+        failures.append(record)
+        app.state.scheduler_readiness_failures = failures
+        logger.error(
+            "Scheduler readiness failure (scope=%s, agent=%s, cause=%s)",
+            scope,
+            agent_name,
+            type(error).__name__,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+
+
+def _latch_active_scheduler_runner_failures(
+    app: FastAPI,
+    agent,
+    manager,
+) -> None:
+    """Promote live runner safety latches into the host readiness contract.
+
+    A shared-PostgreSQL host owns a fleet runner, but each loaded
+    ``SchedulerFeature`` may also have a scoped runner while the host is
+    coming up or while a deployment topology changes.  Those runners cannot
+    receive the app-owned callback at construction time.  Poll their explicit
+    ``readiness_failure`` latch at the health boundary and persist only a
+    sanitized record; a scheduler protocol/database outage must not look
+    healthy merely because a sibling agent remains routable.
+    """
+
+    candidates: list[tuple[str, object]] = []
+    if agent is not None:
+        candidates.append(("default", agent))
+    if manager is not None:
+        try:
+            managed = manager.list_agents()
+        except Exception:  # pragma: no cover - health must not crash
+            logger.warning("Unable to inspect managed scheduler readiness", exc_info=True)
+            managed = {}
+        if isinstance(managed, dict):
+            candidates.extend(
+                (name, candidate)
+                for name, candidate in managed.items()
+                if isinstance(name, str)
+            )
+
+    for agent_name, candidate in candidates:
+        features = getattr(candidate, "features", None)
+        if not isinstance(features, dict):
+            continue
+        for feature in features.values():
+            runner = getattr(feature, "_runner", None)
+            failure = getattr(runner, "readiness_failure", None)
+            if isinstance(failure, BaseException):
+                _latch_scheduler_readiness_failure(
+                    app,
+                    "runtime",
+                    failure,
+                    agent_name=agent_name,
+                )
+
+    host_runner = getattr(app.state, "host_scheduler_runner", None)
+    host_failure = getattr(host_runner, "readiness_failure", None)
+    if isinstance(host_failure, BaseException):
+        _latch_scheduler_readiness_failure(app, "protocol", host_failure)
+
+
 def _constitution_safe_mode_record(agent_name: str, agent) -> Optional[dict]:
     """Return a controlled operator-readiness record for a restricted agent."""
     safe_mode = getattr(agent, "_safe_mode", False) is True
@@ -360,7 +465,7 @@ def _resolve_route_agent(scope, mount_agent):
     return state.get("agent") or mount_agent
 
 
-def _gate_feature_route(route, feature_name: str, mount_agent) -> None:
+def _gate_feature_route(app: FastAPI, route, feature_name: str, mount_agent) -> None:
     """Wrap ``route`` so it only serves while its owning feature is live-enabled.
 
     Feature routers are mounted ONCE at startup, but features can be
@@ -382,6 +487,17 @@ def _gate_feature_route(route, feature_name: str, mount_agent) -> None:
 
     def _gated_matches(scope):
         agent = _resolve_route_agent(scope, mount_agent)
+        # Dynamic feature routes stay physically mounted so a live feature can
+        # be disabled/re-enabled without route churn.  When their mount owner
+        # has been DELETEd, however, an unprefixed request must not keep using
+        # that stale captured object while a scheduler races to cold-wake it.
+        # Request-scoped routes still work for another currently managed agent
+        # that exposes the same feature.
+        manager = getattr(app.state, "agent_manager", None)
+        if manager is not None and agent is mount_agent:
+            managed = manager.list_agents()
+            if not any(current is mount_agent for current in managed.values()):
+                return Match.NONE, {}
         features = getattr(agent, "features", None) or {}
         feature = features.get(feature_name) if hasattr(features, "get") else None
         if feature is None or not bool(getattr(feature, "enabled", True)):
@@ -391,7 +507,27 @@ def _gate_feature_route(route, feature_name: str, mount_agent) -> None:
     route.matches = _gated_matches
 
 
-def _mount_feature_routers(app: FastAPI) -> None:
+def _feature_router_signature(feature_name: str, router) -> tuple:
+    """Return a stable de-duplication key for one feature router.
+
+    Cold agent registration can happen after the startup mount pass.  Router
+    objects are freshly constructed by many features, so object identity is
+    not sufficient to avoid duplicate FastAPI routes; use the exposed route
+    shape instead.  The feature name keeps intentionally distinct features
+    from being conflated merely because they happen to share a path.
+    """
+    routes = tuple(
+        (
+            type(route).__name__,
+            getattr(route, "path", None),
+            tuple(sorted(getattr(route, "methods", ()) or ())),
+        )
+        for route in getattr(router, "routes", ())
+    )
+    return (feature_name, getattr(router, "prefix", ""), routes)
+
+
+def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
     """Mount routers contributed by discovered features.
 
     After agent initialization, iterate over all registered features and
@@ -410,6 +546,7 @@ def _mount_feature_routers(app: FastAPI) -> None:
     """
     routes_before = len(app.routes)
     mounted = []
+    mounted_keys = set(getattr(app.state, "_feature_router_keys", ()))
 
     def _collect_routers_from_agent(agent) -> None:
         features = getattr(agent, "features", {})
@@ -427,27 +564,36 @@ def _mount_feature_routers(app: FastAPI) -> None:
                 router = feature.get_router()
                 if router is None:
                     continue
+                router_key = _feature_router_signature(name, router)
+                if router_key in mounted_keys:
+                    continue
                 before = len(app.routes)
                 app.include_router(router)
                 # Gate exactly the routes this feature just contributed so a
                 # runtime disable/remove makes them 404 (never a core route).
                 for route in app.routes[before:]:
                     if hasattr(route, "app"):
-                        _gate_feature_route(route, name, agent)
+                        _gate_feature_route(app, route, name, agent)
+                mounted_keys.add(router_key)
                 mounted.append(name)
             except Exception as exc:
                 logger.warning("Failed to mount router from feature %s: %s", name, exc)
 
-    # Single-agent mode
-    agent = getattr(app.state, "agent", None)
-    if agent is not None:
-        _collect_routers_from_agent(agent)
+    if agents is None:
+        # Single-agent mode
+        agent = getattr(app.state, "agent", None)
+        if agent is not None:
+            _collect_routers_from_agent(agent)
 
-    # Multi-agent mode — mount routers from all loaded agents
-    manager = getattr(app.state, "agent_manager", None)
-    if manager is not None:
-        for agent_name in manager.list_agents():
-            agent = manager.get_agent(agent_name)
+        # Multi-agent mode — mount routers from all loaded agents
+        manager = getattr(app.state, "agent_manager", None)
+        if manager is not None:
+            for agent_name in manager.list_agents():
+                agent = manager.get_agent(agent_name)
+                if agent is not None:
+                    _collect_routers_from_agent(agent)
+    else:
+        for agent in agents:
             if agent is not None:
                 _collect_routers_from_agent(agent)
 
@@ -463,7 +609,9 @@ def _mount_feature_routers(app: FastAPI) -> None:
     # webhook), while the unprefixed /webhooks/{name} form aggregates across
     # every agent (#2522). Mounted when at least one enabled webhook receiver
     # exists at startup; the provider itself stays live thereafter.
-    if _live_webhook_receivers(app):
+    if _live_webhook_receivers(app) and not getattr(
+        app.state, "_feature_webhook_dispatch_mounted", False
+    ):
         try:
             from kestrel_sovereign.features.webhooks.receiver import (
                 build_webhook_dispatch_router,
@@ -474,6 +622,7 @@ def _mount_feature_routers(app: FastAPI) -> None:
                     lambda agent=None: _live_webhook_receivers(app, agent)
                 )
             )
+            app.state._feature_webhook_dispatch_mounted = True
             mounted.append("webhooks")
         except Exception as exc:
             logger.warning("Failed to mount webhook dispatch router: %s", exc)
@@ -487,6 +636,7 @@ def _mount_feature_routers(app: FastAPI) -> None:
     tracked_routes = list(getattr(app.state, "_feature_routes", ()))
     tracked_routes.extend(added_routes)
     app.state._feature_routes = tracked_routes
+    app.state._feature_router_keys = mounted_keys
     # Kept for compatibility with any external diagnostics that surface the
     # old state field.  Teardown uses ``_feature_routes`` as its authority.
     app.state._feature_route_count = len(tracked_routes)
@@ -564,14 +714,16 @@ def _unmount_feature_routers(app: FastAPI) -> None:
         app.routes[:] = [
             route for route in app.routes if id(route) not in tracked_ids
         ]
-        app.state._feature_routes = []
-        app.state._feature_route_count = 0
         logger.info(
             "Removed %d dynamically-mounted feature routes", len(tracked_routes)
         )
+    app.state._feature_routes = []
+    app.state._feature_route_count = 0
+    app.state._feature_router_keys = set()
+    app.state._feature_webhook_dispatch_mounted = False
 
 
-def _mount_feature_ui_assets(app: FastAPI) -> None:
+def _mount_feature_ui_assets(app: FastAPI, *, agents=None) -> None:
     """Mount per-feature static asset directories (#2043).
 
     A feature that returns a ``UIContributions`` with a ``static_dir`` from
@@ -594,6 +746,7 @@ def _mount_feature_ui_assets(app: FastAPI) -> None:
     from kestrel_sovereign.ui_contributions import feature_static_mounts
 
     seen: set = set()
+    mounted_paths = set(getattr(app.state, "_feature_ui_mount_paths", ()))
     pending: list = []
 
     def _collect(agent) -> None:
@@ -603,20 +756,25 @@ def _mount_feature_ui_assets(app: FastAPI) -> None:
         # #2048). The manifest at GET /api/ui/contributions still lists only
         # enabled features, so a disabled feature's mount is dormant until enabled.
         for mount_path, directory in feature_static_mounts(agent, include_disabled=True):
-            if mount_path in seen:
+            if mount_path in seen or mount_path in mounted_paths:
                 continue
             seen.add(mount_path)
             pending.append((mount_path, directory))
 
-    agent = getattr(app.state, "agent", None)
-    if agent is not None:
-        _collect(agent)
-    manager = getattr(app.state, "agent_manager", None)
-    if manager is not None:
-        for agent_name in manager.list_agents():
-            a = manager.get_agent(agent_name)
-            if a is not None:
-                _collect(a)
+    if agents is None:
+        agent = getattr(app.state, "agent", None)
+        if agent is not None:
+            _collect(agent)
+        manager = getattr(app.state, "agent_manager", None)
+        if manager is not None:
+            for agent_name in manager.list_agents():
+                a = manager.get_agent(agent_name)
+                if a is not None:
+                    _collect(a)
+    else:
+        for agent in agents:
+            if agent is not None:
+                _collect(agent)
 
     added = []
     for mount_path, directory in pending:
@@ -627,10 +785,14 @@ def _mount_feature_ui_assets(app: FastAPI) -> None:
                 name=f"feature-ui:{mount_path}",
             )
             added.append(app.routes[-1])
+            mounted_paths.add(mount_path)
         except Exception as exc:  # noqa: BLE001 - never block startup on one feature
             logger.warning("Failed to mount feature UI assets at %s: %s", mount_path, exc)
 
-    app.state._feature_ui_mounts = added
+    existing = list(getattr(app.state, "_feature_ui_mounts", ()))
+    existing.extend(added)
+    app.state._feature_ui_mounts = existing
+    app.state._feature_ui_mount_paths = mounted_paths
     if added:
         logger.info(
             "Mounted feature UI asset dirs: %s",
@@ -653,6 +815,36 @@ def _unmount_feature_ui_assets(app: FastAPI) -> None:
         except ValueError:
             pass
     app.state._feature_ui_mounts = []
+    app.state._feature_ui_mount_paths = set()
+
+
+async def _onboard_host_registered_agent(app: FastAPI, manager, name: str, agent) -> None:
+    """Apply host-owned integration to every newly registered agent.
+
+    Initial fleet startup and scheduler cold wakes share ``AgentManager``'s
+    registration seam.  Keeping this work in the app (rather than the
+    scheduler) makes a dynamically loaded tenant indistinguishable from an
+    autostart tenant for same-host A2A verification and feature HTTP/UI
+    exposure.  Failure is intentionally propagated to the manager, which
+    unpublishes the partially onboarded agent instead of dispatching work to
+    an incompletely integrated tenant.
+    """
+    from kestrel_sovereign.a2a.did_registry import install_a2a_did_resolver
+
+    federated = os.environ.get("KESTREL_A2A_FEDERATED_DID", "").lower() in (
+        "1", "true", "yes",
+    )
+    install_a2a_did_resolver(manager, federated_fallback=federated)
+    _mount_feature_ui_assets(app, agents=(agent,))
+    _mount_feature_routers(app, agents=(agent,))
+
+    # The host-level demo classification is a live fleet property.  Refresh it
+    # on dynamic registration rather than leaving a cold-woken demo tenant
+    # classified from the startup snapshot.
+    from kestrel_sovereign.security.demo_isolation import classify_server_mode
+
+    app.state.demo_mode = classify_server_mode(manager.list_agents())
+    logger.info("Completed host onboarding for dynamically registered agent %r", name)
 
 
 def _host_config_mapping(config) -> dict:
@@ -993,6 +1185,118 @@ def _uses_shared_postgres_scheduler() -> bool:
     )
 
 
+async def _prepare_shared_postgres_scheduler_protocol(app: FastAPI, manager, config) -> None:
+    """Seed one shared scheduler protocol epoch before agent runners start.
+
+    ``SchedulerFeature.initialize`` starts an agent-scoped runner.  Multi-agent
+    startup initializes those features concurrently, so letting the first
+    individual agent create the global scheduler tables makes the next one see
+    a pre-existing table and indistinguishably resemble a legacy upgrade.  Do
+    one non-polling host bootstrap first: discover every configured local DID
+    without initializing it, establish the database-global provenance marker,
+    and write every DID's rollout row in the same protocol pass.
+
+    This deliberately closes its temporary storage before agent initialization.
+    It is a migration/preflight owner, not a second scheduler replica; starting
+    a polling host runner here could race a concurrent autostart cold load.
+    ``_start_host_scheduler`` creates the long-lived executor only after the
+    configured fleet has completed its initialization phase.
+    """
+    if not _uses_shared_postgres_scheduler():
+        return
+
+    from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
+    from kestrel_sovereign.features.scheduler.runner import (
+        AgentManagerHostedSchedulerExecutor,
+        SchedulerRunner,
+    )
+    from kestrel_sovereign.storage.async_storage import AsyncStorage
+
+    # Do this before ``load_from_config``.  The manager's lookup is explicitly
+    # read-only and omits an unincepted/unresolved DID rather than creating a
+    # blank identity DB or withholding healthy peers from the shared fleet.
+    agent_configs = await manager.local_agent_configs_by_did(config)
+    for name, error in getattr(manager, "cold_scheduler_identity_failures", ()):
+        _latch_scheduler_readiness_failure(
+            app,
+            "identity",
+            error,
+            agent_name=name,
+        )
+    if not agent_configs:
+        logger.info("Shared scheduler protocol bootstrap skipped: no local agents")
+        return
+
+    storage = AsyncStorage(
+        backend="postgres",
+        dsn=os.environ["KESTREL_DATABASE_URL"],
+    )
+    preflight_failure: BaseException | None = None
+    try:
+        await storage.initialize()
+        if storage.db is None:
+            raise RuntimeError(
+                "shared PostgreSQL scheduler protocol storage did not initialize"
+            )
+
+        def _on_scheduler_protocol_failure(error: BaseException) -> None:
+            _latch_scheduler_readiness_failure(app, "protocol", error)
+
+        live_authority = getattr(manager, "is_scheduler_agent_authorized", None)
+        runner = SchedulerRunner(
+            db=storage.db,
+            agent_id=None,
+            executor=AgentManagerHostedSchedulerExecutor(manager, agent_configs),
+            authorized_agent_ids=agent_configs.keys(),
+            is_agent_authorized=(
+                live_authority if callable(live_authority) else None
+            ),
+            on_protocol_failure=_on_scheduler_protocol_failure,
+            misfire_grace_seconds=SchedulerFeature._load_misfire_grace_seconds(),
+            max_concurrent_tasks=SchedulerFeature._load_max_concurrent_tasks(),
+            lease_seconds=SchedulerFeature._load_lease_seconds(),
+            owner_id=f"host-scheduler-preflight:{os.getpid()}",
+        )
+        # This is intentionally ``_ensure_tables`` rather than ``start``.  It
+        # establishes the durable schema/provenance/rollout state but never
+        # polls or dispatches while autostart agents are being initialized.
+        await runner._ensure_tables()
+    except BaseException as error:
+        preflight_failure = error
+        if not isinstance(error, asyncio.CancelledError):
+            _latch_scheduler_readiness_failure(app, "protocol", error)
+        raise
+    finally:
+        # A transient bootstrap pool is invisible to ordinary server teardown,
+        # so this helper remains its cancellation-safe lifecycle owner until it
+        # is terminal.  Do not allow a repeated cancellation to strand it.
+        close_task = asyncio.create_task(
+            storage.close(), name="host_scheduler_protocol_preflight_close"
+        )
+        close_cancelled, close_failure = await await_lifecycle_task_completion(
+            close_task
+        )
+        if close_failure is not None:
+            if not isinstance(close_failure, asyncio.CancelledError):
+                logger.warning(
+                    "Shared scheduler protocol preflight storage close failed: %s",
+                    close_failure,
+                    exc_info=(
+                        type(close_failure),
+                        close_failure,
+                        close_failure.__traceback__,
+                    ),
+                )
+            if preflight_failure is None:
+                if not isinstance(close_failure, asyncio.CancelledError):
+                    _latch_scheduler_readiness_failure(
+                        app, "protocol", close_failure
+                    )
+                raise close_failure
+        if close_cancelled and preflight_failure is None:
+            raise asyncio.CancelledError()
+
+
 async def _start_host_scheduler(app: FastAPI, manager, config) -> None:
     """Start the shared-PostgreSQL scheduler that can wake cold local agents.
 
@@ -1005,6 +1309,13 @@ async def _start_host_scheduler(app: FastAPI, manager, config) -> None:
     """
     app.state.host_scheduler_runner = None
     app.state.host_scheduler_storage = None
+    app.state.scheduler_cold_agent_failures = []
+    # The schema-only preflight runs before parallel agent initialization and
+    # may already have latched an unresolved DID or protocol failure.  A later
+    # transition into the long-lived host runner must not make that safety
+    # evidence disappear from readiness.
+    if not hasattr(app.state, "scheduler_readiness_failures"):
+        app.state.scheduler_readiness_failures = []
     if not _uses_shared_postgres_scheduler():
         return
 
@@ -1019,6 +1330,27 @@ async def _start_host_scheduler(app: FastAPI, manager, config) -> None:
     # including cold (autostart=false) agents.  The manager resolves cold DIDs
     # from their local identity store without loading the agent itself.
     agent_configs = await manager.local_agent_configs_by_did(config)
+    cold_identity_failures = getattr(
+        manager, "cold_scheduler_identity_failures", []
+    )
+    for name, error in cold_identity_failures:
+        _latch_scheduler_readiness_failure(
+            app,
+            "identity",
+            error,
+            agent_name=name,
+        )
+    # Kept as a named compatibility field for authenticated diagnostics; its
+    # entries are the same redacted readiness records, never exception text.
+    app.state.scheduler_cold_agent_failures = list(
+        getattr(app.state, "scheduler_readiness_failures", ())
+    )
+    for failure in app.state.scheduler_cold_agent_failures:
+        logger.error(
+            "Shared scheduler cannot wake configured agent %r (cause=%s)",
+            failure.get("agent"),
+            failure["cause_type"],
+        )
     if not agent_configs:
         logger.info("Shared scheduler not started: host has no local agents")
         return
@@ -1027,30 +1359,64 @@ async def _start_host_scheduler(app: FastAPI, manager, config) -> None:
         backend="postgres",
         dsn=os.environ["KESTREL_DATABASE_URL"],
     )
+    # Publish ownership before the first await.  A cancellation or initialization
+    # failure can then use the ordinary host teardown path to close this
+    # connection rather than leaving an invisible pool behind.
+    app.state.host_scheduler_storage = storage
     runner = None
     try:
         await storage.initialize()
         if storage.db is None:
             raise RuntimeError("shared PostgreSQL scheduler storage did not initialize")
+        def _on_scheduler_protocol_failure(error: BaseException) -> None:
+            _latch_scheduler_readiness_failure(app, "protocol", error)
+
+        live_authority = getattr(manager, "is_scheduler_agent_authorized", None)
         runner = SchedulerRunner(
             db=storage.db,
             agent_id=None,
             executor=AgentManagerHostedSchedulerExecutor(manager, agent_configs),
             authorized_agent_ids=agent_configs.keys(),
+            is_agent_authorized=(
+                live_authority if callable(live_authority) else None
+            ),
+            on_protocol_failure=_on_scheduler_protocol_failure,
             misfire_grace_seconds=SchedulerFeature._load_misfire_grace_seconds(),
             max_concurrent_tasks=SchedulerFeature._load_max_concurrent_tasks(),
             lease_seconds=SchedulerFeature._load_lease_seconds(),
             owner_id=f"host-scheduler:{os.getpid()}",
         )
+        # ``runner.start`` runs schema migration / rollout fencing and can fail.
+        # Publish it first so cleanup also reaches a partially-started runner.
+        app.state.host_scheduler_runner = runner
         await runner.start()
-    except BaseException:
-        if runner is not None:
-            await runner.stop()
-        await storage.close()
+    except BaseException as startup_failure:
+        cleanup = asyncio.create_task(
+            _shutdown_host_scheduler(app),
+            name="host_scheduler_startup_cleanup",
+        )
+        cleanup_cancelled, cleanup_failure = await await_lifecycle_task_completion(
+            cleanup
+        )
+        if cleanup_failure is not None and not isinstance(
+            cleanup_failure, asyncio.CancelledError
+        ):
+            logger.warning(
+                "Host scheduler startup cleanup failed after %s: %s",
+                type(startup_failure).__name__,
+                cleanup_failure,
+                exc_info=(
+                    type(cleanup_failure),
+                    cleanup_failure,
+                    cleanup_failure.__traceback__,
+                ),
+            )
+        if cleanup_cancelled and not isinstance(
+            startup_failure, asyncio.CancelledError
+        ):
+            raise asyncio.CancelledError() from startup_failure
         raise
 
-    app.state.host_scheduler_storage = storage
-    app.state.host_scheduler_runner = runner
     logger.info(
         "Started shared PostgreSQL scheduler for %d local agent(s)",
         len(agent_configs),
@@ -1076,8 +1442,21 @@ async def _shutdown_host_scheduler(app: FastAPI) -> None:
 async def _shutdown_server_agents(app: FastAPI) -> None:
     """Run the agent-owned shutdown phase for either server topology."""
     manager = getattr(app.state, "agent_manager", None)
-    if manager is not None:
-        await manager.shutdown_all()
+    cleanup_manager = getattr(app.state, "startup_cleanup_agent_manager", None)
+    managers = []
+    for candidate in (manager, cleanup_manager):
+        if candidate is not None and all(candidate is not known for known in managers):
+            managers.append(candidate)
+    if managers:
+        for owned_manager in managers:
+            await owned_manager.shutdown_all()
+            if getattr(app.state, "agent_manager", None) is owned_manager:
+                app.state.agent_manager = None
+            if (
+                getattr(app.state, "startup_cleanup_agent_manager", None)
+                is owned_manager
+            ):
+                app.state.startup_cleanup_agent_manager = None
         logger.info("All agents shutdown complete.")
         return
 
@@ -1197,6 +1576,11 @@ async def _lifespan_startup(app: FastAPI):
     _set_startup_error(app, None)
     app.state.mandatory_feature_failures = []
     app.state.identity_readiness_failures = []
+    app.state.scheduler_cold_agent_failures = []
+    app.state.scheduler_readiness_failures = []
+    # On a failed rollback this private owner remains reachable only to
+    # teardown. It must never become the public routing manager.
+    app.state.startup_cleanup_agent_manager = None
 
     # --- Host-supervised Phoenix trace backend (issue #2570) ---
     # Launch Phoenix BEFORE agents so the OTLP endpoint is on os.environ when
@@ -1325,7 +1709,6 @@ async def _lifespan_startup(app: FastAPI):
             )
             _apply_platform_host_port(config, os.environ)
             manager = AgentManager(base_data_dir=Path.cwd())
-            loaded = await manager.load_from_config(config)
             app.state.agent_manager = manager
             # Persistence context for runtime agent creation (#2358): when the
             # deployment is DRIVEN BY a multi_agent.toml, a UI-created agent
@@ -1337,26 +1720,28 @@ async def _lifespan_startup(app: FastAPI):
                 multi_agent_path if multi_agent_path.exists() else None
             )
             app.state.agent = None  # No single default agent
+            # Registration is the one path shared by autostart, runtime
+            # creation, spawning, and scheduler cold wakes.  Install the
+            # app-owned onboarding hook before the first initializer publishes
+            # so every tenant receives A2A + feature integration.
+            manager.set_agent_registration_hook(
+                lambda name, agent: _onboard_host_registered_agent(
+                    app, manager, name, agent
+                )
+            )
+            # Seed the database-global scheduler provenance and every local
+            # DID's durable protocol row before concurrent agent
+            # initialization.  Each SchedulerFeature starts its own scoped
+            # runner during initialize(), so doing this after load_from_config
+            # would reintroduce first-DID/second-DID fresh-fleet ambiguity.
+            await _prepare_shared_postgres_scheduler_protocol(app, manager, config)
+            loaded = await manager.load_from_config(config)
             logger.info(f"Multi-agent mode: {loaded} agent(s) loaded")
 
-            # A2A sender verification (#1705): the host holds every agent, so it
-            # builds the same-host DID registry and injects the resolver into
-            # each agent (consumed by /tasks/send verification, #1673). Local
-            # same-host resolution by default; federated did:web opt-in via
-            # KESTREL_A2A_FEDERATED_DID.
-            try:
-                from kestrel_sovereign.a2a.did_registry import install_a2a_did_resolver
-
-                federated = os.environ.get("KESTREL_A2A_FEDERATED_DID", "").lower() in (
-                    "1", "true", "yes",
-                )
-                install_a2a_did_resolver(manager, federated_fallback=federated)
-            except Exception as exc:  # noqa: BLE001 - never block startup on this
-                logger.warning("Could not install A2A DID resolver: %s", exc)
-            # Fleet-idleness (#F235) is wired at the AgentManager's single agent
-            # registration point (agent_manager._load_one), so every agent —
-            # startup or spawned — gets the co-hosted-agents provider and no
-            # dynamically-added agent can bypass the whole-host-restart gate.
+            # Fleet-idleness (#F235) is wired at the AgentManager's single
+            # registration point, so every agent — startup or dynamically
+            # woken — gets the co-hosted-agents provider and no tenant can
+            # bypass the whole-host-restart gate.
 
             # Lifecycle hardening (#377): surface per-agent init failures
             # — without this, a multi-agent host whose providers all failed
@@ -1414,8 +1799,11 @@ async def _lifespan_startup(app: FastAPI):
                 rollback_complete = not manager.list_agents()
                 if not rollback_complete:
                     # Preserve the manager for the outer lifespan teardown to
-                    # retry; clearing it here would orphan still-loaded agents.
-                    app.state.agent_manager = manager
+                    # retry, but never leave it on the public routing surface:
+                    # a startup error dominates readiness and these agents may
+                    # still be draining their own cleanup.
+                    app.state.startup_cleanup_agent_manager = manager
+                    app.state.agent_manager = None
             identity_record = _identity_readiness_failure_record("default", e)
             if identity_record is not None:
                 logger.error(
@@ -2299,9 +2687,28 @@ def health_check(request: Request):
         [],
     )
     manager = getattr(request.app.state, 'agent_manager', None)
+    # A failed startup may retain an internal manager solely so teardown can
+    # finish closing its agents. It is not routeable and cannot make readiness
+    # pass merely because it still has loaded entries.
+    if startup_error:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unhealthy", "agent_initialized": False},
+        )
+    _latch_active_scheduler_runner_failures(request.app, agent, manager)
+    scheduler_failures = getattr(
+        request.app.state,
+        "scheduler_readiness_failures",
+        [],
+    )
     constitution_safe_mode = _constitution_safe_mode_records(agent, manager)
     any_initialized = bool(agent) or bool(manager and manager.list_agents())
-    if mandatory_failures or identity_failures or constitution_safe_mode:
+    if (
+        mandatory_failures
+        or identity_failures
+        or constitution_safe_mode
+        or scheduler_failures
+    ):
         return JSONResponse(
             status_code=503,
             content={
@@ -2315,7 +2722,10 @@ def health_check(request: Request):
         return {"status": "ok", "agent_initialized": True}
     # In multi-agent mode, check if any agents are loaded
     if any_initialized:
-        return {"status": "ok", "agent_initialized": True}
+        return {
+            "status": "ok",
+            "agent_initialized": True,
+        }
     return JSONResponse(
         status_code=503,
         content={
@@ -2439,6 +2849,17 @@ async def health_detailed(request: Request):
     # Tracing status is surfaced on every branch so an off/unreachable trace
     # backend (and its disabled reason) is visible regardless of agent health.
     tracing = await _phoenix_tracing_status(request.app)
+    if getattr(request.app.state, "startup_error", None):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unhealthy",
+                "error": "Server startup failed",
+                "checks": [],
+                "tracing": tracing,
+            },
+        )
+    _latch_active_scheduler_runner_failures(request.app, agent, manager)
     safe_mode_records = _constitution_safe_mode_records(agent, manager)
     if safe_mode_records:
         return JSONResponse(
@@ -2446,6 +2867,20 @@ async def health_detailed(request: Request):
             content={
                 "status": "restricted",
                 "constitution_safe_mode": safe_mode_records,
+                "checks": [],
+                "tracing": tracing,
+            },
+        )
+    scheduler_failures = getattr(
+        request.app.state, "scheduler_readiness_failures", []
+    )
+    if scheduler_failures:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unhealthy",
+                "error": "Scheduler unavailable",
+                "scheduler_readiness_failures": scheduler_failures,
                 "checks": [],
                 "tracing": tracing,
             },
@@ -2489,6 +2924,9 @@ async def health_detailed(request: Request):
             "agents": breakdown,
             "checks": [],
             "tracing": tracing,
+            "scheduler_cold_agent_failures": getattr(
+                request.app.state, "scheduler_cold_agent_failures", []
+            ),
         }
 
     return {

@@ -429,10 +429,14 @@ class PostgresBackend(DatabaseBackend):
                 self._txn_conn_var.reset(token)
     
     async def table_exists(self, table_name: str) -> bool:
-        """Check if a table exists."""
-        row = await self.fetch_one(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema='public' AND table_name=?",
-            (table_name,)
-        )
-        return row is not None
+        """Check whether an unqualified relation resolves on this connection.
+
+        ``to_regclass`` follows PostgreSQL's active ``search_path``.  That
+        preserves the normal production ``public`` behavior while allowing a
+        transaction-local schema to be inspected on the connection that owns
+        it, rather than accidentally observing an unrelated public table.
+        """
+        return bool(await self.fetch_val(
+            "SELECT to_regclass(?) IS NOT NULL",
+            (table_name,),
+        ))

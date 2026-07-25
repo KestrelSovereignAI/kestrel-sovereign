@@ -8,6 +8,7 @@ SDK wire boundary together.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from types import SimpleNamespace
 from typing import Any
 
@@ -19,6 +20,13 @@ from kestrel_sovereign.features.scheduler.runner import (
     SchedulerExecution,
     _SchedulerExecutionScope,
     _current_execution,
+)
+
+
+_OVERSIZED_SCHEDULE_ID = "🦅" * 129  # 516 UTF-8 bytes: just over the SDK cap.
+_OVERSIZED_SCHEDULE_SOURCE_ID = (
+    "schedule-sha256:"
+    + hashlib.sha256(_OVERSIZED_SCHEDULE_ID.encode("utf-8")).hexdigest()
 )
 
 
@@ -109,10 +117,10 @@ class _SdkJsonRpcAdapter:
         self._client.on_event(handler)
 
 
-def _execution(*, attempt: int) -> SchedulerExecution:
+def _execution(*, attempt: int, schedule_id: str = "daily-report") -> SchedulerExecution:
     return SchedulerExecution(
         id="occurrence-42",
-        schedule_id="daily-report",
+        schedule_id=schedule_id,
         agent_id="agent-1",
         task_name="isolated_effect",
         args={},
@@ -134,8 +142,16 @@ async def _execute_scheduled(tool: Any, execution: SchedulerExecution, **argumen
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("schedule_id", "expected_source_id"),
+    [
+        ("daily-report", "daily-report"),
+        (_OVERSIZED_SCHEDULE_ID, _OVERSIZED_SCHEDULE_SOURCE_ID),
+    ],
+    ids=("native-schedule-id", "oversized-migrated-schedule-id"),
+)
 async def test_scheduler_context_crosses_real_sdk_json_rpc_and_is_revoked(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, schedule_id, expected_source_id
 ):
     """Retries keep a stable effect key while handler context stays scoped."""
 
@@ -213,11 +229,15 @@ async def test_scheduler_context_crosses_real_sdk_json_rpc_and_is_revoked(
             "payload": "keep this unchanged",
         }
         await _execute_scheduled(
-            tools["async_effect"], _execution(attempt=1), **user_arguments
+            tools["async_effect"],
+            _execution(attempt=1, schedule_id=schedule_id),
+            **user_arguments,
         )
         await asyncio.wait_for(child_started.wait(), timeout=1)
         await _execute_scheduled(
-            tools["sync_effect"], _execution(attempt=2), payload="retry"
+            tools["sync_effect"],
+            _execution(attempt=2, schedule_id=schedule_id),
+            payload="retry",
         )
 
         # The public SDK context reaches both async and sync handlers.  Retry
@@ -228,7 +248,8 @@ async def test_scheduler_context_crosses_real_sdk_json_rpc_and_is_revoked(
         assert seen_async[0][1].idempotency_key == "durable-effect-42"
         assert seen_async[0][1].attempt == 1
         assert seen_async[0][1].trigger.kind == "scheduler"
-        assert seen_async[0][1].trigger.source_id == "daily-report"
+        assert seen_async[0][1].trigger.source_id == expected_source_id
+        assert len(seen_async[0][1].trigger.source_id.encode("utf-8")) <= 512
         assert seen_sync[0][1].invocation_id == "occurrence-42"
         assert seen_sync[0][1].idempotency_key == "durable-effect-42"
         assert seen_sync[0][1].attempt == 2

@@ -28,7 +28,10 @@ Reports captured during the May 2026 documentation audit.
 ## System Lanes
 
 - [`package_boundaries_report.md`](reports/package_boundaries_report.md) - core vs external feature packages vs provider packages vs standalone tools.
-- [`context_report.md`](reports/context_report.md) - prompt assembly, history forms, route caps, durable salvage, context diagnostics.
+- [`context_report.md`](reports/context_report.md) - historical prompt/context
+  findings, resolved into the canonical
+  [`CONTEXT_SYSTEM_DESIGN.md`](../../architecture/CONTEXT_SYSTEM_DESIGN.md)
+  contract on 2026-07-25.
 - [`memory_retrieval_storage_report.md`](reports/memory_retrieval_storage_report.md) - memory scoring, encrypted search, saved-item vector search, storage backends, sovereignty exports.
 - [`llm_routing_report.md`](reports/llm_routing_report.md) - `kestrel.toml [llm]`, provider routes, `kestrel-llms`, model preference, old `llm_config.toml` claims.
 - [`signals_workflows_talon_report.md`](reports/signals_workflows_talon_report.md) - wake sources, workflow extraction/status, Talon boundary, mesh-to-A2A drift.
@@ -43,4 +46,3 @@ Reports captured during the May 2026 documentation audit.
 3. Current-state architecture: context, memory/storage, LLM, signals/Talon, cloud/training.
 4. Public/user docs: user guides, generated audience docs, launch/demo claims.
 5. Hygiene: diagrams, archive metadata, code-review notes, internal business/outreach/legal classification.
-

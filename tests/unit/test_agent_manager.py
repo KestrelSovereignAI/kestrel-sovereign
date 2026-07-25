@@ -1,11 +1,22 @@
 """Unit tests for the in-process AgentManager."""
 
 import asyncio
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from fastapi import APIRouter, FastAPI
+from fastapi.testclient import TestClient
 
 from kestrel_sovereign.features import MandatoryFeatureReadinessError
+from kestrel_sovereign.features.scheduler.runner import (
+    AgentManagerHostedSchedulerExecutor,
+    SchedulerExecution,
+)
 from kestrel_sovereign.identity.runtime_identity import IdentityReadinessError
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.multi_agent.agent_manager import AgentManager, _get_agent_did
@@ -92,6 +103,172 @@ class TestAgentManagerBasics:
         did_lookup.assert_awaited_once_with(str(cold_dir))
 
     @pytest.mark.asyncio
+    async def test_local_agent_configs_skips_unincepted_cold_agent_but_keeps_healthy_peer(
+        self, monkeypatch, tmp_path,
+    ):
+        """One missing cold identity cannot abort the healthy scheduler fleet."""
+        manager = AgentManager(base_data_dir=tmp_path)
+        warm = _make_mock_agent("did:pkh:warm")
+        manager._agents["Warm"] = warm
+        config = MultiAgentConfig(
+            agents={
+                "Warm": LocalAgentConfig(
+                    data_dir="warm", port=8801, autostart=True
+                ),
+                "Unincepted": LocalAgentConfig(
+                    data_dir="unincepted", port=8802, autostart=False
+                ),
+            }
+        )
+        missing_identity = RuntimeError("identity database is not initialized")
+        did_lookup = AsyncMock(side_effect=missing_identity)
+        monkeypatch.setattr(
+            "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+            did_lookup,
+        )
+
+        mapping = await manager.local_agent_configs_by_did(config)
+
+        assert mapping == {"did:pkh:warm": ("Warm", config.agents["Warm"])}
+        assert manager.cold_scheduler_identity_failures == [
+            ("Unincepted", missing_identity)
+        ]
+        did_lookup.assert_awaited_once_with(str(tmp_path / "unincepted"))
+
+    @pytest.mark.asyncio
+    async def test_local_agent_configs_skips_unresolved_autostart_agent_but_keeps_healthy_peer(
+        self, monkeypatch, tmp_path,
+    ):
+        """A failed autostart tenant is not scheduler authority for its peer."""
+        manager = AgentManager(base_data_dir=tmp_path)
+        warm = _make_mock_agent("did:pkh:warm")
+        manager._agents["Warm"] = warm
+        config = MultiAgentConfig(
+            agents={
+                "Warm": LocalAgentConfig(data_dir="warm", port=8801),
+                "Unresolved": LocalAgentConfig(
+                    data_dir="unresolved", port=8802, autostart=True
+                ),
+            }
+        )
+        missing_identity = ValueError("local identity unavailable")
+        monkeypatch.setattr(
+            "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+            AsyncMock(side_effect=missing_identity),
+        )
+
+        mapping = await manager.local_agent_configs_by_did(config)
+
+        assert mapping == {"did:pkh:warm": ("Warm", config.agents["Warm"])}
+        assert manager.cold_scheduler_identity_failures == [
+            ("Unresolved", missing_identity)
+        ]
+        assert manager.is_scheduler_agent_authorized("did:pkh:warm")
+        assert not manager.is_scheduler_agent_authorized("did:pkh:unresolved")
+
+    @pytest.mark.asyncio
+    async def test_cold_scheduler_load_refuses_did_mismatch_before_registration(
+        self, tmp_path,
+    ):
+        """A cold wake must not publish tenant B under tenant A's claim."""
+        manager = AgentManager(base_data_dir=tmp_path)
+        tenant_b_agent = _make_mock_agent("did:pkh:tenant-b")
+        manager._initialize_agent = AsyncMock(return_value=tenant_b_agent)
+        config = LocalAgentConfig(
+            data_dir="cold", port=8801, autostart=False
+        )
+        manager._seed_scheduler_authority(
+            {"did:pkh:tenant-a": ("Cold", config)}
+        )
+
+        with pytest.raises(RuntimeError, match="does not match claimed DID"):
+            await manager.load_agent(
+                "Cold",
+                config,
+                expected_agent_id="did:pkh:tenant-a",
+            )
+
+        assert manager.list_agents() == {}
+        assert manager.get_agent_name("did:pkh:tenant-b") is None
+        tenant_b_agent.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cold_did_lookup_missing_database_never_creates_identity_artifacts(
+        self, tmp_path,
+    ):
+        """Discovery of an unincepted cold config is a strictly read-only probe."""
+        cold_dir = tmp_path / "unincepted"
+        cold_dir.mkdir()
+
+        with pytest.raises(ValueError, match="No agent found"):
+            await _get_agent_did(str(cold_dir))
+
+        assert list(cold_dir.iterdir()) == []
+        assert not (cold_dir / "kestrel_prime.db").exists()
+        assert not (cold_dir / "kestrel_prime.db-wal").exists()
+        assert not (cold_dir / "kestrel_prime.db-shm").exists()
+
+    @pytest.mark.asyncio
+    async def test_cold_did_lookup_invalid_existing_database_never_writes_sidecars(
+        self, tmp_path,
+    ):
+        """A malformed identity is reported without schema/WAL side effects."""
+        cold_dir = tmp_path / "invalid"
+        cold_dir.mkdir()
+        db_path = cold_dir / "kestrel_prime.db"
+        connection = sqlite3.connect(db_path)
+        connection.execute("CREATE TABLE unrelated (value TEXT)")
+        connection.commit()
+        connection.close()
+        before = {
+            path.name: path.read_bytes()
+            for path in cold_dir.iterdir()
+        }
+
+        with pytest.raises(ValueError, match="Could not read local agent identity"):
+            await _get_agent_did(str(cold_dir))
+
+        after = {
+            path.name: path.read_bytes()
+            for path in cold_dir.iterdir()
+        }
+        assert after == before
+
+    @pytest.mark.asyncio
+    async def test_cold_did_lookup_refuses_uncheckpointed_wal_without_mutation(
+        self, tmp_path,
+    ):
+        """A cold identity probe must not ignore or materialize WAL state."""
+        cold_dir = tmp_path / "wal-pending"
+        cold_dir.mkdir()
+        db_path = cold_dir / "kestrel_prime.db"
+        connection = sqlite3.connect(db_path)
+        connection.execute(
+            "CREATE TABLE graph_nodes (node_id TEXT, node_type TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO graph_nodes VALUES (?, 'agent')",
+            ("did:test:wal-pending",),
+        )
+        connection.commit()
+        connection.close()
+        wal_path = cold_dir / "kestrel_prime.db-wal"
+        wal_path.write_bytes(b"uncheckpointed identity state")
+        before = {
+            path.name: path.read_bytes()
+            for path in cold_dir.iterdir()
+        }
+
+        with pytest.raises(ValueError, match="WAL state is present"):
+            await _get_agent_did(str(cold_dir))
+
+        after = {
+            path.name: path.read_bytes()
+            for path in cold_dir.iterdir()
+        }
+        assert after == before
+
+    @pytest.mark.asyncio
     async def test_cold_did_lookup_stays_local_sqlite_with_postgres_environment(
         self, monkeypatch, tmp_path,
     ):
@@ -110,10 +287,23 @@ class TestAgentManagerBasics:
         finally:
             await storage.close()
 
+        before = {
+            path.name: path.read_bytes()
+            for path in local_dir.iterdir()
+        }
         monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
         monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://foreign-host/fleet")
 
         assert await _get_agent_did(str(local_dir)) == local_did
+        after = {
+            path.name: path.read_bytes()
+            for path in local_dir.iterdir()
+        }
+        # The successful normal path is as important as malformed/missing
+        # probes: it must not materialize or alter SQLite WAL/SHM sidecars.
+        assert after == before
+        assert "kestrel_prime.db-wal" not in after
+        assert "kestrel_prime.db-shm" not in after
 
     @pytest.mark.asyncio
     async def test_remove_agent(self):
@@ -127,6 +317,281 @@ class TestAgentManagerBasics:
         assert manager.get_agent("Testbot") is None
         assert manager.get_agent_name("did:pkh:remove") is None
         mock.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_remove_agent_revokes_live_scheduler_authority_before_future_cold_wake(
+        self,
+    ):
+        """DELETE cannot be undone by the static startup config's old DID map."""
+        manager = AgentManager()
+        config = LocalAgentConfig(data_dir="managed", port=8801)
+        mock = _make_mock_agent("did:pkh:removed")
+        manager._agents["Managed"] = mock
+        manager._agent_names[mock.agent_id] = "Managed"
+        manager._seed_scheduler_authority({mock.agent_id: ("Managed", config)})
+
+        assert await manager.remove_agent("Managed") is True
+        assert not manager.is_scheduler_agent_authorized(mock.agent_id)
+        manager._initialize_agent = AsyncMock()
+        with pytest.raises(LookupError, match="no longer authorized"):
+            await manager.load_agent(
+                "Managed",
+                config,
+                expected_agent_id=mock.agent_id,
+            )
+        manager._initialize_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_delete_unloaded_scheduler_agent_revokes_before_executor_wake(self):
+        """DELETE of a configured cold tenant is a completed runtime removal."""
+        manager = AgentManager()
+        agent_id = "did:pkh:unloaded-delete"
+        config = LocalAgentConfig(data_dir="cold", port=8801, autostart=False)
+        manager._seed_scheduler_authority({agent_id: ("Cold", config)})
+        manager._initialize_agent = AsyncMock()
+        executor = AgentManagerHostedSchedulerExecutor(
+            manager,
+            {agent_id: ("Cold", config)},
+        )
+        execution = SchedulerExecution(
+            id="execution-unloaded-delete",
+            schedule_id="schedule-unloaded-delete",
+            agent_id=agent_id,
+            task_name="test_task",
+            args={},
+            scheduled_for="2026-07-25T00:00:00+00:00",
+            idempotency_key="effect-unloaded-delete",
+            attempt=1,
+            owner="host",
+        )
+
+        assert await manager.remove_agent("Cold") is True
+        assert not manager.is_scheduler_agent_authorized(agent_id)
+        with pytest.raises(LookupError, match="No hosted agent configuration"):
+            await executor.execute_scheduled(execution)
+        manager._initialize_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_failed_remove_restores_scheduler_authority(self):
+        """A failed DELETE must not silently change desired state."""
+        manager = AgentManager()
+        config = LocalAgentConfig(data_dir="managed", port=8801)
+        mock = _make_mock_agent("did:pkh:still-live")
+        mock.shutdown.side_effect = RuntimeError("shutdown failed")
+        manager._agents["Managed"] = mock
+        manager._agent_names[mock.agent_id] = "Managed"
+        manager._seed_scheduler_authority({mock.agent_id: ("Managed", config)})
+
+        assert await manager.remove_agent("Managed") is False
+        assert manager.is_scheduler_agent_authorized(mock.agent_id)
+
+    @pytest.mark.asyncio
+    async def test_delete_serializes_with_inflight_scheduler_lifecycle_lock(self):
+        """DELETE waits for an in-flight dispatch lease, then revokes cold wake."""
+        manager = AgentManager()
+        config = LocalAgentConfig(data_dir="managed", port=8801)
+        mock = _make_mock_agent("did:pkh:locked-delete")
+        manager._agents["Managed"] = mock
+        manager._agent_names[mock.agent_id] = "Managed"
+        manager._seed_scheduler_authority({mock.agent_id: ("Managed", config)})
+        dispatch_started = asyncio.Event()
+        allow_dispatch_finish = asyncio.Event()
+
+        async def in_flight_dispatch():
+            async with manager.scheduler_lifecycle_lock(mock.agent_id):
+                dispatch_started.set()
+                await allow_dispatch_finish.wait()
+
+        dispatch = asyncio.create_task(in_flight_dispatch())
+        await asyncio.wait_for(dispatch_started.wait(), timeout=1)
+        deletion = asyncio.create_task(manager.remove_agent("Managed"))
+        await asyncio.sleep(0)
+        assert not deletion.done()
+        assert manager.is_scheduler_agent_authorized(mock.agent_id)
+
+        allow_dispatch_finish.set()
+        await dispatch
+        assert await deletion is True
+        assert not manager.is_scheduler_agent_authorized(mock.agent_id)
+
+    @pytest.mark.asyncio
+    async def test_delete_serializes_real_executor_cold_wake_before_registration(
+        self,
+    ):
+        """DELETE cannot return 404 and lose a cold wake already holding its DID lock."""
+        manager = AgentManager()
+        agent_id = "did:pkh:cold-delete-race"
+        config = LocalAgentConfig(data_dir="cold", port=8801, autostart=False)
+        manager._seed_scheduler_authority({agent_id: ("Cold", config)})
+
+        initialization_started = asyncio.Event()
+        allow_initialization = asyncio.Event()
+        dispatch_started = asyncio.Event()
+        allow_dispatch_finish = asyncio.Event()
+
+        async def dispatch(_task_name, _args):
+            dispatch_started.set()
+            await allow_dispatch_finish.wait()
+            return "dispatched"
+
+        cold = _make_mock_agent(agent_id)
+        cold.features = {
+            "SchedulerFeature": SimpleNamespace(
+                _dispatch_scheduled_task=dispatch,
+            )
+        }
+
+        async def initialize(_name, _config):
+            initialization_started.set()
+            await allow_initialization.wait()
+            return cold
+
+        manager._initialize_agent = AsyncMock(side_effect=initialize)
+        executor = AgentManagerHostedSchedulerExecutor(
+            manager,
+            {agent_id: ("Cold", config)},
+        )
+        execution = SchedulerExecution(
+            id="execution-cold-delete-race",
+            schedule_id="schedule-cold-delete-race",
+            agent_id=agent_id,
+            task_name="test_task",
+            args={},
+            scheduled_for="2026-07-25T00:00:00+00:00",
+            idempotency_key="effect-cold-delete-race",
+            attempt=1,
+            owner="host",
+        )
+
+        scheduled = asyncio.create_task(executor.execute_scheduled(execution))
+        await asyncio.wait_for(initialization_started.wait(), timeout=1)
+
+        deletion = asyncio.create_task(manager.remove_agent("Cold"))
+        await asyncio.sleep(0)
+        assert not deletion.done()
+        assert manager.is_scheduler_agent_authorized(agent_id)
+
+        allow_initialization.set()
+        await asyncio.wait_for(dispatch_started.wait(), timeout=1)
+        assert manager.get_agent("Cold") is cold
+        assert not deletion.done()
+
+        allow_dispatch_finish.set()
+        assert await asyncio.wait_for(scheduled, timeout=1) == "dispatched"
+        assert await asyncio.wait_for(deletion, timeout=1) is True
+        assert manager.get_agent("Cold") is None
+        assert not manager.is_scheduler_agent_authorized(agent_id)
+        cold.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_scheduler_cold_wake_receives_host_a2a_and_feature_route_onboarding(
+        self,
+    ):
+        """A scheduler-loaded tenant is integrated like an autostart tenant."""
+        from kestrel_sovereign import server
+        from kestrel_sovereign.a2a.envelope_signing import (
+            bound_envelope_fields,
+            sign_envelope,
+            verify_inbound_envelope,
+        )
+        from kestrel_sovereign.identity.did_web import build_verification_methods
+        from kestrel_sovereign.identity.hybrid_keypair import generate_hybrid_keypair
+
+        host = FastAPI()
+        manager = AgentManager()
+        host.state.agent_manager = manager
+        host.state.agent = None
+        host.state.demo_mode = False
+
+        warm_did = "did:web:example.test:agent:warm"
+        warm_keypair = generate_hybrid_keypair()
+        warm = SimpleNamespace(
+            agent_id=warm_did,
+            identity=SimpleNamespace(
+                is_hybrid=True,
+                signing_did=warm_did,
+                new_verification_methods=build_verification_methods(
+                    warm_did, warm_keypair.public_keys()
+                ),
+            ),
+            features={},
+            shutdown=AsyncMock(),
+        )
+        manager._register_agent("Warm", warm)
+
+        router = APIRouter()
+
+        @router.get("/cold-only")
+        async def cold_only():
+            return {"cold": True}
+
+        feature = SimpleNamespace(
+            enabled=True,
+            receiver=None,
+            get_router=lambda: router,
+        )
+        cold_did = "did:web:example.test:agent:cold"
+        cold_keypair = generate_hybrid_keypair()
+        cold = SimpleNamespace(
+            agent_id=cold_did,
+            identity=SimpleNamespace(
+                is_hybrid=True,
+                signing_did=cold_did,
+                new_verification_methods=build_verification_methods(
+                    cold_did, cold_keypair.public_keys()
+                ),
+            ),
+            features={"ColdOnly": feature},
+            shutdown=AsyncMock(),
+        )
+        config = LocalAgentConfig(data_dir="cold", port=8802, autostart=False)
+        manager._seed_scheduler_authority({cold.agent_id: ("Cold", config)})
+        manager._initialize_agent = AsyncMock(return_value=cold)
+        manager.set_agent_registration_hook(
+            lambda name, agent: server._onboard_host_registered_agent(
+                host, manager, name, agent
+            )
+        )
+
+        loaded = await manager.load_agent(
+            "Cold", config, expected_agent_id=cold.agent_id
+        )
+
+        assert loaded is cold
+        assert cold.a2a_did_resolver(warm_did)["id"] == warm_did
+        assert warm.a2a_did_resolver(cold_did)["id"] == cold_did
+
+        # Exercise the actual verification seam, not merely resolver lookup:
+        # a signed warm→cold same-host envelope must validate after the cold
+        # tenant is registered through the scheduler path.
+        timestamp = datetime.now(timezone.utc).isoformat()
+        metadata = {"sender": warm_did}
+        metadata["signature"] = sign_envelope(
+            warm_keypair,
+            sender=warm_did,
+            task_id="cold-wake-a2a",
+            message="scheduler woke cold peer",
+            timestamp=timestamp,
+            session_id="cold-wake-session",
+            bound=bound_envelope_fields(metadata),
+        )
+        verdict = await verify_inbound_envelope(
+            metadata,
+            task_id="cold-wake-a2a",
+            message="scheduler woke cold peer",
+            session_id="cold-wake-session",
+            resolver=cold.a2a_did_resolver,
+            require_signed=True,
+        )
+        assert verdict.ok is True and verdict.verified is True
+        with TestClient(host) as client:
+            response = client.get("/cold-only")
+            assert response.status_code == 200
+            assert await manager.remove_agent("Cold") is True
+            deleted_response = client.get("/cold-only")
+        assert response.status_code == 200
+        assert response.json() == {"cold": True}
+        assert deleted_response.status_code == 404
 
     @pytest.mark.asyncio
     async def test_remove_nonexistent_agent(self):

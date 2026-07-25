@@ -239,13 +239,13 @@ def test_bridge_route_404s_when_feature_removed():
         restore()
 
 
-def test_repeated_feature_mounts_are_all_unmounted():
-    """An outer teardown owns every route batch from repeated mounts.
+def test_repeated_feature_mounts_are_deduplicated_and_unmounted():
+    """Cold registration does not duplicate routes before outer teardown.
 
-    A restart can mount feature routers again before the previous outer
-    lifecycle cleanup runs.  Tracking only the most recent batch's count used
-    to leave earlier Bridge routes behind, so later tests (and a restarted
-    process) could resolve a stale route ahead of the live-gated one.
+    The host now invokes the mount pass for every scheduler-woken agent.  A
+    repeated feature shape must therefore reuse the live-gated route instead
+    of inserting a stale duplicate ahead of it; outer teardown still owns the
+    one concrete route batch that was mounted.
     """
     from kestrel_sovereign.server import _mount_feature_routers
 
@@ -254,7 +254,7 @@ def test_repeated_feature_mounts_are_all_unmounted():
     try:
         assert _bridge_health_route_count(app) == 1
         _mount_feature_routers(app)
-        assert _bridge_health_route_count(app) == 2
+        assert _bridge_health_route_count(app) == 1
     finally:
         restore()
 

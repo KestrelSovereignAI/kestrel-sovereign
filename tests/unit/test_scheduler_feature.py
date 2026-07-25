@@ -34,9 +34,25 @@ def _make_mock_db():
     db = MagicMock()
     db.execute = AsyncMock()
     db.fetchall = AsyncMock(return_value=[])
-    db.fetchone = AsyncMock(return_value=None)
+
+    async def _fetchone(sql, *args):
+        # The runner's exact effect-entry fence is deliberately a real
+        # token-guarded read. This generic, storageless double models its
+        # otherwise-valid claimed row while leaving unrelated lookups absent.
+        if (
+            "SELECT 1 FROM scheduled_tasks" in sql
+            and "lease_owner = ?" in sql
+            and "claim_token = ?" in sql
+        ):
+            return (1,)
+        return None
+
+    db.fetchone = AsyncMock(side_effect=_fetchone)
     db.fetchval = AsyncMock(return_value=0)
-    db.table_exists = AsyncMock(return_value=True)
+    # This generic unit double models a newly-created scheduler schema. Tests
+    # that need a legacy table set this explicitly; a preexisting table now
+    # correctly requires the durable rollout acknowledgement.
+    db.table_exists = AsyncMock(return_value=False)
     return db
 
 
@@ -473,6 +489,43 @@ class TestScheduleAdd:
         assert result.data["idempotency_key"] == "daily-memory"
 
     @pytest.mark.asyncio
+    async def test_add_accepts_idempotency_base_at_447_utf8_byte_boundary(self, feature):
+        """447 + ':' + SHA-256 hex exactly fits the SDK's 512-byte cap."""
+
+        ascii_boundary = "a" * 447
+        result = await feature.schedule_add(
+            cron_expression="@daily",
+            task_name="memory_consolidate",
+            idempotency_key=ascii_boundary,
+        )
+
+        assert result.status is ToolResultStatus.OK
+        assert result.data["idempotency_key"] == ascii_boundary
+
+        # A multibyte key with the same UTF-8 byte length is accepted too;
+        # validation is deliberately bytes, not Python character count.
+        multibyte_boundary = ("é" * 223) + "a"  # 446 + 1 bytes
+        result = await feature.schedule_add(
+            cron_expression="@daily",
+            task_name="memory_consolidate",
+            idempotency_key=multibyte_boundary,
+        )
+        assert result.status is ToolResultStatus.OK
+        assert len(result.data["idempotency_key"].encode("utf-8")) == 447
+
+    @pytest.mark.asyncio
+    async def test_add_rejects_idempotency_base_over_447_utf8_bytes(self, feature):
+        for key in ("a" * 448, "é" * 224):
+            result = await feature.schedule_add(
+                cron_expression="@daily",
+                task_name="memory_consolidate",
+                idempotency_key=key,
+            )
+            assert result.status is ToolResultStatus.ERROR
+            assert "at most 447 bytes" in result.error
+        feature._db.execute.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_add_deadline_is_one_shot(self, feature):
         result = await feature.schedule_add_deadline(
             run_at="2026-12-01T12:00:00+00:00",
@@ -885,25 +938,49 @@ class TestSchedulerRunner:
 
     @pytest.mark.asyncio
     async def test_ensure_tables_is_idempotent_when_column_exists(self):
-        """ALTER TABLE ADD COLUMN fails if the column already exists — that
-        specific error must be swallowed so re-running _ensure_tables stays safe."""
+        """PostgreSQL migrations use native duplicate-safe DDL.
+
+        Catching a duplicate-column error is not safe here: PostgreSQL marks
+        the caller's transaction failed before Python could catch it.
+        """
         db = _make_mock_db()
+        db.backend_type = "postgres"
 
         async def _exec(sql, *args):
             if "ALTER TABLE" in sql:
-                raise Exception("duplicate column name: outcome_signal")
+                assert "ADD COLUMN IF NOT EXISTS" in sql
 
         db.execute = AsyncMock(side_effect=_exec)
         executor = AsyncMock(return_value="ok")
         runner = SchedulerRunner(db, "test-agent", executor)
-        # Must not raise even though ALTER fails with duplicate-column
         await runner._ensure_tables()
+
+    @pytest.mark.asyncio
+    async def test_ensure_tables_skips_existing_sqlite_columns_before_alter(self):
+        """SQLite checks pragma metadata instead of relying on ALTER errors."""
+        db = _make_mock_db()
+        db.backend_type = "sqlite"
+
+        async def _fetchone(sql, *args):
+            if "pragma_table_info" in sql:
+                return (1,)
+            return None
+
+        db.fetchone = AsyncMock(side_effect=_fetchone)
+        runner = SchedulerRunner(db, "test-agent", AsyncMock(return_value="ok"))
+
+        await runner._ensure_tables()
+
+        assert not any(
+            "ALTER TABLE" in call.args[0] for call in db.execute.call_args_list
+        )
 
     @pytest.mark.asyncio
     async def test_ensure_tables_reraises_unexpected_migration_error(self):
         """The migration must NOT swallow non-duplicate errors — a locked DB,
         permission failure, or schema corruption must surface."""
         db = _make_mock_db()
+        db.backend_type = "sqlite"
 
         async def _exec(sql, *args):
             if "ALTER TABLE" in sql:
@@ -1104,8 +1181,18 @@ class TestSchedulerRunner:
             if "UPDATE scheduled_tasks" in c[0][0] and "terminal_status" in c[0][0]
         )
         assert "enabled = ?" in pause_call[0][0]
-        assert pause_call[0][1][-5] == "restart-task"
-        db.fetchone.assert_not_awaited()
+        # Protocol/lease CAS parameters intentionally evolve; assert the
+        # schedule identity semantically rather than a brittle SQL offset.
+        assert "restart-task" in pause_call[0][1]
+        # A successful CAS rereads the authoritative claim metadata, then the
+        # final effect-entry guard verifies the exact live token.
+        reads = [call.args[0] for call in db.fetchone.call_args_list]
+        assert any("SELECT claim_execution_id" in sql for sql in reads)
+        assert any(
+            "SELECT 1 FROM scheduled_tasks" in sql
+            and "claim_token = ?" in sql
+            for sql in reads
+        )
 
     @pytest.mark.asyncio
     async def test_blocked_schedule_is_durable_and_not_retried(self, tmp_path):
@@ -1129,8 +1216,9 @@ class TestSchedulerRunner:
                 """
                 INSERT INTO scheduled_tasks
                     (id, agent_id, task_name, cron_expression, args_json,
-                     enabled, next_run_at, created_at)
-                VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                     enabled, next_run_at, created_at,
+                     scheduler_protocol_version)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?, 2)
                 """,
                 (
                     "restart-task",
@@ -1254,8 +1342,9 @@ class TestSchedulerRunner:
                 """
                 INSERT INTO scheduled_tasks
                     (id, agent_id, task_name, cron_expression, args_json,
-                     enabled, next_run_at, created_at)
-                VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                     enabled, next_run_at, created_at,
+                     scheduler_protocol_version)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?, 2)
                 """,
                 (
                     "job-task", agent.did, "job", "* * * * *", "{}",
@@ -1689,8 +1778,12 @@ class TestScheduleUpdate:
         )
         assert result.status is ToolResultStatus.OK
         assert result.data["status"] == "unchanged"
-        # Must not UPDATE when nothing changed
-        feature._db.execute.assert_not_called()
+        # The durable rollout control row is locked before the in-transaction
+        # read, but an unchanged definition must not write scheduled_tasks.
+        assert all(
+            "UPDATE scheduled_tasks" not in call.args[0]
+            for call in feature._db.execute.call_args_list
+        )
 
     @pytest.mark.asyncio
     async def test_update_invalid_cron(self, feature):
@@ -1974,28 +2067,26 @@ class TestRunnerCronReload:
         assert "claim_execution_id = ?" in completion[0][0]
 
     @pytest.mark.asyncio
-    async def test_deleted_mid_flight_does_not_crash(self):
-        """If the task row was deleted mid-execution, only last_run_at gets
-        written (for the audit trail); no next_run_at resurrection."""
+    async def test_deleted_before_effect_entry_does_not_execute(self):
+        """A vanished claim loses the final token/live admission check."""
         db = _make_mock_db()
         now_iso = datetime.now(timezone.utc).isoformat()
         db.fetchall = AsyncMock(return_value=[
             ("task-1", "test-agent", "test_task", "@daily", "{}",
              1, None, now_iso, "2026-03-04T00:00:00"),
         ])
+        # The claim was selected and recorded, but an administrative delete
+        # wins before the exact effect-entry read.
         db.fetchone = AsyncMock(return_value=None)
         executor = AsyncMock(return_value="ok")
         runner = SchedulerRunner(db, "test-agent", executor)
-        # Must not raise
         await runner._tick()
 
-        completion = next(
-            c for c in db.execute.call_args_list
-            if "UPDATE scheduled_tasks" in c[0][0] and "terminal_status" in c[0][0]
+        executor.assert_not_awaited()
+        assert not any(
+            "UPDATE task_execution_log" in call.args[0]
+            for call in db.execute.call_args_list
         )
-        # If a row disappears, this compare-and-set affects zero rows and the
-        # stale worker cannot recreate it.
-        assert "claim_token = ?" in completion[0][0]
 
 
 # =========================================================================

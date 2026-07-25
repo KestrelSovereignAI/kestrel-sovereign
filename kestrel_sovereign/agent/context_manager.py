@@ -1112,15 +1112,13 @@ class ContextManager:
         mandatory_system_tokens: int,
         state_of_mind: Any,
     ) -> Optional[ContextResult]:
-        """Durably salvage pruned spans before any model-visible return.
+        """Durably salvage an identifiable persistent pruned span.
 
-        This is C / #1311's fail-closed boundary. Any messages that did not
-        survive the prune pipeline are about to leave the model-visible
-        slice; Emma's invariant is that no model-visible pruning happens
-        without a sync durable artifact. Returns a degraded ContextResult
-        (which the caller MUST return) when the feature flag is on but the
-        store is unreachable, or when the sync salvage write fails. Returns
-        ``None`` on the normal path, recording a salvage note.
+        On the feature-enabled path, an id-bearing span fails closed when its
+        store is unreachable or its synchronous salvage write fails. If the
+        selected history cannot be mapped to persistent row ids (for example,
+        isolated in-memory history), ``compute_pruned_span`` returns ``None``
+        and this conditional implementation does not establish a marker.
         """
         if not (
             is_durable_salvage_enabled()

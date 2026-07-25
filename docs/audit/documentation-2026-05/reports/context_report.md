@@ -21,6 +21,15 @@ privacy: public
 
 Source: subagent lane review, read-only, 2026-05-30.
 
+> **Resolution recorded 2026-07-25:** this snapshot's recommendation was
+> implemented by rewriting
+> [CONTEXT_SYSTEM_DESIGN.md](../../../architecture/CONTEXT_SYSTEM_DESIGN.md) as
+> the active canonical current-state contract and demoting
+> [CONTEXT_C_DURABLE_SALVAGE.md](../../../architecture/CONTEXT_C_DURABLE_SALVAGE.md)
+> to aspirational design. The source/runtime discrepancy identified here is
+> still tracked independently by
+> [#2534](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2534).
+
 ## Scope Reviewed
 
 - Context lane docs and generated feature docs.
@@ -81,4 +90,3 @@ Source: subagent lane review, read-only, 2026-05-30.
 ## Suggested First PR Slice
 
 Documentation-only: add a current-state context spec or rewrite the top/status/current-behavior sections of `CONTEXT_SYSTEM_DESIGN.md`, update `CONTEXT_C_DURABLE_SALVAGE.md` status/substrate claims, and regenerate the generated feature docs.
-

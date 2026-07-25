@@ -8,7 +8,7 @@ tags:
 - docs
 - architecture
 - architecture-spec
-timestamp: '2026-07-24T00:00:00Z'
+timestamp: '2026-07-25T00:00:00Z'
 status: active
 owner: documentation
 canonical: true
@@ -63,7 +63,9 @@ Only **Active** and **Design of record** rows belong here.
 | Document | Status | Current owner / location | Scope |
 |---|---|---|---|
 | [AGENT_IDENTITY_CONTRACT.md](AGENT_IDENTITY_CONTRACT.md) | **Active** | `kestrel-sovereign`: `kestrel_sovereign/kestrel_agent.py` and `kestrel_sovereign/identity/` | DID identity and the derived `agent_id` compatibility property. |
+| [CONTEXT_SYSTEM_DESIGN.md](CONTEXT_SYSTEM_DESIGN.md) | **Active** | `kestrel-sovereign`: `kestrel_sovereign/agent/context_manager.py`, `kestrel_sovereign/agent/context_builder.py`, `kestrel_sovereign/agent/context_stages.py`, `kestrel_sovereign/agent/token_budget.py`, `kestrel_sovereign/storage/async_conversation_store.py`, `kestrel_sovereign/llm/`, and `kestrel_sovereign/endpoints/agent.py` | Canonical current contract from stored history through budgeting, retrieval, cache-stable pruning, provider transport, and explicitly approximate diagnostics. |
 | [LLM_SERVICE_ARCHITECTURE.md](LLM_SERVICE_ARCHITECTURE.md) | **Active** | `kestrel-sovereign`: `kestrel_sovereign/llm/`; shared adapter types are owned by `kestrel-sovereign-sdk` | Canonical vendor / route / model service and routing contract. |
+| [SCHEDULER_DURABILITY.md](SCHEDULER_DURABILITY.md) | **Active** | `kestrel-sovereign`: `kestrel_sovereign/features/scheduler/` | Durable scheduler claims, protocol rollout fencing, and hosted execution contract. |
 | [FEATURE_CLI_ADAPTERS.md](FEATURE_CLI_ADAPTERS.md) | **Active** | `kestrel-sovereign`: `kestrel_sovereign/features/cli/` | Allowlisted local CLI adapter contract; remote GitHub access is excluded. |
 
 ### LLM substrate
@@ -130,6 +132,7 @@ not current implementation contracts.
 
 | Document | Status | Current owner / location | Why it is outside the primary map |
 |---|---|---|---|
+| [CONTEXT_C_DURABLE_SALVAGE.md](CONTEXT_C_DURABLE_SALVAGE.md) | **Planning** | Partial opt-in code: `kestrel_sovereign/agent/salvage.py` and `kestrel_sovereign/agent/context_manager.py`; current behavior is documented in the canonical context row above | The complete automatic durable-salvage lifecycle is aspirational; only a feature-flagged `SalvageWorker` subset and separate manual compaction paths exist. |
 | [USER_LIFECYCLE_MANAGEMENT.md](USER_LIFECYCLE_MANAGEMENT.md) | **Planning** | Design-only; current agent creation/retirement code is `kestrel_sovereign/inception_service.py` and `kestrel_sovereign/retirement_service.py` | Proposed SaaS user/companion schema is not the current persistence contract. |
 | [core/AGENT_ECOSYSTEM.md](core/AGENT_ECOSYSTEM.md) | **Planning** | Design-only; current inception and fleet ownership is `kestrel_sovereign/inception_service.py`, `kestrel_sovereign/multi_agent/`, and `kestrel_sovereign/fleet/` | Multi-phase Genesis Factory and Capsule Host vision. |
 | [storage/DECENTRALIZED_STORAGE.md](storage/DECENTRALIZED_STORAGE.md) | **Planning** | Design-only integration narrative; current providers are `kestrel-storage-filebase`, `kestrel-storage-lighthouse`, and `kestrel-storage-storacha`; core export is `kestrel_sovereign/storage/sovereign_adapter.py` | IPFS/Filecoin, Kavach, and x402 vision exceeds the current provider contract. |

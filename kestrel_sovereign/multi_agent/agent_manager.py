@@ -13,9 +13,10 @@ import asyncio
 import inspect
 import logging
 import os
+import sqlite3
 from decimal import Decimal
 from pathlib import Path
-from typing import List, Optional
+from typing import Awaitable, Callable, List, Optional
 
 from kestrel_sovereign.kestrel_agent import (
     KestrelAgent,
@@ -30,8 +31,6 @@ from kestrel_sovereign.spawn.delegated_wallet import (
 )
 from kestrel_sovereign.spawn.mandate import SpawnMandate, sign_mandate
 from kestrel_sovereign.llm.service import LLMService
-from kestrel_sovereign.storage.async_storage import AsyncStorage
-
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
 
 from .config import LocalAgentConfig, MultiAgentConfig
@@ -52,28 +51,101 @@ def _has_shutdown_completion_contract(agent: object) -> bool:
     )
 
 
-async def _get_agent_did(storage_dir: str) -> str:
-    """Retrieve an agent's DID from its local identity database.
+def _loaded_agent_did(agent: object) -> Optional[str]:
+    """Return a concrete agent DID without trusting a dynamic test proxy."""
 
-    The host's PostgreSQL setting governs runtime storage, not the local
-    ``kestrel_prime.db`` used to identify a configured-but-cold agent.  Passing
-    ``backend='sqlite'`` explicitly prevents ``AsyncStorage`` from following
-    ``KESTREL_DB_BACKEND=postgres`` and accidentally returning another tenant's
-    first agent node while building the cold-agent routing map.
+    for attribute in ("did", "agent_id"):
+        value = getattr(agent, attribute, None)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+async def _get_agent_did(storage_dir: str) -> str:
+    """Read a cold agent's DID without changing its identity database.
+
+    ``AsyncStorage.initialize()`` is deliberately write-capable: on a missing
+    SQLite path it creates the database, WAL, audit tables, and schema.  Cold
+    scheduler discovery is only a lookup and must never turn an unincepted
+    configuration entry into a blank identity that blocks later inception.
+    Use SQLite's read-only URI mode instead, after an explicit existence check.
+    The connection is created and closed in the worker thread so no descriptor
+    survives a lookup failure.
     """
-    db_path = os.path.join(storage_dir, "kestrel_prime.db")
-    storage = AsyncStorage(db_path, backend="sqlite")
-    await storage.initialize()
-    try:
-        agent_nodes = await storage.get_nodes_by_type("agent")
-        if not agent_nodes:
+    db_path = Path(storage_dir) / "kestrel_prime.db"
+
+    def _read_only_lookup() -> str:
+        if not db_path.is_file():
             raise ValueError(
                 f"No agent found in {storage_dir}. "
                 "Run inception first: kestrel create <name>"
             )
-        return agent_nodes[0].node_id
-    finally:
-        await storage.close()
+
+        # A normal ``mode=ro`` connection can still create SQLite's shared
+        # memory and WAL sidecars when it opens a WAL-mode database.  Besides
+        # violating this lookup's read-only contract, ``immutable=1`` would
+        # ignore a pre-existing WAL and could authorize an old main-database
+        # identity.  Treat any outstanding sidecar as unavailable until an
+        # operator has safely checkpointed/recovered it; do not guess which
+        # identity state is authoritative.
+        sidecars = (
+            Path(f"{db_path}-wal"),
+            Path(f"{db_path}-shm"),
+        )
+        if any(sidecar.exists() for sidecar in sidecars):
+            raise ValueError(
+                f"Could not safely read local agent identity from {storage_dir}: "
+                "SQLite WAL state is present"
+            )
+
+        connection = None
+        try:
+            # ``Path.as_uri`` handles spaces and platform path escaping.  The
+            # flags make SQLite reject *all* write attempts and prevent it from
+            # creating WAL/SHM files after the sidecar check above.  The lookup
+            # only accepts a checkpointed cold identity; it never adopts an
+            # unobserved WAL state.
+            connection = sqlite3.connect(
+                f"{db_path.resolve().as_uri()}?mode=ro&immutable=1",
+                uri=True,
+            )
+            rows = connection.execute(
+                "SELECT node_id FROM graph_nodes "
+                "WHERE node_type = ? ORDER BY node_id",
+                ("agent",),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise ValueError(
+                f"Could not read local agent identity from {storage_dir}"
+            ) from exc
+        finally:
+            if connection is not None:
+                connection.close()
+
+        # Catch a writer that raced the pre-open sidecar check.  An immutable
+        # reader deliberately ignores WAL data, so returning a DID after this
+        # transition would be a stale-identity authorization decision.
+        if any(sidecar.exists() for sidecar in sidecars):
+            raise ValueError(
+                f"Could not safely read local agent identity from {storage_dir}: "
+                "SQLite WAL state appeared during lookup"
+            )
+
+        if not rows:
+            raise ValueError(
+                f"No agent found in {storage_dir}. "
+                "Run inception first: kestrel create <name>"
+            )
+        if len(rows) != 1 or not isinstance(rows[0][0], str) or not rows[0][0]:
+            # Multiple roots are an identity-integrity failure.  Picking one by
+            # incidental SQLite order would authorize the wrong tenant.
+            raise ValueError(
+                f"Local identity database in {storage_dir} has an invalid "
+                "agent root set"
+            )
+        return rows[0][0]
+
+    return await asyncio.to_thread(_read_only_lookup)
 
 
 class AgentManager:
@@ -117,9 +189,123 @@ class AgentManager:
         # the FastAPI lifespan can surface them via /health (#377 lifecycle
         # hardening for multi-agent boot).
         self._init_failures: list[tuple[str, Exception]] = []
+        # A host scheduler needs a DID map for cold agents too.  A missing
+        # local identity for an explicitly non-autostart agent is operationally
+        # useful information, but must not roll back unrelated healthy agents.
+        self._cold_scheduler_identity_failures: list[tuple[str, Exception]] = []
+        # Scheduler authority is a *live desired-state registry*, not a frozen
+        # copy of multi_agent.toml.  A host scheduler may wake a cold agent long
+        # after startup, while DELETE is an administrative decision that must
+        # take effect immediately even though the startup config remains on
+        # disk for an intentional future restart.
+        self._scheduler_authority_by_did: dict[
+            str, tuple[str, LocalAgentConfig]
+        ] = {}
+        self._scheduler_authority_by_name: dict[str, str] = {}
+        self._scheduler_revoked_names: set[str] = set()
+        self._scheduler_revoked_dids: set[str] = set()
+        # The hosted executor and DELETE share this lock.  It is deliberately
+        # exposed through ``scheduler_lifecycle_lock`` rather than having each
+        # caller manufacture a private lock, which was the race allowing a
+        # frozen scheduler map to resurrect a deleted tenant.
+        self._scheduler_lifecycle_locks: dict[str, asyncio.Lock] = {}
+        # The server owns app-level registration work (A2A resolver, feature
+        # routes, and static assets).  It installs this hook before loading the
+        # configured fleet so a scheduler cold wake cannot bypass onboarding.
+        self._agent_registration_hook: Optional[
+            Callable[[str, KestrelAgent], Awaitable[None]]
+        ] = None
         # LocalAgentConfig per agent created at runtime via create_agent —
         # consumed by the create-agent endpoint to persist registrations.
         self._created_configs: dict[str, "LocalAgentConfig"] = {}
+
+    def set_agent_registration_hook(
+        self,
+        hook: Optional[Callable[[str, KestrelAgent], Awaitable[None]]],
+    ) -> None:
+        """Install the host-owned onboarding hook for every future register.
+
+        The hook is intentionally an async contract: a cold scheduler wake
+        does not return an agent to the executor until its host integrations
+        are ready.  Existing loaded agents are handled by the normal startup
+        pass; callers installing a hook before ``load_from_config`` cover both
+        initial and dynamic registration through this one seam.
+        """
+        self._agent_registration_hook = hook
+
+    def scheduler_lifecycle_lock(self, agent_id: str) -> asyncio.Lock:
+        """Return the shared lifecycle lock for a scheduler-authorized DID."""
+        if not isinstance(agent_id, str) or not agent_id:
+            raise ValueError("scheduler lifecycle lock requires a non-empty DID")
+        return self._scheduler_lifecycle_locks.setdefault(agent_id, asyncio.Lock())
+
+    def scheduler_authority_for(
+        self, agent_id: str
+    ) -> Optional[tuple[str, LocalAgentConfig]]:
+        """Return currently desired scheduler authority for ``agent_id``.
+
+        A ``None`` result is a fail-closed authorization denial.  In
+        particular, a DID revoked by DELETE remains absent even if the static
+        startup config still contains it.
+        """
+        return self._scheduler_authority_by_did.get(agent_id)
+
+    def is_scheduler_agent_authorized(self, agent_id: str) -> bool:
+        """Whether ``agent_id`` remains in the live scheduler desired state."""
+        return agent_id in self._scheduler_authority_by_did
+
+    def scheduler_authorized_agent_ids(self) -> tuple[str, ...]:
+        """Return a snapshot of the live scheduler authorization set."""
+        return tuple(self._scheduler_authority_by_did)
+
+    def _seed_scheduler_authority(
+        self, mapping: dict[str, tuple[str, LocalAgentConfig]]
+    ) -> None:
+        """Replace configured scheduler authority while preserving revocations."""
+        active = {
+            agent_id: entry
+            for agent_id, entry in mapping.items()
+            if entry[0] not in self._scheduler_revoked_names
+            and agent_id not in self._scheduler_revoked_dids
+        }
+        self._scheduler_authority_by_did = active
+        self._scheduler_authority_by_name = {
+            name: agent_id for agent_id, (name, _config) in active.items()
+        }
+        for agent_id in active:
+            self.scheduler_lifecycle_lock(agent_id)
+
+    def _revoke_scheduler_authority(
+        self, name: str, agent_id: Optional[str]
+    ) -> Optional[tuple[str, LocalAgentConfig]]:
+        """Remove one tenant from live scheduler authority, returning its entry."""
+        self._scheduler_revoked_names.add(name)
+        if isinstance(agent_id, str) and agent_id:
+            self._scheduler_revoked_dids.add(agent_id)
+        known_id = agent_id or self._scheduler_authority_by_name.get(name)
+        if not isinstance(known_id, str) or not known_id:
+            return None
+        entry = self._scheduler_authority_by_did.pop(known_id, None)
+        self._scheduler_authority_by_name.pop(name, None)
+        return entry
+
+    def _restore_scheduler_authority(
+        self, agent_id: Optional[str], entry: Optional[tuple[str, LocalAgentConfig]]
+    ) -> None:
+        """Restore authority only when an administrative removal did not land."""
+        if entry is None or not isinstance(agent_id, str) or not agent_id:
+            return
+        name, _config = entry
+        self._scheduler_revoked_names.discard(name)
+        self._scheduler_revoked_dids.discard(agent_id)
+        self._scheduler_authority_by_did[agent_id] = entry
+        self._scheduler_authority_by_name[name] = agent_id
+
+    async def _on_agent_registered(self, name: str, agent: KestrelAgent) -> None:
+        """Run app-owned onboarding after publication and fail closed on error."""
+        hook = self._agent_registration_hook
+        if hook is not None:
+            await hook(name, agent)
 
     async def _initialize_agent(
         self, name: str, config: LocalAgentConfig
@@ -271,15 +457,80 @@ class AgentManager:
         agent._cohosted_agents_provider = lambda: list(self._agents.values())
         logger.info(f"Loaded agent '{name}' (DID: {agent.agent_id[:30]}...)")
 
-    async def load_agent(self, name: str, config: LocalAgentConfig) -> KestrelAgent:
+    async def load_agent(
+        self,
+        name: str,
+        config: LocalAgentConfig,
+        *,
+        expected_agent_id: Optional[str] = None,
+        scheduler_lifecycle_lock_held: bool = False,
+    ) -> KestrelAgent:
         """Create, initialize, and register one agent.
 
         This is the dynamic/single-agent loading path. Fleet startup uses the
         same initializer and registrar but batches the independent initialization
-        awaits in :meth:`load_from_config`.
+        awaits in :meth:`load_from_config`.  ``expected_agent_id`` is the
+        host-scheduler authorization boundary for a cold wake: verify it before
+        publishing the agent to routing so a stale/misconfigured local identity
+        cannot execute a schedule claimed for another tenant.
         """
+        if expected_agent_id is not None and not scheduler_lifecycle_lock_held:
+            # Direct callers receive the same serialization as the hosted
+            # scheduler.  The executor passes ``True`` only after acquiring
+            # this exact manager-owned lock for its entire dispatch lease.
+            async with self.scheduler_lifecycle_lock(expected_agent_id):
+                return await self.load_agent(
+                    name,
+                    config,
+                    expected_agent_id=expected_agent_id,
+                    scheduler_lifecycle_lock_held=True,
+                )
+
+        if expected_agent_id is not None:
+            authority = self.scheduler_authority_for(expected_agent_id)
+            if authority is None:
+                raise LookupError(
+                    "Refusing hosted scheduler cold wake for an agent that is "
+                    "no longer authorized by the live host desired state"
+                )
+            authorized_name, authorized_config = authority
+            if authorized_name != name or authorized_config != config:
+                raise RuntimeError(
+                    "Refusing hosted scheduler cold wake: the live host "
+                    "authority does not match the claimed configuration"
+                )
+            existing = self._agents.get(name)
+            if existing is not None:
+                existing_did = _loaded_agent_did(existing)
+                if existing_did != expected_agent_id:
+                    raise RuntimeError(
+                        "Refusing hosted scheduler cold wake: configured agent "
+                        f"{name!r} is already loaded as {existing_did!r}, not "
+                        f"the claimed DID {expected_agent_id!r}"
+                    )
+                return existing
         agent = await self._initialize_agent(name, config)
+        actual_agent_id = _loaded_agent_did(agent)
+        if (
+            expected_agent_id is not None
+            and actual_agent_id != expected_agent_id
+        ):
+            await self._shutdown_unregistered_agent(name, agent)
+            raise RuntimeError(
+                "Refusing hosted scheduler cold wake: initialized agent DID "
+                f"{actual_agent_id!r} does not match claimed DID "
+                f"{expected_agent_id!r}"
+            )
         self._register_agent(name, agent)
+        try:
+            await self._on_agent_registered(name, agent)
+        except BaseException:
+            # An agent without app-owned A2A/route/asset onboarding must never
+            # remain routable after a cold wake failure.
+            self._agents.pop(name, None)
+            self._agent_names.pop(actual_agent_id or agent.agent_id, None)
+            await self._shutdown_unregistered_agent(name, agent)
+            raise
         return agent
 
     async def load_from_config(self, config: MultiAgentConfig) -> int:
@@ -388,6 +639,28 @@ class AgentManager:
                 self._init_failures.append((name, e))
                 continue
             self._register_agent(name, result)
+            try:
+                await self._on_agent_registered(name, result)
+            except asyncio.CancelledError:
+                self._agents.pop(name, None)
+                self._agent_names.pop(_loaded_agent_did(result), None)
+                await self._shutdown_unregistered_agent(name, result)
+                raise
+            except Exception as exc:
+                # Host onboarding is part of successful registration.  A
+                # feature-route/A2A failure must not leave an agent published
+                # without the host capabilities every sibling receives.
+                self._agents.pop(name, None)
+                self._agent_names.pop(_loaded_agent_did(result), None)
+                await self._shutdown_unregistered_agent(name, result)
+                logger.error(
+                    "Failed to onboard agent %r after initialization: %s",
+                    name,
+                    exc,
+                    exc_info=True,
+                )
+                self._init_failures.append((name, exc))
+                continue
             loaded += 1
         return loaded
 
@@ -399,6 +672,18 @@ class AgentManager:
         readiness failure) via ``/health``.
         """
         return list(self._init_failures)
+
+    @property
+    def cold_scheduler_identity_failures(self) -> list[tuple[str, Exception]]:
+        """Unavailable configured identities omitted from scheduler routing.
+
+        These are deliberately distinct from ``init_failures``: an autostart
+        tenant may already have failed boot, and a cold tenant may be
+        unincepted.  In either case the host can still route healthy peers,
+        while readiness reports that this tenant's schedules are unavailable.
+        """
+
+        return list(self._cold_scheduler_identity_failures)
 
     def get_agent(self, name: str) -> Optional[KestrelAgent]:
         """Get an agent by name (case-insensitive)."""
@@ -430,15 +715,33 @@ class AgentManager:
         from the agent's local identity database without initializing the agent.
         """
         mapping: dict[str, tuple[str, LocalAgentConfig]] = {}
+        self._cold_scheduler_identity_failures = []
         for name, agent_config in config.agents.items():
             if not isinstance(agent_config, LocalAgentConfig):
                 continue
 
             agent = self._agents.get(name)
-            agent_id = getattr(agent, "agent_id", None) if agent is not None else None
+            agent_id = _loaded_agent_did(agent) if agent is not None else None
             if not isinstance(agent_id, str) or not agent_id:
-                resolved_dir = agent_config.resolve_data_dir(self._base_data_dir)
-                agent_id = await _get_agent_did(str(resolved_dir))
+                try:
+                    resolved_dir = agent_config.resolve_data_dir(self._base_data_dir)
+                    agent_id = await _get_agent_did(str(resolved_dir))
+                except Exception as exc:
+                    # An autostart agent may already have failed its independent
+                    # boot attempt.  Do not let a second cold-DID lookup roll
+                    # back healthy PostgreSQL tenants; omit only the unresolved
+                    # DID from scheduler authority and surface its failure in
+                    # readiness.  This is equally important for an explicitly
+                    # cold entry: neither state is safe to authorize without a
+                    # durable local identity witness.
+                    logger.warning(
+                        "Skipping unavailable scheduler identity for agent %r: %s",
+                        name,
+                        exc,
+                        exc_info=True,
+                    )
+                    self._cold_scheduler_identity_failures.append((name, exc))
+                    continue
 
             if agent_id in mapping:
                 existing_name = mapping[agent_id][0]
@@ -447,6 +750,7 @@ class AgentManager:
                     f"both {existing_name!r} and {name!r}: {agent_id!r}"
                 )
             mapping[agent_id] = (name, agent_config)
+        self._seed_scheduler_authority(mapping)
         return mapping
 
     def get_agent_name(self, agent_id: str) -> Optional[str]:
@@ -454,6 +758,67 @@ class AgentManager:
         return self._agent_names.get(agent_id)
 
     async def remove_agent(self, name: str) -> bool:
+        """Remove an agent while serializing with scheduler cold wakes.
+
+        The shared per-DID lock is acquired before authority is revoked and
+        held through shutdown/unpublication.  A hosted executor that holds the
+        same lock cannot observe stale config and re-load this agent after an
+        administrative DELETE.  If shutdown fails and the agent remains live,
+        restore the exact prior authority instead of silently changing desired
+        state on a failed DELETE.
+        """
+        async with self._lock:
+            current = self._agents.get(name)
+            agent_id = _loaded_agent_did(current) if current is not None else None
+            if not isinstance(agent_id, str) or not agent_id:
+                # A scheduler can be partway through a cold load while the
+                # agent is still absent from ``_agents``.  The live authority
+                # registry is the only durable-in-process witness for that
+                # configured DID at this point.  Use it to wait on the same
+                # lifecycle lock and revoke the desired state, rather than
+                # returning a misleading 404 and letting the already-claimed
+                # cold wake publish the agent immediately afterwards.
+                agent_id = self._scheduler_authority_by_name.get(name)
+
+        if not isinstance(agent_id, str) or not agent_id:
+            return await self._remove_agent_without_scheduler_lifecycle(name)
+
+        async with self.scheduler_lifecycle_lock(agent_id):
+            # Re-read after waiting: another lifecycle operation may have
+            # completed first.  The fallback preserves the old no-agent and
+            # unpublished-budget behavior.
+            current = self._agents.get(name)
+            current_did = _loaded_agent_did(current) if current is not None else None
+            authority = self.scheduler_authority_for(agent_id)
+            if current is None:
+                # DELETE won the race with a cold scheduler load.  Revoking an
+                # authorized-but-unpublished tenant is a completed runtime
+                # removal: the static config may intentionally restore it on a
+                # future process restart, but this host must not wake it again.
+                if authority is not None and authority[0] == name:
+                    self._revoke_scheduler_authority(name, agent_id)
+                    logger.info(
+                        "Revoked cold scheduler authority for agent %r", name
+                    )
+                    return True
+                return await self._remove_agent_without_scheduler_lifecycle(name)
+            if current_did != agent_id:
+                return await self._remove_agent_without_scheduler_lifecycle(name)
+
+            revoked = None
+            if authority is not None and authority[0] == name:
+                revoked = self._revoke_scheduler_authority(name, agent_id)
+            try:
+                removed = await self._remove_agent_without_scheduler_lifecycle(name)
+            except BaseException:
+                if self._agents.get(name) is not None:
+                    self._restore_scheduler_authority(agent_id, revoked)
+                raise
+            if not removed:
+                self._restore_scheduler_authority(agent_id, revoked)
+            return removed
+
+    async def _remove_agent_without_scheduler_lifecycle(self, name: str) -> bool:
         """Shutdown and remove an agent.
 
         Returns:

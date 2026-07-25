@@ -2,6 +2,7 @@
 
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import Request
@@ -46,6 +47,131 @@ def test_health_returns_503_when_agent_missing():
         "agent_initialized": False,
     }
     assert "must-not-leak" not in response.text
+
+
+def test_health_startup_error_dominates_retained_cleanup_manager():
+    """A manager retained solely for rollback cleanup can never pass readiness."""
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    original_cleanup_manager = getattr(
+        app.state, "startup_cleanup_agent_manager", None
+    )
+    original_startup_error = getattr(app.state, "startup_error", None)
+    original_mandatory_failures = getattr(
+        app.state, "mandatory_feature_failures", None
+    )
+    original_identity_failures = getattr(
+        app.state, "identity_readiness_failures", None
+    )
+
+    retained = MagicMock()
+    retained.list_agents.return_value = {"draining": MagicMock()}
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = None
+        # Exercise the old failure mode too: even if an earlier rollback left
+        # the manager on the public field, startup_error is authoritative.
+        app.state.agent_manager = retained
+        app.state.startup_cleanup_agent_manager = retained
+        app.state.startup_error = "scheduler startup failed"
+        app.state.mandatory_feature_failures = []
+        app.state.identity_readiness_failures = []
+
+        with TestClient(app, client=("203.0.113.10", 55000)) as client:
+            response = client.get("/health")
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+        app.state.startup_cleanup_agent_manager = original_cleanup_manager
+        app.state.startup_error = original_startup_error
+        app.state.mandatory_feature_failures = original_mandatory_failures
+        app.state.identity_readiness_failures = original_identity_failures
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "unhealthy",
+        "agent_initialized": False,
+    }
+
+
+def test_health_latches_loaded_scheduler_runner_safety_failure():
+    """A scoped runner outage cannot be masked by a healthy host manager."""
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    original_startup_error = getattr(app.state, "startup_error", None)
+    original_mandatory_failures = getattr(
+        app.state, "mandatory_feature_failures", None
+    )
+    original_identity_failures = getattr(
+        app.state, "identity_readiness_failures", None
+    )
+    original_scheduler_failures = getattr(
+        app.state, "scheduler_readiness_failures", None
+    )
+
+    failed_runner = SimpleNamespace(
+        readiness_failure=RuntimeError("postgres://operator:secret@db/internal")
+    )
+    failed_agent = SimpleNamespace(
+        features={"SchedulerFeature": SimpleNamespace(_runner=failed_runner)}
+    )
+    manager = MagicMock()
+    manager.list_agents.return_value = {"cold-tenant": failed_agent}
+
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = None
+        app.state.agent_manager = manager
+        app.state.startup_error = None
+        app.state.mandatory_feature_failures = []
+        app.state.identity_readiness_failures = []
+        app.state.scheduler_readiness_failures = []
+
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app, client=("203.0.113.10", 55000)) as client:
+                public = client.get("/health")
+                detailed = client.get(
+                    "/health/detailed", headers={"X-API-Key": "test-key"}
+                )
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+        app.state.startup_error = original_startup_error
+        app.state.mandatory_feature_failures = original_mandatory_failures
+        app.state.identity_readiness_failures = original_identity_failures
+        app.state.scheduler_readiness_failures = original_scheduler_failures
+
+    assert public.status_code == 503
+    assert public.json() == {"status": "unhealthy", "agent_initialized": True}
+    assert "secret" not in public.text
+    assert detailed.status_code == 503
+    records = detailed.json()["scheduler_readiness_failures"]
+    assert records == [
+        {
+            "scope": "runtime",
+            "state": "unavailable",
+            "error_code": "scheduler_runtime_unavailable",
+            "cause_type": "RuntimeError",
+            "agent": "cold-tenant",
+        }
+    ]
+    assert "secret" not in detailed.text
 
 
 def test_load_balancer_probe_reports_minimal_degraded_state():
@@ -712,6 +838,74 @@ def test_detailed_health_reports_fleet_when_no_singleton_agent():
     ]
     # Tracing block stays present on the fleet branch (#2690).
     assert "tracing" in body
+
+
+def test_healthy_fleet_with_unavailable_scheduler_identity_fails_readiness():
+    """A scheduler authority gap is a 503, with redacted authenticated detail."""
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    original_startup_error = getattr(app.state, "startup_error", None)
+    original_mandatory_failures = getattr(
+        app.state, "mandatory_feature_failures", None
+    )
+    original_identity_failures = getattr(
+        app.state, "identity_readiness_failures", None
+    )
+    original_cold_failures = getattr(
+        app.state, "scheduler_cold_agent_failures", None
+    )
+    original_scheduler_failures = getattr(
+        app.state, "scheduler_readiness_failures", None
+    )
+
+    manager = MagicMock()
+    manager.list_agents.return_value = {"Warm": _make_health_agent("healthy")}
+    cold_failure = {
+        "agent": "Unincepted",
+        "scope": "identity",
+        "state": "unavailable",
+        "error_code": "scheduler_identity_unavailable",
+        "cause_type": "RuntimeError",
+    }
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = None
+        app.state.agent_manager = manager
+        app.state.startup_error = None
+        app.state.mandatory_feature_failures = []
+        app.state.identity_readiness_failures = []
+        app.state.scheduler_cold_agent_failures = [cold_failure]
+        app.state.scheduler_readiness_failures = [cold_failure]
+
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app, client=("203.0.113.10", 55000)) as client:
+                public = client.get("/health")
+                detailed = client.get(
+                    "/health/detailed", headers={"X-API-Key": "test-key"}
+                )
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+        app.state.startup_error = original_startup_error
+        app.state.mandatory_feature_failures = original_mandatory_failures
+        app.state.identity_readiness_failures = original_identity_failures
+        app.state.scheduler_cold_agent_failures = original_cold_failures
+        app.state.scheduler_readiness_failures = original_scheduler_failures
+
+    assert public.status_code == 503
+    assert public.json() == {"status": "unhealthy", "agent_initialized": True}
+    assert detailed.status_code == 503
+    assert detailed.json()["status"] == "unhealthy"
+    assert detailed.json()["scheduler_readiness_failures"] == [cold_failure]
+    assert "identity database" not in detailed.text
 
 
 def test_detailed_health_fleet_mixed_failure_is_degraded():

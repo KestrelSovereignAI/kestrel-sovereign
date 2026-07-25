@@ -180,6 +180,16 @@ async def test_scheduler_revokes_context_for_detached_core_child_before_late_iso
             return {"echo": args}
 
     class NoStorageRunner(SchedulerRunner):
+        # This test isolates context revocation rather than persistence. The
+        # real runner proves its durable token before and at effect admission;
+        # retain that precondition without giving this deliberately storageless
+        # test double a database implementation.
+        async def _renew_lease_once(self, task):
+            return True
+
+        async def _claim_token_is_live(self, task):
+            return True
+
         async def _renew_lease(self, task):
             await asyncio.Future()
 

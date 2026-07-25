@@ -15,6 +15,7 @@ mistaken for a pip target or a `python -m` module.
 """
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
@@ -40,6 +41,15 @@ logger = logging.getLogger(__name__)
 # probe that exceeds this as unhealthy and fall through to the restart path.
 _HEALTH_PROBE_TIMEOUT = 5.0
 
+# ``ToolExecutionTrigger`` validates identifiers by UTF-8 byte length, not
+# Python character count.  Schedule IDs normally fit unchanged, but legacy
+# imports can contain arbitrarily long IDs while the SDK context permits at
+# most 512 bytes.  Keep the full ID in SchedulerExecution/storage and expose a
+# deterministic, plainly tagged provenance surrogate only at that bounded wire
+# boundary.
+_SDK_CONTEXT_IDENTIFIER_MAX_BYTES = 512
+_SCHEDULE_TRIGGER_SOURCE_HASH_PREFIX = "schedule-sha256:"
+
 
 class SchedulerExecutionContextUnavailable(RuntimeError):
     """A scheduled isolated call cannot carry its trusted effect identity.
@@ -49,6 +59,27 @@ class SchedulerExecutionContextUnavailable(RuntimeError):
     occurrence identity would let an isolated tool perform an effect without
     the idempotency key that makes lease recovery safe.
     """
+
+
+def _scheduler_trigger_source_id(schedule_id: str) -> str:
+    """Return an SDK-safe, stable source ID for a scheduler occurrence.
+
+    The SDK's execution context uses a 512-byte UTF-8 identifier limit.  A
+    migrated schedule can legitimately have a longer database ID, so passing
+    it through would reject an otherwise safe execution *after* it was
+    claimed.  Retain fitting IDs verbatim for compatibility; hash only the
+    oversized representation.  Invalid persisted IDs fail closed rather than
+    being erased or silently replaced.
+    """
+
+    if not isinstance(schedule_id, str) or not schedule_id:
+        raise SchedulerExecutionContextUnavailable(
+            "scheduled occurrence has an invalid schedule_id"
+        )
+    if len(schedule_id.encode("utf-8")) <= _SDK_CONTEXT_IDENTIFIER_MAX_BYTES:
+        return schedule_id
+    digest = hashlib.sha256(schedule_id.encode("utf-8")).hexdigest()
+    return f"{_SCHEDULE_TRIGGER_SOURCE_HASH_PREFIX}{digest}"
 
 
 def _scheduled_tool_execution_context() -> Any | None:
@@ -99,7 +130,7 @@ def _scheduled_tool_execution_context() -> Any | None:
         trigger=ToolExecutionTrigger(
             kind="scheduler",
             id=execution.id,
-            source_id=execution.schedule_id,
+            source_id=_scheduler_trigger_source_id(execution.schedule_id),
             triggered_at=datetime.now(timezone.utc),
             scheduled_for=scheduled_for.astimezone(timezone.utc),
         ),
