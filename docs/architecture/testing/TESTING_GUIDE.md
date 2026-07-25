@@ -40,7 +40,21 @@ Tests are organized in a pyramid structure - run from the bottom up:
 # Run all tests with the test runner
 ./run_tests.py --unit          # Unit tests only
 ./run_tests.py --integration   # Integration tests
-./run_tests.py --ci            # Full CI suite
+./run_tests.py --ci --skip-check  # Full suite + canonical-package coverage
+```
+
+A fresh `uv sync` installs `pytest-cov` through the default development group.
+The `--ci` command measures the canonical `kestrel_sovereign` package and
+enforces the 80% floor in `.coveragerc`. The scheduled weekly analysis runs the
+same coverage gate. It remains failed when tests or coverage fail, while its
+feedback artifact upload and issue-analysis job run unconditionally.
+
+For a focused coverage report during development, override the repository-wide
+floor so untested modules outside the selected test do not fail the command:
+
+```bash
+uv run pytest tests/unit/test_docs_verify.py --cov=kestrel_sovereign \
+  --cov-report=term --cov-fail-under=0
 ```
 
 ### The `run_tests.py` Script
@@ -52,7 +66,7 @@ The project includes a comprehensive test runner with smart features:
 | `--unit` | Run unit tests only |
 | `--integration` | Run integration tests only |
 | `--llm` | Run LLM-dependent tests |
-| `--ci` | Full CI mode (parallel + coverage) |
+| `--ci` | Full CI mode (parallel + canonical-package coverage, 80% floor) |
 | `-x` | Fail fast (stop on first failure) |
 | `--failed` | Re-run only last failed tests |
 | `--skip-check` | Skip DB/Redis health checks |

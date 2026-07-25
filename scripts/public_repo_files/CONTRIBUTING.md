@@ -62,6 +62,13 @@ uv run kestrel doctor
 # Integration tests (configure any required external provider/service first)
 ./run_tests.py --integration --skip-check
 
+# Full suite with canonical-package coverage (enforces the 80% floor)
+./run_tests.py --ci --skip-check
+
+# Focused coverage while developing (reports coverage without the repository-wide floor)
+uv run pytest tests/unit/test_docs_verify.py --cov=kestrel_sovereign \
+  --cov-report=term --cov-fail-under=0
+
 # A specific test file
 uv run pytest tests/unit/test_kestrel_agent.py -v
 
@@ -75,7 +82,10 @@ The test inventory changes frequently; use the commands above and the
 [testing guide](docs/architecture/testing/TESTING_GUIDE.md) instead of relying
 on a fixed test count. Before submitting a PR, run the targeted tests for your
 change and the relevant repository gate. Run integration tests when your change
-or configuration affects an integration path.
+or configuration affects an integration path. The scheduled weekly analysis is
+the repository-wide coverage gate: it measures `kestrel_sovereign`, enforces the
+80% floor configured in `.coveragerc`, and still uploads failure feedback for
+issue analysis when the gate fails.
 
 ---
 

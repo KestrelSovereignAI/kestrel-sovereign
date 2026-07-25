@@ -362,7 +362,7 @@ class SmartTestRunner:
         # Coverage
         if coverage:
             cmd.extend([
-                "--cov=.",
+                "--cov=kestrel_sovereign",
                 "--cov-report=term-missing",
                 "--cov-report=html:coverage_html",
                 "--cov-report=json:coverage.json",

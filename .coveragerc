@@ -1,13 +1,7 @@
 [run]
-# Source directories to measure
+# Measure the canonical installable package, including files not imported by tests.
 source =
-    kestrel_agent
-    storage
-    llm
-    features
-    tools
-    a2a
-    services
+    kestrel_sovereign
 
 # Files and directories to omit
 omit =
