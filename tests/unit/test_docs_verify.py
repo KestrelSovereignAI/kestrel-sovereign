@@ -3,6 +3,8 @@
 import json
 import subprocess
 
+import pytest
+
 from scripts import docs_okf, docs_verify
 
 
@@ -24,29 +26,99 @@ def test_doc_relative_markdown_links_are_not_missing_code_refs():
     assert "demos/DEMO_SCRIPT.md" not in missing_refs
 
 
-def test_worktree_inventory_is_stable_when_new_source_is_staged(tmp_path, monkeypatch):
+def test_worktree_inventory_ignores_scratch_and_requires_new_source_to_be_staged(
+    tmp_path, monkeypatch
+):
     subprocess.run(["git", "init", "--quiet"], cwd=tmp_path, check=True)
     source = tmp_path / "tests" / "unit" / "test_new_source.py"
     source.parent.mkdir(parents=True)
     source.write_text("# new repository evidence\n", encoding="utf-8")
+    scratch = tmp_path / "tests" / "unit" / "scratch.py"
+    scratch.write_text("# must not affect committed artifacts\n", encoding="utf-8")
 
     monkeypatch.setattr(docs_verify, "PROJECT_ROOT", tmp_path)
-    docs_verify.worktree_paths.cache_clear()
-    docs_verify.worktree_dirs.cache_clear()
+    docs_verify.refresh_worktree_inventory()
     try:
         before_staging = docs_verify.worktree_paths()
 
-        subprocess.run(["git", "add", source.relative_to(tmp_path)], cwd=tmp_path, check=True)
-        docs_verify.worktree_paths.cache_clear()
-        docs_verify.worktree_dirs.cache_clear()
+        subprocess.run(
+            ["git", "add", source.relative_to(tmp_path)],
+            cwd=tmp_path,
+            check=True,
+        )
+        docs_verify.refresh_worktree_inventory()
         after_staging = docs_verify.worktree_paths()
 
-        assert before_staging == after_staging == frozenset(
-            {"tests/unit/test_new_source.py"}
+        assert before_staging == frozenset()
+        assert after_staging == frozenset({"tests/unit/test_new_source.py"})
+        assert scratch.relative_to(tmp_path).as_posix() not in after_staging
+    finally:
+        docs_verify.refresh_worktree_inventory()
+
+
+def test_worktree_inventory_filters_deletions_and_refreshes_between_verifications(
+    tmp_path, monkeypatch
+):
+    subprocess.run(["git", "init", "--quiet"], cwd=tmp_path, check=True)
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    source = tmp_path / "scripts" / "evidence.py"
+    source.parent.mkdir()
+    source.write_text("# tracked evidence\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+
+    monkeypatch.setattr(docs_verify, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(docs_verify, "DOCS_ROOT", docs_dir)
+    docs_verify.refresh_worktree_inventory()
+    try:
+        docs_verify.verify_docs(since=docs_verify.DEFAULT_SINCE)
+        assert "scripts/evidence.py" in docs_verify.worktree_paths()
+
+        source.unlink()
+        docs_verify.verify_docs(since=docs_verify.DEFAULT_SINCE)
+        assert "scripts/evidence.py" not in docs_verify.worktree_paths()
+    finally:
+        docs_verify.refresh_worktree_inventory()
+
+
+def test_tracked_symlink_is_inventory_evidence_but_broken_link_is_missing(
+    tmp_path, monkeypatch
+):
+    subprocess.run(["git", "init", "--quiet"], cwd=tmp_path, check=True)
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    target = tmp_path / "scripts" / "target.py"
+    target.parent.mkdir()
+    target.write_text("# target\n", encoding="utf-8")
+    link = tmp_path / "scripts" / "linked.py"
+    try:
+        link.symlink_to(target.name)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+
+    monkeypatch.setattr(docs_verify, "PROJECT_ROOT", tmp_path)
+    docs_verify.refresh_worktree_inventory()
+    try:
+        assert "scripts/linked.py" in docs_verify.worktree_paths()
+        target.unlink()
+        docs_verify.refresh_worktree_inventory()
+        assert "scripts/linked.py" in docs_verify.worktree_paths()
+        assert docs_verify.resolve_doc_link(
+            docs_dir / "example.md", "../scripts/linked.py"
+        ) == target
+        assert not target.exists()
+        assert not docs_verify.repo_path_exists("scripts/target.py")
+        doc = docs_verify.docs_okf.OkfDocument(
+            path=docs_dir / "example.md",
+            frontmatter={},
+            body="[broken](../scripts/linked.py)",
+        )
+        assert docs_verify.missing_markdown_links(doc) == (
+            "../scripts/linked.py",
         )
     finally:
-        docs_verify.worktree_paths.cache_clear()
-        docs_verify.worktree_dirs.cache_clear()
+        docs_verify.refresh_worktree_inventory()
 
 
 def test_verification_outputs_are_current():

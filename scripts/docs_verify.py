@@ -110,21 +110,23 @@ def run_git(args: list[str]) -> str:
 
 @functools.cache
 def worktree_paths() -> frozenset[str]:
-    """Return present repository sources independent of staging state.
+    """Return present paths in Git's index.
 
-    Generators run before the orchestrator stages a change, so newly created
-    non-ignored files must be visible here. Otherwise generating an artifact
-    and then staging those files changes the verifier's answer without changing
-    their content. Filtering for present paths also avoids treating a deleted
-    tracked file as repository evidence.
+    The committed artifacts must be reproducible from a clean checkout.
+    Including every non-ignored untracked file makes an editor scratch file
+    capable of changing the ledger, while including a deleted tracked path
+    treats evidence that is no longer present as valid. New source files must
+    therefore be staged before artifact generation; no file content is read
+    from the index, so ordinary tracked modifications remain visible directly
+    from the worktree.
+
+    ``is_symlink`` deliberately keeps a present tracked symlink in the path
+    inventory even when its target is broken. Markdown-link resolution follows
+    the target and will still report that broken/out-of-repository target as
+    missing.
     """
 
-    candidates = run_git([
-        "ls-files",
-        "--cached",
-        "--others",
-        "--exclude-standard",
-    ]).splitlines()
+    candidates = run_git(["ls-files", "--cached"]).splitlines()
     return frozenset(
         path
         for path in candidates
@@ -140,6 +142,12 @@ def worktree_dirs() -> frozenset[str]:
         for index in range(1, len(parts)):
             dirs.add(Path(*parts[:index]).as_posix())
     return frozenset(dirs)
+
+
+def refresh_worktree_inventory() -> None:
+    """Invalidate the process-local path snapshot before a verification pass."""
+    worktree_paths.cache_clear()
+    worktree_dirs.cache_clear()
 
 
 def repo_path_exists(candidate: str) -> bool:
@@ -372,7 +380,12 @@ def verify_docs(
     entirely. That keeps the generated artifacts deterministic across unrelated
     merges and needs no git history. Pass ``with_activity=True`` for the live
     review-queue view (``audit --activity``).
+
+    Refreshing here matters for library callers that generate, stage, and check
+    in one Python process. CLI calls are one-shot, but the verifier should not
+    retain an inventory captured before the index or worktree changed.
     """
+    refresh_worktree_inventory()
     prs = recent_prs(since, ignored_prs=ignored_prs or set()) if with_activity else []
     verifications: list[DocVerification] = []
     for path in docs_okf.markdown_files(DOCS_ROOT):

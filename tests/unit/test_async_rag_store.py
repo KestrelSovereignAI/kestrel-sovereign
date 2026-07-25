@@ -9,7 +9,8 @@ from kestrel_sovereign.storage.async_rag_store import AsyncRAGStore
 @pytest.mark.asyncio
 async def test_current_writer_persists_document_chunk_content_as_plaintext(tmp_path):
     """Pin the pre-encryption behavior that Child D must intentionally replace."""
-    db = await AsyncDatabase.sqlite(str(tmp_path / "rag.db"))
+    db_path = tmp_path / "rag.db"
+    db = await AsyncDatabase.sqlite(str(db_path))
     agent_id = "did:test:plaintext-characterization"
     file_hash = "characterization-file"
     sentinel = "rag-chunk-plaintext-sentinel-2677"
@@ -42,3 +43,7 @@ async def test_current_writer_persists_document_chunk_content_as_plaintext(tmp_p
         assert "content_ciphertext" not in {column[1] for column in columns}
     finally:
         await db.close()
+
+    # Prove the current SQLite artifact itself contains the body after the
+    # writer has closed, rather than only checking a hydrated return value.
+    assert sentinel.encode("utf-8") in db_path.read_bytes()
