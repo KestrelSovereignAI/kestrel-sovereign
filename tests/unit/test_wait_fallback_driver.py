@@ -246,11 +246,19 @@ async def test_fallback_loop_drives_reconcile_when_no_scheduler(db):
 
     task = asyncio.ensure_future(feature._fallback_reconcile_loop(agent))
     try:
-        # Give the loop a few iterations to enqueue then harvest.
-        for _ in range(50):
-            await asyncio.sleep(0)
-            if dispatcher.signals:
-                break
+        # Wait on the actual condition with a bounded wall-clock timeout, NOT
+        # a fixed number of event-loop turns. The reconcile is aiosqlite-backed
+        # (its awaits bounce to a worker thread and back), so it needs real
+        # time and many loop iterations to reach the enqueue — a fixed
+        # ``sleep(0)`` count was not enough under loaded CI and flaked here
+        # (#2729). Polling the condition on wall-clock is deterministic; the
+        # reconciler dedups the transition (``last_signaled_outcome``), so the
+        # count can never exceed one however many ticks run before we observe.
+        async def _await_first_signal():
+            while not dispatcher.signals:
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(_await_first_signal(), timeout=5.0)
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
