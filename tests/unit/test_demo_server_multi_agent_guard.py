@@ -85,8 +85,8 @@ def test_demo_marker_truthy_variants(tmp_path, monkeypatch):
         )
 
 
-def _calls_named(function: object, name: str) -> bool:
-    """Return whether ``function`` calls ``name`` in its own lexical scope."""
+def _calls_named_on_outer_scope(function: object, name: str) -> bool:
+    """Return whether ``function`` calls ``name`` in its executable outer scope."""
     tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
     outer_function = next(
         node
@@ -121,22 +121,92 @@ def _calls_named(function: object, name: str) -> bool:
     return finder.found
 
 
-def _outer_scope_with_only_nested_startup_calls(_lifespan_startup):
+def _enters_async_context_named_on_outer_scope(function: object, name: str) -> bool:
+    """Return whether ``function`` enters ``name`` in an outer-scope async with."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+    outer_function = next(
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    )
+
+    class OuterScopeAsyncWithFinder(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.found = False
+
+        def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
+            for item in node.items:
+                context_expr = item.context_expr
+                if (
+                    isinstance(context_expr, ast.Call)
+                    and isinstance(context_expr.func, ast.Name)
+                    and context_expr.func.id == name
+                ):
+                    self.found = True
+            self.generic_visit(node)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            return
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            return
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            return
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            return
+
+    finder = OuterScopeAsyncWithFinder()
+    for statement in outer_function.body:
+        finder.visit(statement)
+    return finder.found
+
+
+async def _outer_scope_with_only_nested_startup_context(_lifespan_startup):
+    async def nested_lifespan():
+        async with _lifespan_startup(None):
+            yield
+
+    return nested_lifespan
+
+
+async def _outer_scope_with_bare_startup_context_factory(_lifespan_startup):
+    _lifespan_startup(None)
+
+
+def _outer_scope_with_only_nested_resolve_calls(resolve_multi_agent_path):
     def nested_function():
-        _lifespan_startup(None)
+        resolve_multi_agent_path({})
 
     class NestedClass:
         def method(self):
-            _lifespan_startup(None)
+            resolve_multi_agent_path({})
 
-    return nested_function, (lambda: _lifespan_startup(None)), NestedClass
+    return nested_function, (lambda: resolve_multi_agent_path({})), NestedClass
 
 
-def test_calls_named_ignores_nested_lexical_scopes():
-    """A never-invoked nested call cannot satisfy the lifespan wiring guard."""
-    assert not _calls_named(
-        _outer_scope_with_only_nested_startup_calls,
+def test_async_context_check_ignores_nested_lexical_scopes():
+    """A nested context entry cannot satisfy the lifespan wiring guard."""
+    assert not _enters_async_context_named_on_outer_scope(
+        _outer_scope_with_only_nested_startup_context,
         "_lifespan_startup",
+    )
+
+
+def test_async_context_check_rejects_a_bare_startup_context_factory_call():
+    """Constructing a startup context manager is not the same as entering it."""
+    assert not _enters_async_context_named_on_outer_scope(
+        _outer_scope_with_bare_startup_context_factory,
+        "_lifespan_startup",
+    )
+
+
+def test_outer_scope_call_check_ignores_nested_lexical_scopes():
+    """A never-invoked nested resolver call cannot satisfy the startup guard."""
+    assert not _calls_named_on_outer_scope(
+        _outer_scope_with_only_nested_resolve_calls,
+        "resolve_multi_agent_path",
     )
 
 
@@ -150,11 +220,18 @@ def test_lifespan_reaches_resolve_multi_agent_path_through_startup_helper():
     """
     import server
 
-    assert _calls_named(server.lifespan, "_lifespan_startup"), (
-        "server.lifespan must enter _lifespan_startup so multi-agent startup "
-        "policy remains part of the production lifespan."
+    assert _enters_async_context_named_on_outer_scope(
+        server.lifespan,
+        "_lifespan_startup",
+    ), (
+        "server.lifespan must enter _lifespan_startup through an async with so "
+        "multi-agent startup policy remains part of the production lifespan."
     )
-    assert _calls_named(server._lifespan_startup, "resolve_multi_agent_path"), (
-        "server._lifespan_startup must invoke resolve_multi_agent_path(); the "
-        "unit tests exercise that helper and production must reach it."
+    assert _calls_named_on_outer_scope(
+        server._lifespan_startup,
+        "resolve_multi_agent_path",
+    ), (
+        "server._lifespan_startup must invoke resolve_multi_agent_path on its "
+        "executable outer scope; unit tests exercise that helper and production "
+        "must reach it."
     )
