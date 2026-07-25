@@ -1490,7 +1490,8 @@
     {
       "existing_code_refs": [
         "run_tests.py",
-        "server.py"
+        "server.py",
+        "tests/unit/test_docs_verify.py"
       ],
       "findings": [],
       "missing_code_refs": [],

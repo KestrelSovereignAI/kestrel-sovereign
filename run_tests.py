@@ -341,6 +341,11 @@ class SmartTestRunner:
         # Fail fast
         if fail_fast:
             cmd.append("-x")
+        else:
+            # pyproject.toml supplies ``-x`` through addopts.  A later
+            # ``--maxfail=0`` is required to make --no-fail-fast real and to
+            # let coverage CI finish combining/reporting after test failures.
+            cmd.append("--maxfail=0")
 
         # Skip slow tests
         if fast:
@@ -362,10 +367,11 @@ class SmartTestRunner:
         # Coverage
         if coverage:
             cmd.extend([
-                "--cov=.",
+                "--cov=kestrel_sovereign",
                 "--cov-report=term-missing",
                 "--cov-report=html:coverage_html",
                 "--cov-report=json:coverage.json",
+                "--cov-report=xml:coverage.xml",
             ])
 
         # Failed only (last failed)
@@ -399,6 +405,18 @@ class SmartTestRunner:
             self.log(f"Tests failed (exit code {result.returncode}) in {elapsed:.1f}s", "error")
 
         return result.returncode
+
+
+def configure_ci_defaults(args: argparse.Namespace) -> None:
+    """Apply the deterministic, report-complete defaults for ``--ci``."""
+    if not args.ci:
+        return
+    args.parallel = args.parallel or "auto"
+    args.coverage = True
+    # A weekly failure must still leave complete, diagnosable coverage
+    # artifacts.  Failures remain failures; pytest merely runs the rest of the
+    # suite before returning its non-zero status.
+    args.no_fail_fast = True
 
 
 def main():
@@ -551,9 +569,7 @@ Examples:
         args.skip_check = True
 
     # --ci mode sets defaults
-    if args.ci:
-        args.parallel = args.parallel or "auto"
-        args.coverage = True
+    configure_ci_defaults(args)
 
     # --feedback setup
     if args.feedback:
