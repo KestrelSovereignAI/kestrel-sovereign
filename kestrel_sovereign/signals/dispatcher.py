@@ -927,20 +927,33 @@ class SignalDispatcher:
             )
 
         async with self._durable_lifecycle_lock:
-            completion = self._durable_shutdown_completion
-            if completion is None or self._durable_shutdown_needs_retry(completion):
-                self._durable_shutdown = True
-                completion = asyncio.create_task(
-                    self._complete_durable_shutdown(),
-                    name=f"durable_signal_shutdown:{self._agent.did}",
-                )
-                completion.add_done_callback(self._observe_durable_shutdown_completion)
-                self._durable_shutdown_completion = completion
+            completion = self._start_durable_shutdown_completion()
 
         # A public caller may be cancelled by the bounded agent shutdown
         # wrapper.  Shield the owned teardown so the next caller can either
         # join the same cleanup or retry a genuine cleanup failure.
         await asyncio.shield(completion)
+
+    def _start_durable_shutdown_completion(self) -> asyncio.Task[None]:
+        """Close durable admission and return the one owned teardown task.
+
+        Async callers hold ``_durable_lifecycle_lock`` before calling this
+        helper.  The synchronous compatibility seam runs atomically on the
+        same event-loop thread, so it can use this exact transition without
+        inserting an await between the admission-close decision and task
+        ownership.  Keeping that transition here prevents the two public
+        shutdown forms from drifting into independent release paths.
+        """
+        completion = self._durable_shutdown_completion
+        if completion is None or self._durable_shutdown_needs_retry(completion):
+            self._durable_shutdown = True
+            completion = asyncio.create_task(
+                self._complete_durable_shutdown(),
+                name=f"durable_signal_shutdown:{self._agent.did}",
+            )
+            completion.add_done_callback(self._observe_durable_shutdown_completion)
+            self._durable_shutdown_completion = completion
+        return completion
 
     @staticmethod
     def _durable_shutdown_needs_retry(completion: asyncio.Task[None]) -> bool:
@@ -1013,41 +1026,32 @@ class SignalDispatcher:
         """Compatibility teardown for embeddings that cannot await shutdown.
 
         Production agent shutdown uses :meth:`shutdown_durable_delivery` and
-        awaits the owner-scoped durable release. This legacy synchronous seam
-        still drops raw sidecars immediately and schedules the same release on
-        the agent-owned task tracker when an event loop is available.
+        awaits the owner-scoped durable release.  A synchronous embedding can
+        only initiate that same owned state machine: it returns the work to
+        the dispatcher-owned joinable task and never races an admitted
+        operation by releasing reservations or clearing raw sidecars itself.
         """
-        if self._durable_shutdown:
+        completion = self._durable_shutdown_completion
+        if (
+            completion is not None
+            and completion.done()
+            and not self._durable_shutdown_needs_retry(completion)
+        ):
             return
-        self._durable_shutdown = True
-        if self._runtime_owner_heartbeat_timer is not None:
-            self._runtime_owner_heartbeat_timer.cancel()
-            self._runtime_owner_heartbeat_timer = None
-        if self._runtime_owner_heartbeat_task is not None:
-            self._runtime_owner_heartbeat_task.cancel()
-            self._runtime_owner_heartbeat_task = None
-        if self._durable_runtime_owner_registration_started:
-            try:
-                asyncio.get_running_loop()
-            except RuntimeError:
-                logger.warning(
-                    "Could not schedule durable initial-reservation release "
-                    "during synchronous dispatcher shutdown"
-                )
-            else:
-                self._agent._track_background_task(
-                    self._durable_store.release_initial_reservations(
-                        agent_id=self._agent.did,
-                        owner_id=self._durable_delivery_owner,
-                    ),
-                    name=f"durable_signal_owner_release:{self._agent.did}",
-                )
-                self._durable_runtime_owner_registered = False
-                self._durable_runtime_owner_registration_started = False
-        for timer in self._transient_durable_handoff_timers.values():
-            timer.cancel()
-        self._transient_durable_handoff_timers.clear()
-        self._transient_durable_handoffs.clear()
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "SignalDispatcher.shutdown requires a running event loop; "
+                "await shutdown_durable_delivery() before closing storage"
+            ) from exc
+
+        # A synchronous method cannot await the lifecycle lock.  On one
+        # running asyncio loop it nevertheless executes without an interleave,
+        # so this creates the same linearization point and the same owned task
+        # as the async method above.  Any already-admitted work is drained by
+        # ``_complete_durable_shutdown`` before it releases the runtime owner.
+        self._start_durable_shutdown_completion()
 
     async def _activate_transient_reservations(self, persisted) -> None:
         """Activate every post-commit reservation into its first live lease.

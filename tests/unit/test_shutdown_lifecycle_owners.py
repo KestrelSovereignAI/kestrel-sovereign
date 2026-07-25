@@ -207,6 +207,88 @@ async def test_completion_join_classifies_simultaneous_owned_and_caller_cancella
 
 
 @pytest.mark.asyncio
+async def test_completion_join_returns_a_live_owned_task_failure() -> None:
+    """A failing owned task is terminal data, not an early shutdown escape."""
+    entered = asyncio.Event()
+    release_failure = asyncio.Event()
+
+    async def owned_work() -> None:
+        entered.set()
+        await release_failure.wait()
+        raise RuntimeError("owned lifecycle failure")
+
+    owned = asyncio.create_task(owned_work())
+    join = asyncio.create_task(await_lifecycle_task_completion(owned))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    assert not join.done()
+
+    release_failure.set()
+    cancelled, failure = await asyncio.wait_for(join, timeout=1.0)
+
+    assert cancelled is False
+    assert isinstance(failure, RuntimeError)
+    assert str(failure) == "owned lifecycle failure"
+
+
+@pytest.mark.asyncio
+async def test_completion_join_preserves_repeated_cancellation_with_owned_failure() -> None:
+    """Caller cancellation is recorded without losing the owned failure."""
+    entered = asyncio.Event()
+    release_failure = asyncio.Event()
+
+    async def owned_work() -> None:
+        entered.set()
+        await release_failure.wait()
+        raise RuntimeError("owned failure after caller cancellation")
+
+    owned = asyncio.create_task(owned_work())
+    join = asyncio.create_task(await_lifecycle_task_completion(owned))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+    join.cancel()
+    await asyncio.sleep(0)
+    join.cancel()
+    release_failure.set()
+
+    cancelled, failure = await asyncio.wait_for(join, timeout=1.0)
+    assert cancelled is True
+    assert isinstance(failure, RuntimeError)
+    assert str(failure) == "owned failure after caller cancellation"
+
+
+@pytest.mark.asyncio
+async def test_server_shutdown_drains_host_agent_and_phoenix_after_failures(
+    monkeypatch,
+) -> None:
+    """Each phase runs in order; terminal errors surface only after the drain."""
+    app = FastAPI()
+    phases: list[str] = []
+
+    async def fail_host(_app) -> None:
+        phases.append("host")
+        raise RuntimeError("host failure")
+
+    async def fail_agents(_app) -> None:
+        phases.append("agents")
+        raise RuntimeError("agent failure")
+
+    async def finish_phoenix(_app) -> bool:
+        phases.append("phoenix")
+        return False
+
+    monkeypatch.setattr(server, "_shutdown_host_features", fail_host)
+    monkeypatch.setattr(server, "_shutdown_server_agents", fail_agents)
+    monkeypatch.setattr(server, "_shutdown_phoenix", finish_phoenix)
+
+    cancelled, failure = await server._shutdown_server_resources(app)
+
+    assert phases == ["host", "agents", "phoenix"]
+    assert cancelled is False
+    assert isinstance(failure, RuntimeError)
+    assert str(failure) == "host failure"
+
+
+@pytest.mark.asyncio
 async def test_phoenix_cleanup_survives_repeated_cancellation() -> None:
     """The server joins Phoenix work and reaps its child before re-raising cancel."""
     app = SimpleNamespace(state=SimpleNamespace())

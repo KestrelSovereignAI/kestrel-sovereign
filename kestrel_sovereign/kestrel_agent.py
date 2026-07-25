@@ -263,6 +263,13 @@ async def await_lifecycle_task_completion(
         except asyncio.CancelledError:
             if joiner is not None and joiner.cancelling():
                 cancelled = True
+        except Exception:
+            # ``shield`` re-raises the owned task's terminal exception into
+            # this joiner.  The lifecycle contract returns that outcome as
+            # data so a staged owner can drain every later resource before it
+            # reports or aggregates the failure.  It is terminal at this
+            # point; fetch it below exactly once from the task itself.
+            assert task.done()
 
     if task.cancelled():
         return cancelled, asyncio.CancelledError()

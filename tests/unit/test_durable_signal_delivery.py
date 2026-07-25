@@ -7,6 +7,7 @@ import json
 import time
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -117,6 +118,58 @@ async def _close(backend, agent: _Agent) -> None:
     if pending:
         await asyncio.gather(*pending, return_exceptions=True)
     await backend.close()
+
+
+async def _assert_sync_shutdown_drained(
+    backend: SQLiteBackend,
+    agent: _Agent,
+    dispatcher: SignalDispatcher,
+    completion: asyncio.Task[None],
+) -> None:
+    """Verify the sync seam reached the normal durable teardown terminal state."""
+    from tests.utils.aiosqlite_workers import aiosqlite_worker
+
+    await asyncio.wait_for(completion, timeout=1.0)
+    owner = await backend.fetch_one(
+        "SELECT stopped_at FROM durable_signal_runtime_owners "
+        "WHERE agent_id = ? AND owner_id = ?",
+        (agent.did, dispatcher._durable_delivery_owner),
+    )
+    assert owner is not None and owner[0] is not None
+    assert dispatcher._durable_runtime_owner_registered is False
+    assert dispatcher._durable_runtime_owner_registration_started is False
+    assert dispatcher._durable_active_admissions == 0
+    assert dispatcher._durable_admissions_drained.is_set()
+    assert dispatcher._transient_durable_handoffs == {}
+    assert dispatcher._transient_durable_handoff_timers == {}
+    assert dispatcher._post_commit_reservation_repairs == set()
+    assert dispatcher._runtime_owner_heartbeat_timer is None
+    assert dispatcher._runtime_owner_heartbeat_task is None
+    assert all(task.done() for task in agent.tasks)
+    assert await backend.fetch_val(
+        "SELECT COUNT(*) FROM durable_signal_deliveries "
+        "WHERE status = 'initial_reserved'"
+    ) == 0
+
+    connection = backend._connection
+    assert connection is not None
+    worker = aiosqlite_worker(connection)
+    await backend.close()
+    assert not worker.is_alive()
+
+
+async def _finish_sync_shutdown_test(
+    backend: SQLiteBackend,
+    agent: _Agent,
+    dispatcher: SignalDispatcher,
+) -> None:
+    """Join a sync-started teardown before an assertion failure closes SQLite."""
+    if dispatcher._durable_shutdown_completion is not None:
+        await dispatcher.shutdown_durable_delivery()
+    elif not dispatcher._durable_shutdown:
+        await dispatcher.shutdown_durable_delivery()
+    if backend._connection is not None:
+        await _close(backend, agent)
 
 
 async def _assert_late_durable_calls_fail_safely(
@@ -359,8 +412,8 @@ async def test_volatile_sidecar_is_installed_before_commit_and_reserved_from_pee
     finally:
         backend_a.transaction = original_transaction
         backend_b.fetch_one = original_peer_fetch_one
-        dispatcher_a.shutdown()
-        dispatcher_b.shutdown()
+        await dispatcher_a.shutdown_durable_delivery()
+        await dispatcher_b.shutdown_durable_delivery()
         await _close(backend_a, agent_a)
         await _close(backend_b, agent_b)
 
@@ -425,7 +478,7 @@ async def test_concurrent_local_initial_claims_preserve_the_winner_payload(tmp_p
         assert loser is None
     finally:
         dispatcher._durable_store.claim_initial_delivery = original_claim_initial
-        dispatcher.shutdown()
+        await dispatcher.shutdown_durable_delivery()
         await _close(backend, agent)
 
 
@@ -489,7 +542,7 @@ async def test_initial_reservation_starts_after_sqlite_handoff_contention(tmp_pa
         release_writer.set()
         if holder is not None:
             await asyncio.gather(holder, return_exceptions=True)
-        dispatcher.shutdown()
+        await dispatcher.shutdown_durable_delivery()
         await _close(backend, agent)
         await peer_backend.close()
 
@@ -542,7 +595,7 @@ async def test_notify_resume_expires_and_reschedules_volatile_handoffs(tmp_path)
             is not prior_live_timer
         )
     finally:
-        dispatcher.shutdown()
+        await dispatcher.shutdown_durable_delivery()
         await _close(backend, agent)
 
 
@@ -581,7 +634,7 @@ async def test_volatile_sidecars_are_discarded_when_the_event_transaction_rolls_
         ) is None
     finally:
         backend.transaction = original_transaction
-        dispatcher.shutdown()
+        await dispatcher.shutdown_durable_delivery()
         await _close(backend, agent)
 
 
@@ -1110,6 +1163,9 @@ async def test_expired_volatile_reservation_replays_only_the_durable_marker_afte
         # A process death drops raw state but cannot synchronously rewrite its
         # durable lease. A fresh worker must wait for that lease to expire.
         dispatcher_a.shutdown()
+        completion = dispatcher_a._durable_shutdown_completion
+        assert completion is not None
+        await completion
         assert dispatcher_a._transient_durable_handoffs == {}
     finally:
         await _close(backend_a, agent_a)
@@ -1128,7 +1184,7 @@ async def test_expired_volatile_reservation_replays_only_the_durable_marker_afte
         assert replayed.event.payload == {"_privacy_gated": "none"}
         assert secret not in json.dumps(replayed.event.payload)
     finally:
-        dispatcher_b.shutdown()
+        await dispatcher_b.shutdown_durable_delivery()
         await _close(backend_b, agent_b)
 
 
@@ -1373,7 +1429,7 @@ async def test_volatile_privacy_materializes_payload_correlated_wait_without_per
         assert json.loads(row[0]) == {"_privacy_gated": storage_marker}
         assert secret not in row[0]
         assert workflow_id not in row[0]
-        dispatcher.shutdown()
+        await dispatcher.shutdown_durable_delivery()
         assert dispatcher._transient_durable_handoffs == {}
     finally:
         await _close(backend, agent)
@@ -1467,7 +1523,7 @@ async def test_live_handoff_is_discarded_on_terminal_outcomes_and_lease_expiry(t
         )
         assert expiring.delivery_id not in dispatcher._transient_durable_handoffs
     finally:
-        dispatcher.shutdown()
+        await dispatcher.shutdown_durable_delivery()
         await _close(backend, agent)
 
 
@@ -1530,7 +1586,7 @@ async def test_privacy_transition_waits_for_projection_and_durable_commit(tmp_pa
         assert secret in row[0]
     finally:
         backend.execute = original_execute
-        dispatcher.shutdown()
+        await dispatcher.shutdown_durable_delivery()
         await _close(backend, agent)
 
 
@@ -1760,6 +1816,192 @@ async def test_sqlite_registration_handoff_reserves_the_writer_slot_before_reads
     _SQLiteBackend.execute.assert_awaited_once_with(
         "DELETE FROM durable_signal_consumers WHERE 0"
     )
+
+
+def test_sync_shutdown_without_a_running_loop_fails_before_claiming_cleanup():
+    """The compatibility seam must not claim a durable release it cannot run."""
+    dispatcher = SignalDispatcher(
+        agent=SimpleNamespace(did="did:agent:no-loop"),
+        registry=SourceRegistry(),
+        lock_manager=OrderedLockManager(),
+        store=SimpleNamespace(backend=object()),
+    )
+
+    with pytest.raises(RuntimeError, match="requires a running event loop"):
+        dispatcher.shutdown()
+
+    assert dispatcher._durable_shutdown is False
+    assert dispatcher._durable_shutdown_completion is None
+
+
+@pytest.mark.asyncio
+async def test_sync_shutdown_drains_an_admitted_persistence_before_releasing_owner(
+    tmp_path,
+):
+    """The sync seam linearizes with a real SQLite event transaction."""
+    backend, agent, dispatcher = await _dispatcher(
+        tmp_path / "sync-shutdown-admitted-persistence.db", "did:agent:one"
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id="workflow-wait", source="provider.message", agent_id=agent.did
+    )
+    original_persist = dispatcher._durable_store.persist_signal
+    persist_entered = asyncio.Event()
+    allow_persist = asyncio.Event()
+    dispatch_task = None
+    async_shutdown_task = None
+    completion = None
+    backend_closed = False
+
+    async def block_persist(*args, **kwargs):
+        persist_entered.set()
+        await allow_persist.wait()
+        return await original_persist(*args, **kwargs)
+
+    dispatcher._durable_store.persist_signal = block_persist
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        dispatch_task = asyncio.create_task(
+            dispatcher.dispatch_signal(
+                _signal(agent_id=agent.did, message="sync-admitted-persistence"),
+                source_event_id="sync-admitted-persistence",
+            )
+        )
+        await asyncio.wait_for(persist_entered.wait(), timeout=1.0)
+
+        dispatcher.shutdown()
+        completion = dispatcher._durable_shutdown_completion
+        assert completion is not None and not completion.done()
+        dispatcher.shutdown()
+        assert dispatcher._durable_shutdown_completion is completion
+        async_shutdown_task = asyncio.create_task(dispatcher.shutdown_durable_delivery())
+        await asyncio.sleep(0)
+        assert dispatcher._durable_shutdown_completion is completion
+        assert not async_shutdown_task.done()
+        await _assert_late_durable_calls_fail_safely(
+            dispatcher, agent=agent, consumer=consumer
+        )
+
+        allow_persist.set()
+        assert (await dispatch_task).status is Status.OK
+        await async_shutdown_task
+        await _assert_sync_shutdown_drained(backend, agent, dispatcher, completion)
+        backend_closed = True
+    finally:
+        allow_persist.set()
+        dispatcher._durable_store.persist_signal = original_persist
+        if dispatch_task is not None and not dispatch_task.done():
+            await dispatch_task
+        if async_shutdown_task is not None and not async_shutdown_task.done():
+            await async_shutdown_task
+        if not backend_closed:
+            await _finish_sync_shutdown_test(backend, agent, dispatcher)
+
+
+@pytest.mark.asyncio
+async def test_sync_shutdown_drains_an_admitted_outcome_log_before_releasing_owner(
+    tmp_path,
+):
+    """The sync seam cannot discard sidecars while an accepted log is live."""
+    backend, agent, dispatcher = await _dispatcher(
+        tmp_path / "sync-shutdown-admitted-log.db", "did:agent:one"
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id="workflow-wait", source="provider.message", agent_id=agent.did
+    )
+    original_append = dispatcher._store.append
+    append_entered = asyncio.Event()
+    allow_append = asyncio.Event()
+    dispatch_task = None
+    completion = None
+    backend_closed = False
+
+    async def block_append(*args, **kwargs):
+        append_entered.set()
+        await allow_append.wait()
+        return await original_append(*args, **kwargs)
+
+    dispatcher._store.append = block_append
+    try:
+        dispatch_task = asyncio.create_task(
+            dispatcher.dispatch_signal(
+                _signal(agent_id=agent.did, message="sync-admitted-log"),
+                source_event_id="sync-admitted-log",
+            )
+        )
+        await asyncio.wait_for(append_entered.wait(), timeout=1.0)
+
+        dispatcher.shutdown()
+        completion = dispatcher._durable_shutdown_completion
+        assert completion is not None and not completion.done()
+        assert dispatcher._outcome_log_tasks
+        await _assert_late_durable_calls_fail_safely(
+            dispatcher, agent=agent, consumer=consumer
+        )
+
+        allow_append.set()
+        assert (await dispatch_task).status is Status.OK
+        await _assert_sync_shutdown_drained(backend, agent, dispatcher, completion)
+        backend_closed = True
+    finally:
+        allow_append.set()
+        dispatcher._store.append = original_append
+        if dispatch_task is not None and not dispatch_task.done():
+            await dispatch_task
+        if not backend_closed:
+            await _finish_sync_shutdown_test(backend, agent, dispatcher)
+
+
+@pytest.mark.asyncio
+async def test_sync_shutdown_drains_an_admitted_initialization_before_releasing_owner(
+    tmp_path,
+):
+    """An owner registration admitted before sync shutdown is always stopped."""
+    backend = SQLiteBackend(str(tmp_path / "sync-shutdown-initialization.db"))
+    await backend.connect()
+    log_store = SignalLogStore(backend)
+    await log_store.initialize()
+    agent = _Agent("did:agent:one")
+    registry = SourceRegistry()
+    registry.register(_registration(agent))
+    dispatcher = SignalDispatcher(
+        agent=agent,
+        registry=registry,
+        lock_manager=OrderedLockManager(),
+        store=log_store,
+    )
+    original_register = dispatcher._durable_store.register_runtime_owner
+    registration_entered = asyncio.Event()
+    allow_registration = asyncio.Event()
+    initialization_task = None
+    completion = None
+    backend_closed = False
+
+    async def block_registration(*args, **kwargs):
+        registration_entered.set()
+        await allow_registration.wait()
+        return await original_register(*args, **kwargs)
+
+    dispatcher._durable_store.register_runtime_owner = block_registration
+    try:
+        initialization_task = asyncio.create_task(dispatcher.initialize_durable_delivery())
+        await asyncio.wait_for(registration_entered.wait(), timeout=1.0)
+
+        dispatcher.shutdown()
+        completion = dispatcher._durable_shutdown_completion
+        assert completion is not None and not completion.done()
+
+        allow_registration.set()
+        await initialization_task
+        await _assert_sync_shutdown_drained(backend, agent, dispatcher, completion)
+        backend_closed = True
+    finally:
+        allow_registration.set()
+        dispatcher._durable_store.register_runtime_owner = original_register
+        if initialization_task is not None and not initialization_task.done():
+            await initialization_task
+        if not backend_closed:
+            await _finish_sync_shutdown_test(backend, agent, dispatcher)
 
 
 @pytest.mark.asyncio
