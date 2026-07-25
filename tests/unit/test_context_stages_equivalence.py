@@ -1,13 +1,13 @@
-"""Equivalence + concurrency coverage for the shared context section plan.
+"""Equivalence + concurrency coverage for the canonical context-build plan.
 
 #2523 decomposed ``ContextManager.build_context`` into stages and moved the
 section-content vocabulary into ``kestrel_sovereign.agent.context_stages`` so
-that the production LLM path and the read-only ``measure_context_breakdown``
-path consume ONE definition and cannot drift (#2534). These tests pin:
+that production and dry-run status builds consume one definition and cannot
+drift (#2534). These tests pin:
 
 - the shared vocabulary's exact bytes (golden),
 - the typed ``ContextAssembly`` / ``SectionResult`` per-build state,
-- production ⇄ measurement byte parity for the dynamic-context wrapping,
+- production ⇄ compatibility-adapter byte parity for dynamic wrapping,
 - table-driven ``build_context`` behavior across EPHEMERAL / trivial /
   episodes / memories / RAG / none,
 - durable-salvage success and fail-closed paths,
@@ -29,6 +29,10 @@ from kestrel_sovereign.agent.context_manager import (
     ContextResult,
     get_current_injection_tracking,
     reset_injection_tracking,
+)
+from kestrel_sovereign.agent.context_stages import (
+    ContextBuildMode,
+    SectionStatus,
 )
 from kestrel_sovereign.agent.salvage import SalvageWriteError
 
@@ -130,10 +134,8 @@ def test_context_manager_has_no_shared_assembly_class_state():
 
 
 # ---------------------------------------------------------------------------
-# Shared section producers — the single definition BOTH assemblers consume.
-# ``build_context`` (via _produce_* / _commit_*) and
-# ``measure_context_breakdown`` both build each section through these, so the
-# per-section token cost, item count, and wrapped bytes cannot drift (#2523).
+# Shared section producers — the single definition the canonical planner
+# consumes for both live and dry-run plans.
 # ---------------------------------------------------------------------------
 
 
@@ -339,7 +341,7 @@ def _make_cm(
 
 
 # ---------------------------------------------------------------------------
-# Production ⇄ measurement byte parity for the dynamic-context wrapping
+# Production ⇄ compatibility-adapter byte parity
 # ---------------------------------------------------------------------------
 
 
@@ -420,14 +422,8 @@ async def test_retrieval_inclusion_full_section_parity():
 
 
 @pytest.mark.asyncio
-async def test_trivial_query_is_the_preserved_read_only_distinction():
-    """Trivial-query parity: production skips retrieval on a trivial turn
-    (#1404); the read-only estimator deliberately measures POTENTIAL
-    retrieval (the popup flags it 'estimated'). The section PLAN is shared;
-    the retrieval GATING policy is the preserved production/read-only
-    distinction (#2523) — so when the estimator DOES include a block it wraps
-    it through the SAME shared builder production would use.
-    """
+async def test_trivial_query_uses_the_production_relevance_gate():
+    """The compatibility adapter must not retrieve content production skips."""
     memory_block = "[Memory 1] a"
     rag_block = "[Document A] y"
 
@@ -438,22 +434,23 @@ async def test_trivial_query_is_the_preserved_read_only_distinction():
     cm.memory_manager.retrieve_memories.assert_not_called()
     cm.context_builder.retrieve_context.assert_not_called()
 
-    # Measurement estimates potential retrieval even for the trivial query,
-    # but through the shared builder (identical wrapping/counting).
+    # The read-only adapter follows the same gate and performs no retrieval.
     builder = ContextBuilder(MagicMock())
-    with patch.object(builder, "retrieve_context", AsyncMock(return_value=rag_block)):
+    retrieve = AsyncMock(return_value=rag_block)
+    memories = AsyncMock(return_value=memory_block)
+    with patch.object(builder, "retrieve_context", retrieve):
         measured = await builder.measure_context_breakdown(
             query="hi",
             history=[],
             constitution="C",
             include_rag=True,
-            memory_retriever=AsyncMock(return_value=memory_block),
+            memory_retriever=memories,
         )
-    assert measured["sections"]["memories"]["count"] == 1
-    assert measured["sections"]["rag"]["chunks"] == 1
-    assert measured["_artifacts"]["dynamic_user_context"] == cs.assemble_dynamic_user_context(
-        [cs.wrap_memories(memory_block), cs.wrap_documents(rag_block)]
-    )
+    assert measured["sections"]["memories"]["status"] == "skipped"
+    assert measured["sections"]["rag"]["status"] == "skipped"
+    assert measured["_artifacts"]["dynamic_user_context"] == ""
+    memories.assert_not_awaited()
+    retrieve.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -762,3 +759,333 @@ async def test_concurrent_builds_do_not_share_state():
     assert track_b == (["B_CLAUSE"], [])
     assert res_a.injected_clauses == ["A_CLAUSE"]
     assert res_b.injected_clauses == ["B_CLAUSE"]
+
+
+# ---------------------------------------------------------------------------
+# #2534 canonical live/dry plan parity
+# ---------------------------------------------------------------------------
+
+
+def _assert_live_dry_plan_equivalent(live, dry):
+    assert live.assembly.system_prompt == dry.assembly.system_prompt
+    assert live.assembly.formatted_history == dry.assembly.formatted_history
+    assert live.assembly.dynamic_user_context == dry.assembly.dynamic_user_context
+    assert live.total_tokens == dry.total_tokens
+    assert live.total_budget == dry.total_budget
+    assert live.budget_summary == dry.budget_summary
+    assert live.warnings == dry.warnings
+    assert live.memory_access_ids == dry.memory_access_ids
+    assert live.salvage_requirement == dry.salvage_requirement
+    assert live.microcompacted_tool_results == dry.microcompacted_tool_results
+    assert set(live.sections) == set(dry.sections)
+    for name in live.sections:
+        left = live.sections[name]
+        right = dry.sections[name]
+        assert left.status == right.status, name
+        assert left.tokens == right.tokens, name
+        assert left.raw_tokens == right.raw_tokens, name
+        assert left.items == right.items, name
+        assert left.budget == right.budget, name
+        assert left.provenance == right.provenance, name
+        assert left.reason == right.reason, name
+        assert left.details == right.details, name
+
+
+async def _build_live_dry_plans(cm, **kwargs):
+    live = await cm.build_context_plan(
+        constitution="C",
+        mode=ContextBuildMode.LIVE,
+        **{"query": "explain the phoenix migration", **kwargs},
+    )
+    dry = await cm.build_context_plan(
+        constitution="C",
+        mode=ContextBuildMode.DRY_RUN,
+        **{"query": "explain the phoenix migration", **kwargs},
+    )
+    _assert_live_dry_plan_equivalent(live, dry)
+    return live, dry
+
+
+@pytest.mark.asyncio
+async def test_live_dry_plan_equivalence_for_retrieval_and_tools():
+    from kestrel_sovereign.agent.memory_manager import RetrievedMemoryBlock
+
+    cm = _make_cm(
+        memories_result="[Memory 1] a\n[Memory 2] b",
+        rag_result="[Document A] x",
+    )
+    cm.memory_manager.retrieve_memories.return_value = RetrievedMemoryBlock(
+        text="[Memory 1] a\n[Memory 2] b",
+        message_ids=(41, 42),
+    )
+    tools = [{"type": "function", "function": {"name": "lookup"}}]
+    live, dry = await _build_live_dry_plans(cm, tools=tools)
+
+    assert dry.sections["memories"].status is SectionStatus.INCLUDED
+    assert dry.memory_access_ids == (41, 42)
+    assert dry.sections["rag"].status is SectionStatus.INCLUDED
+    assert dry.sections["tools"].tokens > 0
+    assert (
+        dry.sections["history"].budget
+        > dry.budget_summary["allocations"]["history"]["budget"]
+    ), "finalized section slack must reach the history effective budget"
+    assert sum(
+        section.tokens or 0 for section in dry.sections.values()
+    ) == dry.total_tokens
+    # Planning is read-only: rehearsal access commits only in build_context.
+    cm.memory_retriever.record_accesses.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_live_dry_plan_equivalence_for_trivial_and_ephemeral_turns():
+    cm = _make_cm(
+        memories_result="[Memory 1] should not appear",
+        rag_result="[Document A] should not appear",
+    )
+    live, dry = await _build_live_dry_plans(cm, query="hi")
+    assert dry.sections["memories"].status is SectionStatus.SKIPPED
+    assert dry.sections["memories"].tokens is None
+    assert dry.sections["rag"].status is SectionStatus.SKIPPED
+    assert dry.sections["rag"].tokens is None
+    assert dry.assembly.dynamic_user_context == ""
+    cm.memory_manager.retrieve_memories.assert_not_called()
+    cm.context_builder.retrieve_context.assert_not_called()
+
+    ephemeral_live, ephemeral_dry = await _build_live_dry_plans(
+        cm,
+        privacy_mode="EPHEMERAL",
+    )
+    assert ephemeral_dry.assembly.formatted_history == []
+    assert "EPHEMERAL MODE ACTIVE" in ephemeral_dry.assembly.system_prompt
+    assert ephemeral_dry.sections["history"].tokens is None
+    assert ephemeral_live.total_tokens == ephemeral_dry.total_tokens
+
+
+@pytest.mark.asyncio
+async def test_cheap_plan_labels_expensive_sections_unknown_not_zero():
+    cm = _make_cm(
+        memories_result="[Memory 1] not fetched",
+        rag_result="[Document A] not fetched",
+    )
+    plan = await cm.build_context_plan(
+        query="explain the phoenix migration",
+        constitution="C",
+        mode=ContextBuildMode.DRY_RUN,
+        measure_expensive_sections=False,
+    )
+
+    for name in ("memories", "rag"):
+        assert plan.sections[name].status is SectionStatus.UNKNOWN
+        assert plan.sections[name].tokens is None
+        assert name not in plan.budget_summary["finalized_sections"]
+    assert plan.measurement_complete is False
+    cm.memory_manager.retrieve_memories.assert_not_called()
+    cm.context_builder.retrieve_context.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_live_dry_plan_equivalence_for_doctrine_reflection_and_episodes():
+    from collections import OrderedDict
+
+    history = [{"role": "user", "content": f"m{i}"} for i in range(25)]
+    cm = _make_cm(
+        history=history,
+        injected_clauses=["KESTREL_CONSTITUTION", "TORTOISE_DOCTRINE.md"],
+    )
+    cm.consolidator = MagicMock()
+    episodes = [
+        {"title": "T", "timespan": "x", "summary": "s", "emotional_arc": "a"}
+    ]
+    cm.context_builder.get_episodes_for_context = AsyncMock(
+        return_value=episodes
+    )
+    cm.context_builder.format_episodes_for_context = MagicMock(
+        return_value="--- CONVERSATION EPISODES ---\nblock\n--- END EPISODES ---"
+    )
+
+    _, dry = await _build_live_dry_plans(
+        cm,
+        reflection_guidance=["retain provenance"],
+        system_prompt_addendum="CANARY-DIRECTIVE",
+        system_prompt_budget_bytes=10_000,
+        anchored_doctrine=OrderedDict(
+            {"TORTOISE_DOCTRINE.md": "body"}
+        ),
+    )
+    assert dry.sections["episodes"].status is SectionStatus.INCLUDED
+    assert dry.assembly.episode_count == 1
+    assert "ACTIVE REFLECTION GUIDANCE" in dry.assembly.system_prompt
+    assert "--- END GUIDANCE ---" in dry.assembly.system_prompt
+    assert "CANARY-DIRECTIVE" in dry.assembly.system_prompt
+    assert "system_prompt_addendum" in dry.sections["system"].provenance
+    assert "reflection_guidance" in dry.sections["system"].provenance
+    assert (
+        "anchored_doctrine:TORTOISE_DOCTRINE.md"
+        in dry.sections["system"].provenance
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_dry_plan_equivalence_for_doctrine_addendum_cap_exclusions():
+    """Late optional sections obey the same byte cap in both plan modes."""
+
+    from collections import OrderedDict
+
+    history = [{"role": "user", "content": f"m{i}"} for i in range(25)]
+    cm = _make_cm(history=history)
+    cm.consolidator = MagicMock()
+    cm.context_builder.get_episodes_for_context = AsyncMock(
+        return_value=[
+            {
+                "title": "T",
+                "timespan": "x",
+                "summary": "long episode summary",
+                "emotional_arc": "a",
+            }
+        ]
+    )
+    cm.context_builder.format_episodes_for_context = MagicMock(
+        return_value="--- CONVERSATION EPISODES ---\nblock\n--- END EPISODES ---"
+    )
+
+    _, dry = await _build_live_dry_plans(
+        cm,
+        reflection_guidance=["this optional guidance cannot fit"],
+        system_prompt_addendum="A",
+        system_prompt_budget_bytes=30,
+        anchored_doctrine=OrderedDict(
+            {"TORTOISE_DOCTRINE.md": "body"}
+        ),
+    )
+
+    assert dry.assembly.system_prompt.endswith("\n\nA")
+    assert "ACTIVE REFLECTION GUIDANCE" not in dry.assembly.system_prompt
+    assert dry.sections["episodes"].status is SectionStatus.EXCLUDED
+    assert any("reflection guidance skipped" in warning for warning in dry.warnings)
+    assert any("episode context skipped" in warning for warning in dry.warnings)
+
+
+@pytest.mark.asyncio
+async def test_live_dry_plan_equivalence_under_lumpy_microcompact_pressure():
+    history = [
+        {
+            "id": index,
+            "role": "tool" if index < 8 else "user",
+            "content": "tool-output-" + ("x" * 400),
+            "created_at": "2026-01-01T00:00:00Z",
+            "metadata": {"session_id": "s1"},
+        }
+        for index in range(8)
+    ]
+    original = [dict(message) for message in history]
+    cm = _make_cm(
+        history=history,
+        format_side_effect=lambda history, max_tokens: list(history)[-3:],
+    )
+    live, dry = await _build_live_dry_plans(cm)
+
+    assert live.microcompacted_tool_results == 3
+    assert live.assembly.formatted_history == dry.assembly.formatted_history
+    assert len(dry.assembly.formatted_history) == 3
+    assert any("History truncated" in warning for warning in dry.warnings)
+    # The planner copied its acquisition input; status reads do not mutate it.
+    assert history == original
+
+
+@pytest.mark.asyncio
+async def test_live_dry_plan_equivalence_for_exact_final_payload_pruning():
+    """Tool/wrapper costs participate in the final history prune."""
+
+    history = [
+        {
+            "id": index,
+            "role": "user",
+            "content": "x" * 4_000,
+            "metadata": {"session_id": "s1"},
+        }
+        for index in range(20)
+    ]
+    cm = _make_cm(history=history)
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "large_schema",
+                "description": "x" * 96_000,
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+    live, dry = await _build_live_dry_plans(cm, tools=tools)
+
+    assert len(dry.assembly.formatted_history) < len(history)
+    assert dry.total_tokens <= dry.total_budget
+    assert any(
+        "Final payload pruning removed" in warning
+        for warning in dry.warnings
+    )
+    assert live.sections["history"].tokens == dry.sections["history"].tokens
+
+
+@pytest.mark.asyncio
+async def test_dry_plan_models_salvage_without_writing_success_or_failure():
+    history = [
+        {
+            "id": index,
+            "role": "user",
+            "content": "x" * 20,
+            "metadata": {"session_id": "s1"},
+        }
+        for index in range(3)
+    ]
+    cm = _make_cm(history=history, format_side_effect=_drop_one)
+    with patch(
+        "kestrel_sovereign.agent.context_manager.is_durable_salvage_enabled",
+        return_value=True,
+    ), patch(
+        "kestrel_sovereign.agent.context_manager.get_pending_count",
+        new=AsyncMock(return_value=0),
+    ) as pending, patch(
+        "kestrel_sovereign.agent.context_manager.salvage_messages",
+        new=AsyncMock(
+            return_value=SimpleNamespace(
+                salvage_id=42,
+                pointer_only_terminal=True,
+            )
+        ),
+    ) as salvage:
+        live, dry = await _build_live_dry_plans(cm)
+        assert dry.salvage_requirement is not None
+        assert dry.to_breakdown()["salvage"]["status"] == (
+            "required_not_committed"
+        )
+        pending.assert_not_awaited()
+        salvage.assert_not_awaited()
+
+        result = await cm.build_context(
+            query="explain the phoenix migration",
+            constitution="C",
+        )
+        assert result.degraded_mode is False
+        salvage.assert_awaited_once()
+
+    failing_cm = _make_cm(history=history, format_side_effect=_drop_one)
+    with patch(
+        "kestrel_sovereign.agent.context_manager.is_durable_salvage_enabled",
+        return_value=True,
+    ), patch(
+        "kestrel_sovereign.agent.context_manager.get_pending_count",
+        new=AsyncMock(return_value=0),
+    ), patch(
+        "kestrel_sovereign.agent.context_manager.salvage_messages",
+        new=AsyncMock(side_effect=SalvageWriteError("disk full")),
+    ) as failing_salvage:
+        _, dry_failure = await _build_live_dry_plans(failing_cm)
+        assert dry_failure.salvage_requirement is not None
+        failing_salvage.assert_not_awaited()
+        failed = await failing_cm.build_context(
+            query="explain the phoenix migration",
+            constitution="C",
+        )
+        assert failed.degraded_mode is True

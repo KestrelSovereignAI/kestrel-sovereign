@@ -18,15 +18,15 @@ ARCHITECTURE_INDEX = ARCHITECTURE_DIR / "README.md"
 INVENTORY_PATH = PROJECT_ROOT / "KESTREL_FEATURES.md"
 
 REQUIRED_OWNERS = {
-    "Production section ordering, retrieval gates, elastic allocation, pruning, and degraded mode": (
+    "Typed live/dry build plan, section ordering, retrieval gates, elastic allocation, pruning, degraded mode, and side-effect commit": (
         "[`kestrel_sovereign/agent/context_manager.py`]"
         "(../../kestrel_sovereign/agent/context_manager.py)"
     ),
-    "System construction, history rendering, token measurement, and diagnostic breakdown": (
+    "System-construction and history-rendering primitives; legacy measurement adapter": (
         "[`kestrel_sovereign/agent/context_builder.py`]"
         "(../../kestrel_sovereign/agent/context_builder.py)"
     ),
-    "Shared section vocabulary, rendered-message emission, wrappers, and lumpy-anchor primitives": (
+    "Typed plan/section results, rendered-message emission, wrappers, lumpy anchor, microcompaction, and prune-span primitives": (
         "[`kestrel_sovereign/agent/context_stages.py`]"
         "(../../kestrel_sovereign/agent/context_stages.py)"
     ),
@@ -147,8 +147,8 @@ def test_status_vocabulary_and_runtime_ownership_are_structural_contracts():
             "configuration, feature flag, or data shape."
         ),
         "**Diagnostic**": (
-            "Observes or estimates runtime state; it is not proof of the exact "
-            "provider payload or production decision path."
+            "Observes or estimates runtime state; it is not proof of "
+            "provider-native payload framing or committed side effects."
         ),
         "**Aspirational**": (
             "Design intent that is not a current runtime guarantee."
@@ -243,20 +243,20 @@ def test_provider_and_diagnostic_sections_preserve_current_limitations():
     honesty = _section(text, "Honesty boundary: issue #2534")
     normalized_diagnostics = _squash(diagnostics)
     normalized_honesty = _squash(honesty)
-    assert "up to **10,000** stored rows" in normalized_diagnostics
-    assert "production turn's latest-50 preload" in normalized_diagnostics
+    assert "same latest **50** eligible rows" in normalized_diagnostics
+    assert "`unknown` or `skipped` with no token value" in normalized_diagnostics
+    assert "production relevance gates" in normalized_diagnostics
+    assert "final prune decisions" in normalized_diagnostics
     assert "`silently_pruned_path_active` is derived" in normalized_diagnostics
     assert "not observation that a particular turn" in normalized_diagnostics
-    assert "Issue #2534" in normalized_honesty
-    assert "remains open" in normalized_honesty
-    assert "neither mode is an exact dry-run" in normalized_honesty
-    assert "up to 10,000 stored rows" in normalized_honesty
-    assert "latest 50 eligible entries" in normalized_honesty
-    assert "planning signal, not a receipt" in normalized_honesty
-    assert "does not change or close" in normalized_honesty
-    assert not re.search(
-        r"(?im)^\s*(?:closes|fixes|resolves)\s+#2534\b",
-        text,
+    assert "`ContextManager.build_context_plan()` is the single context coordinator" in (
+        normalized_honesty
+    )
+    assert "renders the same plan in dry-run mode" in normalized_honesty
+    assert "reports the write that a live turn would require" in normalized_honesty
+    assert "Provider-native framing" in normalized_honesty
+    assert "cheap `full=false` response is explicitly incomplete" in (
+        normalized_honesty
     )
 
 

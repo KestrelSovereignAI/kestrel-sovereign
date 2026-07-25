@@ -1,8 +1,9 @@
 """Agent invoke and streaming endpoints."""
 from collections import defaultdict
+from dataclasses import dataclass
 from fastapi import APIRouter, Depends, HTTPException, Request, Query, UploadFile, File
 from fastapi.responses import StreamingResponse
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 import asyncio
 import json
 import logging
@@ -1043,40 +1044,239 @@ async def get_context_status(
     return await compute_context_status(get_agent(request), session_id, full=full)
 
 
+@dataclass
+class _ContextStatusMeasurement:
+    """Data acquired for context-status before UI/route-cap shaping."""
+
+    history: List[Dict[str, Any]]
+    model_identity: Dict[str, Optional[str]]
+    current_model: str
+    context_limit: int
+    breakdown: Dict[str, Any]
+
+
+async def _acquire_context_status_measurement(
+    agent: Any,
+    session_id: str,
+    *,
+    full: bool,
+) -> _ContextStatusMeasurement:
+    """Acquire one dry-run production plan for a session."""
+
+    from kestrel_sovereign.agent.token_counter import get_token_counter
+    from kestrel_sovereign.agent.context_manager import CONTEXT_HISTORY_LIMIT
+
+    privacy_agent = getattr(agent, "privacy_agent", None)
+    history_reader = getattr(
+        privacy_agent, "get_conversation_history", None
+    )
+    if (
+        callable(history_reader)
+        and not type(privacy_agent).__module__.startswith("unittest.mock")
+    ):
+        # This is the live turn's acquisition path. It is load-bearing for
+        # ISOLATED/EPHEMERAL buffers, which do not live in persistent storage.
+        history = await history_reader(
+            limit=CONTEXT_HISTORY_LIMIT,
+            session_id=session_id,
+        )
+    else:
+        # Compatibility for partial endpoint fixtures and older hosts.
+        history = await agent.storage.get_conversation_history(
+            limit=CONTEXT_HISTORY_LIMIT,
+            session_id=session_id,
+        )
+    model_identity = _latest_assistant_model_identity(history)
+    current_model = model_identity["context_model"] or LEGACY_CONTEXT_MODEL
+    counter = get_token_counter(current_model)
+    context_limit = counter.get_context_limit()
+
+    constitution_text = ""
+    get_const = getattr(agent, "get_constitution", None)
+    if callable(get_const):
+        try:
+            got = get_const()
+            constitution_text = await got if hasattr(got, "__await__") else got
+            constitution_text = constitution_text or ""
+        except Exception as exc:
+            logger.debug("constitution fetch failed for breakdown: %s", exc)
+
+    tool_schemas: Optional[List[Dict[str, Any]]] = None
+    build_tools = getattr(agent, "_build_all_tools", None)
+    if not callable(build_tools):
+        registry = getattr(agent, "tool_registry", None)
+        build_tools = getattr(registry, "_build_all_tools", None)
+    if callable(build_tools):
+        try:
+            tool_schemas = list(build_tools())
+        except Exception as exc:
+            logger.debug("tool schema fetch failed for breakdown: %s", exc)
+
+    query = ""
+    try:
+        from kestrel_sovereign.agent.context_builder import (
+            extract_raw_user_content,
+        )
+
+        for row in reversed(history):
+            if (row.get("role") or "").lower() == "user":
+                query = extract_raw_user_content(row.get("content", "") or "")
+                break
+    except Exception as exc:
+        logger.debug("last-user-query lookup failed for breakdown: %s", exc)
+
+    context_manager = getattr(agent, "context_manager", None)
+    plan_builder = getattr(context_manager, "build_context_plan", None)
+    is_real_plan_builder = (
+        callable(plan_builder)
+        and not type(context_manager).__module__.startswith("unittest.mock")
+    )
+    if is_real_plan_builder:
+        from kestrel_sovereign.agent.context_stages import ContextBuildMode
+
+        privacy_mode = getattr(agent, "_privacy_mode", None)
+        if privacy_mode is None:
+            privacy_agent = getattr(agent, "privacy_agent", None)
+            privacy_mode = getattr(privacy_agent, "privacy_mode", "NORMAL")
+        privacy_mode = getattr(
+            privacy_mode, "name", getattr(privacy_mode, "value", privacy_mode)
+        )
+
+        reflection_guidance = None
+        features = getattr(agent, "features", None)
+        reflection_feature = (
+            features.get("ReflectionFeature")
+            if isinstance(features, dict)
+            else None
+        )
+        if reflection_feature is not None:
+            getter = getattr(reflection_feature, "get_active_guidance", None)
+            if callable(getter):
+                try:
+                    reflection_guidance = await getter()
+                except Exception as exc:
+                    logger.debug(
+                        "reflection guidance fetch failed for breakdown: %s",
+                        exc,
+                    )
+
+        plan = await plan_builder(
+            query=query,
+            constitution=constitution_text,
+            include_briefing=not bool(
+                getattr(agent, "_session_briefed", False)
+            ),
+            include_memories=True,
+            include_rag=True,
+            privacy_mode=str(privacy_mode or "NORMAL").upper(),
+            conversation_history=history,
+            reflection_guidance=reflection_guidance,
+            tools=tool_schemas,
+            mode=ContextBuildMode.DRY_RUN,
+            measure_expensive_sections=full,
+        )
+        breakdown = plan.to_breakdown()
+        context_limit = int(breakdown["context_limit"])
+        current_model = str(breakdown.get("model") or current_model)
+    else:
+        # Compatibility for partial/legacy agent test doubles. Production
+        # KestrelAgent always owns ContextManager.build_context_plan.
+        from kestrel_sovereign.agent.context_builder import ContextBuilder
+
+        agent_builder = getattr(agent, "context_builder", None)
+        builder = ContextBuilder(
+            storage=agent.storage,
+            model=current_model,
+            consolidator=getattr(agent_builder, "consolidator", None),
+            agent_data_path=getattr(agent_builder, "agent_data_path", None),
+        )
+        memory_retriever = None
+        if full:
+            from kestrel_sovereign.agent.context_manager import _retrieval_config
+
+            memory_min_score = _retrieval_config().get("memory_min_score")
+            memory_manager = getattr(context_manager, "memory_manager", None)
+            retrieve_memories = getattr(memory_manager, "retrieve_memories", None)
+            if callable(retrieve_memories):
+                async def memory_retriever(
+                    query: str, max_tokens: int
+                ) -> Optional[str]:
+                    return await retrieve_memories(
+                        query=query,
+                        max_tokens=max_tokens,
+                        counter=counter,
+                        read_only=True,
+                        min_score=memory_min_score,
+                    )
+
+        breakdown = await builder.measure_context_breakdown(
+            query=query,
+            history=history,
+            constitution=constitution_text,
+            include_briefing=True,
+            message_count=len(history),
+            tools=tool_schemas,
+            include_rag=full,
+            memory_retriever=memory_retriever,
+        )
+        breakdown.pop("_artifacts", None)
+        for section_name in ("memories", "rag"):
+            row = breakdown.get("sections", {}).get(section_name)
+            if isinstance(row, dict) and (
+                row.get("status") in {"unknown", "skipped"}
+                or row.get("measured") is False
+            ):
+                row["tokens"] = None
+
+    if full and not query:
+        rag_section = breakdown.get("sections", {}).get("rag")
+        if isinstance(rag_section, dict):
+            rag_section["query_used_label"] = (
+                "estimated against latest stored chunks — no recent user "
+                "turn available for query-specific retrieval"
+            )
+
+    return _ContextStatusMeasurement(
+        history=history,
+        model_identity=model_identity,
+        current_model=current_model,
+        context_limit=context_limit,
+        breakdown=breakdown,
+    )
+
+
 async def compute_context_status(
     agent,
     session_id: Optional[str] = None,
     full: bool = False,
 ) -> Dict[str, Any]:
-    """Projected whole-window context status + per-section breakdown.
+    """Render whole-window status from ContextManager's read-only plan.
 
     Single source of truth for BOTH the chat-footer pill (via the HTTP route
     above) AND the agent ``context_status`` tool (#1969). Before this, the tool
-    used a separate cross-session, raw-content token count and drifted from this
-    session-scoped ``measure_context_breakdown`` projection.
+    used a separate cross-session, raw-content token count and drifted from the
+    production context path.
 
     The pill in the chat footer (chat.js) reads ``utilization_percent``
     and renders the ● N msgs · X% indicator. The popup (#1310) reads
-    ``breakdown`` for the layered taxonomy. Both come from a single
-    source of truth: ``ContextBuilder.measure_context_breakdown``
-    (introduced by #1308). The ``breakdown`` field is the entire
-    measurement dict, with Emma's canonical sections (system, tools,
+    ``breakdown`` for the layered taxonomy. Both render the typed,
+    side-effect-free plan from ``ContextManager.build_context_plan``; live
+    turns commit that same plan before rendering it. The ``breakdown`` field
+    contains the canonical sections (system, tools,
     history, episodes, memories, rag, dynamic_context_overhead) plus
     the elastic-budget snapshot from #1309.
 
     Two modes:
 
     - ``full=False`` (default): cheap path for the frequent footer
-      poll. RAG retrieval is skipped; the section is flagged
-      ``skipped=true``. Memories are also off unless the agent supplies
-      a side-effect-free retriever.
-    - ``full=True``: invoked once when the popup opens. RAG is
-      retrieved live; the popup labels it as ``estimated``.
+      poll. Memory/RAG acquisition is omitted and those sections are explicitly
+      ``unknown``/``skipped`` with no token value.
+    - ``full=True``: invoked once when the popup opens. The production
+      relevance gates and retrieval path execute read-only.
     """
     try:
         from kestrel_sovereign.agent.token_counter import get_token_counter
         from kestrel_sovereign.agent.token_budget import RESPONSE_RESERVE
-        from kestrel_sovereign.kestrel_config.constants import MAX_CONVERSATION_HISTORY_LIMIT
 
         # 1. No active session → return an idle shape.  Previously passing
         # session_id=None into get_conversation_history leaked the agent's
@@ -1108,140 +1308,17 @@ async def compute_context_status(
                 "silently_pruned_path_active": False,
             }
 
-        # 2. Get conversation history for the specified session
-        history = await agent.storage.get_conversation_history(
-            limit=MAX_CONVERSATION_HISTORY_LIMIT, session_id=session_id
+        measurement = await _acquire_context_status_measurement(
+            agent,
+            session_id,
+            full=full,
         )
+        history = measurement.history
         message_count = len(history)
-
-        # 3. Budget against the actual model/provider stamped on the latest
-        # assistant turn in this session. This intentionally does not consult
-        # the current dropdown/model preference: a Realtime turn followed by a
-        # text dropdown change must still show Realtime's window until another
-        # assistant turn is written. Legacy/restored rows may have null stamps;
-        # in that case use a neutral placeholder rather than impersonating the
-        # current preference.
-        model_identity = _latest_assistant_model_identity(history)
-        current_model = model_identity["context_model"] or LEGACY_CONTEXT_MODEL
-        counter = get_token_counter(current_model)
-        context_limit = counter.get_context_limit()
-
-        # 4. Run the shared per-section diagnostic projection (A / #1308).
-        # Popup and pill share this computation, but it is not an exact
-        # dry-run of ContextManager's retrieval, elastic, or lumpy-prune path.
-        from kestrel_sovereign.agent.context_builder import ContextBuilder
-        agent_ctx_builder = getattr(agent, 'context_builder', None)
-        ctx_builder = ContextBuilder(
-            storage=agent.storage,
-            model=current_model,
-            consolidator=getattr(agent_ctx_builder, "consolidator", None),
-            agent_data_path=getattr(agent_ctx_builder, "agent_data_path", None),
-        )
-
-        # Constitution and state-of-mind for the measurement match the
-        # production call path. Best-effort fetch — failure here only
-        # affects measurement accuracy, not the pill rendering.
-        constitution_text = ""
-        get_const = getattr(agent, "get_constitution", None)
-        if callable(get_const):
-            try:
-                got = get_const()
-                constitution_text = await got if hasattr(got, "__await__") else got
-                constitution_text = constitution_text or ""
-            except Exception as e:
-                logger.debug(f"constitution fetch failed for breakdown: {e}")
-
-        state_of_mind = None
-        llm_service = getattr(agent, "llm_service", None)
-        if llm_service is not None and hasattr(llm_service, "get_state_of_mind"):
-            try:
-                state_of_mind = llm_service.get_state_of_mind()
-            except Exception as e:
-                logger.debug(f"state_of_mind fetch failed for breakdown: {e}")
-
-        # Tool schemas the agent would send. Best-effort — surfaces the
-        # previously-invisible slice; if the registry isn't reachable,
-        # tool tokens stay at 0 and the popup labels them not-counted.
-        tool_schemas: Optional[List[Dict[str, Any]]] = None
-        registry = getattr(agent, "tool_registry", None)
-        if registry is not None and hasattr(registry, "_build_all_tools"):
-            try:
-                tool_schemas = list(registry._build_all_tools())
-            except Exception as e:
-                logger.debug(f"tool schema fetch failed for breakdown: {e}")
-
-        # When the popup runs the full breakdown (RAG included), use
-        # the most recent user turn as the query so the RAG figure
-        # approximates what the next LLM turn would see (codex round
-        # 1 P2 caught the previous empty-query path overstating
-        # accuracy). When no user turn is available, label the row
-        # so the popup does not pretend the figure is representative.
-        rag_query = ""
-        rag_query_label: Optional[str] = None
-        if full:
-            try:
-                from kestrel_sovereign.agent.context_builder import (
-                    extract_raw_user_content,
-                )
-                for row in reversed(history):
-                    if (row.get("role") or "").lower() == "user":
-                        rag_query = extract_raw_user_content(
-                            row.get("content", "") or ""
-                        )
-                        break
-            except Exception as e:
-                logger.debug(f"last-user-query lookup failed for breakdown: {e}")
-            if not rag_query:
-                rag_query_label = (
-                    "estimated against latest stored chunks — no recent user "
-                    "turn available for query-specific retrieval"
-                )
-
-        memory_retriever = None
-        if full:
-            memory_min_score = None
-            try:
-                from kestrel_sovereign.agent.context_manager import _retrieval_config
-                memory_min_score = _retrieval_config().get("memory_min_score")
-            except Exception as e:
-                logger.debug(f"retrieval config lookup failed for breakdown: {e}")
-            context_manager = getattr(agent, "context_manager", None)
-            memory_manager = getattr(context_manager, "memory_manager", None)
-            retrieve_memories = getattr(memory_manager, "retrieve_memories", None)
-            if callable(retrieve_memories):
-                async def memory_retriever(query: str, max_tokens: int) -> Optional[str]:
-                    return await retrieve_memories(
-                        query=query,
-                        max_tokens=max_tokens,
-                        counter=counter,
-                        read_only=True,
-                        min_score=memory_min_score,
-                    )
-
-        breakdown = await ctx_builder.measure_context_breakdown(
-            query=rag_query,
-            history=history,
-            constitution=constitution_text,
-            include_briefing=True,
-            message_count=message_count,
-            tools=tool_schemas,
-            state_of_mind=state_of_mind,
-            include_rag=full,
-            memory_retriever=memory_retriever,
-        )
-
-        # Drop the internal artifacts blob — it's the assembled bytes,
-        # only useful to ``build_full_context``; the popup doesn't need
-        # the bodies, only the per-section figures.
-        breakdown.pop("_artifacts", None)
-
-        # Attach the "no current query" annotation when RAG was run
-        # without one; the popup renders it under the RAG row so the
-        # operator can tell estimated-with-query from estimated-without.
-        if full and rag_query_label and "sections" in breakdown:
-            rag_section = breakdown["sections"].get("rag")
-            if isinstance(rag_section, dict):
-                rag_section["query_used_label"] = rag_query_label
+        model_identity = measurement.model_identity
+        current_model = measurement.current_model
+        context_limit = measurement.context_limit
+        breakdown = measurement.breakdown
 
         # C / #1311: attach salvage-state counts so the popup can
         # render the layered taxonomy (pointer-only / pending-fold /
@@ -1396,7 +1473,12 @@ async def compute_context_status(
                     # remains a projection. The UI uses this flag
                     # to label the pill / popup honestly (codex round 1
                     # P2 on #1503).
-                    "includes_rag": bool(full),
+                    "includes_rag": bool(full) and (
+                        breakdown.get("sections", {})
+                        .get("rag", {})
+                        .get("status")
+                        not in {"unknown", "skipped"}
+                    ),
                 }
         except Exception as e:
             # Catalog probe must never break the endpoint — degrade to

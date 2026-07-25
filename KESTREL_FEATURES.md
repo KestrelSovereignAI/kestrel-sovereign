@@ -105,14 +105,15 @@ audience-specific derivative:
 
 - A production turn preloads at most the latest **50** eligible entries from
   the active session before retrieval, budgeting, and lumpy history selection.
-- `context_status` and `GET /api/agent/context-status` are diagnostic
-  projections, not exact prompt traces. Diagnostics may inspect up to 10,000
-  stored rows; even `full=true` does not reproduce production's latest-50
-  preload, every retrieval gate, elastic borrowing, lumpy pruning, or provider
-  framing.
-- [Issue #2534](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2534)
-  remains open for that runtime drift. Documentation work does not implement
-  its runtime fix and does not change or close the issue.
+- Production and `GET /api/agent/context-status?full=true` use the same typed
+  `ContextManager` build plan over that latest-50 input. The dry-run executes
+  production relevance gates, elastic finalization, lumpy anchoring,
+  microcompaction, wrapper accounting, and prune decisions without committing
+  access records or salvage writes.
+- The cheap `full=false` status deliberately omits memory/RAG acquisition and
+  reports those sections as `unknown`/`skipped`, never as measured zero.
+  Provider-native framing and stateful provider-thread occupancy remain
+  separate from the Kestrel context plan.
 - Default lumpy pruning omits older history from the provider window while
   retaining the source rows; it does not create an automatic durable summary.
   Automatic durable salvage is disabled by default. Its feature-flagged path is
@@ -311,11 +312,11 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 - Source: [`kestrel_sovereign/features/context/feature.py`](kestrel_sovereign/features/context/feature.py)
 - Enablement state: `enabled`
-- `context_status` is a cheap diagnostic projection shared with
-  `GET /api/agent/context-status`; it is not an exact trace of the production
-  retrieval/pruning path. The endpoint's `full=true` mode adds read-only live
-  retrieval but retains the
-  [documented #2534 limitation](docs/architecture/CONTEXT_SYSTEM_DESIGN.md#honesty-boundary-issue-2534).
+- `context_status` is the cheap dry-run view of the same typed
+  `ContextManager` plan used by `GET /api/agent/context-status` and
+  production turns. Cheap mode marks omitted memory/RAG sections unknown;
+  `full=true` executes the production retrieval and pruning policy read-only.
+  Provider-native framing remains outside the Kestrel plan.
 
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|

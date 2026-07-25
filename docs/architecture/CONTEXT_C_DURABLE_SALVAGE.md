@@ -141,13 +141,12 @@ That is meaningful implementation evidence, but it does **not** prove:
 - that a `SignalDispatcher` owns background work;
 - that every provider and restart topology has completed recovery testing;
 - that the Context feature's manual tools are the automatic state machine;
-- that context-status is an exact view of the production prune; or
 - that the broader UX and operational lifecycle in this design is complete.
 
 `GET /api/agent/context-status` reports best-effort salvage counts and whether
-the silent-prune path is active, but its measurement remains a projection.
-The canonical contract documents the limitation and links open
-[#2534](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2534).
+the silent-prune path is active. Its `full=true` dry-run uses the production
+context plan and reports required salvage without committing a marker; the
+cheap default explicitly leaves expensive sections unknown.
 
 ## Promotion criteria
 

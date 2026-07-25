@@ -42,6 +42,7 @@ from kestrel_sovereign.a2a.stores import (
 )
 # PostgreSQL stores imported conditionally when pg_pool is available
 from kestrel_sovereign.agent import ContextBuilder, ContextManager
+from kestrel_sovereign.agent.context_manager import CONTEXT_HISTORY_LIMIT
 from kestrel_sovereign.agent.boot import (
     AgentBootError,
     BootContext,
@@ -4680,7 +4681,10 @@ Expected Duration: {expected_duration}
             )
 
         try:
-            history = await self.privacy_agent.get_conversation_history(limit=50, session_id=session_id)
+            history = await self.privacy_agent.get_conversation_history(
+                limit=CONTEXT_HISTORY_LIMIT,
+                session_id=session_id,
+            )
             logging.debug(
                 "Conversation history loaded: count=%d session_scoped=%s",
                 len(history),
@@ -4717,6 +4721,9 @@ Expected Duration: {expected_duration}
             except Exception as e:
                 logging.warning(f"Failed to fetch reflection guidance: {e}")
 
+        # Resolve the exact schemas before planning so wrapper/tool accounting
+        # and final pruning describe the same payload sent below.
+        feature_tools = self._build_all_tools()
         context_result = await self.context_manager.build_context(
             query=user_input,
             constitution=constitution,
@@ -4729,6 +4736,7 @@ Expected Duration: {expected_duration}
             system_prompt_addendum=system_prompt_addendum,
             system_prompt_budget_bytes=system_prompt_budget_bytes,
             anchored_doctrine=anchored_doctrine,
+            tools=feature_tools,
         )
 
         # B / #1309 + C / #1311: degraded-mode fail-closed.
@@ -4841,9 +4849,8 @@ Expected Duration: {expected_duration}
         if not effective_model:
             effective_model = await self.check_solvency()
 
-        # Build feature tools for the orchestrator
-        # Includes feature dispatch tools + any direct tools from explored features
-        feature_tools = self._build_all_tools()
+        # ``feature_tools`` was snapshotted before context planning so the
+        # plan and provider call cannot observe different registry states.
 
         # Log tool availability via A2A ObservabilityStore
         tool_names = [t['function']['name'] for t in feature_tools] if feature_tools else []

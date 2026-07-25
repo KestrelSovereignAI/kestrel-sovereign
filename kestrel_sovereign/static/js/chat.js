@@ -3486,8 +3486,12 @@ function renderContextBreakdown(status) {
 
     // ``sectionRow`` ``name`` is hard-coded by callers; ``extras`` is
     // assembled from safe badge() output + escaped fragments; ``warning``
-    // is renderer-supplied static text. Tokens are coerced to Number.
-    const sectionRow = (name, tokens, extras = '', warning = '') => `
+    // is renderer-supplied static text. Null tokens stay visibly unmeasured.
+    const sectionRow = (name, tokens, extras = '', warning = '') => {
+        const measured = tokens !== null && tokens !== undefined;
+        const tokenLabel = measured ? fmt(tokens) : '—';
+        const percentLabel = measured ? `(${pct(tokens)}%)` : '(not measured)';
+        return `
         <div style="display:flex; justify-content:space-between; align-items:center; padding:0.4rem 0; border-bottom:1px solid var(--border-color);">
             <div>
                 <span style="font-weight:500">${name}</span>
@@ -3495,10 +3499,11 @@ function renderContextBreakdown(status) {
                 ${warning ? `<div style="font-size:0.7rem;color:#f97316;margin-top:0.15rem">${_esc(warning)}</div>` : ''}
             </div>
             <div style="font-variant-numeric: tabular-nums; color: var(--text-secondary);">
-                <span style="color:var(--text-primary); font-weight:500">${fmt(tokens)}</span>
-                <span style="margin-left:0.5rem; font-size:0.75rem">(${pct(tokens)}%)</span>
+                <span style="color:var(--text-primary); font-weight:500">${tokenLabel}</span>
+                <span style="margin-left:0.5rem; font-size:0.75rem">${percentLabel}</span>
             </div>
         </div>`;
+    };
 
     // System sub-rows. Mandatory vs optional split per Emma's
     // taxonomy: anything in MANDATORY_SYSTEM_SUBSECTIONS (from B) is
@@ -3589,16 +3594,29 @@ function renderContextBreakdown(status) {
         : '';
 
     const mem = sections.memories || {};
-    const memBadge = mem.wired ? '' : badge('not counted', '#64748b');
+    const memBadge = mem.status === 'unknown'
+        ? badge('unknown (cheap poll)', '#64748b')
+        : (mem.status === 'skipped'
+            ? badge('skipped', '#64748b')
+            : (mem.wired ? '' : badge('not counted', '#64748b')));
     const memExcluded = mem.excluded ? badge('excluded — over budget', '#dc2626') : '';
-    const memExtras = (mem.wired
+    const memExtras = (mem.status === 'unknown' || mem.status === 'skipped'
+        ? memBadge
+        : mem.wired
         ? `<span style="font-size:0.75rem;color:var(--text-secondary)"> · ${mem.count || 0} memories</span>`
         : memBadge) + memExcluded;
 
     const rag = sections.rag || {};
-    const ragBadge = rag.skipped
-        ? badge('skipped (cheap poll)', '#64748b')
-        : (rag.excluded ? badge('excluded — over budget', '#dc2626') : badge('estimated', '#0891b2'));
+    let ragBadge;
+    if (rag.status === 'unknown') {
+        ragBadge = badge('unknown (cheap poll)', '#64748b');
+    } else if (rag.skipped) {
+        ragBadge = badge('skipped', '#64748b');
+    } else if (rag.excluded) {
+        ragBadge = badge('excluded — over budget', '#dc2626');
+    } else {
+        ragBadge = badge('estimated', '#0891b2');
+    }
     // Codex round 1 P2 caught the empty-query gap: the popup's
     // ``full=true`` call runs RAG against the last user turn (so the
     // figure matches what the next LLM turn would see). If we couldn't
@@ -3620,10 +3638,10 @@ function renderContextBreakdown(status) {
         ${sectionRow('System / Governance', sys.tokens || 0)}
         ${sysSubs}
         ${sectionRow('Tools', tools.tokens || 0, toolsBadge + (tools.count ? `<span style="font-size:0.75rem;color:var(--text-secondary)"> · ${tools.count} ${tools.count === 1 ? 'tool' : 'tools'}</span>` : ''))}
-        ${sectionRow('Conversation', hist.tokens || 0, histExtrasFull, histWarning)}
-        ${sectionRow('Memories — episodes', ep.tokens || 0, epExtras)}
-        ${sectionRow('Memories — retrieved', mem.tokens || 0, memExtras)}
-        ${sectionRow('Retrieval / RAG', rag.tokens || 0, ragExtras)}
+        ${sectionRow('Conversation', hist.tokens, histExtrasFull, histWarning)}
+        ${sectionRow('Memories — episodes', ep.tokens, epExtras)}
+        ${sectionRow('Memories — retrieved', mem.tokens, memExtras)}
+        ${sectionRow('Retrieval / RAG', rag.tokens, ragExtras)}
         ${overheadRow}
     `;
 

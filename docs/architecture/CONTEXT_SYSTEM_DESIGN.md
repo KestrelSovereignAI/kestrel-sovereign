@@ -33,7 +33,7 @@ This page uses four labels deliberately:
 |---|---|
 | **Shipped** | Runs on the normal production turn path. |
 | **Conditional** | Implemented, but only runs for a named route, privacy mode, configuration, feature flag, or data shape. |
-| **Diagnostic** | Observes or estimates runtime state; it is not proof of the exact provider payload or production decision path. |
+| **Diagnostic** | Observes or estimates runtime state; it is not proof of provider-native payload framing or committed side effects. |
 | **Aspirational** | Design intent that is not a current runtime guarantee. |
 
 ## Contract at a glance
@@ -52,18 +52,18 @@ canonical session history
     -> provider adapter transport
 ```
 
-The current owner of the live coordinator is
-[`ContextManager.build_context()`](../../kestrel_sovereign/agent/context_manager.py).
-The HTTP and tool diagnostics share section builders with that path, but do not
-run the same coordinator and therefore must not be treated as an exact trace.
+The single coordinator is
+[`ContextManager.build_context_plan()`](../../kestrel_sovereign/agent/context_manager.py).
+`build_context()` commits the plan's declared side effects for a live turn;
+HTTP/tool diagnostics render it without those writes.
 
 ## Ownership and source anchors
 
 | Responsibility | Current owner |
 |---|---|
-| Production section ordering, retrieval gates, elastic allocation, pruning, and degraded mode | [`kestrel_sovereign/agent/context_manager.py`](../../kestrel_sovereign/agent/context_manager.py) |
-| System construction, history rendering, token measurement, and diagnostic breakdown | [`kestrel_sovereign/agent/context_builder.py`](../../kestrel_sovereign/agent/context_builder.py) |
-| Shared section vocabulary, rendered-message emission, wrappers, and lumpy-anchor primitives | [`kestrel_sovereign/agent/context_stages.py`](../../kestrel_sovereign/agent/context_stages.py) |
+| Typed live/dry build plan, section ordering, retrieval gates, elastic allocation, pruning, degraded mode, and side-effect commit | [`kestrel_sovereign/agent/context_manager.py`](../../kestrel_sovereign/agent/context_manager.py) |
+| System-construction and history-rendering primitives; legacy measurement adapter | [`kestrel_sovereign/agent/context_builder.py`](../../kestrel_sovereign/agent/context_builder.py) |
+| Typed plan/section results, rendered-message emission, wrappers, lumpy anchor, microcompaction, and prune-span primitives | [`kestrel_sovereign/agent/context_stages.py`](../../kestrel_sovereign/agent/context_stages.py) |
 | Fixed, adaptive, and production elastic budgets; response reserve | [`kestrel_sovereign/agent/token_budget.py`](../../kestrel_sovereign/agent/token_budget.py) |
 | Route/model context limits and token counting | [`kestrel_sovereign/agent/token_counter.py`](../../kestrel_sovereign/agent/token_counter.py) and [`kestrel_sovereign/llm/model_catalog.py`](../../kestrel_sovereign/llm/model_catalog.py) |
 | Canonical and rendered conversation persistence | [`kestrel_sovereign/storage/async_conversation_store.py`](../../kestrel_sovereign/storage/async_conversation_store.py) |
@@ -72,9 +72,9 @@ run the same coordinator and therefore must not be treated as an exact trace.
 | `/api/agent/context-status` and shared status computation | [`kestrel_sovereign/endpoints/agent.py`](../../kestrel_sovereign/endpoints/agent.py) |
 | Context tools and manual context-management operations | [`kestrel_sovereign/features/context/feature.py`](../../kestrel_sovereign/features/context/feature.py) |
 
-`context_stages` is the shared vocabulary, not a claim that production and
-measurement are identical. `context_manager` coordinates production;
-`ContextBuilder.measure_context_breakdown()` coordinates the projection.
+`context_manager` coordinates both production and dry-run status plans.
+`ContextBuilder.measure_context_breakdown()` remains only as a compatibility
+adapter over that coordinator.
 
 ## The shipped production turn
 
@@ -320,40 +320,40 @@ and the routing contract in
 
 - Without an active session, it returns an idle status and does not query
   storage.
-- For an active session, diagnostics may load up to **10,000** stored rows,
-  unlike the production turn's latest-50 preload.
-- The default (`full=false`) is a cheap projection. It measures that diagnostic
-  history set, stable sections, and best-effort tool schemas, but intentionally
-  skips live memory and RAG retrieval.
+- For an active session, diagnostics load the same latest **50** eligible rows
+  as the production turn.
+- The default (`full=false`) is a cheap, deliberately incomplete plan. It
+  measures stable sections, history, pruning, and best-effort tool schemas but
+  intentionally omits memory and RAG acquisition; those rows are reported as
+  `unknown` or `skipped` with no token value.
 - `full=true` uses the latest stored canonical user turn as the retrieval query
-  and performs read-only memory and RAG lookup. If no stored user query exists,
-  the RAG row is explicitly labeled as an estimate without a representative
-  query.
+  and executes the production relevance gates, read-only memory/RAG lookup,
+  elastic finalization, lumpy anchor, microcompaction, wrapper accounting, and
+  final prune decisions. If no stored user query exists, the RAG row is
+  explicitly labeled as lacking a representative query.
 
 The response includes the resolved model/route identity, context limit,
 response reserve, total budget, measured section breakdown, utilization and
 warning status, route-cap details, salvage counters, and—when available—the
-separate Codex thread occupancy. Tool-schema and provider-framing counts remain
-best-effort estimates. `silently_pruned_path_active` is derived from whether
-the durable-salvage feature flag is enabled; it is not observation that a
-particular turn did or did not create salvage evidence.
+separate Codex thread occupancy. Tool-schema counts remain best-effort
+estimates; provider framing is outside the plan. `silently_pruned_path_active`
+is derived from whether the durable-salvage feature flag is enabled; it is not
+observation that a particular turn did or did not create salvage evidence.
 
 ### Honesty boundary: issue #2534
 
-> **Diagnostic limitation:** neither mode is an exact dry-run of
-> `ContextManager.build_context()`.
-> [Issue #2534](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2534)
-> remains open and tracks the remaining drift. Measurement uses its own non-elastic adaptive
-> coordinator and does not execute the production lumpy-anchor/safety-prune
-> path. It may consider up to 10,000 stored rows while production preloads only
-> the latest 50 eligible entries. Its full retrieval path also does not
-> reproduce every production trivial-turn, relevance, and configured RAG-floor
-> gate. Therefore `context-status` is a planning signal, not a receipt for the
-> exact bytes sent to a provider.
+`ContextManager.build_context_plan()` is the single context coordinator.
+Production commits the plan's declared access/salvage side effects and renders
+it; `context-status?full=true` renders the same plan in dry-run mode without
+those writes. Dry-run salvage output reports the write that a live turn would
+require rather than pretending it committed evidence.
 
-Shared wrappers and counters reduce drift; they do not erase this coordinator
-difference. This documentation issue intentionally does not change or close
-#2534.
+This parity covers Kestrel's generic system prompt, history messages, dynamic
+retrieval block, tool-schema estimate, and prune decisions. Provider-native
+framing, stateful provider thread occupancy, and content transformations remain
+owned by the selected adapter and are not represented as Kestrel context-plan
+bytes. The cheap `full=false` response is explicitly incomplete as described
+above.
 
 ## Context feature and tool surface
 
