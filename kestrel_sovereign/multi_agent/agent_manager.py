@@ -459,10 +459,13 @@ class AgentManager:
         """Authorize the sole hosted unsigned compatibility path.
 
         A pre-ceremony sender has no cryptographic signing DID, so accepting
-        its ``metadata.sender`` is safe only when it is the exact current
-        manager name of a loaded local agent, that agent is incapable of hybrid
-        signing, and the recipient's immutable directory policy authorizes the
-        sender's stable agent id.  This method is called while
+        its ``metadata.sender`` is safe only when it is the unambiguous current
+        *published display identity* of a loaded local agent, that agent is
+        incapable of hybrid signing, and the recipient's immutable directory
+        policy authorizes the sender's stable agent id. The display identity is
+        resolved back through the manager's immutable routing mapping before
+        authorization; an unsigned caller never chooses a routing key. This
+        method is called while
         :meth:`a2a_lifecycle_lease` is held; registration/removal/replacement
         therefore cannot change either endpoint or the policy during the
         directory await.
@@ -474,14 +477,27 @@ class AgentManager:
             or self.a2a_hosted_policy_for(recipient) is not policy
         ):
             return False
-        sender = self._agents.get(claimed_sender)
-        if sender is None or sender is recipient:
+        matches: list[tuple[str, KestrelAgent, str]] = []
+        for routing_name, candidate in self._agents.items():
+            sender_id = _loaded_agent_did(candidate)
+            if (
+                not isinstance(sender_id, str)
+                or self._agent_names.get(sender_id) != routing_name
+                or self._agents.get(routing_name) is not candidate
+                or self._published_a2a_display_identity(candidate) != claimed_sender
+            ):
+                continue
+            matches.append((routing_name, candidate, sender_id))
+
+        # Display names are mutable and not unique by construction. An
+        # unsigned compatibility sender may be accepted only when the current
+        # hosted fleet has exactly one matching published display identity.
+        if len(matches) != 1:
             return False
-        sender_id = _loaded_agent_did(sender)
-        if (
-            not isinstance(sender_id, str)
-            or self._agent_names.get(sender_id) != claimed_sender
-            or self._agents.get(claimed_sender) is not sender
+        routing_name, sender, sender_id = matches[0]
+        if sender is recipient or (
+            self._agent_names.get(sender_id) != routing_name
+            or self._agents.get(routing_name) is not sender
         ):
             return False
 
@@ -518,6 +534,28 @@ class AgentManager:
             )
             return False
         return result is True
+
+    @staticmethod
+    def _published_a2a_display_identity(agent: object) -> Optional[str]:
+        """Return the live display identity published by ``/api/agents``.
+
+        Agent cards (and therefore ``PeersFeature``) expose the agent's live
+        effective name, not the manager's immutable routing key. Keep this
+        lookup synchronous and in-memory so it is safe under the A2A lifecycle
+        lease and cannot race a storage read with unpublication. Test doubles
+        may not implement ``resolve_effective_name``; their live ``_agent_name``
+        remains the equivalent published identity.
+        """
+
+        resolver = getattr(agent, "resolve_effective_name", None)
+        if callable(resolver):
+            try:
+                value = resolver(default=None)
+            except Exception:  # noqa: BLE001 - fail closed at identity boundary
+                return None
+        else:
+            value = getattr(agent, "_agent_name", None)
+        return value if isinstance(value, str) and value.strip() else None
 
     def _revoke_a2a_hosted_policy(self, recipient: object) -> None:
         recipient_id = _loaded_agent_did(recipient)
@@ -1264,8 +1302,9 @@ class AgentManager:
         Unlike :meth:`list_agents`, this includes ``autostart=false`` agents.
         A host-owned scheduler needs that complete map to wake a cold target
         after it atomically claims a due row in the shared PostgreSQL database.
-        Loaded agents provide their in-memory identity; cold identities are read
-        from the agent's local identity database without initializing the agent.
+        Loaded agents provide their in-memory identity. Explicitly cold
+        identities use an immutable local read; autostart identities instead
+        use the same read/write WAL-recovery lookup as imminent initialization.
         """
         mapping: dict[str, tuple[str, LocalAgentConfig]] = {}
         self._cold_scheduler_identity_failures = []
@@ -1278,9 +1317,20 @@ class AgentManager:
             if not isinstance(agent_id, str) or not agent_id:
                 try:
                     resolved_dir = agent_config.resolve_data_dir(self._base_data_dir)
+                    # An autostart entry is about to open this exact local
+                    # identity database during normal startup. Let shared
+                    # scheduler preflight take that same recovery path, so an
+                    # interrupted WAL is replayed before scheduler authority is
+                    # seeded. Explicitly cold entries remain immutable-read-only
+                    # until a scheduler cold wake is authorized to initialize.
+                    lookup_mode = (
+                        _AgentDIDLookupMode.INITIALIZATION
+                        if agent_config.autostart
+                        else _AgentDIDLookupMode.COLD_READ_ONLY
+                    )
                     agent_id = await _get_agent_did(
                         str(resolved_dir),
-                        mode=_AgentDIDLookupMode.COLD_READ_ONLY,
+                        mode=lookup_mode,
                     )
                 except Exception as exc:
                     # An autostart agent may already have failed its independent

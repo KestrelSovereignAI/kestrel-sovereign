@@ -1455,7 +1455,15 @@ class KestrelAgent(
             # PostgreSQL backend - reuse shared pool if available
             if self.pg_pool:
                 from kestrel_sovereign.storage.db.postgres import PostgresBackend
-                pg_backend = PostgresBackend.from_pool(self.pg_pool)
+                # A PostgreSQL scheduler effect holds a session advisory gate
+                # across target execution. Its bounded dedicated pool needs the
+                # same DSN, never the shared operational pool, or a waiting
+                # fence could consume the connection required for renewal/final
+                # CAS. A missing DSN fails clearly at the first scheduler gate.
+                pg_backend = PostgresBackend.from_pool(
+                    self.pg_pool,
+                    advisory_dsn=self._database_url,
+                )
                 self._raw_storage = AsyncStorage(
                     backend=pg_backend,
                     agent_id=self.did,

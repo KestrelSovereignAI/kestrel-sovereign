@@ -810,6 +810,7 @@ async def test_storage_phase_uses_shared_postgres_pool():
         did="did:test:pg",
         db_backend="postgres",
         pg_pool=pool,
+        database_url="postgresql://scheduler-test/kestrel",
         llm_service=MagicMock(),
     )
     ctx = BootContext()
@@ -828,7 +829,10 @@ async def test_storage_phase_uses_shared_postgres_pool():
         await agent._boot_phase_storage_privacy(ctx)
 
         # The shared pool was adopted (not a fresh DSN connection).
-        MockPGBackend.from_pool.assert_called_once_with(pool)
+        MockPGBackend.from_pool.assert_called_once_with(
+            pool,
+            advisory_dsn="postgresql://scheduler-test/kestrel",
+        )
         _, kwargs = MockStorage.call_args
         assert kwargs.get("backend") is pg_backend
     assert agent._raw_storage is storage

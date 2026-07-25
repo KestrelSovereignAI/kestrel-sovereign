@@ -177,6 +177,58 @@ class TestAgentManagerBasics:
         assert not manager.is_scheduler_agent_authorized("did:pkh:unresolved")
 
     @pytest.mark.asyncio
+    async def test_scheduler_preflight_recovers_wal_for_autostart_identity(
+        self, monkeypatch, tmp_path,
+    ):
+        """Autostart authority uses normal WAL recovery before scheduler boot."""
+
+        manager = AgentManager(base_data_dir=tmp_path)
+        config = MultiAgentConfig(
+            agents={
+                "Recovering": LocalAgentConfig(
+                    data_dir="recovering", port=8801, autostart=True
+                ),
+            }
+        )
+        did_lookup = AsyncMock(return_value="did:pkh:recovered")
+        monkeypatch.setattr(
+            "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+            did_lookup,
+        )
+
+        mapping = await manager.local_agent_configs_by_did(config)
+
+        assert mapping == {
+            "did:pkh:recovered": ("Recovering", config.agents["Recovering"])
+        }
+        assert manager.scheduler_authority_for("did:pkh:recovered") == (
+            "Recovering",
+            config.agents["Recovering"],
+        )
+        did_lookup.assert_awaited_once_with(
+            str(tmp_path / "recovering"),
+            mode=_AgentDIDLookupMode.INITIALIZATION,
+        )
+
+    @pytest.mark.asyncio
+    async def test_autostart_preflight_authority_needs_no_runtime_hook(self):
+        """A recovered startup DID is already protocol-seeded before load."""
+
+        manager = AgentManager()
+        manager.set_scheduler_polling_managed_by_host(True)
+        config = LocalAgentConfig(data_dir="recovering", port=8801, autostart=True)
+        agent_id = "did:pkh:recovered"
+        manager._seed_scheduler_authority({agent_id: ("Recovering", config)})
+
+        assert (
+            await manager._begin_dynamic_scheduler_tenant_registration(
+                "Recovering", agent_id, config
+            )
+            is None
+        )
+        assert not manager.scheduler_lifecycle_lock(agent_id).locked()
+
+    @pytest.mark.asyncio
     async def test_dynamic_scheduler_registration_cancellation_joins_and_rolls_back(
         self,
     ):

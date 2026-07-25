@@ -1147,17 +1147,16 @@ class SchedulerRunner:
 
     @asynccontextmanager
     async def _postgres_rollout_effect_gates(self, agent_ids: Collection[str]):
-        """Exclude PG rollout transitions from already-admitted effects.
+        """Gate PG effects and rollout transitions before operational work.
 
-        This is intentionally a *session* advisory lock, not a transaction
-        containing the target effect.  The matching transition path takes
-        ``pg_advisory_xact_lock`` before it can change ``active`` to
-        ``quiescing``.  Therefore either the transition wins and admission
-        observes quiescence, or admission wins and the transition waits until
-        the owned effect plus its terminal CAS complete.  Scheduler tools are
-        free to acquire the ordinary rollout control row while the effect is
-        running, so a target can pause/update/create schedules without a
-        cross-connection self-deadlock.
+        This is intentionally a dedicated-session advisory lock, not a
+        transaction containing the target effect.  Both active-effect
+        admission and active→quiescing/acknowledgement transitions acquire the
+        same gate *before* opening an operational transaction.  Therefore
+        either the transition wins and admission observes quiescence, or
+        admission wins and the transition waits until the owned effect plus its
+        terminal CAS complete. Scheduler tools remain free to mutate ordinary
+        scheduler rows while an effect is running.
         """
 
         if self._database_backend_type() != "postgres":
@@ -1185,24 +1184,6 @@ class SchedulerRunner:
 
         async with self._postgres_rollout_effect_gates((agent_id,)):
             yield
-
-    async def _acquire_rollout_transition_gate(self, agent_id: str) -> None:
-        """Make a PostgreSQL active→quiescing transition wait for effects.
-
-        The caller is already inside the short durable rollout transaction.
-        PostgreSQL releases this xact lock at commit/rollback; SQLite's
-        file-gate ownership is established by its outer bootstrap boundary.
-        """
-
-        if self._database_backend_type() != "postgres":
-            return
-        await self._db.fetchval(
-            "SELECT pg_advisory_xact_lock(?, ?)",
-            (
-                _SCHEDULER_EFFECT_ADVISORY_LOCK_NAMESPACE,
-                self._rollout_effect_advisory_key(agent_id),
-            ),
-        )
 
     def _sqlite_rollout_lock_path(self, agent_id: str) -> Optional[str]:
         """Return a stable sidecar lock path for a file-backed SQLite database."""
@@ -3299,14 +3280,21 @@ class SchedulerRunner:
             preexisting_schedule_table=preexisting_schedule_table
         )
         for agent_id in await self._current_authorized_agent_ids():
-            # Acquire the SQLite advisory boundary *before* its writer
-            # transaction. Waiting for an in-flight executor while holding
-            # SQLite's only writer would deadlock that executor's renewal or
-            # state writes. PostgreSQL uses the transaction row lock below.
+            # Acquire each backend's effect/transition gate *before* its
+            # writer transaction. Waiting for an in-flight executor while
+            # holding the sole SQLite writer or final PostgreSQL query-pool
+            # connection would deadlock that executor's renewal/final CAS.
+            # Bootstrap already owns every gate in stable order, so it passes
+            # ``rollout_gates_held`` and enters the transaction directly.
             if rollout_gates_held:
                 blocked_nonce = await self._ensure_protocol_rollout_agent(
                     agent_id, fresh_v2_schema=fresh_v2_schema
                 )
+            elif self._database_backend_type() == "postgres":
+                async with self._postgres_rollout_effect_gate(agent_id):
+                    blocked_nonce = await self._ensure_protocol_rollout_agent(
+                        agent_id, fresh_v2_schema=fresh_v2_schema
+                    )
             else:
                 async with self._sqlite_rollout_gate(agent_id):
                     blocked_nonce = await self._ensure_protocol_rollout_agent(
@@ -3495,13 +3483,11 @@ class SchedulerRunner:
     ) -> bool:
         """CAS one observed control row into a fresh quiescing epoch."""
 
-        # Acquire this BEFORE touching the control row.  A dispatch holds the
-        # matching session advisory lock from its committed active admission
-        # through effect/finalization, so this transition cannot revoke a live
-        # token underneath an admitted external effect.  Unlike the former
-        # control-row lock, scheduled target tools do not take this gate and
-        # may safely mutate scheduler state while their effect runs.
-        await self._acquire_rollout_transition_gate(agent_id)
+        # The caller already owns this DID's backend-neutral rollout gate.
+        # For PostgreSQL that is the dedicated session gate acquired before
+        # the operational transaction in ``_ensure_protocol_rollout`` (or the
+        # sorted bootstrap boundary); taking a transaction advisory lock here
+        # would make a one-connection query pool wait on itself.
         nonce_predicate = (
             "activation_nonce IS NULL"
             if expected_nonce is None

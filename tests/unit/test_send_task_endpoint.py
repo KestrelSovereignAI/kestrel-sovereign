@@ -281,6 +281,7 @@ def _install_hosted_legacy_unsigned_manager(
     authorize_inbound_sender,
     *,
     sender_name="legacy",
+    sender_display_name=None,
     sender_identity=None,
 ):
     """Build the production hosted policy shape for unsigned compatibility."""
@@ -295,6 +296,7 @@ def _install_hosted_legacy_unsigned_manager(
     sender = SimpleNamespace(
         agent_id=f"did:pkh:hosted:{sender_name}",
         did=f"did:pkh:hosted:{sender_name}",
+        _agent_name=sender_display_name or sender_name,
         identity=sender_identity,
     )
     manager = AgentManager()
@@ -451,6 +453,73 @@ def test_hosted_exact_non_hybrid_local_sender_keeps_unsigned_compatibility(
         is False
     )
     directory.assert_awaited_once_with(agent.peer_requester, sender.agent_id)
+
+
+def test_hosted_unsigned_sender_uses_published_display_name_not_routing_key(
+    app_with_send,
+    monkeypatch,
+):
+    """Peers publish the live display name even when routing differs."""
+
+    monkeypatch.delenv("KESTREL_A2A_REQUIRE_SIGNED", raising=False)
+    agent = _stub_agent()
+    directory = AsyncMock(return_value=True)
+    _manager, sender = _install_hosted_legacy_unsigned_manager(
+        agent,
+        directory,
+        sender_name="routing-alice",
+        sender_display_name="Alice",
+    )
+    _attach(app_with_send, agent)
+
+    with TestClient(app_with_send) as client:
+        published = client.post(
+            "/api/agent/tasks/send", json=_body(metadata={"sender": "Alice"})
+        )
+        routing_key = client.post(
+            "/api/agent/tasks/send",
+            json=_body(id="routing-key", metadata={"sender": "routing-alice"}),
+        )
+
+    assert published.status_code == 200
+    assert routing_key.status_code == 403
+    directory.assert_awaited_once_with(agent.peer_requester, sender.agent_id)
+
+
+def test_hosted_unsigned_ambiguous_display_name_is_rejected(
+    app_with_send,
+    monkeypatch,
+):
+    """Two live agents with one published name fail closed before directory IO."""
+
+    monkeypatch.delenv("KESTREL_A2A_REQUIRE_SIGNED", raising=False)
+    agent = _stub_agent()
+    directory = AsyncMock(return_value=True)
+    manager, _sender = _install_hosted_legacy_unsigned_manager(
+        agent,
+        directory,
+        sender_name="routing-alice",
+        sender_display_name="Alice",
+    )
+    manager._register_agent(
+        "routing-alice-duplicate",
+        SimpleNamespace(
+            agent_id="did:pkh:hosted:routing-alice-duplicate",
+            did="did:pkh:hosted:routing-alice-duplicate",
+            _agent_name="Alice",
+            identity=None,
+        ),
+    )
+    _attach(app_with_send, agent)
+
+    with TestClient(app_with_send) as client:
+        response = client.post(
+            "/api/agent/tasks/send", json=_body(metadata={"sender": "Alice"})
+        )
+
+    assert response.status_code == 403
+    directory.assert_not_awaited()
+    agent.task_manager.create_task.assert_not_awaited()
 
 
 def test_hosted_unsigned_unknown_or_cross_scope_sender_is_rejected(

@@ -216,6 +216,9 @@ async def test_public_hybrid_dispatch_posts_envelope_verifying_both_halves():
     feature._host_url = "http://multi-agent"
     feature._api_key = ""
     feature._own_name = "emma"
+    # A volatile rename changes the legacy public display identity, but a
+    # hybrid envelope must retain its signing DID as the authenticated sender.
+    feature.agent._agent_name = "renamed-emma"
     response = MagicMock(status_code=200)
     response.raise_for_status.return_value = None
     response.json.return_value = {

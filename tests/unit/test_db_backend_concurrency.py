@@ -13,6 +13,26 @@ from __future__ import annotations
 import asyncio
 
 
+def test_postgres_from_pool_keeps_advisory_dsn_outside_operational_pool_state():
+    """A wrapped pool needs an explicit, scheduler-only connection source."""
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    class _Pool:
+        def get_max_size(self):
+            return 2
+
+    backend = PostgresBackend.from_pool(
+        _Pool(),
+        advisory_dsn="postgresql://scheduler-test/kestrel",
+    )
+
+    # ``_dsn`` remains absent for existing wrapped-pool consumers (including
+    # SQLAlchemy factories); only advisory gates use the explicit DSN.
+    assert backend._dsn is None
+    assert backend._advisory_dsn == "postgresql://scheduler-test/kestrel"
+    assert backend._advisory_max_pool_size == 2
+
+
 def test_postgres_txn_conn_is_per_task_and_not_inherited_by_children():
     """A PostgresBackend's transaction connection is keyed to the OWNING task
     (#1726). A SIBLING task never sees it, and — critically — a CHILD task

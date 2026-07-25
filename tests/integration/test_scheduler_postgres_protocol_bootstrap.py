@@ -85,7 +85,13 @@ async def _top_level_scheduler_databases(
     )
     try:
         databases = [
-            AsyncDatabase(PostgresBackend.from_pool(pool))
+            AsyncDatabase(
+                PostgresBackend.from_pool(
+                    pool,
+                    advisory_dsn=db_backend._dsn,
+                    advisory_connect_kwargs={"server_settings": {"search_path": schema}},
+                )
+            )
             for _ in range(count)
         ]
         yield databases

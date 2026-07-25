@@ -348,6 +348,27 @@ class PeersFeature(Feature):
 
         return "unknown"
 
+    def _current_legacy_outbound_sender(self) -> str:
+        """Return the current public display name for an unsigned envelope.
+
+        ``_own_name`` is intentionally retained as this feature's startup
+        identity for logs and legacy fallbacks, but it is stale after a
+        volatile rename. The hosted receiver authorizes unsigned legacy A2A
+        against the live name it publishes on its agent card, so this sender
+        metadata must resolve through the same live source. Hybrid envelopes
+        subsequently overwrite this value with their signing DID.
+        """
+
+        resolver = getattr(self.agent, "resolve_effective_name", None)
+        if callable(resolver):
+            resolved = resolver(default=None)
+            if isinstance(resolved, str) and resolved.strip():
+                return resolved
+        live_name = getattr(self.agent, "_agent_name", None)
+        if isinstance(live_name, str) and live_name.strip():
+            return live_name
+        return self._own_name
+
     def _install_local_host_router(self) -> None:
         """Install the legacy local-host adapter with a private local scope."""
         host_url = getattr(self, "_host_url", None)
@@ -934,7 +955,13 @@ class PeersFeature(Feature):
 
         task_id = uuid4().hex
         sess_id = session_id or uuid4().hex
-        outbound_metadata: Dict[str, Any] = {"sender": self._own_name}
+        # An unsigned legacy envelope is authorized by the receiver against
+        # its current published display name. Do not reuse the feature's
+        # startup-cached name after a volatile rename. Hybrid signing below
+        # replaces this with the authenticated DID before any routing occurs.
+        outbound_metadata: Dict[str, Any] = {
+            "sender": self._current_legacy_outbound_sender()
+        }
         if skill_id:
             outbound_metadata["skill"] = skill_id
         if extra_metadata:

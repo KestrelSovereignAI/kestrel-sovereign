@@ -733,7 +733,13 @@ class AsyncDatabase:
         return db
 
     @classmethod
-    async def from_pool(cls, pool) -> "AsyncDatabase":
+    async def from_pool(
+        cls,
+        pool,
+        *,
+        advisory_dsn: Optional[str] = None,
+        advisory_connect_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> "AsyncDatabase":
         """
         Create AsyncDatabase from an existing asyncpg connection pool.
 
@@ -744,12 +750,21 @@ class AsyncDatabase:
 
         Args:
             pool: asyncpg.Pool instance
+            advisory_dsn: DSN for the separate bounded advisory-lock pool.
+                Required by PostgreSQL scheduler gates when the caller wraps a
+                pre-existing pool.
+            advisory_connect_kwargs: Options for that pool, for example a
+                non-default PostgreSQL ``search_path``.
 
         Returns:
             AsyncDatabase wrapping the pool
         """
         from .db.postgres import PostgresBackend
-        backend = PostgresBackend.from_pool(pool)
+        backend = PostgresBackend.from_pool(
+            pool,
+            advisory_dsn=advisory_dsn,
+            advisory_connect_kwargs=advisory_connect_kwargs,
+        )
         db = cls(backend)
         await db._init_schema()
         db._initialized = True

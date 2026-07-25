@@ -29,6 +29,30 @@ from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 
 
+@asynccontextmanager
+async def _single_connection_scheduler_database(db_backend):
+    """Yield a real PostgreSQL scheduler DB with one operational connection.
+
+    The scheduler's advisory gates must queue independently of this pool: an
+    admitted effect renews/finalizes through the one query connection while a
+    fence waits on the matching per-DID gate. This deliberately exercises the
+    smallest supported operational-pool topology.
+    """
+
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    backend = PostgresBackend(
+        db_backend._dsn,
+        min_pool_size=1,
+        max_pool_size=1,
+    )
+    await backend.connect()
+    try:
+        yield AsyncDatabase(backend)
+    finally:
+        await backend.close()
+
+
 async def _activate_protocol_for_test_agent(db, agent_id, monkeypatch) -> None:
     """Bring a unique test DID through the real rollout control transition."""
 
@@ -819,6 +843,235 @@ async def test_postgres_bootstrap_waits_for_admitted_effect(
         await db.execute("DELETE FROM task_execution_log WHERE task_id = ?", (task_id,))
         await db.execute("DELETE FROM scheduled_tasks WHERE id = ?", (task_id,))
         await db.execute("DELETE FROM scheduler_protocol_rollout WHERE agent_id = ?", (agent_id,))
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_postgres_single_query_connection_effect_renews_while_fence_waits(
+    db_backend,
+    monkeypatch,
+):
+    """A waiting fence never pins the only query connection an effect needs."""
+
+    if db_backend.backend_type != "postgres":
+        pytest.skip("requires PostgreSQL advisory-lock semantics")
+
+    agent_id = f"scheduler-single-pool-fence:{uuid4()}"
+    task_id = f"scheduler-single-pool-fence-task:{uuid4()}"
+    legacy_task_id = f"scheduler-single-pool-fence-legacy:{uuid4()}"
+    executor_started = asyncio.Event()
+    renewed_during_effect = asyncio.Event()
+    release_executor = asyncio.Event()
+    tick: asyncio.Task[None] | None = None
+    transition: asyncio.Task[None] | None = None
+
+    async def executor(_task_name, _args):
+        # This query runs while the effect's advisory gate is held. It would
+        # deadlock if that gate consumed the lone operational pool connection.
+        assert await db.fetchval("SELECT 1") == 1
+        executor_started.set()
+        await release_executor.wait()
+        return "ok"
+
+    async def no_op(_task_name, _args):
+        return None
+
+    async with _single_connection_scheduler_database(db_backend) as db:
+        try:
+            await _activate_protocol_for_test_agent(db, agent_id, monkeypatch)
+            runner = SchedulerRunner(
+                db,
+                agent_id,
+                executor,
+                lease_seconds=1,
+                owner_id="single-pool-effect",
+            )
+            fencer = SchedulerRunner(
+                db,
+                agent_id,
+                no_op,
+                owner_id="single-pool-fence",
+            )
+            original_renew = runner._renew_lease_once
+
+            async def observe_renewal(task):
+                renewed = await original_renew(task)
+                if executor_started.is_set():
+                    renewed_during_effect.set()
+                return renewed
+
+            runner._renew_lease_once = observe_renewal
+            await runner._ensure_tables()
+            due = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+            await db.execute(
+                """
+                INSERT INTO scheduled_tasks
+                    (id, agent_id, task_name, cron_expression, args_json, enabled,
+                     next_run_at, created_at, idempotency_key,
+                     scheduler_protocol_version)
+                VALUES (?, ?, 'task', '* * * * *', '{}', 1, ?, ?,
+                        'single-pool-fence', ?)
+                """,
+                (task_id, agent_id, due, due, SCHEDULER_PROTOCOL_VERSION),
+            )
+            tick = asyncio.create_task(runner._tick())
+            await asyncio.wait_for(executor_started.wait(), timeout=3)
+            await asyncio.wait_for(renewed_during_effect.wait(), timeout=3)
+
+            # A legacy writer makes the fencer rotate active→quiescing. Its
+            # gate wait must happen before it opens the one connection pool.
+            await db.execute(
+                """
+                INSERT INTO scheduled_tasks
+                    (id, agent_id, task_name, cron_expression, args_json, enabled,
+                     next_run_at, created_at, idempotency_key)
+                VALUES (?, ?, 'legacy-task', '* * * * *', '{}', 1, ?, ?,
+                        'single-pool-fence-legacy')
+                """,
+                (legacy_task_id, agent_id, due, due),
+            )
+
+            async def reconcile() -> None:
+                with pytest.raises(SchedulerRolloutQuiescenceRequired):
+                    await fencer._ensure_protocol_rollout(
+                        preexisting_schedule_table=True
+                    )
+
+            transition = asyncio.create_task(reconcile())
+            await asyncio.sleep(0.1)
+            assert not transition.done()
+
+            release_executor.set()
+            await asyncio.wait_for(tick, timeout=4)
+            await asyncio.wait_for(transition, timeout=4)
+            assert await db.fetchone(
+                "SELECT status FROM task_execution_log WHERE task_id = ?",
+                (task_id,),
+            ) == ("success",)
+            assert await db.fetchone(
+                "SELECT state FROM scheduler_protocol_rollout WHERE agent_id = ?",
+                (agent_id,),
+            ) == ("quiescing",)
+        finally:
+            release_executor.set()
+            for pending in (tick, transition):
+                if pending is not None and not pending.done():
+                    pending.cancel()
+                    await asyncio.gather(pending, return_exceptions=True)
+            await db.execute(
+                "DELETE FROM task_execution_log WHERE task_id = ?", (task_id,)
+            )
+            await db.execute(
+                "DELETE FROM scheduled_tasks WHERE id IN (?, ?)",
+                (task_id, legacy_task_id),
+            )
+            await db.execute(
+                "DELETE FROM scheduler_protocol_rollout WHERE agent_id = ?",
+                (agent_id,),
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_postgres_single_query_connection_bootstrap_legacy_fence_does_not_self_wait(
+    db_backend,
+    monkeypatch,
+):
+    """Bootstrap owns the session gate before its one-connection transaction."""
+
+    if db_backend.backend_type != "postgres":
+        pytest.skip("requires PostgreSQL advisory-lock semantics")
+
+    agent_id = f"scheduler-single-pool-bootstrap:{uuid4()}"
+    legacy_task_id = f"scheduler-single-pool-bootstrap-legacy:{uuid4()}"
+
+    async def no_op(_task_name, _args):
+        return None
+
+    async with _single_connection_scheduler_database(db_backend) as db:
+        try:
+            await _activate_protocol_for_test_agent(db, agent_id, monkeypatch)
+            due = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+            await db.execute(
+                """
+                INSERT INTO scheduled_tasks
+                    (id, agent_id, task_name, cron_expression, args_json, enabled,
+                     next_run_at, created_at, idempotency_key)
+                VALUES (?, ?, 'legacy-task', '* * * * *', '{}', 1, ?, ?,
+                        'single-pool-bootstrap-legacy')
+                """,
+                (legacy_task_id, agent_id, due, due),
+            )
+            bootstrap = SchedulerRunner(
+                db,
+                agent_id,
+                no_op,
+                owner_id="single-pool-bootstrap",
+            )
+
+            with pytest.raises(SchedulerRolloutQuiescenceRequired):
+                await asyncio.wait_for(bootstrap._ensure_tables(), timeout=3)
+            assert await db.fetchone(
+                "SELECT state FROM scheduler_protocol_rollout WHERE agent_id = ?",
+                (agent_id,),
+            ) == ("quiescing",)
+        finally:
+            await db.execute(
+                "DELETE FROM task_execution_log WHERE agent_id = ?", (agent_id,)
+            )
+            await db.execute(
+                "DELETE FROM scheduled_tasks WHERE id = ?", (legacy_task_id,)
+            )
+            await db.execute(
+                "DELETE FROM scheduler_protocol_rollout WHERE agent_id = ?",
+                (agent_id,),
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_postgres_cancelled_advisory_gate_releases_the_dedicated_session(
+    db_backend,
+):
+    """Cancelling a holder cannot strand its gate or operational pool."""
+
+    if db_backend.backend_type != "postgres":
+        pytest.skip("requires PostgreSQL advisory-lock semantics")
+
+    agent_id = f"scheduler-cancelled-advisory:{uuid4()}"
+    entered = asyncio.Event()
+    hold = asyncio.Event()
+
+    async def no_op(_task_name, _args):
+        return None
+
+    async with _single_connection_scheduler_database(db_backend) as db:
+        runner = SchedulerRunner(db, agent_id, no_op, owner_id="cancelled-gate")
+
+        async def hold_gate() -> None:
+            async with runner._postgres_rollout_effect_gate(agent_id):
+                entered.set()
+                await hold.wait()
+
+        holder = asyncio.create_task(hold_gate())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=3)
+            holder.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await holder
+
+            # The terminated advisory connection releases the server-side lock
+            # and the one operational connection remains independently usable.
+            async def reacquire_and_query() -> None:
+                async with runner._postgres_rollout_effect_gate(agent_id):
+                    assert await db.fetchval("SELECT 1") == 1
+
+            await asyncio.wait_for(reacquire_and_query(), timeout=3)
+        finally:
+            hold.set()
+            if not holder.done():
+                holder.cancel()
+                await asyncio.gather(holder, return_exceptions=True)
 
 
 @pytest.mark.asyncio
