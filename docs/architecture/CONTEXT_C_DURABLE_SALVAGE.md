@@ -43,8 +43,8 @@ durable-salvage guarantee.
 |---|---|
 | Lumpy selection drops an older history chunk while retaining database rows | **Shipped default** |
 | Manual context compaction writes a summary marker and excludes originals | **Shipped when invoked** |
-| Codex occupancy handling compacts durable session history before resetting a Codex thread | **Shipped on `openai:plan` when its threshold is crossed** |
-| Automatic prune writes a salvage marker/span before omission | **Conditional**, behind `KESTREL_CONTEXT_C_DURABLE_SALVAGE` |
+| Codex occupancy handling attempts durable session compaction and resets the thread only after success | **Conditional best-effort** on `openai:plan` when its threshold is crossed |
+| Automatic prune writes a salvage marker/span before omission | **Conditional**, behind `KESTREL_CONTEXT_C_DURABLE_SALVAGE` and only for a span that maps to id-bearing persistent rows |
 | Background processing and janitor use `SalvageWorker` | **Conditional**, behind the same flag |
 | Automatic salvage is the default for all routes | **Not shipped** |
 | Original SignalDispatcher-based orchestration | **Not shipped**; the partial implementation uses `SalvageWorker` |
@@ -123,13 +123,21 @@ A complete implementation should preserve these properties:
 ## What the partial implementation proves
 
 With `KESTREL_CONTEXT_C_DURABLE_SALVAGE` enabled, the current production
-coordinator computes the pruned span, attempts the synchronous salvage
-write/marker, and schedules the process-local `SalvageWorker`. It fails closed
-when the prerequisite durable write is unavailable or unsuccessful.
+coordinator attempts to map a pruned span to persistent conversation row ids.
+When that mapping succeeds, it attempts the synchronous salvage write/marker
+and schedules the process-local `SalvageWorker`; the path fails closed when the
+store or prerequisite durable write is unavailable or unsuccessful.
+
+When no id-bearing span can be computed—including `ISOLATED` in-memory
+history—the coordinator returns without a marker. The feature flag therefore
+does not establish a universal fail-closed guarantee, and the status endpoint's
+`silently_pruned_path_active` field reflects flag configuration rather than
+per-turn salvage evidence.
 
 That is meaningful implementation evidence, but it does **not** prove:
 
 - that automatic salvage is active in default deployments;
+- that id-less or in-memory history is durably salvaged before omission;
 - that a `SignalDispatcher` owns background work;
 - that every provider and restart topology has completed recovery testing;
 - that the Context feature's manual tools are the automatic state machine;

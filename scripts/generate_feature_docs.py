@@ -9,6 +9,7 @@ Usage:
     uv run python scripts/generate_feature_docs.py --all
     uv run python scripts/generate_feature_docs.py --audience user --model openai/gpt-5.1
     uv run python scripts/generate_feature_docs.py --audience investor --dry-run
+    uv run python scripts/generate_feature_docs.py --sync-protected-contracts
 """
 
 import argparse
@@ -120,6 +121,8 @@ OUTPUT_DIR = PROJECT_ROOT / "docs" / "generated"
 _DISCOVERY_REFRESH_CACHE: dict[str, list[ModelInfo]] = {}
 BOUNDARY_START = "<!-- BEGIN PROTECTED PACKAGE BOUNDARY CONTRACT -->"
 BOUNDARY_END = "<!-- END PROTECTED PACKAGE BOUNDARY CONTRACT -->"
+CONTEXT_START = "<!-- BEGIN PROTECTED CONTEXT HONESTY CONTRACT -->"
+CONTEXT_END = "<!-- END PROTECTED CONTEXT HONESTY CONTRACT -->"
 NON_BUNDLED_ALIASES_PATTERN = re.compile(
     r"<!-- NON_BUNDLED_SURFACE_ALIASES:\s*(.*?)\s*-->",
     re.DOTALL,
@@ -139,6 +142,43 @@ OWNERSHIP_PROMOTION_TERMS = (
     "included in the base install",
     "no separate install",
 )
+CONTEXT_OVERCLAIM_PATTERNS = (
+    (
+        re.compile(
+            r"\b(?:context|conversation) (?:remains?|stays?) coherent "
+            r"regardless\b",
+            re.IGNORECASE,
+        ),
+        "promises context coherence regardless of runtime constraints",
+    ),
+    (
+        re.compile(
+            r"\bcontext (?:status|diagnostics?) "
+            r"(?:is an exact|are exact|provides? an exact|exactly reproduces?)\b",
+            re.IGNORECASE,
+        ),
+        "promotes a context diagnostic projection to an exact trace",
+    ),
+    (
+        re.compile(
+            r"\bautomatic (?:durable )?salvage "
+            r"(?:is|runs|applies|protects) (?:the )?"
+            r"(?:default|all routes|every prune)\b",
+            re.IGNORECASE,
+        ),
+        "promotes conditional automatic salvage to universal behavior",
+    ),
+)
+_INLINE_LINK_RE = re.compile(
+    r"(?P<prefix>!?\[[^\]\n]*\]\()(?P<target>[^)\s]+)(?P<suffix>\))"
+)
+GENERATED_LINK_ALIASES = {
+    # Older LLM output invented this former-looking module name. The current
+    # tool-registry owner is the useful maintained target.
+    "kestrel_sovereign/kestrel_agent_tools.py": (
+        "kestrel_sovereign/agent/tool_registry.py"
+    ),
+}
 
 
 def build_okf_frontmatter(
@@ -183,16 +223,40 @@ def parse_okf_frontmatter(path: Path) -> dict | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def extract_boundary_contract(source: str) -> str:
-    """Return the canonical protected package-boundary block verbatim."""
-    start = source.find(BOUNDARY_START)
-    end = source.find(BOUNDARY_END)
+def _extract_protected_contract(
+    source: str,
+    start_marker: str,
+    end_marker: str,
+    label: str,
+) -> str:
+    """Return one canonical protected contract block verbatim."""
+    start = source.find(start_marker)
+    end = source.find(end_marker)
     if start == -1 or end == -1 or end < start:
         raise ValueError(
-            "Canonical feature inventory is missing the protected package "
-            "boundary contract"
+            f"Canonical feature inventory is missing the protected {label} contract"
         )
-    return source[start : end + len(BOUNDARY_END)]
+    return source[start : end + len(end_marker)]
+
+
+def extract_boundary_contract(source: str) -> str:
+    """Return the canonical protected package-boundary block verbatim."""
+    return _extract_protected_contract(
+        source,
+        BOUNDARY_START,
+        BOUNDARY_END,
+        "package boundary",
+    )
+
+
+def extract_context_contract(source: str) -> str:
+    """Return the canonical protected context-honesty block verbatim."""
+    return _extract_protected_contract(
+        source,
+        CONTEXT_START,
+        CONTEXT_END,
+        "context honesty",
+    )
 
 
 def extract_non_bundled_surface_aliases(
@@ -245,13 +309,23 @@ def extract_non_bundled_surface_aliases(
     return aliases
 
 
-def _strip_boundary_contract(text: str) -> str:
-    """Remove an LLM-echoed protected block before deterministic insertion."""
+def _strip_protected_contract(
+    text: str,
+    start_marker: str,
+    end_marker: str,
+) -> str:
+    """Remove an echoed protected block before deterministic insertion."""
     pattern = re.compile(
-        rf"{re.escape(BOUNDARY_START)}.*?{re.escape(BOUNDARY_END)}",
+        rf"{re.escape(start_marker)}.*?{re.escape(end_marker)}",
         re.DOTALL,
     )
     return pattern.sub("", text).strip()
+
+
+def _strip_protected_contracts(text: str) -> str:
+    """Remove every deterministic contract from transformed prose."""
+    text = _strip_protected_contract(text, BOUNDARY_START, BOUNDARY_END)
+    return _strip_protected_contract(text, CONTEXT_START, CONTEXT_END)
 
 
 def find_boundary_promotions(
@@ -301,26 +375,113 @@ def find_boundary_promotions(
     return violations
 
 
+def find_context_overclaims(text: str) -> list[str]:
+    """Find explicit promotions of projected/conditional context behavior."""
+    violations: list[str] = []
+    for pattern, explanation in CONTEXT_OVERCLAIM_PATTERNS:
+        for match in pattern.finditer(text):
+            excerpt = text[match.start() : match.end()]
+            violations.append(f"{explanation}: {excerpt}")
+    return violations
+
+
+def normalize_generated_links(text: str) -> str:
+    """Rebase repository-root links for files under ``docs/generated``.
+
+    LLM transformations often preserve canonical links such as
+    ``kestrel_sovereign/agent/context_manager.py``. Those resolve from the
+    repository root in ``KESTREL_FEATURES.md`` but not from the generated
+    directory. Keep already-valid links and mechanically rebase only a target
+    that exists from the project root.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        target = match.group("target")
+        if (
+            target.startswith(("#", "/", "//", "<"))
+            or re.match(r"^[A-Za-z][A-Za-z0-9+.\-]*:", target)
+        ):
+            return match.group(0)
+
+        path_part, separator, fragment = target.partition("#")
+        if not path_part:
+            return match.group(0)
+        generated_target = (OUTPUT_DIR / path_part).resolve()
+        if generated_target.exists():
+            return match.group(0)
+        canonical_path = path_part
+        canonical_target = (PROJECT_ROOT / canonical_path).resolve()
+        if not canonical_target.exists() and path_part.startswith("endpoints/"):
+            canonical_path = f"kestrel_sovereign/{path_part}"
+            canonical_target = (PROJECT_ROOT / canonical_path).resolve()
+        if not canonical_target.exists() and path_part in GENERATED_LINK_ALIASES:
+            canonical_path = GENERATED_LINK_ALIASES[path_part]
+            canonical_target = (PROJECT_ROOT / canonical_path).resolve()
+        if not canonical_target.exists():
+            return match.group(0)
+
+        rebased = os.path.relpath(canonical_target, OUTPUT_DIR).replace(os.sep, "/")
+        if separator:
+            rebased = f"{rebased}#{fragment}"
+        prefix = match.group("prefix").replace(path_part, canonical_path)
+        return f"{prefix}{rebased}{match.group('suffix')}"
+
+    return _INLINE_LINK_RE.sub(replace, text)
+
+
 def compose_generated_body(source: str, transformed: str) -> str:
-    """Validate audience prose and prepend the canonical boundary contract."""
+    """Validate audience prose and prepend both canonical contracts."""
     boundary_contract = extract_boundary_contract(source)
+    context_contract = extract_context_contract(source)
     aliases = extract_non_bundled_surface_aliases(boundary_contract)
-    transformed = _strip_boundary_contract(transformed)
+    transformed = _strip_protected_contracts(transformed)
     violations = find_boundary_promotions(transformed, aliases)
+    violations.extend(find_context_overclaims(transformed))
     if violations:
         raise ValueError(
-            "Generated audience document contradicts package ownership:\n- "
+            "Generated audience document contradicts package ownership or "
+            "context honesty:\n- "
             + "\n- ".join(violations)
         )
-    return f"{boundary_contract}\n\n{transformed}\n"
+    transformed = normalize_generated_links(transformed)
+    return f"{boundary_contract}\n\n{context_contract}\n\n{transformed}\n"
+
+
+def _split_frontmatter(text: str) -> tuple[str, str]:
+    """Split a generated document into its unchanged header and body."""
+    match = re.match(r"\A---\n.*?\n---\n\n?", text, re.DOTALL)
+    if match is None:
+        raise ValueError("generated document is missing OKF frontmatter")
+    return match.group(0), text[match.end() :]
+
+
+def sync_protected_contracts() -> list[Path]:
+    """Mechanically sync protected blocks and root-relative links.
+
+    This does not call an LLM or rewrite audience prose/frontmatter.
+    """
+    source = SOURCE_FILE.read_text(encoding="utf-8")
+    updated: list[Path] = []
+    for audience in AUDIENCES:
+        path = OUTPUT_DIR / f"FEATURES_{audience}.md"
+        current = path.read_text(encoding="utf-8")
+        header, transformed = _split_frontmatter(current)
+        rendered = header + compose_generated_body(source, transformed)
+        if current != rendered:
+            path.write_text(rendered, encoding="utf-8")
+            updated.append(path)
+    return updated
 
 
 def check_generated_docs() -> int:
-    """Validate metadata and deterministic package-boundary invariants."""
+    """Validate metadata, protected contracts, claims, and local links."""
     failures: list[str] = []
     source = SOURCE_FILE.read_text(encoding="utf-8")
     boundary_contract = extract_boundary_contract(source)
+    context_contract = extract_context_contract(source)
     aliases = extract_non_bundled_surface_aliases(boundary_contract)
+    from scripts import check_docs_links
+
     for audience in AUDIENCES:
         path = OUTPUT_DIR / f"FEATURES_{audience}.md"
         metadata = parse_okf_frontmatter(path)
@@ -346,16 +507,25 @@ def check_generated_docs() -> int:
                 f"{path.relative_to(PROJECT_ROOT)}: protected package-boundary "
                 "contract is missing, duplicated, or stale"
             )
-        body = text.replace(boundary_contract, "", 1)
-        for violation in find_boundary_promotions(body, aliases):
+        if text.count(context_contract) != 1:
             failures.append(
-                f"{path.relative_to(PROJECT_ROOT)}: {violation}"
+                f"{path.relative_to(PROJECT_ROOT)}: protected context-honesty "
+                "contract is missing, duplicated, or stale"
             )
+        body = text.replace(boundary_contract, "", 1).replace(
+            context_contract, "", 1
+        )
+        for violation in find_boundary_promotions(body, aliases):
+            failures.append(f"{path.relative_to(PROJECT_ROOT)}: {violation}")
+        for violation in find_context_overclaims(body):
+            failures.append(f"{path.relative_to(PROJECT_ROOT)}: {violation}")
+        for broken_link in check_docs_links.check_file(path):
+            failures.append(broken_link.format())
     if failures:
         for failure in failures:
             print(f"ERROR: {failure}", file=sys.stderr)
         return 1
-    print("Generated feature docs metadata and package boundaries are current.")
+    print("Generated feature docs metadata, contracts, and links are current.")
     return 0
 
 
@@ -468,14 +638,18 @@ def generate(
     profile = AUDIENCES[audience]
     source = SOURCE_FILE.read_text()
     protected_rules = (
-        "\n\nPackage-boundary invariants:\n"
+        "\n\nProtected invariants:\n"
         f"- The source section between {BOUNDARY_START} and {BOUNDARY_END} is "
+        "normative; do not contradict it.\n"
+        f"- The source section between {CONTEXT_START} and {CONTEXT_END} is "
         "normative; do not contradict it.\n"
         "- Never describe an extracted Feature package, provider package, or "
         "standalone tool as bundled, built-in, native, core, or included in "
         "the base install.\n"
-        "- The generator inserts the protected section verbatim; do not rely "
-        "on paraphrase to preserve ownership."
+        "- Never promote diagnostic context estimates or conditional salvage "
+        "and compaction paths to exact or universal behavior.\n"
+        "- The generator inserts both protected sections verbatim; do not rely "
+        "on paraphrase to preserve either contract."
     )
 
     user_prompt = (
@@ -555,7 +729,15 @@ def main():
     parser.add_argument(
         "--check",
         action="store_true",
-        help="Check checked-in generated docs metadata without calling the LLM",
+        help="Check checked-in generated docs without calling the LLM",
+    )
+    parser.add_argument(
+        "--sync-protected-contracts",
+        action="store_true",
+        help=(
+            "Sync protected contracts and local-link rebasing without calling "
+            "the LLM or changing audience prose/frontmatter"
+        ),
     )
     parser.add_argument(
         "--skip-discovery-refresh",
@@ -581,6 +763,14 @@ def main():
     if not SOURCE_FILE.exists():
         print(f"Error: {SOURCE_FILE} not found. Generate it first.")
         sys.exit(1)
+
+    if args.sync_protected_contracts:
+        updated = sync_protected_contracts()
+        for path in updated:
+            print(f"Updated {path.relative_to(PROJECT_ROOT)}")
+        if not updated:
+            print("Protected contracts and generated links are already current.")
+        return
 
     if args.all:
         for audience in AUDIENCES:

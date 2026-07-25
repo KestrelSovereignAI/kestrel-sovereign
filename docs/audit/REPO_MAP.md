@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-07-25
-**Scope:** 2150 tracked files (1429 `.py`, 339 `.md`, 382 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 2151 tracked files (1430 `.py`, 339 `.md`, 382 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -1327,7 +1327,7 @@ Repo entry points and standard project files.
 - **scripts/generate_demo_evidence_docs.py** — Generate an OKF index of Kestrel demo and visual-review evidence.
   - `class DemoEvidence`; `def read_eye_config(path)`; `def discover_demo_evidence(root)`; `def build_frontmatter(generated_at)`; `def render(demos)`; `def check_output(expected, path)`; `def main()`
 - **scripts/generate_feature_docs.py** — Generate audience-specific feature docs from the canonical KESTREL_FEATURES.md.
-  - `def build_okf_frontmatter(audience)`; `def parse_okf_frontmatter(path)`; `def extract_boundary_contract(source)`; `def extract_non_bundled_surface_aliases(boundary_contract)`; `def find_boundary_promotions(text, non_bundled_aliases)`; `def compose_generated_body(source, transformed)`; `def check_generated_docs()`; `def get_client_and_model(model_override, refresh_discovery)`; `…`
+  - `def build_okf_frontmatter(audience)`; `def parse_okf_frontmatter(path)`; `def extract_boundary_contract(source)`; `def extract_context_contract(source)`; `def extract_non_bundled_surface_aliases(boundary_contract)`; `def find_boundary_promotions(text, non_bundled_aliases)`; `def find_context_overclaims(text)`; `def normalize_generated_links(text)`; `…`
 - **scripts/generate_feature_inventory.py** — Generate the canonical Kestrel feature inventory from code discovery.
   - `def main()`
 - **scripts/generate_logos.py** — Generate Kestrel Sovereign logo concepts using Nano Banana 2 (Gemini 3.1 Flash Image Preview).
@@ -2325,7 +2325,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_caller_context_endpoint_propagation.py** — Regression suite for #736 — every authenticated endpoint must pass a CallerContext into agent.process_input/process_input_streaming so that sovereign-command authorization is consistent regardless of…
   - `def test_chat_completions_propagates_sovereign_caller_from_api_key()`; `def test_bridge_invoke_propagates_sovereign_caller_from_api_key()`; `def test_bridge_stream_propagates_sovereign_caller_from_api_key()`
 - **tests/unit/test_canonical_inventory_sync.py** — Sync checks between the canonical inventory and the live code surface.
-  - `def test_canonical_inventory_keeps_feature_snapshot_counts_in_sync()`; `def test_canonical_inventory_mentions_all_router_files()`; `def test_canonical_inventory_mentions_all_discoverable_feature_modules()`; `def test_canonical_inventory_mentions_all_router_routes()`; `def test_canonical_inventory_mentions_all_app_routes()`; `def test_canonical_inventory_links_point_to_existing_paths()`
+  - `def test_canonical_inventory_generated_region_is_exact()`; `def test_canonical_inventory_keeps_feature_snapshot_counts_in_sync()`; `def test_canonical_inventory_mentions_all_router_files()`; `def test_canonical_inventory_mentions_all_discoverable_feature_modules()`; `def test_canonical_inventory_mentions_all_router_routes()`; `def test_canonical_inventory_mentions_all_app_routes()`; `def test_canonical_inventory_links_point_to_existing_paths()`
 - **tests/unit/test_canonical_session_id_migration.py** — Tests for the canonical-session-id data migration (#2012).
   - `async def test_relinks_integer_session_id_to_marker_uuid(tmp_path)`; `async def test_leaves_legacy_timegap_anchor_alone(tmp_path)`; `async def test_leaves_uuid_session_ids_alone(tmp_path)`; `async def test_remaps_conversation_title(tmp_path)`; `async def test_title_collision_drops_integer_keeps_uuid(tmp_path)`; `async def test_idempotent_second_run_is_noop(tmp_path)`; `async def test_skips_marker_that_inherited_prior_session_uuid(tmp_path)`; `async def test_relinks_double_marker_same_session(tmp_path)`; `…`
 - **tests/unit/test_canonical_transport_split.py** — Canonical/transport split for the conversation record (#1402).
@@ -2490,6 +2490,8 @@ Repo entry points and standard project files.
   - `class TestContextBuilder`; `class TestContextBuilderIntegration`
 - **tests/unit/test_context_builder_with_tracking.py** — Tests for `ContextBuilder.build_system_prompt_with_tracking`.
   - `def test_returns_system_prompt_result()`; `def test_anchored_doctrine_appears_in_clauses()`; `def test_state_of_mind_renders_when_provided()`; `def test_prompt_adaptation_preamble_renders()`; `def test_prompt_adaptation_skipped_when_preamble_empty()`; `def test_style_reminder_only_emitted_when_soul_loaded()`; `def test_budget_truncation_drops_low_priority()`; `def test_legacy_build_system_prompt_remains_byte_stable()`; `…`
+- **tests/unit/test_context_docs_contract.py** — Structural contract tests for canonical context-management documentation.
+  - `def test_context_system_design_is_the_only_canonical_context_document()`; `def test_status_vocabulary_and_runtime_ownership_are_structural_contracts()`; `def test_production_contract_is_scoped_to_its_numbered_owners()`; `def test_provider_and_diagnostic_sections_preserve_current_limitations()`; `def test_durable_salvage_document_keeps_partial_paths_conditional()`; `def test_context_honesty_contract_cascades_verbatim_to_every_audience_doc()`; `def test_context_documents_are_indexed_and_links_include_valid_anchors()`
 - **tests/unit/test_context_dynamic_user_context.py** — Tests for the dynamic_user_context field on ContextResult (issue #703).
   - `async def test_system_prompt_stable_when_memory_and_rag_differ()`; `async def test_dynamic_user_context_wraps_memories_and_rag()`; `async def test_dynamic_user_context_empty_when_no_retrieval()`; `async def test_dynamic_user_context_memories_only_when_rag_empty()`; `async def test_memory_access_recorded_only_after_context_insertion()`; `async def test_record_accesses_failure_warns_and_continues()`; `async def test_dynamic_user_context_rag_only_when_memories_empty()`; `async def test_system_prompt_does_not_contain_memory_or_rag_markers()`; `…`
 - **tests/unit/test_context_feature_store_accessor.py** — Regression tests for F152 — the context/save tool paths that call ``context_manager._get_conversation_store()``.
@@ -2711,7 +2713,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_gcp_auth.py** — Tests for the shared GCP credential discovery in ``kestrel_sovereign.features.deploy._gcp_auth``.
   - `def test_setup_gcp_auth_clears_stale_credentials_env_var(tmp_path, monkeypatch, caplog)`; `def test_setup_gcp_auth_keeps_valid_credentials_env_var(tmp_path, monkeypatch)`
 - **tests/unit/test_generate_feature_docs.py** — Tests for the feature-doc generation pipeline.
-  - `def test_generator_uses_canonical_source_path()`; `def test_dry_run_returns_expected_output_paths(capsys)`; `def test_okf_frontmatter_for_generated_docs_is_deterministic()`; `def test_checked_in_generated_docs_have_okf_metadata()`; `def test_compose_generated_body_preserves_boundary_contract_verbatim()`; `def test_generator_rejects_non_bundled_surface_promotions(claim)`; `def test_checked_in_docs_copy_the_canonical_boundary_contract_verbatim()`; `def test_generated_docs_explain_why_full_regeneration_is_not_deterministic_ci()`; `…`
+  - `def test_generator_uses_canonical_source_path()`; `def test_dry_run_returns_expected_output_paths(capsys)`; `def test_okf_frontmatter_for_generated_docs_is_deterministic()`; `def test_checked_in_generated_docs_have_okf_metadata()`; `def test_compose_generated_body_preserves_boundary_contract_verbatim()`; `def test_generator_rejects_non_bundled_surface_promotions(claim)`; `def test_generator_rejects_context_overclaims(claim)`; `def test_generated_links_are_rebased_only_when_root_relative()`; `…`
 - **tests/unit/test_github_processor.py** — Tests for Kestrel Talon (GitHub/ADO issue processor).
   - `class TestTalonConfig`; `class TestIssueContext`; `class TestProcessingResult`; `class TestCIStatus`; `class TestGitHubClientExtraction`; `class TestTalonE2E`
 - **tests/unit/test_github_repo_discovery.py** — —

@@ -78,8 +78,9 @@ class ToolContextManager:
         """
         Get detailed context window status for agent introspection.
 
-        Uses the same data path as the LLM to ensure the status report
-        reflects what the model actually receives.
+        This legacy helper estimates utilization from session history. It does
+        not reproduce production retrieval, elastic borrowing, lumpy pruning,
+        or provider framing.
 
         Args:
             counter: TokenCounter for token counting
@@ -92,7 +93,7 @@ class ToolContextManager:
         """
         from .token_budget import create_budget
 
-        # Use provided history (same as LLM sees) or fetch with same constraints
+        # Use provided history or approximate the production 50-row preload.
         if history is None:
             conv_store = self._get_conversation_store()
             if conv_store:
@@ -153,7 +154,10 @@ class ToolContextManager:
             "message_count": message_count,
             "oldest_message_age": oldest_timestamp,
             "model": self.model,
-            "note": "Status reflects the same data path used by the LLM (session-filtered, limited to 50 messages)."
+            "note": (
+                "Legacy projection from session-filtered history limited to "
+                "50 messages; not an exact production prompt trace."
+            )
         }
 
         # Nest context analysis from the accumulator (if provided)

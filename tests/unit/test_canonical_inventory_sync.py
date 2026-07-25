@@ -3,16 +3,30 @@
 from pathlib import Path
 
 from kestrel_sovereign.feature_inventory import (
+    GENERATED_END,
+    GENERATED_START,
+    build_inventory,
     discover_app_routes,
     discover_core_feature_modules,
     discover_endpoint_router_files,
     discover_exported_feature_classes,
     discover_router_routes,
+    render_inventory_markdown,
 )
 from scripts import check_docs_links
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_canonical_inventory_generated_region_is_exact():
+    text = (PROJECT_ROOT / "KESTREL_FEATURES.md").read_text(encoding="utf-8")
+    start = text.index(GENERATED_START)
+    end = text.index(GENERATED_END, start) + len(GENERATED_END)
+    checked_in = text[start:end].strip()
+    rendered = render_inventory_markdown(build_inventory()).strip()
+
+    assert checked_in == rendered
 
 
 def test_canonical_inventory_keeps_feature_snapshot_counts_in_sync():

@@ -460,6 +460,14 @@ def render_inventory_markdown(inventory: Inventory) -> str:
         lines.append("")
         lines.append(f"- Source: [`{feature.source}`]({feature.source})")
         lines.append(f"- Enablement state: `{feature.enablement_state}`")
+        if feature.module == "context":
+            lines.extend([
+                "- `context_status` is a cheap diagnostic projection shared with",
+                "  `GET /api/agent/context-status`; it is not an exact trace of the production",
+                "  retrieval/pruning path. The endpoint's `full=true` mode adds read-only live",
+                "  retrieval but retains the",
+                "  [documented #2534 limitation](docs/architecture/CONTEXT_SYSTEM_DESIGN.md#honesty-boundary-issue-2534).",
+            ])
         if not feature.tools:
             lines.append("- Tools: none discovered")
             lines.append("")

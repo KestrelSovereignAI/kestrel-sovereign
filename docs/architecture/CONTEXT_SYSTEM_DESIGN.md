@@ -141,10 +141,12 @@ loaded-feature prompt is handled later by its own total-token gate.
 
 ### 3. Read canonical, session-scoped history
 
-Outside `EPHEMERAL` privacy mode, production reads the active session's stored
-history. Rows marked `excluded_from_context` are not selected. In `EPHEMERAL`
-mode Kestrel intentionally supplies the system/constitution plus an ephemeral
-notice, without persisted history, memory, or RAG.
+Outside `EPHEMERAL` privacy mode, each production turn preloads at most the
+latest **50** eligible entries from the active session. Persistent history
+excludes rows marked `excluded_from_context`; `ISOLATED` history instead comes
+from the session's bounded in-memory store and has no persistent row ids. In
+`EPHEMERAL` mode Kestrel intentionally supplies the system/constitution plus an
+ephemeral notice, without persisted history, memory, or RAG.
 
 Conversation rows have two different content contracts:
 
@@ -155,9 +157,9 @@ Conversation rows have two different content contracts:
 
 The split prevents transient retrieval text from becoming the user's canonical
 utterance while preserving byte-stable replay for prompt caches. Both columns
-use the conversation store's configured encryption path. Legacy `sent_form`
-rows that stored rendered bytes in `content` are split during read and
-opportunistically migrated.
+use the conversation store's configured encryption path. Legacy **user** rows
+with `sent_form` metadata that stored rendered bytes in `content` are split
+during read and opportunistically migrated.
 
 `ContextBuilder.format_conversation_history()` replays rendered sent forms. A
 legacy user row without that marker is wrapped with the current anti-injection
@@ -209,7 +211,8 @@ canonical utterance.
 
 ### 6. Select cache-stable history with lumpy pruning
 
-History is not continuously squeezed by a few messages on every turn.
+Within that at-most-50-entry production preload, history is not continuously
+squeezed by a few messages on every turn.
 `compute_lumpy_anchor()` selects a suffix that fits a stable target. The anchor
 uses the section's **static history allocation**, rather than the turn's
 temporary elastic slack, so a small change in retrieved material does not move
@@ -291,7 +294,7 @@ apply these material transformations:
 
 | Route family | Current transport behavior |
 |---|---|
-| Anthropic / Claude | Extracts the leading system prompt into Anthropic's top-level system field, converts tool results to Anthropic blocks, and attaches supported ephemeral cache-control breakpoints to stable system/tools/history positions. Inline system messages are retained only on routes that advertise support; otherwise the adapter repairs/demotes them. |
+| Anthropic / Claude | Extracts the leading system prompt into Anthropic's top-level system field, converts tool results to Anthropic blocks, and attaches supported ephemeral cache-control breakpoints to stable system/tools/history positions. Inline system messages are retained only when the selected route **and model** advertise support; otherwise the adapter repairs/demotes them. |
 | Native OpenAI | Sends OpenAI message/tool forms and may supply a stable `prompt_cache_key`. Compatible OpenAI-shaped routes are not assumed to support native-only cache or message features. |
 | Gemini / Vertex | Converts messages to native role/parts structures. A system instruction may be represented as an initial user turn plus a model acknowledgement where required by the transport. |
 | Ollama | Sends Ollama chat messages and separate image fields. `num_ctx` is a route option and can cap the usable window independently of a model-family headline limit. |
@@ -299,9 +302,11 @@ apply these material transformations:
 
 For `openai:plan`, the per-turn Kestrel projection and Codex's server-side
 thread occupancy are different measurements. Codex token-usage notifications
-drive the latter, and Kestrel can compact durable session history and reset the
-thread at the configured occupancy threshold. Do not infer server thread
-occupancy from the size of one outbound turn.
+drive the latter. Above the configured occupancy threshold Kestrel makes a
+best-effort attempt to compact durable session history; it resets the Codex
+thread only after that compaction reports success. Too-short history and any
+compaction error leave the thread unchanged and allow the turn to proceed. Do
+not infer server thread occupancy from the size of one outbound turn.
 
 See the adapter modules in [`kestrel_sovereign/llm/`](../../kestrel_sovereign/llm/)
 and the routing contract in
@@ -315,9 +320,11 @@ and the routing contract in
 
 - Without an active session, it returns an idle status and does not query
   storage.
-- The default (`full=false`) is a cheap projection. It measures stored history,
-  stable sections, and best-effort tool schemas, but intentionally skips live
-  memory and RAG retrieval.
+- For an active session, diagnostics may load up to **10,000** stored rows,
+  unlike the production turn's latest-50 preload.
+- The default (`full=false`) is a cheap projection. It measures that diagnostic
+  history set, stable sections, and best-effort tool schemas, but intentionally
+  skips live memory and RAG retrieval.
 - `full=true` uses the latest stored canonical user turn as the retrieval query
   and performs read-only memory and RAG lookup. If no stored user query exists,
   the RAG row is explicitly labeled as an estimate without a representative
@@ -327,19 +334,22 @@ The response includes the resolved model/route identity, context limit,
 response reserve, total budget, measured section breakdown, utilization and
 warning status, route-cap details, salvage counters, and—when available—the
 separate Codex thread occupancy. Tool-schema and provider-framing counts remain
-best-effort estimates.
+best-effort estimates. `silently_pruned_path_active` is derived from whether
+the durable-salvage feature flag is enabled; it is not observation that a
+particular turn did or did not create salvage evidence.
 
 ### Honesty boundary: issue #2534
 
 > **Diagnostic limitation:** neither mode is an exact dry-run of
-> `ContextManager.build_context()`. Open
-> [#2534](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2534)
-> tracks the remaining drift. Measurement uses its own non-elastic adaptive
+> `ContextManager.build_context()`.
+> [Issue #2534](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2534)
+> remains open and tracks the remaining drift. Measurement uses its own non-elastic adaptive
 > coordinator and does not execute the production lumpy-anchor/safety-prune
-> path. Its full retrieval path also does not reproduce every production
-> trivial-turn, relevance, and configured RAG-floor gate. Therefore
-> `context-status` is a planning signal, not a receipt for the exact bytes sent
-> to a provider.
+> path. It may consider up to 10,000 stored rows while production preloads only
+> the latest 50 eligible entries. Its full retrieval path also does not
+> reproduce every production trivial-turn, relevance, and configured RAG-floor
+> gate. Therefore `context-status` is a planning signal, not a receipt for the
+> exact bytes sent to a provider.
 
 Shared wrappers and counters reduce drift; they do not erase this coordinator
 difference. This documentation issue intentionally does not change or close
@@ -372,15 +382,20 @@ Three distinct behaviors coexist:
 | Behavior | Status |
 |---|---|
 | Default lumpy history omission; source rows remain stored | **Shipped** |
-| Manual durable compaction/exclusion through Context tools and Codex occupancy handling | **Shipped**, when invoked or route-triggered |
-| Synchronous salvage marker/write plus background `SalvageWorker` processing during automatic pruning | **Conditional**, behind `KESTREL_CONTEXT_C_DURABLE_SALVAGE` |
+| Manual durable compaction/exclusion through Context tools | **Shipped**, when invoked |
+| Codex occupancy-triggered durable compaction | **Conditional best-effort**, on `openai:plan`; the thread resets only after successful compaction |
+| Synchronous salvage marker/write plus background `SalvageWorker` processing during automatic pruning | **Conditional**, behind `KESTREL_CONTEXT_C_DURABLE_SALVAGE` and limited to pruned spans that map to id-bearing persistent history |
 | Complete automatic Context C lifecycle and all guarantees in the original design | **Aspirational** |
 
-When the experimental flag is enabled, automatic pruning fails closed if the
-durable marker/write cannot be established. The asynchronous worker and janitor
-live in [`kestrel_sovereign/agent/salvage.py`](../../kestrel_sovereign/agent/salvage.py).
-That partial implementation does not make every state machine, dispatcher, UX,
-or recovery guarantee in the design record current. See
+When the experimental flag is enabled **and** a pruned span has persistent row
+ids, that conditional path fails closed if its durable store or marker/write is
+unavailable. A span that cannot be identified—such as id-less `ISOLATED`
+history—does not enter that fail-closed salvage branch. The asynchronous worker
+and janitor live in
+[`kestrel_sovereign/agent/salvage.py`](../../kestrel_sovereign/agent/salvage.py).
+The flag-derived status indicator is not per-turn evidence, and this partial
+implementation does not make every state machine, dispatcher, UX, or recovery
+guarantee in the design record current. See
 [Context C Durable Salvage](CONTEXT_C_DURABLE_SALVAGE.md) for the intended
 end state.
 

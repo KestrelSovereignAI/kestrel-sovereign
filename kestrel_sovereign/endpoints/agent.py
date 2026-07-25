@@ -1048,12 +1048,12 @@ async def compute_context_status(
     session_id: Optional[str] = None,
     full: bool = False,
 ) -> Dict[str, Any]:
-    """Honest whole-window context status + per-section breakdown.
+    """Projected whole-window context status + per-section breakdown.
 
     Single source of truth for BOTH the chat-footer pill (via the HTTP route
     above) AND the agent ``context_status`` tool (#1969). Before this, the tool
     used a separate cross-session, raw-content token count and drifted from this
-    session-scoped, canonical ``measure_context_breakdown`` measurement.
+    session-scoped ``measure_context_breakdown`` projection.
 
     The pill in the chat footer (chat.js) reads ``utilization_percent``
     and renders the ● N msgs · X% indicator. The popup (#1310) reads
@@ -1126,11 +1126,9 @@ async def compute_context_status(
         counter = get_token_counter(current_model)
         context_limit = counter.get_context_limit()
 
-        # 4. Run the canonical per-section measurement (A / #1308).
-        # ``measure_context_breakdown`` is the single source of truth
-        # for what the LLM call would actually see — popup and pill
-        # cannot drift from production accounting (Emma's "popup must
-        # reflect what the model sees" invariant from PR #1306).
+        # 4. Run the shared per-section diagnostic projection (A / #1308).
+        # Popup and pill share this computation, but it is not an exact
+        # dry-run of ContextManager's retrieval, elastic, or lumpy-prune path.
         from kestrel_sovereign.agent.context_builder import ContextBuilder
         agent_ctx_builder = getattr(agent, 'context_builder', None)
         ctx_builder = ContextBuilder(
@@ -1273,7 +1271,7 @@ async def compute_context_status(
         except Exception as e:
             logger.debug(f"salvage counts fetch failed for breakdown: {e}")
 
-        # 5. Pill % = honest whole-window utilization (the design's
+        # 5. Pill % = projected whole-window utilization (the design's
         # core correctness fix: previously the pill reported history
         # slice utilization, which was misleading whenever other
         # sections dominated). Greenfield — no compat constraint
@@ -1301,15 +1299,9 @@ async def compute_context_status(
                 "compaction strongly recommended"
             )
 
-        # 7. Auto-detect the legacy silent-prune path (Emma's
-        # 2026-05-20 hardening, design doc §"D auto-detect invariant").
-        # When C / #1311's feature flag is enabled in production, the
-        # prune path emits sync salvage records and this flag flips
-        # to False — which is the release-gate signal for epic #1307
-        # (Emma 2026-05-21: gate keys off this flag, not off ticket
-        # closure). When the flag is disabled the legacy silent-prune
-        # remains active and the popup unconditionally surfaces the
-        # warning.
+        # 7. Surface the durable-salvage configuration state. This flag-derived
+        # indicator does not prove that a particular prune produced a marker;
+        # id-less/in-memory history cannot be mapped to a persistent span.
         try:
             from kestrel_sovereign.agent.salvage import (
                 is_durable_salvage_enabled,
@@ -1400,8 +1392,8 @@ async def compute_context_status(
                     # On the cheap footer poll (``full=False``) the
                     # breakdown was measured without RAG, so the
                     # projection is a FLOOR — the real turn payload may
-                    # be higher. The popup (``full=True``) runs RAG and
-                    # the projection is accurate. The UI uses this flag
+                    # be higher. The popup (``full=True``) runs RAG but
+                    # remains a projection. The UI uses this flag
                     # to label the pill / popup honestly (codex round 1
                     # P2 on #1503).
                     "includes_rag": bool(full),
@@ -1429,7 +1421,7 @@ async def compute_context_status(
             "context_model": current_model,
             "model_source": model_identity["model_source"],
             "message_count": message_count,
-            "total_tokens": total_measured,  # honest whole-window total
+            "total_tokens": total_measured,  # projected whole-window total
             "context_limit": context_limit,
             "response_reserve": breakdown["response_reserve"],
             "total_budget": total_budget,
@@ -1452,9 +1444,7 @@ async def compute_context_status(
             # openai:plan, since that figure only measures Kestrel's per-turn
             # payload — not the server-side thread that actually compacts.
             "codex_thread": codex_thread_block,
-            # While C has not shipped, this stays True per the
-            # auto-detection invariant. When C lands and the prune
-            # path emits sync salvage records, flip this to False.
+            # Configuration-derived indicator, not per-turn salvage evidence.
             "silently_pruned_path_active": silently_pruned_path_active,
         }
     except Exception as e:
