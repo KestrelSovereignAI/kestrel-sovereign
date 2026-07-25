@@ -877,9 +877,9 @@ def test_rollout_effect_advisory_key_never_uses_bootstrap_sentinel(monkeypatch):
             return b"\0" * 32
 
     monkeypatch.setattr(
-        scheduler_runner_module.hashlib,
-        "sha256",
-        lambda _payload: ZeroDigest(),
+        scheduler_runner_module,
+        "hashlib",
+        SimpleNamespace(sha256=lambda _payload: ZeroDigest()),
     )
 
     assert SchedulerRunner._rollout_effect_advisory_key("did:scheduler:zero") != 0

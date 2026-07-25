@@ -450,9 +450,9 @@ async def test_postgres_bootstrap_remaps_zero_effect_advisory_key(
             return b"\0" * 32
 
     monkeypatch.setattr(
-        scheduler_runner_module.hashlib,
-        "sha256",
-        lambda _payload: ZeroDigest(),
+        scheduler_runner_module,
+        "hashlib",
+        SimpleNamespace(sha256=lambda _payload: ZeroDigest()),
     )
     agent_id = f"did:scheduler:zero-effect-key:{uuid4()}"
 
