@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from contextlib import asynccontextmanager
+import time
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
@@ -2368,3 +2369,157 @@ async def test_shutdown_drains_committed_reservation_repair_before_owner_release
         if not dispatcher._durable_shutdown:
             await dispatcher.shutdown_durable_delivery()
         await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_releases_admission_without_waiting_on_lifecycle_lock(
+    tmp_path,
+):
+    """An admitted dispatch cannot leak its count when cancellation repeats.
+
+    The old release path awaited ``_durable_lifecycle_lock`` from its
+    ``finally``.  The second cancellation below landed at exactly that await,
+    leaving shutdown permanently blocked on a leaked admission.
+    """
+    backend, agent, dispatcher = await _dispatcher(
+        tmp_path / "admission-release-cancellation.db", "did:agent:one"
+    )
+    original_append = dispatcher._store.append
+    append_entered = asyncio.Event()
+    allow_append = asyncio.Event()
+    dispatch_task = None
+
+    async def block_append(*args, **kwargs):
+        append_entered.set()
+        await allow_append.wait()
+        return await original_append(*args, **kwargs)
+
+    dispatcher._store.append = block_append
+    try:
+        dispatch_task = asyncio.create_task(
+            dispatcher.dispatch_signal(
+                _signal(agent_id=agent.did, message="cancelled-at-release"),
+                source_event_id="cancelled-at-release",
+            )
+        )
+        await asyncio.wait_for(append_entered.wait(), timeout=1.0)
+
+        await dispatcher._durable_lifecycle_lock.acquire()
+        dispatch_task.cancel()
+        await asyncio.sleep(0)
+        # This is harmless with synchronous release, but it interrupted the
+        # old ``async with lifecycle_lock`` finalizer before it decremented.
+        dispatch_task.cancel()
+        allow_append.set()
+        dispatcher._durable_lifecycle_lock.release()
+
+        with pytest.raises(asyncio.CancelledError):
+            await dispatch_task
+        await asyncio.wait_for(dispatcher._drain_outcome_log_tasks(), timeout=1.0)
+        assert dispatcher._durable_active_admissions == 0
+        assert dispatcher._durable_admissions_drained.is_set()
+
+        await asyncio.wait_for(dispatcher.shutdown_durable_delivery(), timeout=1.0)
+        assert dispatcher._durable_runtime_owner_registered is False
+    finally:
+        allow_append.set()
+        dispatcher._store.append = original_append
+        if dispatcher._durable_lifecycle_lock.locked():
+            dispatcher._durable_lifecycle_lock.release()
+        if dispatch_task is not None and not dispatch_task.done():
+            with suppress(asyncio.CancelledError):
+                await dispatch_task
+        if not dispatcher._durable_shutdown:
+            await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_queued_outcome_log_cancellation_reconciles_its_admission(tmp_path):
+    """A writer cancelled before its first turn cannot hold shutdown open."""
+    backend, agent, dispatcher = await _dispatcher(
+        tmp_path / "queued-outcome-log-cancellation.db", "did:agent:one"
+    )
+    queued_log = None
+    try:
+        async with dispatcher._admit_durable_operation():
+            dispatcher._success(
+                _signal(agent_id=agent.did, message="never-written"),
+                time.monotonic(),
+                _registration(agent),
+            )
+            queued_log = next(iter(dispatcher._outcome_log_tasks))
+            queued_log.cancel()
+
+        await asyncio.wait_for(dispatcher._durable_admissions_drained.wait(), timeout=1.0)
+        assert queued_log.done()
+        assert dispatcher._durable_active_admissions == 0
+        assert await backend.fetch_val("SELECT COUNT(*) FROM signal_log") == 0
+
+        await asyncio.wait_for(dispatcher.shutdown_durable_delivery(), timeout=1.0)
+    finally:
+        if not dispatcher._durable_shutdown:
+            await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_in_worker_outcome_log_cancellation_drains_before_sqlite_close(tmp_path):
+    """A cancelled writer finishes its accepted SQLite append before close."""
+    from tests.utils.aiosqlite_workers import aiosqlite_worker
+
+    backend, agent, dispatcher = await _dispatcher(
+        tmp_path / "in-worker-outcome-log-cancellation.db", "did:agent:one"
+    )
+    connection = backend._connection
+    assert connection is not None
+    worker = aiosqlite_worker(connection)
+    original_append = dispatcher._store.append
+    append_entered = asyncio.Event()
+    allow_append = asyncio.Event()
+    outcome_log = None
+    shutdown_task = None
+
+    async def block_append(*args, **kwargs):
+        append_entered.set()
+        await allow_append.wait()
+        return await original_append(*args, **kwargs)
+
+    dispatcher._store.append = block_append
+    try:
+        async with dispatcher._admit_durable_operation():
+            dispatcher._success(
+                _signal(agent_id=agent.did, message="must-finish-writing"),
+                time.monotonic(),
+                _registration(agent),
+            )
+            outcome_log = next(iter(dispatcher._outcome_log_tasks))
+            await asyncio.wait_for(append_entered.wait(), timeout=1.0)
+            outcome_log.cancel()
+            await asyncio.sleep(0)
+            assert not outcome_log.done()
+
+        shutdown_task = asyncio.create_task(dispatcher.shutdown_durable_delivery())
+        await asyncio.sleep(0)
+        assert not shutdown_task.done()
+
+        allow_append.set()
+        with pytest.raises(asyncio.CancelledError):
+            await outcome_log
+        await asyncio.wait_for(shutdown_task, timeout=1.0)
+
+        assert await backend.fetch_val("SELECT COUNT(*) FROM signal_log") == 1
+        await backend.close()
+        assert not worker.is_alive()
+    finally:
+        allow_append.set()
+        dispatcher._store.append = original_append
+        if outcome_log is not None and not outcome_log.done():
+            with suppress(asyncio.CancelledError):
+                await outcome_log
+        if shutdown_task is not None and not shutdown_task.done():
+            await shutdown_task
+        if not dispatcher._durable_shutdown:
+            await dispatcher.shutdown_durable_delivery()
+        if backend._connection is not None:
+            await backend.close()

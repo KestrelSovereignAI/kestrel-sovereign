@@ -232,6 +232,18 @@ class _TransientDurableHandoff:
     initial_lease_token: Optional[str] = None
 
 
+@dataclass
+class _DurableAdmissionReservation:
+    """One synchronous claim on the dispatcher lifecycle gate.
+
+    Releasing a reservation must never await: cancellation is delivered only
+    at await boundaries, so a synchronous, idempotent release cannot strand
+    the active-admission count after an operation's ``finally`` begins.
+    """
+
+    released: bool = False
+
+
 def _agent_accepts_kwarg(callable_: Any, name: str) -> bool:
     """Return True iff `callable_` declares `name` as a parameter or
     accepts arbitrary kwargs (`**kwargs`). Used to feature-detect
@@ -455,6 +467,13 @@ class SignalDispatcher:
         ] = contextvars.ContextVar(
             f"durable_delivery_admission:{id(self)}", default=None
         )
+        # Outcome logging is accepted as part of the dispatch that formed the
+        # result.  These tasks deliberately do not live in the agent's general
+        # background-task set: that set is cancelled before durable teardown,
+        # while a log write sharing this backend must be drained (or its
+        # cancelled-before-start reservation reconciled) before storage closes.
+        self._outcome_log_tasks: set[asyncio.Task] = set()
+        self._outcome_log_tasks_by_signal: dict[str, set[asyncio.Task]] = {}
         # This task owns teardown, rather than whichever public caller first
         # requested it.  Callers await it through ``shield`` so cancellation
         # of an agent's bounded shutdown wrapper cannot abandon a committed
@@ -527,25 +546,54 @@ class SignalDispatcher:
                 self._durable_admission.reset(token)
             return
 
-        async with self._durable_lifecycle_lock:
+        await self._durable_lifecycle_lock.acquire()
+        try:
             if self._durable_shutdown:
                 raise _DurableDeliveryShuttingDownError(
                     "Durable signal delivery is shutting down"
                 )
-            self._durable_active_admissions += 1
+            reservation = self._reserve_durable_admission()
             self._durable_admission_owners.add(current_task)
-            self._durable_admissions_drained.clear()
+        finally:
+            # ``Lock.release`` is synchronous.  Keeping this out of an
+            # ``async with`` avoids another cancellation boundary between
+            # deciding admission and publishing its reservation.
+            self._durable_lifecycle_lock.release()
 
         token = self._durable_admission.set((current_task, 1))
         try:
             yield
         finally:
             self._durable_admission.reset(token)
-            async with self._durable_lifecycle_lock:
-                self._durable_active_admissions -= 1
-                self._durable_admission_owners.discard(current_task)
-                if self._durable_active_admissions == 0:
-                    self._durable_admissions_drained.set()
+            # This finalizer is intentionally await-free.  A cancellation may
+            # arrive at every other exit boundary, but cannot interrupt the
+            # exactly-once counter release and leave shutdown waiting forever.
+            self._durable_admission_owners.discard(current_task)
+            self._release_durable_admission(reservation)
+
+    def _reserve_durable_admission(self) -> _DurableAdmissionReservation:
+        """Synchronously reserve one unit of dispatcher/storage lifetime.
+
+        The caller has already linearized admission with lifecycle shutdown.
+        This is also used while a dispatch is still admitted to transfer that
+        lifetime to an outcome-log task before the dispatch can return.
+        """
+        self._durable_active_admissions += 1
+        self._durable_admissions_drained.clear()
+        return _DurableAdmissionReservation()
+
+    def _release_durable_admission(
+        self, reservation: _DurableAdmissionReservation
+    ) -> None:
+        """Release one lifetime reservation without an await boundary."""
+        if reservation.released:
+            return
+        reservation.released = True
+        if self._durable_active_admissions <= 0:
+            raise RuntimeError("Durable admission accounting underflow")
+        self._durable_active_admissions -= 1
+        if self._durable_active_admissions == 0:
+            self._durable_admissions_drained.set()
 
     def has_live_durable_admission_in_current_context(self) -> bool:
         """Whether this task inherited a still-live durable admission.
@@ -626,7 +674,7 @@ class SignalDispatcher:
         ctx_token = set_current_signal(signal)
         try:
             async with self._admit_durable_operation():
-                return await self._run(
+                result = await self._run(
                     signal,
                     start,
                     source_event_id=(
@@ -635,6 +683,12 @@ class SignalDispatcher:
                         else getattr(signal, "source_event_id", None)
                     ),
                 )
+                # The public dispatch contract returns only after its own
+                # outcome entry has reached a terminal write result.  The task
+                # remains separately admitted so a caller cancellation in
+                # this await cannot create a storage-close gap.
+                await self._drain_outcome_logs_for_signal(signal.id)
+                return result
         except _DurableDeliveryShuttingDownError:
             return self._durable_shutdown_signal_result(signal, start)
         except Exception as e:
@@ -911,6 +965,7 @@ class SignalDispatcher:
         # committed reservation task created immediately before its parent
         # completed.
         await self._durable_admissions_drained.wait()
+        await self._drain_outcome_log_tasks()
         await self._stop_runtime_owner_heartbeat()
         await self._drain_post_commit_reservation_repairs()
         async with self._transient_durable_initial_claim_lock:
@@ -928,6 +983,31 @@ class SignalDispatcher:
                 )
                 self._durable_runtime_owner_registered = False
                 self._durable_runtime_owner_registration_started = False
+
+    async def _drain_outcome_log_tasks(self) -> None:
+        """Join every accepted outcome log before releasing shared storage.
+
+        Each task owns a lifecycle reservation, so normally the admission
+        event above is set only after this set is empty.  Keep this explicit
+        drain as a defensive second half of that contract: a task can complete
+        between the event wake-up and this check, and a task cancelled before
+        its first turn still runs its done callback to reconcile the
+        reservation without ever touching storage.
+        """
+        while self._outcome_log_tasks:
+            tasks = tuple(self._outcome_log_tasks)
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in tasks),
+                return_exceptions=True,
+            )
+
+    async def _drain_outcome_logs_for_signal(self, signal_id: str) -> None:
+        """Join this dispatch's outcome writers before returning its result."""
+        while tasks := self._outcome_log_tasks_by_signal.get(signal_id):
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in tuple(tasks)),
+                return_exceptions=True,
+            )
 
     def shutdown(self) -> None:
         """Compatibility teardown for embeddings that cannot await shutdown.
@@ -2629,12 +2709,7 @@ class SignalDispatcher:
             artifact=artifact if artifact is not None else cognition_result,
             action_result=action_result,
         )
-        # Fire-and-forget log write; if logging fails it's logged but does
-        # not fail the dispatch.
-        self._agent._track_background_task(
-            self._log_safe(signal, registration, result, audit=audit),
-            name=f"signal_log:{signal.source}:{signal.id}",
-        )
+        self._schedule_outcome_log(signal, registration, result, audit=audit)
         return result
 
     def _fail(
@@ -2655,11 +2730,61 @@ class SignalDispatcher:
             error=error,
         )
         if registration is not None:
-            self._agent._track_background_task(
-            self._log_safe(signal, registration, result, audit=audit),
-            name=f"signal_log:{signal.source}:{signal.id}",
-        )
+            self._schedule_outcome_log(signal, registration, result, audit=audit)
         return result
+
+    def _schedule_outcome_log(
+        self,
+        signal: Signal,
+        registration: SourceRegistration,
+        result: SignalResult,
+        *,
+        audit: Optional[_ConstitutionAudit] = None,
+    ) -> None:
+        """Transfer an admitted dispatch's lifetime to its outcome writer.
+
+        ``_success`` and ``_fail`` run before their parent dispatch releases
+        its admission.  Reserve the writer synchronously *before* scheduling
+        it, so shutdown cannot observe zero admitted work in the gap before a
+        queued task gets its first event-loop turn.  The task's done callback
+        is the sole release point, which also covers cancellation before its
+        coroutine body starts.
+        """
+        reservation = self._reserve_durable_admission()
+        try:
+            task = asyncio.create_task(
+                self._log_safe(signal, registration, result, audit=audit),
+                name=f"durable_signal_log:{signal.source}:{signal.id}",
+            )
+        except BaseException:
+            self._release_durable_admission(reservation)
+            raise
+
+        self._outcome_log_tasks.add(task)
+        self._outcome_log_tasks_by_signal.setdefault(signal.id, set()).add(task)
+
+        def _complete(task: asyncio.Task) -> None:
+            self._outcome_log_tasks.discard(task)
+            signal_tasks = self._outcome_log_tasks_by_signal.get(signal.id)
+            if signal_tasks is not None:
+                signal_tasks.discard(task)
+                if not signal_tasks:
+                    self._outcome_log_tasks_by_signal.pop(signal.id, None)
+            self._release_durable_admission(reservation)
+            if task.cancelled():
+                return
+            try:
+                task.result()
+            except Exception:
+                # _log_safe reports storage/UI errors itself.  This is a
+                # defensive harvest for an unexpected task-body failure.
+                logger.error(
+                    "Signal outcome-log task failed for %s",
+                    signal.id,
+                    exc_info=True,
+                )
+
+        task.add_done_callback(_complete)
 
     async def _log_safe(
         self,
@@ -2669,28 +2794,50 @@ class SignalDispatcher:
         *,
         audit: Optional[_ConstitutionAudit] = None,
     ) -> None:
+        # A direct cancellation can land while SQLite has queued the append
+        # but before its worker returns.  Keep the real writer in a child task
+        # and shield it until it settles; otherwise the outer task's done
+        # callback could release the lifecycle reservation and let shutdown
+        # close the backend ahead of that queued write.
+        writer = asyncio.create_task(
+            self._write_outcome_log(signal, registration, result, audit=audit),
+            name=f"durable_signal_log_writer:{signal.source}:{signal.id}",
+        )
+        cancelled = False
+        while not writer.done():
+            try:
+                await asyncio.shield(writer)
+            except asyncio.CancelledError:
+                # Preserve cancellation for the caller after the accepted
+                # write has reached a terminal outcome.  Repeated
+                # cancellation cannot create a post-close SQLite operation.
+                cancelled = True
+                continue
+
         try:
-            with suppress_write_audit():
-                result_summary = await self._store.append(
-                    signal,
-                    registration,
-                    result,
-                    prompt_template_hash=getattr(
-                        signal, _PROMPT_TEMPLATE_HASH_ATTR, None
-                    ),
-                    **_audit_to_log_kwargs(audit),
-                )
+            writer.result()
         except Exception:
-            logger.exception(
-                "Failed to write signal_log entry for %s", signal.id
+            logger.exception("Failed to write signal_log entry for %s", signal.id)
+        if cancelled:
+            raise asyncio.CancelledError()
+
+    async def _write_outcome_log(
+        self,
+        signal: Signal,
+        registration: SourceRegistration,
+        result: SignalResult,
+        *,
+        audit: Optional[_ConstitutionAudit] = None,
+    ) -> None:
+        """Persist one outcome and emit its UI side channel after commit."""
+        with suppress_write_audit():
+            result_summary = await self._store.append(
+                signal,
+                registration,
+                result,
+                prompt_template_hash=getattr(signal, _PROMPT_TEMPLATE_HASH_ATTR, None),
+                **_audit_to_log_kwargs(audit),
             )
-            # #907 review P2: contract says SSE event fires AFTER the
-            # log write. If the write failed, the audit trail is
-            # broken — emitting a signal_completed event whose
-            # signal_id can't be looked up in signal_log would mislead
-            # consumers that try to correlate. Better to be silent and
-            # surface the failure via the logger.exception above.
-            return
 
         # Phase 7 of #889: emit a UI-side-channel SSE event for non-
         # INTERNAL signals. Three rendering tiers in the design:

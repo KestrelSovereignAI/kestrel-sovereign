@@ -238,6 +238,63 @@ KESTREL_SHUTDOWN_AUDIT_TAIL_FRACTION = float(
 )
 
 
+async def await_lifecycle_task_completion(
+    task: "asyncio.Future[object]",
+) -> tuple[bool, BaseException | None]:
+    """Drive one lifecycle task to a terminal state despite caller cancellation.
+
+    A shutdown owner can be cancelled repeatedly while the task it owns still
+    has to release a durable owner or close SQLite.  ``shield`` preserves that
+    work; this helper preserves the *join*.  The returned boolean records
+    cancellation of the joiner, while the second item reports the task's
+    terminal outcome without confusing a task-cancellation with a fresh
+    cancellation of the lifecycle owner.
+    """
+    # A ``CancelledError`` raised by ``shield(task)`` is ambiguous when both
+    # tasks are cancelled in the same loop turn: it can report the owned task's
+    # terminal cancellation, this joiner's cancellation, or both.  Only the
+    # joiner itself can authoritatively tell us whether its cancellation was
+    # requested.  Do not infer that from the owned task's terminal state.
+    joiner = asyncio.current_task()
+    cancelled = bool(joiner is not None and joiner.cancelling())
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if joiner is not None and joiner.cancelling():
+                cancelled = True
+
+    if task.cancelled():
+        return cancelled, asyncio.CancelledError()
+    return cancelled, task.exception()
+
+
+async def await_agent_shutdown_completion(agent: object) -> bool:
+    """Join an agent's deferred durable cleanup without dropping it on cancel.
+
+    ``KestrelAgent.shutdown`` may transfer dispatcher release and shared
+    storage close to a continuation after its bounded user-facing shutdown
+    budget expires.  The lifecycle caller that reported that timeout remains
+    responsible for joining the continuation before its event loop exits.
+
+    Returns whether this *join* observed cancellation.  Callers choose whether
+    to re-raise after cleanup; either way the continuation has already reached
+    a terminal result, so no SQLite worker or runtime owner is orphaned.
+    """
+    waiter = getattr(agent, "wait_for_shutdown_completion", None)
+    if not callable(waiter):
+        return False
+    completion = waiter()
+    if not inspect.isawaitable(completion):
+        return False
+
+    task = asyncio.ensure_future(completion)
+    cancelled, failure = await await_lifecycle_task_completion(task)
+    if failure is not None:
+        raise failure
+    return cancelled
+
+
 def _resolve_shutdown_budget(
     minimum_tail_reserve: float = 0.0,
 ) -> tuple[float, float]:
@@ -2593,28 +2650,40 @@ class KestrelAgent(
         if dispatcher is None:
             return
 
-        try:
-            await dispatcher.shutdown_durable_delivery()
-        except asyncio.CancelledError:
-            # BootContext will continue its unwind, and _boot_teardown_storage
-            # will keep the shared backend open while this handle remains.
-            raise
-        except Exception:
-            # Durable teardown is intentionally retryable.  A failure can land
-            # after an owner-release transaction has reached the driver; join a
-            # fresh dispatcher-owned completion before deciding rollback is
-            # unsafe.  A persistent failure leaves ``self.dispatcher`` intact,
-            # which in turn keeps storage owned and open for a later shutdown.
-            logging.warning(
-                "boot rollback: durable dispatcher teardown failed; retrying "
-                "before storage release",
-                exc_info=True,
-            )
-            await dispatcher.shutdown_durable_delivery()
+        cancelled = False
+        retried_failure = False
+        while True:
+            try:
+                await dispatcher.shutdown_durable_delivery()
+                break
+            except asyncio.CancelledError:
+                # BootContext guarantees a complete rollback, but this
+                # particular step owns the dispatcher-to-storage ordering.
+                # Do not let repeated cancellation leave its owner release
+                # alive while the next rollback action closes SQLite.
+                cancelled = True
+                continue
+            except Exception:
+                if retried_failure:
+                    raise
+                # Durable teardown is intentionally retryable.  A failure can
+                # land after an owner-release transaction has reached the
+                # driver, so retry the dispatcher-owned completion before
+                # deciding rollback is unsafe. A persistent failure leaves
+                # ``self.dispatcher`` intact, which keeps storage owned and
+                # open for a later lifecycle shutdown.
+                retried_failure = True
+                logging.warning(
+                    "boot rollback: durable dispatcher teardown failed; retrying "
+                    "before storage release",
+                    exc_info=True,
+                )
 
         # Only a successfully released dispatcher may lose its public handle.
         # The following storage rollback can now close the shared backend.
         self.dispatcher = None
+        if cancelled:
+            raise asyncio.CancelledError()
 
     async def _boot_teardown_features(self) -> None:
         """Reverse every feature registration made before the failure, LIFO.
@@ -5374,9 +5443,47 @@ Expected Duration: {expected_duration}
         subsequent storage close.  ``shield`` preserves the work if an outer
         lifecycle wait is cancelled; a later owner can join the same task.
         """
-        continuation = self._durable_shutdown_continuation
-        if continuation is not None:
-            await asyncio.shield(continuation)
+        retried_failure = False
+        while True:
+            continuation = self._durable_shutdown_continuation
+            if continuation is None:
+                return
+            try:
+                await asyncio.shield(continuation)
+                return
+            except asyncio.CancelledError:
+                # A continuation can itself be cancelled (for example while
+                # releasing the runtime owner).  That is a retryable cleanup
+                # failure.  A cancellation of *this* waiter, on the other
+                # hand, must remain visible to the outer lifecycle owner,
+                # which keeps the continuation alive with ``shield``.
+                if not continuation.done() or not continuation.cancelled():
+                    raise
+                failure: BaseException = asyncio.CancelledError()
+            except Exception as exc:
+                failure = exc
+
+            if retried_failure:
+                raise RuntimeError(
+                    "Durable shutdown continuation failed after its retry; "
+                    "dispatcher release and storage close are unconfirmed"
+                ) from failure
+
+            retried_failure = True
+            dispatcher = getattr(self, "dispatcher", None)
+            if dispatcher is None or not hasattr(
+                dispatcher, "shutdown_durable_delivery"
+            ):
+                raise RuntimeError(
+                    "Durable shutdown continuation failed without a dispatcher "
+                    "available for its required retry"
+                ) from failure
+            logging.warning(
+                "Durable shutdown continuation failed; retrying dispatcher "
+                "release and storage close before lifecycle exit",
+                exc_info=(type(failure), failure, failure.__traceback__),
+            )
+            await self._ensure_durable_shutdown_continuation(dispatcher)
 
     # Tool registry methods provided by ToolRegistryMixin:
     # - _build_feature_tools, _build_all_tools, _register_explored_feature_tools

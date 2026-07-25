@@ -8,7 +8,10 @@ import os
 from pathlib import Path
 from kestrel_sovereign.storage import AsyncStorage
 from kestrel_sovereign.security.encryption import DecryptionError
-from kestrel_sovereign.kestrel_agent import KestrelAgent
+from kestrel_sovereign.kestrel_agent import (
+    KestrelAgent,
+    await_agent_shutdown_completion,
+)
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.config import load_config
 from kestrel_sovereign.filecoin_adapter import FilecoinAdapter
@@ -161,17 +164,25 @@ async def main():
     except KeyboardInterrupt:
         print("\nDeactivating agent...")
     finally:
+        cancelled = False
         # Graceful shutdown with timeout
         try:
             await asyncio.wait_for(agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
             print("Agent deactivated.")
         except asyncio.TimeoutError:
-            print(f"Agent shutdown timed out ({SHUTDOWN_TIMEOUT}s), forcing exit.")
+            print(
+                f"Agent shutdown timed out ({SHUTDOWN_TIMEOUT}s); "
+                "waiting for durable cleanup."
+            )
         except asyncio.CancelledError:
+            cancelled = True
             print("Agent shutdown cancelled.")
         except Exception as e:
             logger.debug(f"Error during shutdown: {e}")
             print("Agent deactivated (with errors).")
+        cancelled = await await_agent_shutdown_completion(agent) or cancelled
+        if cancelled:
+            raise asyncio.CancelledError()
 
 
 if __name__ == "__main__":

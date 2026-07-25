@@ -200,10 +200,12 @@ class TestAgentManagerBasics:
         manager._agent_names["did:1"] = "A"
         manager._agent_names["did:2"] = "B"
 
-        await manager.shutdown_all()
+        with pytest.raises(ExceptionGroup, match="fleet agents failed"):
+            await manager.shutdown_all()
         # Both are attempted, but a failed shutdown stays published. Removing
         # it would discard the lifecycle owner before durable cleanup can be
-        # confirmed on a later retry.
+        # confirmed on a later retry. The aggregate is raised only after B has
+        # received its own cleanup attempt.
         assert set(manager._agents) == {"A"}
         assert manager.get_agent("B") is None
         agent1.shutdown.assert_awaited_once()
