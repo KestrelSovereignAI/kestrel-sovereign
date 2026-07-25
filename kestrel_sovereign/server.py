@@ -818,6 +818,52 @@ def _unmount_feature_ui_assets(app: FastAPI) -> None:
     app.state._feature_ui_mount_paths = set()
 
 
+def _hosted_peer_directory_context(agent) -> tuple[object, object]:
+    """Return the effective directory pair for one hosted agent's A2A policy.
+
+    ``PeersFeature`` owns the local-host compatibility adapter after feature
+    initialization. Consequently a normally constructed AgentManager agent
+    can have a live ``_peer_router``/``_peer_requester`` on that feature while
+    its public constructor injection attributes remain ``None``. The hosted
+    policy must capture the former exact pair; otherwise signed same-host A2A
+    always fails closed despite the sender and recipient being valid peers.
+
+    Agents without a Peers feature retain the explicit construction-injection
+    seam. A present Peers feature is authoritative: a missing or malformed
+    live context is returned as ``(None, None)`` and makes its hosted policy
+    reject inbound delivery instead of silently falling back to stale attrs.
+    """
+
+    features = getattr(agent, "features", None)
+    peer_feature = (
+        features.get("PeersFeature")
+        if hasattr(features, "get")
+        else None
+    )
+    if peer_feature is None and features is not None:
+        values = features.values() if hasattr(features, "values") else features
+        peer_feature = next(
+            (
+                feature
+                for feature in values
+                if feature.__class__.__name__ == "PeersFeature"
+            ),
+            None,
+        )
+    if peer_feature is not None:
+        context = getattr(peer_feature, "hosted_peer_directory_context", None)
+        if not callable(context):
+            return None, None
+        resolved = context()
+        if resolved is None:
+            return None, None
+        return resolved
+    return (
+        getattr(agent, "peer_directory_router", None),
+        getattr(agent, "peer_requester", None),
+    )
+
+
 async def _onboard_host_registered_agent(app: FastAPI, manager, name: str, agent) -> None:
     """Apply host-owned integration to every newly registered agent.
 
@@ -855,12 +901,13 @@ async def _onboard_host_registered_agent(app: FastAPI, manager, name: str, agent
         federated_fallback=federated,
     )
     install_a2a_inbound_sender_authorizer(manager, recipient=agent)
+    peer_router, peer_requester = _hosted_peer_directory_context(agent)
     manager.install_a2a_hosted_policy(
         agent,
         resolver=agent.a2a_did_resolver,
         authorizer=agent.a2a_inbound_sender_authorizer,
-        router=getattr(agent, "peer_directory_router", None),
-        requester=getattr(agent, "peer_requester", None),
+        router=peer_router,
+        requester=peer_requester,
     )
     _mount_feature_ui_assets(app, agents=(agent,))
     _mount_feature_routers(app, agents=(agent,))

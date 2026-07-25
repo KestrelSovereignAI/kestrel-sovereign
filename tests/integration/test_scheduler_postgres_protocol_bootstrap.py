@@ -922,7 +922,7 @@ async def test_live_postgres_runtime_create_spawn_execute_remove_and_failure_rol
         )
         config = MultiAgentConfig(agents={"Parent": parent_config})
 
-        async def fake_get_agent_did(storage_dir):
+        async def fake_get_agent_did(storage_dir, *, mode):
             return f"did:scheduler:runtime:{storage_dir.rsplit('/', 1)[-1]}"
 
         async def fake_inception(**_kwargs):

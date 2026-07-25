@@ -1252,6 +1252,46 @@ class SchedulerRunner:
             (execution_id, task.id, task.agent_id),
         )
 
+    async def _locked_claim_metadata(
+        self, task: ScheduledTask,
+    ) -> Optional[tuple[Optional[str], Optional[str], int]]:
+        """Read recovery identity after the schedule row is locked.
+
+        ``_due_rows`` intentionally returns an unlocked snapshot.  A worker
+        can therefore select an unclaimed row, wait while another worker
+        claims it, and only resume after that claim expires.  Recovery must
+        use the claim identity now stored in the durable row, rather than the
+        stale snapshot it originally selected; otherwise it creates a second
+        execution-log/idempotency identity for one occurrence.
+
+        The caller holds ``_lock_claim_candidate``'s PostgreSQL row lock or
+        SQLite writer slot, so this is an authoritative single-row read.
+        Lightweight non-database test doubles retain their historical local
+        snapshot path and do not call this helper.
+        """
+
+        row = await self._db.fetchone(
+            """
+            SELECT claim_execution_id, claim_scheduled_for, attempt_count
+            FROM scheduled_tasks
+            WHERE id = ? AND agent_id = ?
+            """,
+            (task.id, task.agent_id),
+        )
+        if row is None:
+            return None
+        if len(row) < 3:
+            raise RuntimeError(
+                f"scheduler claim {task.id} returned incomplete durable claim metadata"
+            )
+        execution_id = row[0]
+        scheduled_for = row[1]
+        return (
+            execution_id if isinstance(execution_id, str) and execution_id else None,
+            scheduled_for if isinstance(scheduled_for, str) and scheduled_for else None,
+            int(row[2] or 0),
+        )
+
     async def _lock_live_claim_for_finalization(
         self, task: ScheduledTask, execution: SchedulerExecution
     ) -> bool:
@@ -1475,6 +1515,9 @@ class SchedulerRunner:
         if base_error is not None:
             await self._disable_invalid_idempotency_key(task, base_error)
             return None
+        # This provisional identity is used only by the legacy test-double
+        # path below. Concrete backends replace it after locking and rereading
+        # the schedule row, which is essential for stale due-row recovery.
         execution_id = (
             task.claim_execution_id
             if task.claim_scheduled_for == scheduled_for and task.claim_execution_id
@@ -1515,6 +1558,26 @@ class SchedulerRunner:
                     # expired claim on PostgreSQL.
                     if not await self._lock_claim_candidate(task):
                         return None
+                    durable_claim = await self._locked_claim_metadata(task)
+                    if durable_claim is None:
+                        # A concurrent administrative delete won after due
+                        # selection. The locked row is gone, so no execution
+                        # can be admitted from this stale snapshot.
+                        return None
+                    (
+                        durable_execution_id,
+                        durable_scheduled_for,
+                        durable_attempt_count,
+                    ) = durable_claim
+                    if (
+                        durable_execution_id is not None
+                        and durable_scheduled_for == scheduled_for
+                    ):
+                        execution_id = durable_execution_id
+                        attempt = durable_attempt_count + 1
+                    else:
+                        execution_id = str(uuid.uuid4())
+                        attempt = 1
                     await self._lock_claim_execution_log(execution_id, task)
                     lease_assignment, lease_assignment_params = (
                         self._database_lease_expiry_sql()

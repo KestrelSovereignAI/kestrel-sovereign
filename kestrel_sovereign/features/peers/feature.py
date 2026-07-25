@@ -399,6 +399,21 @@ class PeersFeature(Feature):
             return self._peer_directory_context()
         return None
 
+    def hosted_peer_directory_context(
+        self,
+    ) -> Optional[Tuple[PeerDirectoryRouter, PeerRequester]]:
+        """Return this feature's live trusted directory pair for host policy.
+
+        A normal ``KestrelAgent`` keeps constructor-injected directory fields
+        on the agent object, but the compatibility local-host adapter belongs
+        to this feature instance. The multi-agent host must install its
+        immutable inbound A2A policy from the effective feature context,
+        rather than assuming those public construction fields still describe
+        the route in use.
+        """
+
+        return self._peer_directory_context()
+
     def _requires_durable_peer_binding(self) -> bool:
         """Whether retained routes must have a durable stable identity.
 

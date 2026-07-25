@@ -19,7 +19,11 @@ from kestrel_sovereign.features.scheduler.runner import (
 )
 from kestrel_sovereign.identity.runtime_identity import IdentityReadinessError
 from kestrel_sovereign.kestrel_agent import KestrelAgent
-from kestrel_sovereign.multi_agent.agent_manager import AgentManager, _get_agent_did
+from kestrel_sovereign.multi_agent.agent_manager import (
+    AgentManager,
+    _AgentDIDLookupMode,
+    _get_agent_did,
+)
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
 from kestrel_sovereign.spawn.mandate import SpawnMandate
 from kestrel_sovereign.storage import AsyncStorage, GraphNode
@@ -100,7 +104,10 @@ class TestAgentManagerBasics:
 
         assert mapping["did:pkh:warm"][0] == "Warm"
         assert mapping["did:pkh:cold"][0] == "Cold"
-        did_lookup.assert_awaited_once_with(str(cold_dir))
+        did_lookup.assert_awaited_once_with(
+            str(cold_dir),
+            mode=_AgentDIDLookupMode.COLD_READ_ONLY,
+        )
 
     @pytest.mark.asyncio
     async def test_local_agent_configs_skips_unincepted_cold_agent_but_keeps_healthy_peer(
@@ -133,7 +140,10 @@ class TestAgentManagerBasics:
         assert manager.cold_scheduler_identity_failures == [
             ("Unincepted", missing_identity)
         ]
-        did_lookup.assert_awaited_once_with(str(tmp_path / "unincepted"))
+        did_lookup.assert_awaited_once_with(
+            str(tmp_path / "unincepted"),
+            mode=_AgentDIDLookupMode.COLD_READ_ONLY,
+        )
 
     @pytest.mark.asyncio
     async def test_local_agent_configs_skips_unresolved_autostart_agent_but_keeps_healthy_peer(
@@ -406,6 +416,37 @@ class TestAgentManagerBasics:
             for path in cold_dir.iterdir()
         }
         assert after == before
+
+    @pytest.mark.asyncio
+    async def test_initialization_did_lookup_recovers_existing_sqlite_wal(
+        self, tmp_path,
+    ):
+        """Normal startup can consume a crash-recovery WAL that cold probes refuse."""
+        agent_dir = tmp_path / "wal-recovery"
+        agent_dir.mkdir()
+        db_path = agent_dir / "kestrel_prime.db"
+        connection = sqlite3.connect(db_path)
+        try:
+            assert connection.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+            connection.execute(
+                "CREATE TABLE graph_nodes (node_id TEXT, node_type TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO graph_nodes VALUES (?, 'agent')",
+                ("did:test:wal-recovery",),
+            )
+            connection.commit()
+            assert (agent_dir / "kestrel_prime.db-wal").exists()
+
+            with pytest.raises(ValueError, match="WAL state is present"):
+                await _get_agent_did(str(agent_dir))
+
+            assert await _get_agent_did(
+                str(agent_dir),
+                mode=_AgentDIDLookupMode.INITIALIZATION,
+            ) == "did:test:wal-recovery"
+        finally:
+            connection.close()
 
     @pytest.mark.asyncio
     async def test_cold_did_lookup_stays_local_sqlite_with_postgres_environment(
@@ -749,9 +790,13 @@ class TestAgentManagerBasics:
         )
         from kestrel_sovereign.a2a.envelope_signing import (
             bound_envelope_fields,
+            canonical_message,
             sign_envelope,
             verify_inbound_envelope,
         )
+        from kestrel_sovereign.a2a.types import Message, TaskSendParams, TextPart
+        import kestrel_sovereign.endpoints.agent as agent_endpoint
+        from kestrel_sovereign.features.peers.directory import PeerRequester
         from kestrel_sovereign.identity.did_web import build_verification_methods
         from kestrel_sovereign.identity.hybrid_keypair import generate_hybrid_keypair
 
@@ -809,9 +854,26 @@ class TestAgentManagerBasics:
                 cold_did, cold_keypair.public_keys()
             ),
         )
-        cold.features = {"ColdOnly": feature}
+        # Normal AgentManager construction leaves these public injection attrs
+        # empty. Its PeersFeature owns the live local-host route instead.
+        # Onboarding must bind the immutable manager policy to this pair.
+        live_router = SimpleNamespace(
+            authorize_inbound_sender=AsyncMock(return_value=True),
+        )
+        live_requester = PeerRequester(cold_did, object())
+        live_peers_feature = SimpleNamespace(
+            hosted_peer_directory_context=lambda: (live_router, live_requester),
+            get_router=lambda: None,
+        )
+        cold.features = {
+            "ColdOnly": feature,
+            "PeersFeature": live_peers_feature,
+        }
         cold.peer_directory_router = None
         cold.peer_requester = None
+        cold.task_manager = SimpleNamespace(
+            create_task=AsyncMock(return_value=SimpleNamespace(id="cold-wake-a2a")),
+        )
         cold.shutdown = AsyncMock()
         cold.wait_for_shutdown_completion = None
         cold._set_display_name = lambda _name: None
@@ -839,6 +901,10 @@ class TestAgentManagerBasics:
         assert cold.a2a_inbound_sender_authorizer.requires_verified_sender is True
         assert cold.a2a_inbound_sender_authorizer.has_valid_current_scope() is False
         assert cold._a2a_host_manager is manager
+        hosted_policy = manager.a2a_hosted_policy_for(cold)
+        assert hosted_policy is not None
+        assert hosted_policy.router is live_router
+        assert hosted_policy.requester is live_requester
 
         # Exercise the actual verification seam, not merely resolver lookup:
         # a signed warm→cold same-host envelope must validate after the cold
@@ -863,6 +929,40 @@ class TestAgentManagerBasics:
             require_signed=True,
         )
         assert verdict.ok is True and verdict.verified is True
+
+        # Exercise the recipient's real verified-send path under the manager
+        # lease. The raw agent attrs remain None, so this would fail if the
+        # hosted policy had not captured PeersFeature's effective context.
+        send_metadata = {"sender": warm_did}
+        send_metadata["signature"] = sign_envelope(
+            warm_keypair,
+            sender=warm_did,
+            task_id="cold-wake-a2a",
+            message=canonical_message(["scheduler woke cold peer"]),
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            session_id="cold-wake-session",
+            bound=bound_envelope_fields(send_metadata),
+        )
+        params = TaskSendParams(
+            id="cold-wake-a2a",
+            sessionId="cold-wake-session",
+            message=Message(
+                role="user", parts=[TextPart(text="scheduler woke cold peer")],
+            ),
+            metadata=send_metadata,
+        )
+        created = await agent_endpoint._create_verified_a2a_task(
+            cold,
+            params,
+            params.message.parts,
+            [],
+            [],
+        )
+        assert created.id == "cold-wake-a2a"
+        live_router.authorize_inbound_sender.assert_awaited_once_with(
+            live_requester, warm_did,
+        )
+        assert cold.task_manager.create_task.await_count == 1
         with TestClient(host) as client:
             response = client.get("/cold-only")
             assert response.status_code == 200
@@ -1094,6 +1194,10 @@ class TestLoadFromConfig:
             with pytest.raises(RuntimeError, match="init failed"):
                 await manager._initialize_agent("partial", config)
 
+        mock_get_did.assert_awaited_once_with(
+            str(Path("/tmp/partial").resolve()),
+            mode=_AgentDIDLookupMode.INITIALIZATION,
+        )
         partial.shutdown.assert_awaited_once()
 
     @pytest.mark.asyncio

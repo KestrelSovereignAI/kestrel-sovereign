@@ -310,6 +310,81 @@ async def test_expired_lease_recovers_the_same_execution_identity(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_stale_due_snapshot_recovers_durable_claim_identity_after_row_lock(
+    tmp_path,
+):
+    """Recovery rereads a claim that appeared after the original due scan.
+
+    This is the interleaving a worker sees when it selects an unclaimed due
+    row, another replica claims it and dies, and the first worker finally
+    acquires the schedule-row lock.  The first worker must retain the durable
+    execution log rather than minting a second identity from its stale row.
+    """
+
+    db = await _database(tmp_path / "stale-due-recovery.db")
+    seen = []
+
+    async def executor(_name, _args):
+        seen.append(get_current_scheduler_execution())
+        return "recovered"
+
+    runner = SchedulerRunner(db, "agent-1", executor, owner_id="late-worker")
+    try:
+        await runner._ensure_tables()
+        due = await _seed_due(db)
+        stale_rows = await runner._due_rows(datetime.now(timezone.utc))
+        stale_task = ScheduledTask.from_row(stale_rows[0])
+        assert stale_task.claim_execution_id is None
+
+        expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        execution_id = "identity-published-after-due-scan"
+        occurrence_key = SchedulerRunner._occurrence_idempotency_key(
+            "stable-effect", "task-1", due,
+        )
+        await db.execute(
+            """
+            UPDATE scheduled_tasks
+            SET enabled = 0, scheduler_claim_fenced = 1,
+                lease_owner = 'dead-worker', lease_expires_at = ?,
+                claim_token = 'dead-token', claim_execution_id = ?,
+                claim_scheduled_for = ?, attempt_count = 1
+            WHERE id = ?
+            """,
+            (expired, execution_id, due, "task-1"),
+        )
+        await db.execute(
+            """
+            INSERT INTO task_execution_log
+                (id, task_id, agent_id, status, result_text, duration_ms,
+                 executed_at, occurrence_at, idempotency_key, attempt_count,
+                 claimed_at)
+            VALUES (?, 'task-1', 'agent-1', 'claimed', NULL, 0,
+                    ?, ?, ?, 1, ?)
+            """,
+            (execution_id, due, due, occurrence_key, due),
+        )
+
+        claimed = await runner._claim(stale_task, datetime.now(timezone.utc))
+        assert claimed is not None
+        assert claimed.claim_execution_id == execution_id
+        assert claimed.attempt_count == 2
+        await runner._execute_claim(claimed)
+
+        assert [execution.id for execution in seen] == [execution_id]
+        assert await db.fetchone(
+            "SELECT status, attempt_count, idempotency_key "
+            "FROM task_execution_log WHERE id = ?",
+            (execution_id,),
+        ) == ("success", 2, occurrence_key)
+        assert await db.fetchone(
+            "SELECT COUNT(*) FROM task_execution_log WHERE task_id = ?",
+            ("task-1",),
+        ) == (1,)
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_crash_before_outcome_commit_retries_with_same_idempotency_key(tmp_path):
     """Failure injection for a crash after dispatch but before outcome CAS.
 

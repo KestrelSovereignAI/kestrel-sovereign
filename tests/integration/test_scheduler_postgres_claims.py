@@ -316,6 +316,96 @@ async def test_recovery_claim_upsert_qualifies_existing_execution_log_columns(
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_stale_due_snapshot_reuses_claim_published_before_row_lock(
+    db_backend, monkeypatch,
+):
+    """The real backend keeps one execution identity across stale recovery.
+
+    This exercises the actual lock/reread ordering on PostgreSQL as well as
+    SQLite: the worker's due result has no claim, but the durable row gains an
+    expired claim before that worker enters ``_claim``.
+    """
+
+    db = AsyncDatabase(db_backend)
+    agent_id = f"scheduler-stale-recovery:{uuid4()}"
+    task_id = f"scheduler-stale-recovery-task:{uuid4()}"
+    execution_id = f"scheduler-stale-recovery-execution:{uuid4()}"
+    seen = []
+
+    async def executor(_task_name, _args):
+        seen.append(get_current_scheduler_execution())
+        return "recovered"
+
+    try:
+        await _activate_protocol_for_test_agent(db, agent_id, monkeypatch)
+        runner = SchedulerRunner(db, agent_id, executor, owner_id="stale-owner")
+        await runner._ensure_tables()
+        due = (datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat()
+        expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        base_key = "integration-stale-recovery"
+        occurrence_key = SchedulerRunner._occurrence_idempotency_key(
+            base_key, task_id, due,
+        )
+        await db.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 next_run_at, created_at, idempotency_key,
+                 scheduler_protocol_version)
+            VALUES (?, ?, 'task', '* * * * *', '{}', 1, ?, ?, ?, ?)
+            """,
+            (task_id, agent_id, due, due, base_key, SCHEDULER_PROTOCOL_VERSION),
+        )
+        stale_rows = await runner._due_rows(datetime.now(timezone.utc))
+        stale_task = ScheduledTask.from_row(stale_rows[0])
+        assert stale_task.claim_execution_id is None
+
+        await db.execute(
+            """
+            UPDATE scheduled_tasks
+            SET enabled = 0, scheduler_claim_fenced = 1,
+                lease_owner = 'dead-owner', lease_expires_at = ?,
+                claim_token = 'dead-token', claim_execution_id = ?,
+                claim_scheduled_for = ?, attempt_count = 1
+            WHERE id = ?
+            """,
+            (expired, execution_id, due, task_id),
+        )
+        await db.execute(
+            """
+            INSERT INTO task_execution_log
+                (id, task_id, agent_id, status, result_text, duration_ms,
+                 executed_at, occurrence_at, idempotency_key, attempt_count,
+                 claimed_at)
+            VALUES (?, ?, ?, 'claimed', NULL, 0, ?, ?, ?, 1, ?)
+            """,
+            (execution_id, task_id, agent_id, due, due, occurrence_key, due),
+        )
+
+        claimed = await runner._claim(stale_task, datetime.now(timezone.utc))
+        assert claimed is not None
+        assert claimed.claim_execution_id == execution_id
+        assert claimed.attempt_count == 2
+        await runner._execute_claim(claimed)
+
+        assert [execution.id for execution in seen] == [execution_id]
+        assert await db.fetchone(
+            "SELECT status, attempt_count, idempotency_key "
+            "FROM task_execution_log WHERE id = ?",
+            (execution_id,),
+        ) == ("success", 2, occurrence_key)
+        assert await db.fetchone(
+            "SELECT COUNT(*) FROM task_execution_log WHERE task_id = ?",
+            (task_id,),
+        ) == (1,)
+    finally:
+        await db.execute("DELETE FROM task_execution_log WHERE task_id = ?", (task_id,))
+        await db.execute("DELETE FROM scheduled_tasks WHERE id = ?", (task_id,))
+        await db.execute("DELETE FROM scheduler_protocol_rollout WHERE agent_id = ?", (agent_id,))
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_postgres_claim_uses_statement_time_after_real_row_lock_stall(
     db_backend, monkeypatch
 ):
