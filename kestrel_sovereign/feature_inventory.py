@@ -462,11 +462,12 @@ def render_inventory_markdown(inventory: Inventory) -> str:
         lines.append(f"- Enablement state: `{feature.enablement_state}`")
         if feature.module == "context":
             lines.extend([
-                "- `context_status` is a cheap diagnostic projection shared with",
-                "  `GET /api/agent/context-status`; it is not an exact trace of the production",
-                "  retrieval/pruning path. The endpoint's `full=true` mode adds read-only live",
-                "  retrieval but retains the",
-                "  [documented #2534 limitation](docs/architecture/CONTEXT_SYSTEM_DESIGN.md#honesty-boundary-issue-2534).",
+                "- `context_status` is the cheap dry-run view of the same typed",
+                "  `ContextManager` plan used by `GET /api/agent/context-status` and",
+                "  production turns. Cheap mode marks omitted memory/RAG sections unknown;",
+                "  `full=true` executes the production retrieval and pruning policy read-only.",
+                "  It reads anchored governing policy without lazily creating missing state.",
+                "  Provider-native framing remains outside the Kestrel plan.",
             ])
         if not feature.tools:
             lines.append("- Tools: none discovered")
