@@ -696,6 +696,11 @@ Each backup produces a `backup_artifact` node in the graph linked to the agent w
 
 `KESTREL_DATA_KEY` (a Fernet key or passphrase) is the master key for Kestrel's **application-layer** encryption at rest. It is **not** whole-database encryption. With it set, Kestrel transparently encrypts conversation-history rows, stored file blobs, agent identity private keys (`SecureKeyStorage`, AES-256-GCM), and agent-resource bodies such as the SOUL (`AgentResourceStore`, Fernet). It does **not** cover saved-item (`saved_items.content`) or RAG document-chunk (`document_chunks.content`) bodies — those are plaintext columns today, with application-layer encryption tracked in [#2677](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2677). Set it before first run:
 
+The accepted, not-yet-implemented design for closing those two gaps is
+[Saved-item and RAG content encryption](docs/architecture/security/MEMORY_CONTENT_ENCRYPTION.md).
+That ADR is a rollout contract, not a claim that the current columns are
+encrypted.
+
 ```bash
 export KESTREL_DATA_KEY=$(python - <<'PY'
 from cryptography.fernet import Fernet
