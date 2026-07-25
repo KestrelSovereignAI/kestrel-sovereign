@@ -253,6 +253,22 @@ class SchedulerProtocolVersionIncompatible(RuntimeError):
         )
 
 
+class SchedulerFeatureUnavailable(RuntimeError):
+    """A hosted agent loaded without a live SchedulerFeature dispatcher.
+
+    This is not an execution failure: a feature may be intentionally excluded
+    from a cold tenant or be soft-disabled while its persisted schedules are
+    retained.  The runner therefore leaves the durable claim recoverable
+    instead of consuming the occurrence as a failed task.
+    """
+
+    def __init__(self, agent_id: str) -> None:
+        self.agent_id = agent_id
+        super().__init__(
+            f"woken agent {agent_id!r} has no enabled SchedulerFeature dispatcher"
+        )
+
+
 def validate_schedule_idempotency_base(base: str) -> Optional[str]:
     """Return an invariant error when ``base`` cannot form an SDK-safe key."""
 
@@ -511,6 +527,7 @@ class HostedSchedulerExecutor:
         """Resolve once before admission and yield a dispatch-only closure."""
 
         agent = await self._resolve_agent(execution.agent_id)
+        self._require_enabled_scheduler_feature(agent, execution.agent_id)
 
         async def dispatch() -> Any:
             return await self._dispatch_resolved_agent(agent, execution)
@@ -535,9 +552,16 @@ class HostedSchedulerExecutor:
             dispatch = getattr(feature, "_dispatch_scheduled_task", None)
             if callable(dispatch):
                 return await dispatch(execution.task_name, execution.args)
-        raise RuntimeError(
-            f"woken agent {execution.agent_id!r} has no enabled SchedulerFeature dispatcher"
-        )
+        raise SchedulerFeatureUnavailable(execution.agent_id)
+
+    @staticmethod
+    def _require_enabled_scheduler_feature(agent: Any, agent_id: str) -> Any:
+        """Require a live scheduler feature before admitting a hosted effect."""
+
+        feature = HostedSchedulerExecutor._enabled_scheduler_feature(agent)
+        if feature is None:
+            raise SchedulerFeatureUnavailable(agent_id)
+        return feature
 
     @staticmethod
     def _enabled_scheduler_feature(agent: Any) -> Optional[Any]:
@@ -595,18 +619,30 @@ class AgentManagerHostedSchedulerExecutor(HostedSchedulerExecutor):
             return config
         return self._agent_configs.get(agent_id)
 
-    def scheduler_dispatch_enabled(self, agent_id: str) -> bool:
-        """Whether a warm tenant has an enabled SchedulerFeature.
+    async def scheduler_dispatch_enabled(self, agent_id: str) -> bool:
+        """Whether the host can safely claim work for this tenant.
 
-        This is a conservative pre-claim optimization for the hosted runner.
-        A cold tenant is intentionally left eligible: waking it merely to
-        inspect feature state would move feature initialization before the
-        scheduler's durable claim boundary. The dispatch path repeats the
-        enabled check, so an in-flight soft disable still cannot invoke a tool.
+        A warm agent is authoritative for soft-disabled state. For a cold
+        tenant, an explicit per-agent feature allowlist can reject an excluded
+        SchedulerFeature without waking it or publishing a claim. A ``None``
+        allowlist is deliberately admitted: global/runtime disable state is
+        only knowable after the cold load, where ``prepare_scheduled`` performs
+        the matching check and leaves the durable claim recoverable.
         """
 
         agent = self._loaded_agent_for(agent_id)
-        return agent is None or self._enabled_scheduler_feature(agent) is not None
+        if agent is not None:
+            return self._enabled_scheduler_feature(agent) is not None
+        config_entry = await self._live_config_for(agent_id)
+        # AgentManager returns ``(name, LocalAgentConfig)`` while lightweight
+        # compatibility adapters may return the configuration directly.
+        config = (
+            config_entry[1]
+            if isinstance(config_entry, tuple) and len(config_entry) == 2
+            else config_entry
+        )
+        allowed_features = getattr(config, "features", None)
+        return allowed_features is None or "SchedulerFeature" in allowed_features
 
     def _lifecycle_lock_for(self, agent_id: str) -> Any:
         """Return the manager's exclusive DID lifecycle lock."""
@@ -676,6 +712,9 @@ class AgentManagerHostedSchedulerExecutor(HostedSchedulerExecutor):
                             "Hosted scheduler authority was revoked for "
                             f"{execution.agent_id!r}"
                         )
+                    self._require_enabled_scheduler_feature(
+                        agent, execution.agent_id
+                    )
 
                     async def dispatch() -> Any:
                         return await self._dispatch_resolved_agent(agent, execution)
@@ -727,6 +766,7 @@ class AgentManagerHostedSchedulerExecutor(HostedSchedulerExecutor):
             # lookup and reader admission. Under the reader, use the live
             # published object rather than invoking a stale/shutting-down one.
             agent = published_agent
+            self._require_enabled_scheduler_feature(agent, execution.agent_id)
 
             async def dispatch() -> Any:
                 return await self._dispatch_resolved_agent(agent, execution)
@@ -1428,9 +1468,12 @@ class SchedulerRunner:
         if not isinstance(db_path, str) or not db_path or db_path == ":memory:":
             return None
         # The DID is hashed so an unusual (but valid) DID cannot influence a
-        # filesystem path. Include the canonical database path so a copied
-        # database receives an independent coordination namespace.
-        canonical = os.path.abspath(db_path)
+        # filesystem path. Resolve aliases before deriving the sidecar so a
+        # real SQLite file and a symlink to it coordinate through one rollout
+        # lock. ``realpath`` also has useful non-strict behavior for a database
+        # that has not been created yet (or a broken leaf symlink): it resolves
+        # every existing parent and retains the unresolved suffix.
+        canonical = os.path.realpath(os.path.abspath(db_path))
         digest = hashlib.sha256(
             f"{canonical}\0{agent_id}".encode("utf-8")
         ).hexdigest()
@@ -2351,6 +2394,19 @@ class SchedulerRunner:
                         ) = self._normalise_result(raw, task)
                     except asyncio.CancelledError:
                         raise
+                    except SchedulerFeatureUnavailable:
+                        # A runtime disable can race preparation/admission.
+                        # It is not a task failure and must not advance this
+                        # occurrence. Leaving the exact claim live prevents a
+                        # hot retry; once it expires, a later re-enable can
+                        # recover the same durable execution identity.
+                        logger.info(
+                            "Deferring scheduler claim %s because %s has no enabled "
+                            "SchedulerFeature",
+                            execution.id,
+                            task.agent_id,
+                        )
+                        return
                     except Exception as e:
                         status = "failed"
                         result_text = f"{type(e).__name__}: {e}"
@@ -2379,6 +2435,19 @@ class SchedulerRunner:
                     )
         except asyncio.CancelledError:
             raise
+        except SchedulerFeatureUnavailable:
+            # Cold preparation can discover that a globally disabled or
+            # otherwise unavailable feature was not visible in the host's
+            # pre-claim configuration. Preserve the claimed occurrence (and
+            # its recovery log) until the lease expires rather than recording
+            # a synthetic failure that consumes/advances the schedule.
+            logger.info(
+                "Deferring scheduler claim %s because %s has no enabled "
+                "SchedulerFeature",
+                execution.id,
+                task.agent_id,
+            )
+            return
         except Exception as error:
             if not in_preparation:
                 # Database/admission failures remain scheduler infrastructure
@@ -3022,10 +3091,10 @@ class SchedulerRunner:
         if self._database_backend_type() == "postgres":
             row = await self._db.fetchone(
                 """
-                SELECT 1 FROM information_schema.columns
-                WHERE table_schema = current_schema()
-                  AND table_name = 'scheduled_tasks'
-                  AND column_name = 'scheduler_protocol_version'
+                SELECT 1 FROM pg_attribute
+                WHERE attrelid = to_regclass('scheduled_tasks')
+                  AND attname = 'scheduler_protocol_version'
+                  AND attnum > 0 AND NOT attisdropped
                 LIMIT 1
                 """
             )

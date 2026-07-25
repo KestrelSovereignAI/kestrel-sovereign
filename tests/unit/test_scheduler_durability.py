@@ -1951,6 +1951,186 @@ async def test_host_runner_skips_claim_for_soft_disabled_scheduler_feature(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_host_runner_skips_cold_tenant_that_excludes_scheduler_feature(tmp_path):
+    """An explicit cold allowlist avoids both a claim and an unnecessary wake."""
+
+    db = await _database(tmp_path / "host-cold-excluded-scheduler-feature.db")
+    agent_id = "did:scheduler:cold-excluded-feature"
+    config = LocalAgentConfig(
+        data_dir="cold-excluded",
+        port=8801,
+        autostart=False,
+        features=["PeersFeature"],
+    )
+    manager = AgentManager()
+    manager._seed_scheduler_authority({agent_id: ("Cold", config)})
+    manager._initialize_agent = AsyncMock(
+        side_effect=AssertionError("excluded SchedulerFeature must not cold-wake")
+    )
+    runner = SchedulerRunner(
+        db,
+        None,
+        AgentManagerHostedSchedulerExecutor(manager),
+        authorized_agent_ids={agent_id},
+        is_agent_authorized=manager.is_scheduler_agent_authorized,
+        owner_id="host-cold-excluded-scheduler-feature",
+    )
+    try:
+        await runner._ensure_tables()
+        await _seed_due(
+            db,
+            task_id="cold-excluded-custom-tool",
+            agent_id=agent_id,
+            task_name="custom_tool",
+        )
+
+        await runner._tick()
+
+        manager._initialize_agent.assert_not_awaited()
+        assert await db.fetchone(
+            """
+            SELECT enabled, scheduler_claim_fenced, claim_token
+            FROM scheduled_tasks WHERE id = ?
+            """,
+            ("cold-excluded-custom-tool",),
+        ) == (1, 0, None)
+        assert await db.fetchone(
+            "SELECT COUNT(*) FROM task_execution_log WHERE task_id = ?",
+            ("cold-excluded-custom-tool",),
+        ) == (0,)
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_host_runner_preserves_claim_when_cold_load_lacks_scheduler_feature(tmp_path):
+    """A post-load runtime disable preserves one recoverable occurrence."""
+
+    db = await _database(tmp_path / "host-cold-missing-scheduler-feature.db")
+    agent_id = "did:scheduler:cold-missing-feature"
+    config = LocalAgentConfig(data_dir="cold-missing", port=8801, autostart=False)
+    manager = AgentManager()
+    manager._seed_scheduler_authority({agent_id: ("Cold", config)})
+    cold_agent = SimpleNamespace(did=agent_id, agent_id=agent_id, features={})
+    manager._initialize_agent = AsyncMock(return_value=cold_agent)
+    runner = SchedulerRunner(
+        db,
+        None,
+        AgentManagerHostedSchedulerExecutor(manager),
+        authorized_agent_ids={agent_id},
+        is_agent_authorized=manager.is_scheduler_agent_authorized,
+        owner_id="host-cold-missing-scheduler-feature",
+        lease_seconds=1,
+    )
+    try:
+        await runner._ensure_tables()
+        due = await _seed_due(
+            db,
+            task_id="cold-missing-custom-tool",
+            agent_id=agent_id,
+            task_name="custom_tool",
+        )
+
+        await runner._tick()
+
+        manager._initialize_agent.assert_awaited_once()
+        claim = await db.fetchone(
+            """
+            SELECT enabled, scheduler_claim_fenced, lease_owner,
+                   lease_expires_at, claim_token, claim_execution_id,
+                   claim_scheduled_for, next_run_at, last_run_at, terminal_status
+            FROM scheduled_tasks WHERE id = ?
+            """,
+            ("cold-missing-custom-tool",),
+        )
+        assert claim is not None
+        assert claim[0:3] == (0, 1, "host-cold-missing-scheduler-feature")
+        assert claim[3] is not None
+        assert claim[4] is not None
+        assert claim[5] is not None
+        assert claim[6:10] == (due, due, None, None)
+        original_expiry = claim[3]
+        execution_id = claim[5]
+        assert await db.fetchone(
+            """
+            SELECT status, result_text, completed_at FROM task_execution_log
+            WHERE task_id = ?
+            """,
+            ("cold-missing-custom-tool",),
+        ) == ("claimed", None, None)
+
+        # Deferral stops renewal. Force recovery eligibility after the normal
+        # renewal cadence would have run; the now-warm disabled agent is
+        # rejected by preflight rather than being cold-woken/reclaimed again.
+        await asyncio.sleep(0.4)
+        assert await db.fetchval(
+            "SELECT lease_expires_at FROM scheduled_tasks WHERE id = ?",
+            ("cold-missing-custom-tool",),
+        ) == original_expiry
+        expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        await db.execute(
+            "UPDATE scheduled_tasks SET lease_expires_at = ? WHERE id = ?",
+            (expired, "cold-missing-custom-tool"),
+        )
+        await runner._tick()
+        manager._initialize_agent.assert_awaited_once()
+        assert await db.fetchone(
+            "SELECT id, status, attempt_count FROM task_execution_log WHERE task_id = ?",
+            ("cold-missing-custom-tool",),
+        ) == (execution_id, "claimed", 1)
+    finally:
+        await db.close()
+
+
+def test_sqlite_rollout_lock_path_resolves_database_symlink_aliases(tmp_path):
+    """Two aliases of one SQLite file derive exactly one rollout sidecar."""
+
+    real_database = tmp_path / "real-scheduler.db"
+    real_database.touch()
+    alias_database = tmp_path / "current-scheduler.db"
+    try:
+        alias_database.symlink_to(real_database)
+    except OSError as error:
+        pytest.skip(f"symlinks unavailable: {error}")
+
+    def runner_for(path):
+        db = SimpleNamespace(
+            backend_type="sqlite",
+            backend=SimpleNamespace(db_path=str(path)),
+        )
+        return SchedulerRunner(db, "agent-1", AsyncMock())
+
+    assert (
+        runner_for(real_database)._sqlite_rollout_lock_path("agent-1")
+        == runner_for(alias_database)._sqlite_rollout_lock_path("agent-1")
+    )
+
+
+def test_sqlite_rollout_lock_path_resolves_symlink_parent_before_database_exists(tmp_path):
+    """A not-yet-created DB remains canonical through a symlinked directory."""
+
+    real_parent = tmp_path / "real-data"
+    real_parent.mkdir()
+    alias_parent = tmp_path / "current-data"
+    try:
+        alias_parent.symlink_to(real_parent, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlinks unavailable: {error}")
+
+    def runner_for(path):
+        db = SimpleNamespace(
+            backend_type="sqlite",
+            backend=SimpleNamespace(db_path=str(path)),
+        )
+        return SchedulerRunner(db, "agent-1", AsyncMock())
+
+    assert (
+        runner_for(real_parent / "new-scheduler.db")._sqlite_rollout_lock_path("agent-1")
+        == runner_for(alias_parent / "new-scheduler.db")._sqlite_rollout_lock_path("agent-1")
+    )
+
+
+@pytest.mark.asyncio
 async def test_host_executor_loads_cold_agent_once_per_target():
     dispatched = AsyncMock(return_value="woken")
     cold_agent = SimpleNamespace(

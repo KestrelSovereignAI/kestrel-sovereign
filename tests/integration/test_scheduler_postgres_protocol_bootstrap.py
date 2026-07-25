@@ -437,6 +437,64 @@ async def test_future_scheduled_task_row_fails_before_bootstrap_mutation(db_back
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_postgres_future_schedule_probe_follows_search_path_relation(db_backend):
+    """A future table in a later search-path schema fails before any DDL."""
+
+    if db_backend.backend_type != "postgres":
+        pytest.skip("requires PostgreSQL search_path relation resolution")
+
+    empty_schema = f"scheduler_probe_empty_{uuid4().hex}"
+    schedule_schema = f"scheduler_probe_schedule_{uuid4().hex}"
+    agent_id = f"did:scheduler:search-path-future:{uuid4()}"
+    task_id = f"search-path-future-task:{uuid4()}"
+    future_version = SCHEDULER_PROTOCOL_VERSION + 9
+    db = AsyncDatabase(db_backend)
+    await db.execute(f'CREATE SCHEMA "{empty_schema}"')
+    await db.execute(f'CREATE SCHEMA "{schedule_schema}"')
+    try:
+        await db.execute(
+            f"""
+            CREATE TABLE \"{schedule_schema}\".scheduled_tasks (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                scheduler_protocol_version INTEGER NOT NULL,
+                sentinel TEXT NOT NULL
+            )
+            """
+        )
+        await db.execute(
+            f"""
+            INSERT INTO \"{schedule_schema}\".scheduled_tasks
+                (id, agent_id, scheduler_protocol_version, sentinel)
+            VALUES (?, ?, ?, 'must-not-normalize')
+            """,
+            (task_id, agent_id, future_version),
+        )
+
+        async with db.transaction():
+            await db.execute(
+                f'SET LOCAL search_path TO "{empty_schema}", "{schedule_schema}"'
+            )
+            runner = _host_runner(db, {agent_id})
+            with pytest.raises(SchedulerProtocolVersionIncompatible):
+                await runner.start()
+
+            assert await db.fetchone(
+                """
+                SELECT id, agent_id, scheduler_protocol_version, sentinel
+                FROM scheduled_tasks WHERE id = ?
+                """,
+                (task_id,),
+            ) == (task_id, agent_id, future_version, "must-not-normalize")
+            assert not await db.table_exists("scheduler_protocol_schema")
+            assert not await db.table_exists("scheduler_protocol_rollout")
+    finally:
+        await db.execute(f'DROP SCHEMA IF EXISTS "{empty_schema}" CASCADE')
+        await db.execute(f'DROP SCHEMA IF EXISTS "{schedule_schema}" CASCADE')
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_postgres_bootstrap_remaps_zero_effect_advisory_key(
     db_backend, monkeypatch
 ):
