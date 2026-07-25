@@ -1092,14 +1092,41 @@ async def _acquire_context_status_measurement(
     context_limit = counter.get_context_limit()
 
     constitution_text = ""
-    get_const = getattr(agent, "get_constitution", None)
+    get_const = getattr(agent, "_get_governing_constitution", None)
+    is_real_governing_getter = (
+        callable(get_const)
+        and not type(get_const).__module__.startswith("unittest.mock")
+    )
+    if not is_real_governing_getter:
+        # Compatibility for partial endpoint fixtures and pre-mixin hosts.
+        get_const = getattr(agent, "get_constitution", None)
     if callable(get_const):
         try:
-            got = get_const()
+            got = (
+                get_const(allow_lazy_anchor=False)
+                if is_real_governing_getter
+                else get_const()
+            )
             constitution_text = await got if hasattr(got, "__await__") else got
             constitution_text = constitution_text or ""
         except Exception as exc:
             logger.debug("constitution fetch failed for breakdown: %s", exc)
+            if is_real_governing_getter:
+                raise RuntimeError(
+                    "governing constitution is unavailable for context "
+                    "measurement"
+                ) from exc
+    if (
+        isinstance(constitution_text, str)
+        and constitution_text.lstrip().startswith("Error:")
+    ):
+        raise RuntimeError(
+            "governing constitution is unavailable for context measurement"
+        )
+    if is_real_governing_getter and not str(constitution_text).strip():
+        raise RuntimeError(
+            "governing constitution is unavailable for context measurement"
+        )
 
     tool_schemas: Optional[List[Dict[str, Any]]] = None
     build_tools = getattr(agent, "_build_all_tools", None)
@@ -1376,16 +1403,13 @@ async def compute_context_status(
                 "compaction strongly recommended"
             )
 
-        # 7. Surface the durable-salvage configuration state. This flag-derived
-        # indicator does not prove that a particular prune produced a marker;
-        # id-less/in-memory history cannot be mapped to a persistent span.
-        try:
-            from kestrel_sovereign.agent.salvage import (
-                is_durable_salvage_enabled,
-            )
-            silently_pruned_path_active = not is_durable_salvage_enabled()
-        except Exception:
-            silently_pruned_path_active = True
+        # 7. Surface the plan's declared salvage disposition. This is true when
+        # automatic salvage is disabled or when the projected pruned span
+        # contains id-less/in-memory rows that no durable marker can link.
+        salvage_projection = breakdown.get("salvage", {})
+        silently_pruned_path_active = bool(
+            salvage_projection.get("silent_prune_possible", True)
+        )
 
         # #1503: route per-turn cap visibility. Some subscription tiers
         # (notably ChatGPT-Plus on ``openai:plan``) enforce a per-turn
@@ -1526,7 +1550,7 @@ async def compute_context_status(
             # openai:plan, since that figure only measures Kestrel's per-turn
             # payload — not the server-side thread that actually compacts.
             "codex_thread": codex_thread_block,
-            # Configuration-derived indicator, not per-turn salvage evidence.
+            # Plan-derived projection, not per-turn salvage commit evidence.
             "silently_pruned_path_active": silently_pruned_path_active,
         }
     except Exception as e:

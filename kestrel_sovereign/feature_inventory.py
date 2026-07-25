@@ -466,6 +466,7 @@ def render_inventory_markdown(inventory: Inventory) -> str:
                 "  `ContextManager` plan used by `GET /api/agent/context-status` and",
                 "  production turns. Cheap mode marks omitted memory/RAG sections unknown;",
                 "  `full=true` executes the production retrieval and pruning policy read-only.",
+                "  It reads anchored governing policy without lazily creating missing state.",
                 "  Provider-native framing remains outside the Kestrel plan.",
             ])
         if not feature.tools:

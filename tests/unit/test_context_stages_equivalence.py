@@ -234,10 +234,32 @@ def test_compute_pruned_span_identifies_dropped_head():
     assert span.token_estimate == 4 + 4
 
 
-def test_compute_pruned_span_none_when_no_ids():
+def test_compute_pruned_span_reports_unmappable_rows_when_no_ids():
     history = [{"content": "a"}, {"content": "b"}]  # no id fields
     span = cs.compute_pruned_span(history, history[1:], len)
-    assert span is None
+    assert span is not None
+    assert span.dropped_messages == []
+    assert span.dropped_ids == []
+    assert span.token_estimate == 0
+    assert span.total_dropped_count == 1
+    assert span.unmappable_count == 1
+
+
+def test_compute_pruned_span_separates_mappable_and_idless_rows():
+    history = [
+        {"content": "idless", "metadata": {"session_id": "s1"}},
+        {"id": 2, "content": "aaaa"},
+        {"id": 3, "content": "kept"},
+    ]
+    span = cs.compute_pruned_span(history, history[2:], len)
+
+    assert span is not None
+    assert span.dropped_messages == [history[1]]
+    assert span.dropped_ids == [2]
+    assert span.token_estimate == len("aaaa") + 4
+    assert span.total_dropped_count == 2
+    assert span.unmappable_count == 1
+    assert span.session_id == "s1"
 
 
 def test_microcompact_clears_old_tool_results_and_keeps_recent():
@@ -807,6 +829,228 @@ async def _build_live_dry_plans(cm, **kwargs):
 
 
 @pytest.mark.asyncio
+async def test_real_status_acquisition_matches_live_render_and_defers_writes():
+    """Drive the endpoint acquisition and live wrapper through real policy.
+
+    Unlike the table-driven parity cases below, this test does not replace
+    system assembly, history formatting, retrieval normalization, budgeting,
+    or pruning with mocks.  The only fakes are the external stores.
+    """
+    from kestrel_sovereign.endpoints.agent import (
+        _acquire_context_status_measurement,
+    )
+
+    route_model = "openai:plan/gpt-4o"
+    llm_service = SimpleNamespace(
+        get_active_model_selection=lambda: {"model": route_model},
+        get_active_model_id=lambda: route_model,
+    )
+    storage = MagicMock()
+    storage.search_chunks = AsyncMock(
+        return_value=[
+            {
+                "document_name": "migration.md",
+                "content": "Phoenix uses an append-only migration journal.",
+                "created_at": "2026-07-24T10:30:00",
+            }
+        ]
+    )
+    memory_retriever = SimpleNamespace(
+        retrieve=AsyncMock(
+            return_value=[
+                {
+                    "id": 701,
+                    "role": "user",
+                    "content": "Keep migration evidence linked to its source.",
+                    "created_at": "2026-07-23T09:00:00",
+                    "metadata": {
+                        "importance": 0.9,
+                        "emotional_valence": 0.1,
+                    },
+                }
+            ]
+        ),
+        record_accesses=AsyncMock(),
+    )
+    builder = ContextBuilder(
+        storage,
+        llm_service=llm_service,
+        model=route_model,
+    )
+    cm = ContextManager(
+        storage,
+        agent_id="did:test:status-live-parity",
+        memory_retriever=memory_retriever,
+        llm_service=llm_service,
+        context_builder=builder,
+    )
+    history = [
+        {
+            "id": 11,
+            "role": "user",
+            "content": "What changed in Phoenix?",
+            "created_at": "2026-07-24T10:00:00",
+        },
+        {
+            "id": 12,
+            "role": "assistant",
+            "content": "The migration became append-only.",
+            "model": "gpt-4o",
+            "provider": "openai",
+            "created_at": "2026-07-24T10:01:00",
+        },
+        {
+            "id": 13,
+            "role": "user",
+            "content": "Explain the Phoenix migration evidence path.",
+            "created_at": "2026-07-24T10:02:00",
+        },
+    ]
+    constitution = "Protect operator intent and preserve evidence provenance."
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup_migration",
+                "description": "Read migration evidence.",
+            },
+        }
+    ]
+    constitution_calls = []
+
+    async def get_governing_constitution(*, allow_lazy_anchor=True):
+        constitution_calls.append(allow_lazy_anchor)
+        return constitution
+
+    privacy_agent = SimpleNamespace(
+        privacy_mode="NORMAL",
+        get_conversation_history=AsyncMock(return_value=history),
+    )
+    agent = SimpleNamespace(
+        storage=storage,
+        privacy_agent=privacy_agent,
+        context_manager=cm,
+        _privacy_mode="NORMAL",
+        _session_briefed=False,
+        _get_governing_constitution=get_governing_constitution,
+        _build_all_tools=lambda: tools,
+        features={},
+    )
+
+    # Capture plans while delegating to the unmodified production planner.
+    real_plan_builder = cm.build_context_plan
+    captured_plans = []
+
+    async def capture_plan(**kwargs):
+        plan = await real_plan_builder(**kwargs)
+        captured_plans.append(plan)
+        return plan
+
+    cm.build_context_plan = capture_plan
+    measurement = await _acquire_context_status_measurement(
+        agent,
+        "session-real-parity",
+        full=True,
+    )
+    dry = captured_plans[-1]
+
+    assert constitution_calls == [False]
+    assert dry.mode is ContextBuildMode.DRY_RUN
+    assert measurement.breakdown == dry.to_breakdown()
+    assert measurement.current_model == route_model
+    assert measurement.model_identity == {
+        "model": "gpt-4o",
+        "provider": "openai",
+        "context_model": "openai/gpt-4o",
+        "model_source": "assistant_turn",
+    }
+    assert dry.sections["memories"].provenance == (
+        "memory_retriever",
+        "query_relevance_gate",
+        "elastic_budget_gate",
+    )
+    assert dry.sections["rag"].provenance == (
+        "rag_store",
+        "query_relevance_gate",
+        "elastic_budget_gate",
+    )
+    assert sum(
+        section.tokens or 0 for section in dry.sections.values()
+    ) == dry.total_tokens
+    memory_retriever.record_accesses.assert_not_awaited()
+
+    live_result = await cm.build_context(
+        query="Explain the Phoenix migration evidence path.",
+        constitution=constitution,
+        include_briefing=True,
+        include_memories=True,
+        include_rag=True,
+        privacy_mode="NORMAL",
+        conversation_history=history,
+        tools=tools,
+    )
+    live = captured_plans[-1]
+
+    assert live.mode is ContextBuildMode.LIVE
+    _assert_live_dry_plan_equivalent(live, dry)
+    assert live_result.system_prompt == dry.assembly.system_prompt
+    assert live_result.messages == dry.assembly.formatted_history
+    assert live_result.dynamic_user_context == dry.assembly.dynamic_user_context
+    assert live_result.total_tokens == dry.total_tokens
+    assert live_result.budget_summary == dry.budget_summary
+    memory_retriever.record_accesses.assert_awaited_once_with(
+        (701,),
+        "did:test:status-live-parity",
+    )
+
+
+@pytest.mark.asyncio
+async def test_status_refuses_missing_governing_policy_before_planning():
+    from kestrel_sovereign.endpoints.agent import (
+        _acquire_context_status_measurement,
+    )
+
+    plan_builder = AsyncMock(
+        side_effect=AssertionError("must not plan with empty governing policy")
+    )
+
+    async def missing_governing_constitution(*, allow_lazy_anchor=True):
+        assert allow_lazy_anchor is False
+        return "Error: Governing constitution is not anchored."
+
+    agent = SimpleNamespace(
+        storage=SimpleNamespace(),
+        privacy_agent=SimpleNamespace(
+            privacy_mode="NORMAL",
+            get_conversation_history=AsyncMock(
+                return_value=[
+                    {
+                        "role": "user",
+                        "content": "explain the migration",
+                    }
+                ]
+            ),
+        ),
+        context_manager=SimpleNamespace(
+            build_context_plan=plan_builder,
+        ),
+        _get_governing_constitution=missing_governing_constitution,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="governing constitution is unavailable",
+    ):
+        await _acquire_context_status_measurement(
+            agent,
+            "session-missing-policy",
+            full=True,
+        )
+
+    plan_builder.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_live_dry_plan_equivalence_for_retrieval_and_tools():
     from kestrel_sovereign.agent.memory_manager import RetrievedMemoryBlock
 
@@ -859,6 +1103,35 @@ async def test_live_dry_plan_equivalence_for_trivial_and_ephemeral_turns():
     assert "EPHEMERAL MODE ACTIVE" in ephemeral_dry.assembly.system_prompt
     assert ephemeral_dry.sections["history"].tokens is None
     assert ephemeral_live.total_tokens == ephemeral_dry.total_tokens
+
+
+@pytest.mark.asyncio
+async def test_live_dry_plan_equivalence_for_degraded_mandatory_floor():
+    cm = _make_cm(
+        memories_result="[Memory 1] must not be retrieved",
+        rag_result="[Document A] must not be retrieved",
+    )
+    cm.context_builder.measure_mandatory_system_tokens.return_value = 10_000_000
+
+    live, dry = await _build_live_dry_plans(cm)
+
+    assert live.degraded_mode is True
+    assert dry.degraded_mode is True
+    assert dry.sections == {}
+    assert dry.total_tokens == 0
+    assert dry.budget_summary["mode"] == "degraded"
+    assert "mandatory governance floor" in dry.degraded_reason
+    cm.memory_manager.retrieve_memories.assert_not_awaited()
+    cm.context_builder.retrieve_context.assert_not_awaited()
+
+    result = await cm.build_context(
+        query="explain the phoenix migration",
+        constitution="C",
+    )
+    assert result.degraded_mode is True
+    assert result.messages == []
+    assert result.system_prompt == ""
+    cm.memory_retriever.record_accesses.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1089,3 +1362,111 @@ async def test_dry_plan_models_salvage_without_writing_success_or_failure():
             constitution="C",
         )
         assert failed.degraded_mode is True
+
+
+@pytest.mark.asyncio
+async def test_dry_plan_reports_idless_salvage_gap_without_writing():
+    history = [
+        {"role": "user", "content": "idless"},
+        {"role": "assistant", "content": "kept"},
+    ]
+    cm = _make_cm(history=history, format_side_effect=_drop_one)
+    with patch(
+        "kestrel_sovereign.agent.context_manager.is_durable_salvage_enabled",
+        return_value=True,
+    ), patch(
+        "kestrel_sovereign.agent.context_manager.get_pending_count",
+        new=AsyncMock(return_value=0),
+    ) as pending, patch(
+        "kestrel_sovereign.agent.context_manager.salvage_messages",
+        new=AsyncMock(),
+    ) as salvage:
+        plan = await cm.build_context_plan(
+            query="explain the migration",
+            constitution="C",
+            mode=ContextBuildMode.DRY_RUN,
+        )
+        rendered = plan.to_breakdown()["salvage"]
+
+        assert plan.salvage_requirement is None
+        assert rendered == {
+            "feature_enabled": True,
+            "required": False,
+            "status": "unavailable_no_persistent_ids",
+            "message_count": 0,
+            "pruned_message_count": 1,
+            "unmappable_message_count": 1,
+            "token_estimate": 0,
+            "silent_prune_possible": True,
+        }
+        pending.assert_not_awaited()
+        salvage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mixed_salvage_span_commits_only_durably_linkable_rows():
+    history = [
+        {"id": 7, "role": "user", "content": "persistent"},
+        {"role": "assistant", "content": "idless"},
+        {"id": 9, "role": "user", "content": "kept"},
+    ]
+    cm = _make_cm(
+        history=history,
+        format_side_effect=lambda history, max_tokens: list(history)[2:],
+    )
+    salvage_result = SimpleNamespace(
+        salvage_id=42,
+        pointer_only_terminal=True,
+    )
+    with patch(
+        "kestrel_sovereign.agent.context_manager.is_durable_salvage_enabled",
+        return_value=True,
+    ), patch(
+        "kestrel_sovereign.agent.context_manager.get_pending_count",
+        new=AsyncMock(return_value=0),
+    ), patch(
+        "kestrel_sovereign.agent.context_manager.salvage_messages",
+        new=AsyncMock(return_value=salvage_result),
+    ) as salvage:
+        plan = await cm.build_context_plan(
+            query="explain the migration",
+            constitution="C",
+            mode=ContextBuildMode.DRY_RUN,
+        )
+        disposition = plan.to_breakdown()["salvage"]
+        assert disposition["status"] == "partial_required_not_committed"
+        assert disposition["message_count"] == 1
+        assert disposition["pruned_message_count"] == 2
+        assert disposition["unmappable_message_count"] == 1
+        salvage.assert_not_awaited()
+
+        result = await cm.build_context(
+            query="explain the migration",
+            constitution="C",
+        )
+
+    assert result.degraded_mode is False
+    committed_rows = salvage.await_args.kwargs["original_messages"]
+    assert committed_rows == [history[0]]
+    assert all(isinstance(row.get("id"), int) for row in committed_rows)
+
+
+@pytest.mark.asyncio
+async def test_read_only_governing_constitution_does_not_lazy_anchor():
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+
+    storage = SimpleNamespace(
+        get_node=AsyncMock(return_value=SimpleNamespace(properties={})),
+        store_file=AsyncMock(),
+        add_node=AsyncMock(),
+    )
+    host = SimpleNamespace(storage=storage, agent_id="did:test:context-status")
+
+    result = await ConstitutionMixin._get_governing_constitution(
+        host,
+        allow_lazy_anchor=False,
+    )
+
+    assert result.startswith("Error: Governing constitution is not anchored")
+    storage.store_file.assert_not_awaited()
+    storage.add_node.assert_not_awaited()

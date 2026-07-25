@@ -689,7 +689,7 @@ class ContextManager:
                 ),
                 budget=budget.episodes,
                 items=episode_result.items if episode_result.committed else 0,
-                provenance=("episode_store",),
+                provenance=("episode_store", "elastic_budget_gate"),
                 reason=(
                     None
                     if episode_result.committed
@@ -749,7 +749,11 @@ class ContextManager:
                 tokens=self.counter.count(memory_result.dynamic_block or ""),
                 budget=budget.memories,
                 items=memory_result.items,
-                provenance=("memory_retriever", "query_relevance_gate"),
+                provenance=(
+                    "memory_retriever",
+                    "query_relevance_gate",
+                    "elastic_budget_gate",
+                ),
                 raw_tokens=memory_result.tokens,
                 details={"wired": self.memory_retriever is not None},
             )
@@ -848,7 +852,11 @@ class ContextManager:
                 tokens=self.counter.count(rag_result.dynamic_block or ""),
                 budget=budget.rag,
                 items=rag_result.items,
-                provenance=("rag_store", "query_relevance_gate"),
+                provenance=(
+                    "rag_store",
+                    "query_relevance_gate",
+                    "elastic_budget_gate",
+                ),
                 raw_tokens=rag_result.tokens,
                 details={
                     "chunks": rag_result.items,
@@ -957,19 +965,33 @@ class ContextManager:
             },
         )
 
+        durable_salvage_enabled = is_durable_salvage_enabled()
+        pruned_span = None
         salvage_requirement = None
-        if (
-            is_durable_salvage_enabled()
-            and len(assembly.formatted_history) < len(history)
-        ):
-            salvage_requirement = compute_pruned_span(
+        if len(assembly.formatted_history) < len(history):
+            pruned_span = compute_pruned_span(
                 history, assembly.formatted_history, self.counter.count
             )
-            if salvage_requirement is not None:
+            if (
+                durable_salvage_enabled
+                and pruned_span is not None
+                and pruned_span.dropped_ids
+            ):
+                salvage_requirement = pruned_span
                 assembly.warnings.append(
                     "context-salvage commit required before the LLM call: "
                     f"{len(salvage_requirement.dropped_ids)} messages "
                     "must be synchronously recorded"
+                )
+            if (
+                durable_salvage_enabled
+                and pruned_span is not None
+                and pruned_span.unmappable_count
+            ):
+                assembly.warnings.append(
+                    "context-salvage cannot durably link "
+                    f"{pruned_span.unmappable_count} pruned in-memory/id-less "
+                    "messages; those omissions remain silently pruned"
                 )
 
         sections["tools"] = ContextSectionPlan(
@@ -1046,6 +1068,8 @@ class ContextManager:
             state_of_mind=state_of_mind,
             memory_access_ids=memory_access_ids,
             salvage_requirement=salvage_requirement,
+            pruned_span=pruned_span,
+            durable_salvage_enabled=durable_salvage_enabled,
             measurement_complete=not any(
                 section.status is SectionStatus.UNKNOWN
                 for section in sections.values()

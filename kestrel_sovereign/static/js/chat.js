@@ -3193,6 +3193,13 @@ export async function updateContextStatus(expectedAgent = deps().api.getHostAgen
         ) return;
         const { message_count, utilization_percent, status: contextState, warnings, route_cap, codex_thread } = status;
         const modelLabel = formatContextModelLabel(status);
+        const measurementComplete = status.breakdown?.measurement_complete !== false;
+        const partialLabel = measurementComplete
+            ? ''
+            : ' <span style="opacity:0.75;font-size:0.65rem;">partial</span>';
+        const partialTooltip = measurementComplete
+            ? ''
+            : '\nMemory and RAG were deliberately not measured in this cheap poll; the percentage is a lower-bound projection.';
 
         // #1844: on openai:plan, codex holds the conversation thread
         // server-side while Kestrel sends only incremental turns — so
@@ -3307,8 +3314,8 @@ export async function updateContextStatus(expectedAgent = deps().api.getHostAgen
                   onclick="window.openContextBreakdownPopup()"
                   onkeydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); window.openContextBreakdownPopup(); }"
                   style="cursor: pointer; user-select: none;"
-                  title="Click for per-section context breakdown · ${message_count} messages · ${effectiveUtil.toFixed(1)}% of window used · ${_esc(modelLabel)}${_esc(codexThreadTooltip)}${warnings.length ? '\nWarnings: ' + warnings.join(', ') : ''}${_esc(routeCapTooltip)}">
-                ${icon} ${message_count} msgs · ${effectiveUtil.toFixed(0)}% <span style="opacity:0.75;font-size:0.65rem;">${_esc(modelLabel)}</span>${routeCapBadge}${compactButton}
+                  title="Click for per-section context breakdown · ${message_count} messages · ${effectiveUtil.toFixed(1)}% of window used · ${_esc(modelLabel)}${_esc(partialTooltip)}${_esc(codexThreadTooltip)}${warnings.length ? '\nWarnings: ' + warnings.join(', ') : ''}${_esc(routeCapTooltip)}">
+                ${icon} ${message_count} msgs · ${effectiveUtil.toFixed(0)}%${partialLabel} <span style="opacity:0.75;font-size:0.65rem;">${_esc(modelLabel)}</span>${routeCapBadge}${compactButton}
             </span>
         `;
 
@@ -3377,10 +3384,10 @@ function showContextWarning(warnings, paneElement = null) {
  *   Retrieval / RAG — chunks + "estimated" badge, "skipped" when poll
  *   Reserve / Overhead — dynamic_context_overhead + response_reserve
  *
- * UI honesty invariant (Emma): never imply "compaction saved this"
- * when only the silent-prune path executed. While #1311 is unshipped,
- * the popup unconditionally surfaces "silently-pruned path still
- * active" — the auto-detect invariant from the design doc.
+ * UI honesty invariant: never imply "compaction saved this" when only the
+ * silent-prune path executed. The popup surfaces the plan's salvage
+ * disposition whenever automatic salvage is disabled or a pruned row has no
+ * persistent id.
  */
 window.openContextBreakdownPopup = async function () {
     const sessionId = deps().state.currentSessionId || null;
@@ -3465,7 +3472,7 @@ function formatContextModelLabel(status) {
 }
 
 /** Render the layered breakdown HTML for ``openContextBreakdownPopup``. */
-function renderContextBreakdown(status) {
+export function renderContextBreakdown(status) {
     const fmt = (n) => Number(n || 0).toLocaleString();
     const breakdown = status.breakdown;
     if (!breakdown) {
@@ -3528,13 +3535,8 @@ function renderContextBreakdown(status) {
         ${fmt(hist.messages_kept_after_pruning || 0)} of ${fmt(hist.messages_total || 0)} messages kept after pruning ·
         raw ${fmt(hist.raw_tokens || 0)} tokens
     </div>`;
-    // Per Emma's canonical taxonomy and the design doc's UI honesty
-    // invariant, the conversation row can show four state badges
-    // depending on what the section reports. ``pending fold`` and
-    // ``failed fold`` are reserved for C/#1311 (durable salvage); the
-    // slots render unconditionally so the popup is ready when C ships,
-    // and a "silently-pruned path still active" warning fires while
-    // C is unshipped (auto-detect invariant).
+    // The conversation row can show the durable-salvage state badges already
+    // recorded for prior spans, plus the current dry-run plan's disposition.
     // C / #1311: salvage-state badges come from
     // ``history.salvages`` which the endpoint attaches once C's
     // feature flag is enabled. Until then ``hist.salvages`` is
@@ -3577,7 +3579,7 @@ function renderContextBreakdown(status) {
     const warningParts = [];
     if (status.silently_pruned_path_active) {
         warningParts.push(
-            'silently-pruned path still active — older messages may have been dropped without a durable summary (until #1311 ships)'
+            'silently-pruned path active — automatic salvage is disabled or this projected prune contains in-memory/id-less messages that cannot be durably linked'
         );
     }
     const warnThreshold = salv.warn_threshold || 10;

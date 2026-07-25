@@ -150,8 +150,8 @@ def test_context_status_reports_whole_window_utilization_and_warning_band():
         assert "breakdown" in payload
         assert payload["breakdown"]["total_measured"] == 2900
         assert "sections" in payload["breakdown"]
-        # Auto-detection of legacy silent-prune (Emma 2026-05-20
-        # hardening): unconditionally True until #1311 ships.
+        # Legacy compatibility projections have no typed salvage disposition,
+        # so the endpoint fails honest and keeps the warning active.
         assert payload["silently_pruned_path_active"] is True
         agent.storage.get_conversation_history.assert_awaited_once_with(
             limit=50,
@@ -259,9 +259,18 @@ def test_context_status_uses_context_manager_dry_plan_and_preserves_unknowns():
 
     manager = PlanManager()
     privacy_history = PrivacyHistory()
+    constitution_calls = []
+
+    async def get_governing_constitution(*, allow_lazy_anchor):
+        constitution_calls.append(allow_lazy_anchor)
+        return "THE ANCHORED CONSTITUTION"
+
     agent = MagicMock()
     agent.storage.get_conversation_history = AsyncMock()
-    agent.get_constitution = lambda: ""
+    agent._get_governing_constitution = get_governing_constitution
+    agent.get_constitution = MagicMock(
+        side_effect=AssertionError("legacy constitution getter must not run")
+    )
     agent.context_manager = manager
     agent.context_builder = MagicMock()
     agent.tool_registry = None
@@ -287,7 +296,10 @@ def test_context_status_uses_context_manager_dry_plan_and_preserves_unknowns():
         assert manager.kwargs["measure_expensive_sections"] is False
         assert manager.kwargs["include_rag"] is True
         assert manager.kwargs["query"] == "explain the migration"
+        assert manager.kwargs["constitution"] == "THE ANCHORED CONSTITUTION"
         assert manager.kwargs["mode"].value == "dry_run"
+        assert constitution_calls == [False]
+        agent.get_constitution.assert_not_called()
         assert privacy_history.calls == [(50, "session-1")]
         agent.storage.get_conversation_history.assert_not_awaited()
         sections = response.json()["breakdown"]["sections"]

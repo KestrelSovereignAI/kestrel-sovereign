@@ -322,6 +322,10 @@ and the routing contract in
   storage.
 - For an active session, diagnostics load the same latest **50** eligible rows
   as the production turn.
+- Diagnostics read the same anchored governing constitution as a live turn.
+  That read is explicitly non-mutating: a status request never creates or
+  anchors a missing constitution, and the measurement fails instead of
+  silently substituting an empty policy.
 - The default (`full=false`) is a cheap, deliberately incomplete plan. It
   measures stable sections, history, pruning, and best-effort tool schemas but
   intentionally omits memory and RAG acquisition; those rows are reported as
@@ -337,16 +341,20 @@ response reserve, total budget, measured section breakdown, utilization and
 warning status, route-cap details, salvage counters, and—when available—the
 separate Codex thread occupancy. Tool-schema counts remain best-effort
 estimates; provider framing is outside the plan. `silently_pruned_path_active`
-is derived from whether the durable-salvage feature flag is enabled; it is not
-observation that a particular turn did or did not create salvage evidence.
+is derived from the dry plan's projected prune span: it remains active when
+automatic salvage is disabled or when any omitted in-memory/id-less row cannot
+be linked to durable evidence. It is a projection, not observation that a
+particular turn did or did not commit salvage evidence.
 
-### Honesty boundary: issue #2534
+### Kestrel-plan parity boundary
 
 `ContextManager.build_context_plan()` is the single context coordinator.
 Production commits the plan's declared access/salvage side effects and renders
 it; `context-status?full=true` renders the same plan in dry-run mode without
-those writes. Dry-run salvage output reports the write that a live turn would
-require rather than pretending it committed evidence.
+those writes. Both non-streaming and streaming live turns use the same
+session-briefing decision. Dry-run salvage output reports id-bearing writes
+that a live turn would require and separately counts pruned rows that cannot
+map to durable ids, rather than pretending either class committed evidence.
 
 This parity covers Kestrel's generic system prompt, history messages, dynamic
 retrieval block, tool-schema estimate, and prune decisions. Provider-native
@@ -387,15 +395,16 @@ Three distinct behaviors coexist:
 | Synchronous salvage marker/write plus background `SalvageWorker` processing during automatic pruning | **Conditional**, behind `KESTREL_CONTEXT_C_DURABLE_SALVAGE` and limited to pruned spans that map to id-bearing persistent history |
 | Complete automatic Context C lifecycle and all guarantees in the original design | **Aspirational** |
 
-When the experimental flag is enabled **and** a pruned span has persistent row
-ids, that conditional path fails closed if its durable store or marker/write is
-unavailable. A span that cannot be identified—such as id-less `ISOLATED`
-history—does not enter that fail-closed salvage branch. The asynchronous worker
-and janitor live in
+When the experimental flag is enabled, the planner describes every projected
+pruned span. Its id-bearing subset enters the conditional path and fails closed
+if the durable store or marker/write is unavailable. Any id-less subset—such as
+`ISOLATED` in-memory history—is reported as unmappable and does not enter that
+write branch. The asynchronous worker and janitor live in
 [`kestrel_sovereign/agent/salvage.py`](../../kestrel_sovereign/agent/salvage.py).
-The flag-derived status indicator is not per-turn evidence, and this partial
-implementation does not make every state machine, dispatcher, UX, or recovery
-guarantee in the design record current. See
+The plan-derived status indicator is still a projection rather than per-turn
+commit evidence, and this partial implementation does not make every state
+machine, dispatcher, UX, or recovery guarantee in the design record current.
+See
 [Context C Durable Salvage](CONTEXT_C_DURABLE_SALVAGE.md) for the intended
 end state.
 

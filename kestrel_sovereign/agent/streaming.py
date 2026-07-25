@@ -1226,7 +1226,7 @@ class StreamingMixin:
         context_result = await self.context_manager.build_context(
             query=user_input,
             constitution=constitution,
-            include_briefing=True,
+            include_briefing=not getattr(self, "_session_briefed", False),
             include_memories=True,
             include_rag=True,
             privacy_mode=privacy_mode,
@@ -1256,6 +1256,11 @@ class StreamingMixin:
                 f"is in a degraded state. Details: {warn_text}"
             )
             return
+
+        # Keep streaming and non-streaming context inputs identical: the
+        # session briefing is admitted once, after a non-degraded plan, before
+        # the provider call starts.
+        self._session_briefed = True
 
         # Build user prompt. `context` carries the per-turn retrieved content
         # (memories + RAG) — kept OUT of the system message so the system prefix

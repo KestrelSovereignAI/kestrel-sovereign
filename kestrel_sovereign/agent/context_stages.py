@@ -261,6 +261,8 @@ class ContextBuildPlan:
     degraded_reason: Optional[str] = None
     memory_access_ids: Tuple[int, ...] = ()
     salvage_requirement: Optional["PrunedSpan"] = None
+    pruned_span: Optional["PrunedSpan"] = None
+    durable_salvage_enabled: bool = False
     measurement_complete: bool = True
     microcompacted_tool_results: int = 0
 
@@ -295,6 +297,22 @@ class ContextBuildPlan:
             row.update(section.details)
             rendered[name] = row
 
+        pruned_span = self.pruned_span
+        salvage_requirement = self.salvage_requirement
+        unmappable_count = (
+            pruned_span.unmappable_count if pruned_span is not None else 0
+        )
+        if salvage_requirement is not None and unmappable_count:
+            salvage_status = "partial_required_not_committed"
+        elif salvage_requirement is not None:
+            salvage_status = "required_not_committed"
+        elif pruned_span is not None and self.durable_salvage_enabled:
+            salvage_status = "unavailable_no_persistent_ids"
+        elif pruned_span is not None:
+            salvage_status = "disabled"
+        else:
+            salvage_status = "not_required"
+
         return {
             "model": self.model,
             "context_limit": self.context_limit,
@@ -308,21 +326,31 @@ class ContextBuildPlan:
             "measurement_complete": self.measurement_complete,
             "dry_run": self.mode is ContextBuildMode.DRY_RUN,
             "salvage": {
-                "required": self.salvage_requirement is not None,
-                "status": (
-                    "required_not_committed"
-                    if self.salvage_requirement is not None
-                    else "not_required"
-                ),
+                "feature_enabled": self.durable_salvage_enabled,
+                "required": salvage_requirement is not None,
+                "status": salvage_status,
                 "message_count": (
-                    len(self.salvage_requirement.dropped_ids)
-                    if self.salvage_requirement is not None
+                    len(salvage_requirement.dropped_ids)
+                    if salvage_requirement is not None
                     else 0
                 ),
-                "token_estimate": (
-                    self.salvage_requirement.token_estimate
-                    if self.salvage_requirement is not None
+                "pruned_message_count": (
+                    pruned_span.total_dropped_count
+                    if pruned_span is not None
                     else 0
+                ),
+                "unmappable_message_count": unmappable_count,
+                "token_estimate": (
+                    salvage_requirement.token_estimate
+                    if salvage_requirement is not None
+                    else 0
+                ),
+                "silent_prune_possible": (
+                    not self.durable_salvage_enabled
+                    or (
+                        pruned_span is not None
+                        and unmappable_count > 0
+                    )
                 ),
             },
             "microcompacted_tool_results": self.microcompacted_tool_results,
@@ -336,12 +364,11 @@ class ContextBuildPlan:
 # These turn already-retrieved raw section content into a typed
 # :class:`SectionResult`: token cost (on the RAW block — the byte the
 # budget gate charges), item count, and the wrapped/append bytes that
-# actually land in the assembly. The *retrieval* differs between the two
-# callers (production runs the side-effectful ``MemoryManager``;
-# measurement runs a side-effect-free adapter), but the normalization
-# after retrieval — count, wrap, gate-input — is single-sourced here so
-# the plan's bytes/counts (#2523 / #2534). The canonical coordinator applies
-# budget and persistence policy to the returned result.
+# actually land in the assembly. Retrieval remains read-only while the plan is
+# built, and normalization after retrieval — count, wrap, gate-input — is
+# single-sourced here so the plan's bytes/counts cannot drift (#2523 / #2534).
+# The canonical coordinator applies budget policy and records any required
+# rehearsal/salvage effects on the plan for the live commit boundary.
 
 
 def build_memory_section(
@@ -505,12 +532,20 @@ def compute_lumpy_anchor(
 
 @dataclass
 class PrunedSpan:
-    """The leading history messages that left the model-visible slice."""
+    """The leading history messages that left the model-visible slice.
+
+    ``dropped_messages`` contains only rows with durable integer ids because
+    those are the only rows the salvage transaction can link.  The aggregate
+    counters preserve the full prune shape so diagnostics never describe a
+    mixed persistent/in-memory span as fully salvageable.
+    """
 
     dropped_messages: List[Dict[str, Any]]
     dropped_ids: List[int]
     token_estimate: int
     session_id: Optional[str]
+    total_dropped_count: int
+    unmappable_count: int
 
 
 def compute_pruned_span(
@@ -520,21 +555,26 @@ def compute_pruned_span(
 ) -> Optional[PrunedSpan]:
     """Identify the oldest span pruned from the model-visible history.
 
-    Returns ``None`` when nothing was dropped or when no dropped row
-    carries an ``id`` (legacy un-tagged rows have nothing durable to
-    salvage against). The session id is derived from the first dropped
-    row's own metadata so the salvage marker stays non-leaking across
-    sessions (#713).
+    Returns ``None`` only when nothing was dropped. Rows without durable
+    integer ids remain represented by ``unmappable_count`` but are excluded
+    from ``dropped_messages`` and the token estimate passed to the salvage
+    transaction. The session id is derived from the first dropped row carrying
+    it, including an id-less row, so a mixed span's marker stays scoped to the
+    already session-filtered acquisition input (#713).
     """
     if len(formatted_history) >= len(history):
         return None
     dropped_count = len(history) - len(formatted_history)
     dropped = history[:dropped_count]
-    dropped_ids = [m["id"] for m in dropped if m.get("id") is not None]
-    if not dropped_ids:
-        return None
+    mappable = [
+        m
+        for m in dropped
+        if isinstance(m.get("id"), int) and not isinstance(m.get("id"), bool)
+    ]
+    dropped_ids = [m["id"] for m in mappable]
     token_estimate = sum(
-        count_tokens(m.get("content", "") or "") + _MESSAGE_OVERHEAD for m in dropped
+        count_tokens(m.get("content", "") or "") + _MESSAGE_OVERHEAD
+        for m in mappable
     )
     session_id: Optional[str] = None
     for m in dropped:
@@ -545,10 +585,12 @@ def compute_pruned_span(
                 session_id = sid
                 break
     return PrunedSpan(
-        dropped_messages=dropped,
+        dropped_messages=mappable,
         dropped_ids=dropped_ids,
         token_estimate=token_estimate,
         session_id=session_id,
+        total_dropped_count=len(dropped),
+        unmappable_count=len(dropped) - len(mappable),
     )
 
 

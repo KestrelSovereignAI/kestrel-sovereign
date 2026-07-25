@@ -240,7 +240,7 @@ def test_provider_and_diagnostic_sections_preserve_current_limitations():
     assert "allow the turn to proceed" in _squash(provider)
 
     diagnostics = _section(text, "Context diagnostics")
-    honesty = _section(text, "Honesty boundary: issue #2534")
+    honesty = _section(text, "Kestrel-plan parity boundary")
     normalized_diagnostics = _squash(diagnostics)
     normalized_honesty = _squash(honesty)
     assert "same latest **50** eligible rows" in normalized_diagnostics
@@ -249,11 +249,20 @@ def test_provider_and_diagnostic_sections_preserve_current_limitations():
     assert "final prune decisions" in normalized_diagnostics
     assert "`silently_pruned_path_active` is derived" in normalized_diagnostics
     assert "not observation that a particular turn" in normalized_diagnostics
+    assert "anchored governing constitution" in normalized_diagnostics
+    assert "never creates or anchors a missing constitution" in (
+        normalized_diagnostics
+    )
     assert "`ContextManager.build_context_plan()` is the single context coordinator" in (
         normalized_honesty
     )
     assert "renders the same plan in dry-run mode" in normalized_honesty
-    assert "reports the write that a live turn would require" in normalized_honesty
+    assert "reports id-bearing writes that a live turn would require" in (
+        normalized_honesty
+    )
+    assert "separately counts pruned rows that cannot map to durable ids" in (
+        normalized_honesty
+    )
     assert "Provider-native framing" in normalized_honesty
     assert "cheap `full=false` response is explicitly incomplete" in (
         normalized_honesty
@@ -289,9 +298,9 @@ def test_durable_salvage_document_keeps_partial_paths_conditional():
 
     evidence = _section(salvage, "What the partial implementation proves")
     normalized_evidence = _squash(evidence)
-    assert "When no id-bearing span can be computed" in normalized_evidence
+    assert "mixed span commits only its id-bearing rows" in normalized_evidence
     assert "`ISOLATED` in-memory history" in normalized_evidence
-    assert "reflects flag configuration rather than per-turn salvage evidence" in (
+    assert "it is not per-turn commit evidence" in (
         normalized_evidence
     )
 

@@ -873,13 +873,14 @@ def is_durable_salvage_enabled() -> bool:
     When true, the production coordinator attempts synchronous salvage for
     pruned spans that can be mapped to id-bearing persistent conversation
     rows, and the process-local worker can summarize those markers. The status
-    endpoint also flips its configuration-derived
-    ``silently_pruned_path_active`` indicator to false. The flag alone is not
-    proof that a particular turn created salvage evidence.
+    endpoint derives ``silently_pruned_path_active`` from the projected plan:
+    it is false only when the enabled path leaves no projected id-less rows.
+    The flag alone is not proof that a particular turn created salvage
+    evidence.
 
     When False, ``ContextManager.build_context`` falls back to the
-    legacy silent-prune behaviour (no salvage records). The popup keeps surfacing
-    ``silently-pruned path still active``.
+    legacy silent-prune behaviour (no salvage records). The popup keeps
+    surfacing the plan's silent-prune warning.
     """
     import os
 

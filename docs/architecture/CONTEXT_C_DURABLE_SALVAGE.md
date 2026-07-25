@@ -123,16 +123,19 @@ A complete implementation should preserve these properties:
 ## What the partial implementation proves
 
 With `KESTREL_CONTEXT_C_DURABLE_SALVAGE` enabled, the current production
-coordinator attempts to map a pruned span to persistent conversation row ids.
-When that mapping succeeds, it attempts the synchronous salvage write/marker
-and schedules the process-local `SalvageWorker`; the path fails closed when the
-store or prerequisite durable write is unavailable or unsuccessful.
+coordinator describes the whole pruned span and maps its id-bearing subset to
+persistent conversation rows. When that subset exists, it attempts the
+synchronous salvage write/marker and schedules the process-local
+`SalvageWorker`; the path fails closed when the store or prerequisite durable
+write is unavailable or unsuccessful.
 
-When no id-bearing span can be computed—including `ISOLATED` in-memory
-history—the coordinator returns without a marker. The feature flag therefore
-does not establish a universal fail-closed guarantee, and the status endpoint's
-`silently_pruned_path_active` field reflects flag configuration rather than
-per-turn salvage evidence.
+Id-less rows—including `ISOLATED` in-memory history—remain outside that durable
+write. A mixed span commits only its id-bearing rows and reports the remainder
+as unmappable; a wholly id-less span produces no marker. The feature flag
+therefore does not establish a universal fail-closed guarantee. The status
+endpoint's `silently_pruned_path_active` field is derived from that projected
+plan and stays active when salvage is disabled or any pruned row is unmappable;
+it is not per-turn commit evidence.
 
 That is meaningful implementation evidence, but it does **not** prove:
 
@@ -145,8 +148,9 @@ That is meaningful implementation evidence, but it does **not** prove:
 
 `GET /api/agent/context-status` reports best-effort salvage counts and whether
 the silent-prune path is active. Its `full=true` dry-run uses the production
-context plan and reports required salvage without committing a marker; the
-cheap default explicitly leaves expensive sections unknown.
+context plan and reports required, partial, or unmappable salvage without
+committing a marker; the cheap default explicitly leaves expensive sections
+unknown.
 
 ## Promotion criteria
 
