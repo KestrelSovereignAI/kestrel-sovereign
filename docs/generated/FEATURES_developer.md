@@ -66,19 +66,22 @@ audience-specific derivative:
 
 - A production turn preloads at most the latest **50** eligible entries from
   the active session before retrieval, budgeting, and lumpy history selection.
-- `context_status` and `GET /api/agent/context-status` are diagnostic
-  projections, not exact prompt traces. Diagnostics may inspect up to 10,000
-  stored rows; even `full=true` does not reproduce production's latest-50
-  preload, every retrieval gate, elastic borrowing, lumpy pruning, or provider
-  framing.
-- [Issue #2534](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2534)
-  remains open for that runtime drift. Documentation work does not implement
-  its runtime fix and does not change or close the issue.
+- Production and `GET /api/agent/context-status?full=true` use the same typed
+  `ContextManager` build plan over that latest-50 input. The dry-run executes
+  production relevance gates, elastic finalization, lumpy anchoring,
+  microcompaction, wrapper accounting, and prune decisions without committing
+  access records or salvage writes. Status reads the anchored governing
+  constitution without lazily creating or anchoring missing policy.
+- The cheap `full=false` status deliberately omits memory/RAG acquisition and
+  reports those sections as `unknown`/`skipped`, never as measured zero.
+  Provider-native framing and stateful provider-thread occupancy remain
+  separate from the Kestrel context plan.
 - Default lumpy pruning omits older history from the provider window while
   retaining the source rows; it does not create an automatic durable summary.
   Automatic durable salvage is disabled by default. Its feature-flagged path is
-  conditional on a pruned span mapping to id-bearing persistent history, so it
-  is not a fail-closed guarantee for id-less or `ISOLATED` in-memory history.
+  conditional on pruned rows mapping to id-bearing persistent history. A mixed
+  span writes only that subset and reports id-less rows as unmappable, so it is
+  not a fail-closed guarantee for id-less or `ISOLATED` in-memory history.
 - `openai:plan` occupancy compaction is best-effort. Kestrel resets the Codex
   thread only after durable compaction reports success; a skipped or failed
   attempt lets the turn continue with the existing thread.
@@ -134,10 +137,16 @@ Discovery rules take precedence over any headline numbers:
 | Concern | Key files |
 |---|---|
 | Core agent orchestration | [`kestrel_sovereign/kestrel_agent.py`](../../kestrel_sovereign/kestrel_agent.py), [`kestrel_sovereign/command_handler.py`](../../kestrel_sovereign/command_handler.py), [`kestrel_sovereign/agent/tool_registry.py`](../../kestrel_sovereign/agent/tool_registry.py) |
-| Context & token budgeting | [`kestrel_sovereign/agent/context_manager.py`](../../kestrel_sovereign/agent/context_manager.py), [`kestrel_sovereign/agent/context_builder.py`](../../kestrel_sovereign/agent/context_builder.py), [`kestrel_sovereign/agent/token_budget.py`](../../kestrel_sovereign/agent/token_budget.py) |
+| Context & token budgeting | [`docs/architecture/CONTEXT_SYSTEM_DESIGN.md`](../architecture/CONTEXT_SYSTEM_DESIGN.md), [`kestrel_sovereign/agent/context_manager.py`](../../kestrel_sovereign/agent/context_manager.py), [`kestrel_sovereign/agent/context_builder.py`](../../kestrel_sovereign/agent/context_builder.py), [`kestrel_sovereign/agent/context_stages.py`](../../kestrel_sovereign/agent/context_stages.py), [`kestrel_sovereign/agent/token_budget.py`](../../kestrel_sovereign/agent/token_budget.py), [`kestrel_sovereign/storage/async_conversation_store.py`](../../kestrel_sovereign/storage/async_conversation_store.py) |
 | Streaming & request lifecycle | [`kestrel_sovereign/agent/streaming.py`](../../kestrel_sovereign/agent/streaming.py), [`kestrel_sovereign/endpoints/agent.py`](../../kestrel_sovereign/endpoints/agent.py) |
 
 > **Quick start:** To invoke the agent, `POST /agent/invoke` (blocking) or `POST /agent/stream` (SSE). See [`kestrel_sovereign/endpoints/agent.py`](../../kestrel_sovereign/endpoints/agent.py).
+>
+> `context_status` and `GET /api/agent/context-status` render the typed
+> `ContextManager` plan. `full=true` executes the production retrieval,
+> budgeting, and pruning policy without writes; cheap mode leaves omitted
+> memory/RAG sections explicitly unknown. Provider-native framing remains
+> outside the Kestrel plan.
 
 ### Multi-LLM Platform
 

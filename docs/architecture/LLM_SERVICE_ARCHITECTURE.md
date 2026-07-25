@@ -268,10 +268,9 @@ This boundary is especially visible on `openai:plan`: Kestrel budgets and
 selects a turn payload, while Codex retains a separate server-side thread.
 Per-turn context projection and server thread occupancy are distinct
 measurements. `/api/agent/context-status` can report both when data is
-available, but remains a diagnostic projection rather than a provider-payload
-receipt; the canonical context contract records the open
-[#2534](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2534)
-limitation.
+available. Its full dry-run is byte/token-equivalent to Kestrel's production
+context plan, but it is not a provider-payload receipt: provider framing and
+the stateful server-side thread remain outside that plan.
 
 ---
 

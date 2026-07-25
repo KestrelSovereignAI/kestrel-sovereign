@@ -167,6 +167,145 @@ class TestAgentManagerBasics:
         assert not manager.is_scheduler_agent_authorized("did:pkh:unresolved")
 
     @pytest.mark.asyncio
+    async def test_dynamic_scheduler_registration_cancellation_joins_and_rolls_back(
+        self,
+    ):
+        """Cancellation cannot expose scope or orphan protocol/authority state."""
+
+        manager = AgentManager()
+        manager.set_scheduler_polling_managed_by_host(True)
+        agent_id = "did:scheduler:dynamic-cancel"
+        config = LocalAgentConfig(data_dir="dynamic", port=8801)
+        hook_started = asyncio.Event()
+        release_hook = asyncio.Event()
+        protocol_rolled_back = asyncio.Event()
+
+        async def register(_name, _agent_id, _config):
+            hook_started.set()
+            await release_hook.wait()
+
+            async def rollback():
+                protocol_rolled_back.set()
+
+            return rollback
+
+        manager.set_scheduler_tenant_registration_hook(register)
+        registration = asyncio.create_task(
+            manager._begin_dynamic_scheduler_tenant_registration(
+                "Dynamic",
+                agent_id,
+                config,
+            )
+        )
+        await asyncio.wait_for(hook_started.wait(), timeout=1)
+        assert manager.scheduler_authority_for(agent_id) == ("Dynamic", config)
+        assert agent_id not in manager.scheduler_authorized_agent_ids()
+
+        registration.cancel()
+        await asyncio.sleep(0)
+        assert not registration.done()
+        release_hook.set()
+        with pytest.raises(asyncio.CancelledError):
+            await registration
+
+        assert protocol_rolled_back.is_set()
+        assert manager.scheduler_authority_for(agent_id) is None
+        assert agent_id not in manager.scheduler_authorized_agent_ids()
+        assert not manager.scheduler_lifecycle_lock(agent_id).locked()
+
+    @pytest.mark.asyncio
+    async def test_dynamic_scheduler_registration_rolls_back_on_onboarding_failure(
+        self,
+    ):
+        """The scheduler lease spans publication and app-owned onboarding."""
+
+        manager = AgentManager()
+        manager.set_scheduler_polling_managed_by_host(True)
+        agent_id = "did:scheduler:onboarding-failure"
+        config = LocalAgentConfig(data_dir="dynamic", port=8801)
+        protocol_rolled_back = asyncio.Event()
+
+        async def register(_name, _agent_id, _config):
+            async def rollback():
+                protocol_rolled_back.set()
+
+            return rollback
+
+        manager.set_scheduler_tenant_registration_hook(register)
+        pending = await manager._begin_dynamic_scheduler_tenant_registration(
+            "Dynamic",
+            agent_id,
+            config,
+        )
+        agent = _make_mock_agent(agent_id)
+        agent._dynamic_scheduler_tenant_registration = pending
+        manager._initialize_agent = AsyncMock(return_value=agent)
+        manager.set_agent_registration_hook(
+            AsyncMock(side_effect=RuntimeError("onboarding failed"))
+        )
+
+        with pytest.raises(RuntimeError, match="onboarding failed"):
+            await manager.load_agent("Dynamic", config)
+
+        assert manager.list_agents() == {}
+        assert protocol_rolled_back.is_set()
+        assert manager.scheduler_authority_for(agent_id) is None
+        assert agent_id not in manager.scheduler_authorized_agent_ids()
+        assert not manager.scheduler_lifecycle_lock(agent_id).locked()
+        agent.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_hosted_cold_registration_validates_authority_without_releasing_owned_lock(
+        self,
+    ):
+        """The explicit lock-owner path never reacquires or releases the DID lease."""
+
+        manager = AgentManager()
+        manager.set_scheduler_polling_managed_by_host(True)
+        agent_id = "did:scheduler:configured-cold"
+        config = LocalAgentConfig(data_dir="cold", port=8801, autostart=False)
+        registration_hook = AsyncMock()
+        manager.set_scheduler_tenant_registration_hook(registration_hook)
+        lifecycle_lock = manager.scheduler_lifecycle_lock(agent_id)
+        await lifecycle_lock.acquire()
+        try:
+            with pytest.raises(LookupError, match="without live manager authority"):
+                await manager._begin_dynamic_scheduler_tenant_registration(
+                    "Cold",
+                    agent_id,
+                    config,
+                    scheduler_lifecycle_lock_held=True,
+                )
+            assert lifecycle_lock.locked()
+
+            manager._seed_scheduler_authority(
+                {agent_id: ("Cold", config)}
+            )
+            assert (
+                await manager._begin_dynamic_scheduler_tenant_registration(
+                    "Cold",
+                    agent_id,
+                    config,
+                    scheduler_lifecycle_lock_held=True,
+                )
+                is None
+            )
+            assert lifecycle_lock.locked()
+            registration_hook.assert_not_awaited()
+
+            manager._scheduler_authority_by_name["Cold"] = "did:other"
+            with pytest.raises(RuntimeError, match="does not match"):
+                await manager._begin_dynamic_scheduler_tenant_registration(
+                    "Cold",
+                    agent_id,
+                    config,
+                    scheduler_lifecycle_lock_held=True,
+                )
+            assert lifecycle_lock.locked()
+        finally:
+            lifecycle_lock.release()
+
+    @pytest.mark.asyncio
     async def test_cold_scheduler_load_refuses_did_mismatch_before_registration(
         self, tmp_path,
     ):
@@ -441,7 +580,8 @@ class TestAgentManagerBasics:
             )
         }
 
-        async def initialize(_name, _config):
+        async def initialize(_name, _config, **kwargs):
+            assert kwargs == {"scheduler_lifecycle_lock_held": True}
             initialization_started.set()
             await allow_initialization.wait()
             return cold
@@ -484,11 +624,129 @@ class TestAgentManagerBasics:
         cold.shutdown.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_shared_pg_hosted_cold_wake_cancellation_releases_delete_waiter(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        """A configured cold wake skips dynamic reacquire and cancellation drains."""
+
+        manager = AgentManager(base_data_dir=tmp_path)
+        manager.set_scheduler_polling_managed_by_host(True)
+        agent_id = "did:scheduler:shared-pg-cold-cancel"
+        config = LocalAgentConfig(
+            data_dir="cold",
+            port=8801,
+            autostart=False,
+        )
+        manager._seed_scheduler_authority({agent_id: ("Cold", config)})
+        initialization_started = asyncio.Event()
+        shutdown_finished = asyncio.Event()
+        registration_hook = AsyncMock(
+            side_effect=AssertionError(
+                "configured cold wake must not enter dynamic registration"
+            )
+        )
+        manager.set_scheduler_tenant_registration_hook(registration_hook)
+
+        class ColdAgent:
+            def __init__(self, *, did, **_kwargs):
+                self.did = did
+                self.agent_id = did
+                self.features = {}
+
+            async def initialize(self):
+                initialization_started.set()
+                await asyncio.Event().wait()
+
+            async def shutdown(self):
+                shutdown_finished.set()
+
+        class TestLLMService:
+            async def close(self):
+                return None
+
+        monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+        monkeypatch.setenv(
+            "KESTREL_DATABASE_URL",
+            "postgresql://scheduler-cold-test",
+        )
+        monkeypatch.setattr(
+            "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+            AsyncMock(return_value=agent_id),
+        )
+        monkeypatch.setattr(
+            "kestrel_sovereign.multi_agent.agent_manager.KestrelAgent",
+            ColdAgent,
+        )
+        monkeypatch.setattr(
+            "kestrel_sovereign.multi_agent.agent_manager.LLMService",
+            TestLLMService,
+        )
+        monkeypatch.setattr(
+            LocalAgentConfig,
+            "validate_runtime",
+            lambda self, **_kwargs: [],
+        )
+        executor = AgentManagerHostedSchedulerExecutor(manager)
+        execution = SchedulerExecution(
+            id="execution-shared-pg-cold-cancel",
+            schedule_id="schedule-shared-pg-cold-cancel",
+            agent_id=agent_id,
+            task_name="wait_reconcile",
+            args={},
+            scheduled_for="2026-07-25T00:00:00+00:00",
+            idempotency_key="effect-shared-pg-cold-cancel",
+            attempt=1,
+            owner="host",
+        )
+
+        scheduled = asyncio.create_task(executor.execute_scheduled(execution))
+        deletion = None
+        try:
+            await asyncio.wait_for(initialization_started.wait(), timeout=1)
+            assert manager.scheduler_lifecycle_lock(agent_id).locked()
+
+            deletion = asyncio.create_task(manager.remove_agent("Cold"))
+            await asyncio.sleep(0)
+            assert not deletion.done()
+            assert manager.is_scheduler_agent_authorized(agent_id)
+
+            scheduled.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await scheduled
+            assert shutdown_finished.is_set()
+            assert await asyncio.wait_for(deletion, timeout=1) is True
+            assert manager.scheduler_authority_for(agent_id) is None
+            assert not manager.scheduler_lifecycle_lock(agent_id).locked()
+            registration_hook.assert_not_awaited()
+        finally:
+            if not scheduled.done():
+                scheduled.cancel()
+            if deletion is not None and not deletion.done():
+                deletion.cancel()
+            await asyncio.gather(
+                scheduled,
+                *(
+                    (deletion,)
+                    if deletion is not None
+                    else ()
+                ),
+                return_exceptions=True,
+            )
+
+    @pytest.mark.asyncio
     async def test_scheduler_cold_wake_receives_host_a2a_and_feature_route_onboarding(
         self,
+        tmp_path,
     ):
         """A scheduler-loaded tenant is integrated like an autostart tenant."""
         from kestrel_sovereign import server
+        from kestrel_sovereign.a2a.did_registry import install_a2a_did_resolver
+        from kestrel_sovereign.a2a.inbound_authorization import (
+            has_a2a_inbound_scoped_policy,
+            install_a2a_inbound_sender_authorizer,
+        )
         from kestrel_sovereign.a2a.envelope_signing import (
             bound_envelope_fields,
             sign_envelope,
@@ -518,6 +776,12 @@ class TestAgentManagerBasics:
             shutdown=AsyncMock(),
         )
         manager._register_agent("Warm", warm)
+        # Model initial fleet onboarding: a later cold wake must not replace
+        # this warm recipient's verification/authorization seams.
+        install_a2a_did_resolver(manager, recipient=warm)
+        install_a2a_inbound_sender_authorizer(manager, recipient=warm)
+        warm_resolver = warm.a2a_did_resolver.__self__
+        warm_authorizer = warm.a2a_inbound_sender_authorizer
 
         router = APIRouter()
 
@@ -532,18 +796,25 @@ class TestAgentManagerBasics:
         )
         cold_did = "did:web:example.test:agent:cold"
         cold_keypair = generate_hybrid_keypair()
-        cold = SimpleNamespace(
-            agent_id=cold_did,
-            identity=SimpleNamespace(
-                is_hybrid=True,
-                signing_did=cold_did,
-                new_verification_methods=build_verification_methods(
-                    cold_did, cold_keypair.public_keys()
-                ),
-            ),
-            features={"ColdOnly": feature},
-            shutdown=AsyncMock(),
+        # Production-shaped cold KestrelAgent: the local Peers adapter is
+        # feature-internal, so these injected hosted fields are genuinely None.
+        cold = KestrelAgent(
+            did=cold_did,
+            storage_path=str(tmp_path / "cold" / "kestrel_prime.db"),
         )
+        cold.identity = SimpleNamespace(
+            is_hybrid=True,
+            signing_did=cold_did,
+            new_verification_methods=build_verification_methods(
+                cold_did, cold_keypair.public_keys()
+            ),
+        )
+        cold.features = {"ColdOnly": feature}
+        cold.peer_directory_router = None
+        cold.peer_requester = None
+        cold.shutdown = AsyncMock()
+        cold.wait_for_shutdown_completion = None
+        cold._set_display_name = lambda _name: None
         config = LocalAgentConfig(data_dir="cold", port=8802, autostart=False)
         manager._seed_scheduler_authority({cold.agent_id: ("Cold", config)})
         manager._initialize_agent = AsyncMock(return_value=cold)
@@ -560,6 +831,14 @@ class TestAgentManagerBasics:
         assert loaded is cold
         assert cold.a2a_did_resolver(warm_did)["id"] == warm_did
         assert warm.a2a_did_resolver(cold_did)["id"] == cold_did
+        assert warm.a2a_did_resolver.__self__ is warm_resolver
+        assert cold.a2a_did_resolver.__self__ is not warm.a2a_did_resolver.__self__
+        assert warm.a2a_inbound_sender_authorizer is warm_authorizer
+        assert cold.a2a_inbound_sender_authorizer is not warm_authorizer
+        assert has_a2a_inbound_scoped_policy(cold) is True
+        assert cold.a2a_inbound_sender_authorizer.requires_verified_sender is True
+        assert cold.a2a_inbound_sender_authorizer.has_valid_current_scope() is False
+        assert cold._a2a_host_manager is manager
 
         # Exercise the actual verification seam, not merely resolver lookup:
         # a signed warm→cold same-host envelope must validate after the cold

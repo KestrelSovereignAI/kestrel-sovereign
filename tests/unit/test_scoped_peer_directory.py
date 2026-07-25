@@ -40,6 +40,7 @@ class ScopedRouter:
     subscribed_to: list[str] = field(default_factory=list)
     resolve_calls: list[str] = field(default_factory=list)
     resolve_by_agent_id_calls: list[str] = field(default_factory=list)
+    inbound_authorization_calls: list[str] = field(default_factory=list)
     scope_a_entries: Optional[dict[str, PeerIdentity]] = None
     deny_subscription: bool = False
     unexpected_resolution_failure: bool = False
@@ -98,6 +99,17 @@ class ScopedRouter:
             if peer.agent_id == agent_id
         ]
         return matches[0] if len(matches) == 1 else None
+
+    async def authorize_inbound_sender(
+        self,
+        requester: PeerRequester,
+        sender_id: str,
+    ) -> bool:
+        self.inbound_authorization_calls.append(sender_id)
+        return any(
+            peer.agent_id == sender_id
+            for peer in self._directory(requester).values()
+        )
 
     async def invoke(
         self, requester: PeerRequester, peer: PeerIdentity, message: str,
@@ -377,6 +389,37 @@ async def test_cross_scope_name_and_did_probes_are_indistinguishable_and_unroute
     assert router.resolve_calls == resolves_before_did_probes
     assert router.sent_to == []
     assert router.fetched_from == []
+
+
+@pytest.mark.asyncio
+async def test_local_host_inbound_authorization_uses_live_stable_identity():
+    adapter = LocalHostPeerDirectory("http://local-host")
+    requester = PeerRequester("did:tenant-a:requester", object())
+    adapter._directory_entries = AsyncMock(  # type: ignore[method-assign]
+        return_value=[
+            PeerIdentity(
+                agent_id="did:tenant-a:companion",
+                slug="companion",
+                routing_key="companion-route",
+            )
+        ]
+    )
+
+    assert (
+        await adapter.authorize_inbound_sender(
+            requester,
+            "did:tenant-a:companion",
+        )
+        is True
+    )
+    assert (
+        await adapter.authorize_inbound_sender(
+            requester,
+            "did:tenant-b:companion",
+        )
+        is False
+    )
+    assert adapter._directory_entries.await_count == 2
 
 
 @pytest.mark.asyncio

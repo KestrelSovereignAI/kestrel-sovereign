@@ -66,19 +66,22 @@ audience-specific derivative:
 
 - A production turn preloads at most the latest **50** eligible entries from
   the active session before retrieval, budgeting, and lumpy history selection.
-- `context_status` and `GET /api/agent/context-status` are diagnostic
-  projections, not exact prompt traces. Diagnostics may inspect up to 10,000
-  stored rows; even `full=true` does not reproduce production's latest-50
-  preload, every retrieval gate, elastic borrowing, lumpy pruning, or provider
-  framing.
-- [Issue #2534](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2534)
-  remains open for that runtime drift. Documentation work does not implement
-  its runtime fix and does not change or close the issue.
+- Production and `GET /api/agent/context-status?full=true` use the same typed
+  `ContextManager` build plan over that latest-50 input. The dry-run executes
+  production relevance gates, elastic finalization, lumpy anchoring,
+  microcompaction, wrapper accounting, and prune decisions without committing
+  access records or salvage writes. Status reads the anchored governing
+  constitution without lazily creating or anchoring missing policy.
+- The cheap `full=false` status deliberately omits memory/RAG acquisition and
+  reports those sections as `unknown`/`skipped`, never as measured zero.
+  Provider-native framing and stateful provider-thread occupancy remain
+  separate from the Kestrel context plan.
 - Default lumpy pruning omits older history from the provider window while
   retaining the source rows; it does not create an automatic durable summary.
   Automatic durable salvage is disabled by default. Its feature-flagged path is
-  conditional on a pruned span mapping to id-bearing persistent history, so it
-  is not a fail-closed guarantee for id-less or `ISOLATED` in-memory history.
+  conditional on pruned rows mapping to id-bearing persistent history. A mixed
+  span writes only that subset and reports id-less rows as unmappable, so it is
+  not a fail-closed guarantee for id-less or `ISOLATED` in-memory history.
 - `openai:plan` occupancy compaction is best-effort. Kestrel resets the Codex
   thread only after durable compaction reports success; a skipped or failed
   attempt lets the turn continue with the existing thread.
@@ -129,7 +132,7 @@ The platform manages the full agent lifecycle, from initial provisioning ("incep
 
 ### Agent Runtime
 
-The agent runtime handles orchestration, context assembly, token budget management, and streaming response delivery as first-class concerns. Context management is designed to operate efficiently within the constraints of any connected LLM, ensuring that long-running conversations and complex multi-step tasks remain coherent regardless of the underlying model in use.
+The agent runtime handles orchestration, context assembly, route-aware token budgets, and streaming response delivery as first-class concerns. It preserves canonical conversation history separately from provider rendering and uses retrieval gates plus cache-stable, chunked pruning to operate within a selected route's limits. Continuity still depends on the configured model, route, privacy mode, retrieval quality, and available window; context diagnostics are planning estimates rather than exact prompt receipts.
 
 Real-time streaming is natively supported, enabling responsive user interfaces and downstream integrations without polling or latency penalties.
 

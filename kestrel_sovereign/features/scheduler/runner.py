@@ -18,9 +18,9 @@ import os
 import secrets
 import time
 import uuid
-from collections.abc import Collection
-from contextlib import asynccontextmanager
-from dataclasses import dataclass, replace
+from collections.abc import AsyncIterator, Collection
+from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Coroutine, Dict, List, Optional, Protocol, Union
 
@@ -70,6 +70,14 @@ SCHEDULER_SCHEMA_PROVENANCE_LEGACY_UNKNOWN = "legacy-unknown"
 # no safe way to infer that its external effect did not happen, so activation
 # deliberately leaves it paused and visible for an explicit operator resume.
 ROLLOUT_AMBIGUOUS_LEGACY_OCCURRENCE = "rollout_ambiguous_legacy_occurrence"
+
+# Distinct from every real DID and used only as the key for the file-backed
+# SQLite bootstrap gate. It serializes provenance discovery, additive DDL, and
+# rollout seeding across independently opened connections to the same file.
+# A NUL cannot occur in a valid DID, so this cannot collide with a per-DID
+# rollout gate while still producing a stable hash-based SQLite lock filename.
+_SCHEDULER_BOOTSTRAP_LOCK_SCOPE = "\0scheduler-bootstrap"
+_SCHEDULER_BOOTSTRAP_ADVISORY_LOCK_SCOPE = 0
 
 
 # SQLite keeps one writer transaction per AsyncDatabase connection.  Holding
@@ -149,6 +157,21 @@ class SchedulerRolloutQuiescenceRequired(RuntimeError):
     """
 
 
+class SchedulerProtocolVersionIncompatible(RuntimeError):
+    """Raised when durable scheduler state belongs to a newer protocol.
+
+    The message is deliberately independent of stored version numbers, DIDs,
+    and activation nonces. A host readiness endpoint may safely surface the
+    error's type without disclosing another scheduler deployment's state.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Scheduler protocol is newer than this runner; upgrade the "
+            "scheduler binary before starting."
+        )
+
+
 def validate_schedule_idempotency_base(base: str) -> Optional[str]:
     """Return an invariant error when ``base`` cannot form an SDK-safe key."""
 
@@ -188,6 +211,16 @@ class SchedulerExecution:
     owner: str
 
 
+@dataclass(frozen=True)
+class SchedulerTenantProtocolRegistration:
+    """Scheduler rows that predated one dynamic host-tenant registration."""
+
+    agent_id: str
+    rollout_preexisting: bool
+    schedule_ids: tuple[str, ...]
+    execution_ids: tuple[str, ...]
+
+
 @dataclass
 class _SchedulerExecutionScope:
     """A revocable scheduler identity shared with copied task contexts.
@@ -206,6 +239,25 @@ class _SchedulerExecutionScope:
         """Make this occurrence unavailable from every copied context."""
 
         self.active = False
+
+
+@dataclass
+class _LeaseRenewalState:
+    """Shared fail-closed state for an owned claim-renewal task.
+
+    A renewal worker returning is never a benign completion: it either lost
+    its exact token/authority or failed to keep it live.  The event lets the
+    preparation and effect paths observe that loss immediately instead of
+    letting a completed executor attempt a stale terminal compare-and-set.
+    """
+
+    lost: asyncio.Event = field(default_factory=asyncio.Event)
+    error: Optional[BaseException] = None
+
+    def mark_lost(self, error: Optional[BaseException] = None) -> None:
+        if self.error is None and error is not None:
+            self.error = error
+        self.lost.set()
 
 
 _current_execution: contextvars.ContextVar[Optional[_SchedulerExecutionScope]] = (
@@ -319,6 +371,7 @@ class ExecutionRecord:
 
 
 TaskExecutor = Callable[[str, dict], Coroutine[Any, Any, Any]]
+PreparedScheduledDispatch = Callable[[], Awaitable[Any]]
 
 
 class HostedExecutionExecutor(Protocol):
@@ -326,6 +379,24 @@ class HostedExecutionExecutor(Protocol):
 
     async def execute_scheduled(self, execution: SchedulerExecution) -> Any:
         """Resolve/wake the target and dispatch ``execution``."""
+
+
+class PreparedExecutionExecutor(Protocol):
+    """Optional structural protocol for a prepared scheduler dispatch.
+
+    ``prepare_scheduled`` performs work which must not happen while the
+    runner holds its database admission transaction (for example a cold agent
+    load whose feature initialization can migrate scheduler tables).  It
+    yields a no-argument dispatcher and owns any lifecycle lock until that
+    dispatcher has returned.  The runner intentionally discovers this by
+    structure so third-party hosted executors do not need to inherit a private
+    base class.
+    """
+
+    def prepare_scheduled(
+        self, execution: SchedulerExecution
+    ) -> Any:
+        """Return an async context yielding a prepared dispatch callable."""
 
 
 def _loaded_agent_did(agent: Any) -> Optional[str]:
@@ -352,9 +423,25 @@ class HostedSchedulerExecutor:
     def __init__(self, resolve_agent: Callable[[str], Awaitable[Any]]):
         self._resolve_agent = resolve_agent
 
-    async def execute_scheduled(self, execution: SchedulerExecution) -> Any:
+    @asynccontextmanager
+    async def prepare_scheduled(
+        self, execution: SchedulerExecution
+    ) -> AsyncIterator[PreparedScheduledDispatch]:
+        """Resolve once before admission and yield a dispatch-only closure."""
+
         agent = await self._resolve_agent(execution.agent_id)
-        return await self._dispatch_resolved_agent(agent, execution)
+
+        async def dispatch() -> Any:
+            return await self._dispatch_resolved_agent(agent, execution)
+
+        yield dispatch
+
+    async def execute_scheduled(self, execution: SchedulerExecution) -> Any:
+        # Retain the public one-shot hosted-executor contract for callers that
+        # do not run through ``SchedulerRunner``. The runner itself enters the
+        # preparation context before its database admission boundary.
+        async with self.prepare_scheduled(execution) as dispatch:
+            return await dispatch()
 
     @staticmethod
     async def _dispatch_resolved_agent(
@@ -375,15 +462,20 @@ class HostedSchedulerExecutor:
 class AgentManagerHostedSchedulerExecutor(HostedSchedulerExecutor):
     """Hosted adapter that loads an unloaded agent through ``AgentManager``.
 
-    ``agent_configs`` maps durable agent DIDs to the manager's ``(name,
-    LocalAgentConfig)`` pair.  The host builds that map while it still has its
-    fleet configuration.  Per-agent locks ensure two due schedules cannot
-    cold-start the same target concurrently.
+    Concrete ``AgentManager`` hosts resolve every dispatch from its live
+    authority registry. ``agent_configs`` remains only as a compatibility
+    fallback for simpler adapters that do not expose that registry. Per-agent
+    locks ensure two due schedules cannot cold-start the same target
+    concurrently.
     """
 
-    def __init__(self, agent_manager: Any, agent_configs: Dict[str, tuple[str, Any]]):
+    def __init__(
+        self,
+        agent_manager: Any,
+        agent_configs: Optional[Dict[str, tuple[str, Any]]] = None,
+    ):
         self._agent_manager = agent_manager
-        self._agent_configs = dict(agent_configs)
+        self._agent_configs = dict(agent_configs or {})
         self._locks: Dict[str, asyncio.Lock] = {}
         super().__init__(self._resolve_or_wake)
 
@@ -408,7 +500,21 @@ class AgentManagerHostedSchedulerExecutor(HostedSchedulerExecutor):
                 return lock
         return self._locks.setdefault(agent_id, asyncio.Lock())
 
-    async def execute_scheduled(self, execution: SchedulerExecution) -> Any:
+    @asynccontextmanager
+    async def prepare_scheduled(
+        self, execution: SchedulerExecution
+    ) -> AsyncIterator[PreparedScheduledDispatch]:
+        """Cold-resolve under the DID lock before database admission.
+
+        Scheduler feature initialization can perform additive schema DDL.  A
+        PostgreSQL admission transaction holds an ``ACCESS SHARE`` lock while
+        it validates the claim, so doing that cold load inside admission can
+        self-deadlock when initialization asks for ``ACCESS EXCLUSIVE``.  Keep
+        the manager-owned lifecycle lock from preparation through the later
+        effect, but deliberately yield only after all resolution and authority
+        validation is complete.
+        """
+
         # DELETE/revoke holds this very DID lock through shutdown and
         # unpublication. Keeping it across the effect dispatch—not merely the
         # cold load—prevents a frozen startup map from resurrecting or using a
@@ -425,7 +531,11 @@ class AgentManagerHostedSchedulerExecutor(HostedSchedulerExecutor):
                 raise LookupError(
                     f"Hosted scheduler authority was revoked for {execution.agent_id!r}"
                 )
-            return await self._dispatch_resolved_agent(agent, execution)
+
+            async def dispatch() -> Any:
+                return await self._dispatch_resolved_agent(agent, execution)
+
+            yield dispatch
 
     async def _resolve_or_wake(self, agent_id: str) -> Any:
         agents = self._agent_manager.list_agents()
@@ -481,13 +591,26 @@ class SchedulerRunner:
         self,
         db,
         agent_id: Optional[str],
-        executor: Union[TaskExecutor, HostedExecutionExecutor],
+        executor: Union[
+            TaskExecutor,
+            HostedExecutionExecutor,
+            PreparedExecutionExecutor,
+        ],
         poll_interval: int = POLL_INTERVAL,
         misfire_grace_seconds: int = DEFAULT_MISFIRE_GRACE_SECONDS,
         max_concurrent_tasks: int = DEFAULT_MAX_CONCURRENT_TASKS,
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
         owner_id: Optional[str] = None,
         authorized_agent_ids: Optional[Collection[str]] = None,
+        authorized_agent_ids_provider: Optional[
+            Callable[
+                [],
+                Union[
+                    Collection[str],
+                    Awaitable[Collection[str]],
+                ],
+            ]
+        ] = None,
         is_agent_authorized: Optional[
             Callable[[str], Union[bool, Awaitable[bool]]]
         ] = None,
@@ -501,11 +624,14 @@ class SchedulerRunner:
             raise ValueError("lease_seconds must be positive")
         if authorized_agent_ids is not None:
             authorized = tuple(sorted(set(authorized_agent_ids)))
-            if not authorized or any(
-                not isinstance(value, str) or not value for value in authorized
-            ):
+            if any(not isinstance(value, str) or not value for value in authorized):
                 raise ValueError(
-                    "authorized_agent_ids must contain at least one non-empty agent ID"
+                    "authorized_agent_ids must contain only non-empty agent IDs"
+                )
+            if not authorized and authorized_agent_ids_provider is None:
+                raise ValueError(
+                    "an empty host scheduler scope requires a live "
+                    "authorized_agent_ids_provider"
                 )
         elif agent_id is None:
             raise ValueError(
@@ -522,15 +648,18 @@ class SchedulerRunner:
         self._db = db
         self._agent_id = agent_id
         self._authorized_agent_ids = authorized
+        self._authorized_agent_ids_provider = authorized_agent_ids_provider
         self._executor = executor
         self._poll_interval = poll_interval
         self._misfire_grace_seconds = max(0, int(misfire_grace_seconds))
         self._max_concurrent_tasks = max(1, int(max_concurrent_tasks))
         self._lease_seconds = normalized_lease_seconds
         self._owner_id = owner_id or f"scheduler:{uuid.uuid4()}"
-        # The constructor scope is an upper bound used for SQL placeholders
-        # and bootstrap.  A hosted manager may revoke an agent after startup,
-        # so every claim/dispatch also consults this live predicate.
+        # Standalone runners retain their fixed one-DID scope. Hosted runners
+        # can additionally resolve a fresh manager-owned scope for every
+        # rollout/selection/CAS boundary, so a runtime-created tenant becomes
+        # executable without rebuilding the runner and a removed tenant drops
+        # out immediately.
         self._is_agent_authorized = is_agent_authorized
         self._on_protocol_failure = on_protocol_failure
         self._readiness_failure: Optional[BaseException] = None
@@ -571,9 +700,9 @@ class SchedulerRunner:
                 logger.exception("Scheduler protocol-failure callback failed")
 
     async def _agent_is_currently_authorized(self, agent_id: str) -> bool:
-        """Check the static fleet boundary and an optional live authority view."""
+        """Check the current fleet scope and an optional live authority view."""
 
-        if agent_id not in self._authorized_agent_ids:
+        if agent_id not in await self._current_authorized_agent_ids():
             return False
         if self._is_agent_authorized is None:
             return True
@@ -582,13 +711,53 @@ class SchedulerRunner:
             result = await result
         return bool(result)
 
-    async def start(self):
+    async def _current_authorized_agent_ids(self) -> tuple[str, ...]:
+        """Return a validated snapshot of this runner's current SQL scope."""
+
+        provider = self._authorized_agent_ids_provider
+        if provider is None:
+            return self._authorized_agent_ids
+        values = provider()
+        if inspect.isawaitable(values):
+            values = await values
+        authorized = tuple(sorted(set(values)))
+        if any(not isinstance(value, str) or not value for value in authorized):
+            raise ValueError(
+                "authorized_agent_ids_provider returned an invalid agent ID"
+            )
+        if self._agent_id is not None and authorized != (self._agent_id,):
+            raise ValueError(
+                "agent-scoped SchedulerRunner provider may authorize only its agent_id"
+            )
+        return authorized
+
+    async def start(self, *, polling: bool = True):
+        """Establish protocol state and optionally arm the polling loop.
+
+        Feature-owned runners prepare their durable schema during feature
+        initialization, then arm only from the agent's final ready hook. Host
+        runners retain the historical one-call start behavior.
+        """
         try:
             await self._ensure_tables()
         except BaseException as error:
             if not isinstance(error, asyncio.CancelledError):
                 self._latch_protocol_failure(error)
             raise
+        if not polling:
+            logger.info("SchedulerRunner %s prepared without polling", self._owner_id)
+            return
+        await self.arm()
+
+    async def arm(self) -> None:
+        """Start polling after durable protocol preparation has completed."""
+
+        if self._running:
+            return
+        if not self._protocol_ready:
+            raise RuntimeError(
+                "SchedulerRunner cannot poll before protocol preparation"
+            )
         self._running = True
         self._task = asyncio.create_task(self._loop(), name="scheduler-runner")
         logger.info("SchedulerRunner %s started (poll every %ds)", self._owner_id, self._poll_interval)
@@ -670,19 +839,24 @@ class SchedulerRunner:
             self._latch_protocol_failure(result)
 
     async def _due_rows(self, now: datetime) -> List[tuple]:
-        authorization_scope = self._authorized_agent_placeholders()
+        authorized_agent_ids = await self._current_authorized_agent_ids()
+        if not authorized_agent_ids:
+            return []
+        authorization_scope = self._authorized_agent_placeholders(
+            authorized_agent_ids
+        )
         if self._uses_database_clock():
             due_predicate = self._database_due_sql()
             expired = self._database_lease_expired_sql()
             params: tuple = (
-                *self._authorized_agent_ids,
+                *authorized_agent_ids,
                 SCHEDULER_PROTOCOL_VERSION,
             )
         else:
             due_predicate = "next_run_at IS NOT NULL AND next_run_at <= ?"
             expired = "(lease_expires_at IS NULL OR lease_expires_at <= ?)"
             params = (
-                *self._authorized_agent_ids,
+                *authorized_agent_ids,
                 SCHEDULER_PROTOCOL_VERSION,
                 now.isoformat(),
                 now.isoformat(),
@@ -722,8 +896,23 @@ class SchedulerRunner:
         if not hasattr(context, "__aenter__"):
             yield
             return
-        async with context:
-            yield
+        try:
+            async with context:
+                yield
+        except BaseException as error:
+            # Both concrete backends normalize arbitrary exceptions escaping a
+            # top-level transaction into TransactionError. Protocol
+            # incompatibility is a typed readiness boundary, not a generic
+            # query failure: recover the original sanitized exception from the
+            # causal chain so callers and /health retain the actionable type.
+            current: Optional[BaseException] = error
+            seen: set[int] = set()
+            while current is not None and id(current) not in seen:
+                seen.add(id(current))
+                if isinstance(current, SchedulerProtocolVersionIncompatible):
+                    raise current from None
+                current = current.__cause__ or current.__context__
+            raise
 
     @staticmethod
     def _updated(result: Any) -> bool:
@@ -737,10 +926,11 @@ class SchedulerRunner:
             return rowcount > 0
         return True
 
-    def _authorized_agent_placeholders(self) -> str:
-        """Return the fixed placeholder list for this runner's fleet scope."""
+    @staticmethod
+    def _authorized_agent_placeholders(agent_ids: Collection[str]) -> str:
+        """Return placeholders for one already-validated fleet snapshot."""
 
-        return ", ".join("?" for _ in self._authorized_agent_ids)
+        return ", ".join("?" for _ in agent_ids)
 
     def _database_backend_type(self) -> str:
         """Return the concrete backend type without trusting loose test doubles."""
@@ -993,6 +1183,28 @@ class SchedulerRunner:
         finally:
             if acquired:
                 await run_blocking_operation(lock.release)
+
+    @asynccontextmanager
+    async def _bootstrap_serialization_boundary(self) -> AsyncIterator[None]:
+        """Hold one backend-wide gate across scheduler bootstrap mutation.
+
+        PostgreSQL keeps its transaction-scoped advisory lock until all DDL
+        and DID rollout state is durable. File-backed SQLite takes a global
+        advisory lock *before* its write transaction, then takes the normal
+        per-DID rollout gates in deterministic order. That order avoids a
+        bootstrap writer holding SQLite's only writer while waiting for an
+        in-flight effect to leave its DID gate.
+        """
+
+        async with self._sqlite_rollout_gate(_SCHEDULER_BOOTSTRAP_LOCK_SCOPE):
+            async with AsyncExitStack() as gates:
+                for agent_id in self._authorized_agent_ids:
+                    await gates.enter_async_context(
+                        self._sqlite_rollout_gate(agent_id)
+                    )
+                async with self._transaction():
+                    await self._acquire_scheduler_schema_lock()
+                    yield
 
     @asynccontextmanager
     async def _active_dispatch_admission(self, task: ScheduledTask):
@@ -1278,7 +1490,12 @@ class SchedulerRunner:
             else 1
         )
 
-        authorization_scope = self._authorized_agent_placeholders()
+        authorized_agent_ids = await self._current_authorized_agent_ids()
+        if task.agent_id not in authorized_agent_ids:
+            return None
+        authorization_scope = self._authorized_agent_placeholders(
+            authorized_agent_ids
+        )
         uses_database_clock = self._uses_database_clock()
         async with self._sqlite_rollout_gate(task.agent_id):
             async with self._transaction():
@@ -1360,7 +1577,7 @@ class SchedulerRunner:
                         base_idempotency,
                         task.id,
                         task.agent_id,
-                        *self._authorized_agent_ids,
+                        *authorized_agent_ids,
                         SCHEDULER_PROTOCOL_VERSION,
                         scheduled_for,
                         base_idempotency,
@@ -1503,7 +1720,12 @@ class SchedulerRunner:
 
         if task.next_run_at is None:
             return
-        authorization_scope = self._authorized_agent_placeholders()
+        authorized_agent_ids = await self._current_authorized_agent_ids()
+        if task.agent_id not in authorized_agent_ids:
+            return
+        authorization_scope = self._authorized_agent_placeholders(
+            authorized_agent_ids
+        )
         async with self._transaction():
             uses_database_clock = self._uses_database_clock()
             now_iso = datetime.now(timezone.utc).isoformat()
@@ -1539,7 +1761,7 @@ class SchedulerRunner:
                 (
                     *((now_iso,) if not uses_database_clock else ()),
                     task.id, task.agent_id,
-                    *self._authorized_agent_ids, SCHEDULER_PROTOCOL_VERSION,
+                    *authorized_agent_ids, SCHEDULER_PROTOCOL_VERSION,
                     task.next_run_at, task.idempotency_key,
                     *((now_iso,) if not uses_database_clock else ()),
                 ),
@@ -1654,111 +1876,321 @@ class SchedulerRunner:
             attempt=task.attempt_count,
             owner=self._owner_id,
         )
-        renewal = asyncio.create_task(self._renew_lease(task), name=f"scheduler-lease:{execution.id}")
+        renewal_state = _LeaseRenewalState()
+        renewal = asyncio.create_task(
+            self._monitor_lease_renewal(task, renewal_state),
+            name=f"scheduler-lease:{execution.id}",
+        )
         started = time.monotonic()
-        status = "success"
-        result_text: Optional[str] = None
-        outcome_signal: Optional[float] = None
-        pause_schedule = False
+        in_preparation = True
         try:
-            async with self._active_dispatch_admission(task) as admitted:
-                if not admitted:
-                    logger.warning(
-                        "Refusing scheduler effect for %s: rollout is no longer active",
-                        execution.id,
-                    )
+            # A prepared executor resolves/cold-starts before the PostgreSQL
+            # control-row transaction. AgentManager's implementation holds its
+            # DID lifecycle lock from this point through the eventual effect,
+            # so DELETE cannot revoke the target between preparation and
+            # dispatch. Renewal is already active while this may take time.
+            async with self._prepared_execution(execution) as dispatch:
+                in_preparation = False
+                if renewal_state.lost.is_set():
+                    self._log_lease_loss(execution, phase="preparation")
                     return
-                now = (
-                    await self._database_clock()
-                    if self._uses_database_clock()
-                    else datetime.now(timezone.utc)
-                )
-                late = self._seconds_late(task.next_run_at, now)
-                grace = (
-                    self._misfire_grace_seconds
-                    if task.misfire_grace_seconds is None
-                    else max(0, int(task.misfire_grace_seconds))
-                )
-                policy = (
-                    task.misfire_policy
-                    if task.misfire_policy in MISFIRE_POLICIES
-                    else MISFIRE_SKIP
-                )
-                if policy == MISFIRE_SKIP and grace and late > grace:
+                async with self._active_dispatch_admission(task) as admitted:
+                    if not admitted:
+                        logger.warning(
+                            "Refusing scheduler effect for %s: rollout is no longer active",
+                            execution.id,
+                        )
+                        return
+                    if renewal_state.lost.is_set():
+                        self._log_lease_loss(execution, phase="admission")
+                        return
+                    now = (
+                        await self._database_clock()
+                        if self._uses_database_clock()
+                        else datetime.now(timezone.utc)
+                    )
+                    late = self._seconds_late(task.next_run_at, now)
+                    grace = (
+                        self._misfire_grace_seconds
+                        if task.misfire_grace_seconds is None
+                        else max(0, int(task.misfire_grace_seconds))
+                    )
+                    policy = (
+                        task.misfire_policy
+                        if task.misfire_policy in MISFIRE_POLICIES
+                        else MISFIRE_SKIP
+                    )
+                    if policy == MISFIRE_SKIP and grace and late > grace:
+                        if renewal_state.lost.is_set():
+                            self._log_lease_loss(execution, phase="misfire finalization")
+                            return
+                        await self._finalize(
+                            task,
+                            execution,
+                            status="skipped_misfire",
+                            result_text=(
+                                f"skipped: {late:.0f}s late (> {grace}s misfire grace); "
+                                "policy=skip"
+                            ),
+                            duration_ms=0,
+                            outcome_signal=None,
+                            ran=False,
+                        )
+                        return
+
+                    status = "success"
+                    result_text: Optional[str] = None
+                    outcome_signal: Optional[float] = None
+                    pause_schedule = False
+                    try:
+                        scope = _SchedulerExecutionScope(execution)
+                        token = _current_execution.set(scope)
+                        try:
+                            # This is the final effect boundary. Preparation is
+                            # complete (and, for AgentManager, the target is
+                            # already cold-loaded under its lifecycle lock), so
+                            # the non-locking exact-token read and live-authority
+                            # check occur as late as possible without making an
+                            # ``ACCESS SHARE`` lock block feature bootstrap DDL.
+                            if (
+                                renewal_state.lost.is_set()
+                                or not await self._agent_is_currently_authorized(
+                                    task.agent_id
+                                )
+                                or not await self._claim_token_is_live(task)
+                                or renewal_state.lost.is_set()
+                            ):
+                                logger.warning(
+                                    "Refusing scheduler effect for %s: agent was revoked, "
+                                    "claim was fenced or expired, or renewal was lost",
+                                    execution.id,
+                                )
+                                return
+                            completed, raw = await self._run_dispatch_while_lease_live(
+                                dispatch,
+                                execution,
+                                renewal_state,
+                            )
+                            if not completed:
+                                self._log_lease_loss(execution, phase="effect")
+                                return
+                        finally:
+                            # Invalidate before the parent context is reset.
+                            # Child tasks created by a target inherit this same
+                            # scope, so they can no longer present a completed
+                            # occurrence as trusted scheduler work after the
+                            # runner cancels or completes its owned effect.
+                            scope.revoke()
+                            _current_execution.reset(token)
+                        (
+                            status,
+                            result_text,
+                            outcome_signal,
+                            pause_schedule,
+                        ) = self._normalise_result(raw, task)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        status = "failed"
+                        result_text = f"{type(e).__name__}: {e}"
+                        logger.error(
+                            "Scheduled task %s (%s) failed: %s",
+                            task.id,
+                            task.task_name,
+                            e,
+                        )
+                    if renewal_state.lost.is_set():
+                        self._log_lease_loss(execution, phase="finalization")
+                        return
+                    # Keep renewal alive until the terminal compare-and-set
+                    # commits. Cancelling it before this await creates a
+                    # lease-expiry window in which a recovery worker can win
+                    # while this worker still writes.
                     await self._finalize(
                         task,
                         execution,
-                        status="skipped_misfire",
-                        result_text=(
-                            f"skipped: {late:.0f}s late (> {grace}s misfire grace); "
-                            "policy=skip"
-                        ),
-                        duration_ms=0,
-                        outcome_signal=None,
-                        ran=False,
+                        status=status,
+                        result_text=result_text,
+                        duration_ms=int((time.monotonic() - started) * 1000),
+                        outcome_signal=outcome_signal,
+                        ran=True,
+                        pause_schedule=pause_schedule,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if not in_preparation:
+                # Database/admission failures remain scheduler infrastructure
+                # failures. Do not disguise one as an ordinary cold-load task
+                # result merely because the prepared context is still open.
+                raise
+            # Preparation errors were historically executor errors: retain a
+            # visible failed execution when we still own a live claim, rather
+            # than escalating a cold-agent startup failure into a runner-wide
+            # protocol outage. Never finalize after the renewal monitor has
+            # reported loss, however.
+            logger.error(
+                "Scheduled task %s (%s) preparation failed: %s",
+                task.id,
+                task.task_name,
+                error,
+            )
+            if renewal_state.lost.is_set():
+                self._log_lease_loss(execution, phase="preparation failure")
+                return
+            async with self._active_dispatch_admission(task) as admitted:
+                if not admitted or renewal_state.lost.is_set():
+                    logger.warning(
+                        "Refusing scheduler preparation failure finalization for %s",
+                        execution.id,
                     )
                     return
-
-                try:
-                    scope = _SchedulerExecutionScope(execution)
-                    token = _current_execution.set(scope)
-                    try:
-                        # The active-control transaction remains held across
-                        # this await. A fencer either committed before admission
-                        # (and we returned above) or cannot commit until this
-                        # effect and its terminal CAS are complete. Do not renew
-                        # here: a PostgreSQL UPDATE would retain the schedule-row
-                        # lock for the whole arbitrary executor call, starving
-                        # the independent renewal task and administration. This
-                        # token-guarded read is the effect-entry linearization:
-                        # it observes the exact live claim after the active epoch
-                        # lock is held, while the epoch lock prevents scheduler
-                        # recovery or fencing from changing that claim before the
-                        # executor starts.
-                        if not await self._agent_is_currently_authorized(
-                            task.agent_id
-                        ) or not await self._claim_token_is_live(task):
-                            logger.warning(
-                                "Refusing scheduler effect for %s: agent was revoked or "
-                                "claim was fenced or expired",
-                                execution.id,
-                            )
-                            return
-                        raw = await self._run_executor(execution)
-                    finally:
-                        # Invalidate before the parent context is reset.  Child
-                        # tasks created by a target inherit this same scope, so
-                        # they can no longer present a completed occurrence as
-                        # trusted scheduler work after they outlive dispatch.
-                        scope.revoke()
-                        _current_execution.reset(token)
-                    status, result_text, outcome_signal, pause_schedule = self._normalise_result(raw, task)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    status = "failed"
-                    result_text = f"{type(e).__name__}: {e}"
-                    logger.error(
-                        "Scheduled task %s (%s) failed: %s",
-                        task.id,
-                        task.task_name,
-                        e,
-                    )
-                # Keep renewal alive until the terminal compare-and-set commits.
-                # Cancelling it before this await creates a lease-expiry window in
-                # which a recovery worker can win while this worker still writes.
                 await self._finalize(
                     task,
                     execution,
-                    status=status,
-                    result_text=result_text,
+                    status="failed",
+                    result_text=f"{type(error).__name__}: {error}",
                     duration_ms=int((time.monotonic() - started) * 1000),
-                    outcome_signal=outcome_signal,
-                    ran=True,
-                    pause_schedule=pause_schedule,
+                    outcome_signal=None,
+                    ran=False,
                 )
         finally:
             await self._stop_renewal(renewal, task, execution)
+
+    def _prepared_executor_method(self) -> Optional[Callable[[SchedulerExecution], Any]]:
+        """Return a structurally supplied preparation method, if any.
+
+        Static discovery preserves compatibility with ``AsyncMock`` callable
+        executors, which manufacture arbitrary dynamic attributes and must not
+        be mistaken for hosted/prepared implementations.
+        """
+
+        try:
+            inspect.getattr_static(self._executor, "prepare_scheduled")
+        except AttributeError:
+            return None
+        method = getattr(self._executor, "prepare_scheduled", None)
+        return method if callable(method) else None
+
+    @asynccontextmanager
+    async def _prepared_execution(
+        self, execution: SchedulerExecution
+    ) -> AsyncIterator[PreparedScheduledDispatch]:
+        """Yield an executor dispatch after optional structural preparation."""
+
+        prepare = self._prepared_executor_method()
+        if prepare is None:
+            async def dispatch() -> Any:
+                return await self._run_executor(execution)
+
+            yield dispatch
+            return
+
+        context = prepare(execution)
+        # A normal ``@asynccontextmanager`` factory returns its context
+        # directly. Accept an async factory too, which keeps the structural
+        # contract friendly to integrations that construct one asynchronously.
+        if inspect.isawaitable(context):
+            context = await context
+        if not hasattr(context, "__aenter__") or not hasattr(context, "__aexit__"):
+            raise TypeError(
+                "prepare_scheduled must return an async context manager"
+            )
+        async with context as dispatch:
+            if not callable(dispatch):
+                raise TypeError(
+                    "prepare_scheduled must yield an async dispatch callable"
+                )
+            yield dispatch
+
+    async def _monitor_lease_renewal(
+        self, task: ScheduledTask, state: _LeaseRenewalState
+    ) -> None:
+        """Run a renewal worker and make any terminal outcome fail closed."""
+
+        try:
+            await self._renew_lease(task)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as error:
+            state.mark_lost(error)
+            raise
+        else:
+            # The renewal loop has no successful terminal state. A normal
+            # return means the exact claim or live authority was lost.
+            state.mark_lost()
+
+    def _log_lease_loss(self, execution: SchedulerExecution, *, phase: str) -> None:
+        """Report a fail-closed lease loss without exposing backend details."""
+
+        logger.warning(
+            "Refusing scheduler execution %s after lease renewal loss during %s",
+            execution.id,
+            phase,
+        )
+
+    async def _run_dispatch_while_lease_live(
+        self,
+        dispatch: PreparedScheduledDispatch,
+        execution: SchedulerExecution,
+        renewal_state: _LeaseRenewalState,
+    ) -> tuple[bool, Any]:
+        """Await an owned effect, cancelling it if its lease is lost.
+
+        A target may be awaiting I/O when the renewal task discovers expiry or
+        revocation.  Cancellation cannot undo an already-committed external
+        effect, but it prevents further scheduler-owned work and, crucially,
+        prevents this worker from finalizing as the stale owner.  Both owned
+        tasks are joined so cancellation never leaves a context-bearing effect
+        detached in the background.
+        """
+
+        async def invoke_dispatch() -> Any:
+            return await dispatch()
+
+        effect = asyncio.create_task(
+            invoke_dispatch(), name=f"scheduler-effect:{execution.id}"
+        )
+        lease_lost = asyncio.create_task(
+            renewal_state.lost.wait(), name=f"scheduler-lease-watch:{execution.id}"
+        )
+        try:
+            await asyncio.wait(
+                {effect, lease_lost}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if renewal_state.lost.is_set():
+                if not effect.done():
+                    effect.cancel()
+                outcome = await await_owned_task(effect)
+                if outcome.cancellation is not None:
+                    raise outcome.cancellation
+                if outcome.error is not None and not isinstance(
+                    outcome.error, asyncio.CancelledError
+                ):
+                    logger.warning(
+                        "Scheduler effect %s failed while cancelling after lease loss: %s",
+                        execution.id,
+                        outcome.error,
+                    )
+                return False, None
+
+            outcome = await await_owned_task(effect)
+            if outcome.cancellation is not None:
+                raise outcome.cancellation
+            if outcome.error is not None:
+                raise outcome.error
+            # Give a renewal completion that raced the effect task precedence:
+            # even a completed effect must not terminalize under a lost lease.
+            if renewal_state.lost.is_set():
+                return False, None
+            return True, outcome.result
+        finally:
+            if not effect.done():
+                effect.cancel()
+                await await_owned_task(effect)
+            if not lease_lost.done():
+                lease_lost.cancel()
+                await await_owned_task(lease_lost)
 
     async def _run_executor(self, execution: SchedulerExecution) -> Any:
         # ``AsyncMock`` and similar dynamic proxies fabricate any attribute on
@@ -1797,7 +2229,7 @@ class SchedulerRunner:
         ):
             logger.error(
                 "Scheduler lease renewal failed for task %s execution %s; "
-                "completion CAS was still attempted",
+                "stale completion was refused",
                 task.id,
                 execution.id,
                 exc_info=(
@@ -2148,8 +2580,60 @@ class SchedulerRunner:
             # other mistakes that just-created table for a legacy upgrade.
             await self._db.fetchval(
                 "SELECT pg_advisory_xact_lock(?, ?)",
-                (2715, SCHEDULER_PROTOCOL_VERSION),
+                # This scope intentionally does not encode the local protocol
+                # version. A v2 process must serialize its compatibility
+                # preflight with a future binary before either can mutate the
+                # shared bootstrap/provenance state.
+                (2715, _SCHEDULER_BOOTSTRAP_ADVISORY_LOCK_SCOPE),
             )
+
+    @staticmethod
+    def _is_newer_protocol_version(value: Any) -> bool:
+        """Whether a persisted integer protocol version is newer than ours."""
+
+        # The durable columns are INTEGER. Keep an exact integer conversion so
+        # hand-edited text values such as ``"3"`` also fail closed, without
+        # treating malformed legacy data as an invented future protocol.
+        try:
+            return int(value) > SCHEDULER_PROTOCOL_VERSION
+        except (TypeError, ValueError):
+            return False
+
+    async def _scheduler_table_exists(self, table: str) -> bool:
+        """Read a scheduler table's existence without mutating the database."""
+
+        table_exists = getattr(self._db, "table_exists", None)
+        if not callable(table_exists):
+            # Lightweight unit doubles predate schema introspection. They are
+            # not persistent upgrade sources, so retain their no-table view.
+            return False
+        result = table_exists(table)
+        if inspect.isawaitable(result):
+            result = await result
+        return bool(result)
+
+    async def _reject_newer_scheduler_protocol_state(self) -> None:
+        """Fail before changing state written by a newer scheduler binary."""
+
+        if await self._scheduler_table_exists("scheduler_protocol_schema"):
+            row = await self._db.fetchone(
+                """
+                SELECT protocol_version FROM scheduler_protocol_schema
+                WHERE singleton = 1
+                """
+            )
+            if row is not None and row and self._is_newer_protocol_version(row[0]):
+                raise SchedulerProtocolVersionIncompatible()
+
+        if await self._scheduler_table_exists("scheduler_protocol_rollout"):
+            rows = await self._db.fetchall(
+                "SELECT protocol_version FROM scheduler_protocol_rollout"
+            )
+            if any(
+                row and self._is_newer_protocol_version(row[0])
+                for row in rows
+            ):
+                raise SchedulerProtocolVersionIncompatible()
 
     async def _establish_scheduler_schema_provenance(self) -> bool:
         """Return whether ``scheduled_tasks`` predated this v2 bootstrap.
@@ -2157,63 +2641,199 @@ class SchedulerRunner:
         The singleton is database-global, not DID-local. It distinguishes a
         genuinely fresh v2 fleet (where later configured DIDs are safe to seed
         active) from a database whose schedule table could have been created
-        by an origin/main binary. SQLite's transaction writer lock and
-        PostgreSQL's advisory transaction lock make the observation durable
-        under concurrent host startup.
+        by an origin/main binary. ``_ensure_tables`` invokes this only while
+        the backend-wide bootstrap boundary owns the transaction and lock.
         """
 
-        async with self._transaction():
-            await self._acquire_scheduler_schema_lock()
-            await self._db.execute(
-                """
-                CREATE TABLE IF NOT EXISTS scheduler_protocol_schema (
-                    singleton INTEGER PRIMARY KEY,
-                    provenance TEXT NOT NULL,
-                    protocol_version INTEGER NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-                """
+        await self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scheduler_protocol_schema (
+                singleton INTEGER PRIMARY KEY,
+                provenance TEXT NOT NULL,
+                protocol_version INTEGER NOT NULL,
+                created_at TEXT NOT NULL
             )
-            existing = await self._db.fetchone(
-                """
-                SELECT provenance FROM scheduler_protocol_schema
-                WHERE singleton = 1
-                """
-            )
-            if existing is not None:
-                provenance = existing[0] if len(existing) else None
-                if provenance not in {
-                    SCHEDULER_SCHEMA_PROVENANCE_FRESH_V2,
-                    SCHEDULER_SCHEMA_PROVENANCE_LEGACY_UNKNOWN,
-                }:
-                    # Unknown provenance is never silently treated as fresh.
-                    provenance = SCHEDULER_SCHEMA_PROVENANCE_LEGACY_UNKNOWN
-                self._schema_provenance = provenance
-                return provenance == SCHEDULER_SCHEMA_PROVENANCE_LEGACY_UNKNOWN
-
-            preexisting_schedule_table = await self._scheduled_tasks_table_exists()
-            provenance = (
-                SCHEDULER_SCHEMA_PROVENANCE_LEGACY_UNKNOWN
-                if preexisting_schedule_table
-                else SCHEDULER_SCHEMA_PROVENANCE_FRESH_V2
-            )
-            await self._db.execute(
-                """
-                INSERT INTO scheduler_protocol_schema
-                    (singleton, provenance, protocol_version, created_at)
-                VALUES (1, ?, ?, ?)
-                """,
-                (
-                    provenance,
-                    SCHEDULER_PROTOCOL_VERSION,
-                    datetime.now(timezone.utc).isoformat(),
-                ),
-            )
+            """
+        )
+        existing = await self._db.fetchone(
+            """
+            SELECT provenance, protocol_version FROM scheduler_protocol_schema
+            WHERE singleton = 1
+            """
+        )
+        if existing is not None:
+            if len(existing) > 1 and self._is_newer_protocol_version(existing[1]):
+                raise SchedulerProtocolVersionIncompatible()
+            provenance = existing[0] if len(existing) else None
+            if provenance not in {
+                SCHEDULER_SCHEMA_PROVENANCE_FRESH_V2,
+                SCHEDULER_SCHEMA_PROVENANCE_LEGACY_UNKNOWN,
+            }:
+                # Unknown provenance is never silently treated as fresh.
+                provenance = SCHEDULER_SCHEMA_PROVENANCE_LEGACY_UNKNOWN
             self._schema_provenance = provenance
-            return preexisting_schedule_table
+            return provenance == SCHEDULER_SCHEMA_PROVENANCE_LEGACY_UNKNOWN
+
+        preexisting_schedule_table = await self._scheduled_tasks_table_exists()
+        provenance = (
+            SCHEDULER_SCHEMA_PROVENANCE_LEGACY_UNKNOWN
+            if preexisting_schedule_table
+            else SCHEDULER_SCHEMA_PROVENANCE_FRESH_V2
+        )
+        await self._db.execute(
+            """
+            INSERT INTO scheduler_protocol_schema
+                (singleton, provenance, protocol_version, created_at)
+            VALUES (1, ?, ?, ?)
+            """,
+            (
+                provenance,
+                SCHEDULER_PROTOCOL_VERSION,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        self._schema_provenance = provenance
+        return preexisting_schedule_table
 
     async def _ensure_tables(self):
-        """Create and additively migrate the durable scheduler schema."""
+        """Create/migrate schema under one durable bootstrap boundary."""
+
+        blocked: list[tuple[str, str]] = []
+        async with self._bootstrap_serialization_boundary():
+            # This must remain the first database operation in the boundary:
+            # do not create, alter, normalize, or rotate a newer protocol's
+            # state just to discover that this binary cannot safely own it.
+            await self._reject_newer_scheduler_protocol_state()
+            blocked = await self._ensure_tables_mutations()
+
+        # A quiescing fence is useful only if it commits. Raising inside the
+        # outer transaction would roll it back and reopen legacy execution, so
+        # construct and raise the operator-facing error after the boundary.
+        if blocked:
+            raise self._rollout_quiescence_error(blocked)
+        self._protocol_ready = True
+
+    async def prepare_tenant_registration(
+        self,
+    ) -> SchedulerTenantProtocolRegistration:
+        """Durably activate one dynamic DID and snapshot rollback ownership.
+
+        The short-lived runner used for this operation must have one fixed DID.
+        Holding the same backend-global bootstrap boundary as ordinary startup
+        keeps runtime tenant activation ordered with schema/protocol changes.
+        """
+
+        if len(self._authorized_agent_ids) != 1:
+            raise ValueError(
+                "dynamic scheduler tenant registration requires exactly one DID"
+            )
+        agent_id = self._authorized_agent_ids[0]
+        blocked: list[tuple[str, str]] = []
+        async with self._bootstrap_serialization_boundary():
+            await self._reject_newer_scheduler_protocol_state()
+            rollout_preexisting = False
+            schedule_ids: tuple[str, ...] = ()
+            execution_ids: tuple[str, ...] = ()
+            if await self._scheduler_table_exists("scheduler_protocol_rollout"):
+                rollout_preexisting = (
+                    await self._db.fetchone(
+                        """
+                        SELECT 1 FROM scheduler_protocol_rollout
+                        WHERE agent_id = ?
+                        """,
+                        (agent_id,),
+                    )
+                    is not None
+                )
+            if await self._scheduler_table_exists("scheduled_tasks"):
+                schedule_ids = tuple(
+                    str(row[0])
+                    for row in await self._db.fetchall(
+                        "SELECT id FROM scheduled_tasks WHERE agent_id = ?",
+                        (agent_id,),
+                    )
+                )
+            if await self._scheduler_table_exists("task_execution_log"):
+                execution_ids = tuple(
+                    str(row[0])
+                    for row in await self._db.fetchall(
+                        "SELECT id FROM task_execution_log WHERE agent_id = ?",
+                        (agent_id,),
+                    )
+                )
+            blocked = await self._ensure_tables_mutations()
+
+        if blocked:
+            raise self._rollout_quiescence_error(blocked)
+        self._protocol_ready = True
+        return SchedulerTenantProtocolRegistration(
+            agent_id=agent_id,
+            rollout_preexisting=rollout_preexisting,
+            schedule_ids=schedule_ids,
+            execution_ids=execution_ids,
+        )
+
+    async def rollback_tenant_registration(
+        self,
+        registration: SchedulerTenantProtocolRegistration,
+    ) -> None:
+        """Remove only scheduler state created by a failed dynamic onboarding."""
+
+        if (
+            len(self._authorized_agent_ids) != 1
+            or registration.agent_id != self._authorized_agent_ids[0]
+        ):
+            raise ValueError("scheduler tenant rollback scope does not match runner")
+        agent_id = registration.agent_id
+        async with self._bootstrap_serialization_boundary():
+            await self._reject_newer_scheduler_protocol_state()
+            await self._delete_dynamic_tenant_rows(
+                "task_execution_log",
+                agent_id,
+                registration.execution_ids,
+            )
+            await self._delete_dynamic_tenant_rows(
+                "scheduled_tasks",
+                agent_id,
+                registration.schedule_ids,
+            )
+            if not registration.rollout_preexisting:
+                await self._db.execute(
+                    """
+                    DELETE FROM scheduler_protocol_rollout
+                    WHERE agent_id = ? AND protocol_version = ?
+                    """,
+                    (agent_id, SCHEDULER_PROTOCOL_VERSION),
+                )
+
+    async def _delete_dynamic_tenant_rows(
+        self,
+        table: str,
+        agent_id: str,
+        preexisting_ids: Collection[str],
+    ) -> None:
+        """Delete rows outside a registration's preexisting ownership snapshot."""
+
+        if table not in {"scheduled_tasks", "task_execution_log"}:
+            raise ValueError("unsupported scheduler tenant rollback table")
+        ids = tuple(preexisting_ids)
+        if not ids:
+            await self._db.execute(
+                f"DELETE FROM {table} WHERE agent_id = ?",
+                (agent_id,),
+            )
+            return
+        placeholders = ", ".join("?" for _ in ids)
+        await self._db.execute(
+            f"""
+            DELETE FROM {table}
+            WHERE agent_id = ? AND id NOT IN ({placeholders})
+            """,
+            (agent_id, *ids),
+        )
+
+    async def _ensure_tables_mutations(self) -> list[tuple[str, str]]:
+        """Apply bootstrap mutations while the caller owns the global gate."""
         preexisting_schedule_table = await self._establish_scheduler_schema_provenance()
         await self._db.execute(
             """
@@ -2283,6 +2903,7 @@ class SchedulerRunner:
             )
             """
         )
+        await self._lock_active_rollout_controls_for_bootstrap()
         scheduled_columns = {
             "schedule_kind": "TEXT NOT NULL DEFAULT 'cron'",
             "run_at": "TEXT",
@@ -2322,32 +2943,35 @@ class SchedulerRunner:
                 await self._add_column_if_missing(table, column, definition)
         # Existing UTC cron schedules retain their old behavior, now made
         # explicit and suitable for occurrence-level idempotency.
-        authorization_scope = self._authorized_agent_placeholders()
-        authorization_params = tuple(self._authorized_agent_ids)
-        await self._db.execute(
-            f"""
-            UPDATE scheduled_tasks SET schedule_kind = 'cron'
-            WHERE schedule_kind IS NULL AND agent_id IN ({authorization_scope})
-            """,
-            authorization_params,
-        )
-        await self._db.execute(
-            f"""
-            UPDATE scheduled_tasks SET timezone_name = 'UTC'
-            WHERE (timezone_name IS NULL OR timezone_name = '')
-              AND agent_id IN ({authorization_scope})
-            """,
-            authorization_params,
-        )
-        await self._db.execute(
-            f"""
-            UPDATE scheduled_tasks SET misfire_policy = 'skip'
-            WHERE (misfire_policy IS NULL OR misfire_policy = '')
-              AND agent_id IN ({authorization_scope})
-            """,
-            authorization_params,
-        )
-        await self._backfill_legacy_idempotency_keys()
+        if self._authorized_agent_ids:
+            authorization_scope = self._authorized_agent_placeholders(
+                self._authorized_agent_ids
+            )
+            authorization_params = tuple(self._authorized_agent_ids)
+            await self._db.execute(
+                f"""
+                UPDATE scheduled_tasks SET schedule_kind = 'cron'
+                WHERE schedule_kind IS NULL AND agent_id IN ({authorization_scope})
+                """,
+                authorization_params,
+            )
+            await self._db.execute(
+                f"""
+                UPDATE scheduled_tasks SET timezone_name = 'UTC'
+                WHERE (timezone_name IS NULL OR timezone_name = '')
+                  AND agent_id IN ({authorization_scope})
+                """,
+                authorization_params,
+            )
+            await self._db.execute(
+                f"""
+                UPDATE scheduled_tasks SET misfire_policy = 'skip'
+                WHERE (misfire_policy IS NULL OR misfire_policy = '')
+                  AND agent_id IN ({authorization_scope})
+                """,
+                authorization_params,
+            )
+            await self._backfill_legacy_idempotency_keys()
         await self._db.execute("CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_agent_next ON scheduled_tasks(agent_id, enabled, next_run_at)")
         await self._db.execute("CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_due_claim ON scheduled_tasks(enabled, next_run_at, lease_expires_at)")
         await self._db.execute(
@@ -2360,29 +2984,48 @@ class SchedulerRunner:
         )
         await self._db.execute("CREATE INDEX IF NOT EXISTS idx_task_execution_log_task ON task_execution_log(task_id, executed_at DESC)")
         await self._db.execute("CREATE INDEX IF NOT EXISTS idx_task_execution_log_idempotency ON task_execution_log(agent_id, idempotency_key)")
-        await self._ensure_protocol_rollout(
-            preexisting_schedule_table=preexisting_schedule_table
+        return await self._ensure_protocol_rollout(
+            preexisting_schedule_table=preexisting_schedule_table,
+            rollout_gates_held=True,
+            defer_quiescence_error=True,
         )
-        self._protocol_ready = True
+
+    async def _lock_active_rollout_controls_for_bootstrap(self) -> None:
+        """Drain admitted PostgreSQL effects before taking schema DDL locks.
+
+        An admitted effect holds its active control row through terminal CAS.
+        If bootstrap instead queued an ``ACCESS EXCLUSIVE`` table migration
+        first, that effect's final schedule update could queue behind DDL while
+        bootstrap later waited on its control row: a lock-order cycle. Lock
+        every current active DID before additive DDL, so an already-admitted
+        effect completes first and no new one can enter until bootstrap commits.
+        SQLite has already acquired every DID advisory gate in the enclosing
+        boundary, so it needs no extra database write here.
+        """
+
+        if self._database_backend_type() != "postgres":
+            return
+        for agent_id in self._authorized_agent_ids:
+            await self._db.execute(
+                """
+                UPDATE scheduler_protocol_rollout
+                SET updated_at = updated_at
+                WHERE agent_id = ? AND protocol_version = ? AND state = 'active'
+                """,
+                (agent_id, SCHEDULER_PROTOCOL_VERSION),
+            )
 
     async def _scheduled_tasks_table_exists(self) -> bool:
         """Return whether this runner is upgrading an existing schedule table."""
 
-        table_exists = getattr(self._db, "table_exists", None)
-        if not callable(table_exists):
-            # Lightweight legacy test doubles cannot answer this question. They
-            # are not a production upgrade source, so treat their bootstrap as
-            # a fresh schema while retaining the durable runtime check below.
-            return False
-        result = table_exists("scheduled_tasks")
-        if inspect.isawaitable(result):
-            result = await result
-        return bool(result)
+        return await self._scheduler_table_exists("scheduled_tasks")
 
     async def _backfill_legacy_idempotency_keys(self) -> None:
         """Give keyless legacy rows a bounded, stable generated base key."""
 
-        authorization_scope = self._authorized_agent_placeholders()
+        authorization_scope = self._authorized_agent_placeholders(
+            self._authorized_agent_ids
+        )
         rows = await self._db.fetchall(
             f"""
             SELECT id, agent_id FROM scheduled_tasks
@@ -2465,7 +3108,7 @@ class SchedulerRunner:
         try:
             row = await self._db.fetchone(
                 """
-                SELECT provenance FROM scheduler_protocol_schema
+                SELECT provenance, protocol_version FROM scheduler_protocol_schema
                 WHERE singleton = 1
                 """
             )
@@ -2474,6 +3117,8 @@ class SchedulerRunner:
             # bootstrap behavior; real startup always establishes the global
             # provenance first and treats any failure as a safety outage.
             return not preexisting_schedule_table
+        if row is not None and len(row) > 1 and self._is_newer_protocol_version(row[1]):
+            raise SchedulerProtocolVersionIncompatible()
         provenance = row[0] if row is not None and len(row) else None
         self._schema_provenance = (
             provenance
@@ -2489,7 +3134,9 @@ class SchedulerRunner:
         self,
         *,
         preexisting_schedule_table: bool,
-    ) -> None:
+        rollout_gates_held: bool = False,
+        defer_quiescence_error: bool = False,
+    ) -> list[tuple[str, str]]:
         """Fence legacy rows until every old scheduler process is drained.
 
         State is per agent DID so a host can never re-enable another fleet's
@@ -2498,32 +3145,50 @@ class SchedulerRunner:
         until the stored nonce is explicitly acknowledged.
         """
 
+        # ``_tick`` calls this independently of bootstrap. Keep the version
+        # preflight here as well so a later newer-protocol writer cannot be
+        # normalized into this runner's version by a periodic reconciliation.
+        await self._reject_newer_scheduler_protocol_state()
         blocked: list[tuple[str, str]] = []
         fresh_v2_schema = await self._scheduler_schema_is_fresh_v2(
             preexisting_schedule_table=preexisting_schedule_table
         )
-        for agent_id in self._authorized_agent_ids:
+        for agent_id in await self._current_authorized_agent_ids():
             # Acquire the SQLite advisory boundary *before* its writer
             # transaction. Waiting for an in-flight executor while holding
             # SQLite's only writer would deadlock that executor's renewal or
             # state writes. PostgreSQL uses the transaction row lock below.
-            async with self._sqlite_rollout_gate(agent_id):
+            if rollout_gates_held:
                 blocked_nonce = await self._ensure_protocol_rollout_agent(
                     agent_id, fresh_v2_schema=fresh_v2_schema
                 )
+            else:
+                async with self._sqlite_rollout_gate(agent_id):
+                    blocked_nonce = await self._ensure_protocol_rollout_agent(
+                        agent_id, fresh_v2_schema=fresh_v2_schema
+                    )
             if blocked_nonce is not None:
                 blocked.append((agent_id, blocked_nonce))
 
-        if blocked:
-            nonces = ", ".join(nonce for _, nonce in blocked)
-            agents = ", ".join(agent_id for agent_id, _ in blocked)
-            raise SchedulerRolloutQuiescenceRequired(
-                "Scheduler protocol v2 is quiescing for agent DID(s) "
-                f"{agents}. Stop and drain every legacy scheduler replica and "
-                "all scheduler mutations, then restart with "
-                f"{SCHEDULER_ROLLOUT_ACK_ENV} containing this one-time nonce "
-                f"(comma-separated when multiple DIDs are fenced): {nonces}"
-            )
+        if blocked and not defer_quiescence_error:
+            raise self._rollout_quiescence_error(blocked)
+        return blocked
+
+    @staticmethod
+    def _rollout_quiescence_error(
+        blocked: Collection[tuple[str, str]],
+    ) -> SchedulerRolloutQuiescenceRequired:
+        """Build the drain instruction only after its fences are durable."""
+
+        nonces = ", ".join(nonce for _, nonce in blocked)
+        agents = ", ".join(agent_id for agent_id, _ in blocked)
+        return SchedulerRolloutQuiescenceRequired(
+            "Scheduler protocol v2 is quiescing for agent DID(s) "
+            f"{agents}. Stop and drain every legacy scheduler replica and "
+            "all scheduler mutations, then restart with "
+            f"{SCHEDULER_ROLLOUT_ACK_ENV} containing this one-time nonce "
+            f"(comma-separated when multiple DIDs are fenced): {nonces}"
+        )
 
     async def _ensure_protocol_rollout_agent(
         self, agent_id: str, *, fresh_v2_schema: bool
@@ -2543,6 +3208,15 @@ class SchedulerRunner:
                     """,
                     (agent_id,),
                 )
+                if (
+                    state_row is not None
+                    and state_row
+                    and self._is_newer_protocol_version(state_row[0])
+                ):
+                    # Do not rotate a future control row down to v2. The
+                    # database state is an authority boundary, not an input
+                    # this older process may repair or reinterpret.
+                    raise SchedulerProtocolVersionIncompatible()
                 rollout_nonce = (
                     state_row[2]
                     if state_row is not None

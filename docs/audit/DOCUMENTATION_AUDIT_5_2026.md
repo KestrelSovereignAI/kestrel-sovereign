@@ -53,10 +53,10 @@ This audit should become the working ledger for cleanup PRs. The recommended ord
 - `docs/architecture/CONTEXT_C_DURABLE_SALVAGE.md` is explicitly aspirational;
   it distinguishes the conditional feature-flagged worker from the unshipped
   complete design.
-- Context-status documentation preserves the open
+- Context-status documentation records the
   [#2534](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2534)
-  measurement limitation instead of presenting the diagnostic as an exact
-  production trace.
+  resolution: one live/dry Kestrel plan owns retrieval, budgeting, and pruning,
+  while provider-native framing remains explicitly outside that projection.
 
 2026-05-31 package-boundary cleanup:
 
@@ -189,7 +189,8 @@ Action:
 
 **Resolved 2026-07-25.** The active source is
 [`CONTEXT_SYSTEM_DESIGN.md`](../architecture/CONTEXT_SYSTEM_DESIGN.md).
-The salvage design is cross-linked and aspirational; #2534 remains open.
+The salvage design is cross-linked and aspirational; #2534's Kestrel-plan
+measurement gap is resolved without claiming provider-native framing parity.
 
 Relevant docs include:
 

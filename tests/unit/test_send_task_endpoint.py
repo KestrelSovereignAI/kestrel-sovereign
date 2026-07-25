@@ -11,6 +11,8 @@ response. This is the send-side mirror of the responder-side
 
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -44,7 +46,14 @@ def _stub_agent():
     call arguments and the serialized response envelope."""
     agent = MagicMock()
     agent.did = "did:test:recipient"
+    agent.agent_id = agent.did
     agent._agent_name = "recipient"
+    agent.a2a_did_resolver = None
+    agent.a2a_inbound_sender_authorizer = None
+    agent.peer_directory_router = None
+    agent.peer_requester = None
+    agent._a2a_inbound_scoped_policy_required = False
+    agent._a2a_host_manager = None
     agent.task_manager = MagicMock()
 
     async def fake_create_task(*, params, agent_name, artifacts=None):
@@ -170,6 +179,39 @@ def test_send_task_rejects_malformed_artifact(app_with_send):
 _SENDER_DID = "did:web:example.com:agent:emma"
 
 
+class _InboundAuthorizer:
+    def __init__(
+        self,
+        *,
+        allowed: bool,
+        requires_verified_sender: bool = True,
+        scope_validator=None,
+    ):
+        self.allowed = allowed
+        self.requires_verified_sender = requires_verified_sender
+        self._scope_validator = scope_validator or (lambda: True)
+        self.calls: list[str] = []
+
+    def has_valid_current_scope(self) -> bool:
+        return self._scope_validator() is True
+
+    async def authorize(self, sender_did: str) -> bool:
+        self.calls.append(sender_did)
+        return self.allowed
+
+
+class _MutatingInboundAuthorizer(_InboundAuthorizer):
+    def __init__(self, mutation, *, scope_validator=None):
+        super().__init__(allowed=True, scope_validator=scope_validator)
+        self._mutation = mutation
+
+    async def authorize(self, sender_did: str) -> bool:
+        self.calls.append(sender_did)
+        await asyncio.sleep(0)
+        self._mutation()
+        return True
+
+
 def _signer_and_doc():
     from datetime import datetime, timezone
     from kestrel_sovereign.identity.hybrid_keypair import generate_hybrid_keypair
@@ -195,6 +237,45 @@ def _signer_and_doc():
     return sign, doc
 
 
+def _install_hosted_a2a_manager(agent, document, authorize_inbound_sender):
+    from kestrel_sovereign.a2a.did_registry import install_a2a_did_resolver
+    from kestrel_sovereign.a2a.inbound_authorization import (
+        install_a2a_inbound_sender_authorizer,
+        mark_a2a_inbound_scoped_policy,
+    )
+    from kestrel_sovereign.features.peers.directory import PeerRequester
+    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+
+    sender = SimpleNamespace(
+        agent_id="did:pkh:hosted:sender",
+        did="did:pkh:hosted:sender",
+        identity=SimpleNamespace(
+            is_hybrid=True,
+            signing_did=_SENDER_DID,
+            new_verification_methods=list(document["verificationMethod"]),
+        ),
+    )
+    manager = AgentManager()
+    manager._register_agent("sender", sender)
+    manager._register_agent("recipient", agent)
+    agent.peer_directory_router = SimpleNamespace(
+        authorize_inbound_sender=authorize_inbound_sender,
+    )
+    agent.peer_requester = PeerRequester(agent.agent_id, object())
+    mark_a2a_inbound_scoped_policy(agent, required=True)
+    install_a2a_did_resolver(manager, recipient=agent)
+    install_a2a_inbound_sender_authorizer(manager, recipient=agent)
+    agent._a2a_host_manager = manager
+    manager.install_a2a_hosted_policy(
+        agent,
+        resolver=agent.a2a_did_resolver,
+        authorizer=agent.a2a_inbound_sender_authorizer,
+        router=agent.peer_directory_router,
+        requester=agent.peer_requester,
+    )
+    return manager, sender
+
+
 def test_unsigned_envelope_accepted_and_marked_unverified(app_with_send):
     agent = _stub_agent()
     agent.a2a_did_resolver = None  # explicit: no resolver wired
@@ -206,6 +287,29 @@ def test_unsigned_envelope_accepted_and_marked_unverified(app_with_send):
     assert resp.status_code == 200
     # Verdict recorded for downstream governance.
     assert agent.task_manager.create_task.await_args.kwargs["params"].metadata["sender_verified"] is False
+
+
+def test_installed_standalone_authorizer_keeps_unsigned_compatibility(
+    app_with_send,
+):
+    authorizer = _InboundAuthorizer(
+        allowed=True,
+        requires_verified_sender=False,
+    )
+    agent = _stub_agent()
+    agent.a2a_inbound_sender_authorizer = authorizer
+    _attach(app_with_send, agent)
+
+    with TestClient(app_with_send) as client:
+        resp = client.post("/api/agent/tasks/send", json=_body())
+
+    assert resp.status_code == 200
+    assert authorizer.calls == []
+    assert (
+        agent.task_manager.create_task.await_args.kwargs["params"]
+        .metadata["sender_verified"]
+        is False
+    )
 
 
 def test_valid_signed_envelope_verifies(app_with_send):
@@ -220,6 +324,518 @@ def test_valid_signed_envelope_verifies(app_with_send):
 
     assert resp.status_code == 200
     assert agent.task_manager.create_task.await_args.kwargs["params"].metadata["sender_verified"] is True
+
+
+def test_scoped_valid_signed_sender_is_authorized_after_verification(
+    app_with_send,
+):
+    sign, doc = _signer_and_doc()
+    authorizer = _InboundAuthorizer(allowed=True)
+    agent = _stub_agent()
+    agent.a2a_did_resolver = lambda did: doc if did == _SENDER_DID else None
+    agent.a2a_inbound_sender_authorizer = authorizer
+    _attach(app_with_send, agent)
+
+    body = _body(metadata={"sender": _SENDER_DID, "signature": sign(["do it"])})
+    with TestClient(app_with_send) as client:
+        resp = client.post("/api/agent/tasks/send", json=body)
+
+    assert resp.status_code == 200
+    assert authorizer.calls == [_SENDER_DID]
+    assert (
+        agent.task_manager.create_task.await_args.kwargs["params"]
+        .metadata["sender_verified"]
+        is True
+    )
+
+
+def test_scoped_other_user_valid_signature_is_rejected(app_with_send):
+    sign, doc = _signer_and_doc()
+    authorizer = _InboundAuthorizer(allowed=False)
+    agent = _stub_agent()
+    agent.a2a_did_resolver = lambda did: doc if did == _SENDER_DID else None
+    agent.a2a_inbound_sender_authorizer = authorizer
+    _attach(app_with_send, agent)
+
+    body = _body(metadata={"sender": _SENDER_DID, "signature": sign(["do it"])})
+    with TestClient(app_with_send) as client:
+        resp = client.post("/api/agent/tasks/send", json=body)
+
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "A2A sender authorization failed"
+    assert authorizer.calls == [_SENDER_DID]
+    agent.task_manager.create_task.assert_not_awaited()
+
+
+def test_scoped_unsigned_envelope_rejected_even_without_global_flag(
+    app_with_send,
+    monkeypatch,
+):
+    monkeypatch.delenv("KESTREL_A2A_REQUIRE_SIGNED", raising=False)
+    authorizer = _InboundAuthorizer(allowed=True)
+    agent = _stub_agent()
+    agent.a2a_inbound_sender_authorizer = authorizer
+    _attach(app_with_send, agent)
+
+    with TestClient(app_with_send) as client:
+        resp = client.post("/api/agent/tasks/send", json=_body())
+
+    assert resp.status_code == 403
+    assert authorizer.calls == []
+    agent.task_manager.create_task.assert_not_awaited()
+
+
+def test_scoped_sender_missing_explicit_authorizer_fails_closed(app_with_send):
+    sign, doc = _signer_and_doc()
+    agent = _stub_agent()
+    agent.a2a_did_resolver = lambda did: doc if did == _SENDER_DID else None
+    agent.peer_directory_router = object()
+    agent.peer_requester = object()
+    _attach(app_with_send, agent)
+
+    body = _body(metadata={"sender": _SENDER_DID, "signature": sign(["do it"])})
+    with TestClient(app_with_send) as client:
+        resp = client.post("/api/agent/tasks/send", json=body)
+
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "A2A sender authorization unavailable"
+    agent.task_manager.create_task.assert_not_awaited()
+
+
+def test_monotonic_hosted_marker_survives_removal_of_every_live_scope_seam(
+    app_with_send,
+):
+    from kestrel_sovereign.a2a.inbound_authorization import (
+        mark_a2a_inbound_scoped_policy,
+    )
+
+    sign, doc = _signer_and_doc()
+    agent = _stub_agent()
+    agent.peer_directory_router = object()
+    agent.peer_requester = object()
+    agent.a2a_inbound_sender_authorizer = _InboundAuthorizer(allowed=True)
+    mark_a2a_inbound_scoped_policy(agent, required=True)
+
+    # Revoke every removable live seam. The registration-owned marker remains.
+    agent.peer_directory_router = None
+    agent.peer_requester = None
+    agent.a2a_inbound_sender_authorizer = None
+    agent.a2a_did_resolver = lambda did: doc if did == _SENDER_DID else None
+    _attach(app_with_send, agent)
+
+    with TestClient(app_with_send) as client:
+        unsigned = client.post("/api/agent/tasks/send", json=_body())
+        signed = client.post(
+            "/api/agent/tasks/send",
+            json=_body(
+                id="task-signed-after-revocation",
+                metadata={
+                    "sender": _SENDER_DID,
+                    "signature": sign(
+                        ["do it"],
+                        task_id="task-signed-after-revocation",
+                    ),
+                },
+            ),
+        )
+
+    assert unsigned.status_code == 403
+    assert "unsigned envelope rejected" in unsigned.json()["detail"]
+    assert signed.status_code == 403
+    assert signed.json()["detail"] == "A2A sender authorization unavailable"
+    agent.task_manager.create_task.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "mutation_kind",
+    ["remove_authorizer", "replace_router", "replace_resolver"],
+)
+def test_scope_change_during_async_did_resolution_fails_closed(
+    app_with_send,
+    mutation_kind,
+):
+    from kestrel_sovereign.a2a.inbound_authorization import (
+        mark_a2a_inbound_scoped_policy,
+    )
+
+    sign, doc = _signer_and_doc()
+    agent = _stub_agent()
+    authorizer = _InboundAuthorizer(allowed=True)
+    agent.peer_directory_router = object()
+    agent.peer_requester = object()
+    agent.a2a_inbound_sender_authorizer = authorizer
+    mark_a2a_inbound_scoped_policy(agent, required=True)
+
+    async def mutating_resolver(did):
+        await asyncio.sleep(0)
+        if mutation_kind == "remove_authorizer":
+            agent.a2a_inbound_sender_authorizer = None
+        elif mutation_kind == "replace_router":
+            agent.peer_directory_router = object()
+        else:
+            agent.a2a_did_resolver = lambda _did: None
+        return doc if did == _SENDER_DID else None
+
+    agent.a2a_did_resolver = mutating_resolver
+    _attach(app_with_send, agent)
+    body = _body(metadata={"sender": _SENDER_DID, "signature": sign(["do it"])})
+
+    with TestClient(app_with_send) as client:
+        resp = client.post("/api/agent/tasks/send", json=body)
+
+    assert resp.status_code == 403
+    assert (
+        resp.json()["detail"]
+        == "A2A sender authorization context changed during verification"
+    )
+    assert authorizer.calls == []
+    agent.task_manager.create_task.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "mutation_kind",
+    ["remove_requester", "replace_authorizer", "remove_router_method"],
+)
+def test_scope_change_during_awaited_authorization_fails_closed(
+    app_with_send,
+    mutation_kind,
+):
+    from kestrel_sovereign.a2a.inbound_authorization import (
+        mark_a2a_inbound_scoped_policy,
+    )
+
+    sign, doc = _signer_and_doc()
+    agent = _stub_agent()
+    agent.peer_directory_router = MagicMock()
+    agent.peer_directory_router.authorize_inbound_sender = AsyncMock(
+        return_value=True,
+    )
+    agent.peer_requester = object()
+
+    def mutate_scope():
+        if mutation_kind == "remove_requester":
+            agent.peer_requester = None
+        elif mutation_kind == "replace_authorizer":
+            agent.a2a_inbound_sender_authorizer = _InboundAuthorizer(
+                allowed=True,
+            )
+        else:
+            agent.peer_directory_router.authorize_inbound_sender = None
+
+    authorizer = _MutatingInboundAuthorizer(
+        mutate_scope,
+        scope_validator=lambda: (
+            agent.peer_requester is not None
+            and callable(
+                getattr(
+                    agent.peer_directory_router,
+                    "authorize_inbound_sender",
+                    None,
+                )
+            )
+        ),
+    )
+    agent.a2a_inbound_sender_authorizer = authorizer
+    agent.a2a_did_resolver = lambda did: doc if did == _SENDER_DID else None
+    mark_a2a_inbound_scoped_policy(agent, required=True)
+    _attach(app_with_send, agent)
+    body = _body(metadata={"sender": _SENDER_DID, "signature": sign(["do it"])})
+
+    with TestClient(app_with_send) as client:
+        resp = client.post("/api/agent/tasks/send", json=body)
+
+    assert resp.status_code == 403
+    if mutation_kind == "remove_router_method":
+        assert (
+            resp.json()["detail"]
+            == "A2A sender authorization context is invalid"
+        )
+    else:
+        assert (
+            resp.json()["detail"]
+            == "A2A sender authorization context changed during authorization"
+        )
+    assert authorizer.calls == [_SENDER_DID]
+    agent.task_manager.create_task.assert_not_awaited()
+
+
+@pytest.mark.parametrize("mutation_kind", ["replace_sender", "rotate_sender_key"])
+def test_live_sender_identity_change_during_authorization_fails_closed(
+    app_with_send,
+    mutation_kind,
+):
+    from kestrel_sovereign.identity.did_web import build_verification_methods
+    from kestrel_sovereign.identity.hybrid_keypair import generate_hybrid_keypair
+
+    sign, doc = _signer_and_doc()
+    agent = _stub_agent()
+    manager_box = {}
+    sender_box = {}
+
+    async def mutating_authorization(_requester, _sender_id):
+        await asyncio.sleep(0)
+        sender = sender_box["sender"]
+        if mutation_kind == "replace_sender":
+            replacement = SimpleNamespace(
+                agent_id=sender.agent_id,
+                did=sender.did,
+                identity=SimpleNamespace(
+                    is_hybrid=True,
+                    signing_did=_SENDER_DID,
+                    new_verification_methods=list(
+                        sender.identity.new_verification_methods
+                    ),
+                ),
+            )
+            manager_box["manager"]._agents["sender"] = replacement
+        else:
+            rotated = generate_hybrid_keypair()
+            sender.identity.new_verification_methods = (
+                build_verification_methods(
+                    _SENDER_DID,
+                    rotated.public_keys(),
+                )
+            )
+        return True
+
+    manager, sender = _install_hosted_a2a_manager(
+        agent,
+        doc,
+        mutating_authorization,
+    )
+    manager_box["manager"] = manager
+    sender_box["sender"] = sender
+    _attach(app_with_send, agent)
+    body = _body(metadata={"sender": _SENDER_DID, "signature": sign(["do it"])})
+
+    with TestClient(app_with_send) as client:
+        resp = client.post("/api/agent/tasks/send", json=body)
+
+    assert resp.status_code == 403
+    assert (
+        resp.json()["detail"]
+        == "A2A sender identity changed during authorization"
+    )
+    agent.task_manager.create_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sender_removal_waits_for_atomic_a2a_task_commit():
+    from kestrel_sovereign.a2a.types import Message, TaskSendParams, TextPart
+
+    sign, doc = _signer_and_doc()
+    authorization_started = asyncio.Event()
+    allow_authorization = asyncio.Event()
+
+    async def blocked_authorization(_requester, _sender_id):
+        authorization_started.set()
+        await allow_authorization.wait()
+        return True
+
+    agent = _stub_agent()
+    manager, sender = _install_hosted_a2a_manager(
+        agent,
+        doc,
+        blocked_authorization,
+    )
+    sender.shutdown = AsyncMock()
+    metadata = {"sender": _SENDER_DID}
+    metadata["signature"] = sign(["do it"])
+    params = TaskSendParams(
+        id="task-1",
+        sessionId="sess-1",
+        message=Message(role="user", parts=[TextPart(text="do it")]),
+        metadata=metadata,
+    )
+
+    request_task = asyncio.create_task(
+        agent_endpoint._create_verified_a2a_task(
+            agent,
+            params,
+            params.message.parts,
+            [],
+            [],
+        )
+    )
+    await asyncio.wait_for(authorization_started.wait(), timeout=1)
+    removal = asyncio.create_task(manager.remove_agent("sender"))
+    await asyncio.sleep(0)
+
+    assert removal.done() is False
+    assert manager.get_agent("sender") is sender
+
+    allow_authorization.set()
+    created = await asyncio.wait_for(request_task, timeout=1)
+    assert created.id == "task-1"
+    assert await asyncio.wait_for(removal, timeout=1) is True
+    assert manager.get_agent("sender") is None
+
+
+@pytest.mark.asyncio
+async def test_recipient_removal_waits_for_atomic_a2a_task_commit():
+    from kestrel_sovereign.a2a.types import Message, TaskSendParams, TextPart
+
+    sign, doc = _signer_and_doc()
+    agent = _stub_agent()
+    manager, _sender = _install_hosted_a2a_manager(
+        agent,
+        doc,
+        AsyncMock(return_value=True),
+    )
+    agent.shutdown = AsyncMock()
+    create_started = asyncio.Event()
+    allow_create = asyncio.Event()
+    original_create = agent.task_manager.create_task.side_effect
+
+    async def blocked_create(**kwargs):
+        create_started.set()
+        await allow_create.wait()
+        return await original_create(**kwargs)
+
+    agent.task_manager.create_task.side_effect = blocked_create
+    metadata = {"sender": _SENDER_DID}
+    metadata["signature"] = sign(["do it"])
+    params = TaskSendParams(
+        id="task-1",
+        sessionId="sess-1",
+        message=Message(role="user", parts=[TextPart(text="do it")]),
+        metadata=metadata,
+    )
+
+    request_task = asyncio.create_task(
+        agent_endpoint._create_verified_a2a_task(
+            agent,
+            params,
+            params.message.parts,
+            [],
+            [],
+        )
+    )
+    await asyncio.wait_for(create_started.wait(), timeout=1)
+    removal = asyncio.create_task(manager.remove_agent("recipient"))
+    await asyncio.sleep(0)
+
+    assert removal.done() is False
+    assert manager.get_agent("recipient") is agent
+
+    allow_create.set()
+    created = await asyncio.wait_for(request_task, timeout=1)
+    assert created.id == "task-1"
+    assert await asyncio.wait_for(removal, timeout=1) is True
+    assert manager.get_agent("recipient") is None
+
+
+@pytest.mark.asyncio
+async def test_removal_winning_lease_rejects_queued_stale_recipient():
+    from fastapi import HTTPException
+    from kestrel_sovereign.a2a.types import Message, TaskSendParams, TextPart
+
+    sign, doc = _signer_and_doc()
+    agent = _stub_agent()
+    manager, _sender = _install_hosted_a2a_manager(
+        agent,
+        doc,
+        AsyncMock(return_value=True),
+    )
+    agent.shutdown = AsyncMock()
+    metadata = {"sender": _SENDER_DID}
+    metadata["signature"] = sign(["do it"])
+    params = TaskSendParams(
+        id="task-1",
+        sessionId="sess-1",
+        message=Message(role="user", parts=[TextPart(text="do it")]),
+        metadata=metadata,
+    )
+    lease = manager.a2a_lifecycle_lease()
+    await lease.acquire()
+    removal = asyncio.create_task(manager.remove_agent("recipient"))
+    while not getattr(lease, "_waiters", None):
+        await asyncio.sleep(0)
+    request_task = asyncio.create_task(
+        agent_endpoint._create_verified_a2a_task(
+            agent,
+            params,
+            params.message.parts,
+            [],
+            [],
+        )
+    )
+    while len(getattr(lease, "_waiters", ())) < 2:
+        await asyncio.sleep(0)
+    lease.release()
+
+    assert await asyncio.wait_for(removal, timeout=1) is True
+    with pytest.raises(HTTPException) as rejected:
+        await asyncio.wait_for(request_task, timeout=1)
+    assert rejected.value.status_code == 403
+    assert "no longer published" in str(rejected.value.detail)
+    agent.task_manager.create_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_manager_policy_is_atomic_during_task_persistence():
+    from kestrel_sovereign.a2a.types import Message, TaskSendParams, TextPart
+
+    sign, doc = _signer_and_doc()
+    agent = _stub_agent()
+    manager, _sender = _install_hosted_a2a_manager(
+        agent,
+        doc,
+        AsyncMock(return_value=True),
+    )
+    create_started = asyncio.Event()
+    allow_create = asyncio.Event()
+    original_create = agent.task_manager.create_task.side_effect
+
+    async def blocked_create(**kwargs):
+        create_started.set()
+        await allow_create.wait()
+        return await original_create(**kwargs)
+
+    agent.task_manager.create_task.side_effect = blocked_create
+    original_policy = manager.a2a_hosted_policy_for(agent)
+    metadata = {"sender": _SENDER_DID}
+    metadata["signature"] = sign(["do it"])
+    params = TaskSendParams(
+        id="task-1",
+        sessionId="sess-1",
+        message=Message(role="user", parts=[TextPart(text="do it")]),
+        metadata=metadata,
+    )
+    request_task = asyncio.create_task(
+        agent_endpoint._create_verified_a2a_task(
+            agent,
+            params,
+            params.message.parts,
+            [],
+            [],
+        )
+    )
+    await asyncio.wait_for(create_started.wait(), timeout=1)
+
+    # Raw compatibility attributes are no longer policy mutation authority.
+    agent.peer_directory_router = None
+    agent.peer_requester = None
+    agent.a2a_inbound_sender_authorizer = None
+    replacement = asyncio.create_task(
+        manager.replace_a2a_hosted_policy(
+            agent,
+            resolver=original_policy.resolver,
+            authorizer=original_policy.authorizer,
+            router=original_policy.router,
+            requester=original_policy.requester,
+        )
+    )
+    await asyncio.sleep(0)
+    assert replacement.done() is False
+
+    allow_create.set()
+    created = await asyncio.wait_for(request_task, timeout=1)
+    replacement_policy = await asyncio.wait_for(replacement, timeout=1)
+
+    assert created.id == "task-1"
+    assert replacement_policy.generation > original_policy.generation
+    assert manager.a2a_hosted_policy_for(agent) is replacement_policy
 
 
 def test_valid_signed_envelope_with_artifacts_verifies(app_with_send):
@@ -274,6 +890,28 @@ def test_tampered_signed_envelope_rejected_403(app_with_send):
         resp = client.post("/api/agent/tasks/send", json=body)
 
     assert resp.status_code == 403
+    agent.task_manager.create_task.assert_not_awaited()
+
+
+def test_failed_crypto_never_calls_scoped_authorizer(app_with_send):
+    sign, doc = _signer_and_doc()
+    authorizer = _InboundAuthorizer(allowed=True)
+    agent = _stub_agent()
+    agent.a2a_did_resolver = lambda did: doc
+    agent.a2a_inbound_sender_authorizer = authorizer
+    _attach(app_with_send, agent)
+
+    body = _body(
+        metadata={
+            "sender": _SENDER_DID,
+            "signature": sign(["different signed content"]),
+        }
+    )
+    with TestClient(app_with_send) as client:
+        resp = client.post("/api/agent/tasks/send", json=body)
+
+    assert resp.status_code == 403
+    assert authorizer.calls == []
     agent.task_manager.create_task.assert_not_awaited()
 
 

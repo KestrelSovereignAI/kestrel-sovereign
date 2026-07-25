@@ -23,6 +23,7 @@ a signature is present and fails, or when ``require_signed=True``.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import secrets
@@ -86,6 +87,27 @@ class EnvelopeVerification:
     # observability/audit. Empty for unsigned/failed verdicts.
     sender: str = ""
     nonce: str = ""
+    # Canonical digest of the exact DID id + verification methods used for
+    # this verdict. Hosted callers bind it to the manager's live sender
+    # identity through authorization and task commit.
+    verification_document_fingerprint: str = ""
+
+
+def verification_document_fingerprint(
+    did_document: Mapping[str, Any],
+) -> str:
+    """Digest exactly the DID-document fields used by envelope verification."""
+    relevant = {
+        "id": did_document.get("id"),
+        "verificationMethod": did_document.get("verificationMethod") or [],
+    }
+    canonical = json.dumps(
+        relevant,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def canonical_message(part_texts: "list[str]") -> str:
@@ -513,6 +535,13 @@ async def verify_inbound_envelope(
         return EnvelopeVerification(
             ok=False, reason=f"cannot resolve sender DID {sender!r}"
         )
+    try:
+        document_fingerprint = verification_document_fingerprint(did_document)
+    except (TypeError, ValueError):
+        return EnvelopeVerification(
+            ok=False,
+            reason="sender DID document is not canonically serializable",
+        )
 
     timestamp = signature_block.get("timestamp") or ""
     nonce = str(signature_block.get("nonce") or "")
@@ -577,4 +606,5 @@ async def verify_inbound_envelope(
     return EnvelopeVerification(
         ok=verdict.ok, reason=verdict.reason, verified=verdict.verified,
         sender=sender, nonce=nonce,
+        verification_document_fingerprint=document_fingerprint,
     )

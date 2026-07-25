@@ -9,12 +9,15 @@ the database re-evaluates the claim predicate under its row lock.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 
 from kestrel_sovereign.features.scheduler.runner import (
+    AgentManagerHostedSchedulerExecutor,
     SCHEDULER_PROTOCOL_VERSION,
     SCHEDULER_ROLLOUT_ACK_ENV,
     SchedulerRolloutQuiescenceRequired,
@@ -484,6 +487,137 @@ async def test_postgres_long_executor_renews_while_admission_epoch_is_held(
         if tick is not None and not tick.done():
             tick.cancel()
             await asyncio.gather(tick, return_exceptions=True)
+        await db.execute("DELETE FROM task_execution_log WHERE task_id = ?", (task_id,))
+        await db.execute("DELETE FROM scheduled_tasks WHERE id = ?", (task_id,))
+        await db.execute("DELETE FROM scheduler_protocol_rollout WHERE agent_id = ?", (agent_id,))
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_postgres_cold_schema_bootstrap_precedes_admission_and_holds_lifecycle_lock(
+    db_backend,
+    monkeypatch,
+):
+    """A real ``ALTER TABLE`` cold load cannot self-deadlock admission."""
+
+    if db_backend.backend_type != "postgres":
+        pytest.skip("requires PostgreSQL ACCESS SHARE/ACCESS EXCLUSIVE semantics")
+
+    db = AsyncDatabase(db_backend)
+    agent_id = f"scheduler-prepared-cold:{uuid4()}"
+    task_id = f"scheduler-prepared-cold-task:{uuid4()}"
+    marker_column = f"scheduler_prepared_{uuid4().hex}"
+    lifecycle_lock = asyncio.Lock()
+    authority = {"active": True}
+    preparation_complete = asyncio.Event()
+    dispatch_started = asyncio.Event()
+    release_dispatch = asyncio.Event()
+    config = object()
+    tick: asyncio.Task[None] | None = None
+    deletion: asyncio.Task[None] | None = None
+
+    async def dispatch(_task_name, _args):
+        assert lifecycle_lock.locked()
+        dispatch_started.set()
+        await release_dispatch.wait()
+        return "ok"
+
+    cold_agent = SimpleNamespace(
+        did=agent_id,
+        features={
+            "SchedulerFeature": SimpleNamespace(
+                _dispatch_scheduled_task=dispatch,
+            )
+        },
+    )
+
+    async def load_agent(name, loaded_config, **kwargs):
+        assert name == "Cold"
+        assert loaded_config is config
+        assert kwargs == {
+            "expected_agent_id": agent_id,
+            "scheduler_lifecycle_lock_held": True,
+        }
+        # This is the same table relation the admission's exact-token SELECT
+        # reads. It needs ACCESS EXCLUSIVE on PostgreSQL, so the test would
+        # deterministically hang/fail under the former ordering.
+        await db.execute(
+            f"ALTER TABLE scheduled_tasks ADD COLUMN IF NOT EXISTS {marker_column} TEXT"
+        )
+        preparation_complete.set()
+        return cold_agent
+
+    manager = SimpleNamespace(
+        list_agents=lambda: {},
+        load_agent=load_agent,
+        scheduler_lifecycle_lock=lambda _agent_id: lifecycle_lock,
+        scheduler_authority_for=lambda _agent_id: (
+            ("Cold", config) if authority["active"] else None
+        ),
+    )
+
+    class AdmissionProbeRunner(SchedulerRunner):
+        @asynccontextmanager
+        async def _active_dispatch_admission(self, task):
+            assert preparation_complete.is_set()
+            async with super()._active_dispatch_admission(task) as admitted:
+                yield admitted
+
+    runner = AdmissionProbeRunner(
+        db,
+        agent_id,
+        AgentManagerHostedSchedulerExecutor(manager, {agent_id: ("Cold", config)}),
+        is_agent_authorized=lambda _agent_id: authority["active"],
+        owner_id="postgres-prepared-cold",
+    )
+
+    async def delete_agent():
+        async with lifecycle_lock:
+            authority["active"] = False
+
+    try:
+        await _activate_protocol_for_test_agent(db, agent_id, monkeypatch)
+        await runner._ensure_tables()
+        due = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        await db.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 next_run_at, created_at, idempotency_key,
+                 scheduler_protocol_version)
+            VALUES (?, ?, 'task', '* * * * *', '{}', 1, ?, ?, 'prepared-cold', ?)
+            """,
+            (task_id, agent_id, due, due, SCHEDULER_PROTOCOL_VERSION),
+        )
+
+        tick = asyncio.create_task(runner._tick())
+        await asyncio.wait_for(dispatch_started.wait(), timeout=3)
+        assert preparation_complete.is_set()
+
+        deletion = asyncio.create_task(delete_agent())
+        await asyncio.sleep(0)
+        assert not deletion.done()
+        assert authority["active"] is True
+
+        release_dispatch.set()
+        await asyncio.wait_for(tick, timeout=4)
+        assert await asyncio.wait_for(deletion, timeout=2) is None
+        assert authority["active"] is False
+        assert await db.fetchone(
+            "SELECT status FROM task_execution_log WHERE task_id = ?", (task_id,)
+        ) == ("success",)
+    finally:
+        release_dispatch.set()
+        for owned in (tick, deletion):
+            if owned is not None and not owned.done():
+                owned.cancel()
+        await asyncio.gather(
+            *(owned for owned in (tick, deletion) if owned is not None),
+            return_exceptions=True,
+        )
+        await db.execute(
+            f"ALTER TABLE scheduled_tasks DROP COLUMN IF EXISTS {marker_column}"
+        )
         await db.execute("DELETE FROM task_execution_log WHERE task_id = ?", (task_id,))
         await db.execute("DELETE FROM scheduled_tasks WHERE id = ?", (task_id,))
         await db.execute("DELETE FROM scheduler_protocol_rollout WHERE agent_id = ?", (agent_id,))

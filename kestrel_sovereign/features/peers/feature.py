@@ -2514,6 +2514,19 @@ class PeersFeature(Feature):
         are both wired on the agent. Skips silently when either is
         absent (standalone mode, no DB) or when no peer router is
         configured."""
+        # Register the ``a2a:`` Waitable provider so an outbound A2A task can
+        # be durably watched/re-armed with the CORRECT provider (#2729). This
+        # is independent of the pending-question replay below, so it runs even
+        # in standalone mode where no peer router is configured — a mismatched
+        # ``task:<outbound-id>`` watch is still rejected because the ``a2a``
+        # kind is available for the ownership cross-check.
+        registry = getattr(agent, "wait_registry", None)
+        if registry is not None:
+            from kestrel_sovereign.features.peers.wait_provider import A2AWaitable
+
+            # Record ownership so base shutdown()/boot rollback unregisters it.
+            self._register_wait_provider(registry, A2AWaitable(self), replace=True)
+
         store = getattr(agent, "pending_a2a_questions", None)
         if store is None:
             logger.debug(

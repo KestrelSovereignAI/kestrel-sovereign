@@ -36,6 +36,14 @@ def _make_mock_db():
     db.fetchall = AsyncMock(return_value=[])
 
     async def _fetchone(sql, *args):
+        if "FROM scheduler_protocol_schema" in sql:
+            if "provenance" in sql:
+                return ("fresh-v2", 2)
+            return (2,)
+        if "FROM scheduler_protocol_rollout" in sql:
+            if "activation_nonce" in sql:
+                return (2, "active", None)
+            return (2, "active")
         # The runner's exact effect-entry fence is deliberately a real
         # token-guarded read. This generic, storageless double models its
         # otherwise-valid claimed row while leaving unrelated lookups absent.
@@ -256,7 +264,7 @@ class TestRetiredCronCleanup:
             ]},
         ))
         f.schedule_remove = AsyncMock(return_value=ToolResult.ok(confirmation="removed"))
-        f.schedule_add = AsyncMock(return_value=ToolResult.ok(
+        f._ensure_builtin_schedule = AsyncMock(return_value=ToolResult.ok(
             confirmation="added", data={"next_run_at": None}))
 
         await f.post_all_features_loaded(agent)
@@ -264,7 +272,10 @@ class TestRetiredCronCleanup:
         # The orphaned built-in was removed by id...
         f.schedule_remove.assert_awaited_once_with("orphan-1")
         # ...and never re-seeded (it's no longer a default).
-        readded = [c.kwargs.get("task_name") for c in f.schedule_add.await_args_list]
+        readded = [
+            c.kwargs.get("task_name")
+            for c in f._ensure_builtin_schedule.await_args_list
+        ]
         assert "cognition_retention" not in readded
         # An already-present live default is not duplicated.
         assert "backup_snapshot" not in readded
@@ -299,7 +310,7 @@ class TestRetiredCronCleanup:
             ]},
         ))
         f.schedule_remove = AsyncMock(return_value=ToolResult.ok(confirmation="removed"))
-        f.schedule_add = AsyncMock(return_value=ToolResult.ok(
+        f._ensure_builtin_schedule = AsyncMock(return_value=ToolResult.ok(
             confirmation="added", data={"next_run_at": None}))
 
         await f.post_all_features_loaded(agent)
@@ -307,7 +318,10 @@ class TestRetiredCronCleanup:
         removed_ids = {c.args[0] for c in f.schedule_remove.await_args_list}
         assert "mc-auto" in removed_ids and "rf-auto" in removed_ids
         assert "mc-custom" not in removed_ids  # user schedule preserved
-        seeded = [c.kwargs.get("task_name") for c in f.schedule_add.await_args_list]
+        seeded = [
+            c.kwargs.get("task_name")
+            for c in f._ensure_builtin_schedule.await_args_list
+        ]
         assert "sleep" in seeded                # the one memory-maintenance cron
         assert "memory_consolidate" not in seeded
         assert "reflect" not in seeded
@@ -1440,6 +1454,48 @@ class TestSchedulerInit:
         feature._runner.stop = AsyncMock()
         await feature.shutdown()
         feature._runner.stop.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_initialize_prepares_but_agent_ready_arms_polling(self):
+        agent = _make_mock_agent()
+        agent.did = agent.agent_id
+        scheduler = SchedulerFeature(agent)
+        with (
+            patch.object(
+                SchedulerRunner,
+                "start",
+                new_callable=AsyncMock,
+            ) as prepare,
+            patch.object(
+                SchedulerRunner,
+                "arm",
+                new_callable=AsyncMock,
+            ) as arm,
+        ):
+            await scheduler.initialize()
+            prepare.assert_awaited_once_with(polling=False)
+            arm.assert_not_awaited()
+
+            await scheduler.on_agent_ready(agent)
+            arm.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_host_managed_postgres_agent_never_creates_scoped_runner(self):
+        agent = _make_mock_agent()
+        agent.did = agent.agent_id
+        agent._scheduler_polling_managed_by_host = True
+        scheduler = SchedulerFeature(agent)
+        with patch.object(
+            SchedulerRunner,
+            "start",
+            new_callable=AsyncMock,
+        ) as start:
+            await scheduler.initialize()
+            await scheduler.on_agent_ready(agent)
+
+        assert scheduler._polling_managed_by_host is True
+        assert scheduler._runner is None
+        start.assert_not_awaited()
 
 
 # =========================================================================

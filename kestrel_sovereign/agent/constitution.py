@@ -1696,14 +1696,29 @@ class ConstitutionMixin:
             f"{safe_mode_note}"
         )
 
-    async def _get_governing_constitution(self) -> str:
-        """Retrieves the agent's constitution from the trusted, anchored source."""
+    async def _get_governing_constitution(
+        self,
+        *,
+        allow_lazy_anchor: bool = True,
+    ) -> str:
+        """Retrieve the constitution from the trusted, anchored source.
+
+        ``allow_lazy_anchor=False`` is the diagnostic/read-only path. It reads
+        an existing anchor but never creates one, so context-status dry runs can
+        measure the same governing bytes as production without causing the
+        legacy lazy-anchor transaction.
+        """
         agent_node = await self.storage.get_node(self.agent_id)
         if not agent_node:
             return "Error: Agent's own identity node not found in storage."
 
         constitution_hash = agent_node.properties.get("constitution_hash")
         if not constitution_hash:
+            if not allow_lazy_anchor:
+                return (
+                    "Error: Governing constitution is not anchored; "
+                    "read-only retrieval cannot create the missing anchor."
+                )
             logging.warning("Constitution hash not found. Attempting to load and anchor default.")
 
             # Auto-anchor the SAME authoritative packaged governing bytes the

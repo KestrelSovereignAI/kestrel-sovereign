@@ -830,11 +830,38 @@ async def _onboard_host_registered_agent(app: FastAPI, manager, name: str, agent
     an incompletely integrated tenant.
     """
     from kestrel_sovereign.a2a.did_registry import install_a2a_did_resolver
+    from kestrel_sovereign.a2a.inbound_authorization import (
+        install_a2a_inbound_sender_authorizer,
+        mark_a2a_inbound_scoped_policy,
+    )
 
     federated = os.environ.get("KESTREL_A2A_FEDERATED_DID", "").lower() in (
         "1", "true", "yes",
     )
-    install_a2a_did_resolver(manager, federated_fallback=federated)
+    # Every agent reaching this hook is hosted by AgentManager, even when its
+    # PeersFeature uses the local adapter and therefore has no injected
+    # router/requester fields on KestrelAgent. Record hosted policy
+    # unconditionally and retain the manager that owns the atomic A2A
+    # topology/commit lease. Standalone agents never pass this hook.
+    mark_a2a_inbound_scoped_policy(agent, required=True)
+    agent._a2a_host_manager = manager
+    # A cold wake receives its own verification resolver and explicit inbound
+    # authorization seam. Existing agents retain their recipient-scoped
+    # objects, whose live manager views see this new peer without replacing
+    # their authorization context.
+    install_a2a_did_resolver(
+        manager,
+        recipient=agent,
+        federated_fallback=federated,
+    )
+    install_a2a_inbound_sender_authorizer(manager, recipient=agent)
+    manager.install_a2a_hosted_policy(
+        agent,
+        resolver=agent.a2a_did_resolver,
+        authorizer=agent.a2a_inbound_sender_authorizer,
+        router=getattr(agent, "peer_directory_router", None),
+        requester=getattr(agent, "peer_requester", None),
+    )
     _mount_feature_ui_assets(app, agents=(agent,))
     _mount_feature_routers(app, agents=(agent,))
 
@@ -1188,11 +1215,9 @@ def _uses_shared_postgres_scheduler() -> bool:
 async def _prepare_shared_postgres_scheduler_protocol(app: FastAPI, manager, config) -> None:
     """Seed one shared scheduler protocol epoch before agent runners start.
 
-    ``SchedulerFeature.initialize`` starts an agent-scoped runner.  Multi-agent
-    startup initializes those features concurrently, so letting the first
-    individual agent create the global scheduler tables makes the next one see
-    a pre-existing table and indistinguishably resemble a legacy upgrade.  Do
-    one non-polling host bootstrap first: discover every configured local DID
+    Hosted ``SchedulerFeature`` instances do not create agent-scoped polling
+    runners, but their post-load hooks still seed defaults concurrently. Do one
+    non-polling host bootstrap first: discover every configured local DID
     without initializing it, establish the database-global provenance marker,
     and write every DID's rollout row in the same protocol pass.
 
@@ -1204,6 +1229,16 @@ async def _prepare_shared_postgres_scheduler_protocol(app: FastAPI, manager, con
     """
     if not _uses_shared_postgres_scheduler():
         return
+
+    # Mark every subsequently loaded AgentManager tenant before feature
+    # initialization. The long-lived host runner below is the sole poller and
+    # owns the manager's live authority/lifecycle gates; an agent-scoped runner
+    # would retain stale execution authority across remove_agent().
+    configure_host_polling = getattr(
+        manager, "set_scheduler_polling_managed_by_host", None
+    )
+    if callable(configure_host_polling):
+        configure_host_polling(True)
 
     from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
     from kestrel_sovereign.features.scheduler.runner import (
@@ -1243,11 +1278,15 @@ async def _prepare_shared_postgres_scheduler_protocol(app: FastAPI, manager, con
             _latch_scheduler_readiness_failure(app, "protocol", error)
 
         live_authority = getattr(manager, "is_scheduler_agent_authorized", None)
+        live_scope = getattr(manager, "scheduler_authorized_agent_ids", None)
         runner = SchedulerRunner(
             db=storage.db,
             agent_id=None,
             executor=AgentManagerHostedSchedulerExecutor(manager, agent_configs),
             authorized_agent_ids=agent_configs.keys(),
+            authorized_agent_ids_provider=(
+                live_scope if callable(live_scope) else None
+            ),
             is_agent_authorized=(
                 live_authority if callable(live_authority) else None
             ),
@@ -1300,12 +1339,13 @@ async def _prepare_shared_postgres_scheduler_protocol(app: FastAPI, manager, con
 async def _start_host_scheduler(app: FastAPI, manager, config) -> None:
     """Start the shared-PostgreSQL scheduler that can wake cold local agents.
 
-    Agent-scoped runners remain the standalone executor implementation.  In a
-    shared PostgreSQL fleet, this host-owned runner claims rows without an
-    ``agent_id`` scope and dispatches through ``AgentManager``; therefore an
-    occurrence for ``autostart=false`` can load its target only after the claim
-    succeeds.  The dedicated storage connection belongs to the host lifecycle,
-    not to any agent that the scheduler might wake or later shut down.
+    Agent-scoped runners remain the standalone executor implementation outside
+    this topology. In a shared PostgreSQL fleet, this is the sole poller: it
+    claims rows without an ``agent_id`` scope and dispatches through
+    ``AgentManager``; therefore an occurrence for ``autostart=false`` can load
+    its target only after the claim succeeds. The dedicated storage connection
+    belongs to the host lifecycle, not to any agent that the scheduler might
+    wake or later shut down.
     """
     app.state.host_scheduler_runner = None
     app.state.host_scheduler_storage = None
@@ -1351,10 +1391,6 @@ async def _start_host_scheduler(app: FastAPI, manager, config) -> None:
             failure.get("agent"),
             failure["cause_type"],
         )
-    if not agent_configs:
-        logger.info("Shared scheduler not started: host has no local agents")
-        return
-
     storage = AsyncStorage(
         backend="postgres",
         dsn=os.environ["KESTREL_DATABASE_URL"],
@@ -1372,11 +1408,15 @@ async def _start_host_scheduler(app: FastAPI, manager, config) -> None:
             _latch_scheduler_readiness_failure(app, "protocol", error)
 
         live_authority = getattr(manager, "is_scheduler_agent_authorized", None)
+        live_scope = getattr(manager, "scheduler_authorized_agent_ids", None)
         runner = SchedulerRunner(
             db=storage.db,
             agent_id=None,
             executor=AgentManagerHostedSchedulerExecutor(manager, agent_configs),
             authorized_agent_ids=agent_configs.keys(),
+            authorized_agent_ids_provider=(
+                live_scope if callable(live_scope) else None
+            ),
             is_agent_authorized=(
                 live_authority if callable(live_authority) else None
             ),
@@ -1390,6 +1430,48 @@ async def _start_host_scheduler(app: FastAPI, manager, config) -> None:
         # Publish it first so cleanup also reaches a partially-started runner.
         app.state.host_scheduler_runner = runner
         await runner.start()
+
+        async def _register_runtime_scheduler_tenant(
+            name: str,
+            agent_id: str,
+            _config,
+        ):
+            # The manager has already published live config authority, but has
+            # not yet exposed this DID to the host runner's execution scope.
+            # Prepare its rollout row under the same database-global bootstrap
+            # serialization as process startup, before SchedulerFeature
+            # post-load can seed built-ins.
+            tenant_runner = SchedulerRunner(
+                db=storage.db,
+                agent_id=None,
+                executor=AgentManagerHostedSchedulerExecutor(manager),
+                authorized_agent_ids=(agent_id,),
+                on_protocol_failure=_on_scheduler_protocol_failure,
+                misfire_grace_seconds=(
+                    SchedulerFeature._load_misfire_grace_seconds()
+                ),
+                max_concurrent_tasks=(
+                    SchedulerFeature._load_max_concurrent_tasks()
+                ),
+                lease_seconds=SchedulerFeature._load_lease_seconds(),
+                owner_id=f"host-scheduler-register:{os.getpid()}:{agent_id}",
+            )
+            registration = await tenant_runner.prepare_tenant_registration()
+
+            async def _rollback_runtime_scheduler_tenant() -> None:
+                await tenant_runner.rollback_tenant_registration(registration)
+
+            logger.info(
+                "Prepared shared scheduler protocol for runtime agent %r",
+                name,
+            )
+            return _rollback_runtime_scheduler_tenant
+
+        configure_registration = getattr(
+            manager, "set_scheduler_tenant_registration_hook", None
+        )
+        if callable(configure_registration):
+            configure_registration(_register_runtime_scheduler_tenant)
     except BaseException as startup_failure:
         cleanup = asyncio.create_task(
             _shutdown_host_scheduler(app),
@@ -1427,6 +1509,13 @@ async def _shutdown_host_scheduler(app: FastAPI) -> None:
     """Stop the host-owned scheduler before agent storage is released."""
     runner = getattr(app.state, "host_scheduler_runner", None)
     storage = getattr(app.state, "host_scheduler_storage", None)
+    manager = getattr(app.state, "agent_manager", None)
+    if manager is not None:
+        configure_registration = getattr(
+            manager, "set_scheduler_tenant_registration_hook", None
+        )
+        if callable(configure_registration):
+            configure_registration(None)
     try:
         if runner is not None:
             await runner.stop()
@@ -1731,9 +1820,7 @@ async def _lifespan_startup(app: FastAPI):
             )
             # Seed the database-global scheduler provenance and every local
             # DID's durable protocol row before concurrent agent
-            # initialization.  Each SchedulerFeature starts its own scoped
-            # runner during initialize(), so doing this after load_from_config
-            # would reintroduce first-DID/second-DID fresh-fleet ambiguity.
+            # initialization and post-load default seeding.
             await _prepare_shared_postgres_scheduler_protocol(app, manager, config)
             loaded = await manager.load_from_config(config)
             logger.info(f"Multi-agent mode: {loaded} agent(s) loaded")

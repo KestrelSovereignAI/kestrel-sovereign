@@ -105,19 +105,22 @@ audience-specific derivative:
 
 - A production turn preloads at most the latest **50** eligible entries from
   the active session before retrieval, budgeting, and lumpy history selection.
-- `context_status` and `GET /api/agent/context-status` are diagnostic
-  projections, not exact prompt traces. Diagnostics may inspect up to 10,000
-  stored rows; even `full=true` does not reproduce production's latest-50
-  preload, every retrieval gate, elastic borrowing, lumpy pruning, or provider
-  framing.
-- [Issue #2534](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2534)
-  remains open for that runtime drift. Documentation work does not implement
-  its runtime fix and does not change or close the issue.
+- Production and `GET /api/agent/context-status?full=true` use the same typed
+  `ContextManager` build plan over that latest-50 input. The dry-run executes
+  production relevance gates, elastic finalization, lumpy anchoring,
+  microcompaction, wrapper accounting, and prune decisions without committing
+  access records or salvage writes. Status reads the anchored governing
+  constitution without lazily creating or anchoring missing policy.
+- The cheap `full=false` status deliberately omits memory/RAG acquisition and
+  reports those sections as `unknown`/`skipped`, never as measured zero.
+  Provider-native framing and stateful provider-thread occupancy remain
+  separate from the Kestrel context plan.
 - Default lumpy pruning omits older history from the provider window while
   retaining the source rows; it does not create an automatic durable summary.
   Automatic durable salvage is disabled by default. Its feature-flagged path is
-  conditional on a pruned span mapping to id-bearing persistent history, so it
-  is not a fail-closed guarantee for id-less or `ISOLATED` in-memory history.
+  conditional on pruned rows mapping to id-bearing persistent history. A mixed
+  span writes only that subset and reports id-less rows as unmappable, so it is
+  not a fail-closed guarantee for id-less or `ISOLATED` in-memory history.
 - `openai:plan` occupancy compaction is best-effort. Kestrel resets the Codex
   thread only after durable compaction reports success; a skipped or failed
   attempt lets the turn continue with the existing thread.
@@ -311,11 +314,12 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 - Source: [`kestrel_sovereign/features/context/feature.py`](kestrel_sovereign/features/context/feature.py)
 - Enablement state: `enabled`
-- `context_status` is a cheap diagnostic projection shared with
-  `GET /api/agent/context-status`; it is not an exact trace of the production
-  retrieval/pruning path. The endpoint's `full=true` mode adds read-only live
-  retrieval but retains the
-  [documented #2534 limitation](docs/architecture/CONTEXT_SYSTEM_DESIGN.md#honesty-boundary-issue-2534).
+- `context_status` is the cheap dry-run view of the same typed
+  `ContextManager` plan used by `GET /api/agent/context-status` and
+  production turns. Cheap mode marks omitted memory/RAG sections unknown;
+  `full=true` executes the production retrieval and pruning policy read-only.
+  It reads anchored governing policy without lazily creating missing state.
+  Provider-native framing remains outside the Kestrel plan.
 
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
@@ -672,7 +676,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
-| `wait` | `!wait` | `utility` | `target`, `duration_seconds`, `timeout_seconds`, `poll_interval_seconds`, `reason`, `mode` | 561 | `enabled` |
+| `wait` | `!wait` | `utility` | `target`, `duration_seconds`, `timeout_seconds`, `poll_interval_seconds`, `reason`, `mode` | 786 | `enabled` |
 
 ### `web_search` (WebSearchFeature)
 
@@ -1110,7 +1114,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!todo list` | `todo` | `[scope] [status] [owner] [include_done] [include_superseded] [limit]` | List durable todos by scope/status/owner, excluding superseded items by default. |
 | `!todo rollup` | `todo` | `[include_done] [limit]` | Summarize pending/waiting/in-progress todos across sessions and linked systems. |
 | `!todo update` | `todo` | `<todo_id> [title] [description] [scope] [status] [priority] [owner] [links] [terminal_condition] [next_check_at] [superseded_by] [source_metadata]` | Update an active todo without marking it complete unless status is explicitly terminal. |
-| `!wait` | `wait` | `[target] [duration_seconds] [timeout_seconds] [poll_interval_seconds] [reason] [mode]` | The ONE generic wait — works across EVERY feature. There is no per-feature wait tool; whatever async work a loaded feature exposes, you wait on it here with `target="<kind>:<handle>"`.<br>Known handle kinds (each contributed by a feature; more may be registered by whatever features are loaded):<br>• `task:<task_id>` — a Kestrel background task<br>• `talon:<job_id>` — a Talon coding job<br>• `ci:<...>`, `lora_train:<...>`, `tx:<...>`, `workflow:<run_id>` and others when those features are present.<br>If you pass an unknown kind, the error lists the kinds currently registered.<br><br>Three ways to call it:<br>• `target="<kind>:<handle>"` (default `mode="block"`) — hold the turn, polling until that thing reaches a terminal state or the timeout expires; returns the terminal outcome (or a still-pending result on timeout).<br>• `target="<kind>:<handle>", mode="signal"` — register a watch and return IMMEDIATELY; the wait reconciler wakes you with a `wait.complete` cognition signal once it finishes. Use this for long/unattended waits so you don't hold a turn.<br>• `duration_seconds=N` (no target) — a plain bounded pause, the native alternative to shelling out to `sleep` between polls in an autonomous loop. |
+| `!wait` | `wait` | `[target] [duration_seconds] [timeout_seconds] [poll_interval_seconds] [reason] [mode]` | The ONE generic wait — works across EVERY feature. There is no per-feature wait tool; whatever async work a loaded feature exposes, you wait on it here with `target="<kind>:<handle>"`.<br>Known handle kinds (each contributed by a feature; more may be registered by whatever features are loaded):<br>• `task:<task_id>` — a LOCAL Kestrel background task (this agent's own store)<br>• `talon:<job_id>` — a Talon coding job<br>• `a2a:<task_id>` — an OUTBOUND A2A TASK you sent a peer via send_a2a_task (route it here, NOT `task:` — a `task:` on an outbound A2A id is a provider mismatch and is rejected at registration). A2A QUESTIONS are NOT watched here: send_a2a_question already wakes you via its own `a2a.question_answered` signal, so an `a2a:<question-id>` watch is rejected to avoid waking you twice for one answer.<br>• `ci:<owner/repo#N>` — a GitHub PR's merge/CI-check state<br>• `lora_train:<...>`, `tx:<...>`, `workflow:<run_id>` and others when those features are present.<br>A kind being LISTED here is documentation, not a guarantee it is AVAILABLE: a provider is only reachable when its feature is loaded. If you pass an unknown/unavailable kind, the error lists the kinds currently registered. A registered kind's signal-mode watch is durable and RE-ARMS across restart; availability (is the provider loaded?) and re-arming (does a live watch resume?) are separate — a documented kind whose feature is not loaded neither registers nor re-arms.<br><br>Three ways to call it:<br>• `target="<kind>:<handle>"` (default `mode="block"`) — hold the turn, polling until that thing reaches a terminal state or the timeout expires; returns the terminal outcome (or a still-pending result on timeout).<br>• `target="<kind>:<handle>", mode="signal"` — register a watch and return IMMEDIATELY; the wait reconciler wakes you with a `wait.complete` cognition signal once it finishes. Use this for long/unattended waits so you don't hold a turn.<br>• `duration_seconds=N` (no target) — a plain bounded pause, the native alternative to shelling out to `sleep` between polls in an autonomous loop. |
 | `!web-search` | `web_search` | `<query> [max_results]` | Search the web for information. max_results is typically 1-10 (default 5). A 'disabled' error means no search provider is configured — set a provider API key (e.g. TAVILY_API_KEY). |
 | `!webhooks history` | `webhooks` | `[limit]` | Show recent webhook receive log for security audit |
 | `!webhooks list` | `webhooks` |  | List all registered webhook endpoints |

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import FastAPI
@@ -62,6 +62,7 @@ async def test_protocol_preflight_seeds_all_resolved_dids_without_polling(
         local_agent_configs_by_did=AsyncMock(side_effect=_resolve),
         cold_scheduler_identity_failures=[],
         is_scheduler_agent_authorized=lambda _did: True,
+        set_scheduler_polling_managed_by_host=MagicMock(),
     )
     app = FastAPI()
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
@@ -88,6 +89,7 @@ async def test_protocol_preflight_seeds_all_resolved_dids_without_polling(
     )
     assert runner_instances[0].started is False
     assert storage_instances[0].closed is True
+    manager.set_scheduler_polling_managed_by_host.assert_called_once_with(True)
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,7 @@
 """Durability contracts for scheduler claims, leases, deadlines, and zones."""
 
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock
@@ -15,12 +16,16 @@ from kestrel_sovereign.features.scheduler.runner import (
     AgentManagerHostedSchedulerExecutor,
     SCHEDULER_PROTOCOL_VERSION,
     SCHEDULER_ROLLOUT_ACK_ENV,
+    SCHEDULER_ROLLOUT_STATE_ACTIVE,
+    SCHEDULER_SCHEMA_PROVENANCE_FRESH_V2,
     SchedulerRolloutQuiescenceRequired,
     SchedulerExecution,
     SchedulerRunner,
     ScheduledTask,
     get_current_scheduler_execution,
 )
+from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
@@ -95,6 +100,155 @@ async def test_two_database_runners_claim_one_occurrence(tmp_path):
             ("task-1",),
         )
         assert history == [("success", 1, calls[0][2])]
+    finally:
+        await db_a.close()
+        await db_b.close()
+
+
+@pytest.mark.asyncio
+async def test_file_sqlite_concurrent_bootstrap_serializes_schema_and_all_did_seeding(
+    tmp_path,
+):
+    """Separate file connections cannot observe a partial scheduler bootstrap."""
+
+    database_path = tmp_path / "concurrent-bootstrap.db"
+    db_a = await _database(database_path)
+    db_b = await _database(database_path)
+    first_inside_mutations = asyncio.Event()
+    release_first = asyncio.Event()
+    second_inside_mutations = asyncio.Event()
+    agent_ids = {"agent-a", "agent-b"}
+
+    class FirstBootstrapRunner(SchedulerRunner):
+        async def _ensure_tables_mutations(self):
+            first_inside_mutations.set()
+            await release_first.wait()
+            return await super()._ensure_tables_mutations()
+
+    class SecondBootstrapRunner(SchedulerRunner):
+        async def _ensure_tables_mutations(self):
+            second_inside_mutations.set()
+            return await super()._ensure_tables_mutations()
+
+    async def noop(_task_name, _args):
+        return None
+
+    first = FirstBootstrapRunner(
+        db_a, None, noop, authorized_agent_ids=agent_ids, owner_id="sqlite-first"
+    )
+    second = SecondBootstrapRunner(
+        db_b, None, noop, authorized_agent_ids=agent_ids, owner_id="sqlite-second"
+    )
+    first_task: asyncio.Task[None] | None = None
+    second_task: asyncio.Task[None] | None = None
+    try:
+        first_task = asyncio.create_task(first._ensure_tables())
+        await asyncio.wait_for(first_inside_mutations.wait(), timeout=1)
+
+        second_task = asyncio.create_task(second._ensure_tables())
+        await asyncio.sleep(0.05)
+        assert not second_inside_mutations.is_set()
+        assert not second_task.done()
+
+        release_first.set()
+        await asyncio.wait_for(asyncio.gather(first_task, second_task), timeout=2)
+
+        assert await db_a.fetchone(
+            "SELECT provenance, protocol_version FROM scheduler_protocol_schema "
+            "WHERE singleton = 1"
+        ) == (SCHEDULER_SCHEMA_PROVENANCE_FRESH_V2, SCHEDULER_PROTOCOL_VERSION)
+        assert await db_a.fetchall(
+            "SELECT agent_id, protocol_version, state, activation_nonce "
+            "FROM scheduler_protocol_rollout ORDER BY agent_id"
+        ) == [
+            ("agent-a", SCHEDULER_PROTOCOL_VERSION, SCHEDULER_ROLLOUT_STATE_ACTIVE, None),
+            ("agent-b", SCHEDULER_PROTOCOL_VERSION, SCHEDULER_ROLLOUT_STATE_ACTIVE, None),
+        ]
+        assert first._protocol_ready and second._protocol_ready
+    finally:
+        release_first.set()
+        for owned in (first_task, second_task):
+            if owned is not None and not owned.done():
+                owned.cancel()
+        await asyncio.gather(
+            *(owned for owned in (first_task, second_task) if owned is not None),
+            return_exceptions=True,
+        )
+        await db_a.close()
+        await db_b.close()
+
+
+@pytest.mark.asyncio
+async def test_file_sqlite_concurrent_builtin_seeders_insert_each_default_once(
+    tmp_path,
+):
+    """Two post-load replicas cannot duplicate core defaults for one DID."""
+
+    database_path = tmp_path / "concurrent-default-seeding.db"
+    db_a = await _database(database_path)
+    db_b = await _database(database_path)
+    agent_id = "did:scheduler:concurrent-defaults"
+
+    def feature_for(db):
+        agent = SimpleNamespace(
+            did=agent_id,
+            agent_id=agent_id,
+            features={},
+            storage=SimpleNamespace(db=db),
+        )
+        feature = SchedulerFeature(agent)
+        feature._db = db
+        feature._agent_id = agent_id
+        return feature, agent
+
+    first, first_agent = feature_for(db_a)
+    second, second_agent = feature_for(db_b)
+    runner = SchedulerRunner(
+        db_a,
+        agent_id,
+        AsyncMock(),
+        owner_id="builtin-seed-schema",
+    )
+    try:
+        await runner._ensure_tables()
+        await asyncio.gather(
+            first.post_all_features_loaded(first_agent),
+            second.post_all_features_loaded(second_agent),
+        )
+
+        defaults = await db_a.fetchall(
+            """
+            SELECT task_name, COUNT(*), MIN(idempotency_key)
+            FROM scheduled_tasks
+            WHERE agent_id = ?
+            GROUP BY task_name
+            ORDER BY task_name
+            """,
+            (agent_id,),
+        )
+        assert defaults == [
+            ("backup_snapshot", 1, "scheduler:builtin:v1:backup_snapshot"),
+            ("morning_signal", 1, "scheduler:builtin:v1:morning_signal"),
+            ("signal_dispatch", 1, "scheduler:builtin:v1:signal_dispatch"),
+            ("trash_retention", 1, "scheduler:builtin:v1:trash_retention"),
+            ("wait_reconcile", 1, "scheduler:builtin:v1:wait_reconcile"),
+        ]
+
+        # The idempotent core ensure is private; the public API intentionally
+        # retains duplicate task names for independently keyed user schedules.
+        custom = await first.schedule_add(
+            cron_expression="@hourly",
+            task_name="backup_snapshot",
+            idempotency_key="user:second-backup",
+        )
+        assert custom.status.value == "ok"
+        assert await db_a.fetchone(
+            """
+            SELECT COUNT(*) FROM scheduled_tasks
+            WHERE agent_id = ? AND task_name = 'backup_snapshot'
+            """,
+            (agent_id,),
+        ) == (2,)
     finally:
         await db_a.close()
         await db_b.close()
@@ -253,6 +407,89 @@ async def test_one_shot_deadline_becomes_terminal_after_one_fire(tmp_path):
         )
         assert row == (0, None, "success")
     finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_overdue_builtin_one_shot_waits_for_agent_ready_before_dispatch(
+    tmp_path,
+):
+    """Polling cannot consume a one-shot while its built-in owner is loading."""
+
+    db = await _database(tmp_path / "post-load-one-shot.db")
+    agent_id = "did:scheduler:post-load-one-shot"
+    agent = SimpleNamespace(
+        did=agent_id,
+        agent_id=agent_id,
+        features={},
+        storage=SimpleNamespace(db=db),
+    )
+    scheduler = SchedulerFeature(agent)
+    executed = asyncio.Event()
+
+    class RestartOwner:
+        enabled = True
+        name = "RestartCoordinatorFeature"
+
+        def __init__(self):
+            async def execute(**_kwargs):
+                executed.set()
+                return {"success": True}
+
+            self.tool = SimpleNamespace(
+                name="restart_coordinator",
+                execute=execute,
+            )
+
+        def get_tools(self):
+            return [self.tool]
+
+    try:
+        await scheduler.initialize()
+        assert scheduler._runner is not None
+        assert scheduler._runner._task is None
+        deadline = (
+            datetime.now(timezone.utc) - timedelta(seconds=2)
+        ).isoformat()
+        added = await scheduler.schedule_add_deadline(
+            run_at=deadline,
+            task_name="restart_coordinator",
+            idempotency_key="post-load-one-shot",
+        )
+        assert added.status.value == "ok"
+
+        # Even an overdue row remains untouched throughout post-load wiring.
+        await asyncio.sleep(0.05)
+        assert await db.fetchone(
+            "SELECT COUNT(*) FROM task_execution_log WHERE task_id = ?",
+            (added.data["task_id"],),
+        ) == (0,)
+
+        agent.features["RestartCoordinatorFeature"] = RestartOwner()
+        await scheduler.on_agent_ready(agent)
+        await asyncio.wait_for(executed.wait(), timeout=1)
+        terminal_row = None
+        for _ in range(100):
+            terminal_row = await db.fetchone(
+                """
+                SELECT enabled, terminal_status
+                FROM scheduled_tasks WHERE id = ?
+                """,
+                (added.data["task_id"],),
+            )
+            if terminal_row == (0, "success"):
+                break
+            await asyncio.sleep(0.01)
+        assert terminal_row == (0, "success")
+        assert await db.fetchone(
+            """
+            SELECT status FROM task_execution_log
+            WHERE task_id = ?
+            """,
+            (added.data["task_id"],),
+        ) == ("success",)
+    finally:
+        await scheduler.shutdown()
         await db.close()
 
 
@@ -1469,6 +1706,121 @@ async def test_host_executor_loads_cold_agent_once_per_target():
 
 
 @pytest.mark.asyncio
+async def test_prepared_agent_manager_cold_load_precedes_admission_and_holds_delete_lock(
+    tmp_path,
+):
+    """Cold schema bootstrap never runs under admission, and DELETE waits.
+
+    The load deliberately executes additive DDL. If the runner took its
+    PostgreSQL-style admission transaction before preparation, that operation
+    would need an ``ACCESS EXCLUSIVE`` table lock while its own token read held
+    ``ACCESS SHARE``. The order probe makes the regression deterministic on
+    SQLite too; the SQL itself remains valid on PostgreSQL.
+    """
+
+    db = await _database(tmp_path / "prepared-cold-load.db")
+    lifecycle_lock = asyncio.Lock()
+    authority = {"active": True}
+    preparation_complete = asyncio.Event()
+    admission_entered = asyncio.Event()
+    dispatch_started = asyncio.Event()
+    allow_dispatch_finish = asyncio.Event()
+    config = object()
+
+    async def dispatch(_task_name, _args):
+        assert lifecycle_lock.locked()
+        dispatch_started.set()
+        await allow_dispatch_finish.wait()
+        return "dispatched"
+
+    cold_agent = SimpleNamespace(
+        did="agent-1",
+        features={
+            "SchedulerFeature": SimpleNamespace(
+                _dispatch_scheduled_task=dispatch,
+            )
+        },
+    )
+
+    async def load_agent(name, loaded_config, **kwargs):
+        assert name == "Cold"
+        assert loaded_config is config
+        assert kwargs == {
+            "expected_agent_id": "agent-1",
+            "scheduler_lifecycle_lock_held": True,
+        }
+        assert lifecycle_lock.locked()
+        await db.execute(
+            "ALTER TABLE scheduled_tasks ADD COLUMN cold_bootstrap_marker TEXT"
+        )
+        preparation_complete.set()
+        return cold_agent
+
+    manager = SimpleNamespace(
+        list_agents=lambda: {},
+        load_agent=load_agent,
+        scheduler_lifecycle_lock=lambda _agent_id: lifecycle_lock,
+        scheduler_authority_for=lambda _agent_id: (
+            ("Cold", config) if authority["active"] else None
+        ),
+    )
+
+    class AdmissionProbeRunner(SchedulerRunner):
+        @asynccontextmanager
+        async def _active_dispatch_admission(self, task):
+            assert preparation_complete.is_set()
+            admission_entered.set()
+            async with super()._active_dispatch_admission(task) as admitted:
+                yield admitted
+
+    runner = AdmissionProbeRunner(
+        db,
+        "agent-1",
+        AgentManagerHostedSchedulerExecutor(manager, {"agent-1": ("Cold", config)}),
+        is_agent_authorized=lambda _agent_id: authority["active"],
+        owner_id="prepared-cold-load",
+    )
+
+    async def delete_agent():
+        async with lifecycle_lock:
+            authority["active"] = False
+
+    tick: asyncio.Task[None] | None = None
+    deletion: asyncio.Task[None] | None = None
+    try:
+        await runner._ensure_tables()
+        await _seed_due(db)
+        tick = asyncio.create_task(runner._tick())
+        await asyncio.wait_for(admission_entered.wait(), timeout=1)
+        await asyncio.wait_for(dispatch_started.wait(), timeout=1)
+        assert await db.fetchone(
+            "SELECT 1 FROM pragma_table_info('scheduled_tasks') WHERE name = ?",
+            ("cold_bootstrap_marker",),
+        ) == (1,)
+
+        deletion = asyncio.create_task(delete_agent())
+        await asyncio.sleep(0)
+        assert not deletion.done()
+        assert authority["active"] is True
+
+        allow_dispatch_finish.set()
+        await asyncio.wait_for(tick, timeout=1)
+        assert await asyncio.wait_for(deletion, timeout=1) is None
+        assert authority["active"] is False
+        assert not lifecycle_lock.locked()
+    finally:
+        allow_dispatch_finish.set()
+        for owned in (tick, deletion):
+            if owned is not None and not owned.done():
+                owned.cancel()
+        await asyncio.gather(
+            *(owned for owned in (tick, deletion) if owned is not None),
+            return_exceptions=True,
+        )
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_host_executor_rejects_cold_agent_did_mismatch_before_dispatch():
     """A nonconforming manager cannot cross-route a claimed tenant DID."""
 
@@ -1578,8 +1930,8 @@ async def test_host_runner_cannot_claim_or_advance_foreign_fleet_rows(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_renewal_exception_after_dispatch_still_finalizes_once(tmp_path, caplog):
-    """A failed renewal is observed without losing the completion CAS."""
+async def test_renewal_exception_before_effect_fails_closed(tmp_path, caplog):
+    """A renewal failure observed before dispatch never invokes the effect."""
     db = await _database(tmp_path / "scheduler.db")
     renewal_started = asyncio.Event()
     executor = AsyncMock()
@@ -1588,11 +1940,6 @@ async def test_renewal_exception_after_dispatch_still_finalizes_once(tmp_path, c
         renewal_started.set()
         raise RuntimeError("renewal backend unavailable")
 
-    async def successful_dispatch(_task_name, _args):
-        await renewal_started.wait()
-        return "delivered"
-
-    executor.side_effect = successful_dispatch
     runner = SchedulerRunner(db, "agent-1", executor, owner_id="host-a")
     runner._renew_lease = fail_renewal
     try:
@@ -1602,16 +1949,130 @@ async def test_renewal_exception_after_dispatch_still_finalizes_once(tmp_path, c
         with caplog.at_level("ERROR", logger="kestrel_sovereign.features.scheduler.runner"):
             await runner._tick()
 
-        executor.assert_awaited_once_with("test_task", {})
+        await asyncio.wait_for(renewal_started.wait(), timeout=1)
+        executor.assert_not_awaited()
         assert await db.fetchall(
             "SELECT status, attempt_count FROM task_execution_log WHERE task_id = ?",
             ("task-1",),
-        ) == [("success", 1)]
+        ) == [("claimed", 1)]
         assert any("lease renewal failed" in record.getMessage() for record in caplog.records)
 
         await runner._tick()
-        executor.assert_awaited_once()
+        executor.assert_not_awaited()
     finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_renewal_loss_during_preparation_never_enters_effect(tmp_path):
+    """The renewal monitor runs during cold preparation and gates admission."""
+
+    db = await _database(tmp_path / "renewal-loss-preparation.db")
+    preparation_started = asyncio.Event()
+    allow_preparation_finish = asyncio.Event()
+    renewal_started = asyncio.Event()
+    lose_lease = asyncio.Event()
+    dispatched = AsyncMock(return_value="must-not-run")
+
+    class PreparedExecutor:
+        @asynccontextmanager
+        async def prepare_scheduled(self, _execution):
+            preparation_started.set()
+            await allow_preparation_finish.wait()
+
+            async def dispatch():
+                return await dispatched()
+
+            yield dispatch
+
+    async def renewal_until_lost(_task):
+        renewal_started.set()
+        await lose_lease.wait()
+
+    runner = SchedulerRunner(
+        db, "agent-1", PreparedExecutor(), owner_id="renewal-preparation"
+    )
+    runner._renew_lease = renewal_until_lost
+    tick: asyncio.Task[None] | None = None
+    try:
+        await runner._ensure_tables()
+        await _seed_due(db)
+        tick = asyncio.create_task(runner._tick())
+        await asyncio.wait_for(preparation_started.wait(), timeout=1)
+        await asyncio.wait_for(renewal_started.wait(), timeout=1)
+
+        lose_lease.set()
+        allow_preparation_finish.set()
+        await asyncio.wait_for(tick, timeout=1)
+
+        dispatched.assert_not_awaited()
+        assert await db.fetchall(
+            "SELECT status, attempt_count FROM task_execution_log WHERE task_id = ?",
+            ("task-1",),
+        ) == [("claimed", 1)]
+    finally:
+        allow_preparation_finish.set()
+        if tick is not None and not tick.done():
+            tick.cancel()
+            await asyncio.gather(tick, return_exceptions=True)
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_renewal_loss_during_effect_cancels_owned_work_without_finalizing(tmp_path):
+    """An expired/revoked owner cannot publish a terminal result after effect."""
+
+    db = await _database(tmp_path / "renewal-loss-effect.db")
+    renewal_started = asyncio.Event()
+    lose_lease = asyncio.Event()
+    effect_started = asyncio.Event()
+    effect_cancelled = asyncio.Event()
+    execution_ids = []
+
+    async def renewal_until_lost(_task):
+        renewal_started.set()
+        await lose_lease.wait()
+
+    async def long_effect(_task_name, _args):
+        execution = get_current_scheduler_execution()
+        assert execution is not None
+        execution_ids.append(execution.id)
+        effect_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            # The runner revokes this scope only after it has joined the owned
+            # effect task, so cancellation cannot strand a trusted context.
+            assert get_current_scheduler_execution() is execution
+            effect_cancelled.set()
+            raise
+
+    runner = SchedulerRunner(
+        db, "agent-1", long_effect, owner_id="renewal-effect"
+    )
+    runner._renew_lease = renewal_until_lost
+    tick: asyncio.Task[None] | None = None
+    try:
+        await runner._ensure_tables()
+        await _seed_due(db)
+        tick = asyncio.create_task(runner._tick())
+        await asyncio.wait_for(effect_started.wait(), timeout=1)
+        await asyncio.wait_for(renewal_started.wait(), timeout=1)
+
+        lose_lease.set()
+        await asyncio.wait_for(effect_cancelled.wait(), timeout=1)
+        await asyncio.wait_for(tick, timeout=1)
+
+        assert execution_ids
+        assert get_current_scheduler_execution() is None
+        assert await db.fetchall(
+            "SELECT status, attempt_count FROM task_execution_log WHERE task_id = ?",
+            ("task-1",),
+        ) == [("claimed", 1)]
+    finally:
+        if tick is not None and not tick.done():
+            tick.cancel()
+            await asyncio.gather(tick, return_exceptions=True)
         await db.close()
 
 
@@ -1675,3 +2136,128 @@ async def test_host_lifecycle_runner_claims_and_wakes_a_cold_agent(monkeypatch, 
         assert storage_instances[0].closed is False
     finally:
         await server._shutdown_host_scheduler(app)
+
+
+@pytest.mark.asyncio
+async def test_empty_shared_postgres_host_starts_for_first_runtime_tenant(
+    monkeypatch,
+    tmp_path,
+):
+    """An empty configured fleet still exposes the dynamic registration seam."""
+
+    db = await _database(tmp_path / "empty-host-scheduler.db")
+
+    class HostStorage:
+        def __init__(self, *, backend, dsn):
+            assert backend == "postgres"
+            self.db = db
+
+        async def initialize(self):
+            return None
+
+        async def close(self):
+            await db.close()
+
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager.set_scheduler_polling_managed_by_host(True)
+    app = FastAPI()
+    app.state.agent_manager = manager
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://scheduler-test")
+    monkeypatch.setattr(
+        "kestrel_sovereign.storage.async_storage.AsyncStorage",
+        HostStorage,
+    )
+
+    try:
+        await server._start_host_scheduler(
+            app,
+            manager,
+            MultiAgentConfig(agents={}),
+        )
+        runner = app.state.host_scheduler_runner
+        assert runner is not None
+        assert await runner._current_authorized_agent_ids() == ()
+        assert manager._scheduler_tenant_registration_hook is not None
+    finally:
+        await server._shutdown_host_scheduler(app)
+
+
+@pytest.mark.asyncio
+async def test_host_managed_feature_cannot_claim_while_remove_revokes_authority(
+    tmp_path,
+):
+    """A shared-PG tenant has no stale scoped poller during DELETE."""
+
+    db = await _database(tmp_path / "host-managed-removal.db")
+    agent_id = "did:scheduler:host-managed-removal"
+    await SchedulerRunner(
+        db,
+        agent_id,
+        AsyncMock(),
+        owner_id="host-managed-schema",
+    )._ensure_tables()
+
+    shutdown_started = asyncio.Event()
+    release_shutdown = asyncio.Event()
+
+    async def shutdown():
+        shutdown_started.set()
+        await release_shutdown.wait()
+
+    agent = SimpleNamespace(
+        did=agent_id,
+        agent_id=agent_id,
+        features={},
+        storage=SimpleNamespace(db=db),
+        shutdown=shutdown,
+        _scheduler_polling_managed_by_host=True,
+    )
+    feature = SchedulerFeature(agent)
+    manager = AgentManager()
+    config = LocalAgentConfig(data_dir="managed", port=8801)
+    removal: asyncio.Task[bool] | None = None
+    try:
+        await feature.initialize()
+        agent.features["SchedulerFeature"] = feature
+        assert feature._runner is None
+        await _seed_due(
+            db,
+            task_id="host-managed-due",
+            agent_id=agent_id,
+        )
+
+        manager._agents["Managed"] = agent
+        manager._agent_names[agent_id] = "Managed"
+        manager._seed_scheduler_authority(
+            {agent_id: ("Managed", config)}
+        )
+        removal = asyncio.create_task(manager.remove_agent("Managed"))
+        await asyncio.wait_for(shutdown_started.wait(), timeout=1)
+        assert not manager.is_scheduler_agent_authorized(agent_id)
+
+        # The ready hook is harmless even when it races removal: there is no
+        # scoped runner capable of claiming from stale per-agent authority.
+        await feature.on_agent_ready(agent)
+        await asyncio.sleep(0.05)
+        assert await db.fetchone(
+            """
+            SELECT enabled, lease_owner FROM scheduled_tasks
+            WHERE id = 'host-managed-due'
+            """
+        ) == (1, None)
+        assert await db.fetchone(
+            """
+            SELECT COUNT(*) FROM task_execution_log
+            WHERE task_id = 'host-managed-due'
+            """
+        ) == (0,)
+
+        release_shutdown.set()
+        assert await removal is True
+    finally:
+        release_shutdown.set()
+        if removal is not None and not removal.done():
+            removal.cancel()
+            await asyncio.gather(removal, return_exceptions=True)
+        await db.close()

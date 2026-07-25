@@ -26,6 +26,30 @@ class TaskWaitable:
         # The owning TaskFeature; provides _get_task_status_data.
         self._feature = feature
 
+    async def owns_handle(self, handle: str) -> Optional[bool]:
+        """Whether ``handle`` is a LOCAL background task in this agent's store.
+
+        Ownership check used at watch registration (#2729): the ``task``
+        provider is the local background-TaskStore, NOT an outbound-A2A
+        provider. An outbound A2A task id (``a2a:``) does not live in the
+        local ``a2a_tasks`` store, so ``task_manager.get_task`` returns None
+        and this returns ``False`` — rejecting a ``task:<outbound-a2a-id>``
+        watch synchronously instead of letting a later poll read "not found"
+        and emit a false terminal ``wait.complete`` failure.
+
+        Returns ``None`` (unverifiable → caller fails open) when no task
+        manager is wired or the lookup raises, so a transient backend hiccup
+        never blocks an otherwise-valid watch.
+        """
+        manager = getattr(self._feature, "task_manager", None)
+        if manager is None:
+            return None
+        try:
+            task = await manager.get_task(handle)
+        except Exception:
+            return None
+        return task is not None
+
     async def poll(self, handle: str) -> WaitStatus:
         data = await self._feature._get_task_status_data(handle)
         if not data.get("ok"):
