@@ -86,6 +86,7 @@ Only **Active** and **Design of record** rows belong here.
 
 | Document | Status | Current owner / location | Scope |
 |---|---|---|---|
+| [security/MEMORY_CONTENT_ENCRYPTION.md](security/MEMORY_CONTENT_ENCRYPTION.md) | **Design of record** | Planned shared codec and migrations in `kestrel-sovereign`; current plaintext owners are `kestrel_sovereign/storage/saved_items_store.py` and `kestrel_sovereign/storage/async_rag_store.py` | Implementation-ready encryption, tenant, search, migration, rotation, and recovery decisions for saved-item and RAG bodies; explicitly not yet shipped. |
 | [security/PRIVACY_MODES.md](security/PRIVACY_MODES.md) | **Active** | `kestrel-sovereign`: `kestrel_sovereign/privacy.py` and `kestrel_sovereign/storage/privacy_wrapper.py` | Privacy flags, presets, and storage/processing enforcement. |
 | [security/PQ_THREAT_MODEL.md](security/PQ_THREAT_MODEL.md) | **Active** | `kestrel-sovereign`: `kestrel_sovereign/security/` and `kestrel_sovereign/identity/` | Current long-horizon cryptographic threat model and control mapping. |
 
