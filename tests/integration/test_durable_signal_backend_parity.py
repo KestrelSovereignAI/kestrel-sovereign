@@ -99,6 +99,18 @@ async def _finish_dispatcher(agent: _DispatcherAgent, dispatcher: SignalDispatch
         await asyncio.gather(*agent.tasks, return_exceptions=True)
 
 
+async def _cancel_and_drain(*tasks: asyncio.Task | None) -> None:
+    """Cancel test choreography tasks before releasing their shared backend."""
+    live_tasks = [task for task in tasks if task is not None]
+    for task in live_tasks:
+        if not task.done():
+            task.cancel()
+    if live_tasks:
+        await asyncio.wait_for(
+            asyncio.gather(*live_tasks, return_exceptions=True), timeout=5
+        )
+
+
 async def _independent_backend(db_backend):
     """Connect a second real backend instance to the same durable ledger."""
     if db_backend.backend_type == "sqlite":
@@ -651,6 +663,8 @@ async def test_same_dispatcher_initial_claim_waits_for_postgres_commit_boundary(
     commit_boundary = asyncio.Event()
     ordinary_claim_missed = asyncio.Event()
     release_commit = asyncio.Event()
+    dispatch_task = None
+    claim_task = None
 
     @asynccontextmanager
     async def pause_after_before_commit():
@@ -667,18 +681,24 @@ async def test_same_dispatcher_initial_claim_waits_for_postgres_commit_boundary(
             ordinary_claim_missed.set()
         return delivery
 
-    db_backend.transaction = pause_after_before_commit
-    dispatcher._durable_store.claim_delivery = note_uncommitted_ordinary_claim
     try:
-        await dispatcher.register_durable_consumer(
-            DurableConsumerRegistration(
-                consumer_id=consumer_id,
-                source="provider.message",
-                agent_id=agent_id,
-                correlation_selector="payload.workflow=wf-1",
-                lease_seconds=10,
-            )
+        await asyncio.wait_for(
+            dispatcher.register_durable_consumer(
+                DurableConsumerRegistration(
+                    consumer_id=consumer_id,
+                    source="provider.message",
+                    agent_id=agent_id,
+                    correlation_selector="payload.workflow=wf-1",
+                    lease_seconds=10,
+                )
+            ),
+            timeout=5,
         )
+        # Register before installing the barrier.  The backend seam wraps every
+        # transaction, and pausing registration here would block the test
+        # before it starts the emitting transaction it is meant to observe.
+        db_backend.transaction = pause_after_before_commit
+        dispatcher._durable_store.claim_delivery = note_uncommitted_ordinary_claim
         secret = "same-dispatcher-commit-boundary@example.com"
         event = _signal(agent_id)
         event.payload["message"] = secret
@@ -703,8 +723,10 @@ async def test_same_dispatcher_initial_claim_waits_for_postgres_commit_boundary(
         assert not claim_task.done()
 
         release_commit.set()
-        assert (await dispatch_task).status is Status.OK
-        delivery = await claim_task
+        assert (
+            await asyncio.wait_for(asyncio.shield(dispatch_task), timeout=5)
+        ).status is Status.OK
+        delivery = await asyncio.wait_for(asyncio.shield(claim_task), timeout=5)
         assert delivery is not None
         assert delivery.event.payload == {"workflow": "wf-1", "message": secret}
         row = await db_backend.fetch_one(
@@ -717,7 +739,10 @@ async def test_same_dispatcher_initial_claim_waits_for_postgres_commit_boundary(
         release_commit.set()
         db_backend.transaction = original_transaction
         dispatcher._durable_store.claim_delivery = original_claim_delivery
-        await _finish_dispatcher(agent, dispatcher)
+        try:
+            await _cancel_and_drain(claim_task, dispatch_task)
+        finally:
+            await _finish_dispatcher(agent, dispatcher)
 
 
 @pytest.mark.asyncio
