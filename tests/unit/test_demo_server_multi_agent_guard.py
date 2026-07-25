@@ -13,8 +13,11 @@ from production behaviour the way an inlined re-implementation could.
 """
 from __future__ import annotations
 
+import ast
+import inspect
 import os
 from pathlib import Path
+import textwrap
 
 from server import resolve_multi_agent_path
 
@@ -82,18 +85,76 @@ def test_demo_marker_truthy_variants(tmp_path, monkeypatch):
         )
 
 
-def test_lifespan_actually_calls_resolve_multi_agent_path():
-    """Belt-and-braces — confirm the lifespan handler uses the helper.
+def _calls_named(function: object, name: str) -> bool:
+    """Return whether ``function`` calls ``name`` in its own lexical scope."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+    outer_function = next(
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    )
+
+    class OuterScopeCallFinder(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.found = False
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if isinstance(node.func, ast.Name) and node.func.id == name:
+                self.found = True
+            self.generic_visit(node)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            return
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            return
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            return
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            return
+
+    finder = OuterScopeCallFinder()
+    for statement in outer_function.body:
+        finder.visit(statement)
+    return finder.found
+
+
+def _outer_scope_with_only_nested_startup_calls(_lifespan_startup):
+    def nested_function():
+        _lifespan_startup(None)
+
+    class NestedClass:
+        def method(self):
+            _lifespan_startup(None)
+
+    return nested_function, (lambda: _lifespan_startup(None)), NestedClass
+
+
+def test_calls_named_ignores_nested_lexical_scopes():
+    """A never-invoked nested call cannot satisfy the lifespan wiring guard."""
+    assert not _calls_named(
+        _outer_scope_with_only_nested_startup_calls,
+        "_lifespan_startup",
+    )
+
+
+def test_lifespan_reaches_resolve_multi_agent_path_through_startup_helper():
+    """Belt-and-braces — confirm the real lifespan startup path uses the helper.
 
     A reviewer rightly flagged the previous version of this file as a
     parallel reimplementation that could pass while the lifespan code
-    diverged.  This assertion locks in the contract: the lifespan body
-    contains a literal call site for ``resolve_multi_agent_path``.
+    diverged.  The cancellation-safe lifespan delegates startup, so this test
+    follows that production call path rather than requiring an inlined call.
     """
-    import inspect
     import server
-    src = inspect.getsource(server.lifespan)
-    assert "resolve_multi_agent_path(" in src, (
-        "server.lifespan must invoke resolve_multi_agent_path(); the unit tests "
-        "exercise that helper and the lifespan needs to reach it."
+
+    assert _calls_named(server.lifespan, "_lifespan_startup"), (
+        "server.lifespan must enter _lifespan_startup so multi-agent startup "
+        "policy remains part of the production lifespan."
+    )
+    assert _calls_named(server._lifespan_startup, "resolve_multi_agent_path"), (
+        "server._lifespan_startup must invoke resolve_multi_agent_path(); the "
+        "unit tests exercise that helper and production must reach it."
     )
