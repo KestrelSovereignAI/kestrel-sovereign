@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -79,12 +80,48 @@ class WaitReconciler:
         raw_storage = getattr(agent, "_raw_storage", None)
         db = getattr(raw_storage, "db", None)
         self._store = WaitSignalStore(db, str(agent_id))
+        # Serialize reconcile ticks so the TWO drivers that can call this — the
+        # scheduler's ``wait_reconcile`` cron AND the mandatory WaitFeature
+        # fallback loop (#2729) — can never race on the shared
+        # ``_pending_signal_tasks`` map and both enqueue a wake for the same
+        # terminal transition before either records it pending.
+        self._reconcile_lock = asyncio.Lock()
+        # Monotonic timestamp of the last reconcile tick's start. The
+        # WaitFeature fallback driver reads it (via
+        # :meth:`seconds_since_last_reconcile`) to stand down while the cron
+        # keeps the reconciler fresh. ``None`` until the first tick.
+        self._last_reconcile_monotonic: Optional[float] = None
 
     # ------------------------------------------------------------------
 
     async def reconcile(self) -> ToolResult:
         """Run one reconcile tick. ACTION — no LLM cost (the COGNITION wake
-        comes from the downstream signal, not from this task)."""
+        comes from the downstream signal, not from this task).
+
+        Serialized (#2729): both the scheduler's ``wait_reconcile`` cron and
+        the mandatory WaitFeature fallback loop may drive this, so the lock
+        guarantees exactly one tick runs at a time. Two overlapping ticks
+        could otherwise both detect the same terminal handle and enqueue a
+        duplicate wake before either recorded it pending.
+        """
+        async with self._reconcile_lock:
+            self._last_reconcile_monotonic = time.monotonic()
+            return await self._reconcile_once()
+
+    def seconds_since_last_reconcile(self) -> Optional[float]:
+        """Monotonic seconds since the last reconcile tick began, or ``None``
+        if none has run yet.
+
+        The WaitFeature fallback driver reads this to decide whether to drive a
+        tick: while the scheduler ``wait_reconcile`` cron keeps it fresh the
+        fallback stands down, so an agent that HAS a scheduler is not
+        double-driven, and one that does not still gets reconciled (#2729).
+        """
+        if self._last_reconcile_monotonic is None:
+            return None
+        return time.monotonic() - self._last_reconcile_monotonic
+
+    async def _reconcile_once(self) -> ToolResult:
         store = self._store
         transitions: List[Dict[str, Any]] = []
         # delivered = dispatcher returned OK or COALESCED on a PRIOR enqueue.
@@ -500,6 +537,41 @@ def _get_reconciler(agent: Any) -> "WaitReconciler":
     return reconciler
 
 
+async def _provider_owns_handle(provider: Any, handle: str) -> Optional[bool]:
+    """Ask ``provider`` whether ``handle`` belongs to its namespace.
+
+    Ownership validation is OPTIONAL and structural (mirrors how
+    ``MonitorableWaitable`` is detected): a provider that can cheaply tell a
+    real handle from a foreign one exposes an async ``owns_handle(handle)``
+    returning
+
+      * ``True``  — the handle is definitely this provider's,
+      * ``False`` — the handle definitely is NOT (reject the watch),
+      * ``None``  — cannot determine right now (backend unavailable, etc.),
+        so the caller fails OPEN and allows the watch.
+
+    A provider with no ``owns_handle`` is treated as ``None`` (unverifiable).
+    A provider bug is swallowed to ``None`` — an ownership check must never be
+    the thing that blocks an otherwise-valid watch.
+    """
+    verify = getattr(provider, "owns_handle", None)
+    if not callable(verify):
+        return None
+    try:
+        result = verify(handle)
+        if asyncio.iscoroutine(result):
+            result = await result
+    except Exception as exc:  # provider bug — don't block on a broken check
+        logger.debug(
+            "owns_handle(%r) raised on provider %s: %s",
+            handle, getattr(provider, "kind", "?"), exc,
+        )
+        return None
+    if result is None:
+        return None
+    return bool(result)
+
+
 async def register_wait_watch(agent: Any, ref: str) -> None:
     """Register an explicit watch on ``ref`` so the reconciler wakes the agent
     when that handle reaches a terminal state.
@@ -507,14 +579,28 @@ async def register_wait_watch(agent: Any, ref: str) -> None:
     This is the durable backing for ``wait(target, mode="signal")``: it parses
     the ``"<kind>:<handle>"`` ref, validates the kind is registered in
     ``agent.wait_registry`` (so a typo'd or unloaded kind fails LOUD rather
-    than silently never waking), and records ``watching=1`` on the reconciler's
+    than silently never waking), validates provider/handle OWNERSHIP whenever
+    the provider can (#2729), and records ``watching=1`` on the reconciler's
     store. The reconciler's watched-handles loop then polls it every tick —
     works for ANY Waitable, including poll-only providers (TaskWaitable) that
     have no ``active_handles`` for the implicit auto-wake path.
 
+    Provider *availability* (a kind is registered) and provider *ownership*
+    (the handle actually belongs to that provider) are distinct. A registered
+    kind re-arms across restart; a handle that a foreign provider owns is a
+    mismatch that must fail synchronously HERE rather than becoming a durable
+    watch that the reconciler later converts into a misleading terminal
+    ``wait.complete`` failure. The canonical example (#2729): an outbound A2A
+    task id registered as ``task:<id>`` — the ``task`` provider is the LOCAL
+    background TaskStore, does not own the outbound id, and its poll would
+    read "not found" and emit a false terminal failure. Ownership validation
+    rejects it up front and, when another registered provider DOES own the
+    handle, names it so the caller can retry with the right kind.
+
     Raises:
-        ValueError: on a malformed ref, a missing ``wait_registry``, or a
-            ``kind`` with no registered provider.
+        ValueError: on a malformed ref, a missing ``wait_registry``, a
+            ``kind`` with no registered provider, or a handle the named
+            provider affirmatively does not own.
     """
     from kestrel_sovereign.waits.engine import parse_ref
 
@@ -524,10 +610,33 @@ async def register_wait_watch(agent: Any, ref: str) -> None:
         raise ValueError(
             "wait engine unavailable: no wait_registry on the agent"
         )
-    if registry.get(kind) is None:
+    provider = registry.get(kind)
+    if provider is None:
         known = ", ".join(registry.kinds()) or "(none registered)"
         raise ValueError(
             f"no wait provider for kind {kind!r}; known kinds: {known}"
         )
+
+    # Ownership validation (#2729): reject a handle the named provider does
+    # not own BEFORE it becomes a durable watch. Only an affirmative False
+    # (the provider is sure the handle is foreign) blocks — an unverifiable
+    # None fails open so providers that can't cheaply check stay permissive.
+    owned = await _provider_owns_handle(provider, handle)
+    if owned is False:
+        hint = ""
+        for other in registry.kinds():
+            if other == kind:
+                continue
+            other_provider = registry.get(other)
+            if other_provider is None:
+                continue
+            if await _provider_owns_handle(other_provider, handle) is True:
+                hint = f" — did you mean {other}:{handle}?"
+                break
+        raise ValueError(
+            f"handle {handle!r} is not a valid {kind!r} wait handle "
+            f"(the {kind!r} provider does not own it){hint}"
+        )
+
     reconciler = _get_reconciler(agent)
     await reconciler._store.start_watch(kind, handle)

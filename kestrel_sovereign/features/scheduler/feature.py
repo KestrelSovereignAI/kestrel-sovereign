@@ -259,6 +259,21 @@ class SchedulerFeature(Feature):
         Idempotent — checks for existing tasks before adding.
         Only schedules reflection/training if ReflectionFeature is available.
         """
+        # Register the ``ci:`` Waitable provider so a GitHub PR merge/check
+        # wait can be durably watched/re-armed across restart (#2729). Done
+        # before the no-DB early return: the CI provider polls GitHub over the
+        # network (via GITHUB_TOKEN) and does not need the scheduler DB, and
+        # registering the kind also makes it available for wait-registration
+        # ownership cross-checks.
+        registry = getattr(agent, "wait_registry", None)
+        if registry is not None:
+            from kestrel_sovereign.features.scheduler.ci_wait_provider import (
+                CIWaitable,
+            )
+
+            # Record ownership so base shutdown()/boot rollback unregisters it.
+            self._register_wait_provider(registry, CIWaitable(self), replace=True)
+
         if not self._db:
             return
 
