@@ -940,7 +940,7 @@ async def test_removal_winning_lease_rejects_queued_stale_recipient():
     lease = manager.a2a_lifecycle_lease()
     await lease.acquire()
     removal = asyncio.create_task(manager.remove_agent("recipient"))
-    while not getattr(lease, "_waiters", None):
+    while not getattr(lease, "_waiting_writers", 0):
         await asyncio.sleep(0)
     request_task = asyncio.create_task(
         agent_endpoint._create_verified_a2a_task(
@@ -951,7 +951,7 @@ async def test_removal_winning_lease_rejects_queued_stale_recipient():
             [],
         )
     )
-    while len(getattr(lease, "_waiters", ())) < 2:
+    while getattr(lease, "_waiting_writers", 0) < 1:
         await asyncio.sleep(0)
     lease.release()
 
@@ -1027,6 +1027,101 @@ async def test_manager_policy_is_atomic_during_task_persistence():
     assert created.id == "task-1"
     assert replacement_policy.generation > original_policy.generation
     assert manager.a2a_hosted_policy_for(agent) is replacement_policy
+
+
+@pytest.mark.asyncio
+async def test_hosted_a2a_requests_for_independent_recipients_share_reader_lease():
+    """One slow hosted task commit does not serialize another recipient."""
+
+    from kestrel_sovereign.a2a.types import Message, TaskSendParams, TextPart
+
+    sign, doc = _signer_and_doc()
+    first_agent = _stub_agent()
+    manager, _sender = _install_hosted_a2a_manager(
+        first_agent,
+        doc,
+        AsyncMock(return_value=True),
+    )
+    second_agent = _stub_agent()
+    second_agent.did = "did:test:second-recipient"
+    second_agent.agent_id = second_agent.did
+    second_agent._agent_name = "second-recipient"
+    manager._register_agent("second-recipient", second_agent)
+    first_policy = manager.a2a_hosted_policy_for(first_agent)
+    manager.install_a2a_hosted_policy(
+        second_agent,
+        resolver=first_policy.resolver,
+        authorizer=first_policy.authorizer,
+        router=first_policy.router,
+        requester=first_policy.requester,
+    )
+    second_agent._a2a_host_manager = manager
+
+    first_started = asyncio.Event()
+    allow_first = asyncio.Event()
+    second_committed = asyncio.Event()
+    original_first_create = first_agent.task_manager.create_task.side_effect
+    original_second_create = second_agent.task_manager.create_task.side_effect
+
+    async def block_first(**kwargs):
+        first_started.set()
+        await allow_first.wait()
+        return await original_first_create(**kwargs)
+
+    async def mark_second(**kwargs):
+        second_committed.set()
+        return await original_second_create(**kwargs)
+
+    first_agent.task_manager.create_task.side_effect = block_first
+    second_agent.task_manager.create_task.side_effect = mark_second
+    first_metadata = {"sender": _SENDER_DID}
+    first_metadata["signature"] = sign(["first"], metadata=first_metadata)
+    second_metadata = {"sender": _SENDER_DID}
+    second_metadata["signature"] = sign(
+        ["second"],
+        task_id="task-2",
+        session_id="sess-2",
+        metadata=second_metadata,
+    )
+    first_params = TaskSendParams(
+        id="task-1",
+        sessionId="sess-1",
+        message=Message(role="user", parts=[TextPart(text="first")]),
+        metadata=first_metadata,
+    )
+    second_params = TaskSendParams(
+        id="task-2",
+        sessionId="sess-2",
+        message=Message(role="user", parts=[TextPart(text="second")]),
+        metadata=second_metadata,
+    )
+
+    first_request = asyncio.create_task(
+        agent_endpoint._create_verified_a2a_task(
+            first_agent,
+            first_params,
+            first_params.message.parts,
+            [],
+            [],
+        )
+    )
+    try:
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        second_request = asyncio.create_task(
+            agent_endpoint._create_verified_a2a_task(
+                second_agent,
+                second_params,
+                second_params.message.parts,
+                [],
+                [],
+            )
+        )
+        await asyncio.wait_for(second_committed.wait(), timeout=0.3)
+        assert second_committed.is_set()
+        assert (await asyncio.wait_for(second_request, timeout=1)).id == "task-2"
+    finally:
+        allow_first.set()
+        assert (await asyncio.wait_for(first_request, timeout=1)).id == "task-1"
 
 
 def test_valid_signed_envelope_with_artifacts_verifies(app_with_send):

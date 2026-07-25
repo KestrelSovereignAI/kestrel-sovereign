@@ -2103,9 +2103,14 @@ async def _create_verified_a2a_task(
     raw_artifacts,
     sender_artifacts,
 ):
-    """Use the manager lease for hosted recipients; preserve standalone flow."""
+    """Use a shared manager lease for hosted recipients; preserve standalone flow."""
     manager = getattr(agent, "_a2a_host_manager", None)
-    lease_factory = getattr(manager, "a2a_lifecycle_lease", None)
+    # Current managers expose a reader lease so independent hosted recipients
+    # can verify and commit concurrently. Retain the old lifecycle-lock seam
+    # for compatibility hosts; it remains exclusive and therefore safe.
+    lease_factory = getattr(manager, "a2a_execution_lease", None)
+    if not callable(lease_factory):
+        lease_factory = getattr(manager, "a2a_lifecycle_lease", None)
     if callable(lease_factory):
         async with lease_factory():
             hosted_policy = manager.a2a_hosted_policy_for(agent)

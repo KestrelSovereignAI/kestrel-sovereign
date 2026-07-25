@@ -20,6 +20,7 @@ from kestrel_sovereign.features.scheduler.runner import (
     SCHEDULER_ROLLOUT_ACK_ENV,
     SCHEDULER_ROLLOUT_STATE_ACTIVE,
     SCHEDULER_SCHEMA_PROVENANCE_FRESH_V2,
+    SchedulerProtocolVersionIncompatible,
     SchedulerRolloutQuiescenceRequired,
     SchedulerExecution,
     SchedulerRunner,
@@ -867,6 +868,150 @@ async def test_sqlite_same_did_effects_share_admission_while_fence_drains_them(
                 await asyncio.gather(task, return_exceptions=True)
         await db_a.close()
         await db_b.close()
+
+
+@pytest.mark.asyncio
+async def test_steady_state_rollout_probe_does_not_block_unrelated_due_work(tmp_path):
+    """An active DID's long effect cannot stall another DID's tick preflight."""
+
+    database_path = tmp_path / "sqlite-steady-rollout-probe.db"
+    db_a = await _database(database_path)
+    db_b = await _database(database_path)
+    first_effect_started = asyncio.Event()
+    release_first_effect = asyncio.Event()
+    second_effect_finished = asyncio.Event()
+    first_tick: asyncio.Task[None] | None = None
+    second_tick: asyncio.Task[None] | None = None
+
+    async def first_executor(_name, _args):
+        first_effect_started.set()
+        await release_first_effect.wait()
+        return "first-done"
+
+    async def second_executor(_name, _args):
+        second_effect_finished.set()
+        return "second-done"
+
+    first = SchedulerRunner(
+        db_a,
+        "agent-a",
+        first_executor,
+        owner_id="steady-probe-first",
+    )
+    fleet = SchedulerRunner(
+        db_b,
+        None,
+        second_executor,
+        authorized_agent_ids={"agent-a", "agent-b"},
+        owner_id="steady-probe-fleet",
+    )
+    try:
+        await first._ensure_tables()
+        await fleet._ensure_tables()
+        await _seed_due(db_a, task_id="held-agent-a", agent_id="agent-a")
+
+        first_tick = asyncio.create_task(first._tick())
+        await asyncio.wait_for(first_effect_started.wait(), timeout=1)
+        await _seed_due(db_a, task_id="ready-agent-b", agent_id="agent-b")
+
+        # Before this probe/read split, fleet._tick() waited for agent-a's
+        # effect while taking an exclusive transition gate for every DID.
+        second_tick = asyncio.create_task(fleet._tick())
+        await asyncio.wait_for(second_effect_finished.wait(), timeout=0.4)
+        await asyncio.wait_for(second_tick, timeout=0.4)
+        assert await db_a.fetchone(
+            "SELECT status FROM task_execution_log WHERE task_id = ?",
+            ("ready-agent-b",),
+        ) == ("success",)
+
+        release_first_effect.set()
+        await asyncio.wait_for(first_tick, timeout=1)
+    finally:
+        release_first_effect.set()
+        for task in (first_tick, second_tick):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (first_tick, second_tick) if task is not None),
+            return_exceptions=True,
+        )
+        await db_a.close()
+        await db_b.close()
+
+
+@pytest.mark.asyncio
+async def test_protocol_preflight_uses_bounded_future_queries(tmp_path, monkeypatch):
+    """Future detection is SQL-bounded and ignores malformed version text."""
+
+    db = await _database(tmp_path / "scheduler-bounded-future-protocol.db")
+    runner = SchedulerRunner(db, "agent-1", AsyncMock())
+    future = SCHEDULER_PROTOCOL_VERSION + 5
+    observed_queries: list[str] = []
+    original_fetchone = db.fetchone
+
+    async def record_fetchone(query, params=()):
+        observed_queries.append(query)
+        return await original_fetchone(query, params)
+
+    try:
+        await runner._ensure_tables()
+        await _seed_due(db, task_id="malformed-version")
+        await db.execute(
+            """
+            UPDATE scheduled_tasks SET scheduler_protocol_version = 'not-an-integer'
+            WHERE id = ?
+            """,
+            ("malformed-version",),
+        )
+        monkeypatch.setattr(db, "fetchone", record_fetchone)
+        monkeypatch.setattr(
+            db,
+            "fetchall",
+            AsyncMock(side_effect=AssertionError("protocol preflight must not fetch all rows")),
+        )
+
+        await runner._reject_newer_scheduler_protocol_state()
+
+        await _seed_due(db, task_id="future-version")
+        await db.execute(
+            """
+            UPDATE scheduled_tasks SET scheduler_protocol_version = ? WHERE id = ?
+            """,
+            (future, "future-version"),
+        )
+        with pytest.raises(SchedulerProtocolVersionIncompatible):
+            await runner._reject_newer_scheduler_protocol_state()
+
+        await db.execute(
+            """
+            UPDATE scheduled_tasks SET scheduler_protocol_version = ? WHERE id = ?
+            """,
+            (SCHEDULER_PROTOCOL_VERSION, "future-version"),
+        )
+        await db.execute(
+            """
+            UPDATE scheduler_protocol_rollout SET protocol_version = 'not-an-integer'
+            WHERE agent_id = ?
+            """,
+            ("agent-1",),
+        )
+        await db.execute(
+            """
+            INSERT INTO scheduler_protocol_rollout
+                (agent_id, protocol_version, state, activation_nonce, updated_at)
+            VALUES (?, ?, 'active', NULL, ?)
+            """,
+            ("agent-2", future, datetime.now(timezone.utc).isoformat()),
+        )
+        with pytest.raises(SchedulerProtocolVersionIncompatible):
+            await runner._reject_newer_scheduler_protocol_state()
+        assert any("scheduled_tasks" in query and "LIMIT 1" in query for query in observed_queries)
+        assert any(
+            "scheduler_protocol_rollout" in query and "LIMIT 1" in query
+            for query in observed_queries
+        )
+    finally:
+        await db.close()
 
 
 def test_rollout_effect_advisory_key_never_uses_bootstrap_sentinel(monkeypatch):

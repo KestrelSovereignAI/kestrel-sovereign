@@ -537,7 +537,7 @@ async def verify_inbound_envelope(
         )
     try:
         document_fingerprint = verification_document_fingerprint(did_document)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, UnicodeEncodeError):
         return EnvelopeVerification(
             ok=False,
             reason="sender DID document is not canonically serializable",

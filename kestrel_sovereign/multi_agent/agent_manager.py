@@ -259,11 +259,12 @@ class AgentManager:
         self._base_data_dir = base_data_dir or Path.cwd()
         self._lock = asyncio.Lock()
         # Inbound hosted A2A verification/authorization/task persistence holds
-        # this lease from DID resolution through create_task. Registration,
-        # onboarding, and removal take the same lock as writers, so no request
-        # can commit work against a sender or recipient topology that changed
-        # after its cryptographic trust decision.
-        self._a2a_lifecycle_lock = asyncio.Lock()
+        # a shared reader lease from DID resolution through create_task.
+        # Registration, onboarding, policy replacement, and removal take the
+        # exclusive writer lease, so no request can commit work against a
+        # sender or recipient topology that changed after its trust decision.
+        # Independent recipients can nevertheless verify and persist together.
+        self._a2a_lifecycle_lock = AsyncReaderWriterLock()
         self._a2a_policy_generation = 0
         self._a2a_hosted_policies: dict[str, A2AHostedPolicy] = {}
         # Reserved-port allocator (#1729 → #2358 codex rounds 4-6). A bare
@@ -364,9 +365,14 @@ class AgentManager:
 
         self._scheduler_tenant_registration_hook = hook
 
-    def a2a_lifecycle_lease(self) -> asyncio.Lock:
-        """Return the manager-owned hosted A2A topology/commit lease."""
+    def a2a_lifecycle_lease(self) -> AsyncReaderWriterLock:
+        """Return the exclusive hosted A2A topology mutation lease."""
         return self._a2a_lifecycle_lock
+
+    def a2a_execution_lease(self):
+        """Return a shared hosted A2A verification-and-commit lease."""
+
+        return self._a2a_lifecycle_lock.read()
 
     def install_a2a_hosted_policy(
         self,
@@ -466,10 +472,9 @@ class AgentManager:
         policy authorizes the sender's stable agent id. The display identity is
         resolved back through the manager's immutable routing mapping before
         authorization; an unsigned caller never chooses a routing key. This
-        method is called while
-        :meth:`a2a_lifecycle_lease` is held; registration/removal/replacement
-        therefore cannot change either endpoint or the policy during the
-        directory await.
+        method is called while :meth:`a2a_execution_lease` is held;
+        registration/removal/replacement therefore cannot change either
+        endpoint or the policy during the directory await.
         """
 
         if (

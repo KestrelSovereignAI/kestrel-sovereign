@@ -3029,6 +3029,45 @@ class SchedulerRunner:
         except (TypeError, ValueError):
             return False
 
+    @staticmethod
+    def _future_protocol_version_sql(column: str) -> tuple[str, tuple[Any, ...]]:
+        """Return a portable, bounded predicate for future integer versions.
+
+        Scheduler columns are INTEGER in the managed schema, but legacy or
+        hand-created relations can expose text values.  Avoid backend-specific
+        integer casts (PostgreSQL rejects malformed text while SQLite coerces
+        it) by comparing a canonical decimal string.  This preserves the
+        fail-closed future check for values such as ``"3"`` and ``"+003"``
+        while leaving malformed/non-integer values outside the future-protocol
+        authority boundary, matching :meth:`_is_newer_protocol_version`.
+        """
+
+        if column not in {"scheduler_protocol_version", "protocol_version"}:
+            raise ValueError("unsupported scheduler protocol version column")
+        text = f"trim(CAST({column} AS TEXT))"
+        unsigned = (
+            f"(CASE WHEN substr({text}, 1, 1) = '+' "
+            f"THEN substr({text}, 2) ELSE {text} END)"
+        )
+        non_digits = unsigned
+        for digit in "0123456789":
+            non_digits = f"replace({non_digits}, '{digit}', '')"
+        normalized = f"COALESCE(NULLIF(ltrim({unsigned}, '0'), ''), '0')"
+        current = str(SCHEDULER_PROTOCOL_VERSION)
+        current_length = len(current)
+        return (
+            f"""
+            {column} IS NOT NULL
+            AND {unsigned} <> ''
+            AND {non_digits} = ''
+            AND (
+                length({normalized}) > ?
+                OR (length({normalized}) = ? AND {normalized} > ?)
+            )
+            """,
+            (current_length, current_length, current),
+        )
+
     async def _scheduler_table_exists(self, table: str) -> bool:
         """Read a scheduler table's existence without mutating the database."""
 
@@ -3046,15 +3085,14 @@ class SchedulerRunner:
         """Fail before changing state written by a newer scheduler binary."""
 
         if await self._scheduled_tasks_protocol_column_exists():
-            rows = await self._db.fetchall(
-                """
-                SELECT scheduler_protocol_version FROM scheduled_tasks
-                """,
+            future, params = self._future_protocol_version_sql(
+                "scheduler_protocol_version"
             )
-            if any(
-                row and self._is_newer_protocol_version(row[0])
-                for row in rows
-            ):
+            row = await self._db.fetchone(
+                f"SELECT 1 FROM scheduled_tasks WHERE {future} LIMIT 1",
+                params,
+            )
+            if row is not None:
                 raise SchedulerProtocolVersionIncompatible()
 
         if await self._scheduler_table_exists("scheduler_protocol_schema"):
@@ -3068,13 +3106,12 @@ class SchedulerRunner:
                 raise SchedulerProtocolVersionIncompatible()
 
         if await self._scheduler_table_exists("scheduler_protocol_rollout"):
-            rows = await self._db.fetchall(
-                "SELECT protocol_version FROM scheduler_protocol_rollout"
+            future, params = self._future_protocol_version_sql("protocol_version")
+            row = await self._db.fetchone(
+                f"SELECT 1 FROM scheduler_protocol_rollout WHERE {future} LIMIT 1",
+                params,
             )
-            if any(
-                row and self._is_newer_protocol_version(row[0])
-                for row in rows
-            ):
+            if row is not None:
                 raise SchedulerProtocolVersionIncompatible()
 
     async def _scheduled_tasks_protocol_column_exists(self) -> bool:
@@ -3627,26 +3664,34 @@ class SchedulerRunner:
             preexisting_schedule_table=preexisting_schedule_table
         )
         for agent_id in await self._current_authorized_agent_ids():
-            # Acquire each backend's effect/transition gate *before* its
-            # writer transaction. Waiting for an in-flight executor while
-            # holding the sole SQLite writer or final PostgreSQL query-pool
-            # connection would deadlock that executor's renewal/final CAS.
-            # Bootstrap already owns every gate in stable order, so it passes
-            # ``rollout_gates_held`` and enters the transaction directly.
+            # Bootstrap already owns every gate in stable order, so it enters
+            # the mutating reconciliation directly. Steady state first takes
+            # a read-only probe: an active v2 row is overwhelmingly normal and
+            # must not wait behind an unrelated long-lived effect merely to
+            # discover it needs no transition. When the probe finds a possible
+            # mutation, take the exclusive gate and re-read inside
+            # ``_ensure_protocol_rollout_agent`` before fencing/activating.
+            # That closes new effect admission and drains existing effects
+            # without allowing the read/probe race to cross a transition.
             if rollout_gates_held:
                 blocked_nonce = await self._ensure_protocol_rollout_agent(
                     agent_id, fresh_v2_schema=fresh_v2_schema
                 )
-            elif self._database_backend_type() == "postgres":
-                async with self._postgres_rollout_transition_gate(agent_id):
-                    blocked_nonce = await self._ensure_protocol_rollout_agent(
-                        agent_id, fresh_v2_schema=fresh_v2_schema
-                    )
             else:
-                async with self._sqlite_rollout_gate(agent_id):
-                    blocked_nonce = await self._ensure_protocol_rollout_agent(
-                        agent_id, fresh_v2_schema=fresh_v2_schema
-                    )
+                transition_needed, blocked_nonce = (
+                    await self._protocol_rollout_transition_needed(agent_id)
+                )
+                if transition_needed:
+                    if self._database_backend_type() == "postgres":
+                        async with self._postgres_rollout_transition_gate(agent_id):
+                            blocked_nonce = await self._ensure_protocol_rollout_agent(
+                                agent_id, fresh_v2_schema=fresh_v2_schema
+                            )
+                    else:
+                        async with self._sqlite_rollout_gate(agent_id):
+                            blocked_nonce = await self._ensure_protocol_rollout_agent(
+                                agent_id, fresh_v2_schema=fresh_v2_schema
+                            )
             if blocked_nonce is not None:
                 blocked.append((agent_id, blocked_nonce))
 
@@ -3669,6 +3714,77 @@ class SchedulerRunner:
             f"{SCHEDULER_ROLLOUT_ACK_ENV} containing this one-time nonce "
             f"(comma-separated when multiple DIDs are fenced): {nonces}"
         )
+
+    async def _protocol_rollout_transition_needed(
+        self, agent_id: str
+    ) -> tuple[bool, Optional[str]]:
+        """Read whether one DID needs an exclusive rollout transition.
+
+        The result is advisory: callers must re-read under the exclusive gate
+        before changing rollout state.  Its purpose is solely to keep ordinary
+        active-v2 polling from serializing behind every admitted effect.  A
+        quiescing DID with an unacknowledged stable nonce is already fenced and
+        returns that nonce without taking a writer gate.
+        """
+
+        state_row = await self._db.fetchone(
+            """
+            SELECT protocol_version, state, activation_nonce
+            FROM scheduler_protocol_rollout WHERE agent_id = ?
+            """,
+            (agent_id,),
+        )
+        if (
+            state_row is not None
+            and state_row
+            and self._is_newer_protocol_version(state_row[0])
+        ):
+            raise SchedulerProtocolVersionIncompatible()
+
+        rollout_nonce = (
+            state_row[2]
+            if state_row is not None
+            and len(state_row) > 2
+            and state_row[1] == SCHEDULER_ROLLOUT_STATE_QUIESCING
+            else None
+        )
+        if rollout_nonce is None:
+            has_unknown_rows = await self._db.fetchone(
+                """
+                SELECT 1 FROM scheduled_tasks
+                WHERE agent_id = ?
+                  AND (scheduler_protocol_version IS NULL
+                       OR scheduler_protocol_version <> ?)
+                LIMIT 1
+                """,
+                (agent_id, SCHEDULER_PROTOCOL_VERSION),
+            )
+            needs_refence = has_unknown_rows is not None
+        else:
+            needs_refence = await self._rollout_rows_need_refence(
+                agent_id, rollout_nonce
+            )
+
+        if state_row is None:
+            # Even a fresh-v2 DID needs its first active control row created.
+            return True, None
+
+        protocol_version, state, nonce = state_row
+        state_is_known = state in {
+            SCHEDULER_ROLLOUT_STATE_ACTIVE,
+            SCHEDULER_ROLLOUT_STATE_QUIESCING,
+        }
+        requires_new_nonce = (
+            protocol_version != SCHEDULER_PROTOCOL_VERSION
+            or not state_is_known
+            or needs_refence
+            or (state == SCHEDULER_ROLLOUT_STATE_QUIESCING and not nonce)
+        )
+        if state == SCHEDULER_ROLLOUT_STATE_QUIESCING:
+            if requires_new_nonce or self._rollout_acknowledges(nonce):
+                return True, None
+            return False, nonce or "<missing nonce>"
+        return requires_new_nonce, None
 
     async def _ensure_protocol_rollout_agent(
         self, agent_id: str, *, fresh_v2_schema: bool
