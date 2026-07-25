@@ -36,6 +36,19 @@ class WaitFeature(Feature):
     # longer than this should be a scheduled/cron resume, not a held turn.
     _MAX_WAIT_SECONDS = 1800
 
+    # Fallback reconcile driver cadence (#2729). The scheduler's
+    # ``wait_reconcile`` cron is the PRIMARY driver at 60s; this loop only
+    # drives a tick when that cron is NOT keeping the reconciler fresh (an
+    # agent profile without SchedulerFeature). WaitFeature is mandatory, so
+    # this makes wait reconciliation a core runtime service that is available
+    # wherever a `mode="signal"` watch can be armed — otherwise a durable
+    # signal watch registered in a scheduler-less profile would never wake.
+    _FALLBACK_RECONCILE_POLL_SECONDS = 60
+    # Drive only when the last tick is older than this. Held above the cron's
+    # 60s cadence so a live scheduler keeps the reconciler fresh and this loop
+    # stays dormant (no double-driving in the common case).
+    _FALLBACK_RECONCILE_STALE_SECONDS = 90
+
     def __init__(self, agent=None):
         if agent is not None:
             super().__init__(agent)
@@ -58,6 +71,66 @@ class WaitFeature(Feature):
     async def initialize(self):
         self.enabled = True
 
+    async def post_all_features_loaded(self, agent):
+        """Start the fallback wait-reconcile driver (#2729).
+
+        The wait reconciler (which turns durable ``mode="signal"`` watches into
+        ``wait.complete`` cognition wakes) has historically been driven ONLY by
+        the ``wait_reconcile`` cron seeded by :class:`SchedulerFeature`. That
+        feature is optional, so a valid minimal profile (Peers + Wait, no
+        Scheduler) could accept a signal watch that then NEVER wakes. Since
+        WaitFeature is mandatory, owning the fallback driver here makes
+        reconciliation a core runtime service present wherever a signal watch
+        can be armed. The loop stands down while the scheduler cron keeps the
+        reconciler fresh (see :meth:`_fallback_reconcile_due`), so an agent that
+        has a scheduler is not double-driven.
+        """
+        if agent is None or getattr(agent, "wait_registry", None) is None:
+            # Standalone / no wait engine — nothing to reconcile.
+            return
+        self._track_owned_background_task(
+            self._fallback_reconcile_loop(agent),
+            name="wait_fallback_reconcile",
+        )
+
+    def _fallback_reconcile_due(self, reconciler) -> bool:
+        """Whether the fallback loop should drive a reconcile tick now.
+
+        ``True`` when no reconciler has run yet (or the singleton is not built),
+        or the last tick is older than :attr:`_FALLBACK_RECONCILE_STALE_SECONDS`.
+        A scheduler cron running every 60s keeps ``seconds_since_last_reconcile``
+        below the threshold, so this returns ``False`` and the fallback stays
+        dormant — the two drivers never overlap in steady state.
+        """
+        if reconciler is None:
+            return True
+        since = reconciler.seconds_since_last_reconcile()
+        return since is None or since >= self._FALLBACK_RECONCILE_STALE_SECONDS
+
+    async def _fallback_reconcile_loop(self, agent):
+        """Periodically drive the wait reconciler when nothing else does.
+
+        Feature-owned (cancelled on shutdown / disable via
+        :meth:`Feature.shutdown`). Each iteration is gated by
+        :meth:`_fallback_reconcile_due` so it defers to the scheduler cron when
+        present; the reconciler's own lock makes an accidental overlap safe.
+        """
+        from kestrel_sovereign.waits.reconciler import run_wait_reconcile
+
+        while True:
+            try:
+                await asyncio.sleep(self._FALLBACK_RECONCILE_POLL_SECONDS)
+                reconciler = getattr(agent, "_wait_reconciler", None)
+                if self._fallback_reconcile_due(reconciler):
+                    await run_wait_reconcile(agent)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - loop must never die
+                logger.warning(
+                    "wait fallback reconcile tick failed: %s", exc,
+                    exc_info=True,
+                )
+
     @tool(
         name="wait",
         description=(
@@ -66,12 +139,27 @@ class WaitFeature(Feature):
             "exposes, you wait on it here with `target=\"<kind>:<handle>\"`.\n"
             "Known handle kinds (each contributed by a feature; more may be "
             "registered by whatever features are loaded):\n"
-            "• `task:<task_id>` — a Kestrel background task\n"
+            "• `task:<task_id>` — a LOCAL Kestrel background task (this "
+            "agent's own store)\n"
             "• `talon:<job_id>` — a Talon coding job\n"
-            "• `ci:<...>`, `lora_train:<...>`, `tx:<...>`, `workflow:<run_id>` "
-            "and others when those features are present.\n"
-            "If you pass an unknown kind, the error lists the kinds currently "
-            "registered.\n"
+            "• `a2a:<task_id>` — an OUTBOUND A2A TASK you sent a peer via "
+            "send_a2a_task (route it here, NOT `task:` — a `task:` on an "
+            "outbound A2A id is a provider mismatch and is rejected at "
+            "registration). A2A QUESTIONS are NOT watched here: "
+            "send_a2a_question already wakes you via its own "
+            "`a2a.question_answered` signal, so an `a2a:<question-id>` watch is "
+            "rejected to avoid waking you twice for one answer.\n"
+            "• `ci:<owner/repo#N>` — a GitHub PR's merge/CI-check state\n"
+            "• `lora_train:<...>`, `tx:<...>`, `workflow:<run_id>` and others "
+            "when those features are present.\n"
+            "A kind being LISTED here is documentation, not a guarantee it is "
+            "AVAILABLE: a provider is only reachable when its feature is "
+            "loaded. If you pass an unknown/unavailable kind, the error lists "
+            "the kinds currently registered. A registered kind's signal-mode "
+            "watch is durable and RE-ARMS across restart; availability "
+            "(is the provider loaded?) and re-arming (does a live watch "
+            "resume?) are separate — a documented kind whose feature is not "
+            "loaded neither registers nor re-arms.\n"
             "\n"
             "Three ways to call it:\n"
             "• `target=\"<kind>:<handle>\"` (default `mode=\"block\"`) — hold "
