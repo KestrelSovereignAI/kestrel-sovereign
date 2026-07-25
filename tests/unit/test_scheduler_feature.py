@@ -192,6 +192,26 @@ class TestScheduleList:
         bad_ids = {e["task_id"] for e in result.data["load_errors"]}
         assert bad_ids == {"id-2", "id-3"}
 
+    @pytest.mark.asyncio
+    async def test_list_exposes_durable_execution_and_misfire_state(self, feature):
+        feature._db.fetchall = AsyncMock(return_value=[
+            (
+                "deadline-1", "workflow_run", "", "{}", 0, None, None,
+                "2026-07-24T00:00:00+00:00", "one_shot",
+                "2026-07-24T01:00:00+00:00", "UTC", "fire_once", 30,
+                "workflow-deadline", None, None, 2, "success",
+                "2026-07-24T01:00:00+00:00",
+            ),
+        ])
+
+        result = await feature.schedule_list()
+        task = result.data["tasks"][0]
+        assert task["schedule_kind"] == "one_shot"
+        assert task["misfire_policy"] == "fire_once"
+        assert task["idempotency_key"] == "workflow-deadline"
+        assert task["attempt_count"] == 2
+        assert task["terminal_status"] == "success"
+
 
 # =========================================================================
 # post_all_features_loaded — retired-cron cutover cleanup (#1674)
@@ -437,6 +457,42 @@ class TestScheduleAdd:
             args_json='{"threshold": 100}',
         )
         assert result.status is ToolResultStatus.OK
+
+    @pytest.mark.asyncio
+    async def test_add_timezone_aware_cron_persists_policy_and_identity(self, feature):
+        result = await feature.schedule_add(
+            cron_expression="30 9 * * *",
+            task_name="memory_consolidate",
+            timezone_name="America/Chicago",
+            misfire_policy="fire_once",
+            idempotency_key="daily-memory",
+        )
+        assert result.status is ToolResultStatus.OK
+        assert result.data["timezone"] == "America/Chicago"
+        assert result.data["misfire_policy"] == "fire_once"
+        assert result.data["idempotency_key"] == "daily-memory"
+
+    @pytest.mark.asyncio
+    async def test_add_deadline_is_one_shot(self, feature):
+        result = await feature.schedule_add_deadline(
+            run_at="2026-12-01T12:00:00+00:00",
+            task_name="memory_consolidate",
+            idempotency_key="workflow-deadline-9",
+        )
+        assert result.status is ToolResultStatus.OK
+        assert result.data["schedule_kind"] == "one_shot"
+        assert result.data["run_at"] == "2026-12-01T12:00:00+00:00"
+        assert result.data["idempotency_key"] == "workflow-deadline-9"
+
+    @pytest.mark.asyncio
+    async def test_add_rejects_unknown_iana_timezone(self, feature):
+        result = await feature.schedule_add(
+            cron_expression="@daily",
+            task_name="memory_consolidate",
+            timezone_name="Mars/Olympus_Mons",
+        )
+        assert result.status is ToolResultStatus.ERROR
+        assert "timezone" in result.error.lower()
 
     @pytest.mark.asyncio
     async def test_add_invalid_cron(self, feature):
@@ -961,17 +1017,18 @@ class TestSchedulerRunner:
         runner = SchedulerRunner(db, "test-agent", executor)
         await runner._tick()
 
-        # Should have recorded execution (INSERT into task_execution_log)
-        # and updated the task (UPDATE scheduled_tasks)
+        # A durable scheduler first claims the row, records a ``claimed``
+        # execution identity, and only then commits the terminal outcome.
         execute_calls = db.execute.call_args_list
-        assert len(execute_calls) >= 2  # INSERT + UPDATE
-
-        # Check the INSERT call
-        insert_call = execute_calls[0]
-        assert "task_execution_log" in insert_call[0][0]
-        insert_params = insert_call[0][1]
-        assert insert_params[1] == "task-1"  # task_id
-        assert insert_params[3] == "success"  # status
+        claim_call = next(c for c in execute_calls if "INSERT INTO task_execution_log" in c[0][0])
+        claim_params = claim_call[0][1]
+        assert claim_params[1] == "task-1"  # task_id
+        assert "'claimed'" in claim_call[0][0]
+        outcome_call = next(
+            c for c in execute_calls
+            if "UPDATE task_execution_log" in c[0][0]
+        )
+        assert outcome_call[0][1][0] == "success"
 
     @pytest.mark.asyncio
     async def test_tick_records_failure(self):
@@ -985,10 +1042,12 @@ class TestSchedulerRunner:
         runner = SchedulerRunner(db, "test-agent", executor)
         await runner._tick()
 
-        # Should record "failed" status
-        insert_call = db.execute.call_args_list[0]
-        insert_params = insert_call[0][1]
-        assert insert_params[3] == "failed"
+        # The durable log starts claimed then transitions to failed via CAS.
+        outcome_call = next(
+            c for c in db.execute.call_args_list
+            if "UPDATE task_execution_log" in c[0][0]
+        )
+        assert outcome_call[0][1][0] == "failed"
 
     @pytest.mark.asyncio
     async def test_tick_records_blocked_reason_and_pauses_schedule(self):
@@ -1009,16 +1068,22 @@ class TestSchedulerRunner:
 
         await runner._tick()
 
-        insert_call = db.execute.call_args_list[0]
-        insert_params = insert_call[0][1]
-        assert insert_params[3] == "blocked"
-        assert "headless scheduler" in insert_params[4]
-        assert "Schedule id: restart-task" in insert_params[4]
-        assert "resume the schedule" in insert_params[4]
+        outcome_call = next(
+            c for c in db.execute.call_args_list
+            if "UPDATE task_execution_log" in c[0][0]
+        )
+        outcome_params = outcome_call[0][1]
+        assert outcome_params[0] == "blocked"
+        assert "headless scheduler" in outcome_params[1]
+        assert "Schedule id: restart-task" in outcome_params[1]
+        assert "resume the schedule" in outcome_params[1]
 
-        pause_call = db.execute.call_args_list[1]
-        assert "SET enabled = 0" in pause_call[0][0]
-        assert pause_call[0][1][1] == "restart-task"
+        pause_call = next(
+            c for c in db.execute.call_args_list
+            if "UPDATE scheduled_tasks" in c[0][0] and "terminal_status" in c[0][0]
+        )
+        assert "enabled = ?" in pause_call[0][0]
+        assert pause_call[0][1][-5] == "restart-task"
         db.fetchone.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1099,9 +1164,12 @@ class TestSchedulerRunner:
         runner = SchedulerRunner(db, "test-agent", executor)
         await runner._tick()
 
-        # Check the UPDATE call
-        update_call = db.execute.call_args_list[1]
-        assert "UPDATE scheduled_tasks" in update_call[0][0]
+        # Locate the claim-CAS completion update (the first writes are claim
+        # metadata and the durable ``claimed`` execution log).
+        update_call = next(
+            c for c in db.execute.call_args_list
+            if "UPDATE scheduled_tasks" in c[0][0] and "terminal_status" in c[0][0]
+        )
         update_params = update_call[0][1]
         # next_run_at should be set (not None)
         assert update_params[1] is not None  # next_run_at
@@ -1768,10 +1836,12 @@ class TestRunnerOutcomeSignal:
         runner = SchedulerRunner(db, "test-agent", executor)
         await runner._tick()
 
-        insert_call = db.execute.call_args_list[0]
-        insert_params = insert_call[0][1]
-        # outcome_signal is the 8th positional arg in the INSERT
-        assert insert_params[7] == 0.75
+        outcome_call = next(
+            c for c in db.execute.call_args_list
+            if "UPDATE task_execution_log" in c[0][0]
+        )
+        # outcome_signal is committed with the terminal CAS outcome.
+        assert outcome_call[0][1][4] == 0.75
 
     @pytest.mark.asyncio
     async def test_plain_string_return_has_null_signal(self):
@@ -1786,8 +1856,8 @@ class TestRunnerOutcomeSignal:
         runner = SchedulerRunner(db, "test-agent", executor)
         await runner._tick()
 
-        insert_params = db.execute.call_args_list[0][0][1]
-        assert insert_params[7] is None
+        outcome_call = next(c for c in db.execute.call_args_list if "UPDATE task_execution_log" in c[0][0])
+        assert outcome_call[0][1][4] is None
 
     @pytest.mark.asyncio
     async def test_non_numeric_tuple_signal_is_dropped(self):
@@ -1803,8 +1873,8 @@ class TestRunnerOutcomeSignal:
         runner = SchedulerRunner(db, "test-agent", executor)
         await runner._tick()
 
-        insert_params = db.execute.call_args_list[0][0][1]
-        assert insert_params[7] is None
+        outcome_call = next(c for c in db.execute.call_args_list if "UPDATE task_execution_log" in c[0][0])
+        assert outcome_call[0][1][4] is None
 
     @pytest.mark.asyncio
     async def test_tuple_signal_is_clamped(self):
@@ -1820,8 +1890,8 @@ class TestRunnerOutcomeSignal:
         runner = SchedulerRunner(db, "test-agent", executor)
         await runner._tick()
 
-        insert_params = db.execute.call_args_list[0][0][1]
-        assert insert_params[7] == 1.0
+        outcome_call = next(c for c in db.execute.call_args_list if "UPDATE task_execution_log" in c[0][0])
+        assert outcome_call[0][1][4] == 1.0
 
 
 class TestRunnerCronReload:
@@ -1862,30 +1932,25 @@ class TestRunnerCronReload:
         )
 
     @pytest.mark.asyncio
-    async def test_paused_mid_flight_does_not_reschedule(self):
-        """If schedule_pause runs while the task is executing, the runner
-        must NOT set a new next_run_at — that would silently undo the pause."""
+    async def test_completion_is_guarded_by_claim_token(self):
+        """A pause/update clears the claim token, so an old worker's final
+        write has a CAS guard instead of being able to resurrect the schedule."""
         db = _make_mock_db()
         now_iso = datetime.now(timezone.utc).isoformat()
         db.fetchall = AsyncMock(return_value=[
             ("task-1", "test-agent", "test_task", "@daily", "{}",
              1, None, now_iso, "2026-03-04T00:00:00"),
         ])
-        # Re-fetch shows enabled=0 — pause happened between SELECT and recompute.
-        db.fetchone = AsyncMock(return_value=("@daily", 0))
         executor = AsyncMock(return_value="ok")
         runner = SchedulerRunner(db, "test-agent", executor)
         await runner._tick()
 
-        # The UPDATE must only touch last_run_at, not next_run_at.
-        update_calls = [
+        completion = next(
             c for c in db.execute.call_args_list
-            if "UPDATE scheduled_tasks" in c[0][0]
-        ]
-        assert len(update_calls) == 1
-        assert "next_run_at" not in update_calls[0][0][0]
-        # Only last_run_at + task id should be in params
-        assert len(update_calls[0][0][1]) == 2
+            if "UPDATE scheduled_tasks" in c[0][0] and "terminal_status" in c[0][0]
+        )
+        assert "claim_token = ?" in completion[0][0]
+        assert "claim_execution_id = ?" in completion[0][0]
 
     @pytest.mark.asyncio
     async def test_deleted_mid_flight_does_not_crash(self):
@@ -1903,14 +1968,13 @@ class TestRunnerCronReload:
         # Must not raise
         await runner._tick()
 
-        update_calls = [
+        completion = next(
             c for c in db.execute.call_args_list
-            if "UPDATE scheduled_tasks" in c[0][0]
-        ]
-        # Either no UPDATE (row gone, DELETE will fail with no-op) or
-        # last_run_at only. Current code takes the last_run_at-only path.
-        if update_calls:
-            assert "next_run_at" not in update_calls[0][0][0]
+            if "UPDATE scheduled_tasks" in c[0][0] and "terminal_status" in c[0][0]
+        )
+        # If a row disappears, this compare-and-set affects zero rows and the
+        # stale worker cannot recreate it.
+        assert "claim_token = ?" in completion[0][0]
 
 
 # =========================================================================

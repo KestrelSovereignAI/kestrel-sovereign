@@ -97,12 +97,12 @@ def background_task_identifiers(task) -> str:
     with task-registry records (#1526). The historical bug truncated this
     to an 8-char prefix that ``check_task_status`` could not resolve.
 
-    No scheduler ``execution_id`` is surfaced: that id is the
-    ``task_execution_log`` row id, generated *after* the scheduled run
-    completes (``features/scheduler/runner.py``), so it never exists on
-    the A2A task this callback receives. Correlation with scheduler
-    history instead flows through the ``cron/<task_name>`` label that
-    :func:`describe_background_task` derives from the causation chain.
+    No scheduler ``execution_id`` is surfaced. It is now claimed before
+    scheduler dispatch so target tools can use it for idempotency, but it
+    deliberately remains scheduler-local context rather than untrusted A2A
+    task metadata. Correlation with scheduler history instead flows through
+    the ``cron/<task_name>`` label that :func:`describe_background_task`
+    derives from the causation chain.
     """
     return f"task: {getattr(task, 'id', 'unknown')}"
 

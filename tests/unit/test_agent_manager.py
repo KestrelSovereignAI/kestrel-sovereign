@@ -65,6 +65,32 @@ class TestAgentManagerBasics:
         assert manager.get_agent_name("did:unknown") is None
 
     @pytest.mark.asyncio
+    async def test_local_agent_configs_by_did_includes_cold_agents(self, monkeypatch, tmp_path):
+        """A host scheduler can resolve both loaded and autostart=false agents."""
+        manager = AgentManager(base_data_dir=tmp_path)
+        warm = _make_mock_agent("did:pkh:warm")
+        manager._agents["Warm"] = warm
+        cold_dir = tmp_path / "cold"
+        config = MultiAgentConfig(
+            agents={
+                "Warm": LocalAgentConfig(data_dir="warm", port=8801, autostart=True),
+                "Cold": LocalAgentConfig(data_dir="cold", port=8802, autostart=False),
+            }
+        )
+
+        did_lookup = AsyncMock(return_value="did:pkh:cold")
+        monkeypatch.setattr(
+            "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+            did_lookup,
+        )
+
+        mapping = await manager.local_agent_configs_by_did(config)
+
+        assert mapping["did:pkh:warm"][0] == "Warm"
+        assert mapping["did:pkh:cold"][0] == "Cold"
+        did_lookup.assert_awaited_once_with(str(cold_dir))
+
+    @pytest.mark.asyncio
     async def test_remove_agent(self):
         manager = AgentManager()
         mock = _make_mock_agent("did:pkh:remove")

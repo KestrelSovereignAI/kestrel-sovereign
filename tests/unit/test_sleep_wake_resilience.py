@@ -255,13 +255,17 @@ class TestSchedulerMisfireGrace:
         await runner._tick()
 
         executor.assert_not_called()  # the slept-through run is skipped
-        sqls = [c[0][0] for c in db.execute.call_args_list]
-        # A skipped_misfire audit row was written...
-        assert any("task_execution_log" in s and "skipped_misfire" in s for s in sqls)
-        # ...and next_run_at was re-anchored without touching last_run_at.
-        assert any(
-            "UPDATE scheduled_tasks SET next_run_at" in s for s in sqls
+        outcome = next(
+            c for c in db.execute.call_args_list
+            if "UPDATE task_execution_log" in c[0][0]
         )
+        # A skipped_misfire terminal outcome is committed against its claim.
+        assert outcome[0][1][0] == "skipped_misfire"
+        completion = next(
+            c for c in db.execute.call_args_list
+            if "UPDATE scheduled_tasks" in c[0][0] and "terminal_status" in c[0][0]
+        )
+        assert "next_run_at = ?" in completion[0][0]
 
     async def test_recent_task_still_executes(self):
         db = _make_mock_db()

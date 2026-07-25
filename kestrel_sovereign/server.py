@@ -985,6 +985,93 @@ async def _shutdown_host_features(app: FastAPI) -> None:
                                 )
 
 
+def _uses_shared_postgres_scheduler() -> bool:
+    """Whether this host can safely poll the fleet's shared schedule table."""
+    return (
+        os.environ.get("KESTREL_DB_BACKEND", "sqlite").lower() == "postgres"
+        and bool(os.environ.get("KESTREL_DATABASE_URL"))
+    )
+
+
+async def _start_host_scheduler(app: FastAPI, manager, config) -> None:
+    """Start the shared-PostgreSQL scheduler that can wake cold local agents.
+
+    Agent-scoped runners remain the standalone executor implementation.  In a
+    shared PostgreSQL fleet, this host-owned runner claims rows without an
+    ``agent_id`` scope and dispatches through ``AgentManager``; therefore an
+    occurrence for ``autostart=false`` can load its target only after the claim
+    succeeds.  The dedicated storage connection belongs to the host lifecycle,
+    not to any agent that the scheduler might wake or later shut down.
+    """
+    app.state.host_scheduler_runner = None
+    app.state.host_scheduler_storage = None
+    if not _uses_shared_postgres_scheduler():
+        return
+
+    from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
+    from kestrel_sovereign.features.scheduler.runner import (
+        AgentManagerHostedSchedulerExecutor,
+        SchedulerRunner,
+    )
+    from kestrel_sovereign.storage.async_storage import AsyncStorage
+
+    # Build this before the first poll and from *all* local configuration,
+    # including cold (autostart=false) agents.  The manager resolves cold DIDs
+    # from their local identity store without loading the agent itself.
+    agent_configs = await manager.local_agent_configs_by_did(config)
+    if not agent_configs:
+        logger.info("Shared scheduler not started: host has no local agents")
+        return
+
+    storage = AsyncStorage(
+        backend="postgres",
+        dsn=os.environ["KESTREL_DATABASE_URL"],
+    )
+    runner = None
+    try:
+        await storage.initialize()
+        if storage.db is None:
+            raise RuntimeError("shared PostgreSQL scheduler storage did not initialize")
+        runner = SchedulerRunner(
+            db=storage.db,
+            agent_id=None,
+            executor=AgentManagerHostedSchedulerExecutor(manager, agent_configs),
+            misfire_grace_seconds=SchedulerFeature._load_misfire_grace_seconds(),
+            max_concurrent_tasks=SchedulerFeature._load_max_concurrent_tasks(),
+            lease_seconds=SchedulerFeature._load_lease_seconds(),
+            owner_id=f"host-scheduler:{os.getpid()}",
+        )
+        await runner.start()
+    except BaseException:
+        if runner is not None:
+            await runner.stop()
+        await storage.close()
+        raise
+
+    app.state.host_scheduler_storage = storage
+    app.state.host_scheduler_runner = runner
+    logger.info(
+        "Started shared PostgreSQL scheduler for %d local agent(s)",
+        len(agent_configs),
+    )
+
+
+async def _shutdown_host_scheduler(app: FastAPI) -> None:
+    """Stop the host-owned scheduler before agent storage is released."""
+    runner = getattr(app.state, "host_scheduler_runner", None)
+    storage = getattr(app.state, "host_scheduler_storage", None)
+    try:
+        if runner is not None:
+            await runner.stop()
+    finally:
+        try:
+            if storage is not None:
+                await storage.close()
+        finally:
+            app.state.host_scheduler_runner = None
+            app.state.host_scheduler_storage = None
+
+
 async def _shutdown_server_agents(app: FastAPI) -> None:
     """Run the agent-owned shutdown phase for either server topology."""
     manager = getattr(app.state, "agent_manager", None)
@@ -1033,6 +1120,7 @@ async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException 
 
     for name, operation in (
         ("host-features", lambda: _shutdown_host_features(app)),
+        ("host-scheduler", lambda: _shutdown_host_scheduler(app)),
         ("agents", lambda: _shutdown_server_agents(app)),
         ("phoenix", lambda: _shutdown_phoenix(app)),
     ):
@@ -1284,6 +1372,12 @@ async def _lifespan_startup(app: FastAPI):
                         f"Multi-agent partial failure: agent '{name}' failed "
                         f"to initialize — {type(exc).__name__}: {exc}"
                     )
+
+            # A shared PostgreSQL database can carry schedules for agents that
+            # are intentionally cold at host boot.  Start the fleet-owned
+            # runner only in that topology; SQLite installations retain the
+            # longstanding agent-scoped runner and never share schedule rows.
+            await _start_host_scheduler(app, manager, config)
         except Exception as e:
             identity_record = _identity_readiness_failure_record("default", e)
             if identity_record is not None:

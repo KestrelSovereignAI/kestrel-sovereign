@@ -53,9 +53,16 @@ def _has_shutdown_completion_contract(agent: object) -> bool:
 
 
 async def _get_agent_did(storage_dir: str) -> str:
-    """Retrieve an agent's DID from its database."""
+    """Retrieve an agent's DID from its local identity database.
+
+    The host's PostgreSQL setting governs runtime storage, not the local
+    ``kestrel_prime.db`` used to identify a configured-but-cold agent.  Passing
+    ``backend='sqlite'`` explicitly prevents ``AsyncStorage`` from following
+    ``KESTREL_DB_BACKEND=postgres`` and accidentally returning another tenant's
+    first agent node while building the cold-agent routing map.
+    """
     db_path = os.path.join(storage_dir, "kestrel_prime.db")
-    storage = AsyncStorage(db_path)
+    storage = AsyncStorage(db_path, backend="sqlite")
     await storage.initialize()
     try:
         agent_nodes = await storage.get_nodes_by_type("agent")
@@ -409,6 +416,38 @@ class AgentManager:
     def list_agents(self) -> dict[str, KestrelAgent]:
         """Return all loaded agents as {name: agent}."""
         return dict(self._agents)
+
+    async def local_agent_configs_by_did(
+        self,
+        config: MultiAgentConfig,
+    ) -> dict[str, tuple[str, LocalAgentConfig]]:
+        """Return every local configured agent keyed by its durable DID.
+
+        Unlike :meth:`list_agents`, this includes ``autostart=false`` agents.
+        A host-owned scheduler needs that complete map to wake a cold target
+        after it atomically claims a due row in the shared PostgreSQL database.
+        Loaded agents provide their in-memory identity; cold identities are read
+        from the agent's local identity database without initializing the agent.
+        """
+        mapping: dict[str, tuple[str, LocalAgentConfig]] = {}
+        for name, agent_config in config.agents.items():
+            if not isinstance(agent_config, LocalAgentConfig):
+                continue
+
+            agent = self._agents.get(name)
+            agent_id = getattr(agent, "agent_id", None) if agent is not None else None
+            if not isinstance(agent_id, str) or not agent_id:
+                resolved_dir = agent_config.resolve_data_dir(self._base_data_dir)
+                agent_id = await _get_agent_did(str(resolved_dir))
+
+            if agent_id in mapping:
+                existing_name = mapping[agent_id][0]
+                raise ValueError(
+                    "Local multi-agent configuration maps the same DID to "
+                    f"both {existing_name!r} and {name!r}: {agent_id!r}"
+                )
+            mapping[agent_id] = (name, agent_config)
+        return mapping
 
     def get_agent_name(self, agent_id: str) -> Optional[str]:
         """Get the name for an agent by its DID."""

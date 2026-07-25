@@ -687,4 +687,7 @@ def build_recurring_schedule_request(
         "cron_expression": cron or RECURRING_DEFAULT_CRON,
         "task_name": RECURRING_SCHEDULE_TASK_NAME,
         "args_json": json.dumps(args, sort_keys=True),
+        # Stable base key; SchedulerRunner derives a distinct key per cron
+        # occurrence and preserves it if a lease is recovered after a crash.
+        "idempotency_key": "workflow:stalled_work_rescue",
     }

@@ -1,145 +1,268 @@
-"""
-Background scheduler runner for executing tasks on a cron schedule.
+"""Durable scheduler execution with claims, leases, and recovery.
 
-The SchedulerRunner runs as an asyncio background task, checking every
-POLL_INTERVAL seconds for tasks whose next_run_at has passed. When a
-task is due it invokes the registered callback (typically a feature tool)
-and records the execution result in the task_execution_log table.
-
-Tasks are persisted in the scheduled_tasks table so they survive restarts.
+``scheduled_tasks`` owns the next occurrence while ``task_execution_log`` owns
+the stable execution identity for that occurrence.  A runner claims before it
+dispatches, renews the claim while dispatch is in flight, and finalizes with a
+compare-and-set.  This makes concurrent runners safe against one another; a
+process death leaves a lease which another runner may recover after expiry.
 """
 
 import asyncio
+import contextvars
+import hashlib
+import inspect
 import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Callable, Coroutine, Dict, List, Optional
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
+from typing import Any, Awaitable, Callable, Coroutine, Dict, List, Optional, Protocol, Union
 
-from kestrel_sovereign.features.scheduler.cron import next_run, CronParseError
+from kestrel_sovereign.features.scheduler.cron import CronParseError, next_run
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 
 logger = logging.getLogger(__name__)
 
-# How often the runner wakes up to check for due tasks (seconds)
 POLL_INTERVAL = 30
-
-# Default misfire grace (seconds). A task more than this far past its
-# scheduled time is assumed to have been slept through (host suspend) or
-# starved, and is skipped-and-re-anchored to its next occurrence rather
-# than fired late in a post-wake burst (#1545). 600s (10 min) is well
-# above normal poll jitter (POLL_INTERVAL=30s plus execution time) yet
-# short enough that a brief lid-close coalesces a missed hourly/daily run
-# to the next one. 0 disables the rail (legacy fire-everything behaviour).
 DEFAULT_MISFIRE_GRACE_SECONDS = 600
-
-# Max number of due tasks executed concurrently per tick (#1675). The serial
-# loop meant one dispatch slower than POLL_INTERVAL (30s) delayed every later
-# due task, so a single long cognition turn could push other tasks past the
-# misfire grace and skip them. A modest cap overlaps the slow task *handlers*
-# while keeping LLM-call / memory pressure bounded; the quick DB writes are
-# serialized by aiosqlite's single connection regardless. Each due task touches
-# only its own scheduled_tasks row + a unique-id log append, so there is no
-# row-level read-modify-write race between concurrent tasks.
 DEFAULT_MAX_CONCURRENT_TASKS = 4
+DEFAULT_LEASE_SECONDS = 120
+
+MISFIRE_SKIP = "skip"
+MISFIRE_FIRE_ONCE = "fire_once"
+MISFIRE_CATCH_UP = "catch_up"
+MISFIRE_POLICIES = frozenset({MISFIRE_SKIP, MISFIRE_FIRE_ONCE, MISFIRE_CATCH_UP})
+
+SCHEDULE_CRON = "cron"
+SCHEDULE_ONE_SHOT = "one_shot"
+
+
+@dataclass(frozen=True)
+class SchedulerExecution:
+    """Identity and delivery context for one durable scheduled occurrence.
+
+    ``idempotency_key`` is stable across lease recovery of this occurrence.
+    Target tools can call :func:`get_current_scheduler_execution` while a
+    scheduler dispatch is active instead of receiving undocumented arguments.
+    """
+
+    id: str
+    schedule_id: str
+    agent_id: str
+    task_name: str
+    args: dict
+    scheduled_for: str
+    idempotency_key: str
+    attempt: int
+    owner: str
+
+
+_current_execution: contextvars.ContextVar[Optional[SchedulerExecution]] = (
+    contextvars.ContextVar("scheduler_execution", default=None)
+)
+
+
+def get_current_scheduler_execution() -> Optional[SchedulerExecution]:
+    """Return the active execution identity, or ``None`` outside a schedule.
+
+    Tools that cause externally-visible effects should use
+    ``execution.idempotency_key`` at their effect boundary.  The value is not
+    added to a tool's normal arguments, which keeps existing tool signatures
+    compatible and prevents callers from forging scheduler metadata.
+    """
+
+    return _current_execution.get()
 
 
 @dataclass
 class ScheduledTask:
-    """In-memory representation of a scheduled task row."""
+    """In-memory representation of a durable scheduled task row."""
+
     id: str
     agent_id: str
     task_name: str
     cron_expression: str
-    args_json: str  # JSON-encoded arguments
+    args_json: str
     enabled: bool
-    last_run_at: Optional[str]  # ISO timestamp or None
-    next_run_at: Optional[str]  # ISO timestamp or None
+    last_run_at: Optional[str]
+    next_run_at: Optional[str]
     created_at: str
+    schedule_kind: str = SCHEDULE_CRON
+    run_at: Optional[str] = None
+    timezone_name: str = "UTC"
+    misfire_policy: str = MISFIRE_SKIP
+    misfire_grace_seconds: Optional[int] = None
+    idempotency_key: Optional[str] = None
+    lease_owner: Optional[str] = None
+    lease_expires_at: Optional[str] = None
+    claim_token: Optional[str] = None
+    claim_execution_id: Optional[str] = None
+    claim_scheduled_for: Optional[str] = None
+    attempt_count: int = 0
+    terminal_status: Optional[str] = None
+    terminal_at: Optional[str] = None
 
     @property
     def args(self) -> dict:
         if not self.args_json:
             return {}
         try:
-            return json.loads(self.args_json)
+            parsed = json.loads(self.args_json)
         except (json.JSONDecodeError, TypeError):
             return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    @classmethod
+    def from_row(cls, row: tuple) -> "ScheduledTask":
+        """Decode current rows and legacy nine-column test/DB rows."""
+        values = list(row)
+        legacy_defaults = [
+            SCHEDULE_CRON, None, "UTC", MISFIRE_SKIP, None, None, None,
+            None, None, None, None, 0, None, None,
+        ]
+        values.extend(legacy_defaults[len(values) - 9 :])
+        return cls(
+            id=values[0], agent_id=values[1], task_name=values[2],
+            cron_expression=values[3] or "", args_json=values[4] or "{}",
+            enabled=bool(values[5]), last_run_at=values[6],
+            next_run_at=values[7], created_at=values[8],
+            schedule_kind=values[9] or SCHEDULE_CRON, run_at=values[10],
+            timezone_name=values[11] or "UTC",
+            misfire_policy=values[12] or MISFIRE_SKIP,
+            misfire_grace_seconds=values[13], idempotency_key=values[14],
+            lease_owner=values[15], lease_expires_at=values[16],
+            claim_token=values[17], claim_execution_id=values[18],
+            claim_scheduled_for=values[19], attempt_count=int(values[20] or 0),
+            terminal_status=values[21], terminal_at=values[22],
+        )
 
 
 @dataclass
 class ExecutionRecord:
-    """Result of a single task execution."""
+    """Result of one terminal task execution."""
+
     id: str
     task_id: str
     agent_id: str
-    status: str  # "success", "failed", "skipped"
+    status: str
     result_text: Optional[str]
     duration_ms: int
     executed_at: str
+    idempotency_key: Optional[str] = None
+    occurrence_at: Optional[str] = None
+    attempt_count: int = 1
 
 
-# Type alias for the callback that actually runs a task
 TaskExecutor = Callable[[str, dict], Coroutine[Any, Any, Any]]
 
 
-class SchedulerRunner:
-    """
-    Background asyncio loop that checks for due tasks and executes them.
+class HostedExecutionExecutor(Protocol):
+    """Executor contract for a host that runs schedules for cold agents."""
 
-    Usage:
-        runner = SchedulerRunner(db, agent_id, executor_fn)
-        await runner.start()   # launches background task
-        ...
-        await runner.stop()    # graceful shutdown
+    async def execute_scheduled(self, execution: SchedulerExecution) -> Any:
+        """Resolve/wake the target and dispatch ``execution``."""
+
+
+class HostedSchedulerExecutor:
+    """Adapter for a host-owned scheduler loop.
+
+    ``resolve_agent`` is intentionally host-specific: it may return a loaded
+    agent or initialize a cold one.  Keeping that responsibility outside the
+    scheduler means a deployment can use a process manager, a serverless wake,
+    or a test double without copying the claim/lease implementation.
+    """
+
+    is_scheduler_host_executor = True
+
+    def __init__(self, resolve_agent: Callable[[str], Awaitable[Any]]):
+        self._resolve_agent = resolve_agent
+
+    async def execute_scheduled(self, execution: SchedulerExecution) -> Any:
+        agent = await self._resolve_agent(execution.agent_id)
+        features = getattr(agent, "features", {}) or {}
+        for feature in features.values():
+            dispatch = getattr(feature, "_dispatch_scheduled_task", None)
+            if callable(dispatch):
+                return await dispatch(execution.task_name, execution.args)
+        raise RuntimeError(
+            f"woken agent {execution.agent_id!r} has no SchedulerFeature dispatcher"
+        )
+
+
+class AgentManagerHostedSchedulerExecutor(HostedSchedulerExecutor):
+    """Hosted adapter that loads an unloaded agent through ``AgentManager``.
+
+    ``agent_configs`` maps durable agent DIDs to the manager's ``(name,
+    LocalAgentConfig)`` pair.  The host builds that map while it still has its
+    fleet configuration.  Per-agent locks ensure two due schedules cannot
+    cold-start the same target concurrently.
+    """
+
+    def __init__(self, agent_manager: Any, agent_configs: Dict[str, tuple[str, Any]]):
+        self._agent_manager = agent_manager
+        self._agent_configs = dict(agent_configs)
+        self._locks: Dict[str, asyncio.Lock] = {}
+        super().__init__(self._resolve_or_wake)
+
+    async def _resolve_or_wake(self, agent_id: str) -> Any:
+        lock = self._locks.setdefault(agent_id, asyncio.Lock())
+        async with lock:
+            agents = self._agent_manager.list_agents()
+            for agent in agents.values():
+                loaded_agent_id = (
+                    getattr(agent, "did", None)
+                    or getattr(agent, "agent_id", None)
+                )
+                if loaded_agent_id == agent_id:
+                    return agent
+            config = self._agent_configs.get(agent_id)
+            if config is None:
+                raise LookupError(f"No hosted agent configuration for {agent_id!r}")
+            name, local_config = config
+            return await self._agent_manager.load_agent(name, local_config)
+
+
+class SchedulerRunner:
+    """Poll durable schedule rows and execute only rows this runner claims.
+
+    Pass an agent ID for the longstanding standalone per-agent loop.  A host
+    may pass ``None`` plus a :class:`HostedExecutionExecutor` to claim rows for
+    every agent in a shared PostgreSQL database.
     """
 
     def __init__(
         self,
         db,
-        agent_id: str,
-        executor: TaskExecutor,
+        agent_id: Optional[str],
+        executor: Union[TaskExecutor, HostedExecutionExecutor],
         poll_interval: int = POLL_INTERVAL,
         misfire_grace_seconds: int = DEFAULT_MISFIRE_GRACE_SECONDS,
         max_concurrent_tasks: int = DEFAULT_MAX_CONCURRENT_TASKS,
+        lease_seconds: int = DEFAULT_LEASE_SECONDS,
+        owner_id: Optional[str] = None,
     ):
-        """
-        Args:
-            db: An AsyncDatabase-like object with execute/fetchall/fetchone.
-            agent_id: The owning agent's identifier.
-            executor: Async callable(task_name, args_dict) -> result_text.
-            poll_interval: Seconds between poll cycles.
-            misfire_grace_seconds: A due task more than this many seconds late
-                is skipped-and-re-anchored instead of executed (host-suspend
-                resilience, #1545). 0 disables the rail.
-            max_concurrent_tasks: Upper bound on due tasks executed
-                concurrently within a single tick (#1675). 1 restores the
-                legacy strictly-serial behaviour.
-        """
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
         self._db = db
         self._agent_id = agent_id
         self._executor = executor
         self._poll_interval = poll_interval
         self._misfire_grace_seconds = max(0, int(misfire_grace_seconds))
         self._max_concurrent_tasks = max(1, int(max_concurrent_tasks))
+        self._lease_seconds = int(lease_seconds)
+        self._owner_id = owner_id or f"scheduler:{uuid.uuid4()}"
         self._task: Optional[asyncio.Task] = None
         self._running = False
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
     async def start(self):
-        """Create DB tables (if needed) and launch the background loop."""
         await self._ensure_tables()
         self._running = True
         self._task = asyncio.create_task(self._loop(), name="scheduler-runner")
-        logger.info("SchedulerRunner started (poll every %ds)", self._poll_interval)
+        logger.info("SchedulerRunner %s started (poll every %ds)", self._owner_id, self._poll_interval)
 
     async def stop(self):
-        """Cancel the background loop and wait for it to finish."""
         self._running = False
         if self._task and not self._task.done():
             self._task.cancel()
@@ -147,14 +270,9 @@ class SchedulerRunner:
                 await self._task
             except asyncio.CancelledError:
                 pass
-        logger.info("SchedulerRunner stopped")
-
-    # ------------------------------------------------------------------
-    # Background loop
-    # ------------------------------------------------------------------
+        logger.info("SchedulerRunner %s stopped", self._owner_id)
 
     async def _loop(self):
-        """Poll for due tasks and execute them."""
         while self._running:
             try:
                 await self._tick()
@@ -168,307 +286,358 @@ class SchedulerRunner:
                 raise
 
     async def _tick(self):
-        """Single poll cycle: find due tasks and run them."""
         now = datetime.now(timezone.utc)
-        now_iso = now.isoformat()
-        rows = await self._db.fetchall(
-            """
+        rows = await self._due_rows(now)
+        if not rows:
+            return
+        semaphore = asyncio.Semaphore(self._max_concurrent_tasks)
+
+        async def run_one(task: ScheduledTask) -> None:
+            async with semaphore:
+                claimed = await self._claim(task, now)
+                if claimed is not None:
+                    await self._execute_claim(claimed)
+
+        await asyncio.gather(*(run_one(ScheduledTask.from_row(row)) for row in rows), return_exceptions=True)
+
+    async def _due_rows(self, now: datetime) -> List[tuple]:
+        scope = ""
+        params: tuple = (now.isoformat(), now.isoformat())
+        if self._agent_id is not None:
+            scope = "AND agent_id = ?"
+            params = (self._agent_id, *params)
+        return await self._db.fetchall(
+            f"""
             SELECT id, agent_id, task_name, cron_expression, args_json,
-                   enabled, last_run_at, next_run_at, created_at
+                   enabled, last_run_at, next_run_at, created_at,
+                   schedule_kind, run_at, timezone_name, misfire_policy,
+                   misfire_grace_seconds, idempotency_key, lease_owner,
+                   lease_expires_at, claim_token, claim_execution_id,
+                   claim_scheduled_for, attempt_count, terminal_status, terminal_at
             FROM scheduled_tasks
-            WHERE agent_id = ? AND enabled = 1 AND next_run_at <= ?
+            WHERE enabled = 1 {scope}
+              AND next_run_at IS NOT NULL AND next_run_at <= ?
+              AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
             ORDER BY next_run_at ASC
             """,
-            (self._agent_id, now_iso),
+            params,
         )
-        tasks = [
-            ScheduledTask(
-                id=row[0],
-                agent_id=row[1],
-                task_name=row[2],
-                cron_expression=row[3],
-                args_json=row[4] or "{}",
-                enabled=bool(row[5]),
-                last_run_at=row[6],
-                next_run_at=row[7],
-                created_at=row[8],
-            )
-            for row in rows
-        ]
-        if not tasks:
+
+    @asynccontextmanager
+    async def _transaction(self):
+        transaction = getattr(self._db, "transaction", None)
+        if not callable(transaction):
+            yield
             return
-
-        # Bounded-concurrent execution (#1675). The serial loop meant one
-        # dispatch slower than the poll interval delayed every later due task,
-        # which could push them past the misfire grace and skip them. Run up to
-        # max_concurrent_tasks at once instead. `now` is frozen at tick start so
-        # the misfire decision is consistent across the batch. Each task touches
-        # only its own scheduled_tasks row (+ a unique-id log append), so there
-        # is no row-level read-modify-write race; aiosqlite serializes the
-        # writes on its single connection.
-        sem = asyncio.Semaphore(self._max_concurrent_tasks)
-
-        async def _run_one(task: ScheduledTask) -> None:
-            async with sem:
-                # Misfire grace (#1545): a task far past its scheduled time was
-                # almost certainly slept through (host suspend) or starved.
-                # Skip-and-re-anchor to the next occurrence instead of firing a
-                # post-wake burst. Within grace, behave exactly as before.
-                late = self._seconds_late(task.next_run_at, now)
-                if self._misfire_grace_seconds and late > self._misfire_grace_seconds:
-                    await self._skip_misfire(task, now, late)
-                else:
-                    await self._execute_task(task)
-
-        # _execute_task / _skip_misfire already swallow their own errors per
-        # task; return_exceptions=True is a backstop so one unexpected failure
-        # can't cancel sibling tasks mid-tick.
-        await asyncio.gather(
-            *(_run_one(task) for task in tasks),
-            return_exceptions=True,
-        )
+        context = transaction()
+        if not hasattr(context, "__aenter__"):
+            yield
+            return
+        async with context:
+            yield
 
     @staticmethod
-    def _seconds_late(next_run_at_iso: Optional[str], now: datetime) -> float:
-        """Seconds between a task's scheduled ``next_run_at`` and ``now``.
+    def _updated(result: Any) -> bool:
+        """Interpret backend row counts without breaking legacy test doubles."""
+        if isinstance(result, bool):
+            return result
+        if isinstance(result, int):
+            return result > 0
+        rowcount = getattr(result, "rowcount", None)
+        if isinstance(rowcount, int):
+            return rowcount > 0
+        return True
 
-        Returns 0.0 if the timestamp is missing or unparseable (treat as
-        on-time rather than infinitely late — an unparseable timestamp is a
-        separate bug that should not silently suppress execution)."""
-        if not next_run_at_iso:
-            return 0.0
-        try:
-            scheduled = datetime.fromisoformat(next_run_at_iso)
-        except (ValueError, TypeError):
-            return 0.0
-        if scheduled.tzinfo is None:
-            scheduled = scheduled.replace(tzinfo=timezone.utc)
-        return max(0.0, (now - scheduled).total_seconds())
-
-    async def _skip_misfire(self, task: ScheduledTask, now: datetime, late: float):
-        """Record a skipped (slept-through) run and re-anchor the task to its
-        next occurrence WITHOUT executing it.
-
-        Writes a ``skipped_misfire`` row to ``task_execution_log`` so the
-        skip is auditable (and visible in ``!schedule history``), then
-        advances ``next_run_at`` past ``now``. ``last_run_at`` is left
-        untouched — the task did not actually run."""
-        now_iso = now.isoformat()
-        logger.warning(
-            "Scheduled task %s (%s) was %.0fs late (> %ds grace); "
-            "skipping the slept-through run and re-anchoring",
-            task.id, task.task_name, late, self._misfire_grace_seconds,
+    async def _claim(self, task: ScheduledTask, now: datetime) -> Optional[ScheduledTask]:
+        if task.next_run_at is None:
+            return None
+        scheduled_for = task.next_run_at
+        execution_id = (
+            task.claim_execution_id
+            if task.claim_scheduled_for == scheduled_for and task.claim_execution_id
+            else str(uuid.uuid4())
         )
+        token = str(uuid.uuid4())
+        base_idempotency = task.idempotency_key or f"legacy:{task.id}"
+        idempotency_key = self._occurrence_idempotency_key(base_idempotency, task.id, scheduled_for)
+        now_iso = now.isoformat()
+        lease_expires = (now + timedelta(seconds=self._lease_seconds)).isoformat()
 
-        record_id = str(uuid.uuid4())
-        try:
+        async with self._transaction():
+            updated = await self._db.execute(
+                """
+                UPDATE scheduled_tasks
+                SET lease_owner = ?, lease_expires_at = ?, claim_token = ?,
+                    claim_execution_id = ?, claim_scheduled_for = ?,
+                    attempt_count = COALESCE(attempt_count, 0) + 1,
+                    idempotency_key = COALESCE(idempotency_key, ?)
+                WHERE id = ? AND agent_id = ? AND enabled = 1
+                  AND next_run_at = ?
+                  AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+                """,
+                (
+                    self._owner_id, lease_expires, token, execution_id, scheduled_for,
+                    base_idempotency, task.id, task.agent_id, scheduled_for, now_iso,
+                ),
+            )
+            if not self._updated(updated):
+                return None
             await self._db.execute(
                 """
                 INSERT INTO task_execution_log
                     (id, task_id, agent_id, status, result_text, duration_ms,
-                     executed_at, outcome_signal)
-                VALUES (?, ?, ?, 'skipped_misfire', ?, 0, ?, NULL)
+                     executed_at, outcome_signal, occurrence_at, idempotency_key,
+                     attempt_count, claimed_at, completed_at)
+                VALUES (?, ?, ?, 'claimed', NULL, 0, ?, NULL, ?, ?, ?, ?, NULL)
+                ON CONFLICT(id) DO NOTHING
                 """,
                 (
-                    record_id, task.id, self._agent_id,
-                    f"skipped: {late:.0f}s late (> {self._misfire_grace_seconds}s "
-                    "misfire grace); assumed host suspend",
-                    now_iso,
+                    execution_id, task.id, task.agent_id, now_iso, scheduled_for,
+                    idempotency_key, task.attempt_count + 1, now_iso,
                 ),
             )
-        except Exception as e:
-            logger.warning(
-                "Failed to record misfire skip for task %s: %s", task.id, e
-            )
+        return replace(
+            task,
+            lease_owner=self._owner_id,
+            lease_expires_at=lease_expires,
+            claim_token=token,
+            claim_execution_id=execution_id,
+            claim_scheduled_for=scheduled_for,
+            attempt_count=task.attempt_count + 1,
+            idempotency_key=base_idempotency,
+        )
 
-        # Re-read in case cron/enabled changed; mirror _execute_task's care.
-        cron_expr = task.cron_expression
-        task_still_live = True
-        try:
-            fresh = await self._db.fetchone(
-                "SELECT cron_expression, enabled FROM scheduled_tasks WHERE id = ?",
-                (task.id,),
-            )
-            if fresh is None:
-                task_still_live = False
-            else:
-                cron_expr = fresh[0]
-                if not bool(fresh[1]):
-                    task_still_live = False
-        except Exception as e:
-            logger.warning("Failed to re-read task %s for misfire: %s", task.id, e)
+    @staticmethod
+    def _occurrence_idempotency_key(base: str, schedule_id: str, scheduled_for: str) -> str:
+        digest = hashlib.sha256(f"{schedule_id}\x00{scheduled_for}".encode()).hexdigest()
+        return f"{base}:{digest}"
 
-        if not task_still_live:
-            return
-
-        try:
-            next_iso = next_run(cron_expr, after=now).isoformat()
-        except CronParseError:
-            logger.warning(
-                "Could not compute next_run for misfired task %s", task.id
-            )
-            return
-        try:
-            await self._db.execute(
-                "UPDATE scheduled_tasks SET next_run_at = ? WHERE id = ? AND enabled = 1",
-                (next_iso, task.id),
-            )
-        except Exception as e:
-            logger.warning(
-                "Failed to re-anchor misfired task %s: %s", task.id, e
-            )
-
-    async def _execute_task(self, task: ScheduledTask):
-        """Execute a single task and record the result."""
-        start = time.monotonic()
+    async def _execute_claim(self, task: ScheduledTask) -> None:
+        assert task.claim_execution_id and task.claim_token and task.next_run_at
+        execution = SchedulerExecution(
+            id=task.claim_execution_id,
+            schedule_id=task.id,
+            agent_id=task.agent_id,
+            task_name=task.task_name,
+            args=task.args,
+            scheduled_for=task.next_run_at,
+            idempotency_key=self._occurrence_idempotency_key(
+                task.idempotency_key or f"legacy:{task.id}", task.id, task.next_run_at,
+            ),
+            attempt=task.attempt_count,
+            owner=self._owner_id,
+        )
         now = datetime.now(timezone.utc)
-        now_iso = now.isoformat()
+        late = self._seconds_late(task.next_run_at, now)
+        grace = self._misfire_grace_seconds if task.misfire_grace_seconds is None else max(0, int(task.misfire_grace_seconds))
+        policy = task.misfire_policy if task.misfire_policy in MISFIRE_POLICIES else MISFIRE_SKIP
+        if policy == MISFIRE_SKIP and grace and late > grace:
+            await self._finalize(
+                task, execution, status="skipped_misfire",
+                result_text=(f"skipped: {late:.0f}s late (> {grace}s misfire grace); "
+                             "policy=skip"),
+                duration_ms=0, outcome_signal=None, ran=False,
+            )
+            return
+
+        renewal = asyncio.create_task(self._renew_lease(task), name=f"scheduler-lease:{execution.id}")
+        started = time.monotonic()
         status = "success"
         result_text: Optional[str] = None
         outcome_signal: Optional[float] = None
         pause_schedule = False
-
         try:
-            raw = await self._executor(task.task_name, task.args)
-            if isinstance(raw, ScheduledTaskOutcome):
-                status = raw.status
-                result_text = (
-                    f"{raw.result_text} Schedule id: {task.id}."
-                )
-                pause_schedule = raw.pause_schedule
-            # Executors may return either a plain string or a (text, signal) tuple.
-            # The signal must be numeric in [0.0, 1.0]; we clamp and drop non-
-            # numeric values rather than propagating garbage to the DB.
-            elif isinstance(raw, tuple) and len(raw) == 2:
-                result_text = raw[0] if isinstance(raw[0], str) else (str(raw[0]) if raw[0] is not None else None)
-                signal_raw = raw[1]
-                if signal_raw is None:
-                    outcome_signal = None
-                else:
-                    try:
-                        outcome_signal = max(0.0, min(1.0, float(signal_raw)))
-                    except (TypeError, ValueError):
-                        logger.warning(
-                            "Task %s (%s) returned non-numeric outcome signal %r; dropping",
-                            task.id, task.task_name, signal_raw,
-                        )
-                        outcome_signal = None
-            else:
-                result_text = raw if isinstance(raw, str) else (str(raw) if raw is not None else None)
+            token = _current_execution.set(execution)
+            try:
+                raw = await self._run_executor(execution)
+            finally:
+                _current_execution.reset(token)
+            status, result_text, outcome_signal, pause_schedule = self._normalise_result(raw, task)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             status = "failed"
-            result_text = str(e)
+            result_text = f"{type(e).__name__}: {e}"
             logger.error("Scheduled task %s (%s) failed: %s", task.id, task.task_name, e)
-
-        duration_ms = int((time.monotonic() - start) * 1000)
-
-        # Record execution — keep the generated id so executors can attach
-        # outcome signals after the fact (e.g. when a user responds to a
-        # dispatched message minutes later).
-        record_id = str(uuid.uuid4())
-        try:
-            await self._db.execute(
-                """
-                INSERT INTO task_execution_log
-                    (id, task_id, agent_id, status, result_text, duration_ms, executed_at, outcome_signal)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (record_id, task.id, self._agent_id, status, result_text, duration_ms, now_iso, outcome_signal),
-            )
-        except Exception as e:
-            logger.warning("Failed to record execution for task %s: %s", task.id, e)
-
-        if pause_schedule:
+        finally:
+            renewal.cancel()
             try:
-                await self._db.execute(
-                    """
-                    UPDATE scheduled_tasks
-                    SET enabled = 0, last_run_at = ?
-                    WHERE id = ? AND enabled = 1
-                    """,
-                    (now_iso, task.id),
-                )
-                logger.warning(
-                    "Scheduled task %s (%s) paused after blocked permission "
-                    "decision; change the tool permission and resume it explicitly",
-                    task.id,
-                    task.task_name,
-                )
-                return
-            except Exception as e:
-                # Do not leave the row due right now if the pause write fails;
-                # fall through to the normal next-run re-anchoring path.
-                logger.warning(
-                    "Failed to pause blocked scheduled task %s: %s; "
-                    "re-anchoring to its next cron occurrence",
-                    task.id,
-                    e,
-                )
-
-        # Re-read the task row in case cron or enabled changed mid-flight.
-        # If the task was paused or deleted while running, we must not compute
-        # a new next_run_at — the pause intent wins over the runner's stale
-        # in-memory snapshot.
-        task_still_live = True
-        cron_expr = task.cron_expression
-        try:
-            fresh = await self._db.fetchone(
-                "SELECT cron_expression, enabled FROM scheduled_tasks WHERE id = ?",
-                (task.id,),
-            )
-            if fresh is None:
-                # Deleted mid-flight — don't try to reschedule.
-                task_still_live = False
-            else:
-                cron_expr = fresh[0]
-                if not bool(fresh[1]):
-                    task_still_live = False
-        except Exception as e:
-            logger.warning("Failed to re-read task %s: %s", task.id, e)
-
-        next_iso: Optional[str] = None
-        if task_still_live:
-            try:
-                nxt = next_run(cron_expr, after=now)
-                next_iso = nxt.isoformat()
-            except CronParseError:
-                logger.warning("Could not compute next_run for task %s", task.id)
-
-        # Always record last_run_at even if the task was paused/deleted —
-        # execution actually happened. Only touch next_run_at when still live.
-        try:
-            if task_still_live:
-                await self._db.execute(
-                    """
-                    UPDATE scheduled_tasks
-                    SET last_run_at = ?, next_run_at = ?
-                    WHERE id = ? AND enabled = 1
-                    """,
-                    (now_iso, next_iso, task.id),
-                )
-            else:
-                await self._db.execute(
-                    """
-                    UPDATE scheduled_tasks
-                    SET last_run_at = ?
-                    WHERE id = ?
-                    """,
-                    (now_iso, task.id),
-                )
-        except Exception as e:
-            logger.warning("Failed to update task %s after execution: %s", task.id, e)
-
-        logger.info(
-            "Scheduled task %s (%s) executed: %s (%dms, signal=%s)",
-            task.id, task.task_name, status, duration_ms, outcome_signal,
+                await renewal
+            except asyncio.CancelledError:
+                pass
+        await self._finalize(
+            task, execution, status=status, result_text=result_text,
+            duration_ms=int((time.monotonic() - started) * 1000),
+            outcome_signal=outcome_signal, ran=True, pause_schedule=pause_schedule,
         )
 
-    # ------------------------------------------------------------------
-    # Table setup
-    # ------------------------------------------------------------------
+    async def _run_executor(self, execution: SchedulerExecution) -> Any:
+        # ``AsyncMock`` and similar dynamic proxies fabricate any attribute on
+        # ordinary callable executors.  Discover the structural hosted method
+        # statically first so a legacy callable is not misclassified merely
+        # because its test double happens to manufacture ``execute_scheduled``.
+        try:
+            inspect.getattr_static(self._executor, "execute_scheduled")
+        except AttributeError:
+            hosted = None
+        else:
+            hosted = getattr(self._executor, "execute_scheduled", None)
+        # ``HostedExecutionExecutor`` is structural: integrations only need to
+        # provide ``execute_scheduled``.  Requiring the implementation detail
+        # marker from ``HostedSchedulerExecutor`` made otherwise valid custom
+        # executors fall through to the legacy callable path and fail at
+        # dispatch time.
+        if callable(hosted):
+            return await hosted(execution)
+        return await self._executor(execution.task_name, execution.args)  # type: ignore[misc]
+
+    async def _renew_lease(self, task: ScheduledTask) -> None:
+        interval = max(1.0, self._lease_seconds / 3)
+        while True:
+            await asyncio.sleep(interval)
+            expires = (datetime.now(timezone.utc) + timedelta(seconds=self._lease_seconds)).isoformat()
+            updated = await self._db.execute(
+                """
+                UPDATE scheduled_tasks SET lease_expires_at = ?
+                WHERE id = ? AND agent_id = ? AND enabled = 1
+                  AND lease_owner = ? AND claim_token = ? AND claim_execution_id = ?
+                """,
+                (expires, task.id, task.agent_id, self._owner_id, task.claim_token, task.claim_execution_id),
+            )
+            if not self._updated(updated):
+                logger.warning("Lost scheduler lease for task %s execution %s", task.id, task.claim_execution_id)
+                return
+
+    @staticmethod
+    def _normalise_result(raw: Any, task: ScheduledTask) -> tuple[str, Optional[str], Optional[float], bool]:
+        if isinstance(raw, ScheduledTaskOutcome):
+            return (
+                raw.status,
+                f"{raw.result_text} Schedule id: {task.id}.",
+                None,
+                raw.pause_schedule,
+            )
+        if isinstance(raw, tuple) and len(raw) == 2:
+            text = raw[0] if isinstance(raw[0], str) else (str(raw[0]) if raw[0] is not None else None)
+            try:
+                signal = None if raw[1] is None else max(0.0, min(1.0, float(raw[1])))
+            except (TypeError, ValueError):
+                logger.warning("Task %s returned non-numeric outcome signal %r; dropping", task.id, raw[1])
+                signal = None
+            return "success", text, signal, False
+        return "success", raw if isinstance(raw, str) else (str(raw) if raw is not None else None), None, False
+
+    async def _finalize(
+        self,
+        task: ScheduledTask,
+        execution: SchedulerExecution,
+        *,
+        status: str,
+        result_text: Optional[str],
+        duration_ms: int,
+        outcome_signal: Optional[float],
+        ran: bool,
+        pause_schedule: bool = False,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        terminal = task.schedule_kind == SCHEDULE_ONE_SHOT or pause_schedule
+        enabled = 0 if terminal else 1
+        terminal_status = status if terminal else None
+        terminal_at = now_iso if terminal else None
+        next_at: Optional[str] = None
+        if not terminal:
+            try:
+                after = now
+                if task.misfire_policy == MISFIRE_CATCH_UP and task.next_run_at:
+                    after = self._parse_utc(task.next_run_at) or now
+                next_at = next_run(task.cron_expression, after=after, timezone_name=task.timezone_name).isoformat()
+            except CronParseError as e:
+                status = "failed"
+                result_text = f"{result_text or ''} scheduler cannot compute next run: {e}".strip()
+                enabled = 0
+                terminal_status = "invalid_cron"
+                terminal_at = now_iso
+
+        # A paused/deleted task must win over an in-flight execution.  The
+        # compare-and-set also rejects an old worker that lost its lease to a
+        # recovery worker; it must never overwrite the newer worker's outcome.
+        async with self._transaction():
+            last_run_sql = "last_run_at = ?" if ran else "last_run_at = last_run_at"
+            params: list[Any] = []
+            if ran:
+                params.append(now_iso)
+            params.extend([
+                next_at, enabled, terminal_status, terminal_at,
+                task.id, task.agent_id, self._owner_id, task.claim_token, execution.id,
+            ])
+            updated = await self._db.execute(
+                f"""
+                UPDATE scheduled_tasks
+                SET {last_run_sql}, next_run_at = ?, enabled = ?,
+                    terminal_status = ?, terminal_at = ?,
+                    lease_owner = NULL, lease_expires_at = NULL, claim_token = NULL,
+                    claim_execution_id = NULL, claim_scheduled_for = NULL
+                WHERE id = ? AND agent_id = ? AND enabled = 1
+                  AND lease_owner = ? AND claim_token = ? AND claim_execution_id = ?
+                """,
+                tuple(params),
+            )
+            if not self._updated(updated):
+                await self._mark_cancelled_if_no_longer_runnable(execution)
+                return
+            updated_log = await self._db.execute(
+                """
+                UPDATE task_execution_log
+                SET status = ?, result_text = ?, duration_ms = ?, executed_at = ?,
+                    outcome_signal = ?, attempt_count = ?, completed_at = ?
+                WHERE id = ? AND task_id = ? AND agent_id = ? AND status = 'claimed'
+                """,
+                (
+                    status, result_text, duration_ms, now_iso, outcome_signal,
+                    execution.attempt, now_iso, execution.id, task.id, task.agent_id,
+                ),
+            )
+            if not self._updated(updated_log):
+                raise RuntimeError(f"claimed execution log {execution.id} disappeared before finalization")
+
+        logger.info(
+            "Scheduled task %s (%s) finalized %s (%dms, attempt=%d)",
+            task.id, task.task_name, status, duration_ms, execution.attempt,
+        )
+
+    async def _mark_cancelled_if_no_longer_runnable(self, execution: SchedulerExecution) -> None:
+        row = await self._db.fetchone(
+            "SELECT enabled FROM scheduled_tasks WHERE id = ? AND agent_id = ?",
+            (execution.schedule_id, execution.agent_id),
+        )
+        if row is not None and bool(row[0]):
+            return
+        await self._db.execute(
+            """
+            UPDATE task_execution_log
+            SET status = 'cancelled', result_text = 'schedule removed or paused while execution was in flight',
+                completed_at = ?
+            WHERE id = ? AND agent_id = ? AND status = 'claimed'
+            """,
+            (datetime.now(timezone.utc).isoformat(), execution.id, execution.agent_id),
+        )
+
+    @staticmethod
+    def _parse_utc(value: str) -> Optional[datetime]:
+        try:
+            parsed = datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _seconds_late(next_run_at_iso: Optional[str], now: datetime) -> float:
+        scheduled = SchedulerRunner._parse_utc(next_run_at_iso) if next_run_at_iso else None
+        return max(0.0, (now - scheduled).total_seconds()) if scheduled else 0.0
 
     async def _ensure_tables(self):
-        """Create the scheduled_tasks and task_execution_log tables if needed."""
+        """Create and additively migrate the durable scheduler schema."""
         await self._db.execute(
             """
             CREATE TABLE IF NOT EXISTS scheduled_tasks (
@@ -480,14 +649,22 @@ class SchedulerRunner:
                 enabled INTEGER DEFAULT 1,
                 last_run_at TEXT,
                 next_run_at TEXT,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                schedule_kind TEXT NOT NULL DEFAULT 'cron',
+                run_at TEXT,
+                timezone_name TEXT NOT NULL DEFAULT 'UTC',
+                misfire_policy TEXT NOT NULL DEFAULT 'skip',
+                misfire_grace_seconds INTEGER,
+                idempotency_key TEXT,
+                lease_owner TEXT,
+                lease_expires_at TEXT,
+                claim_token TEXT,
+                claim_execution_id TEXT,
+                claim_scheduled_for TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                terminal_status TEXT,
+                terminal_at TEXT
             )
-            """
-        )
-        await self._db.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_agent_next
-            ON scheduled_tasks(agent_id, enabled, next_run_at)
             """
         )
         await self._db.execute(
@@ -500,35 +677,59 @@ class SchedulerRunner:
                 result_text TEXT,
                 duration_ms INTEGER NOT NULL,
                 executed_at TEXT NOT NULL,
-                outcome_signal REAL
+                outcome_signal REAL,
+                occurrence_at TEXT,
+                idempotency_key TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 1,
+                claimed_at TEXT,
+                completed_at TEXT
             )
             """
         )
-        # Additive migration for pre-existing databases that lack outcome_signal.
-        # Only swallow the specific "column already exists" case; anything else
-        # (locked DB, permission errors, schema corruption) is a real problem
-        # and must be surfaced — silently continuing could let inserts fail
-        # later with confusing "no such column" errors.
+        scheduled_columns = {
+            "schedule_kind": "TEXT NOT NULL DEFAULT 'cron'",
+            "run_at": "TEXT",
+            "timezone_name": "TEXT NOT NULL DEFAULT 'UTC'",
+            "misfire_policy": "TEXT NOT NULL DEFAULT 'skip'",
+            "misfire_grace_seconds": "INTEGER",
+            "idempotency_key": "TEXT",
+            "lease_owner": "TEXT",
+            "lease_expires_at": "TEXT",
+            "claim_token": "TEXT",
+            "claim_execution_id": "TEXT",
+            "claim_scheduled_for": "TEXT",
+            "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+            "terminal_status": "TEXT",
+            "terminal_at": "TEXT",
+        }
+        log_columns = {
+            "outcome_signal": "REAL",
+            "occurrence_at": "TEXT",
+            "idempotency_key": "TEXT",
+            "attempt_count": "INTEGER NOT NULL DEFAULT 1",
+            "claimed_at": "TEXT",
+            "completed_at": "TEXT",
+        }
+        for table, columns in (("scheduled_tasks", scheduled_columns), ("task_execution_log", log_columns)):
+            for column, definition in columns.items():
+                await self._add_column_if_missing(table, column, definition)
+        # Existing UTC cron schedules retain their old behavior, now made
+        # explicit and suitable for occurrence-level idempotency.
+        await self._db.execute("UPDATE scheduled_tasks SET schedule_kind = 'cron' WHERE schedule_kind IS NULL")
+        await self._db.execute("UPDATE scheduled_tasks SET timezone_name = 'UTC' WHERE timezone_name IS NULL OR timezone_name = ''")
+        await self._db.execute("UPDATE scheduled_tasks SET misfire_policy = 'skip' WHERE misfire_policy IS NULL OR misfire_policy = ''")
+        await self._db.execute("UPDATE scheduled_tasks SET idempotency_key = 'legacy:' || id WHERE idempotency_key IS NULL OR idempotency_key = ''")
+        await self._db.execute("CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_agent_next ON scheduled_tasks(agent_id, enabled, next_run_at)")
+        await self._db.execute("CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_due_claim ON scheduled_tasks(enabled, next_run_at, lease_expires_at)")
+        await self._db.execute("CREATE INDEX IF NOT EXISTS idx_task_execution_log_task ON task_execution_log(task_id, executed_at DESC)")
+        await self._db.execute("CREATE INDEX IF NOT EXISTS idx_task_execution_log_idempotency ON task_execution_log(agent_id, idempotency_key)")
+
+    async def _add_column_if_missing(self, table: str, column: str, definition: str) -> None:
         try:
-            await self._db.execute(
-                "ALTER TABLE task_execution_log ADD COLUMN outcome_signal REAL"
-            )
-            logger.info("Applied outcome_signal column migration")
+            await self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            logger.info("Applied scheduler migration %s.%s", table, column)
         except Exception as e:
-            msg = str(e).lower()
-            is_duplicate = (
-                "duplicate column" in msg
-                or "already exists" in msg
-                or "column outcome_signal" in msg
-            )
-            if is_duplicate:
-                logger.debug("outcome_signal column already present — migration skipped")
-            else:
-                logger.error("Unexpected failure applying outcome_signal migration: %s", e)
-                raise
-        await self._db.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_task_execution_log_task
-            ON task_execution_log(task_id, executed_at DESC)
-            """
-        )
+            message = str(e).lower()
+            if "duplicate column" in message or "already exists" in message or f"column {column}" in message:
+                return
+            raise
