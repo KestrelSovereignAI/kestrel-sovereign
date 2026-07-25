@@ -47,6 +47,7 @@ from kestrel_sovereign.signals.context import (
 def _make_agent(tmp_path=None, name="kestrel"):
     agent = MagicMock()
     agent.agent_name = name
+    agent.did = "did:web:k.example"
     agent._features = []
     if tmp_path is not None:
         agent.storage_path = str(tmp_path / "data" / "agent.db")
