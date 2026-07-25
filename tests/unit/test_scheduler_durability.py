@@ -10,10 +10,12 @@ import pytest
 from fastapi import FastAPI
 
 from kestrel_sovereign import server
+from kestrel_sovereign.features.scheduler import runner as scheduler_runner_module
 from kestrel_sovereign.features.scheduler.cron import next_run
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
 from kestrel_sovereign.features.scheduler.runner import (
     AgentManagerHostedSchedulerExecutor,
+    HostedSchedulerExecutor,
     SCHEDULER_PROTOCOL_VERSION,
     SCHEDULER_ROLLOUT_ACK_ENV,
     SCHEDULER_ROLLOUT_STATE_ACTIVE,
@@ -865,6 +867,22 @@ async def test_sqlite_same_did_effects_share_admission_while_fence_drains_them(
                 await asyncio.gather(task, return_exceptions=True)
         await db_a.close()
         await db_b.close()
+
+
+def test_rollout_effect_advisory_key_never_uses_bootstrap_sentinel(monkeypatch):
+    """A SHA-256 zero prefix cannot self-deadlock PostgreSQL bootstrap."""
+
+    class ZeroDigest:
+        def digest(self) -> bytes:
+            return b"\0" * 32
+
+    monkeypatch.setattr(
+        scheduler_runner_module.hashlib,
+        "sha256",
+        lambda _payload: ZeroDigest(),
+    )
+
+    assert SchedulerRunner._rollout_effect_advisory_key("did:scheduler:zero") != 0
 
 
 @pytest.mark.asyncio
@@ -1843,6 +1861,93 @@ def test_local_cron_dst_gap_and_fold_contract():
     assert fold == datetime(2026, 11, 1, 6, 30, tzinfo=timezone.utc)
     after_fold = next_run("30 1 * * *", fold, chicago)
     assert after_fold == datetime(2026, 11, 2, 7, 30, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_hosted_dispatch_refuses_a_soft_disabled_scheduler_feature():
+    """A live host cannot invoke a persisted task through a disabled feature."""
+
+    dispatched = AsyncMock(return_value="must-not-run")
+    agent = SimpleNamespace(
+        did="agent-1",
+        features={
+            "SchedulerFeature": SimpleNamespace(
+                enabled=False,
+                _dispatch_scheduled_task=dispatched,
+            )
+        },
+    )
+    executor = HostedSchedulerExecutor(AsyncMock(return_value=agent))
+    execution = SchedulerExecution(
+        id="execution-disabled-feature",
+        schedule_id="task-disabled-feature",
+        agent_id="agent-1",
+        task_name="custom_tool",
+        args={"value": "must-not-effect"},
+        scheduled_for="2026-07-25T00:00:00+00:00",
+        idempotency_key="disabled-feature-effect",
+        attempt=1,
+        owner="host",
+    )
+
+    with pytest.raises(RuntimeError, match="no enabled SchedulerFeature"):
+        await executor.execute_scheduled(execution)
+    dispatched.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_host_runner_skips_claim_for_soft_disabled_scheduler_feature(tmp_path):
+    """A disabled warm host feature leaves its due custom-tool row unclaimed."""
+
+    db = await _database(tmp_path / "host-disabled-scheduler-feature.db")
+    agent_id = "did:scheduler:disabled-feature"
+    dispatched = AsyncMock(return_value="must-not-run")
+    feature = SimpleNamespace(
+        enabled=False,
+        _dispatch_scheduled_task=dispatched,
+    )
+    manager = AgentManager()
+    manager._agents["Disabled"] = SimpleNamespace(
+        did=agent_id,
+        features={"SchedulerFeature": feature},
+    )
+    manager._agent_names[agent_id] = "Disabled"
+    manager._seed_scheduler_authority(
+        {agent_id: ("Disabled", LocalAgentConfig(data_dir="disabled", port=8801))}
+    )
+    runner = SchedulerRunner(
+        db,
+        None,
+        AgentManagerHostedSchedulerExecutor(manager),
+        authorized_agent_ids={agent_id},
+        is_agent_authorized=manager.is_scheduler_agent_authorized,
+        owner_id="host-disabled-scheduler-feature",
+    )
+    try:
+        await runner._ensure_tables()
+        await _seed_due(
+            db,
+            task_id="disabled-custom-tool",
+            agent_id=agent_id,
+            task_name="custom_tool",
+        )
+
+        await runner._tick()
+
+        dispatched.assert_not_awaited()
+        assert await db.fetchone(
+            """
+            SELECT enabled, scheduler_claim_fenced, claim_token
+            FROM scheduled_tasks WHERE id = ?
+            """,
+            ("disabled-custom-tool",),
+        ) == (1, 0, None)
+        assert await db.fetchone(
+            "SELECT COUNT(*) FROM task_execution_log WHERE task_id = ?",
+            ("disabled-custom-tool",),
+        ) == (0,)
+    finally:
+        await db.close()
 
 
 @pytest.mark.asyncio

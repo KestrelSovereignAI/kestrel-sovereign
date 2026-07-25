@@ -13,6 +13,7 @@ import pytest
 from fastapi import FastAPI
 
 from kestrel_sovereign import server
+from kestrel_sovereign.features.scheduler import runner as scheduler_runner_module
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
 from kestrel_sovereign.features.scheduler.runner import (
     SCHEDULER_PROTOCOL_VERSION,
@@ -369,6 +370,97 @@ async def test_newer_protocol_state_fails_before_any_scheduler_mutation(
                 future_nonce,
                 "future-updated-at",
             )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_future_scheduled_task_row_fails_before_bootstrap_mutation(db_backend):
+    """A future row cannot be classified as legacy or rewritten to v2."""
+
+    agent_id = f"did:scheduler:future-scheduled-row:{uuid4()}"
+    future_version = SCHEDULER_PROTOCOL_VERSION + 7
+    task_id = f"future-scheduled-task:{uuid4()}"
+
+    async with _isolated_scheduler_schema(db_backend) as db:
+        await db.execute(
+            """
+            CREATE TABLE scheduled_tasks (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                scheduler_protocol_version INTEGER NOT NULL,
+                sentinel TEXT NOT NULL
+            )
+            """
+        )
+        await db.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, scheduler_protocol_version, sentinel)
+            VALUES (?, ?, ?, 'future-row-must-not-change')
+            """,
+            (task_id, agent_id, future_version),
+        )
+
+        runner = _host_runner(db, {agent_id})
+        with pytest.raises(SchedulerProtocolVersionIncompatible):
+            await runner.start()
+
+        assert await db.fetchone(
+            """
+            SELECT id, agent_id, scheduler_protocol_version, sentinel
+            FROM scheduled_tasks WHERE id = ?
+            """,
+            (task_id,),
+        ) == (task_id, agent_id, future_version, "future-row-must-not-change")
+        if db.backend_type == "postgres":
+            columns = await db.fetchall(
+                """
+                SELECT column_name FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'scheduled_tasks'
+                ORDER BY ordinal_position
+                """
+            )
+        else:
+            columns = await db.fetchall(
+                "SELECT name FROM pragma_table_info('scheduled_tasks') ORDER BY cid"
+            )
+        assert columns == [
+            ("id",),
+            ("agent_id",),
+            ("scheduler_protocol_version",),
+            ("sentinel",),
+        ]
+        assert not await db.table_exists("scheduler_protocol_schema")
+        assert not await db.table_exists("scheduler_protocol_rollout")
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_postgres_bootstrap_remaps_zero_effect_advisory_key(
+    db_backend, monkeypatch
+):
+    """A synthetic zero hash does not deadlock PG bootstrap against itself."""
+
+    if db_backend.backend_type != "postgres":
+        pytest.skip("requires PostgreSQL session and transaction advisory locks")
+
+    class ZeroDigest:
+        def digest(self) -> bytes:
+            return b"\0" * 32
+
+    monkeypatch.setattr(
+        scheduler_runner_module.hashlib,
+        "sha256",
+        lambda _payload: ZeroDigest(),
+    )
+    agent_id = f"did:scheduler:zero-effect-key:{uuid4()}"
+
+    async with _isolated_scheduler_schema(db_backend) as db:
+        runner = _host_runner(db, {agent_id})
+        assert runner._rollout_effect_advisory_key(agent_id) != 0
+        await asyncio.wait_for(runner._ensure_tables(), timeout=3)
+        assert await db.table_exists("scheduled_tasks")
 
 
 @pytest.mark.asyncio

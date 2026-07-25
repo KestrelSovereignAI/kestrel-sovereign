@@ -83,8 +83,8 @@ _SCHEDULER_BOOTSTRAP_ADVISORY_LOCK_SCOPE = 0
 # lock without deadlocking a scheduled tool that writes scheduler state through
 # another pooled connection.  A distinct per-DID session advisory lock carries
 # the *effect versus rollout-transition* exclusion instead.  It deliberately
-# shares the issue namespace with the bootstrap lock but has a DID-derived
-# signed-32-bit key, so it cannot collide with the global bootstrap key 0.
+# shares the issue namespace with the bootstrap lock, with the DID-derived
+# signed-32-bit key remapped away from the reserved global key 0.
 _SCHEDULER_EFFECT_ADVISORY_LOCK_NAMESPACE = 2715
 
 
@@ -530,14 +530,38 @@ class HostedSchedulerExecutor:
     ) -> Any:
         """Dispatch only after a host has resolved the claimed DID."""
 
-        features = getattr(agent, "features", {}) or {}
-        for feature in features.values():
+        feature = HostedSchedulerExecutor._enabled_scheduler_feature(agent)
+        if feature is not None:
             dispatch = getattr(feature, "_dispatch_scheduled_task", None)
             if callable(dispatch):
                 return await dispatch(execution.task_name, execution.args)
         raise RuntimeError(
-            f"woken agent {execution.agent_id!r} has no SchedulerFeature dispatcher"
+            f"woken agent {execution.agent_id!r} has no enabled SchedulerFeature dispatcher"
         )
+
+    @staticmethod
+    def _enabled_scheduler_feature(agent: Any) -> Optional[Any]:
+        """Return this agent's live, enabled SchedulerFeature dispatcher.
+
+        Shared-PG hosts retain an agent object after a feature is soft-disabled.
+        Looking only for a private dispatcher method would therefore let a
+        disabled scheduler continue to execute persisted custom-tool rows.
+        The canonical feature-map key is retained for lightweight host test
+        doubles; the class-name check covers normal feature registry wiring.
+        """
+
+        features = getattr(agent, "features", {}) or {}
+        if not isinstance(features, dict):
+            return None
+        for name, feature in features.items():
+            if name != "SchedulerFeature" and type(feature).__name__ != "SchedulerFeature":
+                continue
+            if not getattr(feature, "enabled", True):
+                return None
+            if callable(getattr(feature, "_dispatch_scheduled_task", None)):
+                return feature
+            return None
+        return None
 
 
 class AgentManagerHostedSchedulerExecutor(HostedSchedulerExecutor):
@@ -570,6 +594,19 @@ class AgentManagerHostedSchedulerExecutor(HostedSchedulerExecutor):
                 config = await config
             return config
         return self._agent_configs.get(agent_id)
+
+    def scheduler_dispatch_enabled(self, agent_id: str) -> bool:
+        """Whether a warm tenant has an enabled SchedulerFeature.
+
+        This is a conservative pre-claim optimization for the hosted runner.
+        A cold tenant is intentionally left eligible: waking it merely to
+        inspect feature state would move feature initialization before the
+        scheduler's durable claim boundary. The dispatch path repeats the
+        enabled check, so an in-flight soft disable still cannot invoke a tool.
+        """
+
+        agent = self._loaded_agent_for(agent_id)
+        return agent is None or self._enabled_scheduler_feature(agent) is not None
 
     def _lifecycle_lock_for(self, agent_id: str) -> Any:
         """Return the manager's exclusive DID lifecycle lock."""
@@ -982,6 +1019,8 @@ class SchedulerRunner:
                 # ``now`` above is only the polling cutoff. A task can wait
                 # behind the semaphore longer than its full lease interval, so
                 # begin its lease at the actual compare-and-set transition.
+                if not await self._executor_accepts_scheduled_agent(task.agent_id):
+                    return
                 claimed = await self._claim(task, datetime.now(timezone.utc))
                 if claimed is not None:
                     await self._execute_claim(claimed)
@@ -1007,6 +1046,23 @@ class SchedulerRunner:
                 exc_info=(type(result), result, result.__traceback__),
             )
             self._latch_protocol_failure(result)
+
+    async def _executor_accepts_scheduled_agent(self, agent_id: str) -> bool:
+        """Return whether an optional hosted executor can admit this DID.
+
+        The normal durable authorization check still runs in :meth:`_claim`.
+        This hook only avoids publishing a claim for a warm hosted agent whose
+        SchedulerFeature is already soft-disabled. Executors without an
+        explicit preflight preserve the established claim-first behavior.
+        """
+
+        preflight = getattr(self._executor, "scheduler_dispatch_enabled", None)
+        if not callable(preflight):
+            return True
+        result = preflight(agent_id)
+        if inspect.isawaitable(result):
+            result = await result
+        return bool(result)
 
     async def _due_rows(self, now: datetime) -> List[tuple]:
         authorized_agent_ids = await self._current_authorized_agent_ids()
@@ -1306,7 +1362,12 @@ class SchedulerRunner:
         digest = hashlib.sha256(
             f"scheduler-rollout-effect\0{agent_id}".encode("utf-8")
         ).digest()
-        return int.from_bytes(digest[:4], byteorder="big", signed=True)
+        key = int.from_bytes(digest[:4], byteorder="big", signed=True)
+        # ``(2715, 0)`` is the transaction-scoped bootstrap key. A session
+        # effect gate at that exact key makes bootstrap wait on itself across
+        # its advisory and operational connections. Preserve the long-lived
+        # namespace for rollout compatibility, but remap this one sentinel.
+        return 1 if key == _SCHEDULER_BOOTSTRAP_ADVISORY_LOCK_SCOPE else key
 
     @asynccontextmanager
     async def _postgres_rollout_effect_gates(
@@ -2915,6 +2976,18 @@ class SchedulerRunner:
     async def _reject_newer_scheduler_protocol_state(self) -> None:
         """Fail before changing state written by a newer scheduler binary."""
 
+        if await self._scheduled_tasks_protocol_column_exists():
+            rows = await self._db.fetchall(
+                """
+                SELECT scheduler_protocol_version FROM scheduled_tasks
+                """,
+            )
+            if any(
+                row and self._is_newer_protocol_version(row[0])
+                for row in rows
+            ):
+                raise SchedulerProtocolVersionIncompatible()
+
         if await self._scheduler_table_exists("scheduler_protocol_schema"):
             row = await self._db.fetchone(
                 """
@@ -2934,6 +3007,38 @@ class SchedulerRunner:
                 for row in rows
             ):
                 raise SchedulerProtocolVersionIncompatible()
+
+    async def _scheduled_tasks_protocol_column_exists(self) -> bool:
+        """Return whether an existing schedule table exposes the v2 marker.
+
+        This read-only shape probe is required before bootstrap DDL. A legacy
+        ``scheduled_tasks`` relation lacks the column and remains eligible for
+        the normal controlled rollout; a future row with the column is an
+        authority boundary that this binary must not normalize.
+        """
+
+        if not await self._scheduled_tasks_table_exists():
+            return False
+        if self._database_backend_type() == "postgres":
+            row = await self._db.fetchone(
+                """
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'scheduled_tasks'
+                  AND column_name = 'scheduler_protocol_version'
+                LIMIT 1
+                """
+            )
+        else:
+            row = await self._db.fetchone(
+                """
+                SELECT 1 FROM pragma_table_info('scheduled_tasks')
+                WHERE name = ?
+                LIMIT 1
+                """,
+                ("scheduler_protocol_version",),
+            )
+        return bool(row)
 
     async def _establish_scheduler_schema_provenance(self) -> bool:
         """Return whether ``scheduled_tasks`` predated this v2 bootstrap.
