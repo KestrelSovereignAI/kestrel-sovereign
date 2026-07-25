@@ -219,6 +219,7 @@ try:
     OI_INPUT_VALUE = _OISpanAttributes.INPUT_VALUE
     OI_OUTPUT_VALUE = _OISpanAttributes.OUTPUT_VALUE
     OI_LLM_MODEL_NAME = _OISpanAttributes.LLM_MODEL_NAME
+    OI_SESSION_ID = _OISpanAttributes.SESSION_ID
     OI_SPAN_KIND = _OISpanAttributes.OPENINFERENCE_SPAN_KIND
     OI_SPAN_KIND_CHAIN = _OISpanKindValues.CHAIN.value
     OI_SPAN_KIND_TOOL = _OISpanKindValues.TOOL.value
@@ -226,6 +227,7 @@ except Exception:  # pragma: no cover - openinference optional
     OI_INPUT_VALUE = "input.value"
     OI_OUTPUT_VALUE = "output.value"
     OI_LLM_MODEL_NAME = "llm.model_name"
+    OI_SESSION_ID = "session.id"
     OI_SPAN_KIND = "openinference.span.kind"
     OI_SPAN_KIND_CHAIN = "CHAIN"
     OI_SPAN_KIND_TOOL = "TOOL"
