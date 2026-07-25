@@ -15,6 +15,7 @@ import json
 import logging
 import time
 import uuid
+from collections.abc import Collection
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -253,8 +254,9 @@ class SchedulerRunner:
     """Poll durable schedule rows and execute only rows this runner claims.
 
     Pass an agent ID for the longstanding standalone per-agent loop.  A host
-    may pass ``None`` plus a :class:`HostedExecutionExecutor` to claim rows for
-    every agent in a shared PostgreSQL database.
+    may pass ``None`` plus a :class:`HostedExecutionExecutor` and an explicit
+    set of locally-authorized agent DIDs to claim rows in a shared PostgreSQL
+    database.  A host must never claim another host's fleet rows.
     """
 
     def __init__(
@@ -267,11 +269,33 @@ class SchedulerRunner:
         max_concurrent_tasks: int = DEFAULT_MAX_CONCURRENT_TASKS,
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
         owner_id: Optional[str] = None,
+        authorized_agent_ids: Optional[Collection[str]] = None,
     ):
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
+        if authorized_agent_ids is not None:
+            authorized = tuple(sorted(set(authorized_agent_ids)))
+            if not authorized or any(
+                not isinstance(value, str) or not value for value in authorized
+            ):
+                raise ValueError(
+                    "authorized_agent_ids must contain at least one non-empty agent ID"
+                )
+        elif agent_id is None:
+            raise ValueError(
+                "host SchedulerRunner requires explicit authorized_agent_ids"
+            )
+        else:
+            # Preserve the standalone runner's historical contract: its
+            # provided agent identity is its complete authority scope.
+            authorized = (agent_id,)
+        if agent_id is not None and authorized != (agent_id,):
+            raise ValueError(
+                "agent-scoped SchedulerRunner may authorize only its agent_id"
+            )
         self._db = db
         self._agent_id = agent_id
+        self._authorized_agent_ids = authorized
         self._executor = executor
         self._poll_interval = poll_interval
         self._misfire_grace_seconds = max(0, int(misfire_grace_seconds))
@@ -323,14 +347,30 @@ class SchedulerRunner:
                 if claimed is not None:
                     await self._execute_claim(claimed)
 
-        await asyncio.gather(*(run_one(ScheduledTask.from_row(row)) for row in rows), return_exceptions=True)
+        tasks = [ScheduledTask.from_row(row) for row in rows]
+        results = await asyncio.gather(
+            *(run_one(task) for task in tasks), return_exceptions=True
+        )
+        for task, result in zip(tasks, results):
+            if not isinstance(result, BaseException):
+                continue
+            if isinstance(result, asyncio.CancelledError):
+                logger.warning(
+                    "Scheduled occurrence for task %s (%s) was cancelled",
+                    task.id,
+                    task.task_name,
+                )
+                continue
+            logger.error(
+                "Scheduled occurrence for task %s (%s) failed outside normal finalization",
+                task.id,
+                task.task_name,
+                exc_info=(type(result), result, result.__traceback__),
+            )
 
     async def _due_rows(self, now: datetime) -> List[tuple]:
-        scope = ""
-        params: tuple = (now.isoformat(), now.isoformat())
-        if self._agent_id is not None:
-            scope = "AND agent_id = ?"
-            params = (self._agent_id, *params)
+        authorization_scope = self._authorized_agent_placeholders()
+        params: tuple = (*self._authorized_agent_ids, now.isoformat(), now.isoformat())
         return await self._db.fetchall(
             f"""
             SELECT id, agent_id, task_name, cron_expression, args_json,
@@ -340,7 +380,8 @@ class SchedulerRunner:
                    lease_expires_at, claim_token, claim_execution_id,
                    claim_scheduled_for, attempt_count, terminal_status, terminal_at
             FROM scheduled_tasks
-            WHERE enabled = 1 {scope}
+            WHERE enabled = 1
+              AND agent_id IN ({authorization_scope})
               AND next_run_at IS NOT NULL AND next_run_at <= ?
               AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
             ORDER BY next_run_at ASC
@@ -373,8 +414,13 @@ class SchedulerRunner:
             return rowcount > 0
         return True
 
+    def _authorized_agent_placeholders(self) -> str:
+        """Return the fixed placeholder list for this runner's fleet scope."""
+
+        return ", ".join("?" for _ in self._authorized_agent_ids)
+
     async def _claim(self, task: ScheduledTask, now: datetime) -> Optional[ScheduledTask]:
-        if task.next_run_at is None:
+        if task.next_run_at is None or task.agent_id not in self._authorized_agent_ids:
             return None
         scheduled_for = task.next_run_at
         execution_id = (
@@ -388,21 +434,24 @@ class SchedulerRunner:
         now_iso = now.isoformat()
         lease_expires = (now + timedelta(seconds=self._lease_seconds)).isoformat()
 
+        authorization_scope = self._authorized_agent_placeholders()
         async with self._transaction():
             updated = await self._db.execute(
-                """
+                f"""
                 UPDATE scheduled_tasks
                 SET lease_owner = ?, lease_expires_at = ?, claim_token = ?,
                     claim_execution_id = ?, claim_scheduled_for = ?,
                     attempt_count = COALESCE(attempt_count, 0) + 1,
                     idempotency_key = COALESCE(idempotency_key, ?)
                 WHERE id = ? AND agent_id = ? AND enabled = 1
+                  AND agent_id IN ({authorization_scope})
                   AND next_run_at = ?
                   AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
                 """,
                 (
                     self._owner_id, lease_expires, token, execution_id, scheduled_for,
-                    base_idempotency, task.id, task.agent_id, scheduled_for, now_iso,
+                    base_idempotency, task.id, task.agent_id,
+                    *self._authorized_agent_ids, scheduled_for, now_iso,
                 ),
             )
             if not self._updated(updated):
@@ -438,6 +487,13 @@ class SchedulerRunner:
         return f"{base}:{digest}"
 
     async def _execute_claim(self, task: ScheduledTask) -> None:
+        if task.agent_id not in self._authorized_agent_ids:
+            logger.warning(
+                "Refusing to execute scheduler claim %s for unauthorized agent %s",
+                task.claim_execution_id,
+                task.agent_id,
+            )
+            return
         assert task.claim_execution_id and task.claim_token and task.next_run_at
         execution = SchedulerExecution(
             id=task.claim_execution_id,
@@ -496,6 +552,17 @@ class SchedulerRunner:
                 await renewal
             except asyncio.CancelledError:
                 pass
+            except Exception:
+                # Lease renewal is advisory once dispatch has returned: the
+                # completion CAS remains the authority for this occurrence.
+                # Harvest this task's exception so it cannot skip finalization
+                # or surface later as an unobserved task failure.
+                logger.exception(
+                    "Scheduler lease renewal failed for task %s execution %s; "
+                    "attempting completion CAS",
+                    task.id,
+                    execution.id,
+                )
         await self._finalize(
             task, execution, status=status, result_text=result_text,
             duration_ms=int((time.monotonic() - started) * 1000),
@@ -523,6 +590,8 @@ class SchedulerRunner:
         return await self._executor(execution.task_name, execution.args)  # type: ignore[misc]
 
     async def _renew_lease(self, task: ScheduledTask) -> None:
+        if task.agent_id not in self._authorized_agent_ids:
+            return
         interval = max(1.0, self._lease_seconds / 3)
         while True:
             await asyncio.sleep(interval)
@@ -533,7 +602,14 @@ class SchedulerRunner:
                 WHERE id = ? AND agent_id = ? AND enabled = 1
                   AND lease_owner = ? AND claim_token = ? AND claim_execution_id = ?
                 """,
-                (expires, task.id, task.agent_id, self._owner_id, task.claim_token, task.claim_execution_id),
+                (
+                    expires,
+                    task.id,
+                    task.agent_id,
+                    self._owner_id,
+                    task.claim_token,
+                    task.claim_execution_id,
+                ),
             )
             if not self._updated(updated):
                 logger.warning("Lost scheduler lease for task %s execution %s", task.id, task.claim_execution_id)
@@ -570,6 +646,13 @@ class SchedulerRunner:
         ran: bool,
         pause_schedule: bool = False,
     ) -> None:
+        if task.agent_id not in self._authorized_agent_ids:
+            logger.warning(
+                "Refusing to finalize scheduler execution %s for unauthorized agent %s",
+                execution.id,
+                task.agent_id,
+            )
+            return
         now = datetime.now(timezone.utc)
         now_iso = now.isoformat()
         terminal = task.schedule_kind == SCHEDULE_ONE_SHOT or pause_schedule
@@ -638,6 +721,8 @@ class SchedulerRunner:
         )
 
     async def _mark_cancelled_if_no_longer_runnable(self, execution: SchedulerExecution) -> None:
+        if execution.agent_id not in self._authorized_agent_ids:
+            return
         row = await self._db.fetchone(
             "SELECT enabled FROM scheduled_tasks WHERE id = ? AND agent_id = ?",
             (execution.schedule_id, execution.agent_id),

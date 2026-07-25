@@ -503,6 +503,68 @@ async def test_lifespan_reaps_phoenix_after_agent_manager_cancellation(
 
 
 @pytest.mark.asyncio
+async def test_host_scheduler_startup_failure_rolls_back_loaded_agents(
+    monkeypatch, tmp_path,
+) -> None:
+    """A failed hosted scheduler cannot orphan already-loaded agents."""
+    from kestrel_sovereign import host_features as hf
+    from kestrel_sovereign.a2a import did_registry
+    from kestrel_sovereign.multi_agent import agent_manager, config as ma_config
+
+    config_path = tmp_path / "multi_agent.toml"
+    config_path.write_text("[host]\nport = 8888\n")
+    fake_config = SimpleNamespace(
+        host=SimpleNamespace(bind="127.0.0.1", port=8888), agents={}
+    )
+    loaded_agent = SimpleNamespace(shutdown=AsyncMock())
+
+    class _Manager:
+        init_failures = []
+
+        def __init__(self) -> None:
+            self._agents = {"already-loaded": loaded_agent}
+            self.shutdown_calls = 0
+
+        async def load_from_config(self, config) -> int:
+            assert config is fake_config
+            return 1
+
+        def list_agents(self):
+            return dict(self._agents)
+
+        async def shutdown_all(self) -> None:
+            self.shutdown_calls += 1
+            await loaded_agent.shutdown()
+            self._agents.clear()
+
+    manager = _Manager()
+    monkeypatch.setenv("KESTREL_MULTI_AGENT", "1")
+    monkeypatch.setenv("KESTREL_PHOENIX_ENABLED", "0")
+    monkeypatch.setattr(server, "resolve_multi_agent_path", lambda _env: config_path)
+    monkeypatch.setattr(ma_config.MultiAgentConfig, "load", lambda *_a, **_k: fake_config)
+    monkeypatch.setattr(agent_manager, "AgentManager", lambda **_k: manager)
+    monkeypatch.setattr(did_registry, "install_a2a_did_resolver", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        server, "_start_host_scheduler", AsyncMock(side_effect=RuntimeError("scheduler boot failed"))
+    )
+    monkeypatch.setattr(server, "_mount_feature_ui_assets", lambda _app: None)
+    monkeypatch.setattr(server, "_mount_feature_routers", lambda _app: None)
+    monkeypatch.setattr(server, "setup_tracing", lambda _app: None)
+    monkeypatch.setattr(hf, "instantiate_host_features", lambda **_k: [])
+
+    app = FastAPI()
+    async with server._lifespan_startup(app):
+        pass
+
+    assert manager.shutdown_calls == 1
+    loaded_agent.shutdown.assert_awaited_once()
+    assert manager.list_agents() == {}
+    assert app.state.agent_manager is None
+    assert app.state.agent is None
+    assert "scheduler boot failed" in app.state.startup_error
+
+
+@pytest.mark.asyncio
 async def test_server_timeout_keeps_lifecycle_owner_until_completion(monkeypatch) -> None:
     agent = _DeferredShutdownAgent()
     monkeypatch.setattr(server, "SHUTDOWN_TIMEOUT", 0.01)

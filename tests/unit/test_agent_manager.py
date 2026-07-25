@@ -8,9 +8,10 @@ from pathlib import Path
 from kestrel_sovereign.features import MandatoryFeatureReadinessError
 from kestrel_sovereign.identity.runtime_identity import IdentityReadinessError
 from kestrel_sovereign.kestrel_agent import KestrelAgent
-from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+from kestrel_sovereign.multi_agent.agent_manager import AgentManager, _get_agent_did
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
 from kestrel_sovereign.spawn.mandate import SpawnMandate
+from kestrel_sovereign.storage import AsyncStorage, GraphNode
 from tests.utils.aiosqlite_workers import aiosqlite_worker
 
 
@@ -89,6 +90,30 @@ class TestAgentManagerBasics:
         assert mapping["did:pkh:warm"][0] == "Warm"
         assert mapping["did:pkh:cold"][0] == "Cold"
         did_lookup.assert_awaited_once_with(str(cold_dir))
+
+    @pytest.mark.asyncio
+    async def test_cold_did_lookup_stays_local_sqlite_with_postgres_environment(
+        self, monkeypatch, tmp_path,
+    ):
+        """A host DB default must not select a foreign shared identity."""
+        local_dir = tmp_path / "cold-agent"
+        local_dir.mkdir()
+        local_db = local_dir / "kestrel_prime.db"
+        local_did = "did:test:local-cold-agent"
+
+        storage = AsyncStorage(str(local_db), backend="sqlite")
+        await storage.initialize()
+        try:
+            await storage.graph.add_node(
+                GraphNode(local_did, "agent", "Local cold agent", {})
+            )
+        finally:
+            await storage.close()
+
+        monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+        monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://foreign-host/fleet")
+
+        assert await _get_agent_did(str(local_dir)) == local_did
 
     @pytest.mark.asyncio
     async def test_remove_agent(self):

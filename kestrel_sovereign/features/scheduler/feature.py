@@ -1812,15 +1812,17 @@ class SchedulerFeature(Feature):
                 )
 
             # Keep invalidating the claim and terminalizing its log in one
-            # transaction. A crash between those writes must not strand an
-            # impossible-to-recover ``claimed`` record.
+            # transaction. Mutate the schedule row first, matching runner
+            # finalization and the pause/update paths, before acquiring the
+            # execution-log row. A crash between those writes must not strand
+            # an impossible-to-recover ``claimed`` record.
             async with self._schedule_transaction():
-                await self._cancel_claimed_executions(
-                    task_id, "schedule removed before outcome commit"
-                )
                 await self._db.execute(
                     "DELETE FROM scheduled_tasks WHERE id = ? AND agent_id = ?",
                     (task_id, self._agent_id),
+                )
+                await self._cancel_claimed_executions(
+                    task_id, "schedule removed before outcome commit"
                 )
         except Exception as e:
             logger.error("Failed to remove task %s: %s", task_id, e)

@@ -1036,6 +1036,7 @@ async def _start_host_scheduler(app: FastAPI, manager, config) -> None:
             db=storage.db,
             agent_id=None,
             executor=AgentManagerHostedSchedulerExecutor(manager, agent_configs),
+            authorized_agent_ids=agent_configs.keys(),
             misfire_grace_seconds=SchedulerFeature._load_misfire_grace_seconds(),
             max_concurrent_tasks=SchedulerFeature._load_max_concurrent_tasks(),
             lease_seconds=SchedulerFeature._load_lease_seconds(),
@@ -1083,6 +1084,32 @@ async def _shutdown_server_agents(app: FastAPI) -> None:
     agent = getattr(app.state, "agent", None)
     if agent is not None:
         await _shutdown_single_agent(agent)
+
+
+async def _rollback_startup_agent_manager(manager) -> bool:
+    """Drain a partially-started multi-agent manager before dropping it.
+
+    Host scheduler startup happens after agents have been loaded.  Its failure
+    must therefore not make the manager unreachable while those agents still
+    own dispatchers or storage.  Keep the cleanup task alive through repeated
+    cancellation and return whether the startup caller was cancelled.
+    """
+    rollback = asyncio.create_task(
+        manager.shutdown_all(), name="server_startup:rollback_agents"
+    )
+    cancelled, failure = await await_lifecycle_task_completion(rollback)
+    if failure is not None and not isinstance(failure, asyncio.CancelledError):
+        logger.warning(
+            "Multi-agent startup rollback did not fully shut down loaded agents: %s",
+            failure,
+            exc_info=(type(failure), failure, failure.__traceback__),
+        )
+    elif isinstance(failure, asyncio.CancelledError):
+        logger.warning(
+            "Multi-agent startup rollback was cancelled after its cleanup task "
+            "reached a cancelled terminal state"
+        )
+    return cancelled
 
 
 async def _run_lifespan_shutdown_phase(
@@ -1287,6 +1314,7 @@ async def _lifespan_startup(app: FastAPI):
 
     if multi_agent_env or multi_agent_path.exists():
         # --- Multi-agent mode ---
+        manager = None
         try:
             from kestrel_sovereign.multi_agent.agent_manager import AgentManager
             from kestrel_sovereign.multi_agent.config import MultiAgentConfig
@@ -1379,6 +1407,15 @@ async def _lifespan_startup(app: FastAPI):
             # longstanding agent-scoped runner and never share schedule rows.
             await _start_host_scheduler(app, manager, config)
         except Exception as e:
+            rollback_cancelled = False
+            rollback_complete = manager is None
+            if manager is not None:
+                rollback_cancelled = await _rollback_startup_agent_manager(manager)
+                rollback_complete = not manager.list_agents()
+                if not rollback_complete:
+                    # Preserve the manager for the outer lifespan teardown to
+                    # retry; clearing it here would orphan still-loaded agents.
+                    app.state.agent_manager = manager
             identity_record = _identity_readiness_failure_record("default", e)
             if identity_record is not None:
                 logger.error(
@@ -1394,9 +1431,12 @@ async def _lifespan_startup(app: FastAPI):
                     f"Error during multi-agent startup: {e}",
                     exc_info=True,
                 )
-            app.state.agent_manager = None
+            if rollback_complete:
+                app.state.agent_manager = None
             app.state.agent = None
             _set_startup_error(app, e)
+            if rollback_cancelled:
+                raise asyncio.CancelledError()
     else:
         # --- Single-agent mode (original behavior) ---
         app.state.agent_manager = None

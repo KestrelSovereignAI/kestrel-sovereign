@@ -734,6 +734,27 @@ class TestScheduleRemove:
         assert result.data["status"] == "removed"
 
     @pytest.mark.asyncio
+    async def test_remove_locks_schedule_before_execution_log(self, feature):
+        """Match runner finalization's schedule-row-then-log lock order."""
+        feature._db.fetchone = AsyncMock(return_value=("task-id",))
+
+        result = await feature.schedule_remove(task_id="task-id")
+
+        assert result.status is ToolResultStatus.OK
+        statements = [call.args[0] for call in feature._db.execute.await_args_list]
+        schedule_mutation = next(
+            index
+            for index, statement in enumerate(statements)
+            if "DELETE FROM scheduled_tasks" in statement
+        )
+        log_terminalization = next(
+            index
+            for index, statement in enumerate(statements)
+            if "UPDATE task_execution_log" in statement
+        )
+        assert schedule_mutation < log_terminalization
+
+    @pytest.mark.asyncio
     async def test_remove_not_found(self, feature):
         feature._db.fetchone = AsyncMock(return_value=None)
         result = await feature.schedule_remove(task_id="nonexistent")

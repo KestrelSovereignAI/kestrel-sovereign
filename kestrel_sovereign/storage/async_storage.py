@@ -141,7 +141,10 @@ class AsyncStorage:
             # Use config dict
             self._backend = create_backend(config)
             self.db_path = config.get('db_path')
-        elif backend == "postgres" or os.getenv("KESTREL_DB_BACKEND", "").lower() == "postgres":
+        elif backend == "postgres" or (
+            backend is None
+            and os.getenv("KESTREL_DB_BACKEND", "").lower() == "postgres"
+        ):
             # PostgreSQL mode
             pg_dsn = dsn or os.getenv("KESTREL_DATABASE_URL")
             if pg_dsn:
@@ -150,7 +153,10 @@ class AsyncStorage:
                 # Fall back to individual env vars
                 self._backend = create_backend({"backend": "postgres"})
         else:
-            # Default: SQLite mode
+            # Default or explicit SQLite mode.  An explicit backend is an
+            # ownership boundary: multi-agent hosts use local SQLite identity
+            # stores while their runtime data lives in PostgreSQL, so the
+            # environment default must not redirect those reads.
             if db_path is None:
                 agent_data_dir = get_default_agent_data_dir()
                 db_path = os.path.join(agent_data_dir, "kestrel_prime.db")

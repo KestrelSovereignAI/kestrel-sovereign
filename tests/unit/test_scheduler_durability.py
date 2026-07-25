@@ -308,7 +308,9 @@ async def test_structural_host_executor_needs_no_private_marker(tmp_path):
             executions.append(execution)
             return "dispatched"
 
-    runner = SchedulerRunner(db, None, MinimalHostedExecutor())
+    runner = SchedulerRunner(
+        db, None, MinimalHostedExecutor(), authorized_agent_ids={"agent-1"}
+    )
     try:
         await runner._ensure_tables()
         await _seed_due(db)
@@ -317,6 +319,91 @@ async def test_structural_host_executor_needs_no_private_marker(tmp_path):
         assert len(executions) == 1
         assert executions[0].agent_id == "agent-1"
         assert executions[0].task_name == "test_task"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_host_runner_cannot_claim_or_advance_foreign_fleet_rows(tmp_path):
+    """Host authority scopes due selection and claim before a lease exists."""
+    db = await _database(tmp_path / "scheduler.db")
+    executor = AsyncMock(return_value="local delivery")
+    runner = SchedulerRunner(
+        db, None, executor, authorized_agent_ids={"agent-1"}, owner_id="host-a"
+    )
+    try:
+        await runner._ensure_tables()
+        local_due = await _seed_due(db, task_id="local-task", agent_id="agent-1")
+        foreign_due = await _seed_due(
+            db, task_id="foreign-task", agent_id="did:foreign:fleet"
+        )
+
+        await runner._tick()
+
+        executor.assert_awaited_once_with("test_task", {})
+        foreign = await db.fetchone(
+            """
+            SELECT enabled, last_run_at, next_run_at, lease_owner,
+                   lease_expires_at, claim_token, claim_execution_id,
+                   attempt_count, terminal_status, terminal_at
+            FROM scheduled_tasks WHERE id = ?
+            """,
+            ("foreign-task",),
+        )
+        assert foreign == (1, None, foreign_due, None, None, None, None, 0, None, None)
+        assert await db.fetchall(
+            "SELECT status FROM task_execution_log WHERE task_id = ?",
+            ("foreign-task",),
+        ) == []
+
+        # The next local occurrence is in the future, and the foreign row is
+        # still due. A second host tick must neither redeliver local work nor
+        # terminalize the row belonging to another fleet.
+        await runner._tick()
+        executor.assert_awaited_once()
+        assert await db.fetchone(
+            "SELECT next_run_at FROM scheduled_tasks WHERE id = ?",
+            ("foreign-task",),
+        ) == (foreign_due,)
+        assert local_due < datetime.now(timezone.utc).isoformat()
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_renewal_exception_after_dispatch_still_finalizes_once(tmp_path, caplog):
+    """A failed renewal is observed without losing the completion CAS."""
+    db = await _database(tmp_path / "scheduler.db")
+    renewal_started = asyncio.Event()
+    executor = AsyncMock()
+
+    async def fail_renewal(_task):
+        renewal_started.set()
+        raise RuntimeError("renewal backend unavailable")
+
+    async def successful_dispatch(_task_name, _args):
+        await renewal_started.wait()
+        return "delivered"
+
+    executor.side_effect = successful_dispatch
+    runner = SchedulerRunner(db, "agent-1", executor, owner_id="host-a")
+    runner._renew_lease = fail_renewal
+    try:
+        await runner._ensure_tables()
+        await _seed_due(db)
+
+        with caplog.at_level("ERROR", logger="kestrel_sovereign.features.scheduler.runner"):
+            await runner._tick()
+
+        executor.assert_awaited_once_with("test_task", {})
+        assert await db.fetchall(
+            "SELECT status, attempt_count FROM task_execution_log WHERE task_id = ?",
+            ("task-1",),
+        ) == [("success", 1)]
+        assert any("lease renewal failed" in record.getMessage() for record in caplog.records)
+
+        await runner._tick()
+        executor.assert_awaited_once()
     finally:
         await db.close()
 
@@ -364,6 +451,7 @@ async def test_host_lifecycle_runner_claims_and_wakes_a_cold_agent(monkeypatch, 
         await server._start_host_scheduler(app, manager, object())
         runner = app.state.host_scheduler_runner
         assert runner is not None
+        assert runner._authorized_agent_ids == ("agent-1",)
         # Stop the background loop so this test alone drives the due occurrence.
         await runner.stop()
         await _seed_due(db)
