@@ -17,6 +17,7 @@ uses) and assert the #2522 boot-state-machine contract end to end:
 
 import asyncio
 import contextlib
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -47,6 +48,23 @@ PHASE_NAMES = [
 ]
 
 
+def _durable_backend_double() -> MagicMock:
+    """Provide the transactional backend contract used during signal boot."""
+    backend = MagicMock()
+    backend.backend_type = "sqlite"
+    backend.execute_script = AsyncMock()
+    backend.execute = AsyncMock(return_value=1)
+    backend.fetch_one = AsyncMock(return_value=None)
+    backend.fetch_all = AsyncMock(return_value=[])
+
+    @contextlib.asynccontextmanager
+    async def transaction():
+        yield
+
+    backend.transaction = transaction
+    return backend
+
+
 @contextlib.contextmanager
 def _boot_mocks():
     """Patch the heavy boot collaborators; yield handles for leak assertions.
@@ -70,6 +88,7 @@ def _boot_mocks():
         storage.add_node = AsyncMock()
         storage.db = MagicMock()
         storage.close = AsyncMock()
+        storage._backend = _durable_backend_double()
         MockStorage.return_value = storage
 
         memory = AsyncMock()
@@ -160,6 +179,54 @@ async def test_second_initialize_when_ready_is_a_noop(tmp_path):
         await _cleanup(agent)
 
 
+@pytest.mark.asyncio
+async def test_resume_callback_reconciles_sidecars_when_audit_persistence_fails(tmp_path):
+    """Volatile handoff expiry cannot depend on `system.resumed` persistence."""
+    from kestrel_sdk.signals import Status
+    from kestrel_sovereign.signals.dispatcher import _TransientDurableHandoff
+
+    agent = _make_agent(tmp_path)
+    try:
+        with _boot_mocks():
+            await agent.initialize()
+
+        dispatcher = agent.dispatcher
+        now = datetime.now(timezone.utc)
+        dispatcher._transient_durable_handoffs["expired-resume-handoff"] = (
+            _TransientDurableHandoff(
+                payload={"raw": "must-not-survive-resume"},
+                consumer_id="workflow-wait",
+                created_at=now - timedelta(minutes=2),
+                retention_until=now + timedelta(days=1),
+                expires_at=now - timedelta(seconds=1),
+                initial_lease_token="live-only-capability",
+            )
+        )
+        dispatcher._durable_store.persist_signal = AsyncMock(
+            side_effect=RuntimeError("forced resumed-signal persistence failure")
+        )
+        original_dispatch_signal = dispatcher.dispatch_signal
+        results = []
+
+        async def capture_failed_dispatch(*args, **kwargs):
+            result = await original_dispatch_signal(*args, **kwargs)
+            results.append(result)
+            return result
+
+        dispatcher.dispatch_signal = capture_failed_dispatch
+
+        # `dispatch_signal` encodes this persistence error as Status.FAILED;
+        # it does not raise to the resume callback. The sidecar must already
+        # be reconciled by the direct callback path.
+        await agent.resume_monitor._on_resume(3600.0)
+
+        assert "expired-resume-handoff" not in dispatcher._transient_durable_handoffs
+        dispatcher._durable_store.persist_signal.assert_awaited_once()
+        assert [result.status for result in results] == [Status.FAILED]
+    finally:
+        await _cleanup(agent)
+
+
 # ---------------------------------------------------------------------------
 # Injected failure at each phase boundary — rollback + terminal FAILED
 # ---------------------------------------------------------------------------
@@ -230,6 +297,130 @@ async def test_failed_boot_never_started_periodic_services(tmp_path):
         assert getattr(agent, "resume_monitor", None) is None
     finally:
         await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+async def test_later_boot_failure_tears_down_durable_dispatcher_before_storage(tmp_path):
+    """Phase-2 owner liveness cannot outlive a phase-3 boot failure."""
+    agent = _make_agent(tmp_path)
+    captured = {}
+
+    async def fail_after_dispatcher(_ctx: BootContext) -> None:
+        captured["dispatcher"] = agent.dispatcher
+        raise RuntimeError("injected after dispatcher initialization")
+
+    try:
+        with _boot_mocks() as mocks:
+            with patch.object(
+                agent, "_boot_phase_providers_payer_sync", fail_after_dispatcher
+            ):
+                with pytest.raises(RuntimeError, match="after dispatcher"):
+                    await agent.initialize()
+
+            dispatcher = captured["dispatcher"]
+            assert agent._boot_state is BootPhaseState.FAILED
+            assert agent.dispatcher is None
+            assert dispatcher._runtime_owner_heartbeat_timer is None
+            assert dispatcher._durable_runtime_owner_registered is False
+            # The owner release happens before the phase-1 storage close in
+            # LIFO rollback order, rather than leaving timer work on a closed
+            # database backend.
+            release_calls = [
+                call
+                for call in mocks.storage._backend.execute.await_args_list
+                if "stopped_at" in str(call)
+            ]
+            assert release_calls
+            mocks.storage.close.assert_awaited()
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+async def test_boot_rollback_stops_owner_registered_at_sqlite_commit_cancellation(
+    tmp_path,
+):
+    """Boot teardown releases an owner whose registration await never returned.
+
+    ``aiosqlite`` can complete ``commit`` on its worker before cancellation is
+    raised back into the caller.  Exercise that concrete boundary, then drive
+    the real boot rollback seam (rather than only dispatcher shutdown) to
+    prove an ambiguous registration cannot leave a live runtime owner behind.
+    """
+    from kestrel_sovereign.signals import (
+        OrderedLockManager,
+        SignalDispatcher,
+        SignalLogStore,
+        SourceRegistry,
+    )
+    from kestrel_sovereign.storage.db import SQLiteBackend
+
+    agent = _make_agent(tmp_path)
+    backend = SQLiteBackend(str(tmp_path / "boot-owner-commit-boundary.db"))
+    await backend.connect()
+    log_store = SignalLogStore(backend)
+    await log_store.initialize()
+    dispatcher = SignalDispatcher(
+        agent=agent,
+        registry=SourceRegistry(),
+        lock_manager=OrderedLockManager(),
+        store=log_store,
+    )
+    # Keep schema setup outside the armed registration transaction.
+    await dispatcher._durable_store.initialize()
+    connection = backend._connection
+    assert connection is not None
+    original_commit = connection.commit
+    original_register = dispatcher._durable_store.register_runtime_owner
+    registration_in_flight = False
+
+    async def cancel_after_committed_owner_registration():
+        await original_commit()
+        if registration_in_flight:
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+            await asyncio.sleep(0)
+
+    async def register_with_armed_commit(*args, **kwargs):
+        nonlocal registration_in_flight
+        registration_in_flight = True
+        try:
+            return await original_register(*args, **kwargs)
+        finally:
+            registration_in_flight = False
+
+    try:
+        connection.commit = cancel_after_committed_owner_registration
+        dispatcher._durable_store.register_runtime_owner = register_with_armed_commit
+        with pytest.raises(asyncio.CancelledError):
+            await dispatcher.initialize_durable_delivery()
+
+        assert dispatcher._durable_initialized is False
+        assert dispatcher._durable_runtime_owner_registered is False
+        assert dispatcher._durable_runtime_owner_registration_started is True
+
+        # This is the callback registered before durable initialization's first
+        # await. It must release the ambiguous owner before boot storage closes.
+        connection.commit = original_commit
+        dispatcher._durable_store.register_runtime_owner = original_register
+        agent.dispatcher = dispatcher
+        await agent._boot_teardown_dispatcher()
+
+        assert agent.dispatcher is None
+        owner = await backend.fetch_one(
+            "SELECT stopped_at FROM durable_signal_runtime_owners "
+            "WHERE agent_id = ? AND owner_id = ?",
+            (agent.did, dispatcher._durable_delivery_owner),
+        )
+        assert owner is not None and owner[0] is not None
+        assert dispatcher._durable_runtime_owner_registration_started is False
+    finally:
+        connection.commit = original_commit
+        dispatcher._durable_store.register_runtime_owner = original_register
+        if not dispatcher._durable_shutdown:
+            await dispatcher.shutdown_durable_delivery()
+        await backend.close()
 
 
 # ---------------------------------------------------------------------------

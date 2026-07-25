@@ -18,13 +18,12 @@ So a large positive divergence is exactly the suspend duration — detected
 without any OS-specific power API, identically on macOS/Linux/Windows.
 
 When the gap exceeds a threshold the monitor fires a single ``on_resume``
-callback carrying the measured gap. The wiring in ``KestrelAgent`` turns
-that into one audited ``system.resumed`` signal through the existing
-SignalDispatcher (see ``signals/sources/system_resumed.py``), whose ACTION
-handler re-anchors the dispatcher's throttling windows. The scheduler and
-heartbeat detect staleness locally on their own ticks (so they self-heal
-even if the signal is never delivered); this monitor is the observable
-spine and the dispatcher's re-anchor trigger.
+callback carrying the measured gap. The wiring in ``KestrelAgent`` re-anchors
+the dispatcher directly, then emits one audited ``system.resumed`` signal
+(see ``signals/sources/system_resumed.py``). The scheduler and heartbeat
+detect staleness locally on their own ticks (so they self-heal even if the
+audit signal is never delivered); this monitor is the observable spine and
+the dispatcher's re-anchor trigger.
 """
 
 from __future__ import annotations

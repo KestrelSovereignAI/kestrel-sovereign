@@ -533,7 +533,10 @@ async def _run_shell(agent_dir: Path, args) -> int:
     """Run the interactive chat shell for an agent."""
     from kestrel_sovereign.storage import AsyncStorage
     from kestrel_sovereign.security.encryption import DecryptionError
-    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.kestrel_agent import (
+        KestrelAgent,
+        await_agent_shutdown_completion,
+    )
     from kestrel_sovereign.llm.service import LLMService
     from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
     import logging
@@ -606,15 +609,23 @@ async def _run_shell(agent_dir: Path, args) -> int:
     except KeyboardInterrupt:
         print("\nDeactivating agent...")
     finally:
+        cancelled = False
         try:
             await asyncio.wait_for(agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
             print("Agent deactivated.")
         except asyncio.TimeoutError:
-            print(f"Agent shutdown timed out ({SHUTDOWN_TIMEOUT}s), forcing exit.")
+            print(
+                f"Agent shutdown timed out ({SHUTDOWN_TIMEOUT}s); "
+                "waiting for durable cleanup."
+            )
         except asyncio.CancelledError:
+            cancelled = True
             print("Agent shutdown cancelled.")
         except Exception:
             print("Agent deactivated (with errors).")
+        cancelled = await await_agent_shutdown_completion(agent) or cancelled
+        if cancelled:
+            raise asyncio.CancelledError()
 
     return 0
 

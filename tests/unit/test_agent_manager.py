@@ -7,9 +7,11 @@ from pathlib import Path
 
 from kestrel_sovereign.features import MandatoryFeatureReadinessError
 from kestrel_sovereign.identity.runtime_identity import IdentityReadinessError
+from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
 from kestrel_sovereign.spawn.mandate import SpawnMandate
+from tests.utils.aiosqlite_workers import aiosqlite_worker
 
 
 def _make_mock_agent(agent_id: str = "did:pkh:eip155:1:0xABC"):
@@ -97,6 +99,96 @@ class TestAgentManagerBasics:
         agent2.shutdown.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_remove_agent_joins_deferred_durable_close_before_unpublishing(
+        self, tmp_path
+    ):
+        """One production removal call drains the real SQLite worker (#2713)."""
+        from kestrel_sovereign.signals import (
+            OrderedLockManager,
+            SignalDispatcher,
+            SignalLogStore,
+            SourceRegistry,
+        )
+        from kestrel_sovereign.storage.db import SQLiteBackend
+
+        manager = AgentManager()
+        agent = KestrelAgent(
+            did="did:test:manager-durable-shutdown",
+            storage_path=str(tmp_path / "agent.db"),
+        )
+        backend = SQLiteBackend(str(tmp_path / "ledger.db"))
+        await backend.connect()
+        worker = aiosqlite_worker(backend._connection)
+        log_store = SignalLogStore(backend)
+        await log_store.initialize()
+        dispatcher = SignalDispatcher(
+            agent=agent,
+            registry=SourceRegistry(),
+            lock_manager=OrderedLockManager(),
+            store=log_store,
+        )
+        await dispatcher.initialize_durable_delivery()
+        agent.dispatcher = dispatcher
+
+        original_release = dispatcher._durable_store.release_initial_reservations
+        release_entered = asyncio.Event()
+        allow_release = asyncio.Event()
+        storage_closed: list[bool] = []
+
+        async def block_release(*args, **kwargs):
+            release_entered.set()
+            await allow_release.wait()
+            return await original_release(*args, **kwargs)
+
+        class _Storage:
+            async def close(self):
+                storage_closed.append(True)
+                await backend.close()
+
+        dispatcher._durable_store.release_initial_reservations = block_release
+        agent.features = {}
+        agent.llm_service = None
+        agent.task_manager = None
+        agent.memory_system = None
+        agent._sync_service = None
+        agent.storage = _Storage()
+        manager._agents["Managed"] = agent
+        manager._agent_names[agent.agent_id] = "Managed"
+
+        try:
+            # The manager's normal outer timeout cancels the bounded agent
+            # shutdown. It must then join the agent-owned continuation rather
+            # than removing this routing entry or releasing its resources.
+            with patch(
+                "kestrel_sovereign.multi_agent.agent_manager.SHUTDOWN_TIMEOUT",
+                0.05,
+            ):
+                remove_task = asyncio.create_task(manager.remove_agent("Managed"))
+                await asyncio.wait_for(release_entered.wait(), timeout=1.0)
+                await asyncio.sleep(0.1)
+
+                assert manager.get_agent("Managed") is agent
+                assert not remove_task.done()
+                assert storage_closed == []
+
+                allow_release.set()
+                assert await asyncio.wait_for(remove_task, timeout=1.0) is True
+
+            assert manager.get_agent("Managed") is None
+            assert storage_closed == [True]
+            assert backend._connection is None
+            for _ in range(100):
+                if not worker.is_alive():
+                    break
+                await asyncio.sleep(0)
+            assert not worker.is_alive()
+        finally:
+            allow_release.set()
+            dispatcher._durable_store.release_initial_reservations = original_release
+            if backend._connection is not None:
+                await backend.close()
+
+    @pytest.mark.asyncio
     async def test_shutdown_handles_errors(self):
         """Shutdown should continue even if one agent errors."""
         manager = AgentManager()
@@ -108,9 +200,16 @@ class TestAgentManagerBasics:
         manager._agent_names["did:1"] = "A"
         manager._agent_names["did:2"] = "B"
 
-        await manager.shutdown_all()
-        # Both should have been attempted
-        assert len(manager._agents) == 0
+        with pytest.raises(ExceptionGroup, match="fleet agents failed"):
+            await manager.shutdown_all()
+        # Both are attempted, but a failed shutdown stays published. Removing
+        # it would discard the lifecycle owner before durable cleanup can be
+        # confirmed on a later retry. The aggregate is raised only after B has
+        # received its own cleanup attempt.
+        assert set(manager._agents) == {"A"}
+        assert manager.get_agent("B") is None
+        agent1.shutdown.assert_awaited_once()
+        agent2.shutdown.assert_awaited_once()
 
 
 class TestLoadFromConfig:

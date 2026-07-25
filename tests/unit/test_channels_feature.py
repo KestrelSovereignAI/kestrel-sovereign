@@ -635,6 +635,7 @@ class TestChannelFeature:
         signal = agent.dispatcher.enqueue_signal.await_args.args[0]
         assert signal.source == "channel.message"
         assert signal.payload["content"] == "hi there"
+        assert agent.dispatcher.enqueue_signal.await_args.kwargs["source_event_id"] == msg.id
         router.assert_not_awaited()
 
     @pytest.mark.asyncio

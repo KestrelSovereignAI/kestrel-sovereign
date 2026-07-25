@@ -3,6 +3,7 @@
 A FastAPI server to expose Kestrel agent functionality as a service.
 """
 import argparse
+import asyncio
 import logging
 import os
 import re
@@ -20,7 +21,11 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.routing import Match
 from kestrel_sovereign.main import get_agent_did_async
-from kestrel_sovereign.kestrel_agent import KestrelAgent
+from kestrel_sovereign.kestrel_agent import (
+    KestrelAgent,
+    await_agent_shutdown_completion,
+    await_lifecycle_task_completion,
+)
 from kestrel_sovereign.lifecycle_checks import verify_identity_isolation
 from kestrel_sovereign.llm.service import LLMService
 from dotenv import load_dotenv
@@ -717,6 +722,32 @@ def _apply_platform_host_port(config, env) -> None:
 _PHOENIX_STARTUP_BUDGET_SECONDS = 180.0
 
 
+async def _start_phoenix_in_executor(app, supervisor) -> bool:
+    """Run one Phoenix ``start`` call without losing its worker on cancellation.
+
+    Cancelling ``asyncio.to_thread`` only cancels its awaiting coroutine; the
+    executor worker can still launch the subprocess afterwards.  Keep the task
+    on the app until it is terminal so shutdown can join the actual work before
+    it calls ``supervisor.stop``.
+    """
+    start_task = asyncio.create_task(
+        asyncio.to_thread(supervisor.start, wait_for_health=False),
+        name="phoenix_supervisor_start",
+    )
+    app.state.phoenix_start_task = start_task
+    try:
+        return await asyncio.shield(start_task)
+    finally:
+        # On cancellation, the shield leaves the executor task running.  It is
+        # then owned by ``_shutdown_phoenix``.  Only clear a terminal task; a
+        # later restart never overwrites a still-running start operation.
+        if (
+            start_task.done()
+            and getattr(app.state, "phoenix_start_task", None) is start_task
+        ):
+            app.state.phoenix_start_task = None
+
+
 async def _supervise_phoenix_startup(app, supervisor) -> None:
     """Bring Phoenix up in the background so host boot never blocks on it (#2589).
 
@@ -752,7 +783,7 @@ async def _supervise_phoenix_startup(app, supervisor) -> None:
     try:
         # Initial adopt-or-reap + spawn, off the event loop (subprocess launch +
         # a short reachability probe).
-        started = await asyncio.to_thread(supervisor.start, wait_for_health=False)
+        started = await _start_phoenix_in_executor(app, supervisor)
         if not started:
             _disable(
                 "supervised start failed (custody, port ownership, or spawn — "
@@ -771,9 +802,7 @@ async def _supervise_phoenix_startup(app, supervisor) -> None:
             if not supervisor.running:
                 # The child exited before binding — try a fresh (re)start.
                 logger.info("Phoenix child not running yet — restarting.")
-                restarted = await asyncio.to_thread(
-                    supervisor.start, wait_for_health=False
-                )
+                restarted = await _start_phoenix_in_executor(app, supervisor)
                 if not restarted:
                     _disable(
                         "supervised restart failed (see the ERROR logged above "
@@ -797,10 +826,258 @@ async def _supervise_phoenix_startup(app, supervisor) -> None:
         )
 
 
+async def _shutdown_single_agent(agent: KestrelAgent) -> None:
+    """Bound user-visible shutdown while retaining ownership of its tail."""
+    cancelled = False
+    try:
+        await asyncio.wait_for(agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
+        logger.info("Agent shutdown complete.")
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Agent shutdown timed out (%ss); waiting for durable cleanup",
+            SHUTDOWN_TIMEOUT,
+        )
+    except asyncio.CancelledError:
+        cancelled = True
+        logger.debug("Agent shutdown cancelled")
+    except Exception as e:
+        logger.warning(f"Error during agent shutdown: {e}")
+    cancelled = await await_agent_shutdown_completion(agent) or cancelled
+    if cancelled:
+        raise asyncio.CancelledError()
+
+
+async def _shutdown_phoenix(app: FastAPI) -> bool:
+    """Release all server-owned Phoenix work before lifespan teardown returns.
+
+    The supervisor task and its proxy client are server-owned resources.  A
+    cancelled agent shutdown must not strand either one: join the task and the
+    async close despite repeated cancellation, then always terminate the child
+    even when closing the proxy client fails.  The return value lets the caller
+    re-raise cancellation only after this teardown is complete.
+    """
+    cancelled = False
+
+    phoenix_task = getattr(app.state, "phoenix_task", None)
+    if phoenix_task is not None:
+        if not phoenix_task.done():
+            phoenix_task.cancel()
+        try:
+            join_cancelled, failure = await await_lifecycle_task_completion(
+                phoenix_task
+            )
+            cancelled = cancelled or join_cancelled
+            if failure is not None and not isinstance(
+                failure, asyncio.CancelledError
+            ):
+                logger.warning(
+                    "Phoenix supervision task failed during shutdown: %s",
+                    failure,
+                    exc_info=(type(failure), failure, failure.__traceback__),
+                )
+        finally:
+            app.state.phoenix_task = None
+
+    # ``phoenix_task`` can finish immediately when it is cancelled while its
+    # shielded executor-backed ``start`` is still running.  Never cancel this
+    # task: cancelling it would still leave the worker thread alive.  Join it
+    # first, then stop the supervisor so a late worker cannot launch Phoenix
+    # after teardown has returned.
+    phoenix_start_task = getattr(app.state, "phoenix_start_task", None)
+    if phoenix_start_task is not None:
+        try:
+            join_cancelled, failure = await await_lifecycle_task_completion(
+                phoenix_start_task
+            )
+            cancelled = cancelled or join_cancelled
+            if failure is not None and not isinstance(
+                failure, asyncio.CancelledError
+            ):
+                logger.warning(
+                    "Phoenix startup worker failed during shutdown: %s",
+                    failure,
+                    exc_info=(type(failure), failure, failure.__traceback__),
+                )
+        finally:
+            if getattr(app.state, "phoenix_start_task", None) is phoenix_start_task:
+                app.state.phoenix_start_task = None
+
+    phoenix = getattr(app.state, "phoenix", None)
+    if phoenix is None:
+        return cancelled
+
+    try:
+        close_task = asyncio.create_task(phoenix.aclose())
+        close_cancelled, close_failure = await await_lifecycle_task_completion(
+            close_task
+        )
+        cancelled = cancelled or close_cancelled
+        if close_failure is not None:
+            logger.warning(
+                "Error closing Phoenix proxy client: %s",
+                close_failure,
+                exc_info=(
+                    type(close_failure),
+                    close_failure,
+                    close_failure.__traceback__,
+                ),
+            )
+    except Exception as exc:  # noqa: BLE001 - stop still must reap the child
+        logger.warning("Error closing Phoenix proxy client: %s", exc)
+    finally:
+        try:
+            phoenix.stop()
+        except Exception as exc:  # noqa: BLE001 - complete state teardown
+            logger.warning("Error stopping Phoenix: %s", exc)
+        app.state.phoenix = None
+
+    return cancelled
+
+
+async def _shutdown_host_features(app: FastAPI) -> None:
+    """Release host-scoped resources without leaving later resources behind."""
+    from kestrel_sovereign import host_features as _hf
+
+    host_features = getattr(app.state, "host_features", []) or []
+    host_context = getattr(app.state, "host_context", None)
+    try:
+        if host_features and host_context is not None:
+            await _hf.stop_host_features(host_features, host_context)
+    except Exception as exc:  # noqa: BLE001 - preserve the existing best effort
+        logger.warning("Host feature shutdown failed: %s", exc)
+    finally:
+        # Router/UI state must not outlive a failed feature shutdown.  Each
+        # following cleanup is in a ``finally`` so one bad unmount cannot leave
+        # the host session factory or database live.
+        session_factory = (
+            getattr(host_context, "session_factory", None)
+            if host_context is not None
+            else None
+        )
+        try:
+            _hf.unmount_host_features(app)
+        finally:
+            try:
+                _unmount_feature_routers(app)
+            finally:
+                try:
+                    _unmount_feature_ui_assets(app)
+                finally:
+                    try:
+                        if session_factory is not None:
+                            await session_factory.close()
+                    except Exception as exc:  # noqa: BLE001 - close host DB too
+                        logger.warning(
+                            "Host feature session-factory shutdown failed: %s", exc
+                        )
+                    finally:
+                        host_db = (
+                            getattr(host_context, "db", None)
+                            if host_context is not None
+                            else None
+                        )
+                        if host_db is not None and hasattr(host_db, "close"):
+                            try:
+                                await host_db.close()
+                            except Exception as exc:  # noqa: BLE001 - terminal cleanup
+                                logger.warning(
+                                    "Host feature database shutdown failed: %s", exc
+                                )
+
+
+async def _shutdown_server_agents(app: FastAPI) -> None:
+    """Run the agent-owned shutdown phase for either server topology."""
+    manager = getattr(app.state, "agent_manager", None)
+    if manager is not None:
+        await manager.shutdown_all()
+        logger.info("All agents shutdown complete.")
+        return
+
+    agent = getattr(app.state, "agent", None)
+    if agent is not None:
+        await _shutdown_single_agent(agent)
+
+
+async def _run_lifespan_shutdown_phase(
+    name: str,
+    operation,
+) -> tuple[bool, BaseException | None, object | None]:
+    """Own one teardown phase through repeated cancellation.
+
+    Each phase receives a distinct task.  A cancellation of the lifespan task
+    therefore records cancellation but cannot stop the next independently
+    owned phase from releasing its resources.
+    """
+    phase_task = asyncio.create_task(operation(), name=f"server_shutdown:{name}")
+    cancelled, failure = await await_lifecycle_task_completion(phase_task)
+    if failure is not None and not isinstance(failure, asyncio.CancelledError):
+        logger.warning(
+            "Server shutdown phase %r failed: %s",
+            name,
+            failure,
+            exc_info=(type(failure), failure, failure.__traceback__),
+        )
+    if isinstance(failure, asyncio.CancelledError):
+        cancelled = True
+    result = None
+    if failure is None:
+        result = phase_task.result()
+    return cancelled, failure, result
+
+
+async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException | None]:
+    """Drain every server-owned teardown phase before reporting an outcome."""
+    logger.info("Server shutting down...")
+    cancelled = False
+    first_failure: BaseException | None = None
+
+    for name, operation in (
+        ("host-features", lambda: _shutdown_host_features(app)),
+        ("agents", lambda: _shutdown_server_agents(app)),
+        ("phoenix", lambda: _shutdown_phoenix(app)),
+    ):
+        phase_cancelled, failure, result = await _run_lifespan_shutdown_phase(
+            name, operation
+        )
+        cancelled = cancelled or phase_cancelled
+        if result is True:
+            # ``_shutdown_phoenix`` records cancellation that it observed while
+            # joining its app-owned work.
+            cancelled = True
+        if (
+            failure is not None
+            and not isinstance(failure, asyncio.CancelledError)
+            and first_failure is None
+        ):
+            first_failure = failure
+
+    return cancelled, first_failure
+
+
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Manage the application's lifespan."""
-    import asyncio
+async def _lifespan_teardown_owner(app: FastAPI):
+    """Make teardown own startup, the ``yield``, and all cancellation paths."""
+    body_failure: BaseException | None = None
+    try:
+        yield
+    except BaseException as exc:
+        body_failure = exc
+        raise
+    finally:
+        cancelled, teardown_failure = await _shutdown_server_resources(app)
+        # Preserve the original failure from startup/request lifespan body.  On
+        # a normal exit, however, cleanup must make a terminal agent failure
+        # visible only after Phoenix and every other phase have been drained.
+        if body_failure is None:
+            if cancelled:
+                raise asyncio.CancelledError()
+            if teardown_failure is not None:
+                raise teardown_failure
+
+
+@asynccontextmanager
+async def _lifespan_startup(app: FastAPI):
+    """Initialize server resources; outer lifespan ownership handles teardown."""
     logger.info("Server starting up...")
     _set_startup_error(app, None)
     app.state.mandatory_feature_failures = []
@@ -813,6 +1090,10 @@ async def lifespan(app: FastAPI):
     # installed or KESTREL_PHOENIX_ENABLED=0 — the host is unaffected.
     app.state.phoenix = None
     app.state.phoenix_task = None
+    # A Phoenix ``start`` call runs in an executor.  Its task is distinct from
+    # the supervisor coroutine because cancelling the latter cannot stop an
+    # already-running thread; shutdown joins this task before calling stop().
+    app.state.phoenix_start_task = None
     # Reason tracing is off, surfaced on the authenticated /health/detailed so a
     # silent-off boot is visible to operators (#2690). ``None`` == not disabled.
     app.state.phoenix_disabled_reason = None
@@ -1165,57 +1446,13 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown
-    logger.info("Server shutting down...")
-    # Stop host features first (mirror of startup), then agents.
-    try:
-        _host_features = getattr(app.state, "host_features", []) or []
-        _host_ctx = getattr(app.state, "host_context", None)
-        if _host_features and _host_ctx is not None:
-            await _hf.stop_host_features(_host_features, _host_ctx)
-        _hf.unmount_host_features(app)
-        # Close the host backend / session factory if opened.
-        _sf = getattr(_host_ctx, "session_factory", None) if _host_ctx is not None else None
-        if _sf is not None:
-            await _sf.close()
-        _hdb = getattr(_host_ctx, "db", None) if _host_ctx is not None else None
-        if _hdb is not None and hasattr(_hdb, "close"):
-            await _hdb.close()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Host feature shutdown failed: %s", exc)
-    _unmount_feature_routers(app)
-    _unmount_feature_ui_assets(app)
-    if getattr(app.state, 'agent_manager', None):
-        await app.state.agent_manager.shutdown_all()
-        logger.info("All agents shutdown complete.")
-    elif getattr(app.state, 'agent', None):
-        try:
-            await asyncio.wait_for(app.state.agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
-            logger.info("Agent shutdown complete.")
-        except asyncio.TimeoutError:
-            logger.warning("Agent shutdown timed out (5s)")
-        except asyncio.CancelledError:
-            logger.debug("Agent shutdown cancelled")
-        except Exception as e:
-            logger.warning(f"Error during agent shutdown: {e}")
 
-    # Stop the supervised Phoenix subprocess (mirror of startup).
-    _phoenix_task = getattr(app.state, "phoenix_task", None)
-    if _phoenix_task is not None:
-        _phoenix_task.cancel()
-        try:
-            await _phoenix_task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
-            pass
-        app.state.phoenix_task = None
-    _phoenix = getattr(app.state, "phoenix", None)
-    if _phoenix is not None:
-        try:
-            await _phoenix.aclose()
-            _phoenix.stop()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Error stopping Phoenix: %s", exc)
-        app.state.phoenix = None
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage startup and cancellation-safe teardown for the server."""
+    async with _lifespan_teardown_owner(app):
+        async with _lifespan_startup(app):
+            yield
 
 
 app = FastAPI(lifespan=lifespan)

@@ -403,8 +403,14 @@ async def test_event_manager_callback_keeps_sse_notification_when_dispatcher_pre
     assert len(agent._background_tasks) >= 1
 
     # Drain the background dispatch.
-    pending = [t for t in agent._background_tasks if not t.done()]
-    if pending:
+    # Dispatch schedules its audit write through the same tracker after the
+    # route completes. Drain until quiescent: one snapshot can otherwise miss
+    # that child task when source normalization/persistence lengthens the
+    # dispatch before `_success` schedules the signal_log write.
+    while True:
+        pending = [t for t in agent._background_tasks if not t.done()]
+        if not pending:
+            break
         await asyncio.gather(*pending, return_exceptions=True)
 
     # Confirm the signal landed in signal_log.

@@ -76,6 +76,8 @@ enforces this for the whole repo.
 from __future__ import annotations
 
 import asyncio
+import copy
+import contextvars
 import hashlib
 import inspect
 import logging
@@ -83,7 +85,8 @@ import os
 import secrets
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass, field, replace
 from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Coroutine, List, Optional, Protocol
@@ -112,8 +115,19 @@ from kestrel_sovereign.signals.constitution_metrics import (
     record_echo_missing,
     record_echo_verified,
 )
+from kestrel_sovereign.features.storage_access import resolve_agent_privacy_config
+from kestrel_sovereign.storage.privacy_wrapper import (
+    _resolve_transition_lock,
+    optional_transition_lock,
+)
 from kestrel_sovereign.signals.lock_manager import OrderedLockManager
 from kestrel_sovereign.signals.registry import RegistrationError, SourceRegistry
+from kestrel_sovereign.signals.durable import (
+    FAILED,
+    DurableConsumerRegistration,
+    DurableDelivery,
+    DurableSignalStore,
+)
 from kestrel_sovereign.signals.store import SignalLogStore
 from kestrel_sovereign.storage.db.write_audit import (
     capture_write_queries,
@@ -130,7 +144,22 @@ from kestrel_sovereign.telemetry import (
 logger = logging.getLogger(__name__)
 
 
+# Durable event payloads are intentionally distinct from the runtime signal
+# envelope.  This marker preserves an observable event/consumer handoff while
+# proving that a volatile privacy mode did not retain user-authored content.
+_DURABLE_PRIVACY_GATED_MARKER = "_privacy_gated"
+
+
 _PROMPT_TEMPLATE_HASH_ATTR = "_kestrel_prompt_template_hash"
+
+
+class _DurableDeliveryShuttingDownError(RuntimeError):
+    """Raised when a durable operation arrives after teardown begins.
+
+    This is deliberately a distinct failure from a database error.  Callers
+    can safely retry against a replacement dispatcher, while a dispatch maps
+    it to its normal ``SignalResult`` failure contract.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +193,55 @@ class _ConstitutionAudit:
     # post-dispatch with a fresh nonce would race the model against
     # a moving target.
     canary: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class _DurableSignalProjection:
+    """The durable event representation and its initial selector contract.
+
+    Payload-eliding privacy modes deliberately retain no selector-visible
+    payload in their durable event.  Existing waits still need their
+    normalized in-memory event to be materialized atomically at dispatch
+    time; later registrations and restart backfill must see only the durable
+    representation.  Anonymized payloads, conversely, are replayable and so
+    selectors must use that stored projection from the first delivery.
+    """
+
+    signal: Signal
+    payload_elided: bool = False
+
+
+@dataclass
+class _TransientDurableHandoff:
+    """Process-local payload for one initially matched volatile delivery.
+
+    Volatile privacy modes retain only a marker in ``durable_signal_events``.
+    This handoff lets a worker in the same live dispatcher receive the
+    normalized payload that selected it, while retries after a lease expiry or
+    a process restart correctly fall back to the durable marker.
+    """
+
+    payload: Any
+    consumer_id: str
+    created_at: datetime
+    retention_until: datetime
+    expires_at: datetime
+    # Kept as the historical field name for in-process test/embedding
+    # compatibility. It is a reservation capability until post-commit
+    # activation, never a pre-commit lease token.
+    initial_lease_token: Optional[str] = None
+
+
+@dataclass
+class _DurableAdmissionReservation:
+    """One synchronous claim on the dispatcher lifecycle gate.
+
+    Releasing a reservation must never await: cancellation is delivered only
+    at await boundaries, so a synchronous, idempotent release cannot strand
+    the active-admission count after an operation's ``finally`` begins.
+    """
+
+    released: bool = False
 
 
 def _agent_accepts_kwarg(callable_: Any, name: str) -> bool:
@@ -338,14 +416,103 @@ class SignalDispatcher:
         registry: SourceRegistry,
         lock_manager: OrderedLockManager,
         store: SignalLogStore,
+        durable_store: Optional[DurableSignalStore] = None,
         ttl: int = DEFAULT_TTL,
         coalescing_window_default: timedelta = DEFAULT_COALESCING_WINDOW,
+        runtime_owner_stale_after: timedelta = timedelta(minutes=2),
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         self._agent = agent
         self._registry = registry
         self._locks = lock_manager
         self._store = store
+        # Keep outcome/audit persistence and pending-delivery persistence
+        # distinct.  Existing embeddings/tests construct only SignalLogStore;
+        # deriving the durable store from its backend preserves that seam while
+        # retaining one database transaction domain for each agent.
+        self._durable_store = durable_store or DurableSignalStore(store.backend)
+        self._durable_initialized = False
+        # ``initialize_durable_delivery`` registers this owner before its
+        # startup recovery runs.  Keep that fact separate from full
+        # initialization: recovery itself can fail, and boot rollback must
+        # still mark the partly-registered owner stopped before storage closes.
+        self._durable_runtime_owner_registered = False
+        # A cancelled ``register_runtime_owner`` await is ambiguous on real
+        # async database drivers: its commit can finish on the driver worker
+        # immediately before cancellation is delivered to this task.  Record
+        # that the registration *may* have committed before awaiting it, so
+        # teardown always issues the owner-scoped release for that generation.
+        # A release against a row that never committed is an intentional
+        # no-op; leaving a committed row live is not.
+        self._durable_runtime_owner_registration_started = False
+        self._durable_init_lock = asyncio.Lock()
+        # Durable shutdown is a state transition, not a best-effort flag.
+        # Every public durable operation (and every dispatch) takes an
+        # admission before it can touch the ledger.  Shutdown closes admission
+        # under the same lock, waits for all already-admitted operations, then
+        # releases the runtime owner and permits storage to close.  A task-local
+        # depth makes the guard re-entrant: a dispatch owns one admission while
+        # its internal ``initialize_durable_delivery`` call shares it rather
+        # than deadlocking or reopening the gate after shutdown has begun.
+        self._durable_lifecycle_lock = asyncio.Lock()
+        self._durable_admissions_drained = asyncio.Event()
+        self._durable_admissions_drained.set()
+        self._durable_active_admissions = 0
+        # ContextVars are copied into child tasks.  Keep the actual outer
+        # admission owners separately so shutdown can distinguish a stale
+        # copied context from one whose parent dispatch is still live.
+        self._durable_admission_owners: set[asyncio.Task] = set()
+        self._durable_admission: contextvars.ContextVar[
+            Optional[tuple[asyncio.Task, int]]
+        ] = contextvars.ContextVar(
+            f"durable_delivery_admission:{id(self)}", default=None
+        )
+        # Outcome logging is accepted as part of the dispatch that formed the
+        # result.  These tasks deliberately do not live in the agent's general
+        # background-task set: that set is cancelled before durable teardown,
+        # while a log write sharing this backend must be drained (or its
+        # cancelled-before-start reservation reconciled) before storage closes.
+        self._outcome_log_tasks: set[asyncio.Task] = set()
+        self._outcome_log_tasks_by_signal: dict[str, set[asyncio.Task]] = {}
+        # This task owns teardown, rather than whichever public caller first
+        # requested it.  Callers await it through ``shield`` so cancellation
+        # of an agent's bounded shutdown wrapper cannot abandon a committed
+        # reservation or poison a later retry.
+        self._durable_shutdown_completion: Optional[asyncio.Task[None]] = None
+        if runtime_owner_stale_after.total_seconds() <= 0:
+            raise ValueError("runtime_owner_stale_after must be positive")
+        self._runtime_owner_stale_after = runtime_owner_stale_after
+        self._runtime_owner_heartbeat_timer: Optional[asyncio.TimerHandle] = None
+        self._runtime_owner_heartbeat_task: Optional[asyncio.Task] = None
+        self._durable_shutdown = False
+        # This is intentionally dispatcher-local.  It is not a second durable
+        # queue and must disappear on shutdown/restart; ``delivery_id`` is
+        # globally unique and every dispatcher owns exactly one agent scope.
+        self._transient_durable_handoffs: dict[str, _TransientDurableHandoff] = {}
+        self._transient_durable_handoff_timers: dict[str, asyncio.TimerHandle] = {}
+        # Post-commit reservation repair must outlive the agent-wide
+        # best-effort background-task sweep.  A repair created immediately
+        # before shutdown may not get a first event-loop turn before that
+        # sweep cancels ordinary work; cancelling it would strand a committed
+        # ``LEASED`` or ``INITIAL_RESERVED`` row.  The dispatcher owns these
+        # critical tasks and drains them before it releases its runtime owner
+        # or lets storage close.
+        self._post_commit_reservation_repairs: set[asyncio.Task] = set()
+        # The durable lease transfer is atomic, but its raw sidecar is shared
+        # by local claimants. A payload-elided persistence holds this lock
+        # from pre-commit sidecar installation through commit; a local initial
+        # claim then takes the same lock before it can transfer the lease. A
+        # PostgreSQL claimant can otherwise query on a separate transaction
+        # between those points, not see the uncommitted row, and mistakenly
+        # discard the valid raw sidecar.
+        self._transient_durable_initial_claim_lock = asyncio.Lock()
+        # This opaque runtime generation is persisted as the initial
+        # reservation owner. Its matching capability remains in the live
+        # sidecar, so another dispatcher sharing this database cannot consume
+        # an initial payload-elided delivery before this instance activates and
+        # hands it to its worker. A separate runtime heartbeat makes startup
+        # recovery distinguish a crashed owner from a concurrent live one.
+        self._durable_delivery_owner = f"dispatcher:{secrets.token_urlsafe(24)}"
         self._ttl = ttl
         self._default_window = coalescing_window_default
         self._clock = clock
@@ -356,6 +523,107 @@ class SignalDispatcher:
     # Public API
     # ------------------------------------------------------------------
 
+    @asynccontextmanager
+    async def _admit_durable_operation(self):
+        """Admit one public durable operation until its work is reconciled.
+
+        Checking a shutdown flag at method entry is insufficient: an
+        initializer can be awaiting owner registration, or a dispatch can be
+        between initialization and its event transaction when shutdown starts.
+        This gate linearizes admission with shutdown.  Once closing is marked,
+        no new operation can reach durable storage; work admitted before that
+        point remains valid and shutdown waits for it to finish.
+        """
+        current_task = asyncio.current_task()
+        if current_task is None:  # pragma: no cover - async APIs run in Tasks
+            raise RuntimeError("Durable signal delivery requires an asyncio task")
+        admission = self._durable_admission.get()
+        if admission is not None and admission[0] is current_task:
+            token = self._durable_admission.set((current_task, admission[1] + 1))
+            try:
+                yield
+            finally:
+                self._durable_admission.reset(token)
+            return
+
+        await self._durable_lifecycle_lock.acquire()
+        try:
+            if self._durable_shutdown:
+                raise _DurableDeliveryShuttingDownError(
+                    "Durable signal delivery is shutting down"
+                )
+            reservation = self._reserve_durable_admission()
+            self._durable_admission_owners.add(current_task)
+        finally:
+            # ``Lock.release`` is synchronous.  Keeping this out of an
+            # ``async with`` avoids another cancellation boundary between
+            # deciding admission and publishing its reservation.
+            self._durable_lifecycle_lock.release()
+
+        token = self._durable_admission.set((current_task, 1))
+        try:
+            yield
+        finally:
+            self._durable_admission.reset(token)
+            # This finalizer is intentionally await-free.  A cancellation may
+            # arrive at every other exit boundary, but cannot interrupt the
+            # exactly-once counter release and leave shutdown waiting forever.
+            self._durable_admission_owners.discard(current_task)
+            self._release_durable_admission(reservation)
+
+    def _reserve_durable_admission(self) -> _DurableAdmissionReservation:
+        """Synchronously reserve one unit of dispatcher/storage lifetime.
+
+        The caller has already linearized admission with lifecycle shutdown.
+        This is also used while a dispatch is still admitted to transfer that
+        lifetime to an outcome-log task before the dispatch can return.
+        """
+        self._durable_active_admissions += 1
+        self._durable_admissions_drained.clear()
+        return _DurableAdmissionReservation()
+
+    def _release_durable_admission(
+        self, reservation: _DurableAdmissionReservation
+    ) -> None:
+        """Release one lifetime reservation without an await boundary."""
+        if reservation.released:
+            return
+        reservation.released = True
+        if self._durable_active_admissions <= 0:
+            raise RuntimeError("Durable admission accounting underflow")
+        self._durable_active_admissions -= 1
+        if self._durable_active_admissions == 0:
+            self._durable_admissions_drained.set()
+
+    def has_live_durable_admission_in_current_context(self) -> bool:
+        """Whether this task inherited a still-live durable admission.
+
+        ``asyncio.create_task`` copies ContextVars.  A shutdown child created
+        by a signal handler therefore sees its parent's admission tuple even
+        though the child is not the owner.  That context is unsafe exactly
+        while the parent remains an active admission: waiting for admission
+        drain would then wait on the parent that is awaiting shutdown.  Once
+        the parent releases the admission, its copied tuple is stale and a
+        deferred child may safely perform teardown.
+        """
+        admission = self._durable_admission.get()
+        return (
+            admission is not None
+            and admission[0] in self._durable_admission_owners
+        )
+
+    def _durable_shutdown_signal_result(
+        self, signal: Signal, start: float
+    ) -> SignalResult:
+        """Return the dispatch contract's safe failure after closure starts."""
+        return SignalResult(
+            signal_id=signal.id,
+            status=Status.FAILED,
+            mode=signal.mode,
+            duration_ms=int((time.monotonic() - start) * 1000),
+            error="Durable signal delivery is shutting down",
+        )
+
     def notify_resume(self, gap_seconds: float) -> None:
         """Re-anchor throttling state after a host suspend/resume (#1545).
 
@@ -364,18 +632,31 @@ class SignalDispatcher:
         repeat signal fires again) while the monotonic rate-limit window is
         frozen (quotas look saturated though the hour really elapsed).
         Clearing both restores a consistent, correct post-sleep baseline.
+        Any volatile durable-delivery sidecars are also reconciled against
+        their wall-clock lease deadlines because their ``call_later`` timers
+        use the suspended monotonic clock.
 
-        Invoked by the ``system.resumed`` ACTION handler, which the
-        ResumeMonitor dispatches once per detected suspend.
+        Invoked directly by the ``ResumeMonitor`` callback before it emits a
+        ``system.resumed`` audit signal for each detected suspend.
         """
         self._rate.reset()
         self._coalescing.reset()
+        # ``call_later`` runs against a monotonic clock, which pauses during
+        # system suspend. Reconcile raw sidecars against UTC immediately, then
+        # rebuild every live timer from its wall-clock deadline.
+        self._discard_expired_transient_durable_handoffs()
+        for delivery_id, handoff in list(self._transient_durable_handoffs.items()):
+            self._schedule_transient_durable_handoff_expiry(
+                delivery_id, handoff.expires_at
+            )
         logger.info(
             "Dispatcher throttling windows re-anchored after ~%.0fs host suspend",
             gap_seconds,
         )
 
-    async def dispatch_signal(self, signal: Signal) -> SignalResult:
+    async def dispatch_signal(
+        self, signal: Signal, *, source_event_id: Optional[str] = None
+    ) -> SignalResult:
         """Awaits the full lifecycle. Used by callers that need the result
         (scheduler, heartbeat). Always returns a `SignalResult` — failures
         are encoded as `Status.FAILED` with `error` set, never raised."""
@@ -392,7 +673,24 @@ class SignalDispatcher:
 
         ctx_token = set_current_signal(signal)
         try:
-            return await self._run(signal, start)
+            async with self._admit_durable_operation():
+                result = await self._run(
+                    signal,
+                    start,
+                    source_event_id=(
+                        source_event_id
+                        if source_event_id is not None
+                        else getattr(signal, "source_event_id", None)
+                    ),
+                )
+                # The public dispatch contract returns only after its own
+                # outcome entry has reached a terminal write result.  The task
+                # remains separately admitted so a caller cancellation in
+                # this await cannot create a storage-close gap.
+                await self._drain_outcome_logs_for_signal(signal.id)
+                return result
+        except _DurableDeliveryShuttingDownError:
+            return self._durable_shutdown_signal_result(signal, start)
         except Exception as e:
             # Defensive — every failure path inside _run should already
             # produce a SignalResult. If we land here, log it loudly.
@@ -412,21 +710,711 @@ class SignalDispatcher:
         finally:
             reset_current_signal(ctx_token)
 
-    async def enqueue_signal(self, signal: Signal) -> SignalHandle:
+    async def enqueue_signal(
+        self, signal: Signal, *, source_event_id: Optional[str] = None
+    ) -> SignalHandle:
         """Returns immediately with a tracked handle. The dispatch runs as
         an agent-owned background task; exceptions are logged not swallowed,
         and the task is cancellable via the agent's shutdown path."""
-        coro = self.dispatch_signal(signal)
+        coro = self.dispatch_signal(signal, source_event_id=source_event_id)
         task = self._agent._track_background_task(
             coro, name=f"signal_dispatch:{signal.source}:{signal.id}"
         )
         return SignalHandle(signal_id=signal.id, task=task)
 
+    async def initialize_durable_delivery(self) -> None:
+        """Initialize the durable consumer ledger exactly once.
+
+        Agent boot calls this eagerly, while the guard in ``_run`` preserves
+        compatibility for embedding/test dispatchers that predate the ledger.
+        Initialization is complete before the first event is persisted.
+        """
+        async with self._admit_durable_operation():
+            if self._durable_initialized:
+                return
+            async with self._durable_init_lock:
+                if not self._durable_initialized:
+                    await self._durable_store.initialize()
+                    self._durable_runtime_owner_registration_started = True
+                    await self._durable_store.register_runtime_owner(
+                        agent_id=self._agent.did,
+                        owner_id=self._durable_delivery_owner,
+                    )
+                    self._durable_runtime_owner_registered = True
+                    # Registration can wait behind another database writer.  Do
+                    # not carry a pre-wait timestamp into recovery: that could
+                    # immediately classify an otherwise live owner as stale.
+                    await self._recover_abandoned_initial_reservations()
+                    self._durable_initialized = True
+                    self._schedule_runtime_owner_heartbeat()
+
+    async def register_durable_consumer(
+        self, registration: DurableConsumerRegistration
+    ) -> None:
+        """Register a scoped durable consumer for normalized signals.
+
+        Agent scope is authorization, not an advisory filter: a dispatcher
+        owns one DID and refuses to register a consumer for any other tenant.
+        """
+        if registration.agent_id != self._agent.did:
+            raise PermissionError(
+                "Durable consumer agent_id must match this dispatcher's agent"
+            )
+        async with self._admit_durable_operation():
+            await self.initialize_durable_delivery()
+            await self._durable_store.register_consumer(registration)
+
+    async def claim_durable_delivery(
+        self, *, consumer_id: str, executor_id: str
+    ) -> Optional[DurableDelivery]:
+        """Atomically claim one delivery for this agent-scoped consumer."""
+        async with self._admit_durable_operation():
+            await self.initialize_durable_delivery()
+            self._discard_expired_transient_durable_handoffs()
+            delivery = await self._durable_store.claim_delivery(
+                agent_id=self._agent.did,
+                consumer_id=consumer_id,
+                executor_id=executor_id,
+            )
+            if delivery is not None:
+                return self._delivery_with_transient_handoff(delivery)
+
+            # A payload-elided event is initially an unclaimable reservation in
+            # the transaction that writes its durable privacy marker. It becomes a
+            # real owner lease only after that transaction commits. Ordinary claims
+            # above therefore cannot race ahead of the emitting dispatcher while
+            # its process-local sidecar is installed. Only this dispatcher, which
+            # holds the reservation capability outside the durable payload, may
+            # transfer the activated lease to the requested worker.
+            async with self._transient_durable_initial_claim_lock:
+                # A prior local claimant may have transferred the reservation while
+                # this claimant waited. Re-read the sidecar state inside the lock;
+                # a cleared token means there is no initial reservation left here.
+                self._discard_expired_transient_durable_handoffs()
+                reservations = sorted(
+                    (
+                        (delivery_id, handoff)
+                        for delivery_id, handoff in self._transient_durable_handoffs.items()
+                        if (
+                            handoff.consumer_id == consumer_id
+                            and handoff.initial_lease_token is not None
+                        )
+                    ),
+                    key=lambda item: (item[1].created_at, item[0]),
+                )
+                for delivery_id, handoff in reservations:
+                    assert handoff.initial_lease_token is not None
+                    delivery = await self._durable_store.claim_initial_delivery(
+                        agent_id=self._agent.did,
+                        consumer_id=consumer_id,
+                        delivery_id=delivery_id,
+                        initial_lease_owner=self._durable_delivery_owner,
+                        initial_lease_token=handoff.initial_lease_token,
+                        executor_id=executor_id,
+                    )
+                    if delivery is None:
+                        # A reservation can fail only after it was released,
+                        # expired, or otherwise became terminal. Retaining raw
+                        # data in that case would violate its lease-bound lifetime.
+                        self._discard_transient_durable_handoff(delivery_id)
+                        continue
+                    handoff.initial_lease_token = None
+                    return self._delivery_with_transient_handoff(delivery)
+            return None
+
+    def _delivery_with_transient_handoff(
+        self, delivery: DurableDelivery
+    ) -> DurableDelivery:
+        """Attach a still-live payload sidecar to this dispatcher's claim."""
+        handoff = self._transient_durable_handoffs.get(delivery.delivery_id)
+        if handoff is None:
+            return delivery
+        if handoff.expires_at <= datetime.now(timezone.utc):
+            self._discard_transient_durable_handoff(delivery.delivery_id)
+            return delivery
+        # A claim is the live consumer handoff.  Retain the payload through a
+        # retry, but never past the lease it was handed to this executor.
+        if delivery.lease_expires_at is not None:
+            handoff.expires_at = min(
+                handoff.retention_until, delivery.lease_expires_at
+            )
+            self._schedule_transient_durable_handoff_expiry(
+                delivery.delivery_id, handoff.expires_at
+            )
+        return replace(
+            delivery,
+            event=replace(delivery.event, payload=copy.deepcopy(handoff.payload)),
+        )
+
+    async def ack_durable_delivery(
+        self, *, consumer_id: str, delivery_id: str, lease_token: str
+    ) -> bool:
+        """Acknowledge a claimed delivery owned by this dispatcher."""
+        async with self._admit_durable_operation():
+            await self.initialize_durable_delivery()
+            acknowledged = await self._durable_store.ack_delivery(
+                agent_id=self._agent.did,
+                consumer_id=consumer_id,
+                delivery_id=delivery_id,
+                lease_token=lease_token,
+            )
+            if acknowledged:
+                self._discard_transient_durable_handoff(delivery_id)
+            return acknowledged
+
+    async def nack_durable_delivery(
+        self,
+        *,
+        consumer_id: str,
+        delivery_id: str,
+        lease_token: str,
+        error: str,
+        retry_delay: timedelta = timedelta(),
+        terminal: bool = False,
+    ) -> Optional[DurableDelivery]:
+        """Release a claimed delivery for a bounded retry or terminal failure."""
+        async with self._admit_durable_operation():
+            await self.initialize_durable_delivery()
+            delivery = await self._durable_store.nack_delivery(
+                agent_id=self._agent.did,
+                consumer_id=consumer_id,
+                delivery_id=delivery_id,
+                lease_token=lease_token,
+                error=error,
+                retry_delay=retry_delay,
+                terminal=terminal,
+            )
+            if delivery is not None and delivery.status == FAILED:
+                self._discard_transient_durable_handoff(delivery_id)
+            return delivery
+
+    async def list_durable_deliveries(
+        self,
+        *,
+        consumer_id: Optional[str] = None,
+        statuses: Optional[List[str]] = None,
+        limit: int = 100,
+    ) -> List[DurableDelivery]:
+        """Observe durable delivery state for this agent only."""
+        async with self._admit_durable_operation():
+            await self.initialize_durable_delivery()
+            return await self._durable_store.list_deliveries(
+                agent_id=self._agent.did,
+                consumer_id=consumer_id,
+                statuses=statuses,
+                limit=limit,
+            )
+
+    async def purge_expired_durable_deliveries(self) -> int:
+        """Run the durable-ledger retention sweep (terminal history only)."""
+        async with self._admit_durable_operation():
+            await self.initialize_durable_delivery()
+            purged = await self._durable_store.purge_expired(agent_id=self._agent.did)
+            self._discard_expired_transient_durable_handoffs()
+            return purged
+
+    async def shutdown_durable_delivery(self) -> None:
+        """Close admission, drain committed work, then release this owner.
+
+        The state change is linearizable with every durable public API and
+        dispatch.  In particular, an owner registration or event transaction
+        that started before this method wins admission and is fully reconciled
+        before owner release; all later calls fail before they touch storage.
+        """
+        if self.has_live_durable_admission_in_current_context():
+            raise RuntimeError(
+                "Cannot shut down durable signal delivery from a live admitted operation"
+            )
+
+        async with self._durable_lifecycle_lock:
+            completion = self._start_durable_shutdown_completion()
+
+        # A public caller may be cancelled by the bounded agent shutdown
+        # wrapper.  Shield the owned teardown so the next caller can either
+        # join the same cleanup or retry a genuine cleanup failure.
+        await asyncio.shield(completion)
+
+    def _start_durable_shutdown_completion(self) -> asyncio.Task[None]:
+        """Close durable admission and return the one owned teardown task.
+
+        Async callers hold ``_durable_lifecycle_lock`` before calling this
+        helper.  The synchronous compatibility seam runs atomically on the
+        same event-loop thread, so it can use this exact transition without
+        inserting an await between the admission-close decision and task
+        ownership.  Keeping that transition here prevents the two public
+        shutdown forms from drifting into independent release paths.
+        """
+        completion = self._durable_shutdown_completion
+        if completion is None or self._durable_shutdown_needs_retry(completion):
+            self._durable_shutdown = True
+            completion = asyncio.create_task(
+                self._complete_durable_shutdown(),
+                name=f"durable_signal_shutdown:{self._agent.did}",
+            )
+            completion.add_done_callback(self._observe_durable_shutdown_completion)
+            self._durable_shutdown_completion = completion
+        return completion
+
+    @staticmethod
+    def _durable_shutdown_needs_retry(completion: asyncio.Task[None]) -> bool:
+        """Return whether a completed teardown task failed before completion."""
+        if not completion.done():
+            return False
+        if completion.cancelled():
+            return True
+        return completion.exception() is not None
+
+    @staticmethod
+    def _observe_durable_shutdown_completion(task: asyncio.Task[None]) -> None:
+        """Harvest detached teardown failures without changing retry semantics."""
+        if task.cancelled():
+            return
+        task.exception()
+
+    async def _complete_durable_shutdown(self) -> None:
+        """Reconcile durable state once, leaving failures available for retry."""
+        # No operation that reaches durable storage can still be running
+        # beyond this point.  The final repair drain remains necessary for a
+        # committed reservation task created immediately before its parent
+        # completed.
+        await self._durable_admissions_drained.wait()
+        await self._drain_outcome_log_tasks()
+        await self._stop_runtime_owner_heartbeat()
+        await self._drain_post_commit_reservation_repairs()
+        async with self._transient_durable_initial_claim_lock:
+            # Drop the raw capability before the durable state becomes retry
+            # work. A concurrent worker can therefore receive only the marker
+            # once shutdown releases an unactivated reservation.
+            for timer in self._transient_durable_handoff_timers.values():
+                timer.cancel()
+            self._transient_durable_handoff_timers.clear()
+            self._transient_durable_handoffs.clear()
+            if self._durable_runtime_owner_registration_started:
+                await self._durable_store.release_initial_reservations(
+                    agent_id=self._agent.did,
+                    owner_id=self._durable_delivery_owner,
+                )
+                self._durable_runtime_owner_registered = False
+                self._durable_runtime_owner_registration_started = False
+
+    async def _drain_outcome_log_tasks(self) -> None:
+        """Join every accepted outcome log before releasing shared storage.
+
+        Each task owns a lifecycle reservation, so normally the admission
+        event above is set only after this set is empty.  Keep this explicit
+        drain as a defensive second half of that contract: a task can complete
+        between the event wake-up and this check, and a task cancelled before
+        its first turn still runs its done callback to reconcile the
+        reservation without ever touching storage.
+        """
+        while self._outcome_log_tasks:
+            tasks = tuple(self._outcome_log_tasks)
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in tasks),
+                return_exceptions=True,
+            )
+
+    async def _drain_outcome_logs_for_signal(self, signal_id: str) -> None:
+        """Join this dispatch's outcome writers before returning its result."""
+        while tasks := self._outcome_log_tasks_by_signal.get(signal_id):
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in tuple(tasks)),
+                return_exceptions=True,
+            )
+
+    def shutdown(self) -> None:
+        """Compatibility teardown for embeddings that cannot await shutdown.
+
+        Production agent shutdown uses :meth:`shutdown_durable_delivery` and
+        awaits the owner-scoped durable release.  A synchronous embedding can
+        only initiate that same owned state machine: it returns the work to
+        the dispatcher-owned joinable task and never races an admitted
+        operation by releasing reservations or clearing raw sidecars itself.
+        """
+        completion = self._durable_shutdown_completion
+        if (
+            completion is not None
+            and completion.done()
+            and not self._durable_shutdown_needs_retry(completion)
+        ):
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "SignalDispatcher.shutdown requires a running event loop; "
+                "await shutdown_durable_delivery() before closing storage"
+            ) from exc
+
+        # A synchronous method cannot await the lifecycle lock.  On one
+        # running asyncio loop it nevertheless executes without an interleave,
+        # so this creates the same linearization point and the same owned task
+        # as the async method above.  Any already-admitted work is drained by
+        # ``_complete_durable_shutdown`` before it releases the runtime owner.
+        self._start_durable_shutdown_completion()
+
+    async def _activate_transient_reservations(self, persisted) -> None:
+        """Activate every post-commit reservation into its first live lease.
+
+        The caller owns failure cleanup.  Keeping activation free of partial
+        recovery is deliberate: if any await below raises after the event has
+        committed, every reservation for that event must be returned to the
+        marker-only retry path together, including leases whose UPDATE
+        succeeded before their readback failed.
+        """
+        for reservation in persisted.initial_reservations:
+            handoff = self._transient_durable_handoffs.get(reservation.delivery_id)
+            if handoff is None:
+                raise RuntimeError("initial reservation sidecar is unavailable")
+            delivery = await self._durable_store.activate_initial_delivery(
+                agent_id=self._agent.did,
+                consumer_id=reservation.consumer_id,
+                delivery_id=reservation.delivery_id,
+                initial_lease_owner=self._durable_delivery_owner,
+                initial_lease_token=reservation.reservation_token,
+            )
+            if delivery is None or delivery.lease_expires_at is None:
+                raise RuntimeError("initial reservation could not be activated")
+            handoff.expires_at = min(
+                handoff.retention_until, delivery.lease_expires_at
+            )
+            self._schedule_transient_durable_handoff_expiry(
+                reservation.delivery_id, handoff.expires_at
+            )
+
+    async def _requeue_committed_initial_reservations(self, persisted) -> None:
+        """Synchronously erase raw sidecars and requeue a failed handoff.
+
+        This coroutine runs in a separate task once an event transaction may
+        have committed.  The parent dispatch task can then be cancelled as
+        often as needed without interrupting the durable repair.  A failed
+        activation is all-or-nothing: an earlier reservation may already be
+        ``LEASED`` when a later activation or readback raises, but its
+        owner/token capability still lets ``abandon_initial_reservation`` turn
+        it into marker-only retry work safely.
+        """
+        reservations = persisted.initial_reservations
+        for reservation in reservations:
+            self._discard_transient_durable_handoff(reservation.delivery_id)
+
+        for reservation in reservations:
+            while True:
+                try:
+                    abandoned = await self._durable_store.abandon_initial_reservation(
+                        agent_id=self._agent.did,
+                        consumer_id=reservation.consumer_id,
+                        delivery_id=reservation.delivery_id,
+                        owner_id=self._durable_delivery_owner,
+                        reservation_token=reservation.reservation_token,
+                    )
+                except asyncio.CancelledError:
+                    # The repair task is normally protected by its parent's
+                    # shield, but a direct cancellation (for example during
+                    # event-loop teardown) can still arrive at this await.
+                    # Retrying the owner/token-conditional release is safe and
+                    # ensures the cancellation cannot leave an INITIAL_RESERVED
+                    # row behind.
+                    continue
+                if not abandoned:
+                    # A transaction that definitely rolled back reaches this
+                    # path too: the dispatcher deliberately keeps its opaque
+                    # capability until conditional repair proves there is no
+                    # matching committed row.  This is an expected no-op, not
+                    # an ownership violation.
+                    logger.debug(
+                        "Committed-reservation repair found no matching row for %s",
+                        reservation.delivery_id,
+                    )
+                break
+
+    async def _repair_post_commit_reservations(self, persisted) -> None:
+        """Finish committed-reservation repair despite repeated cancellation.
+
+        Raw sidecars are discarded before this method creates its task, so
+        there is no scheduling window in which cancellation can retain user
+        payload.  The separate repair task is shielded from cancellation of
+        the dispatch task; repeated cancellations are observed and deferred
+        until the repair is done, then the original triggering exception is
+        re-raised by the caller.
+        """
+        for reservation in persisted.initial_reservations:
+            self._discard_transient_durable_handoff(reservation.delivery_id)
+
+        repair_task = asyncio.create_task(
+            self._requeue_committed_initial_reservations(persisted),
+            name=f"durable_signal_post_commit_repair:{self._agent.did}",
+        )
+        self._post_commit_reservation_repairs.add(repair_task)
+        repair_task.add_done_callback(self._post_commit_reservation_repairs.discard)
+        while not repair_task.done():
+            try:
+                await asyncio.shield(repair_task)
+            except asyncio.CancelledError:
+                # The original failure is retained by the caller.  A repeated
+                # cancellation must not strand a committed reservation.
+                continue
+        # Do not catch a database repair error here.  The caller that is
+        # already preserving a persistence/activation exception records the
+        # cleanup fault explicitly, while normal callers must see the repair
+        # error rather than silently proceeding with an unsafe handoff.
+        repair_task.result()
+
+    async def _drain_post_commit_reservation_repairs(self) -> None:
+        """Await every dispatcher-owned committed-reservation repair.
+
+        Unlike general agent background work, a reservation repair is part of
+        the durable state transition already committed to storage.  It must
+        therefore run to completion before the owner release below makes any
+        remaining work visible to a restart worker.
+        """
+        while self._post_commit_reservation_repairs:
+            repairs = tuple(self._post_commit_reservation_repairs)
+            await asyncio.gather(
+                *(asyncio.shield(repair) for repair in repairs),
+            )
+
+    def _schedule_runtime_owner_heartbeat(self) -> None:
+        """Keep owner liveness separate from delivery lease countdowns."""
+        if self._durable_shutdown:
+            return
+        if self._runtime_owner_heartbeat_timer is not None:
+            self._runtime_owner_heartbeat_timer.cancel()
+        interval = max(0.01, self._runtime_owner_stale_after.total_seconds() / 3)
+        self._runtime_owner_heartbeat_timer = asyncio.get_running_loop().call_later(
+            interval, self._start_runtime_owner_heartbeat
+        )
+
+    async def _stop_runtime_owner_heartbeat(self) -> None:
+        """Cancel and drain owner liveness work before closing its store.
+
+        A timer may already have spawned its agent-owned task when boot starts
+        rolling back.  Merely cancelling the next ``TimerHandle`` leaves that
+        in-flight task free to touch storage after the rollback has closed it.
+        """
+        if self._runtime_owner_heartbeat_timer is not None:
+            self._runtime_owner_heartbeat_timer.cancel()
+            self._runtime_owner_heartbeat_timer = None
+        task = self._runtime_owner_heartbeat_task
+        self._runtime_owner_heartbeat_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    def _start_runtime_owner_heartbeat(self) -> None:
+        self._runtime_owner_heartbeat_timer = None
+        if self._durable_shutdown:
+            return
+        task = self._agent._track_background_task(
+            self._heartbeat_runtime_owner(),
+            name=f"durable_signal_owner_heartbeat:{self._agent.did}",
+        )
+        self._runtime_owner_heartbeat_task = task
+        task.add_done_callback(self._finish_runtime_owner_heartbeat)
+
+    async def _heartbeat_runtime_owner(self) -> None:
+        # The timer can have queued this coroutine immediately before
+        # shutdown flips the lifecycle state.  Take the same admission as
+        # public APIs so it either completes before teardown or performs no
+        # post-close storage work at all.
+        async with self._admit_durable_operation():
+            await self._durable_store.heartbeat_runtime_owner(
+                agent_id=self._agent.did,
+                owner_id=self._durable_delivery_owner,
+            )
+            # Startup cannot know whether a recently crashed runtime will cross
+            # the stale threshold moments later.  Sweep on every owner heartbeat
+            # so such unactivated reservations eventually become marker-only
+            # retry work without another process restart.
+            await self._recover_abandoned_initial_reservations()
+
+    async def _recover_abandoned_initial_reservations(self) -> int:
+        """Requeue stale foreign initial reservations for this tenant."""
+        recovery_now = datetime.now(timezone.utc)
+        return await self._durable_store.recover_abandoned_initial_reservations(
+            agent_id=self._agent.did,
+            recovering_owner_id=self._durable_delivery_owner,
+            stale_before=recovery_now - self._runtime_owner_stale_after,
+            now=recovery_now,
+        )
+
+    def _finish_runtime_owner_heartbeat(self, task: asyncio.Task) -> None:
+        if self._runtime_owner_heartbeat_task is task:
+            self._runtime_owner_heartbeat_task = None
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except _DurableDeliveryShuttingDownError:
+            # A queued timer callback can lose the lifecycle race after
+            # shutdown closes admission.  That rejection is normal, but its
+            # exception must still be retrieved before returning.
+            return
+        except Exception:
+            logger.exception("Durable signal runtime-owner heartbeat failed")
+            return
+        if self._durable_shutdown:
+            return
+        self._schedule_runtime_owner_heartbeat()
+
+    def _discard_expired_transient_durable_handoffs(self) -> None:
+        """Drop raw payloads after their live lease or retention deadline."""
+        now = datetime.now(timezone.utc)
+        expired = [
+            delivery_id
+            for delivery_id, handoff in self._transient_durable_handoffs.items()
+            if handoff.expires_at <= now
+        ]
+        for delivery_id in expired:
+            self._discard_transient_durable_handoff(delivery_id)
+
+    def _schedule_transient_durable_handoff_expiry(
+        self, delivery_id: str, expires_at: datetime
+    ) -> None:
+        """Schedule removal without retaining the payload in a task closure."""
+        previous = self._transient_durable_handoff_timers.pop(delivery_id, None)
+        if previous is not None:
+            previous.cancel()
+        delay = max(0.0, (expires_at - datetime.now(timezone.utc)).total_seconds())
+        self._transient_durable_handoff_timers[delivery_id] = (
+            asyncio.get_running_loop().call_later(
+                delay,
+                self._expire_transient_durable_handoff,
+                delivery_id,
+                expires_at,
+            )
+        )
+
+    def _expire_transient_durable_handoff(
+        self, delivery_id: str, expires_at: datetime
+    ) -> None:
+        """Remove only the handoff whose currently scheduled deadline fired."""
+        handoff = self._transient_durable_handoffs.get(delivery_id)
+        if handoff is not None and handoff.expires_at == expires_at:
+            self._discard_transient_durable_handoff(delivery_id)
+
+    def _discard_transient_durable_handoff(self, delivery_id: str) -> None:
+        self._transient_durable_handoffs.pop(delivery_id, None)
+        timer = self._transient_durable_handoff_timers.pop(delivery_id, None)
+        if timer is not None:
+            timer.cancel()
+
+    def _signal_for_durable_persistence(
+        self, signal: Signal
+    ) -> _DurableSignalProjection:
+        """Return the privacy-safe event projection for the durable ledger.
+
+        Signal handlers and cognition run against ``signal`` itself: source
+        schemas have already normalized it, and changing it here would make a
+        storage policy silently alter live delivery.  The ledger instead gets
+        a copy with either an elided payload (EPHEMERAL, ISOLATED, and the
+        not-yet-supported DEIDENTIFIED safe-harbor mode) or the same PII
+        anonymization primitive used by channel storage (ANONYMOUS).
+
+        A failure while reading or applying the privacy policy must never
+        downgrade into a plaintext durable write, so this boundary fails
+        closed by persisting only the marker.
+        """
+        config = resolve_agent_privacy_config(self._agent)
+        if config is None:
+            return _DurableSignalProjection(signal=signal)
+        try:
+            if any(
+                getattr(config, name)()
+                for name in (
+                    "is_ephemeral",
+                    "uses_temp_storage",
+                    "requires_deidentification",
+                )
+            ):
+                return _DurableSignalProjection(
+                    signal=replace(
+                        signal,
+                        payload={
+                            _DURABLE_PRIVACY_GATED_MARKER: getattr(
+                                config, "storage", "restricted"
+                            )
+                        },
+                    ),
+                    payload_elided=True,
+                )
+            if config.requires_anonymization():
+                from kestrel_sovereign.features.privacy.pii_detector import (
+                    anonymize_text,
+                )
+
+                return _DurableSignalProjection(
+                    signal=replace(
+                        signal,
+                        payload=self._anonymize_durable_value(
+                            signal.payload, anonymize_text
+                        ),
+                    ),
+                )
+        except Exception as exc:  # Privacy persistence must fail closed.
+            logger.warning(
+                "Failed to project signal %s for durable privacy storage; "
+                "persisting only a privacy marker: %s",
+                signal.id,
+                exc,
+            )
+            return _DurableSignalProjection(
+                signal=replace(
+                    signal,
+                    payload={_DURABLE_PRIVACY_GATED_MARKER: "projection_error"},
+                ),
+                payload_elided=True,
+            )
+        return _DurableSignalProjection(signal=signal)
+
+    @classmethod
+    def _anonymize_durable_value(
+        cls, value: Any, anonymize: Callable[[str], str]
+    ) -> Any:
+        """Apply the channel PII anonymizer to every persisted string value.
+
+        The source payload is a nested JSON document.  Retaining its shape
+        keeps durable correlation selectors replayable while applying the
+        policy to content in metadata as well as the obvious ``content``
+        field.  Overly deep input is elided rather than left unredacted.
+        """
+        return cls._anonymize_durable_value_at_depth(value, anonymize, depth=0)
+
+    @classmethod
+    def _anonymize_durable_value_at_depth(
+        cls, value: Any, anonymize: Callable[[str], str], *, depth: int
+    ) -> Any:
+        if depth > 8:
+            return _DURABLE_PRIVACY_GATED_MARKER
+        if isinstance(value, dict):
+            return {
+                anonymize(str(key)): cls._anonymize_durable_value_at_depth(
+                    item, anonymize, depth=depth + 1
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [
+                cls._anonymize_durable_value_at_depth(
+                    item, anonymize, depth=depth + 1
+                )
+                for item in value
+            ]
+        if isinstance(value, str):
+            return anonymize(value)
+        return value
+
     # ------------------------------------------------------------------
     # Pipeline
     # ------------------------------------------------------------------
 
-    async def _run(self, signal: Signal, start: float) -> SignalResult:
+    async def _run(
+        self,
+        signal: Signal,
+        start: float,
+        *,
+        source_event_id: Optional[str],
+    ) -> SignalResult:
         # Step 1: validation
         registration = self._registry.get(signal.source)
         if registration is None:
@@ -506,6 +1494,220 @@ class SignalDispatcher:
                 registration=registration,
             )
         signal.causation_chain.append(new_frame)
+
+        # Durable delivery has a stricter boundary than signal_log: commit the
+        # normalized/sanitized envelope and materialized consumer deliveries
+        # before any handler, cognition turn, or external workflow executor can
+        # observe it.  Thus a process loss after this point is replayable.
+        try:
+            await self.initialize_durable_delivery()
+            # A transition and a durable write must share the same critical
+            # section.  Otherwise a NORMAL projection can be computed, the
+            # mode can change to EPHEMERAL while persistence is blocked, and
+            # the stale plaintext projection can commit after the transition.
+            # KestrelAgent provides a task-reentrant lock; lightweight
+            # embeddings with no transition machinery intentionally run
+            # unguarded through ``optional_transition_lock``.
+            async with optional_transition_lock(
+                _resolve_transition_lock(self._agent)
+            ):
+                durable_projection = self._signal_for_durable_persistence(signal)
+                # Snapshot the normalized payload before the durable commit so
+                # a deepcopy failure cannot leave a committed marker with no
+                # corresponding live handoff.
+                transient_payload = (
+                    copy.deepcopy(signal.payload)
+                    if durable_projection.payload_elided
+                    else None
+                )
+                transient_selector_payload = (
+                    {"transient_selector_payload": signal.payload}
+                    if durable_projection.payload_elided
+                    else {}
+                )
+                committed_reservations = None
+
+                def install_transient_handoffs(persisted) -> None:
+                    """Install raw sidecars before the event transaction commits."""
+                    nonlocal committed_reservations
+                    assert transient_payload is not None
+                    retention_until = persisted.retention_until or datetime.now(
+                        timezone.utc
+                    )
+                    for reservation in persisted.initial_reservations:
+                        self._transient_durable_handoffs[reservation.delivery_id] = (
+                            _TransientDurableHandoff(
+                                payload=copy.deepcopy(transient_payload),
+                                consumer_id=reservation.consumer_id,
+                                created_at=reservation.created_at,
+                                retention_until=retention_until,
+                                # Do not start any volatile lease countdown
+                                # before the event commit. Post-commit
+                                # activation replaces this retention bound with
+                                # the actual lease deadline.
+                                expires_at=retention_until,
+                                initial_lease_token=(
+                                    reservation.reservation_token
+                                ),
+                            )
+                        )
+                    # ``persist_signal`` may be cancelled after its transaction
+                    # commits but before its await returns. Retain the opaque
+                    # reservation capabilities here so that boundary can still
+                    # be repaired. ``on_rollback`` cannot distinguish a real
+                    # rollback from cancellation after the driver committed,
+                    # so conditional repair below resolves either outcome.
+                    committed_reservations = persisted
+
+                def discard_rolled_back_handoffs(persisted) -> None:
+                    for reservation in persisted.initial_reservations:
+                        self._discard_transient_durable_handoff(
+                            reservation.delivery_id
+                        )
+                    # Keep ``committed_reservations`` even though the callback
+                    # convention calls this ``on_rollback``. SQLite can raise
+                    # CancelledError from ``await conn.commit()`` after its
+                    # worker has committed; clearing the owner/token
+                    # capabilities here would strand that visible
+                    # INITIAL_RESERVED row. A confirmed rollback makes the
+                    # later conditional repair a harmless no-op.
+
+                persistence_kwargs = {
+                    "agent_id": self._agent.did,
+                    "source_event_id": source_event_id,
+                    "retention_days": registration.retention_days,
+                    # A volatile privacy projection must never make a
+                    # pre-existing payload-correlated wait miss its normalized
+                    # live signal. DurableSignalStore consumes this only while
+                    # materializing the initial deliveries; its event row and
+                    # every later replay retain the projected payload above.
+                    **transient_selector_payload,
+                    "initial_lease_owner": (
+                        self._durable_delivery_owner
+                        if durable_projection.payload_elided
+                        else None
+                    ),
+                    "before_commit": (
+                        install_transient_handoffs
+                        if durable_projection.payload_elided
+                        else None
+                    ),
+                    "on_rollback": (
+                        discard_rolled_back_handoffs
+                        if durable_projection.payload_elided
+                        else None
+                    ),
+                }
+                if durable_projection.payload_elided:
+                    # Keep a local initial claimant outside the store's
+                    # uncommitted-transaction window. The synchronous
+                    # ``before_commit`` callback has already installed raw
+                    # sidecars by the time this await reaches commit, and the
+                    # same lock remains held until the row is visible.
+                    async with self._transient_durable_initial_claim_lock:
+                        try:
+                            persisted = await self._durable_store.persist_signal(
+                                durable_projection.signal,
+                                **persistence_kwargs,
+                            )
+                        except BaseException:
+                            # The before-commit hook already gave us the
+                            # capability set. If cancellation arrives after
+                            # commit but before this await returns, use it to
+                            # erase raw state and requeue every reservation.
+                            # A confirmed rollback leaves no matching rows, so
+                            # this is harmless before commit too.
+                            if committed_reservations is not None:
+                                try:
+                                    await self._repair_post_commit_reservations(
+                                        committed_reservations
+                                    )
+                                except BaseException as cleanup_exc:
+                                    # The event-persistence failure remains
+                                    # authoritative, but a failed repair must
+                                    # never disappear into a broad exception
+                                    # handler. The exception log provides the
+                                    # operator the exact cleanup failure.
+                                    logger.exception(
+                                        "Durable post-commit reservation repair "
+                                        "failed while preserving persistence "
+                                        "failure: %s",
+                                        cleanup_exc,
+                                    )
+                            raise
+                        if persisted.created:
+                            try:
+                                await self._activate_transient_reservations(persisted)
+                            except BaseException as exc:
+                                # The event transaction has already committed.
+                                # Activation can have written a first lease
+                                # before failing its readback. Recover the
+                                # entire committed batch before preserving the
+                                # original failure/cancellation below.
+                                try:
+                                    await self._repair_post_commit_reservations(
+                                        persisted
+                                    )
+                                except BaseException as cleanup_exc:
+                                    # Preserve the activation failure below,
+                                    # but surface any independently failed
+                                    # repair rather than swallowing it.
+                                    logger.exception(
+                                        "Durable post-commit reservation repair "
+                                        "failed while preserving activation "
+                                        "failure: %s",
+                                        cleanup_exc,
+                                    )
+                                if isinstance(exc, Exception):
+                                    logger.error(
+                                        "Durable signal event %s committed but "
+                                        "initial delivery activation failed",
+                                        signal.id,
+                                        exc_info=(
+                                            type(exc), exc, exc.__traceback__
+                                        ),
+                                    )
+                                    return self._fail(
+                                        signal,
+                                        start,
+                                        Status.FAILED,
+                                        error=(
+                                            "Durable signal delivery activation "
+                                            "failed after commit: "
+                                            f"{type(exc).__name__}: {exc}"
+                                        ),
+                                        registration=registration,
+                                    )
+                                raise
+                else:
+                    persisted = await self._durable_store.persist_signal(
+                        durable_projection.signal,
+                        **persistence_kwargs,
+                    )
+        except Exception as exc:
+            logger.exception(
+                "Failed to persist durable signal event %s (source=%s)",
+                signal.id,
+                signal.source,
+            )
+            return self._fail(
+                signal,
+                start,
+                Status.FAILED,
+                error=f"Durable signal persistence failed: {type(exc).__name__}: {exc}",
+                registration=registration,
+            )
+        if not persisted.created:
+            return self._fail(
+                signal,
+                start,
+                Status.COALESCED,
+                error=(
+                    "Duplicate source event ID already accepted as "
+                    f"{persisted.event_id}"
+                ),
+                registration=registration,
+            )
 
         # Step 3: quiet-hours
         if self._in_quiet_hours(signal, registration.attention_policy):
@@ -1511,12 +2713,7 @@ class SignalDispatcher:
             artifact=artifact if artifact is not None else cognition_result,
             action_result=action_result,
         )
-        # Fire-and-forget log write; if logging fails it's logged but does
-        # not fail the dispatch.
-        self._agent._track_background_task(
-            self._log_safe(signal, registration, result, audit=audit),
-            name=f"signal_log:{signal.source}:{signal.id}",
-        )
+        self._schedule_outcome_log(signal, registration, result, audit=audit)
         return result
 
     def _fail(
@@ -1537,11 +2734,61 @@ class SignalDispatcher:
             error=error,
         )
         if registration is not None:
-            self._agent._track_background_task(
-            self._log_safe(signal, registration, result, audit=audit),
-            name=f"signal_log:{signal.source}:{signal.id}",
-        )
+            self._schedule_outcome_log(signal, registration, result, audit=audit)
         return result
+
+    def _schedule_outcome_log(
+        self,
+        signal: Signal,
+        registration: SourceRegistration,
+        result: SignalResult,
+        *,
+        audit: Optional[_ConstitutionAudit] = None,
+    ) -> None:
+        """Transfer an admitted dispatch's lifetime to its outcome writer.
+
+        ``_success`` and ``_fail`` run before their parent dispatch releases
+        its admission.  Reserve the writer synchronously *before* scheduling
+        it, so shutdown cannot observe zero admitted work in the gap before a
+        queued task gets its first event-loop turn.  The task's done callback
+        is the sole release point, which also covers cancellation before its
+        coroutine body starts.
+        """
+        reservation = self._reserve_durable_admission()
+        try:
+            task = asyncio.create_task(
+                self._log_safe(signal, registration, result, audit=audit),
+                name=f"durable_signal_log:{signal.source}:{signal.id}",
+            )
+        except BaseException:
+            self._release_durable_admission(reservation)
+            raise
+
+        self._outcome_log_tasks.add(task)
+        self._outcome_log_tasks_by_signal.setdefault(signal.id, set()).add(task)
+
+        def _complete(task: asyncio.Task) -> None:
+            self._outcome_log_tasks.discard(task)
+            signal_tasks = self._outcome_log_tasks_by_signal.get(signal.id)
+            if signal_tasks is not None:
+                signal_tasks.discard(task)
+                if not signal_tasks:
+                    self._outcome_log_tasks_by_signal.pop(signal.id, None)
+            self._release_durable_admission(reservation)
+            if task.cancelled():
+                return
+            try:
+                task.result()
+            except Exception:
+                # _log_safe reports storage/UI errors itself.  This is a
+                # defensive harvest for an unexpected task-body failure.
+                logger.error(
+                    "Signal outcome-log task failed for %s",
+                    signal.id,
+                    exc_info=True,
+                )
+
+        task.add_done_callback(_complete)
 
     async def _log_safe(
         self,
@@ -1551,28 +2798,50 @@ class SignalDispatcher:
         *,
         audit: Optional[_ConstitutionAudit] = None,
     ) -> None:
+        # A direct cancellation can land while SQLite has queued the append
+        # but before its worker returns.  Keep the real writer in a child task
+        # and shield it until it settles; otherwise the outer task's done
+        # callback could release the lifecycle reservation and let shutdown
+        # close the backend ahead of that queued write.
+        writer = asyncio.create_task(
+            self._write_outcome_log(signal, registration, result, audit=audit),
+            name=f"durable_signal_log_writer:{signal.source}:{signal.id}",
+        )
+        cancelled = False
+        while not writer.done():
+            try:
+                await asyncio.shield(writer)
+            except asyncio.CancelledError:
+                # Preserve cancellation for the caller after the accepted
+                # write has reached a terminal outcome.  Repeated
+                # cancellation cannot create a post-close SQLite operation.
+                cancelled = True
+                continue
+
         try:
-            with suppress_write_audit():
-                result_summary = await self._store.append(
-                    signal,
-                    registration,
-                    result,
-                    prompt_template_hash=getattr(
-                        signal, _PROMPT_TEMPLATE_HASH_ATTR, None
-                    ),
-                    **_audit_to_log_kwargs(audit),
-                )
+            writer.result()
         except Exception:
-            logger.exception(
-                "Failed to write signal_log entry for %s", signal.id
+            logger.exception("Failed to write signal_log entry for %s", signal.id)
+        if cancelled:
+            raise asyncio.CancelledError()
+
+    async def _write_outcome_log(
+        self,
+        signal: Signal,
+        registration: SourceRegistration,
+        result: SignalResult,
+        *,
+        audit: Optional[_ConstitutionAudit] = None,
+    ) -> None:
+        """Persist one outcome and emit its UI side channel after commit."""
+        with suppress_write_audit():
+            result_summary = await self._store.append(
+                signal,
+                registration,
+                result,
+                prompt_template_hash=getattr(signal, _PROMPT_TEMPLATE_HASH_ATTR, None),
+                **_audit_to_log_kwargs(audit),
             )
-            # #907 review P2: contract says SSE event fires AFTER the
-            # log write. If the write failed, the audit trail is
-            # broken — emitting a signal_completed event whose
-            # signal_id can't be looked up in signal_log would mislead
-            # consumers that try to correlate. Better to be silent and
-            # surface the failure via the logger.exception above.
-            return
 
         # Phase 7 of #889: emit a UI-side-channel SSE event for non-
         # INTERNAL signals. Three rendering tiers in the design:

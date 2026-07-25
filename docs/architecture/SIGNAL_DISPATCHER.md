@@ -227,6 +227,113 @@ async def enqueue_signal(self, signal: Signal) -> SignalHandle: ...
 
 **Raw `asyncio.create_task(dispatch_signal(...))` at call sites is forbidden.** The point of `enqueue_signal` is supervised lifetime; ad-hoc tasks defeat that.
 
+### Durable consumer delivery
+
+`signal_log` is an **outcome audit**, not a queue.  A durable consumer uses
+the dispatcher-owned ledger when it must resume a workflow trigger or wait
+after process loss:
+
+```python
+await dispatcher.register_durable_consumer(
+    DurableConsumerRegistration(
+        consumer_id="workflows:wait:run-42",
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector="payload.message_id=provider-msg-123",  # optional
+        max_attempts=5,
+        lease_seconds=60,
+    )
+)
+
+delivery = await dispatcher.claim_durable_delivery(
+    consumer_id="workflows:wait:run-42", executor_id="workflows-worker-1"
+)
+if delivery is not None:
+    try:
+        await resume_workflow(delivery.event)
+    except RetryableFailure as exc:
+        await dispatcher.nack_durable_delivery(
+            consumer_id="workflows:wait:run-42",
+            delivery_id=delivery.delivery_id,
+            lease_token=delivery.lease_token,
+            error=str(exc),
+        )
+    else:
+        await dispatcher.ack_durable_delivery(
+            consumer_id="workflows:wait:run-42",
+            delivery_id=delivery.delivery_id,
+            lease_token=delivery.lease_token,
+        )
+```
+
+The dispatcher permits durable registrations only for its own `agent.did`.
+Every claim, acknowledgement, retry, and observation query is selected by
+that scope in storage; scope is therefore an authorization boundary for a
+shared PostgreSQL backend, not a caller-side filter.  The event's
+`target_agent` remains canonical envelope metadata, but the durable scope is
+always the dispatcher owner — setting a foreign target cannot enqueue work
+for another tenant.
+
+`correlation_selector` is deliberately a small declarative exact-match
+language, not SQL: `payload.<path>=<value>`, `session_id=<value>`, or
+`kind=<value>`.  It is evaluated only against the canonical post-sanitization
+envelope.  A missing selector subscribes to every event from the registered
+source for that agent.
+
+For provider retry de-duplication, inbound bridges pass their stable provider
+ID through `dispatch_signal(..., source_event_id=...)` or
+`enqueue_signal(..., source_event_id=...)`.  The durable event identity is
+unique on `(agent_id, source, source_event_id)`.  A repeat returns a
+`COALESCED` result, does not route the signal again, and creates no second
+delivery.  `channel.message` passes its `ChannelMessage.id` this way.
+
+The delivery guarantee is **at least once**.  Claim is an atomic conditional
+lease transition and returns an unguessable `lease_token`; only that live
+token can ack or nack.  A crash after a side effect but before ack causes a
+lease-expiry retry, so workflow side effects must be idempotent on
+`event_id`/`delivery_id`.  Bounded attempts move exhausted deliveries to the
+observable terminal `failed` state.  `pending`, `initial_reserved`, `leased`,
+`retry`, `acknowledged`, and `failed` are observable through
+`list_durable_deliveries`.
+
+The normalized envelope and matching delivery rows commit atomically **before
+the normal route executes**.  After restart an active registration backfills
+any retained event that lacks a delivery, then claims it normally.  This is
+implemented with ordinary conditional updates and scoped predicates, so it
+has the same contract on standalone SQLite and hosted PostgreSQL; the latter
+does not rely on a process-local application lock.
+
+For payload-eliding privacy modes, the durable event contains only the privacy
+marker. Its initially matched deliveries are instead inserted as
+`initial_reserved` capabilities owned by the emitting dispatcher in that same
+transaction. An initial reservation has **no delivery lease deadline** and is
+not eligible for generic claim or lease recovery. Before commit makes it
+visible, the dispatcher installs a process-local raw-payload sidecar and holds
+its local handoff lock through the commit boundary. Only after
+`persist_signal` returns from that actual commit does the owner atomically
+activate the reservation into a real lease and calculate its deadline; an
+initial local claim can then transfer that lease to a worker. A peer sharing
+the database therefore cannot steal a just-emitted marker-only delivery before
+its owner consumes the live payload, even if commit was paused longer than the
+consumer lease.
+
+Runtime-owner heartbeats make recovery owner-aware: graceful shutdown releases
+only that dispatcher's unactivated reservations to ordinary marker-only retry
+work. Startup recovery and later owner-heartbeat sweeps do the same only for a
+stopped, missing, or stale runtime generation; a just-crashed owner that is
+still fresh at restart is reconsidered after it crosses the stale threshold.
+Recovery never releases a concurrent live dispatcher's
+reservation. The sidecar is discarded on rollback, acknowledgement, terminal
+failure, lease expiry, and shutdown; after a crash or expired lease, normal
+replay intentionally receives only the persisted marker. Raw payload is never
+written to the durable ledger.
+
+Registration and persistence also serialize their handoff at the
+`(agent_id, source)` scope.  Thus an event racing a new workflow subscription
+is either committed first and backfilled by that registration, or sees the
+committed consumer and creates its delivery directly; it cannot fall between
+the two transactions.
+
 ```python
 @dataclass
 class SignalResult:
@@ -246,15 +353,16 @@ The dispatcher pipeline:
 
 1. **Validate** against registration. Unknown source → `DROPPED_VALIDATION`. Mode not in `allowed_modes` → `DROPPED_VALIDATION`. Schema fail → `DROPPED_VALIDATION`. UNTRUSTED with no sanitizer for non-ACTION mode → `DROPPED_VALIDATION`.
 2. **Append-and-cycle-check** — see Concern #6 for exact rules.
-3. **Quiet-hours-check** against the source's `attention_policy`. `urgency >= attention_policy.urgency_override` bypasses.
-4. **Coalesce** by `dedupe_key` within `coalescing_window` (or global default).
-5. **Acquire registered resource locks** in lexicographic order of lock name (single ordered lock manager — see Concern #2). `CONVERSATION` is **never** in this set; it is acquired downstream by the turn lifecycle for COGNITION (see Concern #1).
-6. **Route**:
+3. **Persist durable event/deliveries** — commit the sanitized, schema-normalized envelope and every matching scoped consumer delivery. A duplicate explicit `source_event_id` stops here as `COALESCED`.
+4. **Quiet-hours-check** against the source's `attention_policy`. `urgency >= attention_policy.urgency_override` bypasses.
+5. **Coalesce** by `dedupe_key` within `coalescing_window` (or global default).
+6. **Acquire registered resource locks** in lexicographic order of lock name (single ordered lock manager — see Concern #2). `CONVERSATION` is **never** in this set; it is acquired downstream by the turn lifecycle for COGNITION (see Concern #1).
+7. **Route**:
    - ACTION → `await registration.handler(payload)`
    - ARTIFACT → `await registration.artifact_handler(signal)`
    - COGNITION → select the registration `prompt_template`, or the signal's `prompt_template_override` only when the registration has `allow_prompt_override=True`; render with the signal envelope → `await agent.process_input_or_streaming(prompt, ...)`. The entry point itself acquires `CONVERSATION` at the shared turn lifecycle (Concern #1) — the dispatcher does not pre-acquire it. Streaming vs non-streaming is selected by the calling context; both share the same lifecycle boundary.
-7. **Release locks** in reverse acquisition order.
-8. **Log** per the source's redaction policy.
+8. **Release locks** in reverse acquisition order.
+9. **Log** the routed outcome per the source's redaction policy.
 
 The dispatcher lives as a sibling component the agent holds a reference to. Easier to test than another mixin.
 
@@ -286,6 +394,31 @@ signal_log
 - **Prompt-template provenance** is stored for COGNITION dispatches after prompt render. The hash covers the exact template body chosen for that dispatch, including per-signal overrides.
 
 If a registration doesn't specify a redaction policy, the dispatcher refuses to register the source. No defaults; this is too important to default.
+
+### Audit persistence is not pending-delivery durability
+
+`signal_log` is appended after a route succeeds or fails.  It remains the
+backwards-compatible audit/outcome surface and does not participate in claim,
+lease, acknowledgement, or replay.
+
+The separate `durable_signal_events`, `durable_signal_consumers`, and
+`durable_signal_deliveries` tables are the pending-delivery ledger.  They
+retain the normalized/sanitized payload because a consumer needs the canonical
+event to resume; sources must therefore expose only data their registered
+consumer contract is permitted to receive.  This is deliberately different
+from `signal_log`'s optional trusted raw-payload retention policy.  Raw
+`caller` routing identity is not copied into the durable envelope: a consumer
+uses only fields the source normalized into `payload` (plus the validated
+envelope metadata).
+
+`registration.retention_days` bounds durable event history too.  Retention
+cleanup deletes an event (and its acknowledged/failed deliveries) only after
+the deadline and only when every delivery is terminal; it never silently
+deletes pending, retriable, or leased work.  Consumers are long-lived
+registrations and are not removed by the event cleanup sweep.  The existing
+`trash_retention` maintenance rail invokes this cleanup alongside its
+conversation sweep; a durable-ledger cleanup error is logged but does not
+prevent the independent conversation-retention operation.
 
 ## Concerns
 

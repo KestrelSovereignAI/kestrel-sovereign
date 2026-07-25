@@ -110,6 +110,8 @@ class _FakeAgent:
     ``_track_background_task`` (ACTION sources never touch the constitution
     path, so nothing else is needed)."""
 
+    did = "did:web:k.example"
+
     def __init__(self):
         self.background_tasks: list = []
 

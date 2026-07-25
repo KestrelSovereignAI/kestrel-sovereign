@@ -10,13 +10,18 @@ available for local dev (separate OS processes per agent).
 """
 
 import asyncio
+import inspect
 import logging
 import os
 from decimal import Decimal
 from pathlib import Path
 from typing import List, Optional
 
-from kestrel_sovereign.kestrel_agent import KestrelAgent
+from kestrel_sovereign.kestrel_agent import (
+    KestrelAgent,
+    await_agent_shutdown_completion,
+    await_lifecycle_task_completion,
+)
 from kestrel_sovereign.identity.runtime_identity import IdentityReadinessError
 from kestrel_sovereign.spawn.delegated_wallet import (
     _default_currency_for,
@@ -32,6 +37,19 @@ from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
 from .config import LocalAgentConfig, MultiAgentConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _has_shutdown_completion_contract(agent: object) -> bool:
+    """Whether this object exposes Kestrel's joinable shutdown continuation.
+
+    The manager's construction seam is intentionally patchable in unit tests,
+    where ``KestrelAgent`` itself may be replaced with a ``MagicMock``.  Check
+    the async contract rather than using ``isinstance`` against a patched
+    module global.
+    """
+    return inspect.iscoroutinefunction(
+        getattr(agent, "wait_for_shutdown_completion", None)
+    )
 
 
 async def _get_agent_did(storage_dir: str) -> str:
@@ -193,8 +211,16 @@ class AgentManager:
         are invisible to ``shutdown_all()``, so the startup path owns their
         cleanup explicitly.
         """
+        cancelled = False
         try:
             await asyncio.wait_for(agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
+        except asyncio.CancelledError:
+            cancelled = True
+            logger.warning(
+                "Unregistered agent %r shutdown was cancelled; "
+                "joining durable cleanup before propagating cancellation",
+                name,
+            )
         except (asyncio.TimeoutError, Exception) as exc:
             logger.warning(
                 "Failed to clean up unregistered agent %r: %s",
@@ -202,6 +228,15 @@ class AgentManager:
                 exc,
                 exc_info=True,
             )
+        # A bounded KestrelAgent shutdown can hand durable dispatcher release
+        # plus storage close to its own shielded continuation.  This startup
+        # cleanup path is still its lifecycle owner, so join that continuation
+        # rather than dropping the only reference while its SQLite backend is
+        # live. Lightweight test doubles do not expose this contract.
+        if _has_shutdown_completion_contract(agent):
+            cancelled = await await_agent_shutdown_completion(agent) or cancelled
+        if cancelled:
+            raise asyncio.CancelledError()
 
     def _register_agent(self, name: str, agent: KestrelAgent) -> None:
         """Publish one fully initialized agent to the co-hosted fleet."""
@@ -399,15 +434,114 @@ class AgentManager:
                 f"leaf-first (#2113)."
             )
 
+        # A spawn can reserve a delegated hold before its agent is published.
+        # There is no process to stop in that state, but a DELETE/shutdown must
+        # still refund the hold.  Treat it as a completed removal rather than
+        # silently retaining money because there is no routing entry.
         async with self._lock:
-            agent = self._agents.pop(name, None)
-            if agent is not None:
-                self._agent_names.pop(agent.agent_id, None)
-                try:
-                    await asyncio.wait_for(agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
-                    logger.info(f"Agent '{name}' shut down")
-                except (asyncio.TimeoutError, Exception) as e:
-                    logger.warning(f"Agent '{name}' shutdown issue: {e}")
+            unpublished_hold = (
+                name not in self._agents and name in self._child_budgets
+            )
+        if unpublished_hold:
+            release_cancelled = await self._release_child_budget_cancellation_safe(
+                name
+            )
+            if release_cancelled:
+                raise asyncio.CancelledError()
+            return True
+
+        async with self._lock:
+            agent = self._agents.get(name)
+            if agent is None:
+                return False
+
+            # ``wait_for(agent.shutdown())`` loses the actual task on timeout
+            # and on cancellation.  KestrelAgent deliberately runs its
+            # cancellation tail before re-raising, so that task is the primary
+            # evidence that cleanup is terminal even when no deferred
+            # continuation was necessary.
+            shutdown_task = asyncio.create_task(
+                agent.shutdown(), name=f"agent_shutdown:{name}"
+            )
+            caller_cancelled = False
+            shutdown_timed_out = False
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(shutdown_task), timeout=SHUTDOWN_TIMEOUT
+                )
+            except asyncio.CancelledError:
+                caller_cancelled = asyncio.current_task().cancelling() > 0
+                if not shutdown_task.done():
+                    shutdown_task.cancel()
+                logger.warning(
+                    "Agent '%s' shutdown was cancelled; joining its actual "
+                    "shutdown task and durable cleanup before unpublishing.",
+                    name,
+                )
+            except asyncio.TimeoutError:
+                shutdown_timed_out = True
+                shutdown_task.cancel()
+                logger.warning(
+                    "Agent '%s' shutdown timed out; joining its actual "
+                    "shutdown task before deciding removal.",
+                    name,
+                )
+            except Exception as exc:
+                # A normal shutdown error has no general proof that the agent
+                # reached its cancellation tail.  Keep the historical safe
+                # behaviour for that case; timeouts/cancellation are handled
+                # below by joining the task that did run the tail.
+                logger.warning(
+                    "Agent '%s' shutdown failed; retaining it until cleanup "
+                    "can be confirmed: %s",
+                    name,
+                    exc,
+                    exc_info=True,
+                )
+                return False
+
+            join_cancelled, shutdown_failure = await await_lifecycle_task_completion(
+                shutdown_task
+            )
+            caller_cancelled = caller_cancelled or join_cancelled
+            if shutdown_failure is not None and not isinstance(
+                shutdown_failure, asyncio.CancelledError
+            ):
+                logger.warning(
+                    "Agent '%s' shutdown task failed; retaining it until "
+                    "cleanup can be confirmed: %s",
+                    name,
+                    shutdown_failure,
+                    exc_info=(
+                        type(shutdown_failure),
+                        shutdown_failure,
+                        shutdown_failure.__traceback__,
+                    ),
+                )
+                return False
+            if shutdown_timed_out and shutdown_failure is None:
+                logger.warning(
+                    "Agent '%s' exceeded its shutdown budget but completed "
+                    "while being joined; continuing durable cleanup.",
+                    name,
+                )
+
+            # A tail that spent its dispatcher guard continues in the
+            # agent-owned completion task.  Do not unpublish the agent or
+            # release its delegated budget until that task has released the
+            # owner and closed storage. This also handles a bounded outer
+            # timeout: the one removal call remains the lifecycle owner.
+            if _has_shutdown_completion_contract(agent):
+                caller_cancelled = (
+                    await await_agent_shutdown_completion(agent)
+                ) or caller_cancelled
+
+            # Only publish removal after all agent-owned durable cleanup has
+            # completed.  In particular, this keeps the manager as the
+            # lifecycle owner while a SQLite worker is still draining.
+            self._agents.pop(name, None)
+            self._agent_names.pop(agent.agent_id, None)
+            logger.info(f"Agent '{name}' shut down")
 
         # Release THIS agent's own budget hold AFTER it is stopped (#2113):
         # releasing before shutdown would let a still-running child spend
@@ -417,8 +551,14 @@ class AgentManager:
         # the correct order; directly remove_agent-ing a budgeted PARENT is not a
         # supported budget teardown (folded into #2348 with reload durability).
         # Idempotent — a no-op when those paths already released this entry.
-        await self._release_child_budget(name)
-        return agent is not None
+        # The routing entry is gone, so this release is now the last mutation
+        # required for removal.  Retain its task through repeated cancellation
+        # before propagating cancellation to the caller; otherwise a closed
+        # child can strand its delegated hold.
+        release_cancelled = await self._release_child_budget_cancellation_safe(name)
+        if caller_cancelled or release_cancelled:
+            raise asyncio.CancelledError()
+        return True
 
     def _allocate_port(self) -> int:
         """Pick the first FREE in-range agent port and reserve it.
@@ -731,6 +871,19 @@ class AgentManager:
                 "Failed to release delegated budget for '%s': %s", child_name, e
             )
 
+    async def _release_child_budget_cancellation_safe(self, child_name: str) -> bool:
+        """Release one removed child's hold before reporting caller cancellation."""
+        budget_release = asyncio.create_task(
+            self._release_child_budget(child_name),
+            name=f"agent_budget_release:{child_name}",
+        )
+        release_cancelled, release_failure = await await_lifecycle_task_completion(
+            budget_release
+        )
+        if release_failure is not None:
+            raise release_failure
+        return release_cancelled
+
     async def spawn_agent(
         self,
         name: str,
@@ -948,21 +1101,115 @@ class AgentManager:
         return count
 
     async def shutdown_all(self) -> None:
-        """Gracefully shutdown all agents."""
+        """Gracefully shut down every agent, then report any terminal failures.
+
+        Fleet teardown is an ownership boundary: one agent's failed durable
+        continuation must never strand a later agent's dispatcher or storage.
+        Keep successful removals reflected in the relationship maps, retain
+        failed agents as published, and surface all ordinary failures only once
+        every candidate has received its shutdown attempt.
+        """
         # Stop + release budgeted children leaf-first (#2113): reverse insertion
         # order is leaf-first (a descendant is always spawned after its ancestor),
         # so each is quiesced and its unspent hold refunded UP into its (budgeted)
         # parent before that parent is released to the root. remove_agent does the
         # stop-then-release. (A follow-up covers durable reconciliation across an
         # *ungraceful* crash.)
+        cancelled = False
+        failures: list[Exception] = []
+        removed_names: set[str] = set()
+        attempted_names: set[str] = set()
+
+        def fully_removed(name: str) -> bool:
+            """Whether neither a routable agent nor a delegated hold remains."""
+            return name not in self._agents and name not in self._child_budgets
+
+        def record_failure(name: str, failure: Exception) -> None:
+            failures.append(failure)
+            logger.warning("Could not completely shut down agent %r: %s", name, failure)
+
+        async def attempt_removal(name: str, *, unpublished_hold: bool = False) -> None:
+            """Attempt one removal without allowing it to abort the fleet sweep."""
+            nonlocal cancelled
+            attempted_names.add(name)
+            failure_recorded = False
+            try:
+                if unpublished_hold:
+                    release_cancelled = (
+                        await self._release_child_budget_cancellation_safe(name)
+                    )
+                    cancelled = cancelled or release_cancelled
+                    removed = fully_removed(name)
+                else:
+                    removed = await self.remove_agent(name)
+            except asyncio.CancelledError:
+                # The single-agent primitive completes its durable tail before
+                # propagating cancellation.  Continue sweeping later agents;
+                # only prune this name when the authoritative maps confirm it.
+                cancelled = True
+                removed = fully_removed(name)
+                if not removed:
+                    record_failure(
+                        name,
+                        RuntimeError("removal was interrupted before completion"),
+                    )
+                    failure_recorded = True
+            except Exception as exc:
+                removed = fully_removed(name)
+                record_failure(name, exc)
+                failure_recorded = True
+
+            if removed:
+                removed_names.add(name)
+            elif not failure_recorded:
+                record_failure(
+                    name,
+                    RuntimeError("remove_agent returned False; agent remains published"),
+                )
+
         for child_name in reversed(list(self._child_budgets.keys())):
-            await self.remove_agent(child_name)
+            # A partially completed spawn/boot can leave a delegated hold
+            # without ever publishing its agent.  It has no live process to
+            # stop, but the leaf-first refund is still required before its
+            # parent's hold may be released.
+            await attempt_removal(
+                child_name,
+                unpublished_hold=child_name not in self._agents,
+            )
 
-        # Clear parent-child tracking
-        self._parent_children.clear()
-        self._child_mandates.clear()
-
-        names = list(self._agents.keys())
+        # A failed child remains published and must not be retried as an
+        # unrelated root agent.  Every other agent still receives one attempt.
+        names = [name for name in self._agents if name not in attempted_names]
         for name in names:
-            await self.remove_agent(name)
-        logger.info("All agents shut down")
+            await attempt_removal(name)
+
+        # Only successful removals may disappear from relationship state. A
+        # failed child stays visible to its parent and retains its mandate for a
+        # future recovery/termination attempt.
+        for child_name in removed_names:
+            self._child_mandates.pop(child_name, None)
+        for parent_did, children in list(self._parent_children.items()):
+            remaining_children = [
+                child_name for child_name in children if child_name not in removed_names
+            ]
+            if remaining_children:
+                self._parent_children[parent_did] = remaining_children
+            else:
+                self._parent_children.pop(parent_did, None)
+
+        remaining_agents = list(self._agents)
+        remaining_holds = list(self._child_budgets)
+        if remaining_agents or remaining_holds:
+            logger.warning(
+                "Fleet shutdown incomplete; agents still published=%s, "
+                "delegated holds still active=%s",
+                remaining_agents,
+                remaining_holds,
+            )
+        else:
+            logger.info("All agents shut down")
+
+        if cancelled:
+            raise asyncio.CancelledError()
+        if failures:
+            raise ExceptionGroup("One or more fleet agents failed to shut down", failures)
