@@ -46,6 +46,8 @@ class SchedulerExecution:
     ``idempotency_key`` is stable across lease recovery of this occurrence.
     Target tools can call :func:`get_current_scheduler_execution` while a
     scheduler dispatch is active instead of receiving undocumented arguments.
+    The identity is revoked as soon as that dispatch returns, including from
+    child tasks that inherited the parent task's context.
     """
 
     id: str
@@ -59,7 +61,27 @@ class SchedulerExecution:
     owner: str
 
 
-_current_execution: contextvars.ContextVar[Optional[SchedulerExecution]] = (
+@dataclass
+class _SchedulerExecutionScope:
+    """A revocable scheduler identity shared with copied task contexts.
+
+    ``asyncio.create_task`` and ``asyncio.to_thread`` copy ``ContextVar``
+    values.  Storing a raw :class:`SchedulerExecution` would therefore leave
+    a trusted occurrence identity usable by a detached child after the runner
+    finalized its claim.  A mutable scope is deliberately shared by those
+    copied contexts so revoking it closes every copy at once.
+    """
+
+    execution: SchedulerExecution
+    active: bool = True
+
+    def revoke(self) -> None:
+        """Make this occurrence unavailable from every copied context."""
+
+        self.active = False
+
+
+_current_execution: contextvars.ContextVar[Optional[_SchedulerExecutionScope]] = (
     contextvars.ContextVar("scheduler_execution", default=None)
 )
 
@@ -73,7 +95,10 @@ def get_current_scheduler_execution() -> Optional[SchedulerExecution]:
     compatible and prevents callers from forging scheduler metadata.
     """
 
-    return _current_execution.get()
+    scope = _current_execution.get()
+    if scope is None or not scope.active:
+        return None
+    return scope.execution
 
 
 @dataclass
@@ -447,10 +472,16 @@ class SchedulerRunner:
         outcome_signal: Optional[float] = None
         pause_schedule = False
         try:
-            token = _current_execution.set(execution)
+            scope = _SchedulerExecutionScope(execution)
+            token = _current_execution.set(scope)
             try:
                 raw = await self._run_executor(execution)
             finally:
+                # Invalidate before the parent context is reset.  Child tasks
+                # created by a target inherit this same scope, so they can no
+                # longer present a completed occurrence as trusted scheduler
+                # work after they outlive the dispatch.
+                scope.revoke()
                 _current_execution.reset(token)
             status, result_text, outcome_signal, pause_schedule = self._normalise_result(raw, task)
         except asyncio.CancelledError:

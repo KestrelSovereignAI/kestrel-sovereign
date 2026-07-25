@@ -36,6 +36,14 @@ key at their effect boundary. During dispatch they can retrieve
 `kestrel_sovereign.features.scheduler.runner` for the execution ID, occurrence,
 attempt number, and idempotency key.
 
+For isolated-feature tools, Core translates that trusted scheduler identity to
+the public SDK `ToolExecutionContext` JSON-RPC envelope. The envelope is never
+merged into tool arguments. A scheduled invocation fails before dispatch when
+the isolated service has not explicitly advertised execution-context support;
+ordinary interactive/API calls retain their legacy wire format. Isolated tools
+should use the SDK's `get_tool_execution_context()` only while their handler is
+active and apply `idempotency_key` at the external-effect boundary.
+
 ## Schedule kinds and time zones
 
 `schedule_add` creates a recurring cron schedule. Its `timezone_name` accepts

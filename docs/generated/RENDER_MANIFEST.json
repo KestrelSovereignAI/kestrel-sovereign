@@ -551,6 +551,18 @@
       "type": "Architecture Spec"
     },
     {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/SCHEDULER_DURABILITY.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "active",
+      "title": "Durable Scheduler Execution",
+      "type": "Architecture Spec"
+    },
+    {
       "existing_code_refs": [
         "CLAUDE.md",
         "kestrel_sovereign/a2a/task_manager.py",
