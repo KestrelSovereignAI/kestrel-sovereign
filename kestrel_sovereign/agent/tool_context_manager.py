@@ -154,10 +154,7 @@ class ToolContextManager:
             "message_count": message_count,
             "oldest_message_age": oldest_timestamp,
             "model": self.model,
-            "note": (
-                "Legacy projection from session-filtered history limited to "
-                "50 messages; not an exact production prompt trace."
-            )
+            "note": "Status reflects the same data path used by the LLM (session-filtered, limited to 50 messages)."
         }
 
         # Nest context analysis from the accumulator (if provided)

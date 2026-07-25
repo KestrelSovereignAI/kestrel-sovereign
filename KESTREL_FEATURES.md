@@ -327,7 +327,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `context_stash_peek` | `!context stash peek` | `memory` | `stash_id`, `max_chars` | 103 | `enabled` |
 | `context_stash_pop` | `!context stash pop` | `memory` | `stash_id` | 73 | `enabled` |
 | `context_stash_save` | `!context stash save` | `memory` | `stash_id`, `name`, `summary`, `tags` | 140 | `enabled` |
-| `context_status` | `!context status` | `system` |  | 49 | `enabled` |
+| `context_status` | `!context status` | `system` |  | 44 | `enabled` |
 | `exclude_from_context` | `!context exclude` | `memory` | `target`, `reason` | 113 | `enabled` |
 | `hierarchical_compact` | `!context compact hierarchical` | `memory` | `chunk_size`, `keep_recent`, `max_depth` | 143 | `enabled` |
 | `mark_content` | `!context mark` | `memory` | `action`, `target`, `reason` | 162 | `enabled` |
@@ -964,7 +964,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!context stash peek` | `context` | `[stash_id] [max_chars]` | Peek at stash contents without restoring. Use to explore stashed context programmatically (RLM-inspired context-as-variable). Pass stash_id to target a specific stash; leave stash_id empty ("") to target the most recent stash. |
 | `!context stash pop` | `context` | `[stash_id]` | Pop a stash (restore messages and remove from stash list). Like git stash pop. Pass stash_id to target a specific stash; leave stash_id empty ("") to target the most recent stash. |
 | `!context stash save` | `context` | `[stash_id] [name] [summary] [tags]` | Save a stash to long-term storage with semantic search capability. Use when you want to preserve context for future retrieval via !recall. Pass stash_id to target a specific stash; leave stash_id empty ("") to target the most recent stash. |
-| `!context status` | `context` |  | Estimate current context-window utilization for planning. This diagnostic does not exactly reproduce production retrieval, pruning, or the provider payload. |
+| `!context status` | `context` |  | Check current context window utilization. Use this to understand how much context space is available before deciding to summarize or prune. |
 | `!context summarize` | `context` | `<mode> <criteria> [preserve_key_facts]` | Summarize a specific section of conversation history to save context space. Use this to compact verbose exchanges while preserving key information. mode must be one of: time_range, topic, messages, last_n. |
 | `!delivery failed` | `delivery` | `[limit]` | List messages in the dead letter queue (permanently failed) |
 | `!delivery purge` | `delivery` | `[older_than_hours]` | Clear delivered messages older than 24 hours from the queue |

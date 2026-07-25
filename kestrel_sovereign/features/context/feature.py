@@ -255,11 +255,7 @@ class ContextFeature(Feature):
 
     @tool(
         name="context_status",
-        description=(
-            "Estimate current context-window utilization for planning. "
-            "This diagnostic does not exactly reproduce production retrieval, "
-            "pruning, or the provider payload."
-        ),
+        description="Check current context window utilization. Use this to understand how much context space is available before deciding to summarize or prune.",
         category=ToolCategory.SYSTEM,
         command_prefix="!context status"
     )
