@@ -733,10 +733,12 @@ async def test_postgres_rollout_transition_waits_for_admitted_effect(
         assert await db.fetchone(
             "SELECT status FROM task_execution_log WHERE task_id = ?", (task_id,)
         ) == ("success",)
-        assert await db.fetchone(
+        rollout = await db.fetchone(
             "SELECT state, activation_nonce FROM scheduler_protocol_rollout WHERE agent_id = ?",
             (agent_id,),
-        )[0] == "quiescing"
+        )
+        assert rollout is not None
+        assert rollout[0] == "quiescing"
     finally:
         release_executor.set()
         for task in (tick, transition):
