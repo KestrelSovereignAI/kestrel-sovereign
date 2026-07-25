@@ -1,7 +1,6 @@
 """Sync checks between the canonical inventory and the live code surface."""
 
 from pathlib import Path
-import re
 
 from kestrel_sovereign.feature_inventory import (
     discover_app_routes,
@@ -10,6 +9,7 @@ from kestrel_sovereign.feature_inventory import (
     discover_exported_feature_classes,
     discover_router_routes,
 )
+from scripts import check_docs_links
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -48,10 +48,7 @@ def test_canonical_inventory_mentions_all_app_routes():
 
 
 def test_canonical_inventory_links_point_to_existing_paths():
-    text = (PROJECT_ROOT / "KESTREL_FEATURES.md").read_text(encoding="utf-8")
-    link_pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
+    inventory = PROJECT_ROOT / "KESTREL_FEATURES.md"
+    broken_links = check_docs_links.check_file(inventory)
 
-    for target in link_pattern.findall(text):
-        if target.startswith(("http://", "https://", "#")):
-            continue
-        assert (PROJECT_ROOT / target).exists(), target
+    assert broken_links == [], "\n".join(link.format() for link in broken_links)
