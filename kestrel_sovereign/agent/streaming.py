@@ -20,6 +20,7 @@ from kestrel_sovereign.agent.parts import (
     part_collector,
 )
 from kestrel_sovereign.agent.operator_signals import inject_operator_turn
+from kestrel_sovereign.agent.context_manager import CONTEXT_HISTORY_LIMIT
 from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
 from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
 from kestrel_sovereign.security.input_guardrails import (
@@ -1182,7 +1183,10 @@ class StreamingMixin:
         privacy_mode = self.privacy_agent.privacy_mode.name
 
         # Get session-filtered conversation history
-        history = await self.privacy_agent.get_conversation_history(limit=50, session_id=session_id)
+        history = await self.privacy_agent.get_conversation_history(
+            limit=CONTEXT_HISTORY_LIMIT,
+            session_id=session_id,
+        )
 
         # Get constitution the same way as process_input
         constitution = await self._get_governing_constitution()
@@ -1216,15 +1220,19 @@ class StreamingMixin:
             except Exception:
                 pass  # Non-critical — log already handled in feature
 
+        # Snapshot tool schemas before planning so dry/live accounting and the
+        # eventual provider payload use identical registry bytes.
+        feature_tools = self._build_all_tools()
         context_result = await self.context_manager.build_context(
             query=user_input,
             constitution=constitution,
-            include_briefing=True,
+            include_briefing=not getattr(self, "_session_briefed", False),
             include_memories=True,
             include_rag=True,
             privacy_mode=privacy_mode,
             conversation_history=history,
             reflection_guidance=reflection_guidance,
+            tools=feature_tools,
         )
 
         # B / #1309 + C / #1311 degraded-mode fail-closed (streaming
@@ -1248,6 +1256,11 @@ class StreamingMixin:
                 f"is in a degraded state. Details: {warn_text}"
             )
             return
+
+        # Keep streaming and non-streaming context inputs identical: the
+        # session briefing is admitted once, after a non-degraded plan, before
+        # the provider call starts.
+        self._session_briefed = True
 
         # Build user prompt. `context` carries the per-turn retrieved content
         # (memories + RAG) — kept OUT of the system message so the system prefix
@@ -1300,9 +1313,7 @@ class StreamingMixin:
         if not effective_model:
             effective_model = await self.check_solvency()
 
-        # Build feature tools for the orchestrator (A2A pattern)
-        # Includes feature dispatch tools + any direct tools from explored features
-        feature_tools = self._build_all_tools()
+        # ``feature_tools`` was captured before context planning.
 
         # Log tool availability
         tool_names = [t['function']['name'] for t in feature_tools] if feature_tools else []

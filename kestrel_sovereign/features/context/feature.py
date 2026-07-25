@@ -276,11 +276,11 @@ class ContextFeature(Feature):
             )
 
         try:
-            # #1969: report the SAME session-scoped, canonical measurement the
+            # #1969: report the SAME session-scoped diagnostic projection the
             # chat-footer pill uses (compute_context_status →
             # measure_context_breakdown), instead of the old cross-session,
-            # raw-content count that drifted from the UI. Scope to the agent's
-            # active session — the window the LLM actually sees this turn.
+            # raw-content count that drifted from the UI. Scope the projection
+            # to the agent's active session.
             from kestrel_sovereign.endpoints.agent import compute_context_status
 
             session_id = getattr(self.agent, "_active_session_id", None)

@@ -460,6 +460,15 @@ def render_inventory_markdown(inventory: Inventory) -> str:
         lines.append("")
         lines.append(f"- Source: [`{feature.source}`]({feature.source})")
         lines.append(f"- Enablement state: `{feature.enablement_state}`")
+        if feature.module == "context":
+            lines.extend([
+                "- `context_status` is the cheap dry-run view of the same typed",
+                "  `ContextManager` plan used by `GET /api/agent/context-status` and",
+                "  production turns. Cheap mode marks omitted memory/RAG sections unknown;",
+                "  `full=true` executes the production retrieval and pruning policy read-only.",
+                "  It reads anchored governing policy without lazily creating missing state.",
+                "  Provider-native framing remains outside the Kestrel plan.",
+            ])
         if not feature.tools:
             lines.append("- Tools: none discovered")
             lines.append("")

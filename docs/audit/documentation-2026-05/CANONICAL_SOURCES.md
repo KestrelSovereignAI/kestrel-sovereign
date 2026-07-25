@@ -32,7 +32,7 @@ This file records which documentation surfaces are allowed to act as source-of-t
 | Demo evidence | `demos/*/demo.cjs` plus `demos/*/eye.toml` | `docs/generated/DEMO_EVIDENCE.md`, `docs/demos/DEMO_SCRIPT.md` | Demo evidence is generated from executable demos and visual-review configs. |
 | Package metadata | `pyproject.toml` | README install sections | Source for runtime deps, optional deps, and entry-point groups. |
 | Architecture index | `docs/architecture/README.md` | individual architecture docs | Index should only mark a doc Active when current code/package ownership is known. |
-| Context architecture | To be selected by context lane | `CONTEXT_SYSTEM_DESIGN.md`, `CONTEXT_C_DURABLE_SALVAGE.md` | Current docs need reconciliation. |
+| Context architecture | `docs/architecture/CONTEXT_SYSTEM_DESIGN.md` | `CONTEXT_C_DURABLE_SALVAGE.md`, `LLM_SERVICE_ARCHITECTURE.md`, context research notes, and generated feature views | Resolved 2026-07-25: the canonical page is active current state; durable salvage is an aspirational design with a conditional partial implementation. |
 | Memory/retrieval/storage architecture | To be selected by memory lane | memory/storage/user sovereignty docs | Current docs need reconciliation. |
 | LLM routing architecture | `docs/architecture/LLM_SERVICE_ARCHITECTURE.md` after re-audit | LLM provider docs | Must align with SDK and `kestrel-llms`. |
 | Signals architecture | `docs/architecture/SIGNAL_DISPATCHER.md` after re-audit | `SIGNAL_SOURCES_GUIDE.md`, workflow docs | Workflow ownership must be clarified. |
