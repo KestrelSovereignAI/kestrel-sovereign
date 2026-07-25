@@ -666,6 +666,7 @@ async def test_postgres_rollout_transition_waits_for_admitted_effect(
     db = AsyncDatabase(db_backend)
     agent_id = f"scheduler-admission-fence:{uuid4()}"
     task_id = f"scheduler-admission-fence-task:{uuid4()}"
+    legacy_task_id = f"scheduler-admission-fence-legacy:{uuid4()}"
     executor_started = asyncio.Event()
     release_executor = asyncio.Event()
     tick: asyncio.Task[None] | None = None
@@ -703,11 +704,19 @@ async def test_postgres_rollout_transition_waits_for_admitted_effect(
         tick = asyncio.create_task(runner._tick())
         await asyncio.wait_for(executor_started.wait(), timeout=2)
 
-        # Simulate an origin/main process writing a legacy-visible row after
-        # this runner was prepared. The next reconciliation must quiesce it.
+        # Simulate an origin/main process adding a legacy-visible row after
+        # this runner was prepared. An old binary does not know the v2 marker
+        # column and therefore cannot erase it from the live v2 claim above;
+        # using a separate row models the real mixed-version condition.
         await db.execute(
-            "UPDATE scheduled_tasks SET scheduler_protocol_version = NULL WHERE id = ?",
-            (task_id,),
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 next_run_at, created_at, idempotency_key)
+            VALUES (?, ?, 'legacy-task', '* * * * *', '{}', 1, ?, ?,
+                    'admission-fence-legacy')
+            """,
+            (legacy_task_id, agent_id, due, due),
         )
 
         async def reconcile() -> None:
