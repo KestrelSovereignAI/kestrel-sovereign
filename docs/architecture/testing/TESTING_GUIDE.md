@@ -45,9 +45,18 @@ Tests are organized in a pyramid structure - run from the bottom up:
 
 A fresh `uv sync` installs `pytest-cov` through the default development group.
 The `--ci` command measures the canonical `kestrel_sovereign` package and
-enforces the 80% floor in `.coveragerc`. The scheduled weekly analysis runs the
-same coverage gate. It remains failed when tests or coverage fail, while its
-feedback artifact upload and issue-analysis job run unconditionally.
+enforces the measured ratchet in `.coveragerc`. The current ratchet is 73%, not
+80%: a 2026-07-25 full-unit-suite measurement produced 73.53% combined
+line/branch coverage (68,079 covered lines and 19,863 covered branches). The
+weekly job includes that unit suite plus the remaining repository tests. An 80%
+floor remains the next target and must not be presented as current coverage.
+
+The scheduled weekly analysis runs the same coverage gate with xdist. CI
+disables fail-fast for this lane so pytest-cov can combine every worker file and
+write terminal, HTML, JSON, and XML diagnostics even when tests fail. The job
+remains failed when tests or coverage fail, while feedback/coverage uploads and
+the issue-analysis job still run. Missing artifacts are tolerated so an early
+test-runner failure does not hide the original failure or prevent analysis.
 
 For a focused coverage report during development, override the repository-wide
 floor so untested modules outside the selected test do not fail the command:
@@ -66,7 +75,7 @@ The project includes a comprehensive test runner with smart features:
 | `--unit` | Run unit tests only |
 | `--integration` | Run integration tests only |
 | `--llm` | Run LLM-dependent tests |
-| `--ci` | Full CI mode (parallel + canonical-package coverage, 80% floor) |
+| `--ci` | Full CI mode (parallel + canonical-package branch coverage, 73% measured ratchet) |
 | `-x` | Fail fast (stop on first failure) |
 | `--failed` | Re-run only last failed tests |
 | `--skip-check` | Skip DB/Redis health checks |

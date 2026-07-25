@@ -11,8 +11,10 @@ import pytest
 import tempfile
 import shutil
 import os
+import sys
 import threading
 import asyncio
+import time
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Generator
@@ -32,6 +34,38 @@ from tests.utils.feedback_bridge import (
     pytest_addoption as _feedback_addoption,
     pytest_configure as _feedback_configure,
 )
+
+FORCED_EXIT_GRACE_SECONDS = 10.0
+
+
+def _force_exit_after_plugin_teardown(exitstatus: int) -> None:
+    """Kill a pytest process only if orphaned threads outlive plugin teardown.
+
+    This watchdog is deliberately daemonized and delayed.  In particular,
+    pytest-cov and xdist must be allowed to save and exchange their SQLite
+    coverage data before a stuck non-daemon application thread is allowed to
+    terminate the process.
+    """
+    time.sleep(FORCED_EXIT_GRACE_SECONDS)
+    print(
+        f"\n[CLEANUP] Force exiting after plugin-teardown grace period "
+        f"(exit code: {exitstatus})",
+        file=sys.stderr,
+    )
+    sys.stderr.flush()
+    sys.stdout.flush()
+    os._exit(exitstatus)
+
+
+def _arm_forced_exit_watchdog(exitstatus: int) -> None:
+    """Arm the delayed process-exit guard without blocking pytest hooks."""
+    watchdog = threading.Thread(
+        target=_force_exit_after_plugin_teardown,
+        args=(int(exitstatus),),
+        name="pytest-force-exit-watchdog",
+        daemon=True,
+    )
+    watchdog.start()
 
 
 def pytest_addoption(parser):
@@ -94,8 +128,6 @@ def pytest_sessionfinish(session, exitstatus):
     After all tests have completed, if orphaned aiosqlite threads remain,
     we force exit to prevent CI from hanging.
     """
-    import sys
-    import os as _os
     from tests.shared.cost_tracker import cost_tracker
 
     # 1. Clean up any tracked resources first
@@ -161,12 +193,16 @@ def pytest_sessionfinish(session, exitstatus):
         for t in non_daemon_threads[:5]:
             print(f"  - {t.name} ({type(t).__module__}.{type(t).__name__})", file=sys.stderr)
 
-        # Force exit to prevent CI timeout
-        # This is safe because ALL tests have completed at this point
-        print(f"\n[CLEANUP] Force exiting to prevent CI hang (exit code: {exitstatus})", file=sys.stderr)
-        sys.stderr.flush()
-        sys.stdout.flush()
-        _os._exit(exitstatus)
+        # A direct os._exit() here corrupts pytest-cov/xdist finalization:
+        # worker output and the SQLite coverage files are still consumed by
+        # plugins after this hook.  A daemon watchdog preserves the anti-hang
+        # behavior while giving every pytest teardown hook time to finish.
+        print(
+            f"\n[CLEANUP] Arming {FORCED_EXIT_GRACE_SECONDS:g}s forced-exit "
+            "watchdog so pytest plugins can finish",
+            file=sys.stderr,
+        )
+        _arm_forced_exit_watchdog(exitstatus)
 
 
 # =============================================================================

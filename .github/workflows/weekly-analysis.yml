@@ -67,6 +67,17 @@ jobs:
           path: /tmp/test_feedback.db
           if-no-files-found: ignore
 
+      - name: Upload coverage diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: weekly-coverage-diagnostics
+          path: |
+            coverage.json
+            coverage.xml
+            coverage_html/
+          if-no-files-found: ignore
+
   create-issues:
     runs-on: ubuntu-latest
     needs: full-test-suite
