@@ -58,6 +58,36 @@ Feature lifecycle class names only; provider implementations use
 environment,” not a claim that an external distribution is publicly reachable.
 <!-- END PROTECTED PACKAGE BOUNDARY CONTRACT -->
 
+<!-- BEGIN PROTECTED CONTEXT HONESTY CONTRACT -->
+## Context Runtime and Diagnostic Boundary
+
+These context statements are normative and must remain intact in every
+audience-specific derivative:
+
+- A production turn preloads at most the latest **50** eligible entries from
+  the active session before retrieval, budgeting, and lumpy history selection.
+- `context_status` and `GET /api/agent/context-status` are diagnostic
+  projections, not exact prompt traces. Diagnostics may inspect up to 10,000
+  stored rows; even `full=true` does not reproduce production's latest-50
+  preload, every retrieval gate, elastic borrowing, lumpy pruning, or provider
+  framing.
+- [Issue #2534](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2534)
+  remains open for that runtime drift. Documentation work does not implement
+  its runtime fix and does not change or close the issue.
+- Default lumpy pruning omits older history from the provider window while
+  retaining the source rows; it does not create an automatic durable summary.
+  Automatic durable salvage is disabled by default. Its feature-flagged path is
+  conditional on a pruned span mapping to id-bearing persistent history, so it
+  is not a fail-closed guarantee for id-less or `ISOLATED` in-memory history.
+- `openai:plan` occupancy compaction is best-effort. Kestrel resets the Codex
+  thread only after durable compaction reports success; a skipped or failed
+  attempt lets the turn continue with the existing thread.
+- The complete all-route Context C lifecycle remains aspirational, not shipped
+  behavior. The canonical current-state contract is
+  `docs/architecture/CONTEXT_SYSTEM_DESIGN.md`; the separate
+  `docs/architecture/CONTEXT_C_DURABLE_SALVAGE.md` page is a design record.
+<!-- END PROTECTED CONTEXT HONESTY CONTRACT -->
+
 # Kestrel — What It Can Do For You
 
 > A friendly, scannable overview of everything Kestrel offers — no technical jargon required.

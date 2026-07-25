@@ -9,7 +9,7 @@ tags:
 - docs
 - research
 - research-note
-timestamp: '2026-06-18T00:00:00Z'
+timestamp: '2026-07-25T00:00:00Z'
 status: snapshot
 owner: documentation
 canonical: false
@@ -18,6 +18,13 @@ privacy: public
 ---
 
 # llama-server cache flags
+
+> **Status: operational research snapshot, not the context contract.** The
+> current Kestrel-side persistence, prefix construction, and lumpy-pruning
+> behavior is defined by
+> [Kestrel Context Management Contract](../architecture/CONTEXT_SYSTEM_DESIGN.md).
+> Flags and benchmark numbers below depend on the installed llama-server
+> version and local hardware.
 
 Recommended `llama-server` startup flags when Kestrel talks to it via the
 `llama_cpp:local` route. Pairs with issue #704 (client sends `cache_prompt:
@@ -54,11 +61,12 @@ diverges by a short run (N tokens or fewer), llama-server can re-shift
 the existing KV instead of reprefilling the entire suffix from the
 divergence point.
 
-Typical win: the first turn after Kestrel runs a history-compression
-pass. Compression replaces older raw turns with a synthetic summary
-message; without `--cache-reuse`, that single insertion invalidates the
-entire KV tail. With `--cache-reuse 256`, llama-server detects the small
-middle divergence and only reprocesses the surrounding window.
+Typical win: the first turn after an explicit or route-triggered durable
+history-compaction pass. Compaction replaces older visible turns with a
+synthetic summary marker; without `--cache-reuse`, that insertion can
+invalidate the KV tail. With `--cache-reuse 256`, llama-server may recover
+more of the surrounding window. The normal automatic path uses lumpy suffix
+selection and does not imply that a durable summary was created.
 
 `256` is a reasonable default — larger values cost more CPU per request
 in the hope of recovering more cache; smaller values save CPU but
@@ -88,12 +96,11 @@ starves one conversation's cache to feed the other.
   True}` on the chat completion request. This is a llama-server-specific
   hint to be aggressive about retaining this slot's KV state for prefix
   matching across requests.
-- **Prompt shape** (issue #703): Kestrel's system prompt is stable
-  across turns, and historical user messages are consistently wrapped in
-  `<user_input>` tags when loaded. Together these make the token-level
-  prefix between turn N and turn N+1 byte-identical for the system + the
-  N-2-and-earlier history — which is exactly what llama-server's cache
-  matches against.
+- **Prompt shape** (issue #703): Kestrel keeps turn-dependent retrieval
+  outside the stable system prefix, replays persisted sent-form history
+  byte-for-byte, and moves the selected history boundary in chunks. Together
+  these choices preserve a long identical prefix across many turns when no
+  other cache-invalidating input changes.
 
 ## Verifying it works
 

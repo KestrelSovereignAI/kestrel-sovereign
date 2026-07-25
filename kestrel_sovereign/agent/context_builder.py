@@ -1155,7 +1155,7 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
         include_rag: bool = True,
         memory_retriever: Optional[Callable[[str, int], Awaitable[Optional[str]]]] = None,
     ) -> Dict[str, Any]:
-        """Measure context composition the LLM call would actually see.
+        """Project context composition for diagnostics and legacy assembly.
 
         **Read-only.** No LLM call. No DB writes. The caller is
         responsible for passing only side-effect-free helpers (see
@@ -1164,11 +1164,11 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
         as a rehearsal-effect side effect and MUST NOT be passed in
         unmodified; wrap it in a side-effect-free adapter).
 
-        Single source of truth for per-section token measurement: the
-        breakdown popup (#1310), elastic budget (#1309), and any future
-        introspection caller all read from this method so the surface
-        and the live call path cannot drift. ``build_full_context`` now
-        calls this method directly to obtain its per-section counts.
+        This is the shared per-section measurement used by the breakdown
+        popup (#1310) and ``build_full_context``. The production
+        ``ContextManager.build_context`` coordinator reuses section builders
+        but has different retrieval gates, elastic borrowing, and lumpy-prune
+        behavior, so this method is not an exact dry-run of a production turn.
 
         Per-section accuracy:
 
@@ -1177,13 +1177,13 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
           ``build_system_prompt`` joins. Each subsection's token count
           equals counting the parts of that group joined with
           ``"\\n\\n"``. The whole-system total is computed by counting
-          the fully assembled prompt so it matches the LLM-visible bytes
-          exactly.
+          the fully assembled prompt. That subsection is byte-consistent with
+          this builder, but provider framing remains outside the projection.
         - **tools** — JSON-serialised tool schemas; previously
           *never measured*. Caller passes the same list it would hand
           to the LLM adapter.
         - **history** — runs ``format_conversation_history`` as a
-          dry-run; reports ``messages_kept_after_pruning`` and the
+          projection; reports ``messages_kept_after_pruning`` and the
           unpruned raw sum so the popup can distinguish "lots of stored
           history" from "lots of history the LLM will actually see."
         - **episodes** — uses ``len(episodes)`` (no ``"**"`` heuristic).
@@ -1192,7 +1192,7 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
         - **memories** — wrapped by the production
           ``<retrieved_context><memories>…</memories></retrieved_context>``
           envelope and gated by the per-section ``can_fit`` check, so
-          the figure equals the byte-cost the LLM would actually see.
+          the figure estimates the insertion cost for this builder.
           Measured when ``memory_retriever`` is supplied (and is
           side-effect-free).
         - **rag** — wrapped by the production

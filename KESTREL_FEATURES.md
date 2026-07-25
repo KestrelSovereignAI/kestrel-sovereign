@@ -81,16 +81,51 @@ environment,” not a claim that an external distribution is publicly reachable.
 
 ### Agent runtime and context assembly
 
+- Canonical behavior contract:
+  - [`docs/architecture/CONTEXT_SYSTEM_DESIGN.md`](docs/architecture/CONTEXT_SYSTEM_DESIGN.md)
 - Core agent orchestration:
   - [`kestrel_sovereign/kestrel_agent.py`](kestrel_sovereign/kestrel_agent.py)
   - [`kestrel_sovereign/command_handler.py`](kestrel_sovereign/command_handler.py)
 - Context and token budgeting:
   - [`kestrel_sovereign/agent/context_manager.py`](kestrel_sovereign/agent/context_manager.py)
   - [`kestrel_sovereign/agent/context_builder.py`](kestrel_sovereign/agent/context_builder.py)
+  - [`kestrel_sovereign/agent/context_stages.py`](kestrel_sovereign/agent/context_stages.py)
   - [`kestrel_sovereign/agent/token_budget.py`](kestrel_sovereign/agent/token_budget.py)
+- Canonical and rendered conversation persistence:
+  - [`kestrel_sovereign/storage/async_conversation_store.py`](kestrel_sovereign/storage/async_conversation_store.py)
 - Streaming and request lifecycle:
   - [`kestrel_sovereign/agent/streaming.py`](kestrel_sovereign/agent/streaming.py)
   - [`kestrel_sovereign/endpoints/agent.py`](kestrel_sovereign/endpoints/agent.py)
+
+<!-- BEGIN PROTECTED CONTEXT HONESTY CONTRACT -->
+## Context Runtime and Diagnostic Boundary
+
+These context statements are normative and must remain intact in every
+audience-specific derivative:
+
+- A production turn preloads at most the latest **50** eligible entries from
+  the active session before retrieval, budgeting, and lumpy history selection.
+- `context_status` and `GET /api/agent/context-status` are diagnostic
+  projections, not exact prompt traces. Diagnostics may inspect up to 10,000
+  stored rows; even `full=true` does not reproduce production's latest-50
+  preload, every retrieval gate, elastic borrowing, lumpy pruning, or provider
+  framing.
+- [Issue #2534](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2534)
+  remains open for that runtime drift. Documentation work does not implement
+  its runtime fix and does not change or close the issue.
+- Default lumpy pruning omits older history from the provider window while
+  retaining the source rows; it does not create an automatic durable summary.
+  Automatic durable salvage is disabled by default. Its feature-flagged path is
+  conditional on a pruned span mapping to id-bearing persistent history, so it
+  is not a fail-closed guarantee for id-less or `ISOLATED` in-memory history.
+- `openai:plan` occupancy compaction is best-effort. Kestrel resets the Codex
+  thread only after durable compaction reports success; a skipped or failed
+  attempt lets the turn continue with the existing thread.
+- The complete all-route Context C lifecycle remains aspirational, not shipped
+  behavior. The canonical current-state contract is
+  `docs/architecture/CONTEXT_SYSTEM_DESIGN.md`; the separate
+  `docs/architecture/CONTEXT_C_DURABLE_SALVAGE.md` page is a design record.
+<!-- END PROTECTED CONTEXT HONESTY CONTRACT -->
 
 ### Multi-LLM platform
 
@@ -157,7 +192,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
-| `read_attachment` | `!read-attachment` | `system` | `attachment_id`, `session_id` | 143 | `enabled` |
+| `read_attachment` | `!read-attachment` | `system` | `attachment_id`, `offset`, `length`, `session_id` | 260 | `enabled` |
 
 ### `audit_anchor` (AuditAnchorFeature)
 
@@ -177,12 +212,12 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
-| `bootstrap_add` | `!bootstrap add` | `system` | `file_path` | 56 | `enabled` |
-| `bootstrap_list` | `!bootstrap list` | `system` |  | 26 | `enabled` |
+| `bootstrap_add` | `!bootstrap add` | `system` | `file_path` | 98 | `enabled` |
+| `bootstrap_list` | `!bootstrap list` | `system` |  | 42 | `enabled` |
 | `bootstrap_reload` | `!bootstrap reload` | `system` |  | 33 | `enabled` |
-| `bootstrap_remove` | `!bootstrap remove` | `system` | `name` | 51 | `enabled` |
+| `bootstrap_remove` | `!bootstrap remove` | `system` | `name` | 72 | `enabled` |
 | `bootstrap_status` | `!bootstrap-status` | `system` |  | 21 | `enabled` |
-| `rename_agent` | `!rename` | `system` | `new_name` | 43 | `enabled` |
+| `rename_agent` | `!rename` | `system` | `new_name` | 52 | `enabled` |
 | `restart_discovery` | `!restart-discovery` | `system` |  | 23 | `enabled` |
 | `skip_discovery` | `!skip-discovery` | `system` |  | 25 | `enabled` |
 
@@ -216,11 +251,11 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
 | `cli_status` | `!cli-status` | `system` |  | 27 | `enabled` |
-| `git_diff` | `!git-diff` | `data_access` | `ref`, `path`, `repo_path` | 73 | `enabled` |
-| `git_log` | `!git-log` | `data_access` | `max_count`, `repo_path` | 59 | `enabled` |
-| `git_merge_base` | `!git-merge-base` | `data_access` | `left_ref`, `right_ref`, `repo_path` | 66 | `enabled` |
-| `git_show_file` | `!git-show-file` | `data_access` | `ref`, `path`, `repo_path` | 68 | `enabled` |
-| `git_status` | `!git-status` | `data_access` | `repo_path` | 44 | `enabled` |
+| `git_diff` | `!git-diff` | `data_access` | `ref`, `path`, `repo_path` | 109 | `enabled` |
+| `git_log` | `!git-log` | `data_access` | `max_count`, `repo_path` | 79 | `enabled` |
+| `git_merge_base` | `!git-merge-base` | `data_access` | `left_ref`, `right_ref`, `repo_path` | 93 | `enabled` |
+| `git_show_file` | `!git-show-file` | `data_access` | `ref`, `path`, `repo_path` | 104 | `enabled` |
+| `git_status` | `!git-status` | `data_access` | `repo_path` | 57 | `enabled` |
 
 ### `compute` (ComputeFeature)
 
@@ -233,12 +268,12 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `execution_history` | `!compute-history` | `system` | `script_id`, `limit` | 76 | `enabled` |
 | `get_compute_capabilities` | `!compute-caps` | `system` |  | 21 | `enabled` |
 | `get_compute_policy` |  | `system` |  | 21 | `enabled` |
-| `list_scripts` | `!compute-list` | `system` | `state`, `limit` | 92 | `enabled` |
+| `list_scripts` | `!compute-list` | `system` | `state`, `limit` | 125 | `enabled` |
 | `list_trash` | `!compute-trash` | `system` | `days` | 48 | `enabled` |
 | `restore_from_trash` | `!compute-restore` | `system` | `trash_path`, `destination` | 80 | `enabled` |
-| `run_script` | `!compute-run` | `system` | `script_id`, `executor`, `timeout` | 125 | `enabled` |
+| `run_script` | `!compute-run` | `system` | `script_id`, `executor`, `timeout` | 196 | `enabled` |
 | `show_script` | `!compute-show` | `system` | `script_id` | 44 | `enabled` |
-| `write_script` | `!compute-write` | `system` | `name`, `language`, `content`, `purpose`, `requirements` | 178 | `enabled` |
+| `write_script` | `!compute-write` | `system` | `name`, `language`, `content`, `purpose`, `requirements` | 192 | `enabled` |
 
 ### `computer_use` (ComputerUseFeature)
 
@@ -270,30 +305,35 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
-| `constitution` | `!constitution` | `system` | `article`, `search`, `summary` | 136 | `enabled` |
+| `constitution` | `!constitution` | `system` | `article`, `search`, `summary` | 214 | `enabled` |
 
 ### `context` (ContextFeature)
 
 - Source: [`kestrel_sovereign/features/context/feature.py`](kestrel_sovereign/features/context/feature.py)
 - Enablement state: `enabled`
+- `context_status` is a cheap diagnostic projection shared with
+  `GET /api/agent/context-status`; it is not an exact trace of the production
+  retrieval/pruning path. The endpoint's `full=true` mode adds read-only live
+  retrieval but retains the
+  [documented #2534 limitation](docs/architecture/CONTEXT_SYSTEM_DESIGN.md#honesty-boundary-issue-2534).
 
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
 | `compact_context` | `!context compact` | `memory` | `keep_recent`, `force`, `dry_run` | 156 | `enabled` |
 | `context_stash` | `!context stash` | `memory` | `target`, `name` | 124 | `enabled` |
-| `context_stash_apply` | `!context stash apply` | `memory` | `stash_id` | 52 | `enabled` |
-| `context_stash_drop` | `!context stash drop` | `memory` | `stash_id` | 52 | `enabled` |
+| `context_stash_apply` | `!context stash apply` | `memory` | `stash_id` | 78 | `enabled` |
+| `context_stash_drop` | `!context stash drop` | `memory` | `stash_id` | 77 | `enabled` |
 | `context_stash_list` | `!context stash list` | `memory` |  | 23 | `enabled` |
-| `context_stash_peek` | `!context stash peek` | `memory` | `stash_id`, `max_chars` | 78 | `enabled` |
-| `context_stash_pop` | `!context stash pop` | `memory` | `stash_id` | 50 | `enabled` |
-| `context_stash_save` | `!context stash save` | `memory` | `stash_id`, `name`, `summary`, `tags` | 114 | `enabled` |
+| `context_stash_peek` | `!context stash peek` | `memory` | `stash_id`, `max_chars` | 103 | `enabled` |
+| `context_stash_pop` | `!context stash pop` | `memory` | `stash_id` | 73 | `enabled` |
+| `context_stash_save` | `!context stash save` | `memory` | `stash_id`, `name`, `summary`, `tags` | 140 | `enabled` |
 | `context_status` | `!context status` | `system` |  | 44 | `enabled` |
 | `exclude_from_context` | `!context exclude` | `memory` | `target`, `reason` | 113 | `enabled` |
 | `hierarchical_compact` | `!context compact hierarchical` | `memory` | `chunk_size`, `keep_recent`, `max_depth` | 143 | `enabled` |
 | `mark_content` | `!context mark` | `memory` | `action`, `target`, `reason` | 162 | `enabled` |
-| `recursive_query` | `!context query` | `memory` | `context_source`, `query`, `use_cheap_model` | 160 | `enabled` |
+| `recursive_query` | `!context query` | `memory` | `context_source`, `query`, `use_cheap_model` | 189 | `enabled` |
 | `restore_excluded` | `!context restore` | `memory` | `target` | 63 | `enabled` |
-| `summarize_section` | `!context summarize` | `memory` | `mode`, `criteria`, `preserve_key_facts` | 148 | `enabled` |
+| `summarize_section` | `!context summarize` | `memory` | `mode`, `criteria`, `preserve_key_facts` | 238 | `enabled` |
 
 ### `delivery` (DeliveryFeature)
 
@@ -315,7 +355,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
-| `deploy_agent` | `!deploy` | `system` | `action`, `profile`, `tag` | 138 | `enabled` |
+| `deploy_agent` | `!deploy` | `system` | `action`, `profile`, `tag` | 289 | `enabled` |
 
 ### `health` (HealthFeature)
 
@@ -327,9 +367,9 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `health_check` | `!health` | `system` |  | 21 | `enabled` |
 | `health_history` | `!health-history` | `system` | `limit` | 57 | `enabled` |
 | `health_interval` | `!health-interval` | `system` | `seconds` | 54 | `enabled` |
-| `heartbeat_check` | `!heartbeat` | `system` |  | 17 | `enabled` |
-| `heartbeat_interval` | `!heartbeat-interval` | `system` | `seconds` | 37 | `enabled` |
-| `heartbeat_status` | `!heartbeat-status` | `system` | `limit` | 36 | `enabled` |
+| `heartbeat_check` | `!heartbeat` | `system` |  | 24 | `enabled` |
+| `heartbeat_interval` | `!heartbeat-interval` | `system` | `seconds` | 46 | `enabled` |
+| `heartbeat_status` | `!heartbeat-status` | `system` | `limit` | 45 | `enabled` |
 
 ### `identity` (IdentityFeature)
 
@@ -339,11 +379,11 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
 | `assess_substrate` | `!identity assess` | `system` |  | 42 | `enabled` |
-| `export_identity` | `!identity export` | `system` | `storage_tier`, `sign`, `include_wallet` | 172 | `enabled` |
-| `import_identity` | `!identity import` | `system` | `source`, `verify_signature`, `merge_mode` | 150 | `enabled` |
+| `export_identity` | `!identity export` | `system` | `storage_tier`, `sign`, `include_wallet` | 208 | `enabled` |
+| `import_identity` | `!identity import` | `system` | `source`, `verify_signature`, `merge_mode`, `key_hash`, `allow_unsigned`, `identity_trust_policy` | 303 | `enabled` |
 | `lifecycle_status` | `!identity status` | `system` |  | 70 | `enabled` |
 | `migration_history` | `!identity history` | `system` |  | 38 | `enabled` |
-| `verify_identity` | `!identity verify` | `system` | `source` | 67 | `enabled` |
+| `verify_identity` | `!identity verify` | `system` | `source`, `key_hash`, `identity_trust_policy` | 149 | `enabled` |
 
 ### `keys` (KeyManagementFeature)
 
@@ -353,12 +393,12 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
 | `add_service_key` | `!add-key` | `system` | `provider`, `api_key`, `quota_limit` | 118 | `enabled` |
-| `delete_service_key` | `!delete-key` | `system` | `provider` | 44 | `enabled` |
-| `get_key_usage` | `!key-usage` | `system` | `provider`, `days` | 73 | `enabled` |
+| `delete_service_key` | `!delete-key` | `system` | `provider` | 77 | `enabled` |
+| `get_key_usage` | `!key-usage` | `system` | `provider`, `days` | 106 | `enabled` |
 | `list_providers` | `!providers` | `system` |  | 18 | `enabled` |
 | `list_service_keys` | `!list-keys` | `system` |  | 22 | `enabled` |
-| `remove_service_key` | `!remove-key` | `system` | `provider` | 44 | `enabled` |
-| `rotate_service_key` | `!rotate-key` | `system` | `provider`, `new_api_key` | 68 | `enabled` |
+| `remove_service_key` | `!remove-key` | `system` | `provider` | 77 | `enabled` |
+| `rotate_service_key` | `!rotate-key` | `system` | `provider`, `new_api_key` | 101 | `enabled` |
 
 ### `memory` (MemoryFeature)
 
@@ -368,16 +408,25 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
 | `confirm_person_match` | `!memory confirm-person` | `memory` | `message_id`, `mentioned_label`, `concept_id` | 75 | `enabled` |
-| `delete_messages` | `!memory delete` | `memory` | `pattern`, `confirm` | 110 | `enabled` |
+| `delete_conversation` | `!memory delete-conversation` | `memory` | `session_id`, `confirm` | 147 | `enabled` |
+| `delete_message_by_id` | `!memory delete-message` | `memory` | `message_id`, `session_id` | 174 | `enabled` |
+| `delete_messages` | `!memory delete` | `memory` | `pattern`, `confirm`, `session_id` | 194 | `enabled` |
 | `get_episodes` | `!memory episodes` | `memory` | `limit`, `query` | 152 | `enabled` |
+| `list_conversations` | `!memory conversations` | `memory` | `limit`, `include_trashed` | 168 | `enabled` |
+| `list_trashed_messages` | `!memory trash` | `memory` | `limit` | 168 | `enabled` |
 | `mark_superseded` | `!memory supersede` | `memory` | `old_id`, `new_id`, `reason` | 140 | `enabled` |
 | `memory_consolidate` | `!memory consolidate` | `memory` |  | 72 | `enabled` |
+| `memory_index_backfill` | `!memory index-backfill` | `system` | `batch_size` | 67 | `enabled` |
 | `memory_status` | `!memory status` | `system` |  | 36 | `enabled` |
+| `purge_conversation` | `!memory purge-conversation` | `memory` | `session_id`, `confirm`, `reason` | 155 | `enabled` |
+| `purge_message_by_id` | `!memory purge-message` | `memory` | `message_id`, `confirm`, `session_id`, `reason` | 210 | `enabled` |
 | `recall_action_items` | `!memory actions` | `memory` | `status`, `days`, `assignee_concept_id`, `limit`, `include_superseded` | 240 | `enabled` |
 | `recall_decisions` | `!memory decisions` | `memory` | `limit`, `include_superseded` | 91 | `enabled` |
-| `recall_emotional` | `!memory recall` | `memory` | `query`, `mood`, `limit` | 163 | `enabled` |
+| `recall_emotional` | `!memory recall` | `memory` | `query`, `mood`, `limit`, `min_relevance` | 237 | `enabled` |
 | `recall_interactions` | `!memory interactions` | `memory` | `person_concept_id`, `limit` | 67 | `enabled` |
 | `recall_recent` | `!memory recent` | `memory` | `limit` | 80 | `enabled` |
+| `restore_conversation` | `!memory restore-conversation` | `memory` | `session_id` | 80 | `enabled` |
+| `restore_message_by_id` | `!memory restore-message` | `memory` | `message_id`, `session_id` | 118 | `enabled` |
 | `search_case_law` | `!memory cases` | `memory` | `query`, `limit` | 106 | `enabled` |
 | `search_documents` | `!memory docs` | `memory` | `query`, `limit` | 114 | `enabled` |
 | `search_memory` | `!memory search` | `memory` | `query`, `limit`, `session_id` | 188 | `enabled` |
@@ -405,13 +454,13 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
-| `cleanup_models` |  | `model_management` | `threshold_days`, `dry_run` | 57 | `enabled` |
+| `cleanup_models` |  | `model_management` | `threshold_days`, `dry_run` | 200 | `enabled` |
 | `get_current_model` | `!model` | `model_management` |  | 27 | `enabled` |
 | `get_model_info` | `!model-info` | `model_management` | `model_name` | 35 | `enabled` |
 | `get_model_storage_info` |  | `model_management` | `use_cache` | 40 | `enabled` |
 | `list_models` | `!model-list` | `model_management` | `use_cache` | 36 | `enabled` |
 | `pull_model` | `!model-pull` | `model_management` | `model_name`, `progress_callback` | 54 | `enabled` |
-| `set_model` | `!model-set` | `model_management` | `vendor_or_model`, `model` | 107 | `enabled` |
+| `set_model` | `!model-set` | `model_management` | `vendor_or_model`, `model` | 194 | `enabled` |
 
 ### `peers` (PeersFeature)
 
@@ -425,7 +474,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `list_outbound_a2a_tasks` | `!a2a outbound` | `communication` | `limit`, `recipient` | 175 | `enabled` |
 | `list_peers` | `!peers` | `communication` |  | 22 | `enabled` |
 | `send_a2a_message` | `!a2a tell` | `communication` | `recipient`, `message`, `session_id` | 161 | `enabled` |
-| `send_a2a_question` | `!a2a ask` | `communication` | `recipient`, `message`, `session_id`, `timeout_seconds`, `artifacts`, `references` | 413 | `enabled` |
+| `send_a2a_question` | `!a2a ask` | `communication` | `recipient`, `message`, `session_id`, `timeout_seconds`, `artifacts`, `references` | 445 | `enabled` |
 | `send_a2a_task` | `!a2a send` | `communication` | `recipient`, `message`, `skill_id`, `session_id`, `artifacts`, `references` | 488 | `enabled` |
 
 ### `response_audit` (ResponseAuditFeature)
@@ -436,7 +485,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
 | `audit_disable` | `!audit-off` | `system` |  | 16 | `enabled` |
-| `audit_enable` | `!audit-on` | `system` | `mode` | 59 | `enabled` |
+| `audit_enable` | `!audit-on` | `system` | `mode` | 78 | `enabled` |
 | `audit_status` | `!audit` | `system` |  | 18 | `enabled` |
 
 ### `restart_coordinator` (RestartCoordinatorFeature)
@@ -446,10 +495,10 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
-| `cancel_restart_request` | `!restart cancel` | `system` | `request_id`, `reason` | 66 | `enabled` |
-| `list_restart_requests` | `!restart list` | `data_access` | `status` | 54 | `enabled` |
+| `cancel_restart_request` | `!restart cancel` | `system` | `request_id`, `reason` | 130 | `enabled` |
+| `list_restart_requests` | `!restart list` | `data_access` | `status` | 104 | `enabled` |
 | `list_restart_status_events` | `!restart events` | `data_access` | `limit`, `since` | 91 | `enabled` |
-| `request_restart` | `!restart request` | `system` | `reason`, `urgency`, `policy`, `desired_window`, `operation`, `update_profile`, `target_ref`, `repo_path`, `allow_migrations` | 362 | `enabled` |
+| `request_restart` | `!restart request` | `system` | `reason`, `urgency`, `policy`, `desired_window`, `operation`, `update_profile`, `target_ref`, `repo_path`, `allow_migrations` | 549 | `enabled` |
 | `restart_coordinator` | `!restart coordinator` | `system` |  | 47 | `enabled` |
 
 ### `save` (SaveFeature)
@@ -459,12 +508,12 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
-| `recall` | `!recall` | `memory` | `query`, `item_type`, `limit` | 132 | `enabled` |
+| `recall` | `!recall` | `memory` | `query`, `item_type`, `limit` | 179 | `enabled` |
 | `recall_delete` | `!recall delete` | `memory` | `item_id` | 41 | `enabled` |
 | `recall_get` | `!recall get` | `memory` | `item_id` | 46 | `enabled` |
-| `recall_list` | `!recall list` | `memory` | `item_type`, `limit` | 85 | `enabled` |
-| `save_excerpt` | `!save excerpt` | `memory` | `target`, `name`, `summary`, `tags` | 149 | `enabled` |
-| `save_item` | `!save item` | `memory` | `name`, `content`, `item_type`, `summary`, `tags`, `schema_id` | 216 | `enabled` |
+| `recall_list` | `!recall list` | `memory` | `item_type`, `limit` | 108 | `enabled` |
+| `save_excerpt` | `!save excerpt` | `memory` | `target`, `name`, `summary`, `tags` | 182 | `enabled` |
+| `save_item` | `!save item` | `memory` | `name`, `content`, `item_type`, `summary`, `tags`, `schema_id` | 302 | `enabled` |
 | `save_stash` | `!save stash` | `memory` | `stash_id`, `name`, `summary`, `tags` | 171 | `enabled` |
 
 ### `scheduler` (SchedulerFeature)
@@ -491,12 +540,12 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
-| `approve` | `!security-approve` | `system` | `request_id`, `scope` | 82 | `enabled` |
+| `approve` | `!security-approve` | `system` | `request_id`, `scope` | 92 | `enabled` |
 | `deny` | `!security-deny` | `system` | `request_id` | 45 | `enabled` |
 | `list_permissions` | `!security-list` | `system` |  | 23 | `enabled` |
 | `pending_approvals` | `!security-pending` | `system` |  | 17 | `enabled` |
 | `security_audit` | `!security-audit` | `system` | `limit` | 54 | `enabled` |
-| `set_permission` | `!security-set` | `system` | `feature_name`, `tool_name`, `level` | 137 | `enabled` |
+| `set_permission` | `!security-set` | `system` | `feature_name`, `tool_name`, `level` | 193 | `enabled` |
 
 ### `skills` (SkillsFeature)
 
@@ -519,8 +568,8 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
 | `check_sovereignty_status` | `!check-sovereignty-status` | `system` |  | 20 | `enabled` |
-| `export_sovereignty` | `!export-sovereignty` | `system` | `storage_tier`, `encrypt`, `on_progress` | 142 | `enabled` |
-| `import_sovereignty` | `!import-sovereignty` | `system` | `cid` | 32 | `enabled` |
+| `export_sovereignty` | `!export-sovereignty` | `system` | `storage_tier`, `encrypt`, `on_progress` | 179 | `enabled` |
+| `import_sovereignty` | `!import-sovereignty` | `system` | `cid` | 100 | `enabled` |
 
 ### `spawn` (SpawnFeature)
 
@@ -532,7 +581,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `delegate_task` |  | `agent_management` | `child_name`, `task` | 107 | `enabled` |
 | `get_child_result` |  | `agent_management` | `child_name` | 53 | `enabled` |
 | `list_children` |  | `agent_management` |  | 27 | `enabled` |
-| `spawn_agent` |  | `agent_management` | `name`, `purpose`, `budget`, `ttl`, `constraints`, `features` | 241 | `enabled` |
+| `spawn_agent` |  | `agent_management` | `name`, `purpose`, `budget`, `ttl`, `constraints`, `features` | 369 | `enabled` |
 | `terminate_child` |  | `agent_management` | `child_name` | 53 | `enabled` |
 
 ### `state_of_mind` (StateOfMindFeature)
@@ -554,8 +603,8 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `backlog_hygiene` | `!hygiene` | `system` | `fix` | 88 | `enabled` |
 | `morning_signal` | `!morning` | `system` |  | 48 | `enabled` |
 | `session_log` | `!sessionlog` | `system` | `session_id`, `focus` | 125 | `enabled` |
-| `signal_dispatch` | `!dispatch` | `system` | `mode` | 95 | `enabled` |
-| `strategy_add_blocker` |  | `system` | `issue`, `title`, `severity`, `owner`, `notes` | 164 | `enabled` |
+| `signal_dispatch` | `!dispatch` | `system` | `mode` | 94 | `enabled` |
+| `strategy_add_blocker` |  | `system` | `issue`, `title`, `severity`, `owner`, `notes` | 170 | `enabled` |
 | `strategy_add_decision` |  | `system` | `decision`, `rationale`, `session`, `impact` | 131 | `enabled` |
 | `strategy_add_pattern` |  | `system` | `pattern`, `source`, `implication` | 110 | `enabled` |
 | `strategy_resolve_blocker` |  | `system` | `issue` | 53 | `enabled` |
@@ -568,18 +617,21 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
-| `talon_batch` | `!talon batch` | `utility` | `repo`, `label`, `prd` | 109 | `enabled` |
-| `talon_claim` | `!talon claim` | `utility` | `repo`, `issue`, `max_iterations`, `max_turns`, `backend`, `model`, `auth_lane`, `skip_clarification`, `worktree`, `self_review` | 436 | `enabled` |
+| `scan_stale_work` | `!talon scan-stale-work` | `utility` | `stale_days`, `repo`, `repos`, `org`, `repo_prefix`, `exclude_repos` | 280 | `enabled` |
+| `talon_batch` | `!talon batch` | `utility` | `repo`, `prd` | 292 | `enabled` |
+| `talon_claim` | `!talon claim` | `utility` | `repo`, `issue`, `max_iterations`, `max_turns`, `backend`, `model`, `auth_lane`, `skip_clarification`, `worktree`, `self_review`, `demo_check`, `eye_check` | 537 | `enabled` |
 | `talon_file_and_claim` | `!talon file-and-claim` | `utility` | `title`, `body`, `labels`, `repo` | 214 | `enabled` |
 | `talon_get_config` | `!talon config` | `utility` |  | 50 | `enabled` |
+| `talon_github_write` | `!talon github-write` | `system` | `operation`, `issue`, `repo`, `body`, `labels`, `title`, `state_reason` | 444 | `enabled` |
 | `talon_health` | `!talon health` | `system` |  | 48 | `enabled` |
 | `talon_job_log` | `!talon job-log` | `utility` | `job_id`, `lines` | 64 | `enabled` |
 | `talon_pause` | `!talon pause` | `system` |  | 21 | `enabled` |
 | `talon_resume` | `!talon resume` | `system` |  | 21 | `enabled` |
-| `talon_set_config` | `!talon set-config` | `system` | `default_backend`, `default_model`, `default_auth_lane`, `max_iterations`, `max_turns`, `skip_clarification`, `self_review` | 211 | `enabled` |
+| `talon_schedule_work_rescue` | `!talon schedule-rescue` | `system` | `cron`, `stale_days` | 160 | `enabled` |
+| `talon_set_config` | `!talon set-config` | `system` | `default_backend`, `default_model`, `default_auth_lane`, `max_iterations`, `max_turns`, `skip_clarification`, `self_review` | 602 | `enabled` |
 | `talon_setup_workspace` | `!talon setup-workspace` | `system` | `repo`, `fetch` | 129 | `enabled` |
-| `talon_status` | `!talon status` | `utility` |  | 24 | `enabled` |
-| `talon_verify` | `!talon verify` | `system` | `commands`, `repo`, `cwd`, `ref`, `timeout`, `note` | 348 | `enabled` |
+| `talon_status` | `!talon status` | `utility` | `source` | 188 | `enabled` |
+| `talon_verify` | `!talon verify` | `system` | `commands`, `repo`, `cwd`, `ref`, `timeout`, `note` | 350 | `enabled` |
 | `talon_workspace_status` | `!talon workspace-status` | `utility` | `repo` | 53 | `enabled` |
 
 ### `tasks` (TaskFeature)
@@ -591,10 +643,10 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 |---|---|---|---|---:|---|
 | `attach_artifact_to_a2a_task` | `!a2a attach` | `communication` | `task_id`, `name`, `content`, `index`, `last_chunk` | 383 | `enabled` |
 | `cancel_task` | `!cancel-task` | `utility` | `task_id`, `reason` | 74 | `enabled` |
-| `check_task_status` | `!task-status` | `utility` | `task_id` | 43 | `enabled` |
-| `get_task_result` | `!task-result` | `utility` | `task_id` | 47 | `enabled` |
+| `check_task_status` | `!task-status` | `utility` | `task_id` | 85 | `enabled` |
+| `get_task_result` | `!task-result` | `utility` | `task_id` | 81 | `enabled` |
 | `list_available_skills` | `!list-skills` | `utility` |  | 65 | `enabled` |
-| `list_my_tasks` | `!tasks` | `utility` | `status`, `task_type`, `limit` | 144 | `enabled` |
+| `list_my_tasks` | `!tasks` | `utility` | `status`, `task_type`, `limit` | 197 | `enabled` |
 | `respond_to_a2a_task` | `!a2a respond` | `communication` | `task_id`, `content`, `state` | 259 | `enabled` |
 | `run_workflow` | `!run-workflow` | `utility` | `steps` | 271 | `enabled` |
 
@@ -628,7 +680,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
-| `web_search` | `!web-search` | `web_search` | `query`, `max_results` | 49 | `enabled` |
+| `web_search` | `!web-search` | `web_search` | `query`, `max_results` | 114 | `enabled` |
 
 ### `webhooks` (WebhookFeature)
 
@@ -639,7 +691,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 |---|---|---|---|---:|---|
 | `webhooks_history` | `!webhooks history` | `system` | `limit` | 56 | `enabled` |
 | `webhooks_list` | `!webhooks list` | `system` |  | 19 | `enabled` |
-| `webhooks_register` | `!webhooks register` | `system` | `name`, `auth_type`, `event_type`, `auth_config_json`, `rate_limit`, `allow_unauthenticated` | 260 | `enabled` |
+| `webhooks_register` | `!webhooks register` | `system` | `name`, `auth_type`, `event_type`, `auth_config_json`, `rate_limit`, `allow_unauthenticated` | 359 | `enabled` |
 | `webhooks_remove` | `!webhooks remove` | `system` | `name` | 44 | `enabled` |
 
 ### `wellness` (WellnessFeature)
@@ -662,10 +714,10 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 - `GET /api/host/csrf`
 - `POST /api/host/phoenix/session`
 - `GET /api/host/ui/contributions`
-- `GET /health` — public aggregate readiness only (`status` and `agent_initialized`)
-- `GET /health/detailed` — authenticated operator diagnostics (API key, JWT, or OAuth session)
-- `/phoenix` and `/phoenix/{path}` — same-origin authenticated reverse proxy to the host-supervised Phoenix trace UI (embed-session cookie; all methods). Trace files use the private custody and migration contract in [`docs/architecture/security/PHOENIX_TRACE_CUSTODY.md`](docs/architecture/security/PHOENIX_TRACE_CUSTODY.md).
-- `GET /assets/{path:path}` / `HEAD /assets/{path:path}` — unauthenticated 307 redirect into `/phoenix/assets/{path}` for Phoenix's root-absolute dynamic-import chunks (no data served; auth enforced at the proxy target)
+- `GET /assets/{path:path}`
+- `HEAD /assets/{path:path}`
+- `GET /health`
+- `GET /health/detailed`
 
 ### Router families mounted by `kestrel_sovereign/server.py`
 
@@ -682,8 +734,8 @@ Runtime security policy can still deny a discovered tool at call time; static ge
   - `GET /api/agent/notifications/sse`
   - `GET /api/agent/privacy-mode`
   - `POST /api/agent/privacy-mode`
-  - `POST /api/agent/privacy-mode/confirm`
   - `POST /api/agent/privacy-mode/cancel`
+  - `POST /api/agent/privacy-mode/confirm`
   - `GET /api/agent/reflection/status`
   - `POST /api/agent/stop`
   - `POST /api/agent/stream`
@@ -780,8 +832,8 @@ Runtime security policy can still deny a discovered tool at call time; static ge
   - `POST /v1/chat/completions`
   - `GET /v1/models`
 - [`kestrel_sovereign/endpoints/observability.py`](kestrel_sovereign/endpoints/observability.py)
-  - `GET /api/observability/summary`
   - `GET /api/observability/metrics/{metric_name}`
+  - `GET /api/observability/summary`
 - [`kestrel_sovereign/endpoints/rasa_shim.py`](kestrel_sovereign/endpoints/rasa_shim.py)
   - `POST /webhooks/rest/webhook`
 - [`kestrel_sovereign/endpoints/restart_events.py`](kestrel_sovereign/endpoints/restart_events.py)
@@ -843,6 +895,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!compact` | `built-in` | `[--keep N]` | Compact session context |
 | `!consolidate` | `built-in` |  | Consolidate memories only |
 | `!sleep` | `built-in` | `[--tier ...]` | Consolidate memories and export sovereignty snapshot |
+| `!confirm-privacy-mode` | `built-in` | `[mode]` | Confirm a pending data-destructive privacy-mode change |
 | `!get-privacy-mode` | `built-in` |  | Get current privacy mode |
 | `!privacy` | `built-in` | `[mode]` | Get or set privacy mode |
 | `!privacy-discard` | `built-in` |  | Discard isolated session |
@@ -852,22 +905,21 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!continue` | `built-in` |  | Continue a stopped request |
 | `!legacy-echo` | `built-in` | `<text>` | Echo through the legacy app-context path |
 | `!set-app-context` | `built-in` | `<context>` | Set app-specific context for the active session |
-| `!audit` | `built-in` | `[on|off]` | Toggle or check audit status |
 | `!heartbeat` | `built-in` |  | Trigger a manual heartbeat check |
 | `!help` | `built-in` |  | Show available commands |
 | `!reload-context` | `built-in` |  | Hot-reload bootstrap files from disk |
 | `!status` | `built-in` |  | Show agent status |
 | `!tasks` | `built-in` | `[all|completed|working|failed]` | List background tasks |
-| `!read-attachment` | `attachments` | `<attachment_id> [session_id]` | Read a document the user attached to THIS conversation. Pass the attachment id (a 64-char hex id shown next to the file). Works for text, markdown, and PDF documents. Images can't be read as text — ask the user to paste the image to send it as vision instead. |
+| `!read-attachment` | `attachments` | `<attachment_id> [offset] [length] [session_id]` | Read a document the user attached to THIS conversation. Pass the attachment id (a 64-char hex id shown next to the file). Works for text, markdown, and PDF documents. Long documents are returned in chunks: the result reports the character range read and the total size — call again with 'offset' set to 'next_offset' to read the rest. Images can't be read as text — ask the user to paste the image to send it as vision instead. |
 | `!audit-anchor` | `audit_anchor` |  | Anchor current audit trail to persistent storage |
 | `!audit-status` | `audit_anchor` |  | Check audit anchoring status |
 | `!audit-verify` | `audit_anchor` |  | Verify audit trail integrity against anchors |
-| `!bootstrap add` | `bootstrap` | `<file_path>` | Add a new bootstrap file to be loaded at startup. |
-| `!bootstrap list` | `bootstrap` |  | Show all loaded bootstrap files and their paths, sizes, and status. |
+| `!bootstrap add` | `bootstrap` | `<file_path>` | Add a new bootstrap file to be loaded at startup. file_path resolves relative to the agent data dir when not absolute; the file is registered by BASENAME, so a basename collision loads the search-root copy instead. |
+| `!bootstrap list` | `bootstrap` |  | Show all loaded bootstrap files and their paths, sizes, and per-file status (one of: loaded, partial, not found, skipped (budget)). |
 | `!bootstrap reload` | `bootstrap` |  | Force reload all bootstrap files from disk. Use after editing SOUL.md or other bootstrap files. |
-| `!bootstrap remove` | `bootstrap` | `<name>` | Remove a bootstrap file from the loading convention. |
+| `!bootstrap remove` | `bootstrap` | `<name>` | Remove a bootstrap file from the loading convention. name is the basename as shown by bootstrap_list (the file is not deleted from disk). |
 | `!bootstrap-status` | `bootstrap` |  | Show the current bootstrap/discovery status. |
-| `!rename` | `bootstrap` | `<new_name>` | Rename this agent. |
+| `!rename` | `bootstrap` | `<new_name>` | Rename this agent. new_name must be 1-64 characters. |
 | `!restart-discovery` | `bootstrap` |  | Reset and restart the personality discovery process. |
 | `!skip-discovery` | `bootstrap` |  | Skip the discovery conversation and use default personality. |
 | `!bridge connections` | `bridge` | `[limit]` | List active bridge connections/sessions |
@@ -877,20 +929,20 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!channels list` | `channels` |  | List all connected messaging channels and their current status. |
 | `!channels send` | `channels` | `<channel> <to> <message>` | Send a message to a recipient via a specific messaging channel. |
 | `!cli-status` | `cli` |  | Show platform metadata and registered CLI adapter tool availability. |
-| `!git-diff` | `cli` | `[ref] [path] [repo_path]` | Read local repository diff via `git diff`. |
-| `!git-log` | `cli` | `[max_count] [repo_path]` | Read recent local repository commits via `git log`. |
-| `!git-merge-base` | `cli` | `<left_ref> <right_ref> [repo_path]` | Read the merge-base for two local git refs. |
-| `!git-show-file` | `cli` | `<ref> <path> [repo_path]` | Read a local repository file from a git ref via `git show`. |
-| `!git-status` | `cli` | `[repo_path]` | Read local repository status via `git status --short --branch`. |
+| `!git-diff` | `cli` | `[ref] [path] [repo_path]` | Read local repository diff via `git diff`. ref: single git ref, no ranges/`..`; path: repo-relative pathspec (no leading `/` or `..`); repo_path: within allowed repo roots (default cwd). |
+| `!git-log` | `cli` | `[max_count] [repo_path]` | Read recent local repository commits via `git log`. max_count is capped at 100; repo_path: within allowed repo roots (default cwd). |
+| `!git-merge-base` | `cli` | `<left_ref> <right_ref> [repo_path]` | Read the merge-base for two local git refs. left_ref/right_ref: single git refs, no ranges/`..`; repo_path: within allowed repo roots (default cwd). |
+| `!git-show-file` | `cli` | `<ref> <path> [repo_path]` | Read a local repository file from a git ref via `git show`. ref: single git ref, no ranges/`..`; path: repo-relative pathspec (no leading `/` or `..`); repo_path: within allowed repo roots (default cwd). |
+| `!git-status` | `cli` | `[repo_path]` | Read local repository status via `git status --short --branch`. repo_path: within allowed repo roots (default cwd). |
 | `!compute-caps` | `compute` |  | Query what compute capabilities are available |
 | `!compute-empty-trash` | `compute` | `[older_than_days] [dry_run]` | Permanently delete old trash items (requires approval) |
 | `!compute-history` | `compute` | `[script_id] [limit]` | Show script execution history |
-| `!compute-list` | `compute` | `[state] [limit]` | List all scripts or filter by state |
+| `!compute-list` | `compute` | `[state] [limit]` | List all scripts or filter by state. state is one of: 'draft', 'signed', 'pending_review', 'approved', 'rejected', 'queued', 'running', 'completed', 'failed' (case-insensitive), or empty for all scripts. |
 | `!compute-restore` | `compute` | `<trash_path> [destination]` | Restore a file from trash to a destination |
-| `!compute-run` | `compute` | `<script_id> [executor] [timeout]` | Submit a script for execution (requires security review and user approval) |
+| `!compute-run` | `compute` | `<script_id> [executor] [timeout]` | Submit a script for execution (requires security review and user approval). executor is one of: 'uv', 'docker', 'local' (case-insensitive). 'docker' requires a running Docker daemon and 'local' requires KESTREL_ALLOW_LOCAL_COMPUTE — either may be unavailable on this host. Call get_compute_capabilities to discover the live set of available executors. |
 | `!compute-show` | `compute` | `<script_id>` | Show detailed information about a script |
 | `!compute-trash` | `compute` | `[days]` | List files in the trash folder |
-| `!compute-write` | `compute` | `<name> <language> <content> <purpose> [requirements]` | Write a new script for later execution. The script is NOT executed immediately - it will be signed, reviewed, and requires user approval. |
+| `!compute-write` | `compute` | `<name> <language> <content> <purpose> [requirements]` | Write a new script for later execution. The script is NOT executed immediately - it will be signed, reviewed, and requires user approval. language is one of: 'bash', 'python' (case-insensitive). |
 | `!fs-edit` | `computer_use` | `<path> <old_text> <new_text> [occurrence]` | Replace one occurrence of old_text with new_text in a file (always approval-gated). |
 | `!fs-list` | `computer_use` | `<path>` | List a directory (allow-list auto-approves; outside list requires human approval). |
 | `!fs-read` | `computer_use` | `<path>` | Read a file (allow-list auto-approves; outside list requires human approval). |
@@ -898,62 +950,71 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!shell` | `computer_use` | `<command> [timeout]` | Run a shell command. Deny-listed binaries hard-refuse; auto-approved binaries run without a prompt; everything else routes through the ApprovalQueue. |
 | `!consent-log` | `consent` | `[limit]` | View recent consent records showing the agent's perspective on past changes. |
 | `!consent-stats` | `consent` |  | View consent statistics grouped by action type and sentiment. |
-| `!constitution` | `constitution` | `[article] [search] [summary]` | Get the full text of the Kestrel Constitution, specific books, amendments, or articles. |
+| `!constitution` | `constitution` | `[article] [search] [summary]` | Get the full text of the Kestrel Constitution, specific books, amendments, or articles. Two-slot grammar: 'article' is the subcommand keyword {book, amendment, article, search, summary} and 'search' is the identifier/term — e.g. article='book' search='I', article='amendment' search='VIII', article='search' search='honesty'. Omit both for full text; article='summary' for the executive summary. |
 | `!context compact` | `context` | `[keep_recent] [force] [dry_run]` | Compact context by summarizing older messages. Use when context utilization is high and you need space for new information. |
 | `!context compact hierarchical` | `context` | `[chunk_size] [keep_recent] [max_depth]` | Compact context using hierarchical tree-structured summarization (RLM-inspired). Better preserves structure than linear compaction. |
 | `!context exclude` | `context` | `<target> <reason>` | Exclude messages from context window (they remain in storage but won't be included in context). Use for redundant, superseded, or irrelevant content. |
 | `!context mark` | `context` | `<action> <target> [reason]` | Mark conversation content for context management. Use 'protect' to ensure important content is never pruned, 'droppable' to suggest low-priority content for removal. |
-| `!context query` | `context` | `<context_source> <query> [use_cheap_model]` | Query a subset of context using a cheaper model (RLM-inspired sub-LM call). Use for exploring large context sections, compacted originals, or excluded messages without using main model quota. |
+| `!context query` | `context` | `<context_source> <query> [use_cheap_model]` | Query a subset of context using a cheaper model (RLM-inspired sub-LM call). Use for exploring large context sections, compacted originals, or excluded messages without using main model quota. context_source must be one of: 'stash:name', 'excluded', 'compacted:ID', 'summary:ID', 'last_N' (N = message count). |
 | `!context restore` | `context` | `[target]` | Restore previously excluded content back to context. |
 | `!context stash` | `context` | `[target] [name]` | Stash current working context (like git stash). Use when you need to context-switch to a different topic and want to restore the current discussion later. |
-| `!context stash apply` | `context` | `[stash_id]` | Apply a stash without removing it (restore messages but keep stash for reuse). Like git stash apply. |
-| `!context stash drop` | `context` | `[stash_id]` | Drop a stash without restoring (discard stashed messages). Messages become excluded from context. |
+| `!context stash apply` | `context` | `[stash_id]` | Apply a stash without removing it (restore messages but keep stash for reuse). Like git stash apply. Pass stash_id to target a specific stash; leave stash_id empty ("") to target the most recent stash. |
+| `!context stash drop` | `context` | `[stash_id]` | Drop a stash without restoring (discard stashed messages). Messages become excluded from context. Pass stash_id to target a specific stash; leave stash_id empty ("") to target the most recent stash. |
 | `!context stash list` | `context` |  | List all stashes with their names and message counts. |
-| `!context stash peek` | `context` | `[stash_id] [max_chars]` | Peek at stash contents without restoring. Use to explore stashed context programmatically (RLM-inspired context-as-variable). |
-| `!context stash pop` | `context` | `[stash_id]` | Pop the most recent stash (restore messages and remove from stash list). Like git stash pop. |
-| `!context stash save` | `context` | `[stash_id] [name] [summary] [tags]` | Save a stash to long-term storage with semantic search capability. Use when you want to preserve context for future retrieval via !recall. |
+| `!context stash peek` | `context` | `[stash_id] [max_chars]` | Peek at stash contents without restoring. Use to explore stashed context programmatically (RLM-inspired context-as-variable). Pass stash_id to target a specific stash; leave stash_id empty ("") to target the most recent stash. |
+| `!context stash pop` | `context` | `[stash_id]` | Pop a stash (restore messages and remove from stash list). Like git stash pop. Pass stash_id to target a specific stash; leave stash_id empty ("") to target the most recent stash. |
+| `!context stash save` | `context` | `[stash_id] [name] [summary] [tags]` | Save a stash to long-term storage with semantic search capability. Use when you want to preserve context for future retrieval via !recall. Pass stash_id to target a specific stash; leave stash_id empty ("") to target the most recent stash. |
 | `!context status` | `context` |  | Check current context window utilization. Use this to understand how much context space is available before deciding to summarize or prune. |
-| `!context summarize` | `context` | `<mode> <criteria> [preserve_key_facts]` | Summarize a specific section of conversation history to save context space. Use this to compact verbose exchanges while preserving key information. |
+| `!context summarize` | `context` | `<mode> <criteria> [preserve_key_facts]` | Summarize a specific section of conversation history to save context space. Use this to compact verbose exchanges while preserving key information. mode must be one of: time_range, topic, messages, last_n. |
 | `!delivery failed` | `delivery` | `[limit]` | List messages in the dead letter queue (permanently failed) |
 | `!delivery purge` | `delivery` | `[older_than_hours]` | Clear delivered messages older than 24 hours from the queue |
 | `!delivery queue` | `delivery` | `[limit]` | List pending messages in the delivery queue |
 | `!delivery retry` | `delivery` | `<message_id>` | Manually retry a failed or dead-lettered message by its entry ID |
 | `!delivery status` | `delivery` |  | Show delivery queue status with counts of pending, failed, delivered, and dead letter messages |
-| `!deploy` | `deploy` | `[action] [profile] [tag]` | Deploy or manage Kestrel agent on cloud platforms (usage: !deploy <action> [...]). |
+| `!deploy` | `deploy` | `[action] [profile] [tag]` | Deploy or manage Kestrel agent on cloud platforms (usage: !deploy <action> [...]). Actions: status, deploy, teardown, logs, list, health (synonyms accepted: start=deploy; stop/delete=teardown; log=logs; ls=list; check=health). profile= is REQUIRED for the deploy, teardown, logs and health actions. tag= must be a CONCRETE image tag (e.g. v0.15.1) for Cloud Run — the 'latest' default is REJECTED by Cloud Run, so always pass an explicit tag when deploying. |
 | `!health` | `health` |  | Run a manual liveness check and show results |
 | `!health-history` | `health` | `[limit]` | Show recent liveness-check history and uptime |
 | `!health-interval` | `health` | `[seconds]` | Change the liveness-check interval |
-| `!heartbeat` | `health` |  | [deprecated] alias for !health |
-| `!heartbeat-interval` | `health` | `[seconds]` | [deprecated] alias for !health-interval |
-| `!heartbeat-status` | `health` | `[limit]` | [deprecated] alias for !health-history |
+| `!heartbeat` | `health` |  | [deprecated] alias for !health — use health instead |
+| `!heartbeat-interval` | `health` | `[seconds]` | [deprecated] alias for !health-interval — use health_interval instead |
+| `!heartbeat-status` | `health` | `[limit]` | [deprecated] alias for !health-history — use health_history instead |
 | `!identity assess` | `identity` |  | Assess the current LLM substrate's capabilities and compare with agent requirements. Helps understand limitations when migrating. |
-| `!identity export` | `identity` | `[storage_tier] [sign] [include_wallet]` | Export the agent's complete identity to a portable, signed package. This creates a JSON package containing DID, constitution, memories, personality, relationships, and skills that can be imported to another substrate. |
+| `!identity export` | `identity` | `[storage_tier] [sign] [include_wallet]` | Export the agent's complete identity to a portable, signed package. This creates a JSON package containing DID, constitution, memories, personality, relationships, and skills that can be imported to another substrate. storage_tier must be one of 'local' (default), 'ipfs', or 'filecoin'; an unrecognized value is rejected (it is NOT silently downgraded to local). |
 | `!identity history` | `identity` |  | View the agent's migration history - all substrate changes with timestamps, verification scores, and audit trail. |
-| `!identity import` | `identity` | `<source> [verify_signature] [merge_mode]` | Import agent identity from a portable package. This restores memories, personality, relationships, and skills from a previously exported identity package. |
+| `!identity import` | `identity` | `<source> [verify_signature] [merge_mode] [key_hash] [allow_unsigned] [identity_trust_policy]` | Import agent identity from a portable package. This restores memories, personality, relationships, and skills from a previously exported identity package. merge_mode must be one of: replace, merge (default), skip_existing. |
 | `!identity status` | `identity` |  | Show the agent's lifecycle standing — is_test_instance flag, graduation/retirement timestamps, and the list of lifecycle_event records linked to this agent. Lets the agent verify her own graduation/retirement state directly from her DB. |
-| `!identity verify` | `identity` | `<source>` | Verify the integrity of an identity package without importing it. Checks constitution hash, content hash, and signature. |
+| `!identity verify` | `identity` | `<source> [key_hash] [identity_trust_policy]` | Verify the integrity of an identity package without importing it. Checks constitution hash, content hash, and signature. |
 | `!add-key` | `keys` | `<provider> <api_key> [quota_limit]` | Add an API key for an external service |
-| `!delete-key` | `keys` | `<provider>` | Permanently delete a service key |
-| `!key-usage` | `keys` | `<provider> [days]` | Get usage statistics for a service key |
+| `!delete-key` | `keys` | `<provider>` | Permanently delete a service key. Valid providers: openrouter, openai, anthropic, lighthouse, github, runpod, vastai (use list_providers for the authoritative set). |
+| `!key-usage` | `keys` | `<provider> [days]` | Get usage statistics for a service key. Valid providers: openrouter, openai, anthropic, lighthouse, github, runpod, vastai (use list_providers for the authoritative set). |
 | `!list-keys` | `keys` |  | List configured service keys (no secrets exposed) |
 | `!providers` | `keys` |  | List available service providers |
-| `!remove-key` | `keys` | `<provider>` | Remove/deactivate a service key |
-| `!rotate-key` | `keys` | `<provider> <new_api_key>` | Rotate an API key (requires constitutional approval) |
+| `!remove-key` | `keys` | `<provider>` | Remove/deactivate a service key. Valid providers: openrouter, openai, anthropic, lighthouse, github, runpod, vastai (use list_providers for the authoritative set). |
+| `!rotate-key` | `keys` | `<provider> <new_api_key>` | Rotate an API key (requires constitutional approval). Valid providers: openrouter, openai, anthropic, lighthouse, github, runpod, vastai (use list_providers for the authoritative set). |
 | `!memory action update` | `memory` | `<item_id> [status] [due_date] [assignee_concept_id]` | Update an action item's status (pending/done/cancelled), due date, or assignee. |
 | `!memory actions` | `memory` | `[status] [days] [assignee_concept_id] [limit] [include_superseded]` | Retrieve action items the user committed to. Filters: status, creation-date window (days), assignee. Superseded items are excluded by default; pass include_superseded=True to see them. |
 | `!memory cases` | `memory` | `<query> [limit]` | Search past audit decisions and constitutional interpretations. Use this when I need precedent for ethical or governance decisions. |
 | `!memory confirm-person` | `memory` | `<message_id> <mentioned_label> <concept_id>` | Resolve an ambiguous person mention by confirming which existing concept it refers to. |
 | `!memory consolidate` | `memory` |  | Consolidate recent messages into narrative episodes, detect temporal patterns, and archive decayed memories. Runs the cognitive memory pipeline that turns raw conversation into structured long-term memory. Safe to schedule periodically (e.g. nightly). |
+| `!memory conversations` | `memory` | `[limit] [include_trashed]` | List your conversation sessions so you can navigate them before pruning. Returns session_id, title, message counts, timestamps and a short preview, most-recent first. Pass include_trashed=True to list soft-deleted sessions available to restore. Use the returned session_id with delete_conversation / restore_conversation / purge_conversation. |
 | `!memory decisions` | `memory` | `[limit] [include_superseded]` | Retrieve decisions the user has recorded (stored as graph nodes of type 'decision'). Superseded decisions are excluded by default; pass include_superseded=True to see them. |
-| `!memory delete` | `memory` | `<pattern> [confirm]` | Delete conversation messages matching a pattern. Use for cleaning up test data or removing unwanted messages. Requires Sovereign authorization. |
+| `!memory delete` | `memory` | `<pattern> [confirm] [session_id]` | Delete individual conversation messages matching a text pattern. Pass session_id to confine deletion to one conversation (recommended) so the pattern can't reach across unrelated sessions; omit it only to sweep all conversations. To discard a whole conversation, prefer delete_conversation. Requires Sovereign authorization. |
+| `!memory delete-conversation` | `memory` | `<session_id> [confirm]` | Soft-delete an entire conversation session (moves it to Trash; recoverable with restore_conversation). This is the right tool for discarding a whole disposable/test conversation — use it instead of pattern-matching delete_messages. Requires Sovereign authorization. |
+| `!memory delete-message` | `memory` | `<message_id> [session_id]` | Soft-delete a SINGLE conversation message by its message_id (moves it to Trash; recoverable with restore_message_by_id). Use this for surgical removal of one specific message — it addresses the row by identity, unlike delete_messages which matches by text. Pass session_id to guard: the delete is refused if that message isn't in the named conversation. Requires Sovereign authorization. |
 | `!memory docs` | `memory` | `<query> [limit]` | Search my knowledge base and RAG documents for relevant information. Use this when I need to find information from files, documents, or other stored knowledge. |
 | `!memory episodes` | `memory` | `[limit] [query]` | Get consolidated memory episodes - narrative summaries of past conversation themes. Use this for high-level recall of what we've discussed over time. Pass `query` to recall episodes RELEVANT to a topic (semantic search, can surface older episodes); omit it for the most recent episodes. |
+| `!memory index-backfill` | `memory` | `[batch_size]` | Start or resume the privacy-preserving lexical memory index backfill. Runs in the background; use memory_status for durable coverage and completion health. |
 | `!memory interactions` | `memory` | `<person_concept_id> [limit]` | List recent message→person interactions for a given person concept, with sentiment and topics. |
-| `!memory recall` | `memory` | `<query> [mood] [limit]` | Recall memories with human-like weighting (importance, emotion, recency). Use alongside search_memory for emotionally-aware recall. Scores memories like a human would - important moments and emotionally-charged memories surface first. |
+| `!memory purge-conversation` | `memory` | `<session_id> [confirm] [reason]` | PERMANENTLY delete a conversation session — there is no recovery. Use only to destroy data for good; otherwise prefer delete_conversation (Trash). Requires Sovereign authorization. |
+| `!memory purge-message` | `memory` | `<message_id> [confirm] [session_id] [reason]` | PERMANENTLY delete a single message by its message_id — there is no recovery. This is the intentionally-harder path: prefer delete_message_by_id (Trash) unless you must destroy the data for good. Requires confirm=True and Sovereign authorization. |
+| `!memory recall` | `memory` | `<query> [mood] [limit] [min_relevance]` | Recall memories with human-like weighting (importance, emotion, recency). Use alongside search_memory for emotionally-aware recall. Scores memories like a human would - important moments and emotionally-charged memories surface first. mood must be one of: positive, negative, neutral (case-insensitive); an unrecognized mood is treated as neutral and the result is returned as PARTIAL. |
 | `!memory recent` | `memory` | `[limit]` | Get my most recent conversation messages. Use this to recall what we just discussed or to provide context about our recent interactions. |
+| `!memory restore-conversation` | `memory` | `<session_id>` | Restore a soft-deleted conversation session from Trash, bringing its messages back into normal history. Find restorable sessions with list_conversations(include_trashed=True). |
+| `!memory restore-message` | `memory` | `<message_id> [session_id]` | Restore a single soft-deleted message from Trash by its message_id, bringing it back into normal history. Pass session_id to guard against acting on the wrong message. |
 | `!memory search` | `memory` | `<query> [limit] [session_id]` | PRIMARY TOOL for recalling past conversations. Use this when asked 'do you remember', 'what did we discuss', or any question about past conversations. Decrypts and searches conversation history client-side for reliable results. Pass session_id to scope to a single conversation thread. |
 | `!memory status` | `memory` |  | Check memory system health and statistics. Use this to understand my memory capabilities and current state. |
 | `!memory supersede` | `memory` | `<old_id> <new_id> [reason]` | Mark a claim node (decision or action_item) as superseded by a newer one. Creates a 'supersedes' edge from new to old and sets superseded_by on the old node. |
+| `!memory trash` | `memory` | `[limit]` | List soft-deleted (trashed) individual messages so you can find one to restore_message_by_id or purge_message_by_id. Returns message_id, session_id, role, a short preview, and when it was trashed — most-recently-trashed first. This is the message-level counterpart to list_conversations(include_trashed=True), which lists whole trashed sessions; use this to find messages that were trashed individually (e.g. by delete_messages) inside otherwise-live conversations. |
 | `!memory-admin-unpin-all` | `memory_agency` |  | Administrative command: remove ALL active pins for this agent. Sovereign/admin use only. |
 | `!memory-admin-unpin-oldest` | `memory_agency` | `<count>` | Administrative command: remove the N oldest active pins. Sovereign/admin use only. |
 | `!memory-pin` | `memory_agency` | `<message_id> [reason]` | Pin a memory so it resists decay and stays retrievable. Use this for memories the agent considers important to preserve. |
@@ -965,7 +1026,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!model-info` | `model` | `<model_name>` | Get detailed information about a specific model. |
 | `!model-list` | `model` | `[use_cache]` | List all available AI models. |
 | `!model-pull` | `model` | `<model_name> [progress_callback]` | Download a new AI model (Ollama only). |
-| `!model-set` | `model` | `<vendor_or_model> [model]` | Set the active AI model for conversations. |
+| `!model-set` | `model` | `<vendor_or_model> [model]` | Set the active AI model for conversations. Accepts a vendor and model, e.g. set_model('openai', 'gpt-5-mini'), or the 'vendor:route/model' micro-syntax in a single arg, e.g. set_model('anthropic:plan/claude-opus-4-7'). The vendor, route, and model must be real — an unknown triple is rejected, not silently applied. Call list_models first to discover valid vendor/route/model values. |
 | `!a2a ask` | `peers` | `<recipient> <message> [session_id] [timeout_seconds] [artifacts] [references]` | Ask another agent a question. Fire-and-resume: this tool POSTs the question, spawns a background SSE subscription on the recipient's task, and returns IMMEDIATELY with ``awaiting_reply=True``. Your current turn ends here. When the recipient's task reaches a terminal state, the ``a2a.question_answered`` signal fires a fresh COGNITION turn on your dispatcher with the reply text inline — respond there. Do NOT block your turn waiting for the answer; the supervisor will wake you. For fire-and-forget use send_a2a_message; for tracked work you'll check on later use send_a2a_task.<br><br>SEND-SIDE ARTIFACTS: pass ``artifacts`` and/or ``references`` to attach durable payload (planning docs, evidence, saved-memory/recall references) to the question so the recipient can retrieve it from the task store while answering. This is the SEND side — distinct from the RESPONDER-side attach_artifact_to_a2a_task tool a recipient uses to attach output onto an incoming task before responding. |
 | `!a2a outbound` | `peers` | `[limit] [recipient]` | List the A2A tasks you SENT to peer agents — your local audit log of outbound dispatches (#1576). Each row carries task_id, recipient, verb (message/question/task), dispatch_tool, created_at, and terminal_state (populated after a get_peer_task_result fetch confirms the peer's final state). Use this when you need to enumerate 'what did I send and to whom?' without per-id round trips. |
 | `!a2a result` | `peers` | `<recipient> <task_id>` | Fetch the current state + full reply text of an A2A task you previously sent to a peer agent. Use this when an `a2a.question_answered` signal arrived with `truncated=true` (the inline reply was clipped at 8 KiB) — this tool fetches the FULL untruncated body from the peer's task store. Returns the same envelope shape a local `get_task_result` would, but routed through the host proxy to the peer (#1444 truncation recovery path). |
@@ -975,18 +1036,18 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!peers` | `peers` |  | List all available peer agents in the multi_agent. |
 | `!audit` | `response_audit` |  | Show audit configuration and status |
 | `!audit-off` | `response_audit` |  | Disable per-response audit |
-| `!audit-on` | `response_audit` | `[mode]` | Enable per-response audit |
-| `!restart cancel` | `restart_coordinator` | `<request_id> [reason]` | Cancel a still-pending restart request. Rows already executing/completed/rejected cannot be canceled. |
+| `!audit-on` | `response_audit` | `[mode]` | Enable per-response audit. mode: 'warn' (annotate risky responses) or 'strict' (block risky responses). |
+| `!restart cancel` | `restart_coordinator` | `<request_id> [reason]` | Cancel a still-pending restart request (status pending or approved). Rows already updating/executing/completed/rejected/canceled cannot be canceled. Pass request_id from data.request.id of request_restart (or data.requests[].id of list_restart_requests).<br><br>Returns: data={canceled: bool, request_id: str} (plus current_status when the cancel is refused). |
 | `!restart coordinator` | `restart_coordinator` |  | ACTION cron task — scan restart_requests, run safety checks, and execute pending requests by spawning a detached restart subprocess. No LLM cost. |
 | `!restart events` | `restart_coordinator` | `[limit] [since]` | List recent restart_status lifecycle events for chat-history reload and the agent's pre-turn snapshot. Newest first; uses the typed event records persisted alongside each SSE emit (#1562). |
-| `!restart list` | `restart_coordinator` | `[status]` | List restart requests, optionally filtered by status (pending\|approved\|executing\|completed\|rejected\|canceled). |
-| `!restart request` | `restart_coordinator` | `<reason> [urgency] [policy] [desired_window] [operation] [update_profile] [target_ref] [repo_path] [allow_migrations]` | File a durable restart request. The host coordinator evaluates safety and executes when conditions are met. Returns a request_id you can pass to list_restart_requests or cancel_restart_request.<br><br>operation='restart_only' (default) restarts the current code and NEVER updates it. operation='update_then_restart' first runs an explicit, allowlisted update profile (e.g. 'sovereign_local_uv_sync': git fetch + checkout target_ref + uv sync) against a local checkout, then restarts into the new code. Update mode requires update_profile and target_ref; repo_path defaults to the local Sovereign checkout. Updating/installing is always explicit and audited — it is never an implicit side effect of a plain restart. |
-| `!recall` | `save` | `<query> [item_type] [limit]` | Search saved items using semantic search. Find previously saved stashes, excerpts, files, and items by meaning. |
+| `!restart list` | `restart_coordinator` | `[status]` | List restart requests, optionally filtered by status. Valid statuses: pending\|approved\|updating\|executing\|completed\|rejected\|canceled (omit status for all). An unknown status is rejected with the valid set rather than silently returning no rows.<br><br>Returns: data={count: int, requests: [<public dict>, ...]}. |
+| `!restart request` | `restart_coordinator` | `<reason> [urgency] [policy] [desired_window] [operation] [update_profile] [target_ref] [repo_path] [allow_migrations]` | File a durable restart request. The host coordinator evaluates safety and executes when conditions are met.<br><br>urgency: one of low\|normal\|high\|critical (default 'normal'); common synonyms are accepted ('medium'→normal, 'urgent'→high, 'emergency'→critical). Higher urgency is executed first.<br>policy: one of idle_agents_only\|allow_busy_after_timeout\|manual_only (default 'idle_agents_only'):<br>  - idle_agents_only: execute only while this agent is idle (no in-flight cognition turns or real background work).<br>  - allow_busy_after_timeout: prefer idle, but execute anyway once the request has aged past the busy timeout even if the agent is still busy.<br>  - manual_only: never auto-execute; the row waits for an explicit dispatch.<br><br>operation='restart_only' (default) restarts the current code and NEVER updates it. operation='update_then_restart' first runs an explicit, allowlisted update profile (e.g. 'sovereign_local_uv_sync': git fetch + checkout target_ref + uv sync) against a local checkout, then restarts into the new code. Update mode requires update_profile and target_ref; repo_path defaults to the local Sovereign checkout. Updating/installing is always explicit and audited — it is never an implicit side effect of a plain restart.<br><br>Returns: data={created: bool, request: <public dict>}. The filed request's id is at data.request.id (NOT a top-level request_id) — pass it to list_restart_requests or cancel_restart_request. |
+| `!recall` | `save` | `<query> [item_type] [limit]` | Search saved items and learned facts. Find previously saved stashes, excerpts, files, and items by meaning, plus facts saved via save_fact (matched by keyword). Optional item_type filter must be one of: stash, file, excerpt, structured; passing one scopes the search to saved items only. |
 | `!recall delete` | `save` | `<item_id>` | Delete a saved item by ID. |
 | `!recall get` | `save` | `<item_id>` | Get the full content of a saved item by ID. |
-| `!recall list` | `save` | `[item_type] [limit]` | List all saved items, optionally filtered by type. |
-| `!save excerpt` | `save` | `<target> <name> [summary] [tags]` | Save conversation messages for later retrieval. Use this to preserve important discussions, decisions, or information. |
-| `!save item` | `save` | `<name> <content> [item_type] [summary] [tags] [schema_id]` | Save arbitrary content (text, JSON) for later retrieval. Use for recipes, notes, decisions, or any structured content. |
+| `!recall list` | `save` | `[item_type] [limit]` | List all saved items, optionally filtered by type. Optional item_type filter must be one of: stash, file, excerpt, structured. |
+| `!save excerpt` | `save` | `<target> <name> [summary] [tags]` | Save conversation messages for later retrieval. Use this to preserve important discussions, decisions, or information. The target selects which messages: 'last_N' (e.g. last_10) for the most recent N messages, or 'ids:1,2,3' for specific message ids. |
+| `!save item` | `save` | `<name> <content> [item_type] [summary] [tags] [schema_id]` | Save arbitrary content (text, JSON) for later retrieval. Good for recipes, notes, decisions, and other content you want to recall. item_type must be one of: stash, file, excerpt, structured (default: structured) — do NOT invent your own type or the item becomes unfindable via recall. To finely type a 'structured' item (recipe, user_story, etc.) pass schema_id, not a custom item_type. |
 | `!save stash` | `save` | `[stash_id] [name] [summary] [tags]` | Save a stash to long-term storage for later retrieval. The stash content gets an embedding so you can find it later with semantic search. |
 | `!schedule add` | `scheduler` | `<cron_expression> <task_name> [args_json]` | Add a new scheduled task with a cron expression |
 | `!schedule engagement` | `scheduler` | `[days]` | Report aggregate engagement scores per scheduled task |
@@ -997,37 +1058,40 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!schedule remove` | `scheduler` | `<task_id>` | Remove a scheduled task by ID |
 | `!schedule resume` | `scheduler` | `<task_id>` | Resume a paused scheduled task |
 | `!schedule update` | `scheduler` | `<task_id> <cron_expression>` | Update the cron expression of an existing scheduled task |
-| `!security-approve` | `security` | `<request_id> [scope]` | Approve a pending request |
+| `!security-approve` | `security` | `<request_id> [scope]` | Approve a pending request. scope: 'once', 'session', or 'always'. |
 | `!security-audit` | `security` | `[limit]` | Show recent security audit log |
 | `!security-deny` | `security` | `<request_id>` | Deny a pending request |
 | `!security-list` | `security` |  | List all configured security permissions in tree format |
 | `!security-pending` | `security` |  | Show pending approval requests |
-| `!security-set` | `security` | `<feature_name> [tool_name] [level]` | Set permission level for a tool or all tools in a feature |
+| `!security-set` | `security` | `<feature_name> [tool_name] [level]` | Set permission level for a tool or all tools in a feature. level is one of: allow, auto, always_ask, deny, ask, session. Call list_permissions to enumerate valid feature_name/tool_name values — setting a permission on an unregistered name does not take effect. |
 | `!skill candidates` | `skills` | `[min_confidence] [limit]` | List reflection insights that are candidates for skill extraction |
 | `!skill delete` | `skills` | `<skill_id>` | Remove a saved skill (file + graph node) |
 | `!skill list` | `skills` |  | List all extracted skills for this agent |
 | `!skill save` | `skills` | `<insight_id> <steps_json> <verification> [tags_json]` | Promote a reflection insight into a saved skill |
 | `!skill show` | `skills` | `<skill_id>` | Show the full content of an extracted skill |
 | `!check-sovereignty-status` | `sovereignty` |  | Check the status of sovereignty backups. |
-| `!export-sovereignty` | `sovereignty` | `[storage_tier] [encrypt] [on_progress]` | Export the agent's entire state to IPFS/Filecoin for sovereignty backup. |
-| `!import-sovereignty` | `sovereignty` | `<cid>` | Restore the agent's state from an IPFS CID. |
+| `!export-sovereignty` | `sovereignty` | `[storage_tier] [encrypt] [on_progress]` | Export the agent's entire state to IPFS/Filecoin for sovereignty backup. storage_tier must be one of 'local', 'ipfs' (default), or 'filecoin'; an unrecognized value is rejected (it is NOT silently defaulted to ipfs). |
+| `!import-sovereignty` | `sovereignty` | `<cid>` | Restore this agent's CONVERSATION HISTORY from a prior backup (IPFS CID). Faithfully preserves message timestamps and trash state. NOTE: this currently restores conversation history only — NOT full agent state (memories, knowledge graph, saved items, files, settings). Full-state restore is tracked separately. |
 | `!state-of-mind` | `state_of_mind` |  | Get the current constitutional governance state for this agent |
 | `!dispatch` | `strategic_memory` | `[mode]` | Pick the highest-priority issue from strategic memory and dispatch it to Talon via the Agent Mesh Protocol. Works with any signal source (morning, hygiene, event-driven, on-demand). |
 | `!hygiene` | `strategic_memory` | `[fix]` | Scan all repos for backlog hygiene issues: missing assignees, milestones, status labels. Reports gaps and flags items needing human review. |
 | `!morning` | `strategic_memory` |  | Generate a morning strategic briefing -- milestone status, blockers, recommended work items. Pulls live data from GitHub when GITHUB_TOKEN is available. |
 | `!sessionlog` | `strategic_memory` | `[session_id] [focus]` | End-of-day session log collector. Scans all repos for today's activity (issues closed, PRs merged, comments, commits) and generates a structured session summary with outcomes and metrics. |
 | `!strategy` | `strategic_memory` | `[section]` | View the current strategic context: vision, milestones, stakeholders, decisions, blockers, and patterns. |
-| `!talon batch` | `talon` | `<repo> [label] [prd]` | Dispatch a batch of issues to Talon (by label or PRD). |
-| `!talon claim` | `talon` | `<repo> <issue> [max_iterations] [max_turns] [backend] [model] [auth_lane] [skip_clarification] [worktree] [self_review]` | Dispatch a single issue to Talon for autonomous implementation. Returns immediately with a job_id; the actual work runs in the background. Poll talon_status or talon_job_log to follow progress. |
+| `!talon batch` | `talon` | `<repo> [prd]` | Dispatch a batch of issues to Talon from a PRD JSON file. ``prd`` is REQUIRED and must be an absolute path to an existing PRD JSON file (there is no label/repo-scoped batch mode — kestrel-talon's `batch` subcommand only accepts `--prd`). Runs through the same policy layer as talon_claim: ``allow_background_jobs`` and ``allowed_backends`` are enforced, the subprocess env is credential-sanitized, and a sandbox workspace clone must already be provisioned for ``repo`` (call talon_setup_workspace first) — batch never operates on the running agent's source tree. Returns immediately with a job_id; poll talon_status. |
+| `!talon claim` | `talon` | `<repo> <issue> [max_iterations] [max_turns] [backend] [model] [auth_lane] [skip_clarification] [worktree] [self_review] [demo_check] [eye_check]` | Dispatch a single issue to Talon for autonomous implementation. Returns immediately with a job_id; the actual work runs in the background. Poll talon_status or talon_job_log to follow progress. |
 | `!talon config` | `talon` |  | Read Talon runtime policy and mutable preference. This is the agent's control surface for its coding-agent backend/model, separate from normal chat LLM routing. |
 | `!talon file-and-claim` | `talon` | `<title> <body> [labels] [repo]` | Loop-closing primitive: file a GitHub issue, then immediately dispatch it to Talon. Runs `gh issue create` through the audited computer_use shell path (auto-approved if the Sovereign added a matching allowlist pattern), parses the new issue number, then calls talon_claim. Returns the issue URL and the Talon job_id. |
+| `!talon github-write` | `talon` | `<operation> <issue> [repo] [body] [labels] [title] [state_reason]` | Bounded GitHub issue-write job for orchestration (#2581 — the `github.write` / `issue.close` capability): close, reopen, comment on, label, or update a GitHub issue after work completes, closing the claim→work→close loop without a human running `gh`. The GitHub token is used in-process for a single authenticated REST call and is NEVER handed to a shell or the read-only git/verify surface. Write targets are restricted to the agent's own repo (GITHUB_SELF_REPO) plus GITHUB_FLEET_REPOS. operation ∈ {close_issue, reopen_issue, comment, add_labels, remove_labels, update_issue}. |
 | `!talon health` | `talon` |  | Check whether kestrel-talon is reachable and runnable: binary discoverable, subprocess env clean, executes ``--help`` successfully. Read-only, no dispatch. |
 | `!talon job-log` | `talon` | `<job_id> [lines]` | Tail the log file of a dispatched Talon job. Use the job_id returned by talon_claim. Read-only. |
 | `!talon pause` | `talon` |  | Pause the autonomous Talon loop (kill switch). |
 | `!talon resume` | `talon` |  | Resume the autonomous Talon loop after pause. |
-| `!talon set-config` | `talon` | `[default_backend] [default_model] [default_auth_lane] [max_iterations] [max_turns] [skip_clarification] [self_review]` | Update mutable Talon preferences only: default backend/model, auth lane, iterations, turns, clarification, and self-review. Operator policy is not changed by this tool. |
+| `!talon scan-stale-work` | `talon` | `[stale_days] [repo] [repos] [org] [repo_prefix] [exclude_repos]` | Read-only ecosystem discovery scan for stale Talon work. Returns actionable findings for scheduler discovery watches; never dispatches repairs or closes issues. |
+| `!talon schedule-rescue` | `talon` | `[cron] [stale_days]` | Schedule the stalled_work_rescue workflow as a SAFE recurring loop. Each tick detects stalled fleet work and requests fresh per-run consent; the irreversible dispatch/close stages never auto-run off the schedule. Refuses to bake in repair targets, resolution evidence, or a blanket approval marker. |
+| `!talon set-config` | `talon` | `[default_backend] [default_model] [default_auth_lane] [max_iterations] [max_turns] [skip_clarification] [self_review]` | Update mutable Talon preferences only (operator policy is not changed by this tool). Writes the same defaults that talon_claim consumes per-dispatch. Allowed values: default_backend ∈ {claude, codex, opencode}; default_model — when backend=claude one of {opus, sonnet, haiku} (required), when backend=codex/opencode optional (omit to use the provider default; an explicitly blank value is rejected); default_auth_lane ∈ {oauth, api_key, provider_config}. Cross-field rules: codex ⇒ auth_lane=oauth; opencode ⇒ auth_lane=provider_config; claude ⇒ auth_lane oauth or api_key. max_iterations / max_turns are positive integer counts. |
 | `!talon setup-workspace` | `talon` | `<repo> [fetch]` | Provision (or refresh) a sandboxed talon workspace clone for a repo. The clone lives outside the running agent's source tree, so talon_claim can operate without ever touching the agent's own checkout. Approval-gated. |
-| `!talon status` | `talon` |  | Check status of Talon jobs (running, completed, failed). |
+| `!talon status` | `talon` | `[source]` | Check status of Talon jobs (running, completed, failed). Merges locally-dispatched jobs (the durable registry) with jobs only observed via the shared observability store — e.g. runs driven by a Claude Code session or a peer host. Each job carries a 'source' provenance field ('registry' vs 'observability'). Pass source='observability' to list only externally-driven jobs, or source='registry' for only local ones. |
 | `!talon verify` | `talon` | `<commands> [repo] [cwd] [ref] [timeout] [note]` | Reviewer-side audited test verification. Run one or more test commands and report a precise result state per command (passed / failed / blocked_by_policy / blocked_by_user / blocked_by_sandbox / tooling_error). Allowlisted project test commands (e.g. `uv run pytest ...`) run without prompting; anything else is approval-gated. Use this instead of ad-hoc shell so test evidence is structured and audited, and so a sandbox/policy block is never mislabeled as a user denial. |
 | `!talon workspace-status` | `talon` | `<repo>` | Read-only: report on the talon workspace clone for a repo (path, exists, git HEAD, clean state, last fetch). No side effects. |
 | `!a2a attach` | `tasks` | `<task_id> <name> <content> [index] [last_chunk]` | RESPONDER-SIDE artifact attach: the RECIPIENT of an incoming A2A task uses this to attach its own output. To attach payload as the SENDER of an outgoing task, pass ``artifacts``/``references`` to send_a2a_task / send_a2a_question instead. Attach one chunk of long-form output as an Artifact to an incoming A2A task BEFORE calling respond_to_a2a_task. Use this when your reply exceeds the per-tool argument cap (10K chars) — chunk the body into segments of <=9000 chars each, call this tool once per segment with monotonically-increasing index (0, 1, 2, ...) and last_chunk=False on every segment except the final one. The sender's get_peer_task_result returns the artifacts in order so the resumed turn can reassemble the full body. After all segments are attached, call respond_to_a2a_task with a SHORT content like 'See attached artifacts (N segments).' so the sender knows where to look. |
@@ -1035,9 +1099,9 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!cancel-task` | `tasks` | `<task_id> [reason]` | Cancel a pending or running task. |
 | `!list-skills` | `tasks` |  | List all available features and their skills that can be used with run_workflow. Returns feature names, skill names, and descriptions. Call this first to discover what skills are available before building a workflow plan. |
 | `!run-workflow` | `tasks` | `<steps>` | Execute a multi-step plan across features. Each step runs a specific feature skill with arguments. All steps execute sequentially and results are returned together. Use this instead of making individual subagent calls when you need to gather information from multiple features. Steps format: [{"feature": "feature_name", "skill": "skill_name", "args": {}}]. Feature names match the tool names shown in your available tools (e.g., model_agent, memory_feature, wallet_feature). Skill names are the individual tool methods within each feature (e.g., list_models, memory_status, check_balance). Args can reference prior step outputs with {{steps.N.result}} or {{prev.result}}. Steps can optionally include max_retries (default 0) and retry_delay_ms (default 1000). |
-| `!task-result` | `tasks` | `<task_id>` | Get the result/artifacts from a completed task. |
-| `!task-status` | `tasks` | `<task_id>` | Check the status of a background task by ID. |
-| `!tasks` | `tasks` | `[status] [task_type] [limit]` | List background tasks, optionally filtered by status or type. |
+| `!task-result` | `tasks` | `<task_id>` | Get the result/artifacts from a completed task. The returned message field is the REPLY content, distinct from request_content (what was originally ASKED) surfaced by check_task_status. |
+| `!task-status` | `tasks` | `<task_id>` | Check the status of a background task by ID. Returns two distinct content fields: request_content (what was ASKED — the inbound sender's message) and message (the REPLY that has been written back, if any). |
+| `!tasks` | `tasks` | `[status] [task_type] [limit]` | List background tasks, optionally filtered by status or type. status must be one of the TaskState values: submitted, working, completed, failed, canceled (case-insensitive). With no status, returns the pending (submitted) inbox; a status filter queries tasks across ALL states. |
 | `!todo add` | `todo` | `<title> [description] [scope] [status] [priority] [owner] [links] [terminal_condition] [next_check_at] [source_metadata]` | Create a durable active todo with terminal criteria and optional external links. |
 | `!todo complete` | `todo` | `<todo_id> [outcome] [evidence] [terminal_condition_satisfied] [superseded_by]` | Mark a todo done only when its terminal condition is explicitly satisfied, or cancel/supersede it with a reason. |
 | `!todo link` | `todo` | `<todo_id> <link_type> <target> [title] [status] [url] [metadata]` | Attach an external reference to a todo, such as a GitHub issue, Talon job, A2A task, scheduled job, restart request, action item, or evidence URL. |
@@ -1045,7 +1109,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!todo rollup` | `todo` | `[include_done] [limit]` | Summarize pending/waiting/in-progress todos across sessions and linked systems. |
 | `!todo update` | `todo` | `<todo_id> [title] [description] [scope] [status] [priority] [owner] [links] [terminal_condition] [next_check_at] [superseded_by] [source_metadata]` | Update an active todo without marking it complete unless status is explicitly terminal. |
 | `!wait` | `wait` | `[target] [duration_seconds] [timeout_seconds] [poll_interval_seconds] [reason] [mode]` | The ONE generic wait — works across EVERY feature. There is no per-feature wait tool; whatever async work a loaded feature exposes, you wait on it here with `target="<kind>:<handle>"`.<br>Known handle kinds (each contributed by a feature; more may be registered by whatever features are loaded):<br>• `task:<task_id>` — a Kestrel background task<br>• `talon:<job_id>` — a Talon coding job<br>• `ci:<...>`, `lora_train:<...>`, `tx:<...>`, `workflow:<run_id>` and others when those features are present.<br>If you pass an unknown kind, the error lists the kinds currently registered.<br><br>Three ways to call it:<br>• `target="<kind>:<handle>"` (default `mode="block"`) — hold the turn, polling until that thing reaches a terminal state or the timeout expires; returns the terminal outcome (or a still-pending result on timeout).<br>• `target="<kind>:<handle>", mode="signal"` — register a watch and return IMMEDIATELY; the wait reconciler wakes you with a `wait.complete` cognition signal once it finishes. Use this for long/unattended waits so you don't hold a turn.<br>• `duration_seconds=N` (no target) — a plain bounded pause, the native alternative to shelling out to `sleep` between polls in an autonomous loop. |
-| `!web-search` | `web_search` | `<query> [max_results]` | Search the web for information. |
+| `!web-search` | `web_search` | `<query> [max_results]` | Search the web for information. max_results is typically 1-10 (default 5). A 'disabled' error means no search provider is configured — set a provider API key (e.g. TAVILY_API_KEY). |
 | `!webhooks history` | `webhooks` | `[limit]` | Show recent webhook receive log for security audit |
 | `!webhooks list` | `webhooks` |  | List all registered webhook endpoints |
 | `!webhooks register` | `webhooks` | `<name> [auth_type] [event_type] [auth_config_json] [rate_limit] [allow_unauthenticated]` | Register a new webhook endpoint with authentication |
@@ -1054,6 +1118,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!wellness-history` | `wellness` | `[limit]` | View wellness trends over time |
 
 <!-- END AUTO-GENERATED FEATURE INVENTORY -->
+
 
 
 

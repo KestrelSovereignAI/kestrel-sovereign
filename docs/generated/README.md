@@ -27,15 +27,18 @@ Rules:
 - Regenerate them from the canonical source.
 - If the generated output is wrong, fix the canonical source or the generator prompts.
 - Check metadata with `uv run python scripts/generate_feature_docs.py --check`.
+- After changing a protected contract, sync it without an LLM call with
+  `uv run python scripts/generate_feature_docs.py --sync-protected-contracts`.
 
 Audience prose is an LLM transformation and therefore cannot be regenerated
 byte-for-byte in CI: it requires an external provider credential/model and
-records the generation time and selected model. Package ownership is different.
-The canonical protected boundary section is inserted verbatim by the generator,
-and `--check` deterministically rejects a missing/stale section or prose that
-promotes a named extracted Feature, provider, or standalone surface to bundled
-status. CI can therefore enforce ownership even though it cannot reproduce the
-surrounding audience prose.
+records the generation time and selected model. Package ownership and context
+honesty are different: their canonical protected sections are inserted
+verbatim by the generator. `--check` deterministically rejects a missing/stale
+contract, explicit prose that promotes a named extracted surface to bundled
+status, explicit context overclaims, and broken local links. CI can therefore
+enforce those contracts even though it cannot reproduce the surrounding
+audience prose.
 
 Files:
 

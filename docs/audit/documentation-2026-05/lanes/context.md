@@ -19,6 +19,13 @@ privacy: public
 
 # Lane Brief: Context
 
+> **Resolved 2026-07-25:** the result of this historical review lane is the
+> active canonical
+> [Kestrel Context Management Contract](../../../architecture/CONTEXT_SYSTEM_DESIGN.md).
+> The durable-salvage page is now explicitly aspirational, and the diagnostic
+> gap remains open as
+> [#2534](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2534).
+
 Goal: reconcile documentation for prompt assembly, token budgets, context pruning, canonical history, rendered provider transport, retrieval insertion, and diagnostics.
 
 Start with:
@@ -42,4 +49,3 @@ Check for:
 - endpoint or CLI diagnostics not documented
 
 Report to: `reports/context_report.md`
-
