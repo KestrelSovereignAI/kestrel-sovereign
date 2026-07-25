@@ -692,6 +692,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         user_prompt: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
         model_override: Optional[str] = None,
+        session_id: Optional[str] = None,
         redact: bool = False,
     ):
         """Open the single OpenInference LLM span for one public entry call.
@@ -710,20 +711,25 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         skipped entirely when no exporter is configured, so an unset OTLP
         endpoint costs only the guard.
         """
-        if not telemetry.llm_tracing_enabled():
+        tracing_enabled = telemetry.llm_tracing_enabled()
+        span_attributes = None
+        if not tracing_enabled:
             span_input = None
-        elif redact:
-            # #2674 finding 3: contentless input marker — never serialize the
-            # withheld prompt into the exported span.
-            span_input = _redacted_content_marker(
-                user_prompt if user_prompt is not None else (messages or "")
-            )
         else:
-            span_input = telemetry.serialize_llm_input(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                messages=messages,
-            )
+            if redact:
+                # #2674 finding 3: contentless input marker — never serialize the
+                # withheld prompt into the exported span.
+                span_input = _redacted_content_marker(
+                    user_prompt if user_prompt is not None else (messages or "")
+                )
+            else:
+                span_input = telemetry.serialize_llm_input(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    messages=messages,
+                )
+            if session_id and session_id.strip():
+                span_attributes = {telemetry.OI_SESSION_ID: session_id}
         with telemetry.llm_span(
             f"llm.{method}",
             input_value=span_input,
@@ -731,6 +737,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             # getattr: tests construct LLMService via __new__ (skipping __init__,
             # see test_discovery_hang_regression), so the attribute may not exist.
             agent_name=getattr(self, "_agent_display_name", None),
+            attributes=span_attributes,
         ) as span:
             yield span
 
@@ -4360,6 +4367,7 @@ No other text or formatting.
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             model_override=model_override,
+            session_id=frozen_context.session_id,
             redact=_redact,
         ) as span:
             result = await self._get_response_frozen(
@@ -4571,6 +4579,7 @@ No other text or formatting.
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 model_override=model_id,
+                session_id=invocation_context.session_id,
                 redact=_redact,
             ) as span:
                 response = await self._run_provider_attempt(
@@ -4713,6 +4722,7 @@ No other text or formatting.
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             model_override=model_override,
+            session_id=invocation_context.session_id,
             redact=_redact,
         ) as span:
             # Try remote GPU first when active AND routing isn't pinned.
@@ -4823,6 +4833,7 @@ No other text or formatting.
             "generate_with_messages",
             messages=messages,
             model_override=model_override,
+            session_id=invocation_context.session_id,
             redact=invocation_context.redact_content,
         ) as span:
             return await self._generate_with_messages_inner(

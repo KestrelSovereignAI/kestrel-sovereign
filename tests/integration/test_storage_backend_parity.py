@@ -30,6 +30,7 @@ from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore, GraphNo
 from kestrel_sovereign.storage.async_rag_store import AsyncRAGStore
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+from kestrel_sovereign.storage.saved_items_store import SavedItemsStore
 from kestrel_sovereign.storage.schema_router import SchemaRouter
 
 
@@ -381,6 +382,64 @@ async def test_rag_chunks_are_scoped_through_file_ownership(db_backend):
         await storage.rag.chunk_document(
             hash_b, "unauthorized", compute_embeddings=False
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_saved_item_and_rag_bodies_are_currently_plaintext_on_both_backends(
+    db_backend,
+):
+    """Characterize the PostgreSQL seam as well as the default SQLite path.
+
+    Child A/C/D intentionally replace these assertions. Until then, this proves
+    that the shared production writers and backend-normalized schemas expose
+    both bodies directly to a database reader.
+    """
+    agent_id = f"did:test:{uuid4()}"
+    storage = AsyncStorage(backend=db_backend, agent_id=agent_id)
+    await storage.initialize()
+
+    saved_sentinel = f"saved-plaintext-{uuid4()}"
+    saved = await SavedItemsStore(storage.db, agent_id=agent_id).save_item(
+        item_type="stash",
+        name="Backend plaintext characterization",
+        content=saved_sentinel,
+        compute_embedding=False,
+        deduplicate=False,
+    )
+    saved_row = await storage.db.fetchone(
+        "SELECT content FROM saved_items WHERE id = ? AND agent_id = ?",
+        (saved.id, agent_id),
+    )
+
+    rag_sentinel = f"rag-plaintext-{uuid4()}"
+    file_hash = await storage.files.store_file(
+        b"memory encryption characterization",
+        "memory-encryption-characterization.txt",
+    )
+    await storage.rag.chunk_document(
+        file_hash,
+        rag_sentinel,
+        chunk_size=1000,
+        compute_embeddings=False,
+    )
+    rag_row = await storage.db.fetchone(
+        "SELECT content FROM document_chunks WHERE file_hash = ?",
+        (file_hash,),
+    )
+
+    saved_columns = {
+        column["name"]
+        for column in await _get_table_columns(storage.db, "saved_items")
+    }
+    rag_columns = {
+        column["name"]
+        for column in await _get_table_columns(storage.db, "document_chunks")
+    }
+    assert saved_row is not None and saved_row[0] == saved_sentinel
+    assert rag_row is not None and rag_row[0] == rag_sentinel
+    assert "content_ciphertext" not in saved_columns
+    assert "content_ciphertext" not in rag_columns
 
 
 @pytest.mark.asyncio

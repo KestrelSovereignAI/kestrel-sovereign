@@ -109,22 +109,49 @@ def run_git(args: list[str]) -> str:
 
 
 @functools.cache
-def tracked_paths() -> frozenset[str]:
-    return frozenset(run_git(["ls-files"]).splitlines())
+def worktree_paths() -> frozenset[str]:
+    """Return present paths in Git's index.
+
+    The committed artifacts must be reproducible from a clean checkout.
+    Including every non-ignored untracked file makes an editor scratch file
+    capable of changing the ledger, while including a deleted tracked path
+    treats evidence that is no longer present as valid. New source files must
+    therefore be staged before artifact generation; no file content is read
+    from the index, so ordinary tracked modifications remain visible directly
+    from the worktree.
+
+    ``is_symlink`` deliberately keeps a present tracked symlink in the path
+    inventory even when its target is broken. Markdown-link resolution follows
+    the target and will still report that broken/out-of-repository target as
+    missing.
+    """
+
+    candidates = run_git(["ls-files", "--cached"]).splitlines()
+    return frozenset(
+        path
+        for path in candidates
+        if (PROJECT_ROOT / path).exists() or (PROJECT_ROOT / path).is_symlink()
+    )
 
 
 @functools.cache
-def tracked_dirs() -> frozenset[str]:
+def worktree_dirs() -> frozenset[str]:
     dirs: set[str] = set()
-    for path in tracked_paths():
+    for path in worktree_paths():
         parts = Path(path).parts
         for index in range(1, len(parts)):
             dirs.add(Path(*parts[:index]).as_posix())
     return frozenset(dirs)
 
 
+def refresh_worktree_inventory() -> None:
+    """Invalidate the process-local path snapshot before a verification pass."""
+    worktree_paths.cache_clear()
+    worktree_dirs.cache_clear()
+
+
 def repo_path_exists(candidate: str) -> bool:
-    return candidate in tracked_paths() or candidate in tracked_dirs()
+    return candidate in worktree_paths() or candidate in worktree_dirs()
 
 
 def parse_pr_number(title: str) -> int | None:
@@ -306,7 +333,7 @@ def relevant_prs(doc: docs_okf.OkfDocument, existing_refs: tuple[str, ...], prs:
     ref_dirs = {
         ref
         for ref in existing_refs
-        if ref in tracked_dirs() and is_specific_prefix(ref)
+        if ref in worktree_dirs() and is_specific_prefix(ref)
     }
     ref_prefixes = {
         ref.rsplit("/", 1)[0]
@@ -347,12 +374,18 @@ def verify_docs(
 ) -> list[DocVerification]:
     """Verify every OKF doc.
 
-    The committed ledger/manifest are a pure function of doc *content* (render
-    routing, local links, code references), so by default this skips the
-    HEAD-relative recent-PR query entirely — that keeps the generated artifacts
-    deterministic across unrelated merges and needs no git history. Pass
-    ``with_activity=True`` for the live review-queue view (``audit --activity``).
+    The committed ledger/manifest are a pure function of doc content and the
+    present repository path inventory (render routing, local links, code
+    references), so by default this skips the HEAD-relative recent-PR query
+    entirely. That keeps the generated artifacts deterministic across unrelated
+    merges and needs no git history. Pass ``with_activity=True`` for the live
+    review-queue view (``audit --activity``).
+
+    Refreshing here matters for library callers that generate, stage, and check
+    in one Python process. CLI calls are one-shot, but the verifier should not
+    retain an inventory captured before the index or worktree changed.
     """
+    refresh_worktree_inventory()
     prs = recent_prs(since, ignored_prs=ignored_prs or set()) if with_activity else []
     verifications: list[DocVerification] = []
     for path in docs_okf.markdown_files(DOCS_ROOT):
@@ -433,11 +466,12 @@ def verification_to_dict(item: DocVerification) -> dict[str, Any]:
 
 
 def render_report(items: list[DocVerification]) -> str:
-    """Render the committed verification ledger from doc *content* only.
+    """Render the committed verification ledger without git activity data.
 
     Deterministic across unrelated merges: it embeds no HEAD-relative data, so
-    ``audit --check`` only trips when the docs themselves change. The recent-PR
-    review queue lives in the live ``audit --activity`` view, not here.
+    ``audit --check`` only trips when documentation or referenced repository
+    paths change. The recent-PR review queue lives in the live
+    ``audit --activity`` view, not here.
     """
     by_render: dict[str, int] = {}
     for item in items:
@@ -609,7 +643,7 @@ def main() -> int:
         print(render_activity(items, since=args.since), end="")
         return 0
 
-    # Committed artifacts: content-only, no git history needed, deterministic.
+    # Committed artifacts: content/path inventory only, no git history needed.
     items = verify_docs(since=args.since, ignored_prs=ignored_prs)
     if args.command == "audit":
         if args.format == "json":

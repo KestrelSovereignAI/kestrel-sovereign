@@ -523,10 +523,12 @@
         "kestrel_sovereign/security/narration_check.py",
         "kestrel_sovereign/services/payer_resolver.py",
         "kestrel_sovereign/storage/async_conversation_store.py",
+        "kestrel_sovereign/storage/async_rag_store.py",
         "kestrel_sovereign/storage/memory_consolidator.py",
         "kestrel_sovereign/storage/memory_retriever.py",
         "kestrel_sovereign/storage/memory_system.py",
         "kestrel_sovereign/storage/privacy_wrapper.py",
+        "kestrel_sovereign/storage/saved_items_store.py",
         "kestrel_sovereign/storage/sovereign_adapter.py",
         "kestrel_sovereign/tools/result_contract.py",
         "run_tests.py"
@@ -1188,6 +1190,43 @@
       "status": "experimental",
       "title": "Key Rotation Mechanism",
       "type": "Architecture Spec"
+    },
+    {
+      "existing_code_refs": [
+        "kestrel_sovereign/storage/lexical_memory_index.py",
+        "tests/integration/test_saved_items_rag_smoke.py",
+        "tests/integration/test_storage_backend_parity.py",
+        "tests/unit/test_async_rag_store.py",
+        "tests/unit/test_embedding_reindex.py",
+        "tests/unit/test_key_rotation.py",
+        "tests/unit/test_rag_store_pgvector.py",
+        "tests/unit/test_saved_items.py",
+        "tests/unit/test_saved_items_pgvector.py",
+        "tests/unit/test_saved_items_sqla.py",
+        "tests/unit/test_saved_items_store.py"
+      ],
+      "findings": [
+        "missing_code_refs"
+      ],
+      "missing_code_refs": [
+        "tests/integration/test_memory_encryption_backup_restore.py",
+        "tests/integration/test_memory_encryption_migration_postgres.py",
+        "tests/unit/test_document_chunk_tenant_migration.py",
+        "tests/unit/test_identity_exporter.py",
+        "tests/unit/test_identity_importer.py",
+        "tests/unit/test_memory_content_codec.py",
+        "tests/unit/test_memory_content_failures.py",
+        "tests/unit/test_memory_content_keyring.py",
+        "tests/unit/test_memory_content_schema.py",
+        "tests/unit/test_memory_encryption_migration.py"
+      ],
+      "missing_links": [],
+      "path": "docs/architecture/security/MEMORY_CONTENT_ENCRYPTION.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "design-of-record",
+      "title": "Saved-item and RAG Content Encryption",
+      "type": "Architecture Decision Record"
     },
     {
       "existing_code_refs": [],
