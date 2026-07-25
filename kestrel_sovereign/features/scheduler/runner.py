@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Coroutine, Dict, List, Optional, Protocol, Union
 
 from kestrel_sovereign._async_ownership import await_owned_task, run_blocking_operation
+from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
 from kestrel_sovereign.features.scheduler.cron import CronParseError, next_run
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 
@@ -90,67 +91,140 @@ _SCHEDULER_EFFECT_ADVISORY_LOCK_NAMESPACE = 2715
 # SQLite keeps one writer transaction per AsyncDatabase connection.  Holding
 # that transaction while an executor runs would prevent the separately-owned
 # lease-renewal task (and target tools that persist state) from making any
-# progress.  A per-DID advisory file lock instead serializes the two protocol
-# participants that need an external-effect boundary: v2 dispatch admission
-# and a v2 rollout fence. Advisory locks are released by the OS on a process
-# death, unlike a create-with-O_EXCL sentinel, so a crashed runner cannot
-# permanently wedge a local deployment. ``msvcrt`` supplies the equivalent
-# byte-range lock on Windows.
+# progress. A per-DID advisory file lock instead provides the shared/exclusive
+# external-effect boundary between v2 dispatch admission and a v2 rollout
+# fence. Advisory locks are released by the OS on a process death, unlike a
+# create-with-O_EXCL sentinel, so a crashed runner cannot permanently wedge a
+# local deployment. Windows uses ``LockFileEx`` for the corresponding
+# shared/exclusive byte-range lock.
 class _SQLiteRolloutFileLock:
-    """Small cancellation-safe blocking advisory lock for one SQLite DID."""
+    """Cancellation-safe, writer-preferring advisory lock for one SQLite DID.
 
-    def __init__(self, path: str):
+    The main lock is shared by admitted effects and exclusive for a rollout
+    transition.  A short turnstile lock closes reader admission once a writer
+    queues, so a continual stream of due schedules cannot starve a fence.
+    Both locks are released by the operating system when a process dies.
+    """
+
+    def __init__(self, path: str, *, shared: bool):
         self._path = path
-        self._fd: Optional[int] = None
+        self._shared = shared
+        self._main_fd: Optional[int] = None
+        self._main_token: Any = None
+        self._turnstile_fd: Optional[int] = None
+        self._turnstile_token: Any = None
 
-    def acquire(self) -> None:
-        fd = os.open(self._path, os.O_CREAT | os.O_RDWR, 0o600)
+    @staticmethod
+    def _lock_fd(fd: int, *, shared: bool) -> Any:
+        if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+            import ctypes
+            import msvcrt
+            from ctypes import wintypes
+
+            class _Overlapped(ctypes.Structure):
+                _fields_ = [
+                    ("Internal", ctypes.c_size_t),
+                    ("InternalHigh", ctypes.c_size_t),
+                    ("Offset", wintypes.DWORD),
+                    ("OffsetHigh", wintypes.DWORD),
+                    ("hEvent", wintypes.HANDLE),
+                ]
+
+            overlapped = _Overlapped()
+            flags = 0 if shared else 0x00000002  # LOCKFILE_EXCLUSIVE_LOCK
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            if not kernel32.LockFileEx(
+                wintypes.HANDLE(msvcrt.get_osfhandle(fd)),
+                flags,
+                0,
+                1,
+                0,
+                ctypes.byref(overlapped),
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return overlapped
+
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+        return None
+
+    @staticmethod
+    def _unlock_fd(fd: int, token: Any) -> None:
+        if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+            import ctypes
+            import msvcrt
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            if not kernel32.UnlockFileEx(
+                wintypes.HANDLE(msvcrt.get_osfhandle(fd)),
+                0,
+                1,
+                0,
+                ctypes.byref(token),
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return
+
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+    def _acquire_path(self, path: str, *, shared: bool) -> tuple[int, Any]:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            if os.name == "nt":  # pragma: no cover - exercised on Windows CI
-                import msvcrt
-
-                # ``locking`` needs a byte to exist at the requested offset.
-                if os.fstat(fd).st_size == 0:
-                    os.write(fd, b"\0")
-                while True:
-                    try:
-                        os.lseek(fd, 0, os.SEEK_SET)
-                        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-                        break
-                    except OSError as error:
-                        # ERROR_LOCK_VIOLATION / ERROR_SHARING_VIOLATION. Do
-                        # not swallow an unrelated filesystem failure.
-                        if getattr(error, "winerror", None) not in {32, 33}:
-                            raise
-                        time.sleep(0.05)
-            else:
-                import fcntl
-
-                fcntl.flock(fd, fcntl.LOCK_EX)
-            self._fd = fd
+            return fd, self._lock_fd(fd, shared=shared)
         except BaseException:
             os.close(fd)
             raise
 
-    def release(self) -> None:
-        fd, self._fd = self._fd, None
-        if fd is None:
-            return
+    @staticmethod
+    def _release_path(fd: int, token: Any) -> None:
         try:
-            if os.name == "nt":  # pragma: no cover - exercised on Windows CI
-                import msvcrt
-
-                os.lseek(fd, 0, os.SEEK_SET)
-                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(fd, fcntl.LOCK_UN)
+            _SQLiteRolloutFileLock._unlock_fd(fd, token)
         finally:
             os.close(fd)
 
+    def acquire(self) -> None:
+        # A reader crosses the shared turnstile only while taking the shared
+        # main lock. A writer retains the exclusive turnstile through its
+        # critical section, closing new reader admission before it drains the
+        # effects that were already admitted.
+        turnstile_path = f"{self._path}.turnstile"
+        try:
+            (
+                self._turnstile_fd,
+                self._turnstile_token,
+            ) = self._acquire_path(turnstile_path, shared=self._shared)
+            self._main_fd, self._main_token = self._acquire_path(
+                self._path, shared=self._shared
+            )
+            if self._shared:
+                self._release_turnstile()
+        except BaseException:
+            self.release()
+            raise
 
-_sqlite_memory_rollout_locks: Dict[tuple[int, str], asyncio.Lock] = {}
+    def _release_turnstile(self) -> None:
+        fd, token = self._turnstile_fd, self._turnstile_token
+        self._turnstile_fd = None
+        self._turnstile_token = None
+        if fd is not None:
+            self._release_path(fd, token)
+
+    def release(self) -> None:
+        fd, token = self._main_fd, self._main_token
+        self._main_fd = None
+        self._main_token = None
+        try:
+            if fd is not None:
+                self._release_path(fd, token)
+        finally:
+            self._release_turnstile()
+
+
+_sqlite_memory_rollout_locks: Dict[tuple[int, str], AsyncReaderWriterLock] = {}
 
 
 class SchedulerRolloutQuiescenceRequired(RuntimeError):
@@ -498,7 +572,7 @@ class AgentManagerHostedSchedulerExecutor(HostedSchedulerExecutor):
         return self._agent_configs.get(agent_id)
 
     def _lifecycle_lock_for(self, agent_id: str) -> Any:
-        """Return the manager's DID lock, or a compatibility fallback."""
+        """Return the manager's exclusive DID lifecycle lock."""
 
         factory = getattr(self._agent_manager, "scheduler_lifecycle_lock", None)
         if callable(factory):
@@ -507,48 +581,137 @@ class AgentManagerHostedSchedulerExecutor(HostedSchedulerExecutor):
                 return lock
         return self._locks.setdefault(agent_id, asyncio.Lock())
 
+    def _execution_lease_for(self, agent_id: str) -> Any:
+        """Return a shared manager admission lease, if the host provides one."""
+
+        factory = getattr(self._agent_manager, "scheduler_execution_lease", None)
+        if callable(factory):
+            lease = factory(agent_id)
+            if hasattr(lease, "__aenter__"):
+                return lease
+        # Compatibility managers predate shared lifecycle admission. Their
+        # only safe contract remains the exclusive lock used before this
+        # protocol, so retain it rather than silently weakening deletion.
+        return self._lifecycle_lock_for(agent_id)
+
     @asynccontextmanager
     async def prepare_scheduled(
         self, execution: SchedulerExecution
     ) -> AsyncIterator[PreparedScheduledDispatch]:
         """Cold-resolve under the DID lock before database admission.
 
-        Scheduler feature initialization can perform additive schema DDL.  A
+        Scheduler feature initialization can perform additive schema DDL. A
         PostgreSQL admission transaction holds an ``ACCESS SHARE`` lock while
         it validates the claim, so doing that cold load inside admission can
-        self-deadlock when initialization asks for ``ACCESS EXCLUSIVE``.  Keep
-        the manager-owned lifecycle lock from preparation through the later
-        effect, but deliberately yield only after all resolution and authority
-        validation is complete.
+        self-deadlock when initialization asks for ``ACCESS EXCLUSIVE``. Only
+        cold initialization takes the manager's exclusive lifecycle lock.
+        Every effect then takes a shared execution lease: sibling schedules
+        can dispatch concurrently, while a deletion or authority mutation
+        closes admission and drains them first.
         """
 
-        # DELETE/revoke holds this very DID lock through shutdown and
-        # unpublication. Keeping it across the effect dispatch—not merely the
-        # cold load—prevents a frozen startup map from resurrecting or using a
-        # tenant after administrative removal.
-        async with self._lifecycle_lock_for(execution.agent_id):
-            agent = await self._resolve_or_wake(execution.agent_id)
-            if _loaded_agent_did(agent) != execution.agent_id:
-                raise RuntimeError(
-                    "Hosted scheduler resolved an agent whose DID does not match "
-                    f"the claimed schedule agent: expected {execution.agent_id!r}"
-                )
-            # Recheck live authority immediately before the effect boundary.
+        shared_lease_factory = getattr(
+            self._agent_manager, "scheduler_execution_lease", None
+        )
+        supports_shared_leases = callable(shared_lease_factory)
+        # A warm agent can immediately join the shared execution lease. A
+        # cold agent takes the writer only while it is initialized and made
+        # visible to the host, then atomically downgrades to its reader lease.
+        agent = self._loaded_agent_for(execution.agent_id)
+        retained_cold_lease: Any = None
+        if agent is None:
+            lifecycle_lock = self._lifecycle_lock_for(execution.agent_id)
+            downgrade = getattr(lifecycle_lock, "downgrade", None)
+            if not supports_shared_leases or not callable(downgrade):
+                # Compatibility managers expose only an exclusive lifecycle
+                # lock. Retain their established all-or-nothing safety model
+                # instead of assuming a reader/writer API they do not have.
+                async with lifecycle_lock:
+                    agent = await self._resolve_or_wake(execution.agent_id)
+                    if _loaded_agent_did(agent) != execution.agent_id:
+                        raise RuntimeError(
+                            "Hosted scheduler resolved an agent whose DID does not "
+                            f"match the claimed schedule agent: expected "
+                            f"{execution.agent_id!r}"
+                        )
+                    if await self._live_config_for(execution.agent_id) is None:
+                        raise LookupError(
+                            "Hosted scheduler authority was revoked for "
+                            f"{execution.agent_id!r}"
+                        )
+
+                    async def dispatch() -> Any:
+                        return await self._dispatch_resolved_agent(agent, execution)
+
+                    yield dispatch
+                return
+
+            await lifecycle_lock.acquire()
+            writer_held = True
+            try:
+                agent = await self._resolve_or_wake(execution.agent_id)
+                if _loaded_agent_did(agent) != execution.agent_id:
+                    raise RuntimeError(
+                        "Hosted scheduler resolved an agent whose DID does not match "
+                        f"the claimed schedule agent: expected {execution.agent_id!r}"
+                    )
+                retained_cold_lease = downgrade()
+                writer_held = False
+            except BaseException:
+                if writer_held:
+                    lifecycle_lock.release()
+                raise
+
+        lease = retained_cold_lease or self._execution_lease_for(execution.agent_id)
+        async with lease:
+            # A writer may have revoked authority after preparation but before
+            # this reader was admitted. Fail closed rather than dispatching a
+            # stale prepared agent.
             if await self._live_config_for(execution.agent_id) is None:
                 raise LookupError(
                     f"Hosted scheduler authority was revoked for {execution.agent_id!r}"
                 )
+            published_agent = (
+                self._loaded_agent_for(execution.agent_id)
+                if supports_shared_leases
+                else agent
+            )
+            if published_agent is None:
+                raise LookupError(
+                    "Hosted scheduler agent was unpublished before dispatch for "
+                    f"{execution.agent_id!r}"
+                )
+            if _loaded_agent_did(published_agent) != execution.agent_id:
+                raise RuntimeError(
+                    "Hosted scheduler resolved an agent whose DID does not match "
+                    f"the claimed schedule agent: expected {execution.agent_id!r}"
+                )
+            # A same-DID replacement can happen between the initial warm
+            # lookup and reader admission. Under the reader, use the live
+            # published object rather than invoking a stale/shutting-down one.
+            agent = published_agent
 
             async def dispatch() -> Any:
                 return await self._dispatch_resolved_agent(agent, execution)
 
             yield dispatch
 
-    async def _resolve_or_wake(self, agent_id: str) -> Any:
+    def _loaded_agent_for(self, agent_id: str) -> Optional[Any]:
+        """Return an already-published agent for ``agent_id``, if present."""
+
         agents = self._agent_manager.list_agents()
         for agent in agents.values():
             if _loaded_agent_did(agent) == agent_id:
                 return agent
+
+        return None
+
+    async def _resolve_or_wake(self, agent_id: str) -> Any:
+        """Return a warm agent or cold-load exactly one under the writer."""
+
+        agent = self._loaded_agent_for(agent_id)
+        if agent is not None:
+            return agent
         config = await self._live_config_for(agent_id)
         if config is None:
             raise LookupError(f"No hosted agent configuration for {agent_id!r}")
@@ -566,9 +729,9 @@ class AgentManagerHostedSchedulerExecutor(HostedSchedulerExecutor):
                 for parameter in signature.parameters.values()
             )
         ):
-            # The manager lock is already held across the whole dispatch. Tell
-            # the concrete manager not to recursively acquire its non-reentrant
-            # per-DID lock while cold-loading this agent.
+            # The manager writer lock is already held for cold initialization.
+            # Tell the concrete manager not to recursively acquire its
+            # non-reentrant per-DID lifecycle writer while loading this agent.
             loader_kwargs["scheduler_lifecycle_lock_held"] = True
         loaded = await loader(name, local_config, **loader_kwargs)
         loaded_agent_id = _loaded_agent_did(loaded)
@@ -1146,16 +1309,18 @@ class SchedulerRunner:
         return int.from_bytes(digest[:4], byteorder="big", signed=True)
 
     @asynccontextmanager
-    async def _postgres_rollout_effect_gates(self, agent_ids: Collection[str]):
-        """Gate PG effects and rollout transitions before operational work.
+    async def _postgres_rollout_effect_gates(
+        self, agent_ids: Collection[str], *, shared: bool = False
+    ):
+        """Take PostgreSQL rollout readers or an exclusive transition writer.
 
         This is intentionally a dedicated-session advisory lock, not a
-        transaction containing the target effect.  Both active-effect
-        admission and active→quiescing/acknowledgement transitions acquire the
-        same gate *before* opening an operational transaction.  Therefore
-        either the transition wins and admission observes quiescence, or
-        admission wins and the transition waits until the owned effect plus its
-        terminal CAS complete. Scheduler tools remain free to mutate ordinary
+        transaction containing the target effect. Effects hold a shared lock
+        for their full external-effect/final-CAS
+        span. A rollout transition takes the corresponding exclusive lock
+        before opening its transaction. Therefore a transition closes future
+        admission, drains every previously-admitted effect, then changes the
+        durable epoch. Scheduler tools remain free to mutate ordinary
         scheduler rows while an effect is running.
         """
 
@@ -1175,12 +1340,19 @@ class SchedulerRunner:
             )
             for agent_id in sorted(set(agent_ids))
         )
-        async with advisory_locks(keys):
+        async with advisory_locks(keys, shared=shared):
             yield
 
     @asynccontextmanager
     async def _postgres_rollout_effect_gate(self, agent_id: str):
-        """Exclude a rollout fence from one already-admitted PG effect."""
+        """Hold one shared PostgreSQL effect admission lease."""
+
+        async with self._postgres_rollout_effect_gates((agent_id,), shared=True):
+            yield
+
+    @asynccontextmanager
+    async def _postgres_rollout_transition_gate(self, agent_id: str):
+        """Hold one exclusive PostgreSQL rollout transition lease."""
 
         async with self._postgres_rollout_effect_gates((agent_id,)):
             yield
@@ -1204,8 +1376,8 @@ class SchedulerRunner:
         return f"{canonical}.scheduler-rollout-{digest}.lock"
 
     @asynccontextmanager
-    async def _sqlite_rollout_gate(self, agent_id: str):
-        """Serialize SQLite fencing and dispatch without holding its DB writer."""
+    async def _sqlite_rollout_gate(self, agent_id: str, *, shared: bool = False):
+        """Take SQLite rollout readers or an exclusive transition writer."""
 
         if self._database_backend_type() != "sqlite":
             yield
@@ -1216,13 +1388,14 @@ class SchedulerRunner:
             # process-local gate remains necessary for two runners using the
             # same AsyncDatabase object in tests or embedded hosts.
             lock = _sqlite_memory_rollout_locks.setdefault(
-                (id(self._db), agent_id), asyncio.Lock()
+                (id(self._db), agent_id), AsyncReaderWriterLock()
             )
-            async with lock:
+            context = lock.read() if shared else lock
+            async with context:
                 yield
             return
 
-        lock = _SQLiteRolloutFileLock(path)
+        lock = _SQLiteRolloutFileLock(path, shared=shared)
         acquired = False
         try:
             # The owned-task wrapper waits for a blocking flock/locking call
@@ -1244,13 +1417,13 @@ class SchedulerRunner:
     async def _bootstrap_serialization_boundary(self) -> AsyncIterator[None]:
         """Hold one backend-wide gate across scheduler bootstrap mutation.
 
-        PostgreSQL first drains every fixed-scope effect through session
-        advisory locks, then keeps its transaction-scoped schema lock until
-        all DDL and DID rollout state are durable. File-backed SQLite takes a
-        global advisory lock *before* its write transaction, then takes the
-        normal per-DID rollout gates in deterministic order. That ordering
+        PostgreSQL first drains every fixed-scope effect through exclusive
+        session advisory locks, then keeps its transaction-scoped schema lock
+        until all DDL and DID rollout state are durable. File-backed SQLite
+        takes a global writer lock *before* its write transaction, then takes
+        normal per-DID writer gates in deterministic order. That ordering
         avoids a bootstrap writer holding the database writer while waiting
-        for an in-flight effect to leave its DID gate.
+        for admitted effects to leave their DID leases.
         """
 
         async with self._sqlite_rollout_gate(_SCHEDULER_BOOTSTRAP_LOCK_SCOPE):
@@ -1270,17 +1443,15 @@ class SchedulerRunner:
     async def _active_dispatch_admission(self, task: ScheduledTask):
         """Linearize executor entry against active→quiescing fencing.
 
-        PostgreSQL uses a per-DID session advisory gate for the effect span and
-        holds the active control-row transaction only long enough to record the
-        admission decision.  The matching active→quiescing transition takes a
-        transaction-scoped advisory gate *before* changing the control row.
-        This preserves one durable ordering without holding a row lock across
-        arbitrary target code. SQLite holds its OS advisory gate for the same
-        span, but releases its single-writer transaction immediately after
-        checking the active row so renewal and target storage writes can
-        proceed. If dispatch wins it is linearized before the rollout fence; if
-        fencing wins, admission sees ``quiescing`` and never invokes the
-        executor.
+        PostgreSQL uses a shared per-DID session advisory lease for each
+        effect span and holds the active control-row transaction only long
+        enough to record admission. The matching active→quiescing transition
+        takes the exclusive lease *before* changing the control row. SQLite
+        follows the same shared/exclusive admission rule with OS locks, but
+        releases its single-writer transaction immediately after checking the
+        active row so renewal and target storage writes can proceed. If an
+        effect wins it is linearized before the rollout fence; if fencing wins,
+        admission sees ``quiescing`` and never invokes the executor.
         """
 
         if not self._uses_database_clock():
@@ -1290,7 +1461,7 @@ class SchedulerRunner:
             # Do not retain SQLite's sole writer transaction across an
             # executor. The advisory gate has the same protocol linearization
             # role while allowing lease renewal and ordinary tool writes.
-            async with self._sqlite_rollout_gate(task.agent_id):
+            async with self._sqlite_rollout_gate(task.agent_id, shared=True):
                 async with self._transaction():
                     admitted = await self._lock_active_rollout_control(task.agent_id)
                 yield admitted
@@ -1604,7 +1775,9 @@ class SchedulerRunner:
             authorized_agent_ids
         )
         uses_database_clock = self._uses_database_clock()
-        async with self._sqlite_rollout_gate(task.agent_id):
+        # Claim publication is a reader too: it must not cross a transition,
+        # but it can overlap an already-admitted sibling effect.
+        async with self._sqlite_rollout_gate(task.agent_id, shared=True):
             async with self._transaction():
                 if uses_database_clock:
                     # Serialize claim publication with the same per-DID epoch
@@ -2012,10 +2185,10 @@ class SchedulerRunner:
         in_preparation = True
         try:
             # A prepared executor resolves/cold-starts before the PostgreSQL
-            # control-row transaction. AgentManager's implementation holds its
-            # DID lifecycle lock from this point through the eventual effect,
-            # so DELETE cannot revoke the target between preparation and
-            # dispatch. Renewal is already active while this may take time.
+            # control-row transaction. AgentManager retains a shared DID
+            # execution lease through the eventual effect, so DELETE cannot
+            # revoke the target between preparation and dispatch. Renewal is
+            # already active while this may take time.
             async with self._prepared_execution(execution) as dispatch:
                 in_preparation = False
                 if renewal_state.lost.is_set():
@@ -3291,7 +3464,7 @@ class SchedulerRunner:
                     agent_id, fresh_v2_schema=fresh_v2_schema
                 )
             elif self._database_backend_type() == "postgres":
-                async with self._postgres_rollout_effect_gate(agent_id):
+                async with self._postgres_rollout_transition_gate(agent_id):
                     blocked_nonce = await self._ensure_protocol_rollout_agent(
                         agent_id, fresh_v2_schema=fresh_v2_schema
                     )

@@ -20,6 +20,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Awaitable, Callable, List, Optional
 
+from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
 from kestrel_sovereign.kestrel_agent import (
     KestrelAgent,
     await_agent_shutdown_completion,
@@ -69,7 +70,7 @@ class _DynamicSchedulerTenantRegistration:
         name: str,
         agent_id: str,
         config: LocalAgentConfig,
-        lifecycle_lock: asyncio.Lock,
+        lifecycle_lock: AsyncReaderWriterLock,
         rollback_protocol: Optional[Callable[[], Awaitable[None]]],
     ) -> None:
         self._manager = manager
@@ -316,7 +317,7 @@ class AgentManager:
         # exposed through ``scheduler_lifecycle_lock`` rather than having each
         # caller manufacture a private lock, which was the race allowing a
         # frozen scheduler map to resurrect a deleted tenant.
-        self._scheduler_lifecycle_locks: dict[str, asyncio.Lock] = {}
+        self._scheduler_lifecycle_locks: dict[str, AsyncReaderWriterLock] = {}
         # The server owns app-level registration work (A2A resolver, feature
         # routes, and static assets).  It installs this hook before loading the
         # configured fleet so a scheduler cold wake cannot bypass onboarding.
@@ -611,11 +612,24 @@ class AgentManager:
 
         self._scheduler_polling_managed_by_host = bool(managed)
 
-    def scheduler_lifecycle_lock(self, agent_id: str) -> asyncio.Lock:
-        """Return the shared lifecycle lock for a scheduler-authorized DID."""
+    def scheduler_lifecycle_lock(self, agent_id: str) -> AsyncReaderWriterLock:
+        """Return the exclusive lifecycle writer for a scheduler DID."""
         if not isinstance(agent_id, str) or not agent_id:
             raise ValueError("scheduler lifecycle lock requires a non-empty DID")
-        return self._scheduler_lifecycle_locks.setdefault(agent_id, asyncio.Lock())
+        return self._scheduler_lifecycle_locks.setdefault(
+            agent_id, AsyncReaderWriterLock()
+        )
+
+    def scheduler_execution_lease(self, agent_id: str):
+        """Return a shared execution lease drained by lifecycle writers.
+
+        Scheduled effects hold this lease through their terminal scheduler CAS.
+        Removal, rollout authority mutation, and cold initialization retain the
+        exclusive lifecycle writer, closing admission before they mutate live
+        desired state or routing.
+        """
+
+        return self.scheduler_lifecycle_lock(agent_id).read()
 
     def scheduler_authority_for(
         self, agent_id: str
@@ -1054,9 +1068,9 @@ class AgentManager:
         cannot execute a schedule claimed for another tenant.
         """
         if expected_agent_id is not None and not scheduler_lifecycle_lock_held:
-            # Direct callers receive the same serialization as the hosted
-            # scheduler.  The executor passes ``True`` only after acquiring
-            # this exact manager-owned lock for its entire dispatch lease.
+            # Direct callers receive the same cold-initialization serialization
+            # as the hosted scheduler. The executor passes ``True`` only while
+            # it owns this exact manager-managed lifecycle writer.
             async with self.scheduler_lifecycle_lock(expected_agent_id):
                 return await self.load_agent(
                     name,

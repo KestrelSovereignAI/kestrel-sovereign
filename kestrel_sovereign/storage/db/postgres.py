@@ -534,7 +534,7 @@ class PostgresBackend(DatabaseBackend):
 
     @asynccontextmanager
     async def advisory_locks(
-        self, keys: Sequence[Tuple[int, int]]
+        self, keys: Sequence[Tuple[int, int]], *, shared: bool = False
     ) -> AsyncIterator[None]:
         """Hold multiple session advisory locks on one bounded-pool connection.
 
@@ -542,7 +542,9 @@ class PostgresBackend(DatabaseBackend):
         DID. Acquiring those locks on separate connections risks needless
         connection growth, while using the ordinary query pool can deadlock an
         admitted effect's lease renewal or target writes. Keep every named lock
-        on one bounded advisory-pool session instead.
+        on one bounded advisory-pool session instead. ``shared=True`` admits
+        concurrent readers and is paired with an exclusive writer using the
+        same keys.
 
         Callers must provide keys in their established global order when more
         than one process can acquire an overlapping set.  Each pair uses
@@ -558,6 +560,10 @@ class PostgresBackend(DatabaseBackend):
             # represent that empty exclusion set.
             yield
             return
+        lock_function = "pg_advisory_lock_shared" if shared else "pg_advisory_lock"
+        unlock_function = (
+            "pg_advisory_unlock_shared" if shared else "pg_advisory_unlock"
+        )
         advisory_pool = await self._ensure_advisory_pool()
         # Pool acquisition queues outside the operational query pool.  A
         # cancellation while waiting therefore cannot strand an operational
@@ -567,7 +573,7 @@ class PostgresBackend(DatabaseBackend):
             try:
                 for namespace, key in normalized_keys:
                     await conn.execute(
-                        "SELECT pg_advisory_lock($1, $2)", namespace, key
+                        f"SELECT {lock_function}($1, $2)", namespace, key
                     )
                     acquired.append((namespace, key))
                 yield
@@ -586,7 +592,7 @@ class PostgresBackend(DatabaseBackend):
                     # unlocked connection to the bounded advisory pool.
                     for namespace, key in reversed(acquired):
                         await conn.execute(
-                            "SELECT pg_advisory_unlock($1, $2)", namespace, key
+                            f"SELECT {unlock_function}($1, $2)", namespace, key
                         )
                 except BaseException:
                     conn.terminate()

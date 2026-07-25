@@ -776,6 +776,119 @@ async def test_postgres_rollout_transition_waits_for_admitted_effect(
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_postgres_same_did_effects_share_admission_before_transition(
+    db_backend, monkeypatch
+):
+    """Live PostgreSQL admits sibling effects but drains both for a fence."""
+
+    if db_backend.backend_type != "postgres":
+        pytest.skip("requires PostgreSQL shared advisory-lock semantics")
+
+    db = AsyncDatabase(db_backend)
+    agent_id = f"scheduler-shared-admission:{uuid4()}"
+    task_ids = (
+        f"scheduler-shared-admission-a:{uuid4()}",
+        f"scheduler-shared-admission-b:{uuid4()}",
+    )
+    legacy_task_id = f"scheduler-shared-admission-legacy:{uuid4()}"
+    effect_ids: list[str] = []
+    both_effects_started = asyncio.Event()
+    release_effects = asyncio.Event()
+    transition_started = asyncio.Event()
+    tick: asyncio.Task[None] | None = None
+    transition: asyncio.Task[None] | None = None
+
+    async def executor(_task_name, _args):
+        effect_ids.append(get_current_scheduler_execution().schedule_id)
+        if len(effect_ids) == 2:
+            both_effects_started.set()
+        await release_effects.wait()
+        return "ok"
+
+    async def no_op(_task_name, _args):
+        return None
+
+    try:
+        await _activate_protocol_for_test_agent(db, agent_id, monkeypatch)
+        runner = SchedulerRunner(
+            db,
+            agent_id,
+            executor,
+            owner_id="shared-admission-effects",
+            max_concurrent_tasks=2,
+        )
+        fencer = SchedulerRunner(
+            db, agent_id, no_op, owner_id="shared-admission-transition"
+        )
+        await runner._ensure_tables()
+        due = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        for task_id in task_ids:
+            await db.execute(
+                """
+                INSERT INTO scheduled_tasks
+                    (id, agent_id, task_name, cron_expression, args_json, enabled,
+                     next_run_at, created_at, idempotency_key,
+                     scheduler_protocol_version)
+                VALUES (?, ?, 'task', '* * * * *', '{}', 1, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    agent_id,
+                    due,
+                    due,
+                    f"shared-admission-{task_id}",
+                    SCHEDULER_PROTOCOL_VERSION,
+                ),
+            )
+
+        tick = asyncio.create_task(runner._tick())
+        await asyncio.wait_for(both_effects_started.wait(), timeout=3)
+        assert set(effect_ids) == set(task_ids)
+
+        await db.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 next_run_at, created_at, idempotency_key)
+            VALUES (?, ?, 'legacy-task', '* * * * *', '{}', 1, ?, ?,
+                    'shared-admission-legacy')
+            """,
+            (legacy_task_id, agent_id, due, due),
+        )
+
+        async def reconcile() -> None:
+            transition_started.set()
+            with pytest.raises(SchedulerRolloutQuiescenceRequired):
+                await fencer._ensure_protocol_rollout(preexisting_schedule_table=True)
+
+        transition = asyncio.create_task(reconcile())
+        await asyncio.wait_for(transition_started.wait(), timeout=1)
+        await asyncio.sleep(0.1)
+        assert not transition.done()
+
+        release_effects.set()
+        await asyncio.wait_for(tick, timeout=3)
+        await asyncio.wait_for(transition, timeout=3)
+        rows = await db.fetchall(
+            "SELECT task_id, status FROM task_execution_log WHERE agent_id = ? ORDER BY task_id",
+            (agent_id,),
+        )
+        assert rows == [(task_id, "success") for task_id in sorted(task_ids)]
+    finally:
+        release_effects.set()
+        for task in (tick, transition):
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        await db.execute("DELETE FROM task_execution_log WHERE agent_id = ?", (agent_id,))
+        await db.execute("DELETE FROM scheduled_tasks WHERE agent_id = ?", (agent_id,))
+        await db.execute(
+            "DELETE FROM scheduler_protocol_rollout WHERE agent_id = ?", (agent_id,)
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_postgres_bootstrap_waits_for_admitted_effect(
     db_backend, monkeypatch
 ):

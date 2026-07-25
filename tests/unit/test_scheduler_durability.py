@@ -783,6 +783,91 @@ async def test_sqlite_rollout_gate_allows_executor_write_and_delays_fence(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_sqlite_same_did_effects_share_admission_while_fence_drains_them(
+    tmp_path,
+):
+    """Two due schedules for one DID run together before a fence takes over."""
+
+    database_path = tmp_path / "sqlite-shared-rollout-admission.db"
+    db_a = await _database(database_path)
+    db_b = await _database(database_path)
+    admitted_effects: list[str] = []
+    both_effects_started = asyncio.Event()
+    release_effects = asyncio.Event()
+    transition_started = asyncio.Event()
+    tick: asyncio.Task[None] | None = None
+    transition: asyncio.Task[None] | None = None
+
+    async def executor(_name, _args):
+        execution = get_current_scheduler_execution()
+        admitted_effects.append(execution.schedule_id)
+        if len(admitted_effects) == 2:
+            both_effects_started.set()
+        await release_effects.wait()
+        return "done"
+
+    async def no_op(_name, _args):
+        return None
+
+    runner = SchedulerRunner(
+        db_a,
+        "agent-1",
+        executor,
+        owner_id="sqlite-shared-effects",
+        max_concurrent_tasks=2,
+    )
+    fencer = SchedulerRunner(
+        db_b, "agent-1", no_op, owner_id="sqlite-shared-transition"
+    )
+    try:
+        await runner._ensure_tables()
+        await _seed_due(db_a, task_id="shared-effect-a")
+        await _seed_due(db_a, task_id="shared-effect-b")
+
+        tick = asyncio.create_task(runner._tick())
+        await asyncio.wait_for(both_effects_started.wait(), timeout=2)
+        assert set(admitted_effects) == {"shared-effect-a", "shared-effect-b"}
+
+        due = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        await db_b.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 next_run_at, created_at)
+            VALUES ('shared-legacy', 'agent-1', 'legacy', '* * * * *', '{}', 1, ?, ?)
+            """,
+            (due, due),
+        )
+
+        async def reconcile() -> None:
+            transition_started.set()
+            await fencer._ensure_protocol_rollout(preexisting_schedule_table=True)
+
+        transition = asyncio.create_task(reconcile())
+        await asyncio.wait_for(transition_started.wait(), timeout=1)
+        await asyncio.sleep(0.08)
+        assert not transition.done()
+
+        release_effects.set()
+        await asyncio.wait_for(tick, timeout=2)
+        with pytest.raises(SchedulerRolloutQuiescenceRequired):
+            await asyncio.wait_for(transition, timeout=2)
+        rows = await db_a.fetchall(
+            "SELECT status FROM task_execution_log WHERE task_id IN (?, ?) ORDER BY task_id",
+            ("shared-effect-a", "shared-effect-b"),
+        )
+        assert rows == [("success",), ("success",)]
+    finally:
+        release_effects.set()
+        for task in (tick, transition):
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        await db_a.close()
+        await db_b.close()
+
+
+@pytest.mark.asyncio
 async def test_renewal_stays_alive_while_terminal_cas_is_contended(
     monkeypatch, tmp_path
 ):

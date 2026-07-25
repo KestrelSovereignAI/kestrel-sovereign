@@ -2,6 +2,7 @@
 
 import asyncio
 import sqlite3
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -645,6 +646,146 @@ class TestAgentManagerBasics:
         await dispatch
         assert await deletion is True
         assert not manager.is_scheduler_agent_authorized(mock.agent_id)
+
+    @pytest.mark.asyncio
+    async def test_hosted_effects_share_lifecycle_read_lease_before_delete(self):
+        """Sibling schedules overlap, while DELETE drains both before revoking."""
+
+        manager = AgentManager()
+        config = LocalAgentConfig(data_dir="managed", port=8801)
+        mock = _make_mock_agent("did:pkh:shared-scheduler-effects")
+        manager._agents["Managed"] = mock
+        manager._agent_names[mock.agent_id] = "Managed"
+        manager._seed_scheduler_authority({mock.agent_id: ("Managed", config)})
+        effects_started: list[str] = []
+        both_started = asyncio.Event()
+        release_effects = asyncio.Event()
+
+        async def dispatch(_task_name, args):
+            effects_started.append(args["effect"])
+            if len(effects_started) == 2:
+                both_started.set()
+            await release_effects.wait()
+            return "dispatched"
+
+        mock.features = {
+            "SchedulerFeature": SimpleNamespace(
+                _dispatch_scheduled_task=dispatch,
+            )
+        }
+        executor = AgentManagerHostedSchedulerExecutor(manager)
+
+        def execution(effect: str) -> SchedulerExecution:
+            return SchedulerExecution(
+                id=f"execution-{effect}",
+                schedule_id=f"schedule-{effect}",
+                agent_id=mock.agent_id,
+                task_name="test_task",
+                args={"effect": effect},
+                scheduled_for="2026-07-25T00:00:00+00:00",
+                idempotency_key=f"effect-{effect}",
+                attempt=1,
+                owner="host",
+            )
+
+        scheduled = [
+            asyncio.create_task(executor.execute_scheduled(execution(effect)))
+            for effect in ("a", "b")
+        ]
+        deletion = None
+        try:
+            await asyncio.wait_for(both_started.wait(), timeout=1)
+            assert set(effects_started) == {"a", "b"}
+
+            deletion = asyncio.create_task(manager.remove_agent("Managed"))
+            await asyncio.sleep(0.02)
+            assert not deletion.done()
+            assert manager.is_scheduler_agent_authorized(mock.agent_id)
+
+            release_effects.set()
+            assert await asyncio.gather(*scheduled) == ["dispatched", "dispatched"]
+            assert await asyncio.wait_for(deletion, timeout=1) is True
+            assert not manager.is_scheduler_agent_authorized(mock.agent_id)
+        finally:
+            release_effects.set()
+            for task in (*scheduled, deletion):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *scheduled,
+                *(() if deletion is None else (deletion,)),
+                return_exceptions=True,
+            )
+
+    @pytest.mark.asyncio
+    async def test_hosted_executor_uses_live_same_did_replacement_after_handoff(
+        self,
+    ):
+        """A writer replacement cannot leave a stale warm agent dispatchable."""
+
+        manager = AgentManager()
+        config = LocalAgentConfig(data_dir="managed", port=8801)
+        agent_id = "did:pkh:scheduler-replacement"
+        original = _make_mock_agent(agent_id)
+        replacement = _make_mock_agent(agent_id)
+        original_dispatch = AsyncMock(return_value="original")
+        replacement_dispatch = AsyncMock(return_value="replacement")
+        original.features = {
+            "SchedulerFeature": SimpleNamespace(
+                _dispatch_scheduled_task=original_dispatch,
+            )
+        }
+        replacement.features = {
+            "SchedulerFeature": SimpleNamespace(
+                _dispatch_scheduled_task=replacement_dispatch,
+            )
+        }
+        manager._agents["Managed"] = original
+        manager._agent_names[agent_id] = "Managed"
+        manager._seed_scheduler_authority({agent_id: ("Managed", config)})
+        warm_lookup_complete = asyncio.Event()
+        allow_reader_admission = asyncio.Event()
+
+        class HandoffProbeExecutor(AgentManagerHostedSchedulerExecutor):
+            def _execution_lease_for(self, target_agent_id):
+                base_lease = super()._execution_lease_for(target_agent_id)
+
+                @asynccontextmanager
+                async def delayed_reader_lease():
+                    warm_lookup_complete.set()
+                    await allow_reader_admission.wait()
+                    async with base_lease:
+                        yield
+
+                return delayed_reader_lease()
+
+        executor = HandoffProbeExecutor(manager)
+        execution = SchedulerExecution(
+            id="execution-replacement",
+            schedule_id="schedule-replacement",
+            agent_id=agent_id,
+            task_name="test_task",
+            args={},
+            scheduled_for="2026-07-25T00:00:00+00:00",
+            idempotency_key="effect-replacement",
+            attempt=1,
+            owner="host",
+        )
+        scheduled = asyncio.create_task(executor.execute_scheduled(execution))
+        try:
+            await asyncio.wait_for(warm_lookup_complete.wait(), timeout=1)
+            async with manager.scheduler_lifecycle_lock(agent_id):
+                manager._agents["Managed"] = replacement
+            allow_reader_admission.set()
+
+            assert await asyncio.wait_for(scheduled, timeout=1) == "replacement"
+            original_dispatch.assert_not_awaited()
+            replacement_dispatch.assert_awaited_once_with("test_task", {})
+        finally:
+            allow_reader_admission.set()
+            if not scheduled.done():
+                scheduled.cancel()
+            await asyncio.gather(scheduled, return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_delete_serializes_real_executor_cold_wake_before_registration(
