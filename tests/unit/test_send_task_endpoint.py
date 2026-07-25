@@ -276,6 +276,48 @@ def _install_hosted_a2a_manager(agent, document, authorize_inbound_sender):
     return manager, sender
 
 
+def _install_hosted_legacy_unsigned_manager(
+    agent,
+    authorize_inbound_sender,
+    *,
+    sender_name="legacy",
+    sender_identity=None,
+):
+    """Build the production hosted policy shape for unsigned compatibility."""
+    from kestrel_sovereign.a2a.did_registry import install_a2a_did_resolver
+    from kestrel_sovereign.a2a.inbound_authorization import (
+        install_a2a_inbound_sender_authorizer,
+        mark_a2a_inbound_scoped_policy,
+    )
+    from kestrel_sovereign.features.peers.directory import PeerRequester
+    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+
+    sender = SimpleNamespace(
+        agent_id=f"did:pkh:hosted:{sender_name}",
+        did=f"did:pkh:hosted:{sender_name}",
+        identity=sender_identity,
+    )
+    manager = AgentManager()
+    manager._register_agent(sender_name, sender)
+    manager._register_agent("recipient", agent)
+    agent.peer_directory_router = SimpleNamespace(
+        authorize_inbound_sender=authorize_inbound_sender,
+    )
+    agent.peer_requester = PeerRequester(agent.agent_id, object())
+    mark_a2a_inbound_scoped_policy(agent, required=True)
+    install_a2a_did_resolver(manager, recipient=agent)
+    install_a2a_inbound_sender_authorizer(manager, recipient=agent)
+    agent._a2a_host_manager = manager
+    manager.install_a2a_hosted_policy(
+        agent,
+        resolver=agent.a2a_did_resolver,
+        authorizer=agent.a2a_inbound_sender_authorizer,
+        router=agent.peer_directory_router,
+        requester=agent.peer_requester,
+    )
+    return manager, sender
+
+
 def test_unsigned_envelope_accepted_and_marked_unverified(app_with_send):
     agent = _stub_agent()
     agent.a2a_did_resolver = None  # explicit: no resolver wired
@@ -382,6 +424,86 @@ def test_scoped_unsigned_envelope_rejected_even_without_global_flag(
 
     assert resp.status_code == 403
     assert authorizer.calls == []
+    agent.task_manager.create_task.assert_not_awaited()
+
+
+def test_hosted_exact_non_hybrid_local_sender_keeps_unsigned_compatibility(
+    app_with_send,
+    monkeypatch,
+):
+    """Hosted policy permits only its current local pre-ceremony peer."""
+    monkeypatch.delenv("KESTREL_A2A_REQUIRE_SIGNED", raising=False)
+    agent = _stub_agent()
+    directory = AsyncMock(return_value=True)
+    _manager, sender = _install_hosted_legacy_unsigned_manager(agent, directory)
+    _attach(app_with_send, agent)
+
+    with TestClient(app_with_send) as client:
+        response = client.post(
+            "/api/agent/tasks/send",
+            json=_body(metadata={"sender": "legacy"}),
+        )
+
+    assert response.status_code == 200
+    assert (
+        agent.task_manager.create_task.await_args.kwargs["params"]
+        .metadata["sender_verified"]
+        is False
+    )
+    directory.assert_awaited_once_with(agent.peer_requester, sender.agent_id)
+
+
+def test_hosted_unsigned_unknown_or_cross_scope_sender_is_rejected(
+    app_with_send,
+    monkeypatch,
+):
+    """No external/global unsigned fallback survives user-scoped hosting."""
+    monkeypatch.delenv("KESTREL_A2A_REQUIRE_SIGNED", raising=False)
+    agent = _stub_agent()
+    directory = AsyncMock(return_value=False)
+    _manager, sender = _install_hosted_legacy_unsigned_manager(agent, directory)
+    _attach(app_with_send, agent)
+
+    with TestClient(app_with_send) as client:
+        unknown = client.post(
+            "/api/agent/tasks/send", json=_body(metadata={"sender": "external"})
+        )
+        denied = client.post(
+            "/api/agent/tasks/send", json=_body(id="cross-scope", metadata={"sender": "legacy"})
+        )
+
+    assert unknown.status_code == 403
+    assert denied.status_code == 403
+    directory.assert_awaited_once_with(agent.peer_requester, sender.agent_id)
+    agent.task_manager.create_task.assert_not_awaited()
+
+
+def test_hosted_hybrid_sender_cannot_downgrade_to_unsigned(
+    app_with_send,
+    monkeypatch,
+):
+    """A loaded signing-capable peer must supply a verified hybrid envelope."""
+    monkeypatch.delenv("KESTREL_A2A_REQUIRE_SIGNED", raising=False)
+    agent = _stub_agent()
+    directory = AsyncMock(return_value=True)
+    _install_hosted_legacy_unsigned_manager(
+        agent,
+        directory,
+        sender_identity=SimpleNamespace(
+            is_hybrid=True,
+            hybrid_keypair=object(),
+            new_verification_methods=[object()],
+        ),
+    )
+    _attach(app_with_send, agent)
+
+    with TestClient(app_with_send) as client:
+        response = client.post(
+            "/api/agent/tasks/send", json=_body(metadata={"sender": "legacy"})
+        )
+
+    assert response.status_code == 403
+    directory.assert_not_awaited()
     agent.task_manager.create_task.assert_not_awaited()
 
 

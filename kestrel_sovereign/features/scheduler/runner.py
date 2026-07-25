@@ -78,6 +78,13 @@ ROLLOUT_AMBIGUOUS_LEGACY_OCCURRENCE = "rollout_ambiguous_legacy_occurrence"
 # rollout gate while still producing a stable hash-based SQLite lock filename.
 _SCHEDULER_BOOTSTRAP_LOCK_SCOPE = "\0scheduler-bootstrap"
 _SCHEDULER_BOOTSTRAP_ADVISORY_LOCK_SCOPE = 0
+# PostgreSQL long-running effects cannot keep a transaction-scoped control-row
+# lock without deadlocking a scheduled tool that writes scheduler state through
+# another pooled connection.  A distinct per-DID session advisory lock carries
+# the *effect versus rollout-transition* exclusion instead.  It deliberately
+# shares the issue namespace with the bootstrap lock but has a DID-derived
+# signed-32-bit key, so it cannot collide with the global bootstrap key 0.
+_SCHEDULER_EFFECT_ADVISORY_LOCK_NAMESPACE = 2715
 
 
 # SQLite keeps one writer transaction per AsyncDatabase connection.  Holding
@@ -1129,6 +1136,74 @@ class SchedulerRunner:
         )
         return self._updated(updated)
 
+    @staticmethod
+    def _rollout_effect_advisory_key(agent_id: str) -> int:
+        """Return a stable signed-32-bit PostgreSQL advisory key for one DID."""
+
+        digest = hashlib.sha256(
+            f"scheduler-rollout-effect\0{agent_id}".encode("utf-8")
+        ).digest()
+        return int.from_bytes(digest[:4], byteorder="big", signed=True)
+
+    @asynccontextmanager
+    async def _postgres_rollout_effect_gates(self, agent_ids: Collection[str]):
+        """Exclude PG rollout transitions from already-admitted effects.
+
+        This is intentionally a *session* advisory lock, not a transaction
+        containing the target effect.  The matching transition path takes
+        ``pg_advisory_xact_lock`` before it can change ``active`` to
+        ``quiescing``.  Therefore either the transition wins and admission
+        observes quiescence, or admission wins and the transition waits until
+        the owned effect plus its terminal CAS complete.  Scheduler tools are
+        free to acquire the ordinary rollout control row while the effect is
+        running, so a target can pause/update/create schedules without a
+        cross-connection self-deadlock.
+        """
+
+        if self._database_backend_type() != "postgres":
+            yield
+            return
+        backend = getattr(self._db, "backend", None)
+        advisory_locks = getattr(backend, "advisory_locks", None)
+        if not callable(advisory_locks):
+            raise RuntimeError(
+                "PostgreSQL scheduler execution requires backend advisory-lock support"
+            )
+        keys = tuple(
+            (
+                _SCHEDULER_EFFECT_ADVISORY_LOCK_NAMESPACE,
+                self._rollout_effect_advisory_key(agent_id),
+            )
+            for agent_id in sorted(set(agent_ids))
+        )
+        async with advisory_locks(keys):
+            yield
+
+    @asynccontextmanager
+    async def _postgres_rollout_effect_gate(self, agent_id: str):
+        """Exclude a rollout fence from one already-admitted PG effect."""
+
+        async with self._postgres_rollout_effect_gates((agent_id,)):
+            yield
+
+    async def _acquire_rollout_transition_gate(self, agent_id: str) -> None:
+        """Make a PostgreSQL active→quiescing transition wait for effects.
+
+        The caller is already inside the short durable rollout transaction.
+        PostgreSQL releases this xact lock at commit/rollback; SQLite's
+        file-gate ownership is established by its outer bootstrap boundary.
+        """
+
+        if self._database_backend_type() != "postgres":
+            return
+        await self._db.fetchval(
+            "SELECT pg_advisory_xact_lock(?, ?)",
+            (
+                _SCHEDULER_EFFECT_ADVISORY_LOCK_NAMESPACE,
+                self._rollout_effect_advisory_key(agent_id),
+            ),
+        )
+
     def _sqlite_rollout_lock_path(self, agent_id: str) -> Optional[str]:
         """Return a stable sidecar lock path for a file-backed SQLite database."""
 
@@ -1188,12 +1263,13 @@ class SchedulerRunner:
     async def _bootstrap_serialization_boundary(self) -> AsyncIterator[None]:
         """Hold one backend-wide gate across scheduler bootstrap mutation.
 
-        PostgreSQL keeps its transaction-scoped advisory lock until all DDL
-        and DID rollout state is durable. File-backed SQLite takes a global
-        advisory lock *before* its write transaction, then takes the normal
-        per-DID rollout gates in deterministic order. That order avoids a
-        bootstrap writer holding SQLite's only writer while waiting for an
-        in-flight effect to leave its DID gate.
+        PostgreSQL first drains every fixed-scope effect through session
+        advisory locks, then keeps its transaction-scoped schema lock until
+        all DDL and DID rollout state are durable. File-backed SQLite takes a
+        global advisory lock *before* its write transaction, then takes the
+        normal per-DID rollout gates in deterministic order. That ordering
+        avoids a bootstrap writer holding the database writer while waiting
+        for an in-flight effect to leave its DID gate.
         """
 
         async with self._sqlite_rollout_gate(_SCHEDULER_BOOTSTRAP_LOCK_SCOPE):
@@ -1202,20 +1278,28 @@ class SchedulerRunner:
                     await gates.enter_async_context(
                         self._sqlite_rollout_gate(agent_id)
                     )
-                async with self._transaction():
-                    await self._acquire_scheduler_schema_lock()
-                    yield
+                async with self._postgres_rollout_effect_gates(
+                    self._authorized_agent_ids
+                ):
+                    async with self._transaction():
+                        await self._acquire_scheduler_schema_lock()
+                        yield
 
     @asynccontextmanager
     async def _active_dispatch_admission(self, task: ScheduledTask):
         """Linearize executor entry against active→quiescing fencing.
 
-        PostgreSQL holds its active control-row transaction through dispatch
-        and terminal CAS. SQLite holds an OS advisory gate for the same span,
-        but releases its single-writer transaction immediately after checking
-        the active row so renewal and target storage writes can proceed. If
-        dispatch wins it is linearized before the rollout fence; if fencing
-        wins, admission sees ``quiescing`` and never invokes the executor.
+        PostgreSQL uses a per-DID session advisory gate for the effect span and
+        holds the active control-row transaction only long enough to record the
+        admission decision.  The matching active→quiescing transition takes a
+        transaction-scoped advisory gate *before* changing the control row.
+        This preserves one durable ordering without holding a row lock across
+        arbitrary target code. SQLite holds its OS advisory gate for the same
+        span, but releases its single-writer transaction immediately after
+        checking the active row so renewal and target storage writes can
+        proceed. If dispatch wins it is linearized before the rollout fence; if
+        fencing wins, admission sees ``quiescing`` and never invokes the
+        executor.
         """
 
         if not self._uses_database_clock():
@@ -1230,11 +1314,10 @@ class SchedulerRunner:
                     admitted = await self._lock_active_rollout_control(task.agent_id)
                 yield admitted
             return
-        async with self._transaction():
-            if not await self._lock_active_rollout_control(task.agent_id):
-                yield False
-                return
-            yield True
+        async with self._postgres_rollout_effect_gate(task.agent_id):
+            async with self._transaction():
+                admitted = await self._lock_active_rollout_control(task.agent_id)
+            yield admitted
 
     async def _lock_claim_execution_log(
         self, execution_id: str, task: ScheduledTask
@@ -3056,14 +3139,13 @@ class SchedulerRunner:
     async def _lock_active_rollout_controls_for_bootstrap(self) -> None:
         """Drain admitted PostgreSQL effects before taking schema DDL locks.
 
-        An admitted effect holds its active control row through terminal CAS.
-        If bootstrap instead queued an ``ACCESS EXCLUSIVE`` table migration
-        first, that effect's final schedule update could queue behind DDL while
-        bootstrap later waited on its control row: a lock-order cycle. Lock
-        every current active DID before additive DDL, so an already-admitted
-        effect completes first and no new one can enter until bootstrap commits.
-        SQLite has already acquired every DID advisory gate in the enclosing
-        boundary, so it needs no extra database write here.
+        The enclosing bootstrap boundary has already acquired every
+        fixed-scope PostgreSQL effect gate, so no newly admitted v2 effect can
+        enter while DDL is pending and any earlier one has completed. Lock the
+        current active control rows as an additional compatibility drain for a
+        pre-gate v2 process sharing the database. SQLite has already acquired
+        every DID advisory gate in the enclosing boundary, so it needs no
+        extra database write here.
         """
 
         if self._database_backend_type() != "postgres":
@@ -3413,6 +3495,13 @@ class SchedulerRunner:
     ) -> bool:
         """CAS one observed control row into a fresh quiescing epoch."""
 
+        # Acquire this BEFORE touching the control row.  A dispatch holds the
+        # matching session advisory lock from its committed active admission
+        # through effect/finalization, so this transition cannot revoke a live
+        # token underneath an admitted external effect.  Unlike the former
+        # control-row lock, scheduled target tools do not take this gate and
+        # may safely mutate scheduler state while their effect runs.
+        await self._acquire_rollout_transition_gate(agent_id)
         nonce_predicate = (
             "activation_nonce IS NULL"
             if expected_nonce is None

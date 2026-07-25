@@ -92,6 +92,23 @@ class _WebSocketFeatureStub:
         return router
 
 
+class _InstanceBoundRouterFeature:
+    """Feature whose endpoint deliberately closes over its own instance."""
+
+    def __init__(self, owner: str):
+        self.enabled = True
+        self.owner = owner
+
+    def get_router(self):
+        router = APIRouter()
+
+        @router.get("/test-feature-lifecycle/instance-bound")
+        async def instance_bound():
+            return {"owner": self.owner}
+
+        return router
+
+
 def _boot(features):
     """Boot the real app with a mock single agent exposing ``features``.
 
@@ -151,7 +168,10 @@ def _boot_multi_agent(agents):
     original_manager = getattr(app.state, "agent_manager", None)
 
     manager = MagicMock()
-    manager.list_agents = MagicMock(return_value=list(agents.keys()))
+    # Match AgentManager's production contract: list_agents returns the live
+    # name -> agent mapping, not merely a list of names.  Keep it dynamic so
+    # removal/reload assertions observe the current test fleet.
+    manager.list_agents = MagicMock(side_effect=lambda: dict(agents))
     manager.get_agent = MagicMock(side_effect=lambda name: agents.get(name))
 
     app.router.lifespan_context = noop_lifespan
@@ -280,6 +300,54 @@ def test_disabled_websocket_feature_route_is_not_matched():
                     "/test-feature-lifecycle/ws", headers=headers
                 ):
                     pass
+    finally:
+        restore()
+
+
+def test_instance_bound_feature_router_dispatches_to_request_agent_and_reload():
+    """One shape-mounted route must never retain the first tenant's callable.
+
+    ``include_router`` copies Alice's bound endpoint during startup.  Bob has
+    the same route shape, so mounting his router would be deduplicated; the
+    physically mounted route must instead resolve Bob's *current* feature on
+    each agent-prefixed request.  This also proves an in-place feature reload
+    replaces the callable without adding a duplicate route.
+    """
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    alice = _InstanceBoundRouterFeature("alice-v1")
+    bob = _InstanceBoundRouterFeature("bob-v1")
+    agents = {
+        "alice": _make_agent({"ProxyFeature": alice}),
+        "bob": _make_agent({"ProxyFeature": bob}),
+    }
+    app, restore = _boot_multi_agent(agents)
+    path = "/test-feature-lifecycle/instance-bound"
+    try:
+        assert sum(1 for route in app.routes if getattr(route, "path", None) == path) == 1
+        headers = {"X-API-Key": API_KEY}
+        with TestClient(app) as client:
+            assert client.get(f"/api/agents/alice{path}", headers=headers).json() == {
+                "owner": "alice-v1"
+            }
+            assert client.get(f"/api/agents/bob{path}", headers=headers).json() == {
+                "owner": "bob-v1"
+            }
+
+            # A reload swaps the instance but deliberately keeps the route
+            # shape identical.  It must use Bob-v2, not the first mount nor
+            # the prior Bob instance.
+            agents["bob"].features["ProxyFeature"] = _InstanceBoundRouterFeature(
+                "bob-v2"
+            )
+            assert client.get(f"/api/agents/bob{path}", headers=headers).json() == {
+                "owner": "bob-v2"
+            }
+
+            agents["bob"].features.pop("ProxyFeature")
+            assert client.get(f"/api/agents/bob{path}", headers=headers).status_code == 404
+            assert sum(
+                1 for route in app.routes if getattr(route, "path", None) == path
+            ) == 1
     finally:
         restore()
 

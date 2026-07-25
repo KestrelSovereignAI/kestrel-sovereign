@@ -63,7 +63,12 @@ class RecipientA2ASenderAuthorizer:
 
     @property
     def requires_verified_sender(self) -> bool:
-        """Whether unsigned envelopes must be rejected for this recipient."""
+        """Whether direct unsigned use of this recipient policy is forbidden.
+
+        Hosted requests report ``True`` here.  Their one legacy compatibility
+        exception is manager-owned and additionally proves an exact current
+        non-hybrid local sender before this authorizer sees its stable id.
+        """
         self._observe_live_scope()
         return self._scoped_policy_required
 
@@ -93,6 +98,28 @@ class RecipientA2ASenderAuthorizer:
             context,
         )
 
+    async def authorize_legacy_local_sender_with_policy(
+        self,
+        sender_id: str,
+        *,
+        router: Any,
+        requester: Any,
+    ) -> bool:
+        """Authorize one exact loaded pre-ceremony sender under host policy.
+
+        Unsigned A2A traffic has no signing DID to resolve.  Hosted callers
+        may use this narrowly scoped seam only after the manager has proved
+        that ``sender_id`` names a current same-host non-hybrid agent.  The
+        directory remains the user-scope authority, so this method never
+        restores the old global same-host fallback.
+        """
+        if not isinstance(sender_id, str) or not sender_id:
+            return False
+        context = self._validate_scoped_context(router, requester)
+        if context is None:
+            return False
+        return await self._authorize_sender_id_with_context(sender_id, context)
+
     async def authorize(self, verified_sender_did: str) -> bool:
         """Authorize a sender only after its signature has been verified."""
         if not isinstance(verified_sender_did, str) or not verified_sender_did:
@@ -114,10 +141,19 @@ class RecipientA2ASenderAuthorizer:
         verified_sender_did: str,
         context: tuple[Any, PeerRequester],
     ) -> bool:
-        router, requester = context
         sender_id = self._sender_directory_id(verified_sender_did)
         if sender_id is None:
             return False
+
+        return await self._authorize_sender_id_with_context(sender_id, context)
+
+    async def _authorize_sender_id_with_context(
+        self,
+        sender_id: str,
+        context: tuple[Any, PeerRequester],
+    ) -> bool:
+        """Ask the validated directory whether one stable sender is in scope."""
+        router, requester = context
 
         try:
             result = router.authorize_inbound_sender(requester, sender_id)

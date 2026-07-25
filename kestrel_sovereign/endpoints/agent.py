@@ -1869,6 +1869,11 @@ async def _create_a2a_task_under_lifecycle_lease(
 
     if hosted_policy is not None:
         inbound_authorizer = hosted_policy.authorizer
+        # Hosted recipients normally require a verified sender.  Keep the
+        # envelope verifier open only long enough to identify a genuinely
+        # absent signature: the manager-owned legacy path below then permits
+        # one exact current same-host pre-ceremony sender.  A present malformed
+        # or invalid signature remains a hard verification failure.
         scoped_sender_required = True
         verification_scope = None
         resolver = hosted_policy.resolver
@@ -1882,10 +1887,14 @@ async def _create_a2a_task_under_lifecycle_lease(
         # newly attached scope, avoiding a self-induced marker transition.
         verification_scope = _a2a_inbound_scope_snapshot(agent)
         resolver = verification_scope[1]
-    require_signed = scoped_sender_required or os.environ.get(
+    globally_required_signed = os.environ.get(
         "KESTREL_A2A_REQUIRE_SIGNED", ""
     ).lower() in (
         "1", "true", "yes",
+    )
+    require_signed = (
+        globally_required_signed
+        or (hosted_policy is None and scoped_sender_required)
     )
     claimed_sender = str(params.metadata.get("sender") or "")
     sender_witness = (
@@ -2024,6 +2033,41 @@ async def _create_a2a_task_under_lifecycle_lease(
             raise HTTPException(
                 status_code=403,
                 detail="A2A sender authorization unavailable",
+            )
+    elif hosted_policy is not None:
+        # Hosted unsigned compatibility is deliberately narrower than the
+        # historic same-host API-key fallback.  The manager, while holding its
+        # lifecycle lease, proves the claimed name is an exact current local
+        # non-hybrid sender and asks the immutable recipient directory policy
+        # to authorize its stable DID. Unknown, cross-user, external, and
+        # hybrid-downgrade claims fail closed.
+        authorize_legacy = getattr(
+            manager,
+            "authorize_a2a_legacy_unsigned_sender",
+            None,
+        )
+        authorized = False
+        if callable(authorize_legacy):
+            try:
+                authorized = await authorize_legacy(
+                    agent,
+                    claimed_sender,
+                    hosted_policy,
+                )
+            except Exception:  # noqa: BLE001 - manager policy boundary
+                logger.warning(
+                    "Hosted legacy unsigned A2A sender authorization failed",
+                    exc_info=True,
+                )
+        if authorized is not True:
+            raise HTTPException(
+                status_code=403,
+                detail="A2A unsigned sender is not an authorized local legacy peer",
+            )
+        if manager.a2a_hosted_policy_for(agent) is not hosted_policy:
+            raise HTTPException(
+                status_code=403,
+                detail="A2A hosted policy changed during legacy authorization",
             )
     elif scoped_sender_required:
         raise HTTPException(

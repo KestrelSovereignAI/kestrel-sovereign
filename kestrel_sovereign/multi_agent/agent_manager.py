@@ -450,6 +450,75 @@ class AgentManager:
             return None
         return policy
 
+    async def authorize_a2a_legacy_unsigned_sender(
+        self,
+        recipient: object,
+        claimed_sender: str,
+        policy: A2AHostedPolicy,
+    ) -> bool:
+        """Authorize the sole hosted unsigned compatibility path.
+
+        A pre-ceremony sender has no cryptographic signing DID, so accepting
+        its ``metadata.sender`` is safe only when it is the exact current
+        manager name of a loaded local agent, that agent is incapable of hybrid
+        signing, and the recipient's immutable directory policy authorizes the
+        sender's stable agent id.  This method is called while
+        :meth:`a2a_lifecycle_lease` is held; registration/removal/replacement
+        therefore cannot change either endpoint or the policy during the
+        directory await.
+        """
+
+        if (
+            not isinstance(claimed_sender, str)
+            or not claimed_sender
+            or self.a2a_hosted_policy_for(recipient) is not policy
+        ):
+            return False
+        sender = self._agents.get(claimed_sender)
+        if sender is None or sender is recipient:
+            return False
+        sender_id = _loaded_agent_did(sender)
+        if (
+            not isinstance(sender_id, str)
+            or self._agent_names.get(sender_id) != claimed_sender
+            or self._agents.get(claimed_sender) is not sender
+        ):
+            return False
+
+        identity = getattr(sender, "identity", None)
+        # A loaded hybrid identity must never deliberately downgrade to the
+        # unsigned transport.  Treat any retained hybrid key/material as a
+        # signing capability even if a caller corrupts ``is_hybrid``.
+        if identity is not None and (
+            getattr(identity, "is_hybrid", False) is True
+            or getattr(identity, "hybrid_keypair", None) is not None
+            or bool(getattr(identity, "new_verification_methods", None))
+        ):
+            return False
+
+        authorize = getattr(
+            policy.authorizer,
+            "authorize_legacy_local_sender_with_policy",
+            None,
+        )
+        if not callable(authorize):
+            return False
+        try:
+            result = authorize(
+                sender_id,
+                router=policy.router,
+                requester=policy.requester,
+            )
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception:  # noqa: BLE001 - recipient policy provider boundary
+            logger.warning(
+                "Hosted legacy A2A sender authorization failed",
+                exc_info=True,
+            )
+            return False
+        return result is True
+
     def _revoke_a2a_hosted_policy(self, recipient: object) -> None:
         recipient_id = _loaded_agent_did(recipient)
         if not isinstance(recipient_id, str):

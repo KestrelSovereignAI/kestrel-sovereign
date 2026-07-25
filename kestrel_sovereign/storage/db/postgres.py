@@ -427,6 +427,69 @@ class PostgresBackend(DatabaseBackend):
                 raise TransactionError(f"Transaction failed: {e}") from e
             finally:
                 self._txn_conn_var.reset(token)
+
+    @asynccontextmanager
+    async def advisory_lock(self, namespace: int, key: int) -> AsyncIterator[None]:
+        """Hold a session-scoped PostgreSQL advisory lock on one connection.
+
+        Transaction-scoped advisory locks are ideal for short schema and row
+        transitions.  Long-running work must not keep a database transaction
+        (or its row locks) open, though.  This primitive pins a pooled
+        connection for the caller's explicit critical section and releases the
+        lock before returning that connection to the pool.
+
+        ``namespace`` and ``key`` are signed 32-bit values, matching
+        PostgreSQL's two-int advisory-lock form.  The caller owns the lock
+        naming scheme; this backend deliberately supplies only the safe
+        connection lifetime.
+        """
+        async with self.advisory_locks(((namespace, key),)):
+            yield
+
+    @asynccontextmanager
+    async def advisory_locks(
+        self, keys: Sequence[Tuple[int, int]]
+    ) -> AsyncIterator[None]:
+        """Hold multiple session advisory locks on one pooled connection.
+
+        A multi-tenant bootstrap can need to drain effects for more than one
+        DID.  Acquiring those locks on separate pooled connections risks pool
+        exhaustion precisely while a caller is waiting for a long-running
+        effect.  Keep every named lock on one pinned connection instead.
+
+        Callers must provide keys in their established global order when more
+        than one process can acquire an overlapping set.  Each pair uses
+        PostgreSQL's signed two-int advisory-lock form.
+        """
+        normalized_keys = tuple(keys)
+        for namespace, key in normalized_keys:
+            if not isinstance(namespace, int) or not isinstance(key, int):
+                raise TypeError("PostgreSQL advisory lock keys must be integers")
+        if not normalized_keys:
+            # A dynamic hosted scheduler can legitimately have no tenants
+            # during bootstrap. Do not pin a spare pool connection just to
+            # represent that empty exclusion set.
+            yield
+            return
+        pool = self._ensure_connected()
+        async with pool.acquire() as conn:
+            acquired: list[Tuple[int, int]] = []
+            try:
+                for namespace, key in normalized_keys:
+                    await conn.execute(
+                        "SELECT pg_advisory_lock($1, $2)", namespace, key
+                    )
+                    acquired.append((namespace, key))
+                yield
+            finally:
+                # ``pg_advisory_unlock`` must run on the same session that
+                # acquired the lock.  A connection close would eventually
+                # release it too, but explicit release keeps a cancelled
+                # scheduler effect from pinning a pool slot until teardown.
+                for namespace, key in reversed(acquired):
+                    await conn.execute(
+                        "SELECT pg_advisory_unlock($1, $2)", namespace, key
+                    )
     
     async def table_exists(self, table_name: str) -> bool:
         """Check whether an unqualified relation resolves on this connection.

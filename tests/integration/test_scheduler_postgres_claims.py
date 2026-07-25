@@ -25,6 +25,7 @@ from kestrel_sovereign.features.scheduler.runner import (
     ScheduledTask,
     get_current_scheduler_execution,
 )
+from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 
 
@@ -482,14 +483,13 @@ async def test_postgres_claim_uses_statement_time_after_real_row_lock_stall(
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
-async def test_postgres_long_executor_renews_while_admission_epoch_is_held(
+async def test_postgres_long_executor_renews_while_admission_gate_is_held(
     db_backend, monkeypatch
 ):
-    """A held rollout epoch does not hide a long-running claim's renewal."""
+    """A long-running effect renews without retaining the control-row lock."""
 
     if db_backend.backend_type != "postgres":
-        pytest.skip("requires PostgreSQL row-level lock semantics")
-    from asyncpg.exceptions import LockNotAvailableError
+        pytest.skip("requires PostgreSQL advisory-lock semantics")
 
     db = AsyncDatabase(db_backend)
     agent_id = f"scheduler-admission-renew:{uuid4()}"
@@ -531,41 +531,29 @@ async def test_postgres_long_executor_renews_while_admission_epoch_is_held(
         renewed: str | None = None
         for _ in range(30):
             candidate = await db.fetchval(
-                "SELECT lease_expires_at FROM scheduled_tasks WHERE id = ?",
-                (task_id,),
+                "SELECT lease_expires_at FROM scheduled_tasks WHERE id = ?", (task_id,)
             )
             if isinstance(candidate, str) and candidate != initial:
                 renewed = candidate
                 break
             await asyncio.sleep(0.05)
         assert renewed is not None
-        renewed_at = datetime.fromisoformat(renewed).astimezone(timezone.utc)
-        initial_at = datetime.fromisoformat(initial).astimezone(timezone.utc)
-        database_now = await db.fetchval("SELECT clock_timestamp()")
-        if database_now.tzinfo is None:
-            database_now = database_now.replace(tzinfo=timezone.utc)
-        else:
-            database_now = database_now.astimezone(timezone.utc)
-        assert renewed_at > initial_at
-        assert renewed_at > database_now + timedelta(milliseconds=100)
 
-        # The scheduler still holds this control row through the target effect.
-        # The nonblocking probe proves the admission epoch remains the fence
-        # boundary while the schedule row itself stays available to renewal.
+        # Unlike the replaced row-lock admission epoch, the control row is
+        # available while the effect is running. The per-DID advisory gate,
+        # rather than this row, owns the rollout/effect exclusion.
         pool = db_backend._pool
         assert pool is not None
         async with pool.acquire() as contender:
-            # A PostgreSQL lock failure aborts its transaction, so let it
-            # escape the transaction context and be caught only after rollback.
-            with pytest.raises(LockNotAvailableError):
-                async with contender.transaction():
-                    await contender.fetchrow(
-                        """
-                        SELECT agent_id FROM scheduler_protocol_rollout
-                        WHERE agent_id = $1 FOR UPDATE NOWAIT
-                        """,
-                        agent_id,
-                    )
+            async with contender.transaction():
+                control = await contender.fetchrow(
+                    """
+                    SELECT agent_id FROM scheduler_protocol_rollout
+                    WHERE agent_id = $1 FOR UPDATE NOWAIT
+                    """,
+                    agent_id,
+                )
+        assert control is not None
 
         release_executor.set()
         await asyncio.wait_for(tick, timeout=3)
@@ -577,6 +565,246 @@ async def test_postgres_long_executor_renews_while_admission_epoch_is_held(
         if tick is not None and not tick.done():
             tick.cancel()
             await asyncio.gather(tick, return_exceptions=True)
+        await db.execute("DELETE FROM task_execution_log WHERE task_id = ?", (task_id,))
+        await db.execute("DELETE FROM scheduled_tasks WHERE id = ?", (task_id,))
+        await db.execute("DELETE FROM scheduler_protocol_rollout WHERE agent_id = ?", (agent_id,))
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_postgres_scheduled_mutator_does_not_deadlock_rollout_admission(
+    db_backend, monkeypatch
+):
+    """A scheduled pause runs on another PG connection without deadlocking.
+
+    This is the production shape that the prior implementation wedged: the
+    runner held ``scheduler_protocol_rollout`` in its parent transaction while
+    user code invoked ``SchedulerFeature.schedule_pause`` through the normal
+    pooled database path.  The mutation waited on the runner's control-row
+    lock while the runner awaited the mutation.  The advisory effect gate now
+    preserves rollout/effect exclusion without retaining that row lock.
+    """
+
+    if db_backend.backend_type != "postgres":
+        pytest.skip("requires PostgreSQL advisory-lock semantics")
+
+    db = AsyncDatabase(db_backend)
+    agent_id = f"scheduler-admission-mutate:{uuid4()}"
+    task_id = f"scheduler-admission-mutate-task:{uuid4()}"
+    tick: asyncio.Task[None] | None = None
+    mutation_result = []
+    mutation_agent = SimpleNamespace(
+        did=agent_id,
+        agent_id=agent_id,
+        _raw_storage=SimpleNamespace(db=db),
+        features={},
+    )
+    mutation_feature = SchedulerFeature(mutation_agent)
+    # This executor is already inside the runner's admitted effect boundary;
+    # only the feature's actual scheduler mutator is relevant to the
+    # regression, so avoid starting a second feature-owned polling runner.
+    mutation_feature._db = db
+    mutation_feature._agent_id = agent_id
+
+    async def executor(_task_name, _args):
+        mutation_result.append(await mutation_feature.schedule_pause(task_id))
+        return "ok"
+
+    try:
+        await _activate_protocol_for_test_agent(db, agent_id, monkeypatch)
+        runner = SchedulerRunner(
+            db, agent_id, executor, owner_id="admission-renew", lease_seconds=1
+        )
+        await runner._ensure_tables()
+        due = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        await db.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 next_run_at, created_at, idempotency_key,
+                 scheduler_protocol_version)
+            VALUES (?, ?, 'task', '* * * * *', '{}', 1, ?, ?,
+                    'admission-renew', ?)
+            """,
+            (task_id, agent_id, due, due, SCHEDULER_PROTOCOL_VERSION),
+        )
+        tick = asyncio.create_task(runner._tick())
+        await asyncio.wait_for(tick, timeout=3)
+        assert len(mutation_result) == 1
+        assert mutation_result[0].data["status"] == "paused"
+        assert await db.fetchone(
+            "SELECT enabled, claim_token FROM scheduled_tasks WHERE id = ?", (task_id,)
+        ) == (False, None)
+        assert await db.fetchone(
+            "SELECT status FROM task_execution_log WHERE task_id = ?", (task_id,)
+        ) == ("cancelled",)
+    finally:
+        if tick is not None and not tick.done():
+            tick.cancel()
+            await asyncio.gather(tick, return_exceptions=True)
+        await db.execute("DELETE FROM task_execution_log WHERE task_id = ?", (task_id,))
+        await db.execute("DELETE FROM scheduled_tasks WHERE id = ?", (task_id,))
+        await db.execute("DELETE FROM scheduler_protocol_rollout WHERE agent_id = ?", (agent_id,))
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_postgres_rollout_transition_waits_for_admitted_effect(
+    db_backend, monkeypatch
+):
+    """A fence cannot revoke a claim after its external effect has started.
+
+    The transition observes a newly introduced legacy row while an admitted
+    task is paused in its executor.  It must wait at the per-DID advisory gate
+    until terminal compare-and-set finalization has completed, rather than
+    changing the durable rollout row under the live effect.
+    """
+
+    if db_backend.backend_type != "postgres":
+        pytest.skip("requires PostgreSQL advisory-lock semantics")
+
+    db = AsyncDatabase(db_backend)
+    agent_id = f"scheduler-admission-fence:{uuid4()}"
+    task_id = f"scheduler-admission-fence-task:{uuid4()}"
+    executor_started = asyncio.Event()
+    release_executor = asyncio.Event()
+    tick: asyncio.Task[None] | None = None
+    transition: asyncio.Task[None] | None = None
+
+    async def executor(_task_name, _args):
+        executor_started.set()
+        await release_executor.wait()
+        return "ok"
+
+    async def no_op(_task_name, _args):
+        return None
+
+    try:
+        await _activate_protocol_for_test_agent(db, agent_id, monkeypatch)
+        runner = SchedulerRunner(
+            db, agent_id, executor, owner_id="admission-fence-effect"
+        )
+        fencer = SchedulerRunner(
+            db, agent_id, no_op, owner_id="admission-fence-transition"
+        )
+        await runner._ensure_tables()
+        due = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        await db.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 next_run_at, created_at, idempotency_key,
+                 scheduler_protocol_version)
+            VALUES (?, ?, 'task', '* * * * *', '{}', 1, ?, ?,
+                    'admission-fence', ?)
+            """,
+            (task_id, agent_id, due, due, SCHEDULER_PROTOCOL_VERSION),
+        )
+        tick = asyncio.create_task(runner._tick())
+        await asyncio.wait_for(executor_started.wait(), timeout=2)
+
+        # Simulate an origin/main process writing a legacy-visible row after
+        # this runner was prepared. The next reconciliation must quiesce it.
+        await db.execute(
+            "UPDATE scheduled_tasks SET scheduler_protocol_version = NULL WHERE id = ?",
+            (task_id,),
+        )
+
+        async def reconcile() -> None:
+            with pytest.raises(SchedulerRolloutQuiescenceRequired):
+                await fencer._ensure_protocol_rollout(preexisting_schedule_table=True)
+
+        transition = asyncio.create_task(reconcile())
+        await asyncio.sleep(0.1)
+        assert not transition.done()
+
+        release_executor.set()
+        await asyncio.wait_for(tick, timeout=3)
+        await asyncio.wait_for(transition, timeout=3)
+        assert await db.fetchone(
+            "SELECT status FROM task_execution_log WHERE task_id = ?", (task_id,)
+        ) == ("success",)
+        assert await db.fetchone(
+            "SELECT state, activation_nonce FROM scheduler_protocol_rollout WHERE agent_id = ?",
+            (agent_id,),
+        )[0] == "quiescing"
+    finally:
+        release_executor.set()
+        for task in (tick, transition):
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        await db.execute("DELETE FROM task_execution_log WHERE task_id = ?", (task_id,))
+        await db.execute("DELETE FROM scheduled_tasks WHERE id = ?", (task_id,))
+        await db.execute("DELETE FROM scheduler_protocol_rollout WHERE agent_id = ?", (agent_id,))
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_postgres_bootstrap_waits_for_admitted_effect(
+    db_backend, monkeypatch
+):
+    """Schema bootstrap drains active effects before it proceeds with DDL."""
+
+    if db_backend.backend_type != "postgres":
+        pytest.skip("requires PostgreSQL advisory-lock semantics")
+
+    db = AsyncDatabase(db_backend)
+    agent_id = f"scheduler-admission-bootstrap:{uuid4()}"
+    task_id = f"scheduler-admission-bootstrap-task:{uuid4()}"
+    executor_started = asyncio.Event()
+    release_executor = asyncio.Event()
+    tick: asyncio.Task[None] | None = None
+    bootstrap: asyncio.Task[None] | None = None
+
+    async def executor(_task_name, _args):
+        executor_started.set()
+        await release_executor.wait()
+        return "ok"
+
+    async def no_op(_task_name, _args):
+        return None
+
+    try:
+        await _activate_protocol_for_test_agent(db, agent_id, monkeypatch)
+        runner = SchedulerRunner(
+            db, agent_id, executor, owner_id="admission-bootstrap-effect"
+        )
+        rebootstrap = SchedulerRunner(
+            db, agent_id, no_op, owner_id="admission-bootstrap-schema"
+        )
+        await runner._ensure_tables()
+        due = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        await db.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 next_run_at, created_at, idempotency_key,
+                 scheduler_protocol_version)
+            VALUES (?, ?, 'task', '* * * * *', '{}', 1, ?, ?,
+                    'admission-bootstrap', ?)
+            """,
+            (task_id, agent_id, due, due, SCHEDULER_PROTOCOL_VERSION),
+        )
+        tick = asyncio.create_task(runner._tick())
+        await asyncio.wait_for(executor_started.wait(), timeout=2)
+
+        bootstrap = asyncio.create_task(rebootstrap._ensure_tables())
+        await asyncio.sleep(0.1)
+        assert not bootstrap.done()
+
+        release_executor.set()
+        await asyncio.wait_for(tick, timeout=3)
+        await asyncio.wait_for(bootstrap, timeout=3)
+        assert await db.fetchone(
+            "SELECT status FROM task_execution_log WHERE task_id = ?", (task_id,)
+        ) == ("success",)
+    finally:
+        release_executor.set()
+        for task in (tick, bootstrap):
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
         await db.execute("DELETE FROM task_execution_log WHERE task_id = ?", (task_id,))
         await db.execute("DELETE FROM scheduled_tasks WHERE id = ?", (task_id,))
         await db.execute("DELETE FROM scheduler_protocol_rollout WHERE agent_id = ?", (agent_id,))

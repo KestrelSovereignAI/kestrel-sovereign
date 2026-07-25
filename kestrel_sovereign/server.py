@@ -465,7 +465,81 @@ def _resolve_route_agent(scope, mount_agent):
     return state.get("agent") or mount_agent
 
 
-def _gate_feature_route(app: FastAPI, route, feature_name: str, mount_agent) -> None:
+def _feature_router_route_selector(router, route_index: int) -> tuple:
+    """Describe one child route without retaining its instance-bound callable.
+
+    ``FastAPI.include_router`` copies a route's endpoint at mount time.  That
+    is fine for module-level handlers, but is wrong for a per-agent feature
+    whose route closes over ``self``: a route first mounted for Alice would
+    otherwise call Alice's feature when a request is addressed to Bob.  Keep
+    only structural coordinates here and resolve Bob's current child route at
+    request time.
+    """
+
+    routes = tuple(getattr(router, "routes", ()) or ())
+    if route_index < 0 or route_index >= len(routes):
+        raise IndexError("feature router child route index is out of range")
+    route = routes[route_index]
+    return (
+        getattr(router, "prefix", ""),
+        route_index,
+        type(route).__name__,
+        getattr(route, "path", None),
+        tuple(sorted(getattr(route, "methods", ()) or ())),
+    )
+
+
+def _current_feature_router_route(feature, selector: tuple):
+    """Resolve the request target's current matching child route, or ``None``.
+
+    A replacement feature is eligible only if it still exposes exactly the
+    router shape that was mounted.  Returning ``None`` on removal/reload shape
+    drift is intentionally fail-closed: the old captured callable must never
+    serve a request merely because a similarly named feature was once loaded.
+    """
+
+    get_router = getattr(feature, "get_router", None)
+    if not callable(get_router):
+        return None
+    try:
+        router = get_router()
+    except Exception:  # noqa: BLE001 - optional feature boundary
+        logger.warning("Failed to resolve current router from feature", exc_info=True)
+        return None
+    if router is None:
+        return None
+    prefix, index, route_type, path, methods = selector
+    routes = tuple(getattr(router, "routes", ()) or ())
+    if index >= len(routes):
+        return None
+    current = routes[index]
+    if (
+        getattr(router, "prefix", "") != prefix
+        or type(current).__name__ != route_type
+        or getattr(current, "path", None) != path
+        or tuple(sorted(getattr(current, "methods", ()) or ())) != methods
+        or not callable(getattr(current, "app", None))
+    ):
+        return None
+    return current
+
+
+async def _feature_route_gone_response(scope, receive, send) -> None:
+    """Emit the protocol-correct no-route response for a reload race."""
+
+    if scope.get("type") == "websocket":
+        await send({"type": "websocket.close", "code": 1008})
+        return
+    await Response(status_code=404)(scope, receive, send)
+
+
+def _gate_feature_route(
+    app: FastAPI,
+    route,
+    feature_name: str,
+    mount_agent,
+    selector: tuple,
+) -> None:
     """Wrap ``route`` so it only serves while its owning feature is live-enabled.
 
     Feature routers are mounted ONCE at startup, but features can be
@@ -496,15 +570,39 @@ def _gate_feature_route(app: FastAPI, route, feature_name: str, mount_agent) -> 
         manager = getattr(app.state, "agent_manager", None)
         if manager is not None and agent is mount_agent:
             managed = manager.list_agents()
-            if not any(current is mount_agent for current in managed.values()):
+            managed_agents = (
+                managed.values() if hasattr(managed, "values") else (managed or ())
+            )
+            if not any(current is mount_agent for current in managed_agents):
                 return Match.NONE, {}
         features = getattr(agent, "features", None) or {}
         feature = features.get(feature_name) if hasattr(features, "get") else None
-        if feature is None or not bool(getattr(feature, "enabled", True)):
+        if (
+            feature is None
+            or not bool(getattr(feature, "enabled", True))
+            or _current_feature_router_route(feature, selector) is None
+        ):
             return Match.NONE, {}
         return original_matches(scope)
 
     route.matches = _gated_matches
+    # Do not call the copied ``route.app`` here.  Its endpoint is bound to the
+    # feature instance that won initial mounting; request-scoped multi-agent
+    # dispatch must run the target agent's current route object instead.
+    async def _dispatch_current_feature_route(scope, receive, send):
+        agent = _resolve_route_agent(scope, mount_agent)
+        features = getattr(agent, "features", None) or {}
+        feature = features.get(feature_name) if hasattr(features, "get") else None
+        if feature is None or not bool(getattr(feature, "enabled", True)):
+            await _feature_route_gone_response(scope, receive, send)
+            return
+        current = _current_feature_router_route(feature, selector)
+        if current is None:
+            await _feature_route_gone_response(scope, receive, send)
+            return
+        await current.app(scope, receive, send)
+
+    route.app = _dispatch_current_feature_route
 
 
 def _feature_router_signature(feature_name: str, router) -> tuple:
@@ -571,9 +669,26 @@ def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
                 app.include_router(router)
                 # Gate exactly the routes this feature just contributed so a
                 # runtime disable/remove makes them 404 (never a core route).
-                for route in app.routes[before:]:
-                    if hasattr(route, "app"):
-                        _gate_feature_route(app, route, name, agent)
+                selectors = tuple(
+                    _feature_router_route_selector(router, index)
+                    for index, candidate in enumerate(
+                        tuple(getattr(router, "routes", ()) or ())
+                    )
+                    if hasattr(candidate, "app")
+                )
+                added = tuple(
+                    candidate
+                    for candidate in app.routes[before:]
+                    if hasattr(candidate, "app")
+                )
+                if len(added) != len(selectors):
+                    raise RuntimeError(
+                        "Feature router mount did not preserve child-route shape"
+                    )
+                for added_route, selector in zip(added, selectors):
+                    _gate_feature_route(
+                        app, added_route, name, agent, selector
+                    )
                 mounted_keys.add(router_key)
                 mounted.append(name)
             except Exception as exc:
