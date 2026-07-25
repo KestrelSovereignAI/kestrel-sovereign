@@ -1,6 +1,7 @@
 """Tests for documentation verification and render routing."""
 
 import json
+import subprocess
 
 from scripts import docs_okf, docs_verify
 
@@ -23,9 +24,34 @@ def test_doc_relative_markdown_links_are_not_missing_code_refs():
     assert "demos/DEMO_SCRIPT.md" not in missing_refs
 
 
+def test_worktree_inventory_is_stable_when_new_source_is_staged(tmp_path, monkeypatch):
+    subprocess.run(["git", "init", "--quiet"], cwd=tmp_path, check=True)
+    source = tmp_path / "tests" / "unit" / "test_new_source.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("# new repository evidence\n", encoding="utf-8")
+
+    monkeypatch.setattr(docs_verify, "PROJECT_ROOT", tmp_path)
+    docs_verify.worktree_paths.cache_clear()
+    docs_verify.worktree_dirs.cache_clear()
+    try:
+        before_staging = docs_verify.worktree_paths()
+
+        subprocess.run(["git", "add", source.relative_to(tmp_path)], cwd=tmp_path, check=True)
+        docs_verify.worktree_paths.cache_clear()
+        docs_verify.worktree_dirs.cache_clear()
+        after_staging = docs_verify.worktree_paths()
+
+        assert before_staging == after_staging == frozenset(
+            {"tests/unit/test_new_source.py"}
+        )
+    finally:
+        docs_verify.worktree_paths.cache_clear()
+        docs_verify.worktree_dirs.cache_clear()
+
+
 def test_verification_outputs_are_current():
-    # The committed ledger/manifest are a pure function of doc content (no git
-    # history), so this is deterministic and never needs a full-history clone.
+    # The committed ledger/manifest depend on documentation and the repository
+    # path inventory, not git history, so no full-history clone is required.
     items = docs_verify.verify_docs(
         since=docs_verify.DEFAULT_SINCE,
         ignored_prs=docs_verify.DEFAULT_IGNORED_PRS,
