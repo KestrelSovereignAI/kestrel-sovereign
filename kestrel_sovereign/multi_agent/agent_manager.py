@@ -10,6 +10,7 @@ available for local dev (separate OS processes per agent).
 """
 
 import asyncio
+import inspect
 import logging
 import os
 from decimal import Decimal
@@ -32,6 +33,19 @@ from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
 from .config import LocalAgentConfig, MultiAgentConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _has_shutdown_completion_contract(agent: object) -> bool:
+    """Whether this object exposes Kestrel's joinable shutdown continuation.
+
+    The manager's construction seam is intentionally patchable in unit tests,
+    where ``KestrelAgent`` itself may be replaced with a ``MagicMock``.  Check
+    the async contract rather than using ``isinstance`` against a patched
+    module global.
+    """
+    return inspect.iscoroutinefunction(
+        getattr(agent, "wait_for_shutdown_completion", None)
+    )
 
 
 async def _get_agent_did(storage_dir: str) -> str:
@@ -202,6 +216,21 @@ class AgentManager:
                 exc,
                 exc_info=True,
             )
+        # A bounded KestrelAgent shutdown can hand durable dispatcher release
+        # plus storage close to its own shielded continuation.  This startup
+        # cleanup path is still its lifecycle owner, so join that continuation
+        # rather than dropping the only reference while its SQLite backend is
+        # live. Lightweight test doubles do not expose this contract.
+        if _has_shutdown_completion_contract(agent):
+            try:
+                await agent.wait_for_shutdown_completion()
+            except (asyncio.TimeoutError, Exception) as exc:
+                logger.warning(
+                    "Deferred cleanup for unregistered agent %r failed: %s",
+                    name,
+                    exc,
+                    exc_info=True,
+                )
 
     def _register_agent(self, name: str, agent: KestrelAgent) -> None:
         """Publish one fully initialized agent to the co-hosted fleet."""
@@ -400,14 +429,56 @@ class AgentManager:
             )
 
         async with self._lock:
-            agent = self._agents.pop(name, None)
-            if agent is not None:
-                self._agent_names.pop(agent.agent_id, None)
+            agent = self._agents.get(name)
+            if agent is None:
+                return False
+            try:
+                await asyncio.wait_for(agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
+            except (asyncio.TimeoutError, Exception) as e:
+                continuation = (
+                    getattr(agent, "_durable_shutdown_continuation", None)
+                    if _has_shutdown_completion_contract(agent)
+                    else None
+                )
+                if continuation is None:
+                    logger.warning(
+                        "Agent '%s' shutdown incomplete; retaining it until "
+                        "cleanup can be confirmed: %s",
+                        name,
+                        e,
+                        exc_info=True,
+                    )
+                    return False
+                logger.warning(
+                    "Agent '%s' timed out after transferring durable cleanup; "
+                    "joining its dispatcher-to-storage continuation.",
+                    name,
+                )
+
+            # A tail that spent its dispatcher guard continues in the
+            # agent-owned completion task.  Do not unpublish the agent or
+            # release its delegated budget until that task has released the
+            # owner and closed storage. This also handles a bounded outer
+            # timeout: the one removal call remains the lifecycle owner.
+            if _has_shutdown_completion_contract(agent):
                 try:
-                    await asyncio.wait_for(agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
-                    logger.info(f"Agent '{name}' shut down")
+                    await agent.wait_for_shutdown_completion()
                 except (asyncio.TimeoutError, Exception) as e:
-                    logger.warning(f"Agent '{name}' shutdown issue: {e}")
+                    logger.warning(
+                        "Agent '%s' deferred shutdown failed; retaining it "
+                        "until durable cleanup can be confirmed: %s",
+                        name,
+                        e,
+                        exc_info=True,
+                    )
+                    return False
+
+            # Only publish removal after all agent-owned durable cleanup has
+            # completed.  In particular, this keeps the manager as the
+            # lifecycle owner while a SQLite worker is still draining.
+            self._agents.pop(name, None)
+            self._agent_names.pop(agent.agent_id, None)
+            logger.info(f"Agent '{name}' shut down")
 
         # Release THIS agent's own budget hold AFTER it is stopped (#2113):
         # releasing before shutdown would let a still-running child spend
@@ -418,7 +489,7 @@ class AgentManager:
         # supported budget teardown (folded into #2348 with reload durability).
         # Idempotent — a no-op when those paths already released this entry.
         await self._release_child_budget(name)
-        return agent is not None
+        return True
 
     def _allocate_port(self) -> int:
         """Pick the first FREE in-range agent port and reserve it.

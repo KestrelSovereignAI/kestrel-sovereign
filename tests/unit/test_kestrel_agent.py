@@ -136,6 +136,11 @@ async def _initialize_with_features(
                     mock_task_manager = AsyncMock()
                     mock_task_manager.initialize = AsyncMock()
                     mock_task_manager.register_agent = MagicMock()
+                    # TaskManager's runtime unregister contract is
+                    # synchronous. Keep this double faithful so feature
+                    # rollback does not create an unawaited AsyncMock
+                    # coroutine during shutdown.
+                    mock_task_manager.unregister_agent = MagicMock()
                     MockTaskManager.return_value = mock_task_manager
 
                     await agent.initialize()
@@ -1215,7 +1220,11 @@ class TestLifecycle:
             # before releasing the owner. Verify all rows are marker-only
             # retry work immediately before closing the backing storage.
             await dispatcher.shutdown_durable_delivery()
-            deliveries = await dispatcher.list_durable_deliveries()
+            # Public durable APIs are deliberately closed once teardown begins;
+            # inspect the real ledger directly to verify the completed repair.
+            deliveries = await dispatcher._durable_store.list_deliveries(
+                agent_id=agent.did
+            )
             assert len(deliveries) == 2
             assert all(delivery.status == RETRY for delivery in deliveries)
             assert all(delivery.lease_owner is None for delivery in deliveries)
@@ -1656,6 +1665,284 @@ class TestLifecycle:
             assert dispatcher._durable_runtime_owner_registered is False
         finally:
             await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_signal_handler_shutdown_refuses_before_agent_storage_closes(
+        self, tmp_path
+    ):
+        """A handler cannot close storage while its dispatch owns admission."""
+        from kestrel_sdk.signals import (
+            RedactionPolicy,
+            Signal,
+            SignalMode,
+            SourceRegistration,
+            Status,
+            Trust,
+        )
+        from kestrel_sovereign.signals import (
+            OrderedLockManager,
+            SignalDispatcher,
+            SignalLogStore,
+            SourceRegistry,
+        )
+        from kestrel_sovereign.storage.db import SQLiteBackend
+
+        agent = KestrelAgent(
+            did="did:test:handler-shutdown",
+            storage_path=str(tmp_path / "handler-shutdown-agent.db"),
+        )
+        backend = SQLiteBackend(str(tmp_path / "handler-shutdown-ledger.db"))
+        await backend.connect()
+        log_store = SignalLogStore(backend)
+        await log_store.initialize()
+        handler_started = asyncio.Event()
+        storage_close_attempts: list[str] = []
+
+        async def handler(_payload):
+            handler_started.set()
+            # This is the production-shaped failure: agent.shutdown() reaches
+            # its bounded durable tail from inside the parent dispatch.
+            await agent.shutdown()
+
+        registry = SourceRegistry()
+        registry.register(
+            SourceRegistration(
+                name="handler.shutdown",
+                schema=lambda payload: payload,
+                default_mode=SignalMode.ACTION,
+                allowed_modes=frozenset({SignalMode.ACTION}),
+                handler=handler,
+                trust=Trust.TRUSTED,
+                log_redaction=RedactionPolicy(
+                    summarize=lambda _payload: "<redacted>"
+                ),
+                retention_days=7,
+            )
+        )
+        dispatcher = SignalDispatcher(
+            agent=agent,
+            registry=registry,
+            lock_manager=OrderedLockManager(),
+            store=log_store,
+        )
+        await dispatcher.initialize_durable_delivery()
+        agent.dispatcher = dispatcher
+
+        class _Storage:
+            async def close(self):
+                # The durable owner must be stopped before the agent's real
+                # tail reaches storage close.
+                owner = await backend.fetch_one(
+                    "SELECT stopped_at FROM durable_signal_runtime_owners "
+                    "WHERE agent_id = ? AND owner_id = ?",
+                    (agent.did, dispatcher._durable_delivery_owner),
+                )
+                assert owner is not None and owner[0] is not None
+                assert dispatcher._durable_active_admissions == 0
+                storage_close_attempts.append("closed")
+                await backend.close()
+
+        agent.features = {}
+        agent.llm_service = None
+        agent.task_manager = None
+        agent.memory_system = None
+        agent._sync_service = None
+        agent.storage = _Storage()
+
+        try:
+            result = await dispatcher.dispatch_signal(
+                Signal(
+                    source="handler.shutdown",
+                    kind="inbound",
+                    mode=SignalMode.ACTION,
+                    payload={},
+                    target_agent=agent.did,
+                )
+            )
+            assert handler_started.is_set()
+            assert result.status is Status.FAILED
+            assert "live durable signal operation" in (result.error or "")
+            # The failed nested request leaves both the ledger and the
+            # dispatcher live, allowing dispatch audit completion and an
+            # external lifecycle owner to perform shutdown safely.
+            assert storage_close_attempts == []
+            assert await backend.fetch_val("SELECT 1") == 1
+
+            await agent.shutdown()
+            assert storage_close_attempts == ["closed"]
+            assert backend._connection is None
+        finally:
+            if backend._connection is not None:
+                await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_agent_shutdown_continuation_closes_storage_without_retry(
+        self, tmp_path
+    ):
+        """A cancelled outer shutdown leaves one owned completion path.
+
+        The caller invokes shutdown exactly once.  Once its bounded wrapper
+        times out, the agent's continuation must join dispatcher release and
+        close storage itself; no test-only dispatcher/agent retry may mask a
+        leaked SQLite worker.
+        """
+        from kestrel_sovereign.signals import (
+            OrderedLockManager,
+            SignalDispatcher,
+            SignalLogStore,
+            SourceRegistry,
+        )
+        from kestrel_sovereign.storage.db import SQLiteBackend
+
+        agent = KestrelAgent(
+            did="did:test:cancelled-agent-shutdown",
+            storage_path=str(tmp_path / "cancelled-agent-shutdown.db"),
+        )
+        backend = SQLiteBackend(str(tmp_path / "cancelled-agent-ledger.db"))
+        await backend.connect()
+        log_store = SignalLogStore(backend)
+        await log_store.initialize()
+        dispatcher = SignalDispatcher(
+            agent=agent,
+            registry=SourceRegistry(),
+            lock_manager=OrderedLockManager(),
+            store=log_store,
+        )
+        await dispatcher.initialize_durable_delivery()
+        agent.dispatcher = dispatcher
+
+        original_release = dispatcher._durable_store.release_initial_reservations
+        release_entered = asyncio.Event()
+        allow_release = asyncio.Event()
+        storage_close_attempts: list[str] = []
+
+        async def block_release(*args, **kwargs):
+            release_entered.set()
+            await allow_release.wait()
+            return await original_release(*args, **kwargs)
+
+        class _Storage:
+            async def close(self):
+                storage_close_attempts.append("closed")
+
+        dispatcher._durable_store.release_initial_reservations = block_release
+        agent.features = {}
+        agent.llm_service = None
+        agent.task_manager = None
+        agent.memory_system = None
+        agent._sync_service = None
+        agent.storage = _Storage()
+
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(agent.shutdown(), timeout=0.05)
+            await asyncio.wait_for(release_entered.wait(), timeout=1.0)
+
+            # The outer agent shutdown is gone, but its shielded dispatcher
+            # cleanup remains live. Storage must stay untouched until the
+            # agent-owned continuation sees owner release complete.
+            assert storage_close_attempts == []
+            assert dispatcher._durable_shutdown_completion is not None
+            assert not dispatcher._durable_shutdown_completion.done()
+            assert agent._durable_shutdown_continuation is not None
+
+            allow_release.set()
+            await asyncio.wait_for(agent.wait_for_shutdown_completion(), timeout=1.0)
+            assert storage_close_attempts == ["closed"]
+            assert dispatcher._durable_shutdown_completion.done()
+        finally:
+            allow_release.set()
+            dispatcher._durable_store.release_initial_reservations = original_release
+            if agent._durable_shutdown_continuation is not None:
+                await agent.wait_for_shutdown_completion()
+            elif not dispatcher._durable_shutdown:
+                await dispatcher.shutdown_durable_delivery()
+            if backend._connection is not None:
+                await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_boot_rollback_retries_owner_release_before_storage_close(
+        self, tmp_path
+    ):
+        """Boot rollback retains its dispatcher until a fail-once release works."""
+        from kestrel_sovereign.agent.boot import (
+            BootContext,
+            BootPhase,
+            run_boot_sequence,
+        )
+        from kestrel_sovereign.signals import (
+            OrderedLockManager,
+            SignalDispatcher,
+            SignalLogStore,
+            SourceRegistry,
+        )
+        from kestrel_sovereign.storage.db import SQLiteBackend
+
+        agent = KestrelAgent(
+            did="did:test:boot-rollback-durable-release",
+            storage_path=str(tmp_path / "agent.db"),
+        )
+        backend = SQLiteBackend(str(tmp_path / "ledger.db"))
+        await backend.connect()
+        log_store = SignalLogStore(backend)
+        await log_store.initialize()
+        dispatcher = SignalDispatcher(
+            agent=agent,
+            registry=SourceRegistry(),
+            lock_manager=OrderedLockManager(),
+            store=log_store,
+        )
+        await dispatcher.initialize_durable_delivery()
+        agent.dispatcher = dispatcher
+
+        release_calls = 0
+        original_release = dispatcher._durable_store.release_initial_reservations
+        raw_close_calls: list[str] = []
+
+        async def fail_once_release(*args, **kwargs):
+            nonlocal release_calls
+            release_calls += 1
+            if release_calls == 1:
+                raise RuntimeError("injected owner-release failure")
+            return await original_release(*args, **kwargs)
+
+        class _RawStorage:
+            async def close(self):
+                raw_close_calls.append("closed")
+                await backend.close()
+
+        dispatcher._durable_store.release_initial_reservations = fail_once_release
+        agent._raw_storage = _RawStorage()
+        agent.storage = object()
+        ctx = BootContext()
+        states = []
+
+        async def acquire(ctx):
+            # These are the actual rollback actions and their real LIFO
+            # ordering: storage first, dispatcher second.
+            ctx.on_rollback("storage", agent._boot_teardown_storage)
+            ctx.on_rollback("signal_dispatcher", agent._boot_teardown_dispatcher)
+
+        async def fail_after_dispatcher(_ctx):
+            raise RuntimeError("fail after dispatcher startup")
+
+        try:
+            with pytest.raises(RuntimeError, match="fail after dispatcher startup"):
+                await run_boot_sequence(
+                    [BootPhase("acquire", acquire), BootPhase("fail", fail_after_dispatcher)],
+                    ctx,
+                    states.append,
+                )
+
+            assert release_calls == 2
+            assert agent.dispatcher is None
+            assert agent._raw_storage is None
+            assert raw_close_calls == ["closed"]
+            assert backend._connection is None
+        finally:
+            dispatcher._durable_store.release_initial_reservations = original_release
+            if backend._connection is not None:
+                await backend.close()
 
     @pytest.mark.asyncio
     async def test_shutdown_bounds_a_hung_feature(self, tmp_path):
@@ -2402,6 +2689,7 @@ class TestInitialize:
                         assert agent._raw_storage is not None
                         assert agent.storage is not None
                         mock_storage_instance.initialize.assert_called_once()
+                        await _shutdown_feature_init_test_agent(agent)
 
     @pytest.mark.asyncio
     async def test_initialize_wires_observability_store_into_llm_service(self, tmp_path):
@@ -2443,6 +2731,7 @@ class TestInitialize:
 
                         assert agent.observability_store is not None
                         assert agent.llm_service._observability_store is agent.observability_store
+                        await _shutdown_feature_init_test_agent(agent)
 
     @pytest.mark.asyncio
     async def test_initialize_creates_memory_system(self, tmp_path):
@@ -2481,6 +2770,7 @@ class TestInitialize:
                         # Verify memory system created and initialized
                         assert agent.memory_system is not None
                         mock_memory_system.initialize.assert_called_once()
+                        await _shutdown_feature_init_test_agent(agent)
 
     @pytest.mark.asyncio
     async def test_initialize_creates_agent_node_if_missing(self, tmp_path):
@@ -2521,6 +2811,7 @@ class TestInitialize:
                         call_args = mock_storage.add_node.call_args[0][0]
                         assert call_args.node_id == "did:test:agent123"
                         assert call_args.node_type == "agent"
+                        await _shutdown_feature_init_test_agent(agent)
 
     @pytest.mark.asyncio
     async def test_initialize_registers_features(self, tmp_path):
@@ -2577,6 +2868,7 @@ class TestInitialize:
                         assert "TestFeature" in agent.features
                         assert agent.features["TestFeature"] is mock_feature
                         mock_feature.initialize.assert_called_once()
+                        await _shutdown_feature_init_test_agent(agent)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("feature_name", sorted(MANDATORY_FEATURES))

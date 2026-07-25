@@ -832,6 +832,14 @@ class KestrelAgent(
         # Pending task completion notifications (for background tasks)
         self._pending_task_notifications: List[str] = []
         self._background_tasks: set[asyncio.Task] = set()
+        # If the bounded durable tail cannot wait for dispatcher release, this
+        # task owns the only safe successor: dispatcher drain followed by the
+        # matching storage close.  It deliberately does not live in
+        # ``_background_tasks`` because that set is cancelled at the start of
+        # the tail; cancelling it would revive the post-close durable-write
+        # race the continuation exists to prevent.
+        self._durable_shutdown_continuation: Optional[asyncio.Task] = None
+        self._durable_shutdown_continuation_lock = asyncio.Lock()
 
         # Cancellation tracking for stop button functionality
         self._current_request_id: Optional[str] = None
@@ -2540,13 +2548,24 @@ class KestrelAgent(
     # Each releases exactly ONE resource a boot phase acquired and is
     # registered via ``ctx.on_rollback`` at the moment of acquisition, so the
     # BootContext can unwind them in reverse (LIFO) order on any phase failure.
-    # All are idempotent and guarded: they null their handle first so a later
-    # ``shutdown()`` (e.g. the AgentManager cleanup path) is a clean no-op, and
-    # they never raise past their own guard — the rollback driver logs and
-    # continues so one stubborn resource can't strand the others.
+    # Each clears its handle only after releasing the resource it protects. A
+    # durable dispatcher is the deliberate exception to eager handle clearing:
+    # a failed owner release retains both dispatcher and storage so a later
+    # lifecycle shutdown can retry safely. The rollback driver logs failures
+    # and continues with independent resources.
     # ------------------------------------------------------------------
     async def _boot_teardown_storage(self) -> None:
         """Close the primary DB connection and drop the privacy layer."""
+        # Dispatcher teardown owns a runtime-owner release against this very
+        # backend.  If its retryable release has not succeeded, retaining both
+        # handles is the only safe rollback state: closing here would strand a
+        # live owner or let its completion touch a closed SQLite worker.
+        if getattr(self, "dispatcher", None) is not None:
+            logging.error(
+                "boot rollback: retaining storage because durable dispatcher "
+                "teardown is still incomplete"
+            )
+            return
         raw = self._raw_storage
         self._raw_storage = None
         self.storage = None
@@ -2571,11 +2590,31 @@ class KestrelAgent(
     async def _boot_teardown_dispatcher(self) -> None:
         """Stop durable dispatcher liveness before its storage is released."""
         dispatcher = getattr(self, "dispatcher", None)
-        # Clear the public handle first: no rollback tail can route new work to
-        # a dispatcher whose backing storage is about to close.
-        self.dispatcher = None
-        if dispatcher is not None:
+        if dispatcher is None:
+            return
+
+        try:
             await dispatcher.shutdown_durable_delivery()
+        except asyncio.CancelledError:
+            # BootContext will continue its unwind, and _boot_teardown_storage
+            # will keep the shared backend open while this handle remains.
+            raise
+        except Exception:
+            # Durable teardown is intentionally retryable.  A failure can land
+            # after an owner-release transaction has reached the driver; join a
+            # fresh dispatcher-owned completion before deciding rollback is
+            # unsafe.  A persistent failure leaves ``self.dispatcher`` intact,
+            # which in turn keeps storage owned and open for a later shutdown.
+            logging.warning(
+                "boot rollback: durable dispatcher teardown failed; retrying "
+                "before storage release",
+                exc_info=True,
+            )
+            await dispatcher.shutdown_durable_delivery()
+
+        # Only a successfully released dispatcher may lose its public handle.
+        # The following storage rollback can now close the shared backend.
+        self.dispatcher = None
 
     async def _boot_teardown_features(self) -> None:
         """Reverse every feature registration made before the failure, LIFO.
@@ -5274,6 +5313,71 @@ Expected Duration: {expected_duration}
         await asyncio.gather(*tasks, return_exceptions=True)
         self._background_tasks.clear()
 
+    async def _complete_durable_shutdown_continuation(
+        self,
+        dispatcher,
+        storage,
+        storage_preclose,
+    ) -> None:
+        """Finish dispatcher release before touching its shared storage.
+
+        This task is created only after the bounded tail has spent its
+        dispatcher guard.  It is deliberately unbounded and joinable: the
+        durable dispatcher already owns a shielded, retryable release task,
+        and storage cannot safely close until that task has actually finished.
+        The production lifecycle owner joins this continuation before removing
+        the agent or releasing its budget.
+        """
+        await dispatcher.shutdown_durable_delivery()
+        if storage_preclose is not None:
+            await storage_preclose()
+        if storage is not None and hasattr(storage, "close"):
+            await storage.close()
+
+    async def _ensure_durable_shutdown_continuation(self, dispatcher) -> asyncio.Task:
+        """Return the single agent-owned dispatcher-to-storage continuation."""
+        async with self._durable_shutdown_continuation_lock:
+            continuation = self._durable_shutdown_continuation
+            if continuation is not None and not continuation.done():
+                return continuation
+            if continuation is not None and not continuation.cancelled():
+                # A completed successful continuation has already performed
+                # its storage close.  Reuse it so a second shutdown cannot
+                # duplicate that close.
+                if continuation.exception() is None:
+                    return continuation
+
+            storage = self.storage
+            continuation = asyncio.create_task(
+                self._complete_durable_shutdown_continuation(
+                    dispatcher,
+                    storage,
+                    _storage_preclose(storage),
+                ),
+                name=f"agent_durable_shutdown_continuation:{self.did}",
+            )
+            # Always retrieve an unjoined failure.  The task remains retained
+            # for a later lifecycle retry, rather than disappearing as an
+            # unobserved "Task exception was never retrieved" warning.
+            continuation.add_done_callback(
+                lambda task: None if task.cancelled() else task.exception()
+            )
+            self._durable_shutdown_continuation = continuation
+            return continuation
+
+    async def wait_for_shutdown_completion(self) -> None:
+        """Join deferred durable cleanup before releasing this agent.
+
+        Normal shutdown has no continuation because its bounded tail closes
+        storage directly.  If dispatcher release outlives that guard, this
+        joins the agent-owned continuation that performs the only permitted
+        subsequent storage close.  ``shield`` preserves the work if an outer
+        lifecycle wait is cancelled; a later owner can join the same task.
+        """
+        continuation = self._durable_shutdown_continuation
+        if continuation is not None:
+            await asyncio.shield(continuation)
+
     # Tool registry methods provided by ToolRegistryMixin:
     # - _build_feature_tools, _build_all_tools, _register_explored_feature_tools
     # - _maybe_evict_direct_tools, _build_features_prompt_section
@@ -5470,6 +5574,21 @@ Expected Duration: {expected_duration}
         own slice and cannot starve a later feature — or the durable tail.
         """
         loop = asyncio.get_running_loop()
+        dispatcher = getattr(self, "dispatcher", None)
+        inherited_durable_admission = getattr(
+            dispatcher, "has_live_durable_admission_in_current_context", None
+        )
+        if callable(inherited_durable_admission) and inherited_durable_admission():
+            # A signal handler can call agent.shutdown(), whose bounded tail
+            # creates child tasks.  ContextVars copy the parent dispatch's
+            # durable admission into those children, so allowing this shutdown
+            # to begin would make dispatcher teardown wait for the dispatch
+            # that is itself awaiting shutdown.  Refuse before any prefix or
+            # storage teardown runs; an external lifecycle owner may retry
+            # once the dispatch has released its admission.
+            raise RuntimeError(
+                "Cannot shut down an agent from a live durable signal operation"
+            )
         storage_close_timeout = _minimum_storage_close_timeout(self.storage)
         # A feature may lazily create a file-backed SQLAlchemy factory during
         # its shutdown.  Reserve that backend-declared *potential* close
@@ -5732,6 +5851,27 @@ Expected Duration: {expected_duration}
             )
             if tail_cancelled:
                 shutdown_cancelled = True
+
+        # A timed dispatcher guard transfers ownership of the remaining
+        # dispatcher-drain -> storage-close sequence to one agent-owned task.
+        # On an ordinary shutdown we join it here, so this method never reports
+        # completion while the shared SQLite worker remains open.  If an outer
+        # lifecycle timeout already cancelled us, leave the continuation
+        # shielded and let that lifecycle owner join it before removing the
+        # agent; re-raising below preserves the cancellation contract.
+        if not shutdown_cancelled:
+            try:
+                await self.wait_for_shutdown_completion()
+            except asyncio.CancelledError:
+                shutdown_cancelled = True
+        elif (
+            self._durable_shutdown_continuation is not None
+            and not self._durable_shutdown_continuation.done()
+        ):
+            # We must propagate the caller's timeout, but must not describe
+            # shutdown as complete while its owned dispatcher-to-storage tail
+            # is still running.
+            tail_degraded = True
 
         if shutdown_cancelled:
             # Never report success after cancellation: re-raise so the outer
@@ -6057,12 +6197,19 @@ Expected Duration: {expected_duration}
         # the dispatcher can briefly hold a same-process live payload handoff
         # for a worker that claims before restart.  It is never durable and
         # must not outlive this agent instance.
+        dispatcher_shutdown_complete = True
         if run_dispatcher:
-            await _bounded(
+            dispatcher_shutdown_status = await _bounded(
                 dispatcher.shutdown_durable_delivery(),
                 _step_guard(),
                 "durable-signal-dispatcher",
             )
+            dispatcher_shutdown_complete = dispatcher_shutdown_status == "ok"
+            # The dispatcher owns an independent, shielded teardown task, so
+            # caller cancellation cannot strand committed work.  If its task
+            # outlives this guard, it may still be using the same backend;
+            # closing storage here would recreate the post-close audit-write
+            # race. The agent-owned continuation below joins it first.
 
         # Stop memory-owned bookkeeping before storage/sync shutdown.
         if run_memory:
@@ -6083,6 +6230,29 @@ Expected Duration: {expected_duration}
             await _bounded(sync_service.stop(), _step_guard(), "sync-stop")
             if status == "ok":
                 logging.info("Sync service: final snapshot flushed")
+
+        # Another lifecycle caller may already have spent the dispatcher guard
+        # and installed the unique continuation while this tail was stopping
+        # memory/sync work.  That task owns the eventual close; a second tail
+        # must join or retry it rather than closing the same backend directly.
+        continuation = self._durable_shutdown_continuation
+        if continuation is not None:
+            if continuation.done() and (
+                continuation.cancelled() or continuation.exception() is not None
+            ):
+                continuation = await self._ensure_durable_shutdown_continuation(
+                    dispatcher
+                )
+            return state["cancelled"], state["degraded"]
+
+        if run_dispatcher and not dispatcher_shutdown_complete:
+            await self._ensure_durable_shutdown_continuation(dispatcher)
+            logging.warning(
+                "Durable signal dispatcher teardown exceeded the bounded "
+                "tail guard; an agent-owned continuation will close storage "
+                "after owner release."
+            )
+            return state["cancelled"], state["degraded"]
 
         # Dispose an optional cached SQLAlchemy engine as its own bounded
         # phase.  Otherwise a slow engine disposal can consume the guard that

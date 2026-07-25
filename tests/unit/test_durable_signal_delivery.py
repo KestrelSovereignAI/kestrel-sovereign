@@ -118,6 +118,53 @@ async def _close(backend, agent: _Agent) -> None:
     await backend.close()
 
 
+async def _assert_late_durable_calls_fail_safely(
+    dispatcher: SignalDispatcher,
+    *,
+    agent: _Agent,
+    consumer: DurableConsumerRegistration,
+) -> None:
+    """Assert every public durable entry point is closed before store access."""
+    with pytest.raises(RuntimeError, match="shutting down"):
+        await dispatcher.initialize_durable_delivery()
+    with pytest.raises(RuntimeError, match="shutting down"):
+        await dispatcher.register_durable_consumer(consumer)
+    with pytest.raises(RuntimeError, match="shutting down"):
+        await dispatcher.claim_durable_delivery(
+            consumer_id=consumer.consumer_id, executor_id="late-worker"
+        )
+    with pytest.raises(RuntimeError, match="shutting down"):
+        await dispatcher.ack_durable_delivery(
+            consumer_id=consumer.consumer_id,
+            delivery_id="late-delivery",
+            lease_token="late-token",
+        )
+    with pytest.raises(RuntimeError, match="shutting down"):
+        await dispatcher.nack_durable_delivery(
+            consumer_id=consumer.consumer_id,
+            delivery_id="late-delivery",
+            lease_token="late-token",
+            error="late",
+        )
+    with pytest.raises(RuntimeError, match="shutting down"):
+        await dispatcher.list_durable_deliveries()
+    with pytest.raises(RuntimeError, match="shutting down"):
+        await dispatcher.purge_expired_durable_deliveries()
+
+    result = await dispatcher.dispatch_signal(
+        _signal(agent_id=agent.did, message="late-dispatch")
+    )
+    assert result.status is Status.FAILED
+    assert result.error == "Durable signal delivery is shutting down"
+
+    handle = await dispatcher.enqueue_signal(
+        _signal(agent_id=agent.did, message="late-enqueue")
+    )
+    enqueued = await handle.task
+    assert enqueued.status is Status.FAILED
+    assert enqueued.error == "Durable signal delivery is shutting down"
+
+
 @pytest.mark.asyncio
 async def test_committed_signal_replays_after_restart_with_normalized_payload(tmp_path):
     path = tmp_path / "durable.db"
@@ -1712,3 +1759,612 @@ async def test_sqlite_registration_handoff_reserves_the_writer_slot_before_reads
     _SQLiteBackend.execute.assert_awaited_once_with(
         "DELETE FROM durable_signal_consumers WHERE 0"
     )
+
+
+@pytest.mark.asyncio
+async def test_shutdown_waits_for_admitted_dispatch_then_rejects_late_storage_calls(
+    tmp_path,
+):
+    """A dispatch admitted before closure finishes before owner release.
+
+    The persistence barrier makes this a real-SQLite race: shutdown has
+    closed admission while the event transaction has not yet begun.  It must
+    not release the owner or permit storage close until the admitted dispatch
+    has committed and its lifecycle admission has drained.
+    """
+    from tests.utils.aiosqlite_workers import aiosqlite_worker
+
+    backend, agent, dispatcher = await _dispatcher(
+        tmp_path / "shutdown-admitted-dispatch.db", "did:agent:one"
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id="workflow-wait", source="provider.message", agent_id=agent.did
+    )
+    original_persist = dispatcher._durable_store.persist_signal
+    persist_entered = asyncio.Event()
+    allow_persist = asyncio.Event()
+    dispatch_task = None
+    shutdown_task = None
+    backend_closed = False
+
+    async def persist_after_shutdown_admission(*args, **kwargs):
+        persist_entered.set()
+        await allow_persist.wait()
+        return await original_persist(*args, **kwargs)
+
+    dispatcher._durable_store.persist_signal = persist_after_shutdown_admission
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        dispatch_task = asyncio.create_task(
+            dispatcher.dispatch_signal(
+                _signal(agent_id=agent.did, message="admitted-before-shutdown"),
+                source_event_id="admitted-before-shutdown",
+            )
+        )
+        await asyncio.wait_for(persist_entered.wait(), timeout=1.0)
+
+        shutdown_task = asyncio.create_task(dispatcher.shutdown_durable_delivery())
+        await asyncio.sleep(0)
+        assert not shutdown_task.done()
+        assert dispatcher._durable_runtime_owner_registered is True
+
+        # The close linearization point has passed.  None of these calls may
+        # reach the real database while shutdown waits for the admitted write.
+        await _assert_late_durable_calls_fail_safely(
+            dispatcher, agent=agent, consumer=consumer
+        )
+
+        allow_persist.set()
+        result = await dispatch_task
+        assert result.status is Status.OK
+        await shutdown_task
+
+        owner = await backend.fetch_one(
+            "SELECT stopped_at FROM durable_signal_runtime_owners "
+            "WHERE agent_id = ? AND owner_id = ?",
+            (agent.did, dispatcher._durable_delivery_owner),
+        )
+        assert owner is not None and owner[0] is not None
+        assert dispatcher._durable_runtime_owner_registered is False
+        assert dispatcher._transient_durable_handoffs == {}
+        assert dispatcher._transient_durable_handoff_timers == {}
+        assert dispatcher._post_commit_reservation_repairs == set()
+        assert dispatcher._runtime_owner_heartbeat_timer is None
+        assert all(task.done() for task in agent.tasks)
+        assert await backend.fetch_val(
+            "SELECT COUNT(*) FROM durable_signal_deliveries "
+            "WHERE status = 'initial_reserved'"
+        ) == 0
+
+        # The lifecycle guard remains effective after the actual SQLite
+        # connection is closed; a regression would now fail with a backend
+        # connection error instead of the deliberate shutdown outcome.
+        connection = backend._connection
+        assert connection is not None
+        worker = aiosqlite_worker(connection)
+        await backend.close()
+        backend_closed = True
+        assert not worker.is_alive()
+        await _assert_late_durable_calls_fail_safely(
+            dispatcher, agent=agent, consumer=consumer
+        )
+    finally:
+        allow_persist.set()
+        dispatcher._durable_store.persist_signal = original_persist
+        if dispatch_task is not None and not dispatch_task.done():
+            await dispatch_task
+        if shutdown_task is not None and not shutdown_task.done():
+            await shutdown_task
+        if not dispatcher._durable_shutdown:
+            await dispatcher.shutdown_durable_delivery()
+        if not backend_closed:
+            await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_serializes_an_inflight_runtime_owner_registration(tmp_path):
+    """A registration that crosses shutdown is released before close returns."""
+    backend = SQLiteBackend(str(tmp_path / "shutdown-owner-registration.db"))
+    await backend.connect()
+    log_store = SignalLogStore(backend)
+    await log_store.initialize()
+    agent = _Agent("did:agent:one")
+    registry = SourceRegistry()
+    registry.register(_registration(agent))
+    dispatcher = SignalDispatcher(
+        agent=agent,
+        registry=registry,
+        lock_manager=OrderedLockManager(),
+        store=log_store,
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id="workflow-wait", source="provider.message", agent_id=agent.did
+    )
+    original_register = dispatcher._durable_store.register_runtime_owner
+    registration_entered = asyncio.Event()
+    allow_registration = asyncio.Event()
+    initialization_task = None
+    shutdown_task = None
+
+    async def register_after_shutdown_admission(*args, **kwargs):
+        registration_entered.set()
+        await allow_registration.wait()
+        return await original_register(*args, **kwargs)
+
+    dispatcher._durable_store.register_runtime_owner = register_after_shutdown_admission
+    try:
+        initialization_task = asyncio.create_task(
+            dispatcher.initialize_durable_delivery()
+        )
+        await asyncio.wait_for(registration_entered.wait(), timeout=1.0)
+
+        shutdown_task = asyncio.create_task(dispatcher.shutdown_durable_delivery())
+        await asyncio.sleep(0)
+        assert not shutdown_task.done()
+
+        # Closing admission blocks a concurrent public initialization as well
+        # as a full durable API operation while the first registration owns its
+        # pre-close admission.
+        with pytest.raises(RuntimeError, match="shutting down"):
+            await dispatcher.initialize_durable_delivery()
+        await _assert_late_durable_calls_fail_safely(
+            dispatcher, agent=agent, consumer=consumer
+        )
+
+        allow_registration.set()
+        await initialization_task
+        await shutdown_task
+
+        owner = await backend.fetch_one(
+            "SELECT stopped_at FROM durable_signal_runtime_owners "
+            "WHERE agent_id = ? AND owner_id = ?",
+            (agent.did, dispatcher._durable_delivery_owner),
+        )
+        assert owner is not None and owner[0] is not None
+        assert dispatcher._durable_initialized is True
+        assert dispatcher._durable_runtime_owner_registered is False
+        assert dispatcher._runtime_owner_heartbeat_timer is None
+        assert dispatcher._transient_durable_handoffs == {}
+        assert dispatcher._post_commit_reservation_repairs == set()
+    finally:
+        allow_registration.set()
+        dispatcher._durable_store.register_runtime_owner = original_register
+        if initialization_task is not None and not initialization_task.done():
+            await initialization_task
+        if shutdown_task is not None and not shutdown_task.done():
+            await shutdown_task
+        if not dispatcher._durable_shutdown:
+            await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_drains_an_admitted_owner_heartbeat_before_release(tmp_path):
+    """A queued heartbeat cannot revive the owner after teardown begins."""
+    backend, agent, dispatcher = await _dispatcher(
+        tmp_path / "shutdown-owner-heartbeat.db", "did:agent:one"
+    )
+    original_heartbeat = dispatcher._durable_store.heartbeat_runtime_owner
+    heartbeat_entered = asyncio.Event()
+    allow_heartbeat = asyncio.Event()
+    heartbeat_task = None
+    shutdown_task = None
+
+    async def heartbeat_after_shutdown_admission(*args, **kwargs):
+        heartbeat_entered.set()
+        await allow_heartbeat.wait()
+        return await original_heartbeat(*args, **kwargs)
+
+    dispatcher._durable_store.heartbeat_runtime_owner = heartbeat_after_shutdown_admission
+    try:
+        heartbeat_task = asyncio.create_task(dispatcher._heartbeat_runtime_owner())
+        await asyncio.wait_for(heartbeat_entered.wait(), timeout=1.0)
+
+        shutdown_task = asyncio.create_task(dispatcher.shutdown_durable_delivery())
+        await asyncio.sleep(0)
+        assert not shutdown_task.done()
+
+        allow_heartbeat.set()
+        await heartbeat_task
+        await shutdown_task
+
+        owner = await backend.fetch_one(
+            "SELECT stopped_at FROM durable_signal_runtime_owners "
+            "WHERE agent_id = ? AND owner_id = ?",
+            (agent.did, dispatcher._durable_delivery_owner),
+        )
+        assert owner is not None and owner[0] is not None
+
+        # A timer callback that wins the event-loop turn after closure reaches
+        # the same gate and cannot issue a write against closed storage.
+        with pytest.raises(RuntimeError, match="shutting down"):
+            await dispatcher._heartbeat_runtime_owner()
+    finally:
+        allow_heartbeat.set()
+        dispatcher._durable_store.heartbeat_runtime_owner = original_heartbeat
+        if heartbeat_task is not None and not heartbeat_task.done():
+            await heartbeat_task
+        if shutdown_task is not None and not shutdown_task.done():
+            await shutdown_task
+        if not dispatcher._durable_shutdown:
+            await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_retry_survives_cancelled_caller(tmp_path):
+    """Caller cancellation cannot strand the owned teardown task."""
+    backend, agent, dispatcher = await _dispatcher(
+        tmp_path / "shutdown-cancel-retry.db", "did:agent:one"
+    )
+    original_release = dispatcher._durable_store.release_initial_reservations
+    release_entered = asyncio.Event()
+    allow_release = asyncio.Event()
+    shutdown_task = None
+
+    async def block_release(*args, **kwargs):
+        release_entered.set()
+        await allow_release.wait()
+        return await original_release(*args, **kwargs)
+
+    dispatcher._durable_store.release_initial_reservations = block_release
+    try:
+        shutdown_task = asyncio.create_task(dispatcher.shutdown_durable_delivery())
+        await asyncio.wait_for(release_entered.wait(), timeout=1.0)
+
+        shutdown_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await shutdown_task
+
+        # The caller was cancelled, not the dispatcher-owned cleanup.  A
+        # retry must join it instead of re-raising a cached CancelledError.
+        completion = dispatcher._durable_shutdown_completion
+        assert completion is not None and not completion.done()
+        assert dispatcher._durable_runtime_owner_registration_started is True
+
+        allow_release.set()
+        await dispatcher.shutdown_durable_delivery()
+
+        owner = await backend.fetch_one(
+            "SELECT stopped_at FROM durable_signal_runtime_owners "
+            "WHERE agent_id = ? AND owner_id = ?",
+            (agent.did, dispatcher._durable_delivery_owner),
+        )
+        assert owner is not None and owner[0] is not None
+        assert dispatcher._durable_runtime_owner_registered is False
+        assert dispatcher._durable_runtime_owner_registration_started is False
+    finally:
+        allow_release.set()
+        dispatcher._durable_store.release_initial_reservations = original_release
+        if shutdown_task is not None and not shutdown_task.done():
+            await shutdown_task
+        if dispatcher._durable_shutdown_completion is not None:
+            await dispatcher.shutdown_durable_delivery()
+        elif not dispatcher._durable_shutdown:
+            await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_retry_restarts_after_release_failure(tmp_path):
+    """A failed cleanup attempt remains retryable until owner release succeeds."""
+    backend, agent, dispatcher = await _dispatcher(
+        tmp_path / "shutdown-failure-retry.db", "did:agent:one"
+    )
+    original_release = dispatcher._durable_store.release_initial_reservations
+    attempts = 0
+
+    async def fail_once(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("injected owner-release failure")
+        return await original_release(*args, **kwargs)
+
+    dispatcher._durable_store.release_initial_reservations = fail_once
+    try:
+        with pytest.raises(RuntimeError, match="owner-release failure"):
+            await dispatcher.shutdown_durable_delivery()
+        failed_completion = dispatcher._durable_shutdown_completion
+        assert failed_completion is not None and failed_completion.done()
+        assert dispatcher._durable_runtime_owner_registration_started is True
+
+        await dispatcher.shutdown_durable_delivery()
+        assert attempts == 2
+        assert dispatcher._durable_shutdown_completion is not failed_completion
+        assert dispatcher._durable_runtime_owner_registered is False
+        assert dispatcher._durable_runtime_owner_registration_started is False
+    finally:
+        dispatcher._durable_store.release_initial_reservations = original_release
+        if dispatcher._durable_shutdown_completion is not None:
+            try:
+                await dispatcher.shutdown_durable_delivery()
+            except RuntimeError:
+                # The injected release failure remains observable above; this
+                # cleanup branch is only for an assertion failure before retry.
+                pass
+        elif not dispatcher._durable_shutdown:
+            await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_queued_heartbeat_shutdown_rejection_is_harvested(tmp_path):
+    """A timer callback queued before closure cannot leak an exception."""
+    backend, agent, dispatcher = await _dispatcher(
+        tmp_path / "shutdown-queued-heartbeat.db", "did:agent:one"
+    )
+    heartbeat_done = asyncio.Event()
+    heartbeat_task = None
+    try:
+        # This invokes the same callback a heartbeat timer uses, then closes
+        # admission before the newly-created task receives its first turn.
+        dispatcher._start_runtime_owner_heartbeat()
+        heartbeat_task = dispatcher._runtime_owner_heartbeat_task
+        assert heartbeat_task is not None
+        heartbeat_task.add_done_callback(lambda _task: heartbeat_done.set())
+        dispatcher._durable_shutdown = True
+
+        await asyncio.wait_for(heartbeat_done.wait(), timeout=1.0)
+        assert heartbeat_task.done()
+        # ``Task._log_traceback`` is set only while an exception has not been
+        # retrieved. The dispatcher callback must harvest the expected gate
+        # rejection before the production task tracker drops its reference.
+        assert not heartbeat_task._log_traceback
+    finally:
+        if not dispatcher._durable_shutdown:
+            await dispatcher.shutdown_durable_delivery()
+        elif dispatcher._durable_shutdown_completion is None:
+            await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_rejects_child_task_inherited_from_an_admitted_dispatch(tmp_path):
+    """Child task context cannot turn a closed gate into nested admission."""
+    backend = SQLiteBackend(str(tmp_path / "shutdown-inherited-child-task.db"))
+    await backend.connect()
+    log_store = SignalLogStore(backend)
+    await log_store.initialize()
+    agent = _Agent("did:agent:one")
+    registry = SourceRegistry()
+    child_created = asyncio.Event()
+    allow_child = asyncio.Event()
+    child_task = None
+
+    async def register_after_parent_dispatch() -> None:
+        await allow_child.wait()
+        await dispatcher.register_durable_consumer(
+            DurableConsumerRegistration(
+                consumer_id="late-child",
+                source="child.spawn",
+                agent_id=agent.did,
+            )
+        )
+
+    async def handler(_payload):
+        nonlocal child_task
+        child_task = asyncio.create_task(register_after_parent_dispatch())
+        child_created.set()
+        return {"handled": True}
+
+    registry.register(
+        SourceRegistration(
+            name="child.spawn",
+            schema=lambda payload: payload,
+            default_mode=SignalMode.ACTION,
+            allowed_modes=frozenset({SignalMode.ACTION}),
+            handler=handler,
+            trust=Trust.TRUSTED,
+            log_redaction=RedactionPolicy(summarize=lambda _payload: "<redacted>"),
+            retention_days=7,
+        )
+    )
+    dispatcher = SignalDispatcher(
+        agent=agent,
+        registry=registry,
+        lock_manager=OrderedLockManager(),
+        store=log_store,
+    )
+    try:
+        result = await dispatcher.dispatch_signal(
+            Signal(
+                source="child.spawn",
+                kind="inbound",
+                mode=SignalMode.ACTION,
+                payload={},
+                target_agent=agent.did,
+            )
+        )
+        assert result.status is Status.OK
+        await asyncio.wait_for(child_created.wait(), timeout=1.0)
+        assert child_task is not None
+
+        await dispatcher.shutdown_durable_delivery()
+        allow_child.set()
+        with pytest.raises(RuntimeError, match="shutting down"):
+            await child_task
+
+        # The inherited ContextVar must not allow a post-release consumer row.
+        assert await backend.fetch_val(
+            "SELECT COUNT(*) FROM durable_signal_consumers "
+            "WHERE agent_id = ? AND consumer_id = ?",
+            (agent.did, "late-child"),
+        ) == 0
+    finally:
+        allow_child.set()
+        if child_task is not None and not child_task.done():
+            await child_task
+        if not dispatcher._durable_shutdown:
+            await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_allows_child_with_completed_parent_admission(tmp_path):
+    """A child may tear down after inheriting its completed parent's context.
+
+    ``asyncio.create_task`` copies the dispatch admission ContextVar.  The
+    copied tuple belongs to the completed parent task, not the child, so it
+    must not prevent the child from owning shutdown and releasing the runtime
+    owner.
+    """
+    backend = SQLiteBackend(str(tmp_path / "shutdown-inherited-completed-parent.db"))
+    await backend.connect()
+    log_store = SignalLogStore(backend)
+    await log_store.initialize()
+    agent = _Agent("did:agent:one")
+    child_created = asyncio.Event()
+    allow_child_shutdown = asyncio.Event()
+    child_task = None
+
+    async def shutdown_after_parent_dispatch() -> None:
+        await allow_child_shutdown.wait()
+        await dispatcher.shutdown_durable_delivery()
+
+    async def handler(_payload):
+        nonlocal child_task
+        child_task = asyncio.create_task(shutdown_after_parent_dispatch())
+        child_created.set()
+        return {"handled": True}
+
+    registry = SourceRegistry()
+    registry.register(
+        SourceRegistration(
+            name="child.shutdown",
+            schema=lambda payload: payload,
+            default_mode=SignalMode.ACTION,
+            allowed_modes=frozenset({SignalMode.ACTION}),
+            handler=handler,
+            trust=Trust.TRUSTED,
+            log_redaction=RedactionPolicy(summarize=lambda _payload: "<redacted>"),
+            retention_days=7,
+        )
+    )
+    dispatcher = SignalDispatcher(
+        agent=agent,
+        registry=registry,
+        lock_manager=OrderedLockManager(),
+        store=log_store,
+    )
+    await dispatcher.initialize_durable_delivery()
+
+    try:
+        result = await dispatcher.dispatch_signal(
+            Signal(
+                source="child.shutdown",
+                kind="inbound",
+                mode=SignalMode.ACTION,
+                payload={},
+                target_agent=agent.did,
+            )
+        )
+        assert result.status is Status.OK
+        await asyncio.wait_for(child_created.wait(), timeout=1.0)
+        assert child_task is not None
+
+        # The parent dispatch has released its admission before the child
+        # starts shutdown, but the child still inherited the stale ContextVar.
+        allow_child_shutdown.set()
+        await child_task
+
+        owner = await backend.fetch_one(
+            "SELECT stopped_at FROM durable_signal_runtime_owners "
+            "WHERE agent_id = ? AND owner_id = ?",
+            (agent.did, dispatcher._durable_delivery_owner),
+        )
+        assert owner is not None and owner[0] is not None
+        assert dispatcher._durable_runtime_owner_registered is False
+    finally:
+        allow_child_shutdown.set()
+        if child_task is not None and not child_task.done():
+            await child_task
+        if not dispatcher._durable_shutdown:
+            await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_drains_committed_reservation_repair_before_owner_release(tmp_path):
+    """A committed volatile reservation cannot be dropped during shutdown."""
+    from kestrel_sovereign.privacy import get_privacy_preset
+
+    backend, agent, dispatcher = await _dispatcher(
+        tmp_path / "shutdown-committed-repair.db", "did:agent:one"
+    )
+    agent.privacy_config = get_privacy_preset("ephemeral")
+    consumer = DurableConsumerRegistration(
+        consumer_id="workflow-wait", source="provider.message", agent_id=agent.did
+    )
+    original_activate = dispatcher._durable_store.activate_initial_delivery
+    original_abandon = dispatcher._durable_store.abandon_initial_reservation
+    repair_entered = asyncio.Event()
+    allow_repair = asyncio.Event()
+    dispatch_task = None
+    shutdown_task = None
+
+    async def fail_after_committed_activation(**kwargs):
+        await original_activate(**kwargs)
+        raise RuntimeError("inject committed activation failure")
+
+    async def block_committed_repair(**kwargs):
+        repair_entered.set()
+        await allow_repair.wait()
+        return await original_abandon(**kwargs)
+
+    dispatcher._durable_store.activate_initial_delivery = fail_after_committed_activation
+    dispatcher._durable_store.abandon_initial_reservation = block_committed_repair
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        dispatch_task = asyncio.create_task(
+            dispatcher.dispatch_signal(
+                _signal(agent_id=agent.did, message="must-repair-before-close"),
+                source_event_id="must-repair-before-close",
+            )
+        )
+        await asyncio.wait_for(repair_entered.wait(), timeout=1.0)
+        assert dispatcher._post_commit_reservation_repairs
+
+        shutdown_task = asyncio.create_task(dispatcher.shutdown_durable_delivery())
+        await asyncio.sleep(0)
+        assert not shutdown_task.done()
+
+        allow_repair.set()
+        result = await dispatch_task
+        assert result.status is Status.FAILED
+        await shutdown_task
+
+        row = await backend.fetch_one(
+            "SELECT status, lease_owner, lease_token, lease_expires_at "
+            "FROM durable_signal_deliveries WHERE agent_id = ? "
+            "AND consumer_id = ?",
+            (agent.did, consumer.consumer_id),
+        )
+        assert row is not None
+        assert row[0] == RETRY
+        assert row[1:] == (None, None, None)
+        assert await backend.fetch_val(
+            "SELECT COUNT(*) FROM durable_signal_deliveries "
+            "WHERE status = 'initial_reserved'"
+        ) == 0
+        assert dispatcher._transient_durable_handoffs == {}
+        assert dispatcher._transient_durable_handoff_timers == {}
+        assert dispatcher._post_commit_reservation_repairs == set()
+
+        owner = await backend.fetch_one(
+            "SELECT stopped_at FROM durable_signal_runtime_owners "
+            "WHERE agent_id = ? AND owner_id = ?",
+            (agent.did, dispatcher._durable_delivery_owner),
+        )
+        assert owner is not None and owner[0] is not None
+    finally:
+        allow_repair.set()
+        dispatcher._durable_store.activate_initial_delivery = original_activate
+        dispatcher._durable_store.abandon_initial_reservation = original_abandon
+        if dispatch_task is not None and not dispatch_task.done():
+            await dispatch_task
+        if shutdown_task is not None and not shutdown_task.done():
+            await shutdown_task
+        if not dispatcher._durable_shutdown:
+            await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
