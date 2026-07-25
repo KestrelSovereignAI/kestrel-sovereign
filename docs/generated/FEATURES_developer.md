@@ -104,10 +104,15 @@ Discovery rules take precedence over any headline numbers:
 | Concern | Key files |
 |---|---|
 | Core agent orchestration | [`kestrel_sovereign/kestrel_agent.py`](kestrel_sovereign/kestrel_agent.py), [`kestrel_sovereign/command_handler.py`](kestrel_sovereign/command_handler.py), [`kestrel_sovereign/kestrel_agent_tools.py`](kestrel_sovereign/kestrel_agent_tools.py) |
-| Context & token budgeting | [`kestrel_sovereign/agent/context_manager.py`](kestrel_sovereign/agent/context_manager.py), [`kestrel_sovereign/agent/context_builder.py`](kestrel_sovereign/agent/context_builder.py), [`kestrel_sovereign/agent/token_budget.py`](kestrel_sovereign/agent/token_budget.py) |
+| Context & token budgeting | [`docs/architecture/CONTEXT_SYSTEM_DESIGN.md`](../architecture/CONTEXT_SYSTEM_DESIGN.md), [`kestrel_sovereign/agent/context_manager.py`](kestrel_sovereign/agent/context_manager.py), [`kestrel_sovereign/agent/context_builder.py`](kestrel_sovereign/agent/context_builder.py), [`kestrel_sovereign/agent/context_stages.py`](kestrel_sovereign/agent/context_stages.py), [`kestrel_sovereign/agent/token_budget.py`](kestrel_sovereign/agent/token_budget.py), [`kestrel_sovereign/storage/async_conversation_store.py`](kestrel_sovereign/storage/async_conversation_store.py) |
 | Streaming & request lifecycle | [`kestrel_sovereign/agent/streaming.py`](kestrel_sovereign/agent/streaming.py), [`endpoints/agent.py`](endpoints/agent.py) |
 
 > **Quick start:** To invoke the agent, `POST /agent/invoke` (blocking) or `POST /agent/stream` (SSE). See [`endpoints/agent.py`](endpoints/agent.py).
+>
+> `context_status` and `GET /api/agent/context-status` are diagnostic
+> projections, not exact traces of the production retrieval and pruning path.
+> The endpoint's `full=true` mode adds read-only retrieval but retains the
+> [documented #2534 limitation](../architecture/CONTEXT_SYSTEM_DESIGN.md#honesty-boundary-issue-2534).
 
 ### Multi-LLM Platform
 

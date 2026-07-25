@@ -81,13 +81,18 @@ environment,” not a claim that an external distribution is publicly reachable.
 
 ### Agent runtime and context assembly
 
+- Canonical behavior contract:
+  - [`docs/architecture/CONTEXT_SYSTEM_DESIGN.md`](docs/architecture/CONTEXT_SYSTEM_DESIGN.md)
 - Core agent orchestration:
   - [`kestrel_sovereign/kestrel_agent.py`](kestrel_sovereign/kestrel_agent.py)
   - [`kestrel_sovereign/command_handler.py`](kestrel_sovereign/command_handler.py)
 - Context and token budgeting:
   - [`kestrel_sovereign/agent/context_manager.py`](kestrel_sovereign/agent/context_manager.py)
   - [`kestrel_sovereign/agent/context_builder.py`](kestrel_sovereign/agent/context_builder.py)
+  - [`kestrel_sovereign/agent/context_stages.py`](kestrel_sovereign/agent/context_stages.py)
   - [`kestrel_sovereign/agent/token_budget.py`](kestrel_sovereign/agent/token_budget.py)
+- Canonical and rendered conversation persistence:
+  - [`kestrel_sovereign/storage/async_conversation_store.py`](kestrel_sovereign/storage/async_conversation_store.py)
 - Streaming and request lifecycle:
   - [`kestrel_sovereign/agent/streaming.py`](kestrel_sovereign/agent/streaming.py)
   - [`kestrel_sovereign/endpoints/agent.py`](kestrel_sovereign/endpoints/agent.py)
@@ -276,6 +281,11 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 - Source: [`kestrel_sovereign/features/context/feature.py`](kestrel_sovereign/features/context/feature.py)
 - Enablement state: `enabled`
+- `context_status` is a cheap diagnostic projection shared with
+  `GET /api/agent/context-status`; it is not an exact trace of the production
+  retrieval/pruning path. The endpoint's `full=true` mode adds read-only live
+  retrieval but retains the
+  [documented #2534 limitation](docs/architecture/CONTEXT_SYSTEM_DESIGN.md#honesty-boundary-issue-2534).
 
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
@@ -912,7 +922,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!context stash peek` | `context` | `[stash_id] [max_chars]` | Peek at stash contents without restoring. Use to explore stashed context programmatically (RLM-inspired context-as-variable). |
 | `!context stash pop` | `context` | `[stash_id]` | Pop the most recent stash (restore messages and remove from stash list). Like git stash pop. |
 | `!context stash save` | `context` | `[stash_id] [name] [summary] [tags]` | Save a stash to long-term storage with semantic search capability. Use when you want to preserve context for future retrieval via !recall. |
-| `!context status` | `context` |  | Check current context window utilization. Use this to understand how much context space is available before deciding to summarize or prune. |
+| `!context status` | `context` |  | Estimate current context-window utilization. This diagnostic is useful for planning but is not an exact trace of production retrieval or pruning. |
 | `!context summarize` | `context` | `<mode> <criteria> [preserve_key_facts]` | Summarize a specific section of conversation history to save context space. Use this to compact verbose exchanges while preserving key information. |
 | `!delivery failed` | `delivery` | `[limit]` | List messages in the dead letter queue (permanently failed) |
 | `!delivery purge` | `delivery` | `[older_than_hours]` | Clear delivered messages older than 24 hours from the queue |

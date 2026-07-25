@@ -1476,8 +1476,8 @@ Repo entry points and standard project files.
 - **docs/architecture/APPROVAL_PATHS.md** — Approval paths — Closes #1582.
 - **docs/architecture/COMPUTE_FEATURE_DESIGN.md** — Kestrel Compute Feature - Architecture Design — ## Executive Summary
 - **docs/architecture/CONSTITUTION_INJECTION.md** — SignalDispatcher Constitutional Injection — Architecture Design — > Draft v1.
-- **docs/architecture/CONTEXT_C_DURABLE_SALVAGE.md** — Context C — Unify Auto-Prune With Durable Compaction — > Auto-prune is a silent decision.
-- **docs/architecture/CONTEXT_SYSTEM_DESIGN.md** — Kestrel Context System — Assessment & Redesign — > A context window is not a buffer you fill until it overflows.
+- **docs/architecture/CONTEXT_C_DURABLE_SALVAGE.md** — Context C Durable Salvage Design Record — > **Status: aspirational design with a conditional partial implementation.** This page is not the current context runtime contract.
+- **docs/architecture/CONTEXT_SYSTEM_DESIGN.md** — Kestrel Context Management Contract — > **Status: active and canonical.** This page describes the current context runtime.
 - **docs/architecture/CONVERSATION_MODEL_PROVIDER_STAMPING.md** — Conversation Model/Provider Stamping — Every assistant row in `conversation_history` can expose the model route that produced the visible text:
 - **docs/architecture/DESTRUCTIVE_DB_AUDIT.md** — Destructive DB Audit Trail — Kestrel records destructive conversation-history operations in a separate SQLite database, `kestrel_audit.db`, next to the agent's main `kestrel_prime.db`.
 - **docs/architecture/DYNAMIC_TOOL_LOADING.md** — Dynamic Tool Loading — **Status:** Implemented **Author:** Design review **Date:** 2026-02-16 **Affected files:** `kestrel_sovereign/kestrel_agent.py`, `kestrel_sovereign/features/base.py`, `kestrel_sovereign/prompts/syste…
@@ -1591,7 +1591,7 @@ Repo entry points and standard project files.
 - **docs/audit/documentation-2026-05/issues/execution-order.md** — Documentation Audit Execution Order - May 2026 — Parent ledger: `docs/audit/DOCUMENTATION_AUDIT_5_2026.md`
 - **docs/audit/documentation-2026-05/issues/prd.json** — (configuration)
 - **docs/audit/documentation-2026-05/lanes/cloud_training_deployment.md** — Lane Brief: Cloud Training Deployment — Goal: reconcile Cloud Run deployment docs with external cloud provider packages and research-era GPU/training docs.
-- **docs/audit/documentation-2026-05/lanes/context.md** — Lane Brief: Context — Goal: reconcile documentation for prompt assembly, token budgets, context pruning, canonical history, rendered provider transport, retrieval insertion, and diagnostics.
+- **docs/audit/documentation-2026-05/lanes/context.md** — Lane Brief: Context — > **Resolved 2026-07-25:** the result of this historical review lane is the active canonical [Kestrel Context Management Contract](../../../architecture/CONTEXT_SYSTEM_DESIGN.md).
 - **docs/audit/documentation-2026-05/lanes/index_diagrams_hygiene.md** — Lane Brief: Index Diagrams Hygiene — Goal: audit navigation, diagrams, archives, and public/internal doc hygiene.
 - **docs/audit/documentation-2026-05/lanes/llm_routing.md** — Lane Brief: LLM Routing — Goal: reconcile docs for LLM configuration, model preference, provider capability contracts, provider packages, streaming, honesty markers, and transport behavior.
 - **docs/audit/documentation-2026-05/lanes/memory_retrieval_storage.md** — Lane Brief: Memory Retrieval Storage — Goal: reconcile docs for memory ownership, retrieval, saved items, storage backends, encryption, export/import, and privacy-mode effects.
@@ -1777,7 +1777,7 @@ Repo entry points and standard project files.
 - **docs/research/FLUX2_TRAINING_CONFIG.md** — FLUX.2 LoRA Training Configuration — **Source**: [SimpleTuner FLUX2.md Quickstart](https://github.com/bghira/SimpleTuner/blob/main/documentation/quickstart/FLUX2.md)
 - **docs/research/GPU-Enabled Container Hosting Options for AI Workloads.md** — **GPU-Enabled Container Hosting Options for AI** **Workloads** — Large AI models (like LLMs) demand powerful GPUs with substantial VRAM.
 - **docs/research/KV_CACHE_QUANTIZATION.md** — KV Cache Quantization Benchmark — ## Mac Studio M3 Ultra 512GB — Kimi K2.5 (1T params, Q2_K_XL)
-- **docs/research/LLAMA_SERVER_CACHE_FLAGS.md** — llama-server cache flags — Recommended `llama-server` startup flags when Kestrel talks to it via the `llama_cpp:local` route.
+- **docs/research/LLAMA_SERVER_CACHE_FLAGS.md** — llama-server cache flags — > **Status: operational research snapshot, not the context contract.** The current Kestrel-side persistence, prefix construction, and lumpy-pruning behavior is defined by [Kestrel Context Management…
 - **docs/research/LoRA/LoRATrainingAndInferenceWebUIFrameworks.md** — **LoRA Training & Inference Web UI Frameworks** — Below are several **self-hosted web UI frameworks** that support **LoRA training** on diffusion models and **text-to-image inference** with LoRA adapters, meeting the criteria of permissive model lic…
 - **docs/research/LoRA/TrainingLoRA_FLUX2dev.md** — **Training LoRA on the FLUX 2 [dev] Diffusion Model** — ## **Tools and Templates for FLUX 2 LoRA Training**
 - **docs/research/OpenClaw_Kestrel_Diff.md** — OpenClaw vs Kestrel Sovereign: Feature Diff Analysis — *Research Date: 2026-01-31* *OpenClaw Version: v2026.1.30* *Source: https://github.com/openclaw/openclaw*

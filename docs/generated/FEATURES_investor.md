@@ -99,7 +99,7 @@ The platform manages the full agent lifecycle, from initial provisioning ("incep
 
 ### Agent Runtime
 
-The agent runtime handles orchestration, context assembly, token budget management, and streaming response delivery as first-class concerns. Context management is designed to operate efficiently within the constraints of any connected LLM, ensuring that long-running conversations and complex multi-step tasks remain coherent regardless of the underlying model in use.
+The agent runtime handles orchestration, context assembly, route-aware token budgets, and streaming response delivery as first-class concerns. It preserves canonical conversation history separately from provider rendering and uses retrieval gates plus cache-stable, chunked pruning to operate within a selected route's limits. Continuity still depends on the configured model, route, privacy mode, retrieval quality, and available window; context diagnostics are planning estimates rather than exact prompt receipts.
 
 Real-time streaming is natively supported, enabling responsive user interfaces and downstream integrations without polling or latency penalties.
 

@@ -45,6 +45,19 @@ This audit should become the working ledger for cleanup PRs. The recommended ord
 
 ## Follow-Up Cleanup Status
 
+2026-07-25 context-contract cleanup:
+
+- `docs/architecture/CONTEXT_SYSTEM_DESIGN.md` is now the single active
+  canonical contract for context persistence, assembly, budgets, retrieval,
+  pruning, provider transport, and diagnostics.
+- `docs/architecture/CONTEXT_C_DURABLE_SALVAGE.md` is explicitly aspirational;
+  it distinguishes the conditional feature-flagged worker from the unshipped
+  complete design.
+- Context-status documentation preserves the open
+  [#2534](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2534)
+  measurement limitation instead of presenting the diagnostic as an exact
+  production trace.
+
 2026-05-31 package-boundary cleanup:
 
 - `README.md` no longer says the base `kestrel-sovereign` install includes voice or wallet/economics features. It now distinguishes bundled core, optional feature packages, and provider packages.
@@ -173,6 +186,10 @@ Action:
 - Make `docs/architecture/README.md` index only active and design-of-record docs. Move old planning material into an archive section.
 
 ### P1 - Context Management Docs Need A Fresh Canonical Story
+
+**Resolved 2026-07-25.** The active source is
+[`CONTEXT_SYSTEM_DESIGN.md`](../architecture/CONTEXT_SYSTEM_DESIGN.md).
+The salvage design is cross-linked and aspirational; #2534 remains open.
 
 Relevant docs include:
 

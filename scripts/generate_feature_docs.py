@@ -44,6 +44,8 @@ AUDIENCES: dict[str, dict] = {
             "- Use precise technical language — your readers know Python, FastAPI, async\n"
             "- Keep it concise — this is a reference, not a tutorial\n"
             "- Output clean GitHub-flavored markdown\n"
+            "- Preserve limitations and diagnostic-versus-runtime distinctions; "
+            "never upgrade an estimate or conditional path into a guarantee\n"
             "- Do NOT invent features or details not present in the source"
         ),
     },
@@ -64,6 +66,8 @@ AUDIENCES: dict[str, dict] = {
             "- If the source names privacy presets, keep those exact preset names and do not invent replacements\n"
             "- Keep the hierarchical structure but simplify headings\n"
             "- Use 'you/your' language — speak directly to the user\n"
+            "- Preserve limitations in plain language; do not describe context "
+            "diagnostics as exact or conditional context behavior as universal\n"
             "- Include the privacy levels table but rewrite for non-technical readers\n"
             "- Aim for ~300 lines, scannable, with short paragraphs\n"
             "- Output clean GitHub-flavored markdown\n"
@@ -94,6 +98,9 @@ AUDIENCES: dict[str, dict] = {
             "- If you mention privacy presets, use the exact preset names from the source: "
             "`ephemeral`, `isolated`, `anonymous`, `normal`, `public`\n"
             "- If the source names route classes or HTTP methods, preserve those exactly rather than renaming them\n"
+            "- Preserve limitations and conditional status. Do not promise that "
+            "context remains coherent regardless of model or that context "
+            "diagnostics exactly reproduce the production prompt\n"
             "- Organize around: Platform Architecture, AI Capabilities, Data Sovereignty, "
             "Security & Privacy, Deployment Flexibility, Extensibility\n"
             "- Keep it to ~250-350 lines, professional tone\n"
