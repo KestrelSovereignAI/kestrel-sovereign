@@ -675,6 +675,228 @@ async def test_committed_initial_activation_failure_requeues_only_marker_and_dro
         await _close(backend, agent)
 
 
+class _PostCommitAbort(BaseException):
+    """Deliberate non-``Exception`` failure for cancellation-safety coverage."""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ("persist", "activate-first", "activate-second"))
+@pytest.mark.parametrize("failure_kind", ("cancelled", "base-exception"))
+async def test_post_commit_reservation_repair_survives_every_await_boundary_and_repeated_cancellation(
+    tmp_path, boundary, failure_kind
+):
+    """Committed volatile work is marker-only after every activation boundary.
+
+    The persistence boundary is the awkward one: the store's transaction can
+    commit after its before-commit callback installs raw sidecars, then its
+    caller can be cancelled before it receives ``DurableEventPersistence``.
+    The two activation boundaries cover a partially activated multi-consumer
+    batch.  In every case, a second and third cancellation land while the
+    shielded repair task is awaiting its first durable release.
+    """
+    from kestrel_sovereign.privacy import get_privacy_preset
+
+    backend, agent, dispatcher = await _dispatcher(
+        tmp_path / f"post-commit-{boundary}-{failure_kind}.db", "did:agent:one"
+    )
+    agent.privacy_config = get_privacy_preset("ephemeral")
+    consumers = (
+        DurableConsumerRegistration(
+            consumer_id="workflow-wait-a",
+            source="provider.message",
+            agent_id=agent.did,
+        ),
+        DurableConsumerRegistration(
+            consumer_id="workflow-wait-b",
+            source="provider.message",
+            agent_id=agent.did,
+        ),
+    )
+    original_persist = dispatcher._durable_store.persist_signal
+    original_activate = dispatcher._durable_store.activate_initial_delivery
+    original_abandon = dispatcher._durable_store.abandon_initial_reservation
+    dispatch_task = None
+    activation_count = 0
+    repeated_cancellation_injected = False
+
+    async def _raise_at_boundary() -> None:
+        if failure_kind == "cancelled":
+            asyncio.current_task().cancel()
+            await asyncio.sleep(0)
+        raise _PostCommitAbort(f"injected after committed {boundary} await")
+
+    async def cancel_after_persist(*args, **kwargs):
+        persistence = await original_persist(*args, **kwargs)
+        if boundary == "persist" and persistence.created:
+            await _raise_at_boundary()
+        return persistence
+
+    async def cancel_after_activation(**kwargs):
+        nonlocal activation_count
+        delivery = await original_activate(**kwargs)
+        activation_count += 1
+        if boundary == f"activate-{'first' if activation_count == 1 else 'second'}":
+            await _raise_at_boundary()
+        return delivery
+
+    async def cancel_dispatch_again_during_repair(**kwargs):
+        nonlocal repeated_cancellation_injected
+        if not repeated_cancellation_injected:
+            assert dispatch_task is not None
+            repeated_cancellation_injected = True
+            dispatch_task.cancel()
+            dispatch_task.cancel()
+        return await original_abandon(**kwargs)
+
+    dispatcher._durable_store.persist_signal = cancel_after_persist
+    dispatcher._durable_store.activate_initial_delivery = cancel_after_activation
+    dispatcher._durable_store.abandon_initial_reservation = (
+        cancel_dispatch_again_during_repair
+    )
+    try:
+        for consumer in consumers:
+            await dispatcher.register_durable_consumer(consumer)
+
+        dispatch_task = asyncio.create_task(
+            dispatcher.dispatch_signal(
+                _signal(
+                    agent_id=agent.did,
+                    message=f"{boundary}-{failure_kind}-customer@example.com",
+                ),
+                source_event_id=f"post-commit-{boundary}-{failure_kind}",
+            )
+        )
+        expected_error = (
+            asyncio.CancelledError
+            if failure_kind == "cancelled"
+            else _PostCommitAbort
+        )
+        with pytest.raises(expected_error):
+            await dispatch_task
+
+        assert repeated_cancellation_injected
+        assert dispatcher._transient_durable_handoffs == {}
+        assert dispatcher._transient_durable_handoff_timers == {}
+        deliveries = await dispatcher.list_durable_deliveries()
+        assert len(deliveries) == 2
+        assert all(delivery.status == RETRY for delivery in deliveries)
+        assert all(delivery.lease_owner is None for delivery in deliveries)
+        assert all(delivery.lease_token is None for delivery in deliveries)
+        assert all(delivery.lease_expires_at is None for delivery in deliveries)
+
+        # A normal shutdown must still synchronously stop the runtime owner;
+        # the cancellation path cannot leak a live liveness record behind it.
+        dispatcher._durable_store.persist_signal = original_persist
+        dispatcher._durable_store.activate_initial_delivery = original_activate
+        dispatcher._durable_store.abandon_initial_reservation = original_abandon
+        await dispatcher.shutdown_durable_delivery()
+        owner = await backend.fetch_one(
+            "SELECT stopped_at FROM durable_signal_runtime_owners "
+            "WHERE agent_id = ? AND owner_id = ?",
+            (agent.did, dispatcher._durable_delivery_owner),
+        )
+        assert owner is not None and owner[0] is not None
+        assert dispatcher._durable_runtime_owner_registered is False
+    finally:
+        dispatcher._durable_store.persist_signal = original_persist
+        dispatcher._durable_store.activate_initial_delivery = original_activate
+        dispatcher._durable_store.abandon_initial_reservation = original_abandon
+        if not dispatcher._durable_shutdown:
+            await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ("cancelled", "base-exception"))
+async def test_real_sqlite_commit_boundary_repairs_ambiguous_persistence_outcome(
+    tmp_path, failure_kind
+):
+    """A driver commit that succeeds before it raises cannot strand a row.
+
+    This drives the production SQLite transaction implementation rather than
+    wrapping ``persist_signal`` after it returns.  The patched ``commit``
+    finishes the aiosqlite worker operation, then injects cancellation (or a
+    non-``Exception`` failure) while the backend context manager is still
+    unwinding.  ``DurableSignalStore`` consequently invokes ``on_rollback``
+    despite the event being visible; the dispatcher must retain and repair the
+    owner/token capability instead of trusting that callback as proof of a
+    rollback.
+    """
+    from kestrel_sovereign.privacy import get_privacy_preset
+
+    backend, agent, dispatcher = await _dispatcher(
+        tmp_path / f"sqlite-commit-boundary-{failure_kind}.db", "did:agent:one"
+    )
+    agent.privacy_config = get_privacy_preset("ephemeral")
+    consumer = DurableConsumerRegistration(
+        consumer_id="workflow-wait", source="provider.message", agent_id=agent.did
+    )
+    connection = backend._connection
+    assert connection is not None
+    original_commit = connection.commit
+    original_persist = dispatcher._durable_store.persist_signal
+    persistence_in_flight = False
+
+    async def fail_after_committed_sqlite_write():
+        await original_commit()
+        if persistence_in_flight:
+            if failure_kind == "cancelled":
+                task = asyncio.current_task()
+                assert task is not None
+                task.cancel()
+                await asyncio.sleep(0)
+            raise _PostCommitAbort("injected after SQLite commit completed")
+
+    async def persist_with_armed_commit(*args, **kwargs):
+        nonlocal persistence_in_flight
+        persistence_in_flight = True
+        try:
+            return await original_persist(*args, **kwargs)
+        finally:
+            persistence_in_flight = False
+
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        connection.commit = fail_after_committed_sqlite_write
+        dispatcher._durable_store.persist_signal = persist_with_armed_commit
+
+        expected = (
+            asyncio.CancelledError
+            if failure_kind == "cancelled"
+            else _PostCommitAbort
+        )
+        with pytest.raises(expected):
+            await dispatcher.dispatch_signal(
+                _signal(
+                    agent_id=agent.did,
+                    message=f"sqlite-commit-{failure_kind}@example.com",
+                ),
+                source_event_id=f"sqlite-commit-boundary-{failure_kind}",
+            )
+
+        # The repair is awaited before the original error/cancellation escapes:
+        # no raw sidecar and no initial reservation can outlive this boundary.
+        assert dispatcher._transient_durable_handoffs == {}
+        assert dispatcher._transient_durable_handoff_timers == {}
+        connection.commit = original_commit
+        dispatcher._durable_store.persist_signal = original_persist
+        deliveries = await dispatcher.list_durable_deliveries(
+            consumer_id=consumer.consumer_id
+        )
+        assert len(deliveries) == 1
+        delivery = deliveries[0]
+        assert delivery.status == RETRY
+        assert delivery.lease_owner is None
+        assert delivery.lease_token is None
+        assert delivery.lease_expires_at is None
+    finally:
+        connection.commit = original_commit
+        dispatcher._durable_store.persist_signal = original_persist
+        if not dispatcher._durable_shutdown:
+            await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
 @pytest.mark.asyncio
 async def test_heartbeat_recovers_reservation_that_becomes_stale_after_restart(tmp_path):
     """A fresh crash is retried after its owner becomes stale, without restart.

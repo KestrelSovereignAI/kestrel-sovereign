@@ -336,6 +336,93 @@ async def test_later_boot_failure_tears_down_durable_dispatcher_before_storage(t
         await _cleanup(agent)
 
 
+@pytest.mark.asyncio
+async def test_boot_rollback_stops_owner_registered_at_sqlite_commit_cancellation(
+    tmp_path,
+):
+    """Boot teardown releases an owner whose registration await never returned.
+
+    ``aiosqlite`` can complete ``commit`` on its worker before cancellation is
+    raised back into the caller.  Exercise that concrete boundary, then drive
+    the real boot rollback seam (rather than only dispatcher shutdown) to
+    prove an ambiguous registration cannot leave a live runtime owner behind.
+    """
+    from kestrel_sovereign.signals import (
+        OrderedLockManager,
+        SignalDispatcher,
+        SignalLogStore,
+        SourceRegistry,
+    )
+    from kestrel_sovereign.storage.db import SQLiteBackend
+
+    agent = _make_agent(tmp_path)
+    backend = SQLiteBackend(str(tmp_path / "boot-owner-commit-boundary.db"))
+    await backend.connect()
+    log_store = SignalLogStore(backend)
+    await log_store.initialize()
+    dispatcher = SignalDispatcher(
+        agent=agent,
+        registry=SourceRegistry(),
+        lock_manager=OrderedLockManager(),
+        store=log_store,
+    )
+    # Keep schema setup outside the armed registration transaction.
+    await dispatcher._durable_store.initialize()
+    connection = backend._connection
+    assert connection is not None
+    original_commit = connection.commit
+    original_register = dispatcher._durable_store.register_runtime_owner
+    registration_in_flight = False
+
+    async def cancel_after_committed_owner_registration():
+        await original_commit()
+        if registration_in_flight:
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+            await asyncio.sleep(0)
+
+    async def register_with_armed_commit(*args, **kwargs):
+        nonlocal registration_in_flight
+        registration_in_flight = True
+        try:
+            return await original_register(*args, **kwargs)
+        finally:
+            registration_in_flight = False
+
+    try:
+        connection.commit = cancel_after_committed_owner_registration
+        dispatcher._durable_store.register_runtime_owner = register_with_armed_commit
+        with pytest.raises(asyncio.CancelledError):
+            await dispatcher.initialize_durable_delivery()
+
+        assert dispatcher._durable_initialized is False
+        assert dispatcher._durable_runtime_owner_registered is False
+        assert dispatcher._durable_runtime_owner_registration_started is True
+
+        # This is the callback registered before durable initialization's first
+        # await. It must release the ambiguous owner before boot storage closes.
+        connection.commit = original_commit
+        dispatcher._durable_store.register_runtime_owner = original_register
+        agent.dispatcher = dispatcher
+        await agent._boot_teardown_dispatcher()
+
+        assert agent.dispatcher is None
+        owner = await backend.fetch_one(
+            "SELECT stopped_at FROM durable_signal_runtime_owners "
+            "WHERE agent_id = ? AND owner_id = ?",
+            (agent.did, dispatcher._durable_delivery_owner),
+        )
+        assert owner is not None and owner[0] is not None
+        assert dispatcher._durable_runtime_owner_registration_started is False
+    finally:
+        connection.commit = original_commit
+        dispatcher._durable_store.register_runtime_owner = original_register
+        if not dispatcher._durable_shutdown:
+            await dispatcher.shutdown_durable_delivery()
+        await backend.close()
+
+
 # ---------------------------------------------------------------------------
 # Failure DURING an initializer's own await — the resource the initializer
 # opened before raising is still torn down (#2522 P1). Teardown is registered

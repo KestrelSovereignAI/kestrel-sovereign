@@ -415,6 +415,14 @@ class SignalDispatcher:
         # initialization: recovery itself can fail, and boot rollback must
         # still mark the partly-registered owner stopped before storage closes.
         self._durable_runtime_owner_registered = False
+        # A cancelled ``register_runtime_owner`` await is ambiguous on real
+        # async database drivers: its commit can finish on the driver worker
+        # immediately before cancellation is delivered to this task.  Record
+        # that the registration *may* have committed before awaiting it, so
+        # teardown always issues the owner-scoped release for that generation.
+        # A release against a row that never committed is an intentional
+        # no-op; leaving a committed row live is not.
+        self._durable_runtime_owner_registration_started = False
         self._durable_init_lock = asyncio.Lock()
         if runtime_owner_stale_after.total_seconds() <= 0:
             raise ValueError("runtime_owner_stale_after must be positive")
@@ -427,6 +435,14 @@ class SignalDispatcher:
         # globally unique and every dispatcher owns exactly one agent scope.
         self._transient_durable_handoffs: dict[str, _TransientDurableHandoff] = {}
         self._transient_durable_handoff_timers: dict[str, asyncio.TimerHandle] = {}
+        # Post-commit reservation repair must outlive the agent-wide
+        # best-effort background-task sweep.  A repair created immediately
+        # before shutdown may not get a first event-loop turn before that
+        # sweep cancels ordinary work; cancelling it would strand a committed
+        # ``LEASED`` or ``INITIAL_RESERVED`` row.  The dispatcher owns these
+        # critical tasks and drains them before it releases its runtime owner
+        # or lets storage close.
+        self._post_commit_reservation_repairs: set[asyncio.Task] = set()
         # The durable lease transfer is atomic, but its raw sidecar is shared
         # by local claimants. A payload-elided persistence holds this lock
         # from pre-commit sidecar installation through commit; a local initial
@@ -553,6 +569,7 @@ class SignalDispatcher:
         async with self._durable_init_lock:
             if not self._durable_initialized:
                 await self._durable_store.initialize()
+                self._durable_runtime_owner_registration_started = True
                 await self._durable_store.register_runtime_owner(
                     agent_id=self._agent.did,
                     owner_id=self._durable_delivery_owner,
@@ -725,9 +742,10 @@ class SignalDispatcher:
         return purged
 
     async def shutdown_durable_delivery(self) -> None:
-        """Discard live raw sidecars, then release unactivated reservations."""
+        """Finish critical repairs, then drop sidecars and release this owner."""
         self._durable_shutdown = True
         await self._stop_runtime_owner_heartbeat()
+        await self._drain_post_commit_reservation_repairs()
         async with self._transient_durable_initial_claim_lock:
             # Drop the raw capability before the durable state becomes retry
             # work. A concurrent worker can therefore receive only the marker
@@ -736,12 +754,13 @@ class SignalDispatcher:
                 timer.cancel()
             self._transient_durable_handoff_timers.clear()
             self._transient_durable_handoffs.clear()
-            if self._durable_runtime_owner_registered:
+            if self._durable_runtime_owner_registration_started:
                 await self._durable_store.release_initial_reservations(
                     agent_id=self._agent.did,
                     owner_id=self._durable_delivery_owner,
                 )
                 self._durable_runtime_owner_registered = False
+                self._durable_runtime_owner_registration_started = False
 
     def shutdown(self) -> None:
         """Compatibility teardown for embeddings that cannot await shutdown.
@@ -760,7 +779,7 @@ class SignalDispatcher:
         if self._runtime_owner_heartbeat_task is not None:
             self._runtime_owner_heartbeat_task.cancel()
             self._runtime_owner_heartbeat_task = None
-        if self._durable_runtime_owner_registered:
+        if self._durable_runtime_owner_registration_started:
             try:
                 asyncio.get_running_loop()
             except RuntimeError:
@@ -777,44 +796,58 @@ class SignalDispatcher:
                     name=f"durable_signal_owner_release:{self._agent.did}",
                 )
                 self._durable_runtime_owner_registered = False
+                self._durable_runtime_owner_registration_started = False
         for timer in self._transient_durable_handoff_timers.values():
             timer.cancel()
         self._transient_durable_handoff_timers.clear()
         self._transient_durable_handoffs.clear()
 
     async def _activate_transient_reservations(self, persisted) -> None:
-        """Activate post-commit reservations without stranding raw sidecars.
+        """Activate every post-commit reservation into its first live lease.
 
-        ``persist_signal`` has committed before this method runs.  An
-        activation can therefore fail after the event exists, including after
-        its conditional state update commits but before its readback returns.
-        Each failed handoff must consequently drop its raw sidecar and turn
-        only that owner/token-bound initial capability into marker-only retry
-        work.  Continue cleaning later reservations before surfacing failure
-        so a multi-consumer event cannot leave an earlier raw sidecar behind.
+        The caller owns failure cleanup.  Keeping activation free of partial
+        recovery is deliberate: if any await below raises after the event has
+        committed, every reservation for that event must be returned to the
+        marker-only retry path together, including leases whose UPDATE
+        succeeded before their readback failed.
         """
-        activation_errors: list[Exception] = []
         for reservation in persisted.initial_reservations:
             handoff = self._transient_durable_handoffs.get(reservation.delivery_id)
-            try:
-                if handoff is None:
-                    raise RuntimeError("initial reservation sidecar is unavailable")
-                delivery = await self._durable_store.activate_initial_delivery(
-                    agent_id=self._agent.did,
-                    consumer_id=reservation.consumer_id,
-                    delivery_id=reservation.delivery_id,
-                    initial_lease_owner=self._durable_delivery_owner,
-                    initial_lease_token=reservation.reservation_token,
-                )
-                if delivery is None or delivery.lease_expires_at is None:
-                    raise RuntimeError("initial reservation could not be activated")
-            except Exception as exc:
-                # Discard the process-local capability before publishing its
-                # marker as retryable work.  ``abandon_initial_reservation``
-                # also recognizes the owner/token-bound LEASED state, which
-                # covers an activation update that committed before readback
-                # raised.
-                self._discard_transient_durable_handoff(reservation.delivery_id)
+            if handoff is None:
+                raise RuntimeError("initial reservation sidecar is unavailable")
+            delivery = await self._durable_store.activate_initial_delivery(
+                agent_id=self._agent.did,
+                consumer_id=reservation.consumer_id,
+                delivery_id=reservation.delivery_id,
+                initial_lease_owner=self._durable_delivery_owner,
+                initial_lease_token=reservation.reservation_token,
+            )
+            if delivery is None or delivery.lease_expires_at is None:
+                raise RuntimeError("initial reservation could not be activated")
+            handoff.expires_at = min(
+                handoff.retention_until, delivery.lease_expires_at
+            )
+            self._schedule_transient_durable_handoff_expiry(
+                reservation.delivery_id, handoff.expires_at
+            )
+
+    async def _requeue_committed_initial_reservations(self, persisted) -> None:
+        """Synchronously erase raw sidecars and requeue a failed handoff.
+
+        This coroutine runs in a separate task once an event transaction may
+        have committed.  The parent dispatch task can then be cancelled as
+        often as needed without interrupting the durable repair.  A failed
+        activation is all-or-nothing: an earlier reservation may already be
+        ``LEASED`` when a later activation or readback raises, but its
+        owner/token capability still lets ``abandon_initial_reservation`` turn
+        it into marker-only retry work safely.
+        """
+        reservations = persisted.initial_reservations
+        for reservation in reservations:
+            self._discard_transient_durable_handoff(reservation.delivery_id)
+
+        for reservation in reservations:
+            while True:
                 try:
                     abandoned = await self._durable_store.abandon_initial_reservation(
                         agent_id=self._agent.did,
@@ -823,32 +856,71 @@ class SignalDispatcher:
                         owner_id=self._durable_delivery_owner,
                         reservation_token=reservation.reservation_token,
                     )
-                    if not abandoned:
-                        logger.warning(
-                            "Initial durable reservation %s was no longer "
-                            "owned while cleaning an activation failure",
-                            reservation.delivery_id,
-                        )
-                except Exception as cleanup_exc:
-                    logger.exception(
-                        "Could not requeue committed initial reservation %s "
-                        "after activation failure",
+                except asyncio.CancelledError:
+                    # The repair task is normally protected by its parent's
+                    # shield, but a direct cancellation (for example during
+                    # event-loop teardown) can still arrive at this await.
+                    # Retrying the owner/token-conditional release is safe and
+                    # ensures the cancellation cannot leave an INITIAL_RESERVED
+                    # row behind.
+                    continue
+                if not abandoned:
+                    # A transaction that definitely rolled back reaches this
+                    # path too: the dispatcher deliberately keeps its opaque
+                    # capability until conditional repair proves there is no
+                    # matching committed row.  This is an expected no-op, not
+                    # an ownership violation.
+                    logger.debug(
+                        "Committed-reservation repair found no matching row for %s",
                         reservation.delivery_id,
                     )
-                    activation_errors.append(cleanup_exc)
-                activation_errors.append(exc)
+                break
+
+    async def _repair_post_commit_reservations(self, persisted) -> None:
+        """Finish committed-reservation repair despite repeated cancellation.
+
+        Raw sidecars are discarded before this method creates its task, so
+        there is no scheduling window in which cancellation can retain user
+        payload.  The separate repair task is shielded from cancellation of
+        the dispatch task; repeated cancellations are observed and deferred
+        until the repair is done, then the original triggering exception is
+        re-raised by the caller.
+        """
+        for reservation in persisted.initial_reservations:
+            self._discard_transient_durable_handoff(reservation.delivery_id)
+
+        repair_task = asyncio.create_task(
+            self._requeue_committed_initial_reservations(persisted),
+            name=f"durable_signal_post_commit_repair:{self._agent.did}",
+        )
+        self._post_commit_reservation_repairs.add(repair_task)
+        repair_task.add_done_callback(self._post_commit_reservation_repairs.discard)
+        while not repair_task.done():
+            try:
+                await asyncio.shield(repair_task)
+            except asyncio.CancelledError:
+                # The original failure is retained by the caller.  A repeated
+                # cancellation must not strand a committed reservation.
                 continue
-            handoff.expires_at = min(
-                handoff.retention_until, delivery.lease_expires_at
+        # Do not catch a database repair error here.  The caller that is
+        # already preserving a persistence/activation exception records the
+        # cleanup fault explicitly, while normal callers must see the repair
+        # error rather than silently proceeding with an unsafe handoff.
+        repair_task.result()
+
+    async def _drain_post_commit_reservation_repairs(self) -> None:
+        """Await every dispatcher-owned committed-reservation repair.
+
+        Unlike general agent background work, a reservation repair is part of
+        the durable state transition already committed to storage.  It must
+        therefore run to completion before the owner release below makes any
+        remaining work visible to a restart worker.
+        """
+        while self._post_commit_reservation_repairs:
+            repairs = tuple(self._post_commit_reservation_repairs)
+            await asyncio.gather(
+                *(asyncio.shield(repair) for repair in repairs),
             )
-            self._schedule_transient_durable_handoff_expiry(
-                reservation.delivery_id, handoff.expires_at
-            )
-        if activation_errors:
-            raise RuntimeError(
-                "Durable event committed, but one or more initial "
-                "reservations could not be activated"
-            ) from activation_errors[0]
 
     def _schedule_runtime_owner_heartbeat(self) -> None:
         """Keep owner liveness separate from delivery lease countdowns."""
@@ -1191,8 +1263,11 @@ class SignalDispatcher:
                     if durable_projection.payload_elided
                     else {}
                 )
+                committed_reservations = None
+
                 def install_transient_handoffs(persisted) -> None:
                     """Install raw sidecars before the event transaction commits."""
+                    nonlocal committed_reservations
                     assert transient_payload is not None
                     retention_until = persisted.retention_until or datetime.now(
                         timezone.utc
@@ -1214,12 +1289,26 @@ class SignalDispatcher:
                                 ),
                             )
                         )
+                    # ``persist_signal`` may be cancelled after its transaction
+                    # commits but before its await returns. Retain the opaque
+                    # reservation capabilities here so that boundary can still
+                    # be repaired. ``on_rollback`` cannot distinguish a real
+                    # rollback from cancellation after the driver committed,
+                    # so conditional repair below resolves either outcome.
+                    committed_reservations = persisted
 
                 def discard_rolled_back_handoffs(persisted) -> None:
                     for reservation in persisted.initial_reservations:
                         self._discard_transient_durable_handoff(
                             reservation.delivery_id
                         )
+                    # Keep ``committed_reservations`` even though the callback
+                    # convention calls this ``on_rollback``. SQLite can raise
+                    # CancelledError from ``await conn.commit()`` after its
+                    # worker has committed; clearing the owner/token
+                    # capabilities here would strand that visible
+                    # INITIAL_RESERVED row. A confirmed rollback makes the
+                    # later conditional repair a harmless no-op.
 
                 persistence_kwargs = {
                     "agent_id": self._agent.did,
@@ -1254,36 +1343,80 @@ class SignalDispatcher:
                     # sidecars by the time this await reaches commit, and the
                     # same lock remains held until the row is visible.
                     async with self._transient_durable_initial_claim_lock:
-                        persisted = await self._durable_store.persist_signal(
-                            durable_projection.signal,
-                            **persistence_kwargs,
-                        )
+                        try:
+                            persisted = await self._durable_store.persist_signal(
+                                durable_projection.signal,
+                                **persistence_kwargs,
+                            )
+                        except BaseException:
+                            # The before-commit hook already gave us the
+                            # capability set. If cancellation arrives after
+                            # commit but before this await returns, use it to
+                            # erase raw state and requeue every reservation.
+                            # A confirmed rollback leaves no matching rows, so
+                            # this is harmless before commit too.
+                            if committed_reservations is not None:
+                                try:
+                                    await self._repair_post_commit_reservations(
+                                        committed_reservations
+                                    )
+                                except BaseException as cleanup_exc:
+                                    # The event-persistence failure remains
+                                    # authoritative, but a failed repair must
+                                    # never disappear into a broad exception
+                                    # handler. The exception log provides the
+                                    # operator the exact cleanup failure.
+                                    logger.exception(
+                                        "Durable post-commit reservation repair "
+                                        "failed while preserving persistence "
+                                        "failure: %s",
+                                        cleanup_exc,
+                                    )
+                            raise
                         if persisted.created:
                             try:
                                 await self._activate_transient_reservations(persisted)
-                            except Exception as exc:
+                            except BaseException as exc:
                                 # The event transaction has already committed.
-                                # _activate_transient_reservations has dropped
-                                # every unresolved raw sidecar and converted
-                                # its owner/token-bound reservation to a
-                                # marker-only retry, so this is materially
-                                # different from a failed persistence.
-                                logger.exception(
-                                    "Durable signal event %s committed but "
-                                    "initial delivery activation failed",
-                                    signal.id,
-                                )
-                                return self._fail(
-                                    signal,
-                                    start,
-                                    Status.FAILED,
-                                    error=(
-                                        "Durable signal delivery activation "
-                                        "failed after commit: "
-                                        f"{type(exc).__name__}: {exc}"
-                                    ),
-                                    registration=registration,
-                                )
+                                # Activation can have written a first lease
+                                # before failing its readback. Recover the
+                                # entire committed batch before preserving the
+                                # original failure/cancellation below.
+                                try:
+                                    await self._repair_post_commit_reservations(
+                                        persisted
+                                    )
+                                except BaseException as cleanup_exc:
+                                    # Preserve the activation failure below,
+                                    # but surface any independently failed
+                                    # repair rather than swallowing it.
+                                    logger.exception(
+                                        "Durable post-commit reservation repair "
+                                        "failed while preserving activation "
+                                        "failure: %s",
+                                        cleanup_exc,
+                                    )
+                                if isinstance(exc, Exception):
+                                    logger.error(
+                                        "Durable signal event %s committed but "
+                                        "initial delivery activation failed",
+                                        signal.id,
+                                        exc_info=(
+                                            type(exc), exc, exc.__traceback__
+                                        ),
+                                    )
+                                    return self._fail(
+                                        signal,
+                                        start,
+                                        Status.FAILED,
+                                        error=(
+                                            "Durable signal delivery activation "
+                                            "failed after commit: "
+                                            f"{type(exc).__name__}: {exc}"
+                                        ),
+                                        registration=registration,
+                                    )
+                                raise
                 else:
                     persisted = await self._durable_store.persist_signal(
                         durable_projection.signal,

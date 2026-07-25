@@ -390,8 +390,14 @@ class DurableSignalStore(UnifiedStoreBase):
         installs its process-local raw-payload sidecars through
         ``before_commit`` before this transaction becomes visible, then
         activates the reservation after this method returns from commit.  A
-        rollback invokes ``on_rollback`` so those sidecars cannot outlive rows
-        that did not commit.  Both callbacks are synchronous deliberately:
+        transaction failure invokes ``on_rollback`` so those sidecars cannot
+        outlive rows that did not commit.  Async database drivers can report
+        cancellation after their worker has completed ``commit``, however, so
+        the callback is an *ambiguous transaction-outcome* notification rather
+        than proof of rollback. Callers that retained an owner/token capability
+        must conditionally repair it; that repair is a no-op for a confirmed
+        rollback and releases a row whose commit was already durable. Both
+        callbacks are synchronous deliberately:
         yielding between installing the sidecar and committing would reopen
         the very visibility race this handoff closes.
         """

@@ -5779,6 +5779,10 @@ Expected Duration: {expected_duration}
         run_memory = bool(memory_system and hasattr(memory_system, "shutdown"))
         sync_service = getattr(self, "_sync_service", None)
         run_sync = bool(sync_service and sync_service.is_running)
+        dispatcher = getattr(self, "dispatcher", None)
+        run_dispatcher = bool(
+            dispatcher and hasattr(dispatcher, "shutdown_durable_delivery")
+        )
         run_storage = hasattr(self.storage, "close")
         if not run_storage:
             return 0.0
@@ -5787,7 +5791,13 @@ Expected Duration: {expected_duration}
         # operation.  Its own SQLite driver workers need their own declared
         # reservation; it must not consume the primary close's reservation.
         run_storage_preclose = _storage_preclose(self.storage) is not None
-        preceding_steps = 1 + int(run_memory) + 2 * int(run_sync)
+        # The dispatcher releases runtime-owner liveness and any raw volatile
+        # handoffs before storage closes. It is a distinct guarded tail step,
+        # so its minimum must be reserved alongside background cleanup,
+        # memory, and the two sync phases.
+        preceding_steps = (
+            1 + int(run_dispatcher) + int(run_memory) + 2 * int(run_sync)
+        )
         preclose_minimum = (
             max(KESTREL_SHUTDOWN_TAIL_MIN_STEP_S, storage_preclose_timeout)
             if run_storage_preclose
@@ -5841,6 +5851,10 @@ Expected Duration: {expected_duration}
         run_memory = bool(memory_system and hasattr(memory_system, "shutdown"))
         sync_service = getattr(self, "_sync_service", None)
         run_sync = bool(sync_service and sync_service.is_running)
+        dispatcher = getattr(self, "dispatcher", None)
+        run_dispatcher = bool(
+            dispatcher and hasattr(dispatcher, "shutdown_durable_delivery")
+        )
         run_storage = hasattr(self.storage, "close")
         if storage_close_timeout is None:
             storage_close_timeout = _minimum_storage_close_timeout(self.storage)
@@ -5874,6 +5888,7 @@ Expected Duration: {expected_duration}
         run_storage_preclose = storage_preclose is not None
         pending_steps = (
             1
+            + int(run_dispatcher)
             + int(run_memory)
             + 2 * int(run_sync)
             + int(run_storage_preclose)
@@ -6042,8 +6057,7 @@ Expected Duration: {expected_duration}
         # the dispatcher can briefly hold a same-process live payload handoff
         # for a worker that claims before restart.  It is never durable and
         # must not outlive this agent instance.
-        dispatcher = getattr(self, "dispatcher", None)
-        if dispatcher is not None:
+        if run_dispatcher:
             await _bounded(
                 dispatcher.shutdown_durable_delivery(),
                 _step_guard(),
