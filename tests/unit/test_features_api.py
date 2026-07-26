@@ -930,6 +930,34 @@ class TestSecretMasking:
         assert saved["api_key"] == "stored-key"
         assert saved["enabled"] is False
 
+    def test_patch_delegates_isolated_secret_preservation_to_atomic_feature_method(self):
+        """Hosted isolated features own preservation at their stage CAS boundary."""
+
+        feature = _make_feature(
+            config_schema=SECRET_SCHEMA,
+            config={"api_key": "stored-key", "enabled": False},
+        )
+        feature.set_config_with_secret_preservation = AsyncMock()
+        agent = _make_agent(features={"TestFeature": feature})
+        app = _make_app(agent)
+
+        with TestClient(app) as client:
+            resp = client.patch(
+                "/api/features/TestFeature/config",
+                json={"config": {"enabled": True}},
+            )
+
+        assert resp.status_code == 200
+        feature.set_config_with_secret_preservation.assert_awaited_once()
+        saved, secret_fields, validate = feature.set_config_with_secret_preservation.await_args.args
+        assert saved == {"enabled": True}
+        assert secret_fields == {"api_key"}
+        # The endpoint does not read/re-inject a secret before delegating. The
+        # runtime invokes this validation only after it merged the stage-CAS
+        # snapshot's current secret.
+        validate({"enabled": True, "api_key": "atomic-key"})
+        feature.set_config.assert_not_awaited()
+
     def test_patch_new_secret_overrides(self):
         feature = _make_feature(
             config_schema=SECRET_SCHEMA,

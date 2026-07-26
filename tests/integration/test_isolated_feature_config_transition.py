@@ -46,6 +46,14 @@ class _Storage:
     async def get_node(self, node_id):
         return self.nodes.get(node_id)
 
+    async def compare_and_swap_node(self, node_id, expected, new_node):
+        current = self.nodes.get(node_id)
+        current_properties = None if current is None else current.properties
+        if current_properties != expected:
+            return "predicate_failed"
+        self.nodes[node_id] = new_node
+        return "swapped"
+
 
 class _SDKWireClient:
     """Proxy-compatible lifecycle adapter over a real SDK JSON-RPC client."""
@@ -231,14 +239,14 @@ async def test_proxy_uses_negotiated_sdk_transition_before_replacement(
 async def test_real_sdk_fenced_transition_promotion_failure_restores_durable_config(
     monkeypatch, tmp_path
 ):
-    """A real SDK cancellation fence cannot strand a next-config child.
+    """A real SDK cancellation fence cannot start a pending-config child.
 
     The transition request is cancelled only after the service received it, so
     ``IsolatedFeatureClient`` takes its documented unknown-outcome path and
     fences the client for replacement.  The storage fault then rejects the
-    candidate's *promotion* write, not its initial pending write.  Recovery
-    must retire that candidate, restore the active config, and keep a restart
-    on the same durable value.
+    candidate's *promotion* write, not its initial pending write. Recovery
+    must restore the active config without ever initializing that pending
+    candidate, then preserve the SDK cancellation outcome.
     """
 
     old_config = {"enabled": True, "token": "old-token-not-for-logs"}
@@ -252,14 +260,14 @@ async def test_real_sdk_fenced_transition_promotion_failure_restores_durable_con
     class PromotionFailingStorage(_Storage):
         def __init__(self):
             super().__init__()
-            self.add_calls = 0
+            self.cas_calls = 0
 
-        async def add_node(self, node) -> None:
-            self.add_calls += 1
-            # Seed old config; stage candidate; reject candidate promotion.
-            if self.add_calls == 3:
+        async def compare_and_swap_node(self, node_id, expected, new_node):
+            self.cas_calls += 1
+            # Stage candidate, then reject its conditional promotion.
+            if self.cas_calls == 2:
                 raise OSError("storage offline during promotion")
-            await super().add_node(node)
+            return await super().compare_and_swap_node(node_id, expected, new_node)
 
     class FencedRecoveryService(IsolatedFeatureService):
         def __init__(self) -> None:
@@ -314,35 +322,37 @@ async def test_real_sdk_fenced_transition_promotion_failure_restores_durable_con
         # triggers the SDK's unknown-outcome fence before the service is allowed
         # to return its late response and process the replacement shutdown.
         update.cancel()
-        await asyncio.sleep(0)
+
+        async def _wait_for_sdk_fence() -> None:
+            while not clients[0].replacement_required:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(_wait_for_sdk_fence(), timeout=1)
         assert clients[0].replacement_required is True
         release_transition.set()
 
-        with pytest.raises(RuntimeError, match="failed to persist config"):
+        with pytest.raises(asyncio.CancelledError):
             await update
 
         assert observed == [
             ("initialize", old_config),
             ("transition", old_config, next_config),
             ("shutdown", old_config),
-            ("initialize", next_config),
-            ("shutdown", next_config),
             ("initialize", old_config),
         ]
         assert clients[0].stopped is True
-        assert clients[1].stopped is True
-        assert clients[2].stopped is False
+        assert clients[1].stopped is False
         assert feature._host_config == old_config
-        assert feature._client is clients[2]
-        assert agent.storage.nodes["feature_config:FencedRecoveryFeature"].properties == {
-            "config": old_config,
-            "pending_config": next_config,
-        }
+        assert feature._client is clients[1]
+        properties = agent.storage.nodes["feature_config:FencedRecoveryFeature"].properties
+        assert properties["config"] == old_config
+        assert "pending_config" not in properties
+        assert "_isolated_pending_generation" not in properties
         assert feature._supervision_task is not None
         assert feature._supervision_task.done() is False
 
-        # A fresh host proxy performs the restart handshake with durable active
-        # config, never the rejected pending candidate.
+        # A fresh host proxy performs the restart handshake with the durable
+        # active config; the rejected candidate was removed during cleanup.
         fresh = ProxyFeature(agent, runtime, client_factory=client_factory)
         await fresh.initialize()
         assert fresh._host_config == old_config

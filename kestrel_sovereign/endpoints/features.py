@@ -1,6 +1,7 @@
 """Feature Store API — catalog, install, enable, disable, configure features."""
 
 import asyncio
+import inspect
 import logging
 import subprocess
 import sys
@@ -601,17 +602,33 @@ async def update_feature_config(
     incoming = dict(body.config)
 
     secret_fields = _secret_field_names(schema)
-    if secret_fields:
-        current = await feature.get_config()
-        if isinstance(current, dict):
-            for key in secret_fields:
-                if key not in incoming and key in current:
-                    incoming[key] = current[key]
+    atomic_secret_update = getattr(feature, "set_config_with_secret_preservation", None)
+    has_atomic_secret_update = inspect.iscoroutinefunction(atomic_secret_update)
+    if secret_fields and has_atomic_secret_update:
+        # Isolated hosted features preserve omitted write-only fields from the
+        # same durable snapshot used by their transition CAS.  Reading here and
+        # reinjecting later would let a stale replica overwrite a concurrent
+        # credential rotation.
+        await atomic_secret_update(
+            incoming,
+            secret_fields,
+            lambda effective: _validate_config(effective, schema)
+            if schema is not None
+            else None,
+        )
+    else:
+        if secret_fields:
+            current = await feature.get_config()
+            if isinstance(current, dict):
+                for key in secret_fields:
+                    if key not in incoming and key in current:
+                        incoming[key] = current[key]
 
-    if schema is not None:
-        _validate_config(incoming, schema)
+        if schema is not None:
+            _validate_config(incoming, schema)
 
-    await feature.set_config(incoming)
+        await feature.set_config(incoming)
+
     updated = await feature.get_config()
 
     # Never echo secret values back to the client.
