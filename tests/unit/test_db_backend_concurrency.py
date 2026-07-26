@@ -11,6 +11,7 @@ the full suite, so it was deferred rather than shipped on the hot read path.)
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -33,6 +34,75 @@ def test_postgres_from_pool_keeps_advisory_dsn_outside_operational_pool_state():
     assert backend._dsn is None
     assert backend._advisory_dsn == "postgresql://scheduler-test/kestrel"
     assert backend._advisory_max_pool_size == 2
+
+
+@pytest.mark.asyncio
+async def test_postgres_from_pool_derives_a_dedicated_advisory_pool_recipe():
+    """Pool-only embeddings never borrow the operational pool for gates."""
+
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    class _Pool:
+        _connect_args = ("postgresql://pool-only/kestrel",)
+        _connect_kwargs = {"server_settings": {"application_name": "host"}}
+        _connect = staticmethod(lambda *_args, **_kwargs: None)
+        _connection_class = object
+        _record_class = object
+
+        def get_max_size(self):
+            return 2
+
+        acquire = Mock(side_effect=AssertionError("shared pool must not be acquired"))
+
+    shared_pool = _Pool()
+    backend = PostgresBackend.from_pool(shared_pool)
+    advisory_pool = object()
+    with patch.object(
+        postgres_module.asyncpg,
+        "create_pool",
+        AsyncMock(return_value=advisory_pool),
+    ) as create_pool:
+        assert await backend._ensure_advisory_pool() is advisory_pool
+
+    create_pool.assert_awaited_once_with(
+        "postgresql://pool-only/kestrel",
+        min_size=0,
+        max_size=2,
+        server_settings={"application_name": "host"},
+        connect=shared_pool._connect,
+        connection_class=object,
+        record_class=object,
+    )
+    shared_pool.acquire.assert_not_called()
+
+
+def test_postgres_from_pool_explicit_advisory_dsn_ignores_pool_connect_kwargs():
+    """An explicit scheduler DSN does not inherit operational credentials."""
+
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    class _Pool:
+        _connect_args = ("postgresql://operational/kestrel",)
+        _connect_kwargs = {"ssl": "operational-only", "password": "secret"}
+        _connection_class = object
+        _record_class = object
+
+        def get_max_size(self):
+            return 2
+
+    backend = PostgresBackend.from_pool(
+        _Pool(),
+        advisory_dsn="postgresql://scheduler/kestrel",
+        advisory_connect_kwargs={"server_settings": {"search_path": "scheduler"}},
+    )
+
+    assert backend._advisory_connect_args == ("postgresql://scheduler/kestrel",)
+    assert backend._advisory_connect_kwargs == {
+        "connection_class": object,
+        "record_class": object,
+        "server_settings": {"search_path": "scheduler"},
+    }
 
 
 def test_postgres_txn_conn_is_per_task_and_not_inherited_by_children():

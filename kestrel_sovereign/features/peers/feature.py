@@ -435,6 +435,36 @@ class PeersFeature(Feature):
 
         return self._peer_directory_context()
 
+    def refresh_local_host_peer_directory(
+        self,
+        *,
+        host_url: str,
+        api_key: str,
+    ) -> Optional[Tuple[PeerDirectoryRouter, PeerRequester]]:
+        """Refresh only the local compatibility adapter for hosted policy.
+
+        Host registration can occur after platform port resolution or API-key
+        generation. Those are host-owned runtime facts, so the local adapter
+        must be reconstructed from them before the host freezes its inbound
+        policy. An injected scoped router is intentionally never replaced.
+        """
+
+        router = getattr(self, "_peer_router", None)
+        requester = getattr(self, "_peer_requester", None)
+        if (router is None) != (requester is None):
+            raise PeerDirectoryConfigurationError(
+                "Injected peer router and trusted requester identity must "
+                "be supplied together"
+            )
+        if router is not None and not isinstance(router, LocalHostPeerDirectory):
+            return self._peer_directory_context()
+        self._host_url = host_url.rstrip("/")
+        self._api_key = api_key
+        self._peer_router = None
+        self._peer_requester = None
+        self._install_local_host_router()
+        return self._peer_directory_context()
+
     def _requires_durable_peer_binding(self) -> bool:
         """Whether retained routes must have a durable stable identity.
 

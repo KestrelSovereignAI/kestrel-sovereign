@@ -138,6 +138,7 @@ class PostgresBackend(DatabaseBackend):
         # smaller operational pools keep the same cap.
         self._advisory_max_pool_size = max(1, min(max_pool_size, 4))
         self._advisory_dsn = dsn
+        self._advisory_connect_args: tuple[Any, ...] = (dsn,) if dsn else ()
         self._advisory_connect_kwargs: dict[str, Any] = {}
         self._advisory_pool: Optional[asyncpg.Pool] = None
         self._advisory_pool_lock = asyncio.Lock()
@@ -175,10 +176,9 @@ class PostgresBackend(DatabaseBackend):
 
         Args:
             pool: Existing asyncpg.Pool instance
-            advisory_dsn: DSN for the bounded dedicated advisory-lock pool.
-                Required before scheduler advisory gates can run, because an
-                existing asyncpg pool does not expose safe public connection
-                parameters for creating an independent session pool.
+            advisory_dsn: Optional explicit DSN for the bounded dedicated
+                advisory-lock pool. When omitted, connection construction
+                settings are copied from asyncpg's pool construction context.
             advisory_connect_kwargs: Connection options for the dedicated
                 advisory-lock pool, such as a non-default ``search_path``.
 
@@ -202,14 +202,60 @@ class PostgresBackend(DatabaseBackend):
         except (AttributeError, TypeError, ValueError):
             operational_max = 4
         instance._advisory_max_pool_size = max(1, min(operational_max, 4))
+        pool_args, pool_kwargs = cls._advisory_settings_from_pool(pool)
+        if advisory_dsn is not None:
+            pool_args = (advisory_dsn,)
+            # An explicit scheduler connection source must not inherit the
+            # wrapped pool's host/password/SSL options. Retain only protocol
+            # classes, while callers supply any intended advisory overrides.
+            pool_kwargs = {
+                key: value
+                for key, value in pool_kwargs.items()
+                if key in {"connection_class", "record_class"}
+            }
         instance._advisory_dsn = advisory_dsn
-        instance._advisory_connect_kwargs = dict(advisory_connect_kwargs or {})
+        instance._advisory_connect_args = pool_args
+        instance._advisory_connect_kwargs = {
+            **pool_kwargs,
+            **dict(advisory_connect_kwargs or {}),
+        }
         instance._advisory_pool = None
         instance._advisory_pool_lock = asyncio.Lock()
         instance._pool = pool
         instance._txn_conn_var = contextvars.ContextVar("pg_txn_conn", default=None)
         instance._owns_pool = False  # Mark that we don't own the pool
         return instance
+
+    @staticmethod
+    def _advisory_settings_from_pool(
+        pool: "asyncpg.Pool",
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        """Copy the independent connection recipe from an asyncpg pool.
+
+        asyncpg deliberately does not offer a public DSN accessor for a live
+        pool. It does retain the immutable arguments used to construct that
+        pool, which are the only safe pool-only embedding seam for a fresh
+        advisory session: borrowing the shared operational pool for a
+        long-lived scheduler lock can starve the lease/finalization path.
+        Treat malformed third-party doubles as having no derivable recipe so
+        the advisory gate still fails closed rather than guessing credentials.
+        """
+
+        raw_args = getattr(pool, "_connect_args", ())
+        raw_kwargs = getattr(pool, "_connect_kwargs", {})
+        if not isinstance(raw_args, tuple) or not isinstance(raw_kwargs, dict):
+            return (), {}
+        kwargs = dict(raw_kwargs)
+        connect_factory = getattr(pool, "_connect", None)
+        if callable(connect_factory):
+            kwargs.setdefault("connect", connect_factory)
+        connection_class = getattr(pool, "_connection_class", None)
+        if connection_class is not None:
+            kwargs.setdefault("connection_class", connection_class)
+        record_class = getattr(pool, "_record_class", None)
+        if record_class is not None:
+            kwargs.setdefault("record_class", record_class)
+        return raw_args, kwargs
 
     def _current_txn_conn(self):
         """This task's open transaction connection, or None (#1726).
@@ -345,9 +391,9 @@ class PostgresBackend(DatabaseBackend):
                 return self._advisory_pool
             kwargs = dict(self._advisory_connect_kwargs)
             try:
-                if self._advisory_dsn:
+                if self._advisory_connect_args:
                     pool = await asyncpg.create_pool(
-                        self._advisory_dsn,
+                        *self._advisory_connect_args,
                         min_size=0,
                         max_size=self._advisory_max_pool_size,
                         **kwargs,

@@ -1064,15 +1064,36 @@ def _unmount_feature_ui_assets(app: FastAPI) -> None:
     app.state._feature_ui_mount_paths = set()
 
 
-def _hosted_peer_directory_context(agent) -> tuple[object, object]:
+def _active_local_peer_host_url(app: FastAPI) -> Optional[str]:
+    """Return the local peer URL from the host's effective listen settings."""
+
+    config = getattr(app.state, "multi_agent_config", None)
+    host = getattr(config, "host", None)
+    port = getattr(host, "port", None)
+    if isinstance(port, int) and 0 < port <= 65535:
+        # A wildcard listener is reachable through loopback from the local
+        # peer adapter. Do not advertise 0.0.0.0/:: as an HTTP client target.
+        bind = getattr(host, "bind", None)
+        hostname = (
+            bind
+            if isinstance(bind, str) and bind not in {"", "0.0.0.0", "::"}
+            else "localhost"
+        )
+        if ":" in hostname and not hostname.startswith("["):
+            hostname = f"[{hostname}]"
+        return f"http://{hostname}:{port}"
+    explicit_url = os.environ.get("KESTREL_HOST_URL")
+    return explicit_url.rstrip("/") if explicit_url else None
+
+
+def _hosted_peer_directory_context(app: FastAPI, agent) -> tuple[object, object]:
     """Return the effective directory pair for one hosted agent's A2A policy.
 
     ``PeersFeature`` owns the local-host compatibility adapter after feature
-    initialization. Consequently a normally constructed AgentManager agent
-    can have a live ``_peer_router``/``_peer_requester`` on that feature while
-    its public constructor injection attributes remain ``None``. The hosted
-    policy must capture the former exact pair; otherwise signed same-host A2A
-    always fails closed despite the sender and recipient being valid peers.
+    initialization. Its startup snapshot can predate generated API-key auth,
+    explicit multi-agent config discovery, or a platform ``PORT`` override.
+    Rebuild only that local adapter from the active host state before freezing
+    the hosted policy. An injected scoped router remains authoritative.
 
     Agents without a Peers feature retain the explicit construction-injection
     seam. A present Peers feature is authoritative: a missing or malformed
@@ -1101,9 +1122,26 @@ def _hosted_peer_directory_context(agent) -> tuple[object, object]:
         if not callable(context):
             return None, None
         resolved = context()
-        if resolved is None:
+        if resolved is not None:
+            router, requester = resolved
+            from kestrel_sovereign.features.peers.directory import (
+                LocalHostPeerDirectory,
+            )
+
+            # Never replace an explicitly injected user-scoped router with
+            # global local-host discovery. Only the compatibility adapter is
+            # rebuilt from the active host config/auth state.
+            if not isinstance(router, LocalHostPeerDirectory):
+                return router, requester
+
+        host_url = _active_local_peer_host_url(app)
+        if host_url is None:
             return None, None
-        return resolved
+        refresh = getattr(peer_feature, "refresh_local_host_peer_directory", None)
+        if not callable(refresh):
+            return None, None
+        refreshed = refresh(host_url=host_url, api_key=get_api_key())
+        return refreshed if refreshed is not None else (None, None)
     return (
         getattr(agent, "peer_directory_router", None),
         getattr(agent, "peer_requester", None),
@@ -1147,7 +1185,7 @@ async def _onboard_host_registered_agent(app: FastAPI, manager, name: str, agent
         federated_fallback=federated,
     )
     install_a2a_inbound_sender_authorizer(manager, recipient=agent)
-    peer_router, peer_requester = _hosted_peer_directory_context(agent)
+    peer_router, peer_requester = _hosted_peer_directory_context(app, agent)
     manager.install_a2a_hosted_policy(
         agent,
         resolver=agent.a2a_did_resolver,

@@ -841,6 +841,47 @@ async def test_storage_phase_uses_shared_postgres_pool():
 
 
 @pytest.mark.asyncio
+async def test_storage_phase_supports_pool_only_postgres_embedding():
+    """A pool-only embedder retains an independent scheduler gate recipe."""
+
+    class PoolOnlyAsyncpgDouble:
+        _connect_args = ("postgresql://pool-only/kestrel",)
+        _connect_kwargs = {"server_settings": {"application_name": "host"}}
+        _connect = staticmethod(lambda *_args, **_kwargs: None)
+        _connection_class = object
+        _record_class = object
+
+        def get_max_size(self):
+            return 3
+
+    pool = PoolOnlyAsyncpgDouble()
+    agent = KestrelAgent(
+        did="did:test:pg-pool-only",
+        db_backend="postgres",
+        pg_pool=pool,
+        llm_service=MagicMock(),
+    )
+    ctx = BootContext()
+    with patch("kestrel_sovereign.kestrel_agent.AsyncStorage") as MockStorage:
+        storage = AsyncMock()
+        storage.initialize = AsyncMock()
+        storage.get_node = AsyncMock(return_value=None)
+        storage.db = MagicMock()
+        storage.close = AsyncMock()
+        MockStorage.return_value = storage
+
+        await agent._boot_phase_storage_privacy(ctx)
+
+    backend = MockStorage.call_args.kwargs["backend"]
+    assert backend._pool is pool
+    assert backend._advisory_connect_args == ("postgresql://pool-only/kestrel",)
+    assert backend._advisory_connect_kwargs["server_settings"] == {
+        "application_name": "host"
+    }
+    assert backend._advisory_max_pool_size == 3
+
+
+@pytest.mark.asyncio
 async def test_storage_phase_uses_sqlite_by_default(tmp_path):
     agent = _make_agent(tmp_path)
     ctx = BootContext()
