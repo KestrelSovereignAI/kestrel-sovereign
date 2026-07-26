@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+from kestrel_sovereign.agent.sleep import SleepHookContract, SleepHookPhase
+
 logger = logging.getLogger(__name__)
 
 
@@ -36,6 +38,14 @@ class RetrievedMemoryCandidate:
 
 class ReflectionSleepHook:
     """Sleep hook that marks load-bearing retrieved memories as applied."""
+
+    # Stable declarative identity lets post-consolidation consumers order
+    # themselves against memory's knowledge-extraction boundary without core
+    # knowing this feature's concrete class.
+    sleep_hook_contract = SleepHookContract(
+        hook_id="kestrel_sovereign.memory.reflection",
+        phase=SleepHookPhase.KNOWLEDGE_EXTRACTION,
+    )
 
     async def on_pre_sleep(self, agent) -> Dict[str, Any]:
         memory = getattr(agent, "memory", None) or getattr(agent, "memory_system", None)
