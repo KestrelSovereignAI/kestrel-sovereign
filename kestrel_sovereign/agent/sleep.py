@@ -342,6 +342,8 @@ class SleepMixin:
 
         report = SleepReport(success=False)
         reflection_start = time.time()
+        consolidation_succeeded = False
+        export_succeeded = False
 
         # Note: Privacy mode checks are handled by the storage layer.
         # - EPHEMERAL/ISOLATED: Storage will raise PrivacyViolationError on export
@@ -369,19 +371,31 @@ class SleepMixin:
             consolidation_result: Optional[Dict[str, Any]] = None
             try:
                 consolidation_result = await self._consolidate_memories()
-                report.episodes_created = consolidation_result.get("episodes_created", 0)
-                report.patterns_found = consolidation_result.get("patterns_found", 0)
-                report.messages_archived = consolidation_result.get("messages_archived", 0)
-                report.episodes_deleted = consolidation_result.get("episodes_deleted", 0)
-                report.total_messages = consolidation_result.get("total_messages_processed", 0)
-                logger.info(
-                    f"Consolidation complete: {report.episodes_created} episodes, "
-                    f"{report.messages_archived} archived, "
-                    f"{report.episodes_deleted} forgotten"
+                unavailability_reason = self._post_consolidation_unavailability_reason(
+                    consolidation_result
                 )
-            except Exception as e:
-                logger.error(f"Consolidation failed: {e}")
-                report.error = f"Consolidation failed: {e}"
+                if unavailability_reason is None:
+                    report.episodes_created = consolidation_result.get("episodes_created", 0)
+                    report.patterns_found = consolidation_result.get("patterns_found", 0)
+                    report.messages_archived = consolidation_result.get("messages_archived", 0)
+                    report.episodes_deleted = consolidation_result.get("episodes_deleted", 0)
+                    report.total_messages = consolidation_result.get("total_messages_processed", 0)
+                    consolidation_succeeded = True
+                    logger.info(
+                        f"Consolidation complete: {report.episodes_created} episodes, "
+                        f"{report.messages_archived} archived, "
+                        f"{report.episodes_deleted} forgotten"
+                    )
+                else:
+                    # MemorySystem.consolidate() reports some failures and
+                    # privacy-gated passes as dictionaries.  Do not let their
+                    # zero-valued counters masquerade as a completed sleep
+                    # cycle, and do not surface provider or memory content in
+                    # this operator-facing report.
+                    report.error = unavailability_reason
+            except Exception:
+                logger.error("Consolidation failed")
+                report.error = "consolidation_failed"
                 # Continue to export anyway - partial sleep is better than none
             report.consolidation_ms = int((time.time() - start) * 1000)
 
@@ -389,8 +403,14 @@ class SleepMixin:
             # are phase- and dependency-ordered; legacy hooks retain their
             # registration-order, continue-on-error behavior.
             if not skip_reflection and self.sleep_hooks:
-                if consolidation_result is None:
-                    self._record_unavailable_post_consolidation_hooks(report)
+                unavailability_reason = self._post_consolidation_unavailability_reason(
+                    consolidation_result
+                )
+                if unavailability_reason is not None:
+                    self._record_unavailable_post_consolidation_hooks(
+                        report,
+                        reason=unavailability_reason,
+                    )
                 else:
                     await self._run_post_consolidation_hooks(
                         consolidation_result, report
@@ -407,6 +427,7 @@ class SleepMixin:
                 report.cid = export_result.get("cid")
                 report.shards_exported = export_result.get("shards_exported", 0)
                 report.total_size_bytes = export_result.get("total_size_bytes", 0)
+                export_succeeded = report.cid is not None
                 logger.info(f"Export complete: CID={report.cid}")
             except Exception as e:
                 logger.error(f"Export failed: {e}")
@@ -416,11 +437,11 @@ class SleepMixin:
                     report.error = f"Export failed: {e}"
             report.export_ms = int((time.time() - start) * 1000)
 
-        # Success if at least one operation completed
-        report.success = (
-            (not skip_consolidation and report.episodes_created >= 0) or
-            (not skip_export and report.cid is not None)
-        )
+        # Success is an actual completed consolidation or export, never merely
+        # a requested operation with zero counters.  In particular,
+        # MemorySystem.consolidate() reports some failures as ``{"error": ...}``
+        # and the scheduler normally skips export.
+        report.success = consolidation_succeeded or export_succeeded
 
         # Invoke callback if set (allows platform to update latest_cid)
         if report.success and report.cid and self.on_sleep_complete:
@@ -495,6 +516,27 @@ class SleepMixin:
         if success is True:
             return SleepHookStatus.SUCCESS, None, insights_generated
         return SleepHookStatus.SUCCESS, None, None
+
+    @staticmethod
+    def _post_consolidation_unavailability_reason(
+        consolidation_result: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Return why post hooks cannot consume this consolidation result.
+
+        ``MemorySystem.consolidate()`` deliberately reports failed and
+        privacy-skipped work as dictionaries so callers can finish their
+        surrounding sleep/export cycle.  Those dictionaries are not a fresh
+        corpus boundary: no post-consolidation hook may acknowledge or consume
+        them.  Keep the reason content-free because the original error can
+        contain memory or provider details.
+        """
+        if consolidation_result is None:
+            return "consolidation_failed"
+        if "error" in consolidation_result:
+            return "consolidation_failed"
+        if consolidation_result.get("skipped"):
+            return "consolidation_skipped"
+        return None
 
     @staticmethod
     def _record_hook_execution(
@@ -572,7 +614,10 @@ class SleepMixin:
                 continue
 
     def _record_unavailable_post_consolidation_hooks(
-        self, report: SleepReport
+        self,
+        report: SleepReport,
+        *,
+        reason: str,
     ) -> None:
         """Report hooks skipped because consolidation produced no safe input.
 
@@ -597,7 +642,7 @@ class SleepMixin:
                 status=SleepHookStatus.SKIPPED,
                 duration_ms=0,
                 stage="post_consolidation",
-                reason="consolidation_failed",
+                reason=reason,
             )
 
     def _build_post_consolidation_plan(

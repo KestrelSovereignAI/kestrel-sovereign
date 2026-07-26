@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-from unittest.mock import AsyncMock, MagicMock
+from datetime import datetime, timezone
 
 import pytest
 
@@ -17,11 +18,16 @@ from kestrel_sovereign.agent.sleep import (
 
 
 class _Agent(SleepMixin):
-    def __init__(self, hooks):
+    def __init__(self, hooks, *, consolidation_result=None):
         self.sleep_hooks = hooks
+        self._consolidation_result = (
+            {"episodes_created": 1}
+            if consolidation_result is None
+            else consolidation_result
+        )
 
     async def _consolidate_memories(self):
-        return {"episodes_created": 1}
+        return self._consolidation_result
 
 
 class _PostHook:
@@ -65,8 +71,35 @@ def _contract(hook_id, phase, **kwargs):
     return SleepHookContract(hook_id=hook_id, phase=phase, **kwargs)
 
 
-async def _run(hooks):
-    return await _Agent(hooks).sleep(skip_export=True)
+async def _run(hooks, *, consolidation_result=None):
+    return await _Agent(
+        hooks,
+        consolidation_result=consolidation_result,
+    ).sleep(skip_export=True)
+
+
+class _ReflectionMemory:
+    def __init__(self, db):
+        self.storage = type("Storage", (), {"db": db})()
+        self.marked_ids = []
+
+    async def mark_applied(self, message_id, *, reason):
+        self.marked_ids.append((message_id, reason))
+
+
+class _ReflectionDb:
+    def __init__(self, rows):
+        self.rows = rows
+
+    async def fetchall(self, query, params):
+        return self.rows
+
+
+def _reflection_agent(hooks, rows=(), *, consolidation_result=None):
+    agent = _Agent(hooks, consolidation_result=consolidation_result)
+    agent.agent_id = "did:test:reflection-phase"
+    agent.memory_system = _ReflectionMemory(_ReflectionDb(rows))
+    return agent
 
 
 @pytest.mark.asyncio
@@ -540,36 +573,260 @@ def test_reflection_hook_declares_knowledge_extraction_contract():
 
 
 @pytest.mark.asyncio
-async def test_installed_feature_hooks_block_training_after_semantic_failure():
-    """The real feature wrappers honor the phase contract across packages."""
-    sleep_hook_module = pytest.importorskip(
-        "kestrel_feature_parametric_self.sleep_hook",
-        reason="parametric-self is an optional extracted feature",
-    )
+async def test_reflection_post_boundary_allows_a_real_declared_dependent():
+    """Reflection's advertised identity is a satisfiable post-stage barrier."""
     from kestrel_sovereign.features.memory.reflection_hook import ReflectionSleepHook
 
-    training_feature = MagicMock()
-    training_feature.on_post_consolidation = AsyncMock(
-        return_value={"success": True}
-    )
-    training_hook = sleep_hook_module.ParametricSelfSleepHook(training_feature)
+    calls = []
     semantic_hook = _PostHook(
         "semantic",
-        [],
+        calls,
+        contract=_contract(
+            "semantic",
+            SleepHookPhase.SEMANTIC_MAINTENANCE,
+            after=("kestrel_sovereign.memory.reflection",),
+        ),
+    )
+
+    report = await _reflection_agent([semantic_hook, ReflectionSleepHook()]).sleep(
+        skip_export=True
+    )
+
+    post_results = [
+        result
+        for result in report.hook_results
+        if result.stage == "post_consolidation"
+    ]
+    assert calls == ["semantic"]
+    assert [result.hook_id for result in post_results] == [
+        "kestrel_sovereign.memory.reflection",
+        "semantic",
+    ]
+    assert [result.status.value for result in post_results] == ["success", "success"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("consolidation_result", "expected_reason"),
+    [
+        ({"error": "consolidator unavailable"}, "consolidation_failed"),
+        ({"skipped": True, "privacy_blocked": True}, "consolidation_skipped"),
+    ],
+)
+async def test_unavailable_consolidation_never_dispatches_post_dependencies(
+    consolidation_result,
+    expected_reason,
+):
+    """Structured consolidation failures are not a post-hook data boundary."""
+    from kestrel_sovereign.features.memory.reflection_hook import ReflectionSleepHook
+
+    calls = []
+    semantic_hook = _PostHook(
+        "semantic",
+        calls,
+        contract=_contract(
+            "semantic",
+            SleepHookPhase.SEMANTIC_MAINTENANCE,
+            after=("kestrel_sovereign.memory.reflection",),
+        ),
+    )
+
+    report = await _reflection_agent(
+        [semantic_hook, ReflectionSleepHook()],
+        consolidation_result=consolidation_result,
+    ).sleep(skip_export=True)
+
+    pre_reflection = next(
+        result
+        for result in report.hook_results
+        if result.hook_id == "kestrel_sovereign.memory.reflection"
+        and result.stage == "pre_sleep"
+    )
+    post_results = [
+        result
+        for result in report.hook_results
+        if result.stage == "post_consolidation"
+    ]
+    assert pre_reflection.status.value == "success"
+    assert calls == []
+    assert report.success is False
+    assert report.error == expected_reason
+    assert report.post_reflection == []
+    assert {result.hook_id for result in post_results} == {
+        "kestrel_sovereign.memory.reflection",
+        "semantic",
+    }
+    assert {result.status.value for result in post_results} == {"skipped"}
+    assert {result.reason for result in post_results} == {expected_reason}
+
+
+@pytest.mark.asyncio
+async def test_failed_reflection_pre_stage_blocks_its_post_dependent():
+    """A real provider failure cannot be acknowledged by the post barrier."""
+    from kestrel_sovereign.features.memory.reflection_hook import ReflectionSleepHook
+
+    class _FailingReflectionSleepHook(ReflectionSleepHook):
+        async def _attest_application(self, agent, *, candidate, session_context):
+            raise RuntimeError("attestation failed")
+
+    calls = []
+    semantic_hook = _PostHook(
+        "semantic",
+        calls,
+        contract=_contract(
+            "semantic",
+            SleepHookPhase.SEMANTIC_MAINTENANCE,
+            after=("kestrel_sovereign.memory.reflection",),
+        ),
+    )
+
+    recently_retrieved = datetime.now(timezone.utc).isoformat()
+    report = await _reflection_agent(
+        [semantic_hook, _FailingReflectionSleepHook()],
+        rows=[
+            (
+                1,
+                "assistant",
+                "private memory content",
+                json.dumps({"last_accessed": recently_retrieved}),
+                recently_retrieved,
+            )
+        ],
+    ).sleep(skip_export=True)
+
+    reflection = next(
+        result
+        for result in report.hook_results
+        if result.hook_id == "kestrel_sovereign.memory.reflection"
+        and result.stage == "post_consolidation"
+    )
+    semantic = next(
+        result for result in report.hook_results if result.hook_id == "semantic"
+    )
+    assert calls == []
+    assert reflection.status.value == "failed"
+    assert semantic.status.value == "blocked"
+    assert semantic.reason == (
+        "required_prerequisite_not_successful:"
+        "kestrel_sovereign.memory.reflection:failed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_skipped_reflection_pre_stage_blocks_its_post_dependent():
+    """An unavailable reflection prerequisite is not a successful corpus boundary."""
+    from kestrel_sovereign.features.memory.reflection_hook import ReflectionSleepHook
+
+    calls = []
+    semantic_hook = _PostHook(
+        "semantic",
+        calls,
+        contract=_contract(
+            "semantic",
+            SleepHookPhase.SEMANTIC_MAINTENANCE,
+            after=("kestrel_sovereign.memory.reflection",),
+        ),
+    )
+
+    report = await _run([semantic_hook, ReflectionSleepHook()])
+
+    reflection = next(
+        result
+        for result in report.hook_results
+        if result.hook_id == "kestrel_sovereign.memory.reflection"
+        and result.stage == "post_consolidation"
+    )
+    semantic = next(
+        result for result in report.hook_results if result.hook_id == "semantic"
+    )
+    assert calls == []
+    assert reflection.status.value == "skipped"
+    assert semantic.status.value == "blocked"
+    assert semantic.reason == (
+        "required_prerequisite_not_successful:"
+        "kestrel_sovereign.memory.reflection:skipped"
+    )
+    serialized_pre_reflection = report.to_dict()["reflection"]["pre_reflection"]
+    assert serialized_pre_reflection == [{
+        "success": True,
+        "skipped": True,
+        "reason": "memory_system_unavailable",
+        "insights_generated": 0,
+        "candidates": 0,
+        "applied_count": 0,
+    }]
+
+
+@pytest.mark.asyncio
+async def test_overlapping_sleep_cycles_keep_reflection_attestations_cycle_scoped():
+    """A scheduled and manual sleep cannot consume each other's pre-stage result."""
+    from kestrel_sovereign.features.memory.reflection_hook import ReflectionSleepHook
+
+    class _InterleavingAgent(_Agent):
+        def __init__(self, hook):
+            super().__init__([hook])
+            self.agent_id = "did:test:reflection-overlap"
+            self.memory_system = _ReflectionMemory(_ReflectionDb(()))
+            self.first_consolidation_started = asyncio.Event()
+            self.release_first_consolidation = asyncio.Event()
+            self._consolidation_calls = 0
+
+        async def _consolidate_memories(self):
+            self._consolidation_calls += 1
+            if self._consolidation_calls == 1:
+                self.first_consolidation_started.set()
+                await self.release_first_consolidation.wait()
+            return {"episodes_created": 1}
+
+    agent = _InterleavingAgent(ReflectionSleepHook())
+    scheduled_sleep = asyncio.create_task(agent.sleep(skip_export=True))
+    await agent.first_consolidation_started.wait()
+
+    manual_sleep = asyncio.create_task(agent.sleep(skip_export=True))
+    manual_report = await manual_sleep
+    agent.release_first_consolidation.set()
+    scheduled_report = await scheduled_sleep
+
+    for report in (scheduled_report, manual_report):
+        reflection_post = next(
+            result
+            for result in report.hook_results
+            if result.hook_id == "kestrel_sovereign.memory.reflection"
+            and result.stage == "post_consolidation"
+        )
+        assert reflection_post.status.value == "success"
+
+
+@pytest.mark.asyncio
+async def test_unannotated_training_consumer_remains_legacy_until_it_adopts_contract():
+    """Core never identifies optional feature classes to impose phase safety.
+
+    Parametric-self's current hook is intentionally unannotated. Its migration
+    to the training phase and semantic-maintenance prerequisite belongs to its
+    own feature repository; until then it remains a loadable legacy hook with
+    the established continue-on-error semantics.
+    """
+    calls = []
+    semantic_hook = _PostHook(
+        "semantic",
+        calls,
         contract=_contract("semantic", SleepHookPhase.SEMANTIC_MAINTENANCE),
         result={"success": False},
     )
+    legacy_training_hook = _PostHook(
+        "legacy-training",
+        calls,
+        result={"success": True},
+    )
 
-    report = await _run([training_hook, ReflectionSleepHook(), semantic_hook])
+    report = await _run([legacy_training_hook, semantic_hook])
 
-    training_feature.on_post_consolidation.assert_not_awaited()
-    training = next(
+    legacy_training = next(
         result
         for result in report.hook_results
-        if result.hook_id == "kestrel_feature_parametric_self.training"
+        if result.hook_id.startswith("legacy:")
         and result.stage == "post_consolidation"
     )
-    assert training.status.value == "blocked"
-    assert training.reason == (
-        "required_prerequisite_not_successful:semantic:failed"
-    )
+    assert calls == ["semantic", "legacy-training"]
+    assert legacy_training.phase == "legacy"
+    assert legacy_training.status.value == "success"
