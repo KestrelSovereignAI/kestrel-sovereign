@@ -5,8 +5,49 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
+
+
+_MISSING_STATE = object()
+_READINESS_STATE_BASELINE = {
+    "startup_error": None,
+    "mandatory_feature_failures": [],
+    "identity_readiness_failures": [],
+    "scheduler_cold_agent_failures": [],
+    "scheduler_readiness_failures": [],
+    "host_scheduler_runner": None,
+}
+
+
+@pytest.fixture(autouse=True)
+def _isolate_shared_health_readiness_state():
+    """Give every test a healthy app-state baseline and restore its caller.
+
+    ``server.app`` is a module singleton, so a readiness latch set by any
+    earlier unit test can short-circuit an unrelated detailed-health test with
+    a 503. Tests remain free to assert latching inside their own body; this
+    fixture only establishes the pre-test baseline and restores the exact
+    missing-versus-present state afterwards.
+    """
+
+    from server import app
+
+    saved = {
+        name: getattr(app.state, "_state", {}).get(name, _MISSING_STATE)
+        for name in _READINESS_STATE_BASELINE
+    }
+    for name, value in _READINESS_STATE_BASELINE.items():
+        setattr(app.state, name, list(value) if isinstance(value, list) else value)
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is _MISSING_STATE:
+                delattr(app.state, name)
+            else:
+                setattr(app.state, name, value)
 
 
 def test_health_returns_503_when_agent_missing():
