@@ -301,6 +301,16 @@ def test_multi_agent_prefixed_detailed_health_keeps_auth_then_routes():
     original_host_scheduler_runner = getattr(
         app.state, "host_scheduler_runner", None
     )
+    original_startup_error = getattr(app.state, "startup_error", None)
+    original_mandatory_failures = getattr(
+        app.state, "mandatory_feature_failures", None
+    )
+    original_identity_failures = getattr(
+        app.state, "identity_readiness_failures", None
+    )
+    original_cold_agent_failures = getattr(
+        app.state, "scheduler_cold_agent_failures", None
+    )
 
     health_feature = MagicMock()
     health_feature.get_latest = AsyncMock(
@@ -320,6 +330,10 @@ def test_multi_agent_prefixed_detailed_health_keeps_auth_then_routes():
         # This shared application may have a deliberately latched scheduler
         # failure from a prior test. This test owns a healthy mock fleet, so it
         # must not inherit that unrelated readiness state.
+        app.state.startup_error = None
+        app.state.mandatory_feature_failures = []
+        app.state.identity_readiness_failures = []
+        app.state.scheduler_cold_agent_failures = []
         app.state.scheduler_readiness_failures = []
         app.state.host_scheduler_runner = None
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
@@ -337,6 +351,10 @@ def test_multi_agent_prefixed_detailed_health_keeps_auth_then_routes():
         app.state.agent_manager = original_manager
         app.state.scheduler_readiness_failures = original_scheduler_failures
         app.state.host_scheduler_runner = original_host_scheduler_runner
+        app.state.startup_error = original_startup_error
+        app.state.mandatory_feature_failures = original_mandatory_failures
+        app.state.identity_readiness_failures = original_identity_failures
+        app.state.scheduler_cold_agent_failures = original_cold_agent_failures
 
     assert unauthenticated.status_code == 401
     assert authenticated.status_code == 200
