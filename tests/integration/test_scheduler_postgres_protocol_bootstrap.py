@@ -24,6 +24,7 @@ from kestrel_sovereign.features.scheduler.runner import (
     SchedulerProtocolVersionIncompatible,
     SchedulerRolloutQuiescenceRequired,
     SchedulerRunner,
+    ScheduledTask,
 )
 from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
@@ -1669,6 +1670,122 @@ async def test_postgres_registration_rollback_preserves_owner_row_adopted_by_cla
         assert await db_owner.fetchone(
             "SELECT COUNT(*) FROM task_execution_log WHERE task_id = ?", (task_id,)
         ) == (1,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_postgres_registration_rollback_keeps_claim_log_adopted_after_stale_read(
+    db_backend,
+):
+    """An adoption between rollback steps cannot strand its claimed schedule.
+
+    The database wrapper forces the former interleaving deterministically:
+    after rollback has read an owned schedule ID (the pre-fix path), or just
+    before its atomic CTE (the fixed path), a second real PostgreSQL
+    connection claims and adopts that schedule.  The old read → log delete →
+    schedule delete sequence removed the claim log after adoption cleared the
+    nonce.  The CTE instead sees the adopted row as ineligible and preserves
+    both pieces of durable execution state.
+    """
+
+    if db_backend.backend_type != "postgres":
+        pytest.skip("the stale-read rollback interleaving requires PostgreSQL")
+
+    async with _top_level_scheduler_databases(db_backend, count=2) as databases:
+        db_owner, db_replica = databases
+        agent_id = f"did:scheduler:rollback-stale-read:{uuid4()}"
+        replica = SchedulerRunner(
+            db_replica,
+            None,
+            _noop_executor,
+            authorized_agent_ids=(agent_id,),
+            owner_id="rollback-stale-read-replica",
+        )
+        adopted = False
+
+        async def adopt_and_claim() -> None:
+            nonlocal adopted
+            if adopted:
+                return
+            due_rows = await replica._due_rows(datetime.now(timezone.utc))
+            assert len(due_rows) == 1
+            claimed = await replica._claim(
+                ScheduledTask.from_row(due_rows[0]), datetime.now(timezone.utc)
+            )
+            assert claimed is not None
+            adopted = True
+
+        class RollbackAdoptionInterleavingDatabase:
+            """Force adoption after a legacy read or before the atomic delete."""
+
+            def __init__(self, database):
+                self._database = database
+
+            @property
+            def backend(self):
+                return self._database.backend
+
+            def __getattr__(self, name):
+                return getattr(self._database, name)
+
+            async def fetchall(self, sql, params=()):
+                rows = await self._database.fetchall(sql, params)
+                normalized = " ".join(sql.split()).lower()
+                if (
+                    normalized.startswith("select id from scheduled_tasks")
+                    and "scheduler_registration_nonce" in normalized
+                ):
+                    await adopt_and_claim()
+                return rows
+
+            async def execute(self, sql, params=()):
+                if "with deleted_schedules as" in " ".join(sql.split()).lower():
+                    await adopt_and_claim()
+                return await self._database.execute(sql, params)
+
+        owner = SchedulerRunner(
+            RollbackAdoptionInterleavingDatabase(db_owner),
+            None,
+            _noop_executor,
+            authorized_agent_ids=(agent_id,),
+            owner_id="rollback-stale-read-owner",
+        )
+        registration = await owner.prepare_tenant_registration()
+        task_id = f"rollback-stale-read-task:{uuid4()}"
+        now = datetime.now(timezone.utc).isoformat()
+        due = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        await db_owner.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 next_run_at, created_at, scheduler_protocol_version,
+                 scheduler_registration_nonce)
+            VALUES (?, ?, 'backup_snapshot', '* * * * *', '{}', 1, ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                agent_id,
+                due,
+                now,
+                SCHEDULER_PROTOCOL_VERSION,
+                registration.registration_nonce,
+            ),
+        )
+
+        await owner.rollback_tenant_registration(registration)
+
+        assert adopted
+        assert await db_owner.fetchone(
+            """
+            SELECT scheduler_registration_nonce, enabled, scheduler_claim_fenced
+            FROM scheduled_tasks WHERE id = ?
+            """,
+            (task_id,),
+        ) == (None, 0, 1)
+        assert await db_owner.fetchone(
+            "SELECT status, attempt_count FROM task_execution_log WHERE task_id = ?",
+            (task_id,),
+        ) == ("claimed", 1)
 
 
 @pytest.mark.asyncio

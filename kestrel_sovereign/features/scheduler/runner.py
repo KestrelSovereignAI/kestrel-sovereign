@@ -3468,35 +3468,63 @@ class SchedulerRunner:
         self,
         registration: SchedulerTenantProtocolRegistration,
     ) -> None:
-        """Delete schedules/logs marked by exactly this registration nonce."""
+        """Delete logs only for schedules deleted under this registration nonce.
+
+        A pending registration's schedule can be adopted by another replica
+        between statements.  PostgreSQL must therefore derive both deletes
+        from one data-modifying CTE: a prior read of IDs can become stale
+        after the adopter clears the nonce and publishes its claim log.
+        SQLite lacks data-modifying CTEs, but the enclosing bootstrap
+        transaction holds its exclusive per-DID rollout gate.  Its
+        ``DELETE ... RETURNING`` consequently records exactly the rows this
+        rollback removed before their logs are deleted in that same
+        transaction.
+        """
 
         agent_id = registration.agent_id
-        owned_schedule_ids = tuple(
-            str(row[0])
-            for row in await self._db.fetchall(
+        backend_type = self._database_backend_type()
+        if backend_type == "postgres":
+            await self._db.execute(
                 """
-                SELECT id FROM scheduled_tasks
-                WHERE agent_id = ? AND scheduler_registration_nonce = ?
+                WITH deleted_schedules AS (
+                    DELETE FROM scheduled_tasks
+                    WHERE agent_id = ? AND scheduler_registration_nonce = ?
+                    RETURNING id
+                )
+                DELETE FROM task_execution_log AS execution_log
+                USING deleted_schedules
+                WHERE execution_log.agent_id = ?
+                  AND execution_log.task_id = deleted_schedules.id
                 """,
-                (agent_id, registration.registration_nonce),
+                (agent_id, registration.registration_nonce, agent_id),
             )
-        )
-        if owned_schedule_ids:
-            placeholders = ", ".join("?" for _ in owned_schedule_ids)
+            return
+
+        if backend_type == "sqlite":
+            deleted_schedule_ids = tuple(
+                str(row[0])
+                for row in await self._db.fetchall(
+                    """
+                    DELETE FROM scheduled_tasks
+                    WHERE agent_id = ? AND scheduler_registration_nonce = ?
+                    RETURNING id
+                    """,
+                    (agent_id, registration.registration_nonce),
+                )
+            )
+            if not deleted_schedule_ids:
+                return
+            placeholders = ", ".join("?" for _ in deleted_schedule_ids)
             await self._db.execute(
                 f"""
                 DELETE FROM task_execution_log
                 WHERE agent_id = ? AND task_id IN ({placeholders})
                 """,
-                (agent_id, *owned_schedule_ids),
+                (agent_id, *deleted_schedule_ids),
             )
-        await self._db.execute(
-            """
-            DELETE FROM scheduled_tasks
-            WHERE agent_id = ? AND scheduler_registration_nonce = ?
-            """,
-            (agent_id, registration.registration_nonce),
-        )
+            return
+
+        raise RuntimeError("scheduler registration rollback requires PostgreSQL or SQLite")
 
     async def _ensure_tables_mutations(self) -> list[tuple[str, str]]:
         """Apply bootstrap mutations while the caller owns the global gate."""
