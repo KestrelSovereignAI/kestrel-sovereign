@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -416,7 +417,10 @@ async def test_lifecycle_closure_preserves_independent_current_replacements() ->
         erased = await storage.erase_assertion(root.assertion_id)
         assert derived_child.assertion_id in erased.erased_assertion_ids
         assert independent.assertion_id not in erased.erased_assertion_ids
-        assert await storage.get_assertion(independent.assertion_id) == replacement.replacement
+        surviving = await storage.get_assertion(independent.assertion_id)
+        assert surviving is not None
+        assert surviving.revision_id == replacement.replacement.revision_id
+        assert surviving.supersedes_revision_id is None
     finally:
         await storage.close()
 
@@ -456,7 +460,10 @@ async def test_erasure_scrubs_historical_lineage_but_preserves_same_identity_dir
         assert derived_child.revision_id in erased.erased_revision_ids
         assert supersession.predecessor.revision_id in erased.erased_revision_ids
         assert supersession.replacement.revision_id not in erased.erased_revision_ids
-        assert await storage.get_assertion(derived_child.assertion_id) == supersession.replacement
+        surviving = await storage.get_assertion(derived_child.assertion_id)
+        assert surviving is not None
+        assert surviving.revision_id == supersession.replacement.revision_id
+        assert surviving.supersedes_revision_id is None
         assert await storage.get_assertion_revision(derived_child.revision_id) is None
         assert await storage.get_assertion_revision(supersession.predecessor.revision_id) is None
         assert await db.fetchall(
@@ -472,6 +479,77 @@ async def test_erasure_scrubs_historical_lineage_but_preserves_same_identity_dir
             "SELECT COUNT(*) FROM semantic_assertion_operations WHERE tenant_id = ?",
             (TENANT,),
         ) == 0
+        surviving_row = await db.fetchone(
+            "SELECT supersedes_revision_id, assertion_mapping "
+            "FROM semantic_assertion_revisions WHERE tenant_id = ? AND revision_id = ?",
+            (TENANT, supersession.replacement.revision_id),
+        )
+        assert surviving_row is not None
+        assert surviving_row[0] is None
+        assert Assertion.from_mapping(
+            json.loads(surviving_row[1])
+        ).supersedes_revision_id is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_erasure_sanitizes_historical_direct_replacement_references() -> None:
+    """A second replacement must not leave the first pointing into erasure."""
+    storage = await _storage()
+    db = storage.db
+    try:
+        root = direct("multi-replacement-root", source_id="multi-replacement-root-source")
+        await storage.put_assertion(
+            root,
+            source_occurrences=(source("multi-replacement-root-source"),),
+        )
+        derived_child = derived("multi-replacement-derived", root.revision_id)
+        await storage.put_assertion(derived_child)
+
+        first_mapping = derived_child.to_mapping()
+        first_mapping["revision_id"] = "multi-replacement-direct-first"
+        first_mapping["lineage"] = DirectLineage(
+            ("multi-replacement-direct-first-source",)
+        ).to_mapping()
+        first_mapping["epistemic_state"] = EpistemicState.REPORTED.value
+        first_direct = Assertion.from_mapping(first_mapping)
+        first_supersession = await storage.supersede_assertion(
+            derived_child.revision_id,
+            first_direct,
+            source_occurrences=(source("multi-replacement-direct-first-source"),),
+        )
+
+        second_mapping = first_direct.to_mapping()
+        second_mapping["revision_id"] = "multi-replacement-direct-second"
+        second_mapping["lineage"] = DirectLineage(
+            ("multi-replacement-direct-second-source",)
+        ).to_mapping()
+        second_direct = Assertion.from_mapping(second_mapping)
+        second_supersession = await storage.supersede_assertion(
+            first_supersession.replacement.revision_id,
+            second_direct,
+            source_occurrences=(source("multi-replacement-direct-second-source"),),
+        )
+
+        assert first_supersession.replacement.supersedes_revision_id == first_supersession.predecessor.revision_id
+        erased = await storage.erase_assertion(root.assertion_id)
+
+        assert first_supersession.predecessor.revision_id in erased.erased_revision_ids
+        assert first_supersession.replacement.revision_id not in erased.erased_revision_ids
+        first_row = await db.fetchone(
+            "SELECT supersedes_revision_id, assertion_mapping "
+            "FROM semantic_assertion_revisions WHERE tenant_id = ? AND revision_id = ?",
+            (TENANT, first_supersession.replacement.revision_id),
+        )
+        assert first_row is not None
+        assert first_row[0] is None
+        assert Assertion.from_mapping(json.loads(first_row[1])).supersedes_revision_id is None
+
+        current = await storage.get_assertion(derived_child.assertion_id)
+        assert current is not None
+        assert current.revision_id == second_supersession.replacement.revision_id
+        assert current.supersedes_revision_id == second_supersession.predecessor.revision_id
     finally:
         await storage.close()
 

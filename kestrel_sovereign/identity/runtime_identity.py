@@ -521,42 +521,79 @@ def _load_legacy_part(
         )
     did_document = json.loads(did_path.read_text())
     legacy_did = did_document.get("id")
-    if not legacy_did:
+    if not isinstance(legacy_did, str) or not legacy_did:
         raise RuntimeIdentityError(
             f"DID document at {did_path} has no 'id' field"
         )
 
+    # The legacy DID document is not merely display metadata.  The loader
+    # later attests this identity as the tenant authority, so bind all three
+    # persisted pieces here: the local key, the document's public key, and
+    # the self-certifying did:pkh address.  Otherwise a mismatched key/doc
+    # pair could cause an authority capability to be issued for the DID in a
+    # document that the local key never controlled.
+    verification_methods = (
+        did_document.get("publicKey")
+        or did_document.get("verificationMethod")
+    )
+    if not isinstance(verification_methods, list) or len(verification_methods) != 1:
+        raise RuntimeIdentityError(
+            f"DID document at {did_path} must contain exactly one legacy public key"
+        )
+    verification_method = verification_methods[0]
+    if not isinstance(verification_method, Mapping):
+        raise RuntimeIdentityError(
+            f"DID document at {did_path} has a malformed legacy public key"
+        )
+    public_key_hex = verification_method.get("publicKeyHex")
+    if not isinstance(public_key_hex, str) or not public_key_hex:
+        raise RuntimeIdentityError(
+            f"DID document at {did_path} has no legacy publicKeyHex"
+        )
+    try:
+        document_public_key = ec.EllipticCurvePublicKey.from_encoded_point(
+            ec.SECP256K1(), bytes.fromhex(public_key_hex),
+        )
+    except (TypeError, ValueError) as error:
+        raise RuntimeIdentityError(
+            f"DID document at {did_path} has an invalid legacy publicKeyHex"
+        ) from error
+
     if priv is not None:
         pub = priv.public_key()
     else:
-        # Post-destruction: derive public from the DID document.
-        # The legacy DID document carries publicKeyHex in the
-        # ``publicKey``/``verificationMethod`` array.
-        pub_hex = None
-        for vm in (
-            did_document.get("publicKey") or did_document.get("verificationMethod") or []
-        ):
-            pub_hex = vm.get("publicKeyHex")
-            if pub_hex:
-                break
-        if not pub_hex:
-            raise FileNotFoundError(
-                f"Legacy private key not on disk for {legacy_key_id} "
-                f"AND DID document at {did_path} has no publicKeyHex. "
-                f"Cannot reconstruct legacy public key."
-            )
-        try:
-            pub = ec.EllipticCurvePublicKey.from_encoded_point(
-                ec.SECP256K1(), bytes.fromhex(pub_hex),
-            )
-        except Exception as e:
-            raise RuntimeIdentityError(
-                f"Failed to decode legacy public key from DID document: {e}"
-            )
+        # Post-destruction: the verified document key is all that remains of
+        # the legacy keypair.  Hybrid signing still covers new artifacts.
+        pub = document_public_key
         logger.info(
             f"Legacy private key absent (post-destruction) for {legacy_did}; "
             f"derived legacy public from DID document. Hybrid identity "
             f"continues to provide signing capability."
+        )
+
+    public_bytes = pub.public_bytes(
+        serialization.Encoding.X962,
+        serialization.PublicFormat.UncompressedPoint,
+    )
+    document_public_bytes = document_public_key.public_bytes(
+        serialization.Encoding.X962,
+        serialization.PublicFormat.UncompressedPoint,
+    )
+    if public_bytes != document_public_bytes:
+        raise RuntimeIdentityError(
+            "legacy private key does not match the DID document public key"
+        )
+    did_prefix = "did:pkh:eip155:1:"
+    if not legacy_did.startswith(did_prefix):
+        raise RuntimeIdentityError(
+            f"legacy DID is not a did:pkh:eip155:1 identifier: {legacy_did!r}"
+        )
+    from kestrel_sovereign.inception_service import public_key_to_ethereum_address
+
+    derived_address = public_key_to_ethereum_address(pub)
+    if legacy_did[len(did_prefix):].lower() != derived_address.lower():
+        raise RuntimeIdentityError(
+            "legacy DID address does not match the verified legacy public key"
         )
 
     legacy_kp = Keypair(

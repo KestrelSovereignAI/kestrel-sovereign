@@ -315,7 +315,7 @@ async def test_erasure_scrubs_historical_derived_lineage_on_both_backends(
     db_backend,
     tmp_path,
 ):
-    """A same-identity direct replacement survives while stale lineage is erased."""
+    """Erasure removes stale links from current and historical direct revisions."""
     from kestrel_sovereign.knowledge import Assertion, DirectLineage, EpistemicState
 
     tenant, identity = await _incepted_assertion_identity(tmp_path, "historical-lineage")
@@ -348,17 +348,37 @@ async def test_erasure_scrubs_historical_derived_lineage_on_both_backends(
             source_occurrences=(_semantic_source("historical-direct-source"),),
         )
 
+        second_mapping = replacement.to_mapping()
+        second_mapping["revision_id"] = "historical-direct-second-replacement"
+        second_mapping["lineage"] = DirectLineage(
+            ("historical-direct-second-source",)
+        ).to_mapping()
+        second_replacement = Assertion.from_mapping(second_mapping)
+        second_supersession = await storage.supersede_assertion(
+            supersession.replacement.revision_id,
+            second_replacement,
+            source_occurrences=(_semantic_source("historical-direct-second-source"),),
+        )
+
         erased = await storage.erase_assertion(root.assertion_id)
 
         assert derived.assertion_id not in erased.erased_assertion_ids
         assert derived.revision_id in erased.erased_revision_ids
         assert supersession.predecessor.revision_id in erased.erased_revision_ids
-        assert await storage.get_assertion(derived.assertion_id) == supersession.replacement
-        assert await storage.db.fetchall(
-            "SELECT revision_id FROM semantic_assertion_revisions "
-            "WHERE tenant_id = ? AND assertion_id = ?",
-            (tenant, derived.assertion_id),
-        ) == [(supersession.replacement.revision_id,)]
+        surviving = await storage.get_assertion(derived.assertion_id)
+        assert surviving is not None
+        assert surviving.revision_id == second_supersession.replacement.revision_id
+        assert surviving.supersedes_revision_id == second_supersession.predecessor.revision_id
+        historical_row = await storage.db.fetchone(
+            "SELECT supersedes_revision_id, assertion_mapping "
+            "FROM semantic_assertion_revisions WHERE tenant_id = ? AND revision_id = ?",
+            (tenant, supersession.replacement.revision_id),
+        )
+        assert historical_row is not None
+        assert historical_row[0] is None
+        assert Assertion.from_mapping(
+            json.loads(historical_row[1])
+        ).supersedes_revision_id is None
         assert await storage.db.fetchval(
             "SELECT COUNT(*) FROM semantic_derivation_inputs WHERE tenant_id = ?",
             (tenant,),

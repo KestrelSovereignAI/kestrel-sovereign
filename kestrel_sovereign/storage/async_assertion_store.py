@@ -1087,6 +1087,57 @@ class AsyncAssertionStore:
             )
             return DeletionResult(deleted, tuple(invalidated), tuple(invalidated_revision_ids), generation)
 
+    async def _sanitize_surviving_references_after_erasure(
+        self,
+        erased_revision_ids: Sequence[str],
+    ) -> None:
+        """Remove predecessor links from every surviving assertion revision.
+
+        Erasure can remove an inferred historical revision while retaining a
+        later direct fact with the same deterministic assertion identity.  A
+        later supersession can make that direct fact historical too, so every
+        retained revision must lose any ``supersedes`` pointer into erased
+        history, including in its canonical mapping.  This is an erasure-only
+        redaction of otherwise immutable revisions: it leaves direct facts and
+        their revision identities intact, while ensuring no durable row can
+        reconstruct the removed lineage.
+        """
+        if not erased_revision_ids:
+            return
+        tenant_id, _ = self._require_scope()
+        erased = tuple(sorted(set(erased_revision_ids)))
+        rows = await self._database.fetchall(
+            "SELECT r.revision_id, r.assertion_mapping "
+            "FROM semantic_assertion_revisions r "
+            "WHERE r.tenant_id = ? "
+            f"AND r.supersedes_revision_id IN ({_placeholders(erased)}) "
+            f"AND r.revision_id NOT IN ({_placeholders(erased)})",
+            (tenant_id,) + erased + erased,
+        )
+        for revision_id, encoded in rows:
+            try:
+                assertion = Assertion.from_mapping(json.loads(encoded))
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                raise AssertionStoreError(
+                    "surviving assertion row contains an invalid canonical mapping"
+                ) from error
+            if (
+                assertion.revision_id != revision_id
+                or assertion.supersedes_revision_id not in erased
+            ):
+                raise AssertionStoreError(
+                    "surviving assertion row is inconsistent with its predecessor reference"
+                )
+            sanitized_mapping = assertion.to_mapping()
+            sanitized_mapping["supersedes_revision_id"] = None
+            sanitized = Assertion.from_mapping(sanitized_mapping)
+            await self._database.execute(
+                "UPDATE semantic_assertion_revisions "
+                "SET supersedes_revision_id = NULL, assertion_mapping = ? "
+                "WHERE tenant_id = ? AND revision_id = ?",
+                (_json(sanitized.to_mapping()), tenant_id, revision_id),
+            )
+
     async def erase(self, assertion_id: str, *, operation_id: str | None = None) -> ErasureResult:
         """Physically erase an assertion and its transitive derived closure.
 
@@ -1160,6 +1211,9 @@ class AsyncAssertionStore:
                             pending.add(revision_id)
             revision_tuple = tuple(sorted(revision_ids))
             assertion_tuple = tuple(sorted(assertion_ids))
+            await self._sanitize_surviving_references_after_erasure(
+                revision_tuple,
+            )
             source_rows = await self._database.fetchall(
                 "SELECT DISTINCT source_occurrence_id FROM semantic_revision_sources "
                 f"WHERE tenant_id = ? AND revision_id IN ({_placeholders(revision_tuple)})",
