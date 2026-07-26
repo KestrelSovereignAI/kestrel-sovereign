@@ -293,10 +293,20 @@ class PostgresBackend(DatabaseBackend):
             return True
         if connect_args and connect_args[0] is not None:
             return isinstance(connect_args[0], str) and bool(connect_args[0])
-        return all(
-            isinstance(connect_kwargs.get(name), str)
-            and bool(connect_kwargs[name])
-            for name in ("host", "database")
+        host = connect_kwargs.get("host")
+        database = connect_kwargs.get("database")
+        if not isinstance(database, str) or not database:
+            return False
+        if isinstance(host, str):
+            return bool(host)
+        # asyncpg accepts list/tuple hosts for ordered multi-host failover.
+        # Limit copied wrapped-pool recipes to those concrete containers so an
+        # arbitrary sequence or ambient asyncpg configuration cannot authorize
+        # a dedicated advisory connection.
+        return (
+            isinstance(host, (list, tuple))
+            and bool(host)
+            and all(isinstance(candidate, str) and bool(candidate) for candidate in host)
         )
 
     def _current_txn_conn(self):

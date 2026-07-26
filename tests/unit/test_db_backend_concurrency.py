@@ -11,6 +11,7 @@ the full suite, so it was deferred rather than shipped on the hot read path.)
 from __future__ import annotations
 
 import asyncio
+from collections import UserList
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -218,6 +219,92 @@ async def test_postgres_from_pool_derives_keyword_only_advisory_pool_recipe():
         password="pool-only-secret",
     )
     shared_pool.acquire.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_postgres_from_pool_derives_multi_host_advisory_pool_recipe():
+    """A real asyncpg multi-host pool remains an explicit advisory recipe."""
+
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    hosts = ["primary", "standby"]
+    # min_size=0 lets us exercise asyncpg's real recorded connection settings
+    # without attempting a network connection to either failover host.
+    shared_pool = await postgres_module.asyncpg.create_pool(
+        host=hosts,
+        database="kestrel",
+        min_size=0,
+        max_size=2,
+    )
+    try:
+        backend = PostgresBackend.from_pool(shared_pool)
+        assert backend._advisory_connect_kwargs["host"] == hosts
+        assert backend._advisory_recipe_available is True
+
+        advisory_pool = object()
+        with patch.object(
+            postgres_module.asyncpg,
+            "create_pool",
+            AsyncMock(return_value=advisory_pool),
+        ) as create_pool:
+            assert await backend._ensure_advisory_pool() is advisory_pool
+
+        create_pool.assert_awaited_once_with(
+            None,
+            min_size=0,
+            max_size=2,
+            host=hosts,
+            database="kestrel",
+            connect=postgres_module.asyncpg.connection.connect,
+            connection_class=postgres_module.asyncpg.Connection,
+            record_class=postgres_module.asyncpg.Record,
+        )
+    finally:
+        await shared_pool.close()
+
+
+@pytest.mark.parametrize(
+    ("host", "database", "expected"),
+    [
+        ("primary", "kestrel", True),
+        (["primary", "standby"], "kestrel", True),
+        (("primary", "standby"), "kestrel", True),
+        ([], "kestrel", False),
+        ((), "kestrel", False),
+        (["primary", ""], "kestrel", False),
+        (("primary", None), "kestrel", False),
+        (UserList(["primary"]), "kestrel", False),
+        ("primary", "", False),
+        ("primary", None, False),
+    ],
+    ids=[
+        "string-host",
+        "list-hosts",
+        "tuple-hosts",
+        "empty-list",
+        "empty-tuple",
+        "empty-list-member",
+        "non-string-tuple-member",
+        "arbitrary-sequence",
+        "empty-database",
+        "missing-database",
+    ],
+)
+def test_postgres_advisory_recipe_requires_explicit_valid_host_and_database(
+    host, database, expected
+):
+    """Default asyncpg connection settings must stay explicit and complete."""
+
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    assert (
+        PostgresBackend._has_advisory_connection_recipe(
+            (),
+            {"host": host, "database": database},
+        )
+        is expected
+    )
 
 
 @pytest.mark.asyncio
