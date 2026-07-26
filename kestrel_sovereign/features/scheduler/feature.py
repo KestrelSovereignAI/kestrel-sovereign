@@ -131,6 +131,21 @@ class SchedulerFeature(Feature):
             return result > 0
         return True
 
+    def _pending_scheduler_registration_nonce(self) -> Optional[str]:
+        """Return this dynamic onboarding's private schedule ownership marker.
+
+        The manager keeps the registration object on an agent until host
+        onboarding commits.  Scheduler rows written in that window can be
+        removed by its rollback; any row without this registration's nonce is
+        never inferred to belong to the failed registration.
+        """
+
+        registration = getattr(
+            self.agent, "_dynamic_scheduler_tenant_registration", None
+        )
+        nonce = getattr(registration, "registration_nonce", None)
+        return nonce if isinstance(nonce, str) and nonce else None
+
     @staticmethod
     def _rollout_mutation_error() -> ToolResult:
         """Return the fail-closed response for an unacknowledged rollout."""
@@ -1922,14 +1937,16 @@ class SchedulerFeature(Feature):
                          last_run_at, next_run_at, created_at, schedule_kind, run_at,
                          timezone_name, misfire_policy, misfire_grace_seconds,
                          idempotency_key, attempt_count, scheduler_protocol_version,
-                         scheduler_rollout_fenced, scheduler_claim_fenced)
-                    VALUES (?, ?, ?, ?, ?, 1, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, 0)
+                         scheduler_rollout_fenced, scheduler_claim_fenced,
+                         scheduler_registration_nonce)
+                    VALUES (?, ?, ?, ?, ?, 1, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, 0, ?)
                     """,
                     (
                         task_id, self._agent_id, task_name, cron_expression, args_json,
                         next_run_at, now_iso, schedule_kind, run_at, timezone_name,
                         misfire_policy, misfire_grace_seconds, base_idempotency,
                         SCHEDULER_PROTOCOL_VERSION,
+                        self._pending_scheduler_registration_nonce(),
                     ),
                 )
                 if not self._scheduler_mutation_wrote(inserted):
@@ -2503,10 +2520,37 @@ class SchedulerFeature(Feature):
             return False
         if rollout_version > SCHEDULER_PROTOCOL_VERSION:
             raise SchedulerProtocolVersionIncompatible()
-        return (
+        compatible = (
             rollout_version == SCHEDULER_PROTOCOL_VERSION
             and rollout_row[1] in allowed_states
         )
+        if not compatible:
+            return False
+
+        # A pending registration preserves its own ownership marker while it
+        # seeds schedules. Any other feature instance that mutates this DID
+        # adopts the control row instead, preventing the first registration's
+        # rollback from deleting state a different replica now relies on.
+        pending_nonce = self._pending_scheduler_registration_nonce()
+        await self._db.execute(
+            """
+            UPDATE scheduler_protocol_rollout
+            SET scheduler_registration_nonce = CASE
+                WHEN scheduler_registration_nonce = ?
+                THEN scheduler_registration_nonce
+                ELSE NULL
+            END
+            WHERE agent_id = ? AND protocol_version = ?
+              AND state IN ({states})
+            """.format(states=", ".join("?" for _ in sorted(allowed_states))),
+            (
+                pending_nonce,
+                self._agent_id,
+                SCHEDULER_PROTOCOL_VERSION,
+                *sorted(allowed_states),
+            ),
+        )
+        return True
 
     async def _lock_active_scheduler_rollout(self) -> bool:
         """Lock this DID's active rollout epoch for a runnable mutation.

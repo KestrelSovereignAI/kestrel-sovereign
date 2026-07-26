@@ -1209,3 +1209,86 @@ async def test_live_postgres_runtime_create_spawn_execute_remove_and_failure_rol
             )
             await server._shutdown_host_scheduler(app)
             await manager.shutdown_all()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_postgres_registration_rollback_keeps_other_replica_rows(
+    db_backend,
+):
+    """A failed runtime registration never deletes another replica's DID rows."""
+
+    if db_backend.backend_type != "postgres":
+        pytest.skip("registration rollback interleaving requires PostgreSQL")
+
+    async with _top_level_scheduler_databases(db_backend, count=2) as databases:
+        db_owner, db_replica = databases
+        agent_id = f"did:scheduler:rollback-owner:{uuid4()}"
+        owner = SchedulerRunner(
+            db_owner,
+            None,
+            _noop_executor,
+            authorized_agent_ids=(agent_id,),
+            owner_id="rollback-owner",
+        )
+        registration = await owner.prepare_tenant_registration()
+        now = datetime.now(timezone.utc).isoformat()
+        own_task_id = f"owned-{uuid4()}"
+        replica_task_id = f"replica-{uuid4()}"
+
+        # This is the schedule the pending registration seeded before its
+        # app-owned onboarding failed. The other connection models an active
+        # PostgreSQL replica inserting both a schedule and execution later.
+        await db_owner.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 created_at, scheduler_protocol_version,
+                 scheduler_registration_nonce)
+            VALUES (?, ?, 'backup_snapshot', '@daily', '{}', 1, ?, ?, ?)
+            """,
+            (
+                own_task_id,
+                agent_id,
+                now,
+                SCHEDULER_PROTOCOL_VERSION,
+                registration.registration_nonce,
+            ),
+        )
+        await db_replica.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 created_at, scheduler_protocol_version)
+            VALUES (?, ?, 'backup_snapshot', '@hourly', '{}', 1, ?, ?)
+            """,
+            (replica_task_id, agent_id, now, SCHEDULER_PROTOCOL_VERSION),
+        )
+        for db, execution_id, task_id in (
+            (db_owner, "owned-execution", own_task_id),
+            (db_replica, "replica-execution", replica_task_id),
+        ):
+            await db.execute(
+                """
+                INSERT INTO task_execution_log
+                    (id, task_id, agent_id, status, result_text, duration_ms,
+                     executed_at)
+                VALUES (?, ?, ?, 'success', NULL, 0, ?)
+                """,
+                (execution_id, task_id, agent_id, now),
+            )
+
+        await owner.rollback_tenant_registration(registration)
+
+        assert await db_owner.fetchall(
+            "SELECT id FROM scheduled_tasks WHERE agent_id = ? ORDER BY id",
+            (agent_id,),
+        ) == [(replica_task_id,)]
+        assert await db_owner.fetchall(
+            "SELECT id FROM task_execution_log WHERE agent_id = ? ORDER BY id",
+            (agent_id,),
+        ) == [("replica-execution",)]
+        assert await db_owner.fetchone(
+            "SELECT COUNT(*) FROM scheduler_protocol_rollout WHERE agent_id = ?",
+            (agent_id,),
+        ) == (1,)

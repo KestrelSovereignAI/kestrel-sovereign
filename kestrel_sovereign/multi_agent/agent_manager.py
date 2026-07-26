@@ -79,6 +79,9 @@ class _DynamicSchedulerTenantRegistration:
         self._config = config
         self._lifecycle_lock = lifecycle_lock
         self._rollback_protocol = rollback_protocol
+        self.registration_nonce = getattr(
+            rollback_protocol, "scheduler_registration_nonce", None
+        )
         self._finished = False
 
     def commit(self) -> None:

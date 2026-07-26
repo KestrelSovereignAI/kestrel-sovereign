@@ -370,12 +370,11 @@ class SchedulerExecution:
 
 @dataclass(frozen=True)
 class SchedulerTenantProtocolRegistration:
-    """Scheduler rows that predated one dynamic host-tenant registration."""
+    """Durable ownership evidence for one dynamic host-tenant registration."""
 
     agent_id: str
     rollout_preexisting: bool
-    schedule_ids: tuple[str, ...]
-    execution_ids: tuple[str, ...]
+    registration_nonce: str
 
 
 @dataclass
@@ -1423,7 +1422,7 @@ class SchedulerRunner:
         updated = await self._db.execute(
             """
             UPDATE scheduler_protocol_rollout
-            SET updated_at = updated_at
+            SET updated_at = updated_at, scheduler_registration_nonce = NULL
             WHERE agent_id = ? AND protocol_version = ? AND state = 'active'
             """,
             (agent_id, SCHEDULER_PROTOCOL_VERSION),
@@ -3262,11 +3261,13 @@ class SchedulerRunner:
     async def prepare_tenant_registration(
         self,
     ) -> SchedulerTenantProtocolRegistration:
-        """Durably activate one dynamic DID and snapshot rollback ownership.
+        """Durably activate one dynamic DID and create rollback ownership.
 
         The short-lived runner used for this operation must have one fixed DID.
         Holding the same backend-global bootstrap boundary as ordinary startup
         keeps runtime tenant activation ordered with schema/protocol changes.
+        Rows later seeded by the pending agent carry ``registration_nonce``;
+        rollback never infers ownership from a point-in-time DID snapshot.
         """
 
         if len(self._authorized_agent_ids) != 1:
@@ -3274,12 +3275,11 @@ class SchedulerRunner:
                 "dynamic scheduler tenant registration requires exactly one DID"
             )
         agent_id = self._authorized_agent_ids[0]
+        registration_nonce = secrets.token_urlsafe(24)
         blocked: list[tuple[str, str]] = []
         async with self._bootstrap_serialization_boundary():
             await self._reject_newer_scheduler_protocol_state()
             rollout_preexisting = False
-            schedule_ids: tuple[str, ...] = ()
-            execution_ids: tuple[str, ...] = ()
             if await self._scheduler_table_exists("scheduler_protocol_rollout"):
                 rollout_preexisting = (
                     await self._db.fetchone(
@@ -3291,23 +3291,40 @@ class SchedulerRunner:
                     )
                     is not None
                 )
-            if await self._scheduler_table_exists("scheduled_tasks"):
-                schedule_ids = tuple(
-                    str(row[0])
-                    for row in await self._db.fetchall(
-                        "SELECT id FROM scheduled_tasks WHERE agent_id = ?",
-                        (agent_id,),
-                    )
-                )
-            if await self._scheduler_table_exists("task_execution_log"):
-                execution_ids = tuple(
-                    str(row[0])
-                    for row in await self._db.fetchall(
-                        "SELECT id FROM task_execution_log WHERE agent_id = ?",
-                        (agent_id,),
-                    )
-                )
             blocked = await self._ensure_tables_mutations()
+            if not blocked:
+                if rollout_preexisting:
+                    # A second host registering the same DID can use the
+                    # active control row even before it has written a
+                    # schedule. Its prepare adopts that row, so the first
+                    # host's later rollback cannot delete shared state.
+                    await self._db.execute(
+                        """
+                        UPDATE scheduler_protocol_rollout
+                        SET scheduler_registration_nonce = NULL
+                        WHERE agent_id = ?
+                        """,
+                        (agent_id,),
+                    )
+                else:
+                    # The bootstrap boundary made the absent-row observation
+                    # and active-row creation atomic. Stamp only that exact
+                    # fresh active row; a quiescing legacy transition never
+                    # reaches a returned registration.
+                    await self._db.execute(
+                        """
+                        UPDATE scheduler_protocol_rollout
+                        SET scheduler_registration_nonce = ?
+                        WHERE agent_id = ? AND protocol_version = ?
+                          AND state = ? AND activation_nonce IS NULL
+                        """,
+                        (
+                            registration_nonce,
+                            agent_id,
+                            SCHEDULER_PROTOCOL_VERSION,
+                            SCHEDULER_ROLLOUT_STATE_ACTIVE,
+                        ),
+                    )
 
         if blocked:
             raise self._rollout_quiescence_error(blocked)
@@ -3315,15 +3332,20 @@ class SchedulerRunner:
         return SchedulerTenantProtocolRegistration(
             agent_id=agent_id,
             rollout_preexisting=rollout_preexisting,
-            schedule_ids=schedule_ids,
-            execution_ids=execution_ids,
+            registration_nonce=registration_nonce,
         )
 
     async def rollback_tenant_registration(
         self,
         registration: SchedulerTenantProtocolRegistration,
     ) -> None:
-        """Remove only scheduler state created by a failed dynamic onboarding."""
+        """Remove only scheduler state created by a failed dynamic onboarding.
+
+        A different host replica can begin scheduling this DID after prepare
+        releases the bootstrap boundary.  Its rows did not exist at prepare
+        time, but they are never evidence that this registration owns them.
+        Delete only rows stamped by this registration's unpredictable nonce.
+        """
 
         if (
             len(self._authorized_agent_ids) != 1
@@ -3333,49 +3355,63 @@ class SchedulerRunner:
         agent_id = registration.agent_id
         async with self._bootstrap_serialization_boundary():
             await self._reject_newer_scheduler_protocol_state()
-            await self._delete_dynamic_tenant_rows(
-                "task_execution_log",
-                agent_id,
-                registration.execution_ids,
-            )
-            await self._delete_dynamic_tenant_rows(
-                "scheduled_tasks",
-                agent_id,
-                registration.schedule_ids,
-            )
+            await self._delete_registration_owned_rows(registration)
             if not registration.rollout_preexisting:
                 await self._db.execute(
                     """
                     DELETE FROM scheduler_protocol_rollout
                     WHERE agent_id = ? AND protocol_version = ?
+                      AND state = ? AND activation_nonce IS NULL
+                      AND scheduler_registration_nonce = ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM scheduled_tasks WHERE agent_id = ?
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM task_execution_log WHERE agent_id = ?
+                      )
                     """,
-                    (agent_id, SCHEDULER_PROTOCOL_VERSION),
+                    (
+                        agent_id,
+                        SCHEDULER_PROTOCOL_VERSION,
+                        SCHEDULER_ROLLOUT_STATE_ACTIVE,
+                        registration.registration_nonce,
+                        agent_id,
+                        agent_id,
+                    ),
                 )
 
-    async def _delete_dynamic_tenant_rows(
+    async def _delete_registration_owned_rows(
         self,
-        table: str,
-        agent_id: str,
-        preexisting_ids: Collection[str],
+        registration: SchedulerTenantProtocolRegistration,
     ) -> None:
-        """Delete rows outside a registration's preexisting ownership snapshot."""
+        """Delete schedules/logs marked by exactly this registration nonce."""
 
-        if table not in {"scheduled_tasks", "task_execution_log"}:
-            raise ValueError("unsupported scheduler tenant rollback table")
-        ids = tuple(preexisting_ids)
-        if not ids:
-            await self._db.execute(
-                f"DELETE FROM {table} WHERE agent_id = ?",
-                (agent_id,),
+        agent_id = registration.agent_id
+        owned_schedule_ids = tuple(
+            str(row[0])
+            for row in await self._db.fetchall(
+                """
+                SELECT id FROM scheduled_tasks
+                WHERE agent_id = ? AND scheduler_registration_nonce = ?
+                """,
+                (agent_id, registration.registration_nonce),
             )
-            return
-        placeholders = ", ".join("?" for _ in ids)
+        )
+        if owned_schedule_ids:
+            placeholders = ", ".join("?" for _ in owned_schedule_ids)
+            await self._db.execute(
+                f"""
+                DELETE FROM task_execution_log
+                WHERE agent_id = ? AND task_id IN ({placeholders})
+                """,
+                (agent_id, *owned_schedule_ids),
+            )
         await self._db.execute(
-            f"""
-            DELETE FROM {table}
-            WHERE agent_id = ? AND id NOT IN ({placeholders})
+            """
+            DELETE FROM scheduled_tasks
+            WHERE agent_id = ? AND scheduler_registration_nonce = ?
             """,
-            (agent_id, *ids),
+            (agent_id, registration.registration_nonce),
         )
 
     async def _ensure_tables_mutations(self) -> list[tuple[str, str]]:
@@ -3414,6 +3450,10 @@ class SchedulerRunner:
                 scheduler_rollout_fenced INTEGER NOT NULL DEFAULT 0,
                 scheduler_rollout_nonce TEXT,
                 scheduler_rollout_snapshot TEXT,
+                -- Set only while dynamic host onboarding is pending.  It
+                -- lets rollback target its own seeded schedules without
+                -- claiming rows another replica created for the same DID.
+                scheduler_registration_nonce TEXT,
                 scheduler_claim_fenced INTEGER NOT NULL DEFAULT 0,
                 scheduler_rollout_fenced_at TEXT
             )
@@ -3445,9 +3485,15 @@ class SchedulerRunner:
                 protocol_version INTEGER NOT NULL,
                 state TEXT NOT NULL,
                 activation_nonce TEXT,
+                scheduler_registration_nonce TEXT,
                 updated_at TEXT NOT NULL
             )
             """
+        )
+        await self._add_column_if_missing(
+            "scheduler_protocol_rollout",
+            "scheduler_registration_nonce",
+            "TEXT",
         )
         await self._lock_active_rollout_controls_for_bootstrap()
         scheduled_columns = {
@@ -3473,6 +3519,7 @@ class SchedulerRunner:
             "scheduler_rollout_fenced": "INTEGER NOT NULL DEFAULT 0",
             "scheduler_rollout_nonce": "TEXT",
             "scheduler_rollout_snapshot": "TEXT",
+            "scheduler_registration_nonce": "TEXT",
             "scheduler_claim_fenced": "INTEGER NOT NULL DEFAULT 0",
             "scheduler_rollout_fenced_at": "TEXT",
         }
@@ -3554,7 +3601,7 @@ class SchedulerRunner:
             await self._db.execute(
                 """
                 UPDATE scheduler_protocol_rollout
-                SET updated_at = updated_at
+                SET updated_at = updated_at, scheduler_registration_nonce = NULL
                 WHERE agent_id = ? AND protocol_version = ? AND state = 'active'
                 """,
                 (agent_id, SCHEDULER_PROTOCOL_VERSION),

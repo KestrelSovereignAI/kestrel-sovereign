@@ -259,6 +259,230 @@ async def test_file_sqlite_concurrent_builtin_seeders_insert_each_default_once(
 
 
 @pytest.mark.asyncio
+async def test_dynamic_registration_rollback_preserves_other_replica_rows(
+    tmp_path,
+):
+    """Rollback deletes only schedules seeded by its pending registration.
+
+    A failed onboarding can race another host replica that already runs the
+    same DID.  Rows that appear after prepare are not proof of ownership; the
+    unpredictable registration nonce is.
+    """
+
+    database_path = tmp_path / "registration-rollback.db"
+    db_owner = await _database(database_path)
+    db_replica = await _database(database_path)
+    agent_id = "did:scheduler:registration-rollback"
+
+    def scheduler_feature_for(db, registration=None):
+        agent = SimpleNamespace(
+            did=agent_id,
+            agent_id=agent_id,
+            features={},
+            storage=SimpleNamespace(db=db),
+        )
+        if registration is not None:
+            agent._dynamic_scheduler_tenant_registration = registration
+        feature = SchedulerFeature(agent)
+        feature._db = db
+        feature._agent_id = agent_id
+        agent.features = {"SchedulerFeature": feature}
+        return feature
+
+    owner_runner = SchedulerRunner(
+        db_owner,
+        None,
+        AsyncMock(),
+        authorized_agent_ids=(agent_id,),
+        owner_id="registration-owner",
+    )
+    try:
+        registration = await owner_runner.prepare_tenant_registration()
+        owner_feature = scheduler_feature_for(
+            db_owner,
+            SimpleNamespace(registration_nonce=registration.registration_nonce),
+        )
+        own = await owner_feature.schedule_add(
+            "@daily", "backup_snapshot", idempotency_key="registration:owned"
+        )
+        assert own.status.value == "ok"
+        own_task_id = own.data["task_id"]
+
+        # A separate replica inserts its own schedule and execution AFTER the
+        # failed registration prepared the DID. Neither row carries its nonce.
+        replica_feature = scheduler_feature_for(db_replica)
+        external = await replica_feature.schedule_add(
+            "@hourly", "backup_snapshot", idempotency_key="replica:external"
+        )
+        assert external.status.value == "ok"
+        external_task_id = external.data["task_id"]
+        now = datetime.now(timezone.utc).isoformat()
+        await db_owner.execute(
+            """
+            INSERT INTO task_execution_log
+                (id, task_id, agent_id, status, result_text, duration_ms, executed_at)
+            VALUES (?, ?, ?, 'success', NULL, 0, ?)
+            """,
+            ("owned-execution", own_task_id, agent_id, now),
+        )
+        await db_replica.execute(
+            """
+            INSERT INTO task_execution_log
+                (id, task_id, agent_id, status, result_text, duration_ms, executed_at)
+            VALUES (?, ?, ?, 'success', NULL, 0, ?)
+            """,
+            ("replica-execution", external_task_id, agent_id, now),
+        )
+
+        assert await db_owner.fetchone(
+            "SELECT scheduler_registration_nonce FROM scheduled_tasks WHERE id = ?",
+            (own_task_id,),
+        ) == (registration.registration_nonce,)
+        assert await db_owner.fetchone(
+            "SELECT scheduler_registration_nonce FROM scheduled_tasks WHERE id = ?",
+            (external_task_id,),
+        ) == (None,)
+        assert await db_owner.fetchone(
+            "SELECT scheduler_registration_nonce FROM scheduler_protocol_rollout "
+            "WHERE agent_id = ?",
+            (agent_id,),
+        ) == (None,)
+
+        await owner_runner.rollback_tenant_registration(registration)
+
+        assert await db_owner.fetchall(
+            "SELECT id FROM scheduled_tasks WHERE agent_id = ? ORDER BY id",
+            (agent_id,),
+        ) == [(external_task_id,)]
+        assert await db_owner.fetchall(
+            "SELECT id FROM task_execution_log WHERE agent_id = ? ORDER BY id",
+            (agent_id,),
+        ) == [("replica-execution",)]
+        # The control row was created by this registration, but it became
+        # shared as soon as the other replica persisted work, so rollback must
+        # retain it rather than disrupting that replica's active protocol.
+        assert await db_owner.fetchone(
+            "SELECT COUNT(*) FROM scheduler_protocol_rollout WHERE agent_id = ?",
+            (agent_id,),
+        ) == (1,)
+
+        # The other replica's ordinary schedule mutation adopts the control
+        # row, so a later retry remains unable to remove it even after that
+        # replica finishes its own work.
+        await db_replica.execute(
+            "DELETE FROM task_execution_log WHERE id = ?", ("replica-execution",)
+        )
+        await db_replica.execute(
+            "DELETE FROM scheduled_tasks WHERE id = ?", (external_task_id,)
+        )
+        await owner_runner.rollback_tenant_registration(registration)
+        assert await db_owner.fetchone(
+            "SELECT COUNT(*) FROM scheduler_protocol_rollout WHERE agent_id = ?",
+            (agent_id,),
+        ) == (1,)
+    finally:
+        await db_owner.close()
+        await db_replica.close()
+
+
+@pytest.mark.asyncio
+async def test_dynamic_registration_rollback_removes_unshared_owned_state(tmp_path):
+    """An isolated failed registration still removes its own durable state."""
+
+    db = await _database(tmp_path / "unshared-registration-rollback.db")
+    agent_id = "did:scheduler:unshared-registration-rollback"
+    runner = SchedulerRunner(
+        db,
+        None,
+        AsyncMock(),
+        authorized_agent_ids=(agent_id,),
+        owner_id="unshared-registration-owner",
+    )
+    try:
+        registration = await runner.prepare_tenant_registration()
+        agent = SimpleNamespace(
+            did=agent_id,
+            agent_id=agent_id,
+            features={},
+            storage=SimpleNamespace(db=db),
+            _dynamic_scheduler_tenant_registration=SimpleNamespace(
+                registration_nonce=registration.registration_nonce
+            ),
+        )
+        feature = SchedulerFeature(agent)
+        feature._db = db
+        feature._agent_id = agent_id
+        agent.features = {"SchedulerFeature": feature}
+        added = await feature.schedule_add(
+            "@daily", "backup_snapshot", idempotency_key="registration:unshared"
+        )
+        assert added.status.value == "ok"
+
+        await runner.rollback_tenant_registration(registration)
+
+        assert await db.fetchone(
+            "SELECT COUNT(*) FROM scheduled_tasks WHERE agent_id = ?", (agent_id,)
+        ) == (0,)
+        assert await db.fetchone(
+            "SELECT COUNT(*) FROM task_execution_log WHERE agent_id = ?", (agent_id,)
+        ) == (0,)
+        assert await db.fetchone(
+            "SELECT COUNT(*) FROM scheduler_protocol_rollout WHERE agent_id = ?",
+            (agent_id,),
+        ) == (0,)
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_dynamic_registration_rollback_preserves_controller_adopted_by_prepare(
+    tmp_path,
+):
+    """A second host adopts the control row before it creates any schedule."""
+
+    database_path = tmp_path / "registration-controller-adoption.db"
+    db_owner = await _database(database_path)
+    db_replica = await _database(database_path)
+    agent_id = "did:scheduler:registration-controller-adoption"
+    owner = SchedulerRunner(
+        db_owner,
+        None,
+        AsyncMock(),
+        authorized_agent_ids=(agent_id,),
+        owner_id="controller-owner",
+    )
+    replica = SchedulerRunner(
+        db_replica,
+        None,
+        AsyncMock(),
+        authorized_agent_ids=(agent_id,),
+        owner_id="controller-replica",
+    )
+    try:
+        owner_registration = await owner.prepare_tenant_registration()
+        replica_registration = await replica.prepare_tenant_registration()
+
+        assert replica_registration.rollout_preexisting is True
+        assert await db_owner.fetchone(
+            "SELECT scheduler_registration_nonce FROM scheduler_protocol_rollout "
+            "WHERE agent_id = ?",
+            (agent_id,),
+        ) == (None,)
+
+        # There are intentionally no schedules or execution rows. The second
+        # host has nevertheless adopted this DID's active protocol, so the
+        # first host's later failed onboarding cannot remove its control row.
+        await owner.rollback_tenant_registration(owner_registration)
+        assert await db_owner.fetchone(
+            "SELECT COUNT(*) FROM scheduler_protocol_rollout WHERE agent_id = ?",
+            (agent_id,),
+        ) == (1,)
+    finally:
+        await db_owner.close()
+        await db_replica.close()
+
+
+@pytest.mark.asyncio
 async def test_expired_lease_recovers_the_same_execution_identity(tmp_path):
     """Death before dispatch is recoverable without creating a new effect key."""
     db = await _database(tmp_path / "scheduler.db")

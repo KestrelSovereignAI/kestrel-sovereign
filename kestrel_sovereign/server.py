@@ -1754,6 +1754,14 @@ async def _start_host_scheduler(app: FastAPI, manager, config) -> None:
             async def _rollback_runtime_scheduler_tenant() -> None:
                 await tenant_runner.rollback_tenant_registration(registration)
 
+            # The manager retains this callable only until app-owned
+            # onboarding commits. Carry the private nonce through that seam so
+            # SchedulerFeature can stamp schedules seeded during the pending
+            # registration and rollback can identify only those rows.
+            _rollback_runtime_scheduler_tenant.scheduler_registration_nonce = (
+                registration.registration_nonce
+            )
+
             logger.info(
                 "Prepared shared scheduler protocol for runtime agent %r",
                 name,
