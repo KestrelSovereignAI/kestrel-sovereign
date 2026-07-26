@@ -278,6 +278,19 @@ class PostgresBackend(DatabaseBackend):
     ) -> bool:
         """Whether copied asyncpg settings can create an isolated session."""
 
+        # ``Pool`` stores ``connection.connect`` as ``_connect`` when callers
+        # do not provide ``connect=``.  That default needs a DSN or complete
+        # keyword credentials and must not authorize a fresh connection from
+        # ambient configuration.  A distinct factory, however, is itself the
+        # caller-provided connection recipe (and may keep its credentials in a
+        # closure), so preserve it for the dedicated advisory pool.
+        connect_factory = connect_kwargs.get("connect")
+        if (
+            callable(connect_factory)
+            and asyncpg is not None
+            and connect_factory is not asyncpg.connection.connect
+        ):
+            return True
         if connect_args and connect_args[0] is not None:
             return isinstance(connect_args[0], str) and bool(connect_args[0])
         return all(

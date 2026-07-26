@@ -133,6 +133,48 @@ async def test_postgres_from_pool_preserves_list_connect_args_from_asyncpg_mutat
 
 
 @pytest.mark.asyncio
+async def test_postgres_from_pool_uses_custom_asyncpg_connect_factory_without_dsn():
+    """A custom asyncpg connector is a complete advisory-pool recipe."""
+
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    async def custom_connect(*_args, **_kwargs):
+        raise AssertionError("the wrapped operational pool must not be acquired")
+
+    # A real asyncpg pool records its absent DSN as ``(None,)`` and stores a
+    # custom connection factory in ``_connect``.  With min_size=0, asyncpg
+    # initializes this pool without opening a database connection.
+    shared_pool = await postgres_module.asyncpg.create_pool(
+        min_size=0,
+        max_size=2,
+        connect=custom_connect,
+    )
+    try:
+        backend = PostgresBackend.from_pool(shared_pool)
+        assert backend._advisory_recipe_available is True
+
+        advisory_pool = object()
+        with patch.object(
+            postgres_module.asyncpg,
+            "create_pool",
+            AsyncMock(return_value=advisory_pool),
+        ) as create_pool:
+            assert await backend._ensure_advisory_pool() is advisory_pool
+
+        create_pool.assert_awaited_once_with(
+            None,
+            min_size=0,
+            max_size=2,
+            connect=custom_connect,
+            connection_class=postgres_module.asyncpg.Connection,
+            record_class=postgres_module.asyncpg.Record,
+        )
+    finally:
+        await shared_pool.close()
+
+
+@pytest.mark.asyncio
 async def test_postgres_from_pool_derives_keyword_only_advisory_pool_recipe():
     """asyncpg keyword-only pool settings are a valid dedicated recipe."""
 
@@ -180,7 +222,7 @@ async def test_postgres_from_pool_derives_keyword_only_advisory_pool_recipe():
 
 @pytest.mark.asyncio
 async def test_postgres_from_pool_rejects_incomplete_advisory_pool_recipe():
-    """Factory/class metadata alone cannot authorize a new DB connection."""
+    """asyncpg's default connector needs explicit connection settings."""
 
     from kestrel_sovereign.storage.db import postgres as postgres_module
     from kestrel_sovereign.storage.db.postgres import PostgresBackend
@@ -189,7 +231,6 @@ async def test_postgres_from_pool_rejects_incomplete_advisory_pool_recipe():
     class _Pool:
         _connect_args = ()
         _connect_kwargs = {}
-        _connect = staticmethod(lambda *_args, **_kwargs: None)
         _connection_class = object
         _record_class = object
 
@@ -199,6 +240,7 @@ async def test_postgres_from_pool_rejects_incomplete_advisory_pool_recipe():
         acquire = Mock(side_effect=AssertionError("shared pool must not be acquired"))
 
     shared_pool = _Pool()
+    shared_pool._connect = postgres_module.asyncpg.connection.connect
     backend = PostgresBackend.from_pool(shared_pool)
     assert backend._advisory_recipe_available is False
     with patch.object(postgres_module.asyncpg, "create_pool", AsyncMock()) as create_pool:
