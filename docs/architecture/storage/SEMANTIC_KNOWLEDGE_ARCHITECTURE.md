@@ -383,7 +383,7 @@ term container.
 
 The snapshot-pinned `rdf12-cr-20260407` transport profile may recognize RDF
 1.2 source syntax, but it does **not** negotiate RDF 1.2 term support in this
-contract. In particular, an RDF 1.2 triple term (`<< s p o >>`) is not an
+contract. In particular, an RDF 1.2 triple term (`<<( s p o )>>`) is not an
 `AssertionTerm` in any position, and a directional language-tagged string is
 not a canonical literal because `AssertionTerm` has no direction member.
 The input adapter must never flatten either form into a string, substitute a
@@ -718,6 +718,11 @@ it cannot be used to smuggle an initial required-profile failure into the
 canonical store.
 
 ## Standards and compatibility matrix
+
+The executable, offline artifact pins and import closure for this matrix live
+in [Semantic Knowledge Registry](SEMANTIC_KNOWLEDGE_REGISTRY.md). The registry
+is schema/profile metadata only; it does not participate in constitutional,
+approval, privacy, or tool-authorization decisions.
 
 The status below is checked **as of 2026-07-26**. “Pinned” means Kestrel stores
 the dated publication URL and a SHA-256 of the exact retrieved artifact in the

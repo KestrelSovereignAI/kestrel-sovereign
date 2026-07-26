@@ -1416,12 +1416,38 @@
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],
+      "path": "docs/architecture/storage/RDF_ASSERTION_CODEC.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "active",
+      "title": "RDF Assertion Codec Boundary",
+      "type": "Architecture Reference"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
       "path": "docs/architecture/storage/SEMANTIC_KNOWLEDGE_ARCHITECTURE.md",
       "privacy": "public",
       "render": "public",
       "status": "design-of-record",
       "title": "Semantic Knowledge Architecture",
       "type": "Architecture Spec"
+    },
+    {
+      "existing_code_refs": [
+        "kestrel_sovereign/data/semantic/registry.toml"
+      ],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/storage/SEMANTIC_KNOWLEDGE_REGISTRY.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "active",
+      "title": "Semantic Knowledge Registry",
+      "type": "Architecture Reference"
     },
     {
       "existing_code_refs": [

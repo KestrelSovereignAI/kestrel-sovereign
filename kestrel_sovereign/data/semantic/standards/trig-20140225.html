@@ -1,0 +1,1513 @@
+<html lang="en" dir="ltr" typeof="bibo:Document w3p:REC" about="" property="dcterms:language" content="en" prefix="bibo: http://purl.org/ontology/bibo/ w3p: http://www.w3.org/2001/02pd/rec54#" xmlns="http://www.w3.org/1999/xhtml"><head>
+	<title>RDF 1.1 TriG</title>
+	<meta content="text/html;charset=utf-8" http-equiv="Content-Type">
+	
+    
+    
+  	
+  
+
+   <style type="text/css">
+    /* Style Turtle script blocks to be visable */
+    pre.example script {
+        display:block;
+    }
+    .separated { border-collapse:collapse; }
+    .separated thead tr th { border:1px solid black; padding: .2em; }
+    .separated tbody tr td { border:1px solid black; text-align: center; }
+    .separated tbody tr td.r { text-align: right; padding: .5em; }
+    .grammar td { font-family: monospace; vertical-align: top; }
+    .grammar-literal { color: gray;}
+    .atrisk {
+    padding:    1em;
+    margin: 1em 0em 0em;
+    border: 1px solid #f00;
+    background: #ffc;
+}
+
+/* .atrisk::before */
+.atrisktext
+{
+    /* content:    "Feature At Risk"; */
+    display:    block;
+    width:  150px;
+    margin: -1.5em 0 0.5em 0;
+    font-weight:    bold;
+    border: 1px solid #f00;
+    background: #fff;
+    padding:    3px 1em;
+}
+
+    </style>
+
+	<style>/*****************************************************************
+ * ReSpec 3 CSS
+ * Robin Berjon - http://berjon.com/
+ *****************************************************************/
+
+/* --- INLINES --- */
+em.rfc2119 { 
+    text-transform:     lowercase;
+    font-variant:       small-caps;
+    font-style:         normal;
+    color:              #900;
+}
+
+h1 acronym, h2 acronym, h3 acronym, h4 acronym, h5 acronym, h6 acronym, a acronym,
+h1 abbr, h2 abbr, h3 abbr, h4 abbr, h5 abbr, h6 abbr, a abbr {
+    border: none;
+}
+
+dfn {
+    font-weight:    bold;
+}
+
+a.internalDFN {
+    color:  inherit;
+    border-bottom:  1px solid #99c;
+    text-decoration:    none;
+}
+
+a.externalDFN {
+    color:  inherit;
+    border-bottom:  1px dotted #ccc;
+    text-decoration:    none;
+}
+
+a.bibref {
+    text-decoration:    none;
+}
+
+cite .bibref {
+    font-style: normal;
+}
+
+code {
+    color:  #ff4500;
+}
+
+/* --- TOC --- */
+.toc a, .tof a {
+    text-decoration:    none;
+}
+
+a .secno, a .figno {
+    color:  #000;
+}
+
+ul.tof, ol.tof {
+    list-style: none outside none;
+}
+
+.caption {
+    margin-top: 0.5em;
+    font-style:   italic;
+}
+
+/* --- TABLE --- */
+table.simple {
+    border-spacing: 0;
+    border-collapse:    collapse;
+    border-bottom:  3px solid #005a9c;
+}
+
+.simple th {
+    background: #005a9c;
+    color:  #fff;
+    padding:    3px 5px;
+    text-align: left;
+}
+
+.simple th[scope="row"] {
+    background: inherit;
+    color:  inherit;
+    border-top: 1px solid #ddd;
+}
+
+.simple td {
+    padding:    3px 10px;
+    border-top: 1px solid #ddd;
+}
+
+.simple tr:nth-child(even) {
+    background: #f0f6ff;
+}
+
+/* --- DL --- */
+.section dd > p:first-child {
+    margin-top: 0;
+}
+
+.section dd > p:last-child {
+    margin-bottom: 0;
+}
+
+.section dd {
+    margin-bottom:  1em;
+}
+
+.section dl.attrs dd, .section dl.eldef dd {
+    margin-bottom:  0;
+}
+
+@media print {
+    .removeOnSave {
+        display: none;
+    }
+}
+</style><style>/* --- EXAMPLES --- */
+div.example-title {
+    min-width: 7.5em;
+    color: #b9ab2d;
+}
+div.example-title span {
+    text-transform: uppercase;   
+}
+aside.example, div.example, div.illegal-example {
+    padding: 0.5em;
+    margin: 1em 0;
+    position: relative;
+    clear: both;
+}
+div.illegal-example { color: red }
+div.illegal-example p { color: black }
+aside.example, div.example {
+    padding: .5em;
+    border-left-width: .5em;
+    border-left-style: solid;
+    border-color: #e0cb52;
+    background: #fcfaee;    
+}
+
+aside.example div.example {
+    border-left-width: .1em;
+    border-color: #999;
+    background: #fff;
+}
+aside.example div.example div.example-title {
+    color: #999;
+}
+</style><style>/* --- ISSUES/NOTES --- */
+div.issue-title, div.note-title {
+    padding-right:  1em;
+    min-width: 7.5em;
+    color: #b9ab2d;
+}
+div.issue-title { color: #e05252; }
+div.note-title { color: #2b2; }
+div.issue-title span, div.note-title span {
+    text-transform: uppercase;
+}
+div.note, div.issue {
+    margin-top: 1em;
+    margin-bottom: 1em;
+}
+.note > p:first-child, .issue > p:first-child { margin-top: 0 }
+.issue, .note {
+    padding: .5em;
+    border-left-width: .5em;
+    border-left-style: solid;
+}
+div.issue, div.note {
+    padding: 1em 1.2em 0.5em;
+    margin: 1em 0;
+    position: relative;
+    clear: both;
+}
+span.note, span.issue { padding: .1em .5em .15em; }
+
+.issue {
+    border-color: #e05252;
+    background: #fbe9e9;
+}
+.note {
+    border-color: #52e052;
+    background: #e9fbe9;
+}
+
+
+</style><link rel="stylesheet" href="https://www.w3.org/StyleSheets/TR/W3C-REC">
+<!--[if lt IE 9]><script src='https://www.w3.org/2008/site/js/html5shiv.js'></script><![endif]-->
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20data-codex-favicon-badge%3D%22codex-favicon-badge%22%20width%3D%2232%22%20height%3D%2232%22%20viewBox%3D%220%200%2032%2032%22%3E%3Cimage%20href%3D%22data%3Aimage%2Fbmp%3Bbase64%2CiVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAGyElEQVR4nMRXCUxUVxQ9MwwM%2ByKKDIuIG6KgVCyiouJSqbHV1qYmrQvYxrQ0TW1TNbVNrTVtbIxpXJLGRLs30S42Ja0tdQFUXBBEUBQGcFhlB5VdGKDn%2FpkhAwahrbQ3Ofkz8%2B%2B8e9695933ngZDsJ6eHg0fk4hFRDQRSngTTmaXFqKKuE6cIU4T%2BSqVyjjY2KpBAtvwMZOII54k%2FAgNHm4StJxIJL4irjyMiOohwX342GQO7oV%2FZrVmEntJogJDJcDgEXzsIaIwSJaGYD1EKrGZJC4PSoDBF%2FJxEKaaP0rLJ%2BJJImlAAuaZf0MEYXhMT6y3zoTKKrjU%2FAgxH8Nr54gXSOK2fFGbg4vaNw1H8K7uHjS1d6Ktw6iIgTaPeIMxldgqM4FIPhIIrx561Te3o%2FJuK9QqFXw9nODuZPfAwB3GbtQ1taO9swsjnLRwc7SDqp%2Birpc14LOTucgqaYCjVoNl0%2F3wUvQk8a%2Fh65XMwiWNefaxEryxrQOHk%2FPxXWohSuubFQLjR7sibv5ErI2aACcOIjM6k1uJQ8l6ZBbVo63TCG93Rzw7MwAvRwfBy9VeCX6fxN7%2F4QoS0opgZ28Lo7ELKTkVKKlrxqdrZnnZatSxjJ1us2PHjmD6b2%2FtMHps%2Bz4DnyRkoaKuBfc5Q%2F6G8pomnOAf2zjggsneSDfUYvX%2BZKTpq1DPDDS2dtK%2FCUk3K5Ff1Yj59HFxsIVarQK5YlrgSLz3TBhcHbW4VFiLMk5sRXgARrrYezLuCelq0l79f8koweGkPHTxTzEzxmDt3PFKmr8%2BV4CznPH%2BxBtKmucFjYbW1gaTx4zA6shx8OHsE6%2BV43hmKRLSi%2BHprMW%2B9ZFw5qzXcAyL3W5oISkoWTWXyl9iC4Fopktz9IIB7RTLrCBvHN4YBb8Rpja%2FOMQHGw%2Bl4mR2GXYxO47Pz8TxLUuVAAGjnBURvThnPLYeuYyDp3LxLQlPYNm2Pj0NNszCT5eLcChJj7yKu7DT2OCVJcFKWWFq6dGixJDGtk4YahoVTcZM8%2BsNLhYw0hkH4mYjksRa6bfz50xkFNX1BheTlH%2Fw3AzEUGSdLNXuX6%2FhR9ZerIBluVBQw9S3wMHOBpN0rtCoe9UaIhr4uLOrW3v0ogEVrM84nRuWh%2FkrNbQY64Vw1vIia1hKTZzPr8YYEgvx9%2Bj1kYyEBXjiHN%2BJTwYFGj5uJMU5VhGoB0tz6noFV8YdLH%2FMHx5cOTQ7IfCRva2NWl95Dxfza2CobVIGn84aW5uOtZ7G31IZoKy2mWRqOBs3BBEW83JzwARvV0WQ5RTm1dIGRDFzQkxmLVlpaL6PmFC%2F3jIIge38oA70cuXgNShhyjKK6xE21hOBo1z6kBjj6YzJvu44m1fFAM2KqkMD%2BvrJwKNJJCW3CsXVjThNMjnld3CEGjPwu7ebI15bGszl6iDuPULgbX7Qinon%2B7gjhYOXVjchu7yBS0qHUeZ13RuARAO9XBQ%2FIZFuqEPE%2BFHwtdLNVD8PeLpokXarTlnGmQW1iq%2B91hZvLgvBqsfHKquB1iQE4qTM8m0sheXPWSZz2RmYiUL%2BeeEUHVwd%2BnZCISolScmrZDmakMWON5eptpCVwSXt0hN0JObLkkZMHI3NT4Viw4JJymowW7EQiOaHKZZfgjm4COYMZ3iTqSuleqWOonRrC%2FUfATcnk5%2BkOpcakoBmcSkkdB6ObGhdGMeMvbUsVCFFuVkPkyIE5LSzFOaNSTIznY7Su1P11cguqcfN23cVAUptpRX%2FnlXOlq3HCjYsCSLCLKxshJ5E5nCmQkL2iM9T9Ij%2F4jx%2BY5NaEuLL7DpZB5dj2kFpBnJAKCMCLW9Esa8%2FMQVGtsWdxzKReLWUbfaeErC1owvH2FzqG1rhyqX3zsrpkD1kD9d%2B4tUyrLpzCguCdShiaZLYwltaOxA%2B0Qs%2BJNrPJGayEJBDwp%2FEq9ZvuVlQMFPZdtX4kCQM7GR7mQlzfhHMVbI41FdJ6bsrw9iUVNibmINs7hXZt2oVNxXfRbB1H4idrTS0fiaHVv0D23F%2FLyNTnnSjgi22EIVMsXQzUX0sd0jRi8Wk1n%2BwNNLQZPbu3DcWTfVR2nS%2F1ItVw7Qdp1kISP13EVsxgAkROVRIeextNQ%2Fs%2FRZjV6VfF5Wupp%2FNQMPtJraRQPf%2FcSQ7C9ORTDmm964J8w9bYNLEcJmMvcX6jtBnUZpPq%2FEYHhIyZnz%2Fu4G6vxcdkvlYB1OqevDvTcaQk%2FA689h94w34r0d3NfuS2Pe3rmZWJETG4cQGIgamY9R%2FczntR0SCToTp%2FChXtxBCh77X80oih0iB6XpeMJTr%2BV8AAAD%2F%2FxFj6VwAAAAGSURBVAMAAEO%2F%2BBSFkK4AAAAASUVORK5CYII%3D%22%20width%3D%2232%22%20height%3D%2232%22%20opacity%3D%220.3%22%20%2F%3E%3Cpath%20d%3D%22M3.04536%204.45259C2.7582%203.60299%203.60299%202.7582%204.45259%203.04536L14.1828%206.33403C15.1637%206.66558%2015.0872%208.08006%2014.0715%208.39045L10.2994%209.54319C9.93919%209.65327%209.65327%209.93919%209.54319%2010.2994L8.39046%2014.0715C8.08007%2015.0872%206.66558%2015.1637%206.33404%2014.1828L3.04536%204.45259Z%22%20fill%3D%22black%22%20stroke%3D%22white%22%20stroke-width%3D%221.5%22%20stroke-linejoin%3D%22round%22%20paint-order%3D%22stroke%20fill%22%20transform%3D%22translate(-2%20-2)%20scale(2.1)%22%20%2F%3E%3C%2Fsvg%3E" data-codex-favicon-badge="true" data-codex-favicon-badge-created="true"></head>
+	<body class="h-entry" role="document" id="respecDocument"><div class="head" role="contentinfo" id="respecHeader">
+  <p>
+    
+      <a href="https://www.w3.org/"><img width="72" height="48" alt="W3C" src="https://www.w3.org/Icons/w3c_home"></a>
+    
+  </p>
+  <h1 property="dcterms:title" id="title" class="title p-name">RDF 1.1 TriG</h1>
+  
+    <h2 id="subtitle" property="bibo:subtitle">RDF Dataset Language</h2>
+  
+  <h2 content="2014-02-24T23:00:00.000Z" datatype="xsd:dateTime" property="dcterms:issued" id="w3c-recommendation-25-february-2014"><abbr title="World Wide Web Consortium">W3C</abbr> Recommendation <time datetime="2014-02-25" class="dt-published">25 February 2014</time></h2>
+  <dl>
+    
+      <dt>This version:</dt>
+      <dd><a href="https://www.w3.org/TR/2014/REC-trig-20140225/" class="u-url">http://www.w3.org/TR/2014/REC-trig-20140225/</a></dd>
+      <dt>Latest published version:</dt>
+      <dd><a href="https://www.w3.org/TR/trig/">http://www.w3.org/TR/trig/</a></dd>
+    
+    
+    
+      <dt>Test suite:</dt>
+      <dd><a href="https://www.w3.org/TR/2014/NOTE-rdf11-testcases-20140225/">http://www.w3.org/TR/2014/NOTE-rdf11-testcases-20140225/</a></dd>
+    
+    
+      <dt>Implementation report:</dt>
+      <dd><a href="https://www.w3.org/2013/TriGReports/index.html">http://www.w3.org/2013/TriGReports/index.html</a></dd>
+    
+    
+    
+    
+      <dt>Previous version:</dt>
+      <dd><a href="https://www.w3.org/TR/2014/PR-trig-20140109/" rel="dcterms:replaces">http://www.w3.org/TR/2014/PR-trig-20140109/</a></dd>
+    
+    
+    <dt>Editors:</dt>
+    <dd inlist="" rel="bibo:editor" class="p-author h-card vcard"><span typeof="foaf:Person"><span class="p-name fn" property="foaf:name">Gavin Carothers</span>, <a href="https://lexmachina.com/" class="p-org org h-org h-card" rel="foaf:workplaceHomepage">Lex Machina</a></span>
+</dd>
+<dd inlist="" rel="bibo:editor" class="p-author h-card vcard"><span typeof="foaf:Person"><span class="p-name fn" property="foaf:name">Andy Seaborne</span>, <a href="http://www.apache.org/" class="p-org org h-org h-card" rel="foaf:workplaceHomepage">Apache Software Foundation</a></span>
+</dd>
+
+    
+      <dt>Authors:</dt>
+      <dd rel="dcterms:contributor" class="p-author h-card vcard"><span typeof="foaf:Person"><span class="p-name fn" property="foaf:name">Chris Bizer</span>, <a href="http://www.fu-berlin.de/" class="p-org org h-org h-card" rel="foaf:workplaceHomepage">Freie Universität Berlin</a></span>
+</dd>
+<dd rel="dcterms:contributor" class="p-author h-card vcard"><span typeof="foaf:Person"><a href="http://richard.cyganiak.de" content="Richard Cyganiak" property="foaf:name" rel="foaf:homepage" class="u-url url p-name fn">Richard Cyganiak</a>, <a href="http://www.fu-berlin.de/" class="p-org org h-org h-card" rel="foaf:workplaceHomepage">Freie Universität Berlin</a></span>
+</dd>
+
+    
+    
+  </dl>
+  
+    <p>
+      Please check the <a href="https://www.w3.org/2014/rdf1.1-errata"><strong>errata</strong></a> for any errors or issues
+      reported since publication.
+    </p>
+  
+  
+  
+    <p>
+      The English version of this specification is the only normative version. Non-normative
+      <a href="https://www.w3.org/Consortium/Translation/">translations</a> may also be available.
+    </p>
+  
+  
+    
+      <p class="copyright">
+        <a href="https://www.w3.org/Consortium/Legal/ipr-notice#Copyright">Copyright</a> ©
+        2010-2014
+        
+        <a href="https://www.w3.org/"><abbr title="World Wide Web Consortium">W3C</abbr></a><sup>®</sup>
+        (<a href="http://www.csail.mit.edu/"><abbr title="Massachusetts Institute of Technology">MIT</abbr></a>,
+        <a href="http://www.ercim.eu/"><abbr title="European Research Consortium for Informatics and Mathematics">ERCIM</abbr></a>,
+        <a href="http://www.keio.ac.jp/">Keio</a>, <a href="http://ev.buaa.edu.cn/">Beihang</a>), 
+        
+        All Rights Reserved.
+        
+        <abbr title="World Wide Web Consortium">W3C</abbr> <a href="https://www.w3.org/Consortium/Legal/ipr-notice#Legal_Disclaimer">liability</a>,
+        <a href="https://www.w3.org/Consortium/Legal/ipr-notice#W3C_Trademarks">trademark</a> and
+        
+          <a href="https://www.w3.org/Consortium/Legal/copyright-documents">document use</a>
+        
+        rules apply.
+      </p>
+    
+  
+  <hr>
+</div>
+		<section id="abstract" class="introductory" property="dcterms:abstract" datatype="" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter"><h2 aria-level="1" role="heading" id="h2_abstract">Abstract</h2>
+			<p>This document defines a textual syntax for RDF called TriG
+			that allows an RDF dataset to be completely written in a compact and
+			natural text form, with abbreviations for common usage patterns and
+			datatypes. TriG is an extension of the
+			Turtle [<cite><a class="bibref" href="#bib-TURTLE">TURTLE</a></cite>] format.
+			</p>
+		</section><section class="introductory" id="sotd" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter"><h2 aria-level="1" role="heading" id="h2_sotd">Status of This Document</h2>
+  
+    
+      
+        <p>
+          <em>This section describes the status of this document at the time of its publication.
+          Other documents may supersede this document. A list of current <abbr title="World Wide Web Consortium">W3C</abbr> publications and the
+          latest revision of this technical report can be found in the <a href="https://www.w3.org/TR/"><abbr title="World Wide Web Consortium">W3C</abbr> technical reports index</a> at
+          http://www.w3.org/TR/.</em>
+        </p>
+        
+<p>This document is part of the RDF 1.1 document suite.
+TriG is intended the meet the charter requirement of the
+RDF Working Group to
+define an RDF syntax for multiple graphs. TriG is an extension of the
+Turtle
+syntax for RDF [<cite><a class="bibref" href="#bib-TURTLE">TURTLE</a></cite>]. The current document is based on
+the original proposal by Chris Bizer and Richard Cyganiak.</p>
+
+                
+        <p>
+          This document was published by the <a href="https://www.w3.org/2011/rdf-wg/">RDF Working Group</a> as a Recommendation.
+          
+          
+            If you wish to make comments regarding this document, please send them to 
+            <a href="mailto:public-rdf-comments@w3.org">public-rdf-comments@w3.org</a> 
+            (<a href="mailto:public-rdf-comments-request@w3.org?subject=subscribe">subscribe</a>,
+            <a href="http://lists.w3.org/Archives/Public/public-rdf-comments/">archives</a>).
+          
+          
+          
+          
+            All comments are welcome.
+          
+        </p>
+        
+          <p>
+            Please see the Working Group's  <a href="https://www.w3.org/2013/TriGReports/index.html">implementation
+            report</a>.
+          </p>
+        
+        
+        
+          <p>
+            This document has been reviewed by <abbr title="World Wide Web Consortium">W3C</abbr> Members, by software developers, and by other <abbr title="World Wide Web Consortium">W3C</abbr>
+            groups and interested parties, and is endorsed by the Director as a <abbr title="World Wide Web Consortium">W3C</abbr> Recommendation.
+            It is a stable document and may be used as reference material or cited from another
+            document. <abbr title="World Wide Web Consortium">W3C</abbr>'s role in making the Recommendation is to draw attention to the
+            specification and to promote its widespread deployment. This enhances the functionality
+            and interoperability of the Web.
+          </p>
+        
+        
+        <p>
+          
+            This document was produced by a group operating under the 
+            <a href="https://www.w3.org/Consortium/Patent-Policy-20040205/" rel="w3p:patentRules" about="" id="sotd_patent">5 February 2004 <abbr title="World Wide Web Consortium">W3C</abbr> Patent
+            Policy</a>.
+          
+          
+          
+            
+              <abbr title="World Wide Web Consortium">W3C</abbr> maintains a <a rel="disclosure" href="https://www.w3.org/2004/01/pp-impl/46168/status">public list of any patent
+              disclosures</a> 
+            
+            made in connection with the deliverables of the group; that page also includes
+            instructions for disclosing a patent. An individual who has actual knowledge of a patent
+            which the individual believes contains
+            <a href="https://www.w3.org/Consortium/Patent-Policy-20040205/#def-essential">Essential
+            Claim(s)</a> must disclose the information in accordance with
+            <a href="https://www.w3.org/Consortium/Patent-Policy-20040205/#sec-Disclosure">section
+            6 of the <abbr title="World Wide Web Consortium">W3C</abbr> Patent Policy</a>.
+          
+          
+        </p>
+        
+      
+    
+  
+</section><section id="toc"><h2 class="introductory" aria-level="1" role="heading" id="h2_toc">Table of Contents</h2><ul class="toc" role="directory" id="respecContents"><li class="tocline"><a href="#sec-intro" class="tocxref"><span class="secno">1. </span>Introduction</a></li><li class="tocline"><a href="#sec-trig-intro" class="tocxref"><span class="secno">2. </span>TriG Language</a><ul class="toc"><li class="tocline"><a href="#sec-triple-statements" class="tocxref"><span class="secno">2.1 </span>Triple Statements</a></li><li class="tocline"><a href="#sec-graph-statements" class="tocxref"><span class="secno">2.2 </span>Graph Statements</a></li><li class="tocline"><a href="#other-terms" class="tocxref"><span class="secno">2.3 </span>Other Terms</a><ul class="toc"><li class="tocline"><a href="#terms-blanks-nodes" class="tocxref"><span class="secno">2.3.1 </span>Special Considerations for Blank Nodes</a></li></ul></li></ul></li><li class="tocline"><a href="#conformance" class="tocxref"><span class="secno">3. </span>Conformance</a><ul class="toc"><li class="tocline"><a href="#sec-mime" class="tocxref"><span class="secno">3.1 </span>Media Type and Content Encoding</a></li></ul></li><li class="tocline"><a href="#sec-grammar" class="tocxref"><span class="secno">4. </span>TriG Grammar</a><ul class="toc"><li class="tocline"><a href="#sec-grammar-ws" class="tocxref"><span class="secno">4.1 </span>White Space</a></li><li class="tocline"><a href="#sec-grammar-comments" class="tocxref"><span class="secno">4.2 </span>Comments</a></li><li class="tocline"><a href="#sec-iri-references" class="tocxref"><span class="secno">4.3 </span>IRI References</a></li><li class="tocline"><a href="#sec-escapes" class="tocxref"><span class="secno">4.4 </span>Escape Sequences</a></li><li class="tocline"><a href="#grammar-ebnf" class="tocxref"><span class="secno">4.5 </span>Grammar</a></li></ul></li><li class="tocline"><a href="#sec-parsing" class="tocxref"><span class="secno">5. </span>Parsing</a><ul class="toc"><li class="tocline"><a href="#sec-parsing-state" class="tocxref"><span class="secno">5.1 </span>Parser State</a></li><li class="tocline"><a href="#sec-parsing-terms" class="tocxref"><span class="secno">5.2 </span>RDF Term Constructors</a></li><li class="tocline"><a href="#sec-parsing-triples" class="tocxref"><span class="secno">5.3 </span>RDF Triples Construction</a><ul class="toc"><li class="tocline"><a href="#output-graph" class="tocxref"><span class="secno">5.3.1 </span>Output Graph</a></li><li class="tocline"><a href="#triple-output" class="tocxref"><span class="secno">5.3.2 </span>Triple Output</a><ul class="toc"><li class="tocline"><a href="#triple-production" class="tocxref"><span class="secno">5.3.2.1 </span>Triple Production</a></li><li class="tocline"><a href="#propertyList" class="tocxref"><span class="secno">5.3.2.2 </span>Property Lists</a></li><li class="tocline"><a href="#collection" class="tocxref"><span class="secno">5.3.2.3 </span><span>Collections</span></a></li></ul></li></ul></li></ul></li><li class="tocline"><a href="#acknowledgements" class="tocxref"><span class="secno">6. </span>Acknowledgements</a></li><li class="tocline"><a href="#sec-differences" class="tocxref"><span class="secno">A. </span>Differences from Previous TriG</a></li><li class="tocline"><a href="#sec-mediaReg" class="tocxref"><span class="secno">B. </span>Media Type Registration</a></li><li class="tocline"><a href="#sec-changes" class="tocxref"><span class="secno">C. </span>Changes since the last publication of this document</a></li><li class="tocline"><a href="#references" class="tocxref"><span class="secno">D. </span>References</a><ul class="toc"><li class="tocline"><a href="#normative-references" class="tocxref"><span class="secno">D.1 </span>Normative references</a></li><li class="tocline"><a href="#informative-references" class="tocxref"><span class="secno">D.2 </span>Informative references</a></li></ul></li></ul></section>
+
+	        
+
+		<section id="sec-intro" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+			
+<!--OddPage-->
+<h2 aria-level="1" role="heading" id="h2_sec-intro"><span class="secno">1. </span>Introduction</h2>
+			<p>This document defines TriG, a concrete syntax for RDF as defined in the
+			RDF Concepts and Abstract Syntax document
+			[<cite><a class="bibref" href="#bib-RDF11-CONCEPTS">RDF11-CONCEPTS</a></cite>]. TriG is an extension of
+			Turtle [<cite><a class="bibref" href="#bib-TURTLE">TURTLE</a></cite>], extended
+			to support representing a complete RDF Dataset.
+		</p></section>
+
+		<section class="informative" id="sec-trig-intro" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+			
+<!--OddPage-->
+<h2 aria-level="1" role="heading" id="h2_sec-trig-intro"><span class="secno">2. </span>TriG Language</h2><p><em>This section is non-normative.</em></p>
+
+			<p>A TriG document allows writing down an RDF Dataset in a compact
+			textual form.  It consists of a sequence of directives, triple statements, graph statements which contain triple-generating statements and optional blank lines.
+			Comments may be given after a <code>#</code> that is not part of another
+			lexical token and continue to the end of the line.</p>
+			<p>
+
+			</p><p>Graph statements are a pair of an IRI or blank node label and a group of triple statements
+			surrounded by <code>{}</code>. The IRI or blank node label of the graph statement may be used in another graph statement which implies taking the union of the tripes generated
+			by each graph statement. An IRI or blank node label used as a graph label may also reoccur as part of any triple statement.
+			Optionally a graph statement may not not be labeled with an IRI. Such a
+			graph statement corresponds to the Default Graph of an RDF Dataset.</p>
+			<p>
+			  The construction of an RDF Dataset from a TriG document is defined in <a class="sectionRef sec-ref" href="#sec-grammar">section <span class="secno">4.</span> <span class="sec-title">TriG Grammar</span></a> and <a class="sectionRef sec-ref" href="#sec-parsing">section <span class="secno">5.</span> <span class="sec-title">Parsing</span></a>.
+			</p>
+
+			<section id="sec-triple-statements" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+				<h3 aria-level="2" role="heading" id="h3_sec-triple-statements"><span class="secno">2.1 </span>Triple Statements</h3>
+				<p>As TriG is an extention of the Turtle language it allows for any constructs from the <a href="https://www.w3.org/TR/turtle/#language-features">Turtle language</a>. <a href="https://www.w3.org/TR/turtle/#simple-triples">Simple Triples</a>, <a href="https://www.w3.org/TR/turtle/#predicate-lists">Predicate Lists</a>, and <a href="https://www.w3.org/TR/turtle/#object-lists">Object Lists</a> can all be used either inside a graph statement, or on their own as in a Turtle document. When outside a graph statement, the triples are considered to be part of the default graph of the RDF Dataset.</p>
+			</section>
+
+			<section id="sec-graph-statements" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+				<h3 aria-level="2" role="heading" id="h3_sec-graph-statements"><span class="secno">2.2 </span>Graph Statements</h3>
+
+				<p>A graph statement pairs an IRI or blank node with a RDF graph. The triple statements that make up the graph are enclosed in <code>{}</code>.</p>
+
+				<p>In a TriG document a graph IRI or blank node may be used as label for more than one graph statements. The graph label of a graph statement may be omitted. In this case the graph is considered the default graph of the RDF Dataset.</p>
+
+				<p>A RDF Dataset might contain only a single graph.</p>
+				<div class="example"><div class="example-title"><span>Example 1</span></div><pre class="example"><span># This document encodes one graph.
+@prefix ex: &lt;http://www.example.org/vocabulary#&gt; .
+@prefix : &lt;http://www.example.org/exampleDocument#&gt; .
+
+:G1 { :Monica a ex:Person ;
+              ex:name "Monica Murphy" ;
+              ex:homepage &lt;http://www.monicamurphy.org&gt; ;
+              ex:email &lt;mailto:monica@monicamurphy.org&gt; ;
+              ex:hasSkill ex:Management ,
+                          ex:Programming . }
+</span></pre></div>
+				<p>A RDF Dataset may contain a default graph, and named graphs.</p>
+				<div class="example"><div class="example-title"><span>Example 2</span></div><pre class="example"><span># This document contains a default graph and two named graphs.
+
+@prefix rdf: &lt;http://www.w3.org/1999/02/22-rdf-syntax-ns#&gt; .
+@prefix dc: &lt;http://purl.org/dc/terms/&gt; .
+@prefix foaf: &lt;http://xmlns.com/foaf/0.1/&gt; .
+
+# default graph
+    {
+      &lt;http://example.org/bob&gt; dc:publisher "Bob" .
+      &lt;http://example.org/alice&gt; dc:publisher "Alice" .
+    }
+
+&lt;http://example.org/bob&gt;
+    {
+       _:a foaf:name "Bob" .
+       _:a foaf:mbox &lt;mailto:bob@oldcorp.example.org&gt; .
+       _:a foaf:knows _:b .
+    }
+
+&lt;http://example.org/alice&gt;
+    {
+       _:b foaf:name "Alice" .
+       _:b foaf:mbox &lt;mailto:alice@work.example.org&gt; .
+    }				</span></pre></div>
+
+                <p>TriG provides various alternative ways to write graphs
+and triples, giving the data writer choices for clarity:
+                </p>
+
+                <div class="example"><div class="example-title"><span>Example 3</span></div><pre class="example"><span># This document contains a same data as the
+previous example.
+
+@prefix rdf: &lt;http://www.w3.org/1999/02/22-rdf-syntax-ns#&gt; .
+@prefix dc: &lt;http://purl.org/dc/terms/&gt; .
+@prefix foaf: &lt;http://xmlns.com/foaf/0.1/&gt; .
+
+# default graph - no {} used.
+&lt;http://example.org/bob&gt; dc:publisher "Bob" .
+&lt;http://example.org/alice&gt; dc:publisher "Alice" .
+
+# GRAPH keyword to highlight a named graph
+# Abbreviation of triples using ;
+GRAPH &lt;http://example.org/bob&gt;
+{
+   [] foaf:name "Bob" ;
+      foaf:mbox &lt;mailto:bob@oldcorp.example.org&gt; ;
+      foaf:knows _:b .
+}
+
+GRAPH &lt;http://example.org/alice&gt;
+{
+    _:b foaf:name "Alice" ;
+        foaf:mbox &lt;mailto:alice@work.example.org&gt;
+}</span></pre></div>
+
+
+			</section>
+
+			<section id="other-terms" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+				<h3 aria-level="2" role="heading" id="h3_other-terms"><span class="secno">2.3 </span>Other Terms</h3>
+				<p>All other terms and directives come from Turtle.</p>
+				<section id="terms-blanks-nodes" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+					<h4 aria-level="3" role="heading" id="h4_terms-blanks-nodes"><span class="secno">2.3.1 </span>Special Considerations for Blank Nodes</h4>
+					<p>BlankNodes sharing the same label in differently labeled graph statements are considered to be the same BlankNode.</p>
+				</section>
+			</section>
+		</section>
+
+
+
+        <section id="conformance" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+<!--OddPage-->
+<h2 aria-level="1" role="heading" id="h2_conformance"><span class="secno">3. </span>Conformance</h2>
+<p>
+  As well as sections marked as non-normative, all authoring guidelines, diagrams, examples,
+  and notes in this specification are non-normative. Everything else in this specification is
+  normative.
+</p>
+<p>
+  The key words <em class="rfc2119" title="MUST">MUST</em>, <em class="rfc2119" title="MUST NOT">MUST NOT</em>, <em class="rfc2119" title="REQUIRED">REQUIRED</em>, <em class="rfc2119" title="SHOULD">SHOULD</em>, <em class="rfc2119" title="SHOULD NOT">SHOULD NOT</em>, <em class="rfc2119" title="RECOMMENDED">RECOMMENDED</em>, <em class="rfc2119" title="MAY">MAY</em>,
+  and <em class="rfc2119" title="OPTIONAL">OPTIONAL</em> in this specification are to be interpreted as described in [<cite><a class="bibref" href="#bib-RFC2119">RFC2119</a></cite>].
+</p>
+
+        	<p>This specification defines conformance criteria for:</p>
+        			<ul>
+        				<li>TriG documents
+    					</li><li>TriG parsers
+					</li></ul>
+			<p>A conforming <strong>TriG document</strong> is a Unicode string that conforms to the grammar and additional constraints defined in <a class="sectionRef sec-ref" href="#sec-grammar">section <span class="secno">4.</span> <span class="sec-title">TriG Grammar</span></a>, starting with the <a href="#grammar-production-trigDoc"><code>trigDoc</code> production</a>. A TriG document serializes an RDF dataset.</p>
+
+			<p>A conforming <strong>TriG parser</strong> is a system capable of reading TriG documents on behalf of an application. It makes the serialized RDF dataset, as defined in <a class="sectionRef sec-ref" href="#sec-parsing">section <span class="secno">5.</span> <span class="sec-title">Parsing</span></a>, available to the application, usually through some form of API.</p>
+
+			<p>The IRI that identifies the TriG language is: <code>http://www.w3.org/ns/formats/TriG</code></p>
+
+			<div class="note"><div class="note-title" aria-level="2" role="heading" id="h_note_1"><span>Note</span></div><p class="">This specification does not define how TriG parsers handle non-conforming input documents.</p></div>
+	        <section id="sec-mime" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+	          <h3 aria-level="2" role="heading" id="h3_sec-mime"><span class="secno">3.1 </span>Media Type and Content Encoding</h3>
+
+	          <p>The media type of TriG is <code>application/trig</code>.
+	          The content encoding of TriG content is always UTF-8.
+	          </p>
+	        </section>
+        </section>
+
+		<section id="sec-grammar" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+		  
+<!--OddPage-->
+<h2 aria-level="1" role="heading" id="h2_sec-grammar"><span class="secno">4. </span>TriG Grammar</h2>
+
+
+          <p>A TriG document is a Unicode [<cite><a class="bibref" href="#bib-UNICODE">UNICODE</a></cite>] character string
+            encoded in UTF-8.
+            Unicode characters only in the range U+0000 to U+10FFFF inclusive are
+            allowed.
+          </p>
+          <section id="sec-grammar-ws" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+            <h3 aria-level="2" role="heading" id="h3_sec-grammar-ws"><span class="secno">4.1 </span>White Space</h3>
+			<p>White space (production <a href="#grammar-production-WS">WS</a>) is used to separate two terminals which would otherwise be (mis-)recognized as one terminal. Rule names below in capitals indicate where white space is significant; these form a possible choice of terminals for constructing a TriG parser.</p>
+
+			<p>White space is significant in the production <a href="#grammar-production-String">String</a>.</p>
+          </section>
+          <section id="sec-grammar-comments" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+            <h3 aria-level="2" role="heading" id="h3_sec-grammar-comments"><span class="secno">4.2 </span>Comments</h3>
+
+            <p>Comments in TriG take the form of '#', outside an
+
+            <a href="#grammar-production-iri">IRI</a> or a <a href="#grammar-production-String">string</a>,
+            and continue to the end of line (marked by characters U+000D or U+000A)
+            or end of file if there is no end of line after the comment
+            marker.  Comments are treated as white space.
+            </p>
+          </section>
+          <section id="sec-iri-references" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+          	<h3 aria-level="2" role="heading" id="h3_sec-iri-references"><span class="secno">4.3 </span>IRI References</h3>
+  					<p>
+					  Relative IRIs are resolved with base IRIs as per <em>Uniform Resource Identifier (URI): Generic Syntax</em> [<cite><a class="bibref" href="#bib-RFC3986">RFC3986</a></cite>] using only the basic algorithm in section 5.2.
+					  Neither Syntax-Based Normalization nor Scheme-Based Normalization (described in sections 6.2.2 and 6.2.3 of RFC3986) are performed.
+					  Characters additionally allowed in IRI references are treated in the same way that unreserved characters are treated in URI references, per section 6.5 of <em>Internationalized Resource Identifiers (IRIs)</em> [<cite><a class="bibref" href="#bib-RFC3987">RFC3987</a></cite>].
+					</p>
+					<p>
+					  The <code>@base</code> directive defines the Base IRI used to resolve relative IRIs per RFC3986 section 5.1.1, "Base URI Embedded in Content".
+					  Section 5.1.2, "Base URI from the Encapsulating Entity" defines how the In-Scope Base IRI may come from an encapsulating document, such as a SOAP envelope with an xml:base directive or a mime multipart document with a Content-Location header.
+					  The "Retrieval URI" identified in 5.1.3, Base "URI from the Retrieval URI", is the URL from which a particular TriG document was retrieved.
+					  If none of the above specifies the Base URI, the default Base URI (section 5.1.4, "Default Base URI") is used.
+					  Each <code>@base</code> directive sets a new In-Scope Base URI, relative to the previous one.
+					</p>
+			</section>
+          <section id="sec-escapes" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+            <h3 aria-level="2" role="heading" id="h3_sec-escapes"><span class="secno">4.4 </span>Escape Sequences</h3>
+
+	    <p>
+	      There are three forms of escapes used in TriG documents:
+	    </p>
+
+	    <ul>
+	      <li>
+		<p>
+		  <em id="numeric">numeric escape sequences</em> represent Unicode code points:
+		</p>
+
+		<table>
+		  <thead>
+		    <tr>
+		      <th>Escape sequence</th>
+
+		      <th>Unicode code point</th>
+
+		    </tr>
+		  </thead>
+		  <tbody>
+
+		    <tr>
+		      <td>'\u' <a href="#rHEX">hex</a> <a href="#rHEX">hex</a> <a href="#rHEX">hex</a> <a href="#rHEX">hex</a></td>
+		      <td>A Unicode character in the range U+0000 to U+FFFF inclusive
+		      corresponding to the value encoded by the four hexadecimal digits interpreted from most significant to least significant digit.</td>
+		    </tr>
+
+
+		    <tr>
+		      <td>'\U' <a href="#rHEX">hex</a> <a href="#rHEX">hex</a> <a href="#rHEX">hex</a> <a href="#rHEX">hex</a> <a href="#rHEX">hex</a> <a href="#rHEX">hex</a> <a href="#rHEX">hex</a> <a href="#rHEX">hex</a></td>
+
+		      <td>A Unicode character in the range U+0000 to U+10FFFF inclusive
+		      corresponding to the value encoded by the eight hexadecimal digits interpreted from most significant to least significant digit.</td>
+		    </tr>
+
+		  </tbody>
+		</table>
+
+		<p>where <a href="#rHEX">HEX</a> is a hexadecimal character</p>
+		<blockquote>
+		  <p><span style="font-family: monospace; font-size: 85%;"><span id="rHEX">HEX</span>
+		  ::= [0-9] | [A-F] | [a-f]</span></p>
+
+		</blockquote>
+	      </li>
+
+	      <li>
+		<p>
+		  <em id="string">string escape sequences</em> represent the characters traditionally escaped in string literals:
+		</p>
+
+		<table>
+		  <thead>
+		    <tr>
+		      <th>Escape sequence</th>
+
+		      <th>Unicode code point</th>
+
+		    </tr>
+		  </thead>
+		  <tbody>
+
+		    <tr>
+		      <td>'\t'</td>
+		      <td>U+0009</td>
+		    </tr>
+
+		    <tr>
+		      <td>'\b'</td>
+		      <td>U+0008</td>
+		    </tr>
+
+		    <tr>
+
+		      <td>'\n'</td>
+		      <td>U+000A</td>
+		    </tr>
+
+		    <tr>
+		      <td>'\r'</td>
+		      <td>U+000D</td>
+		    </tr>
+
+		    <tr>
+		      <td>'\f'</td>
+		      <td>U+000C</td>
+		    </tr>
+
+		    <tr>
+		      <td>'\"'</td>
+<!-- " -->
+
+		      <td>U+0022</td>
+		    </tr>
+
+		    <tr>
+		      <td>'\''</td> 
+<!-- ' -->
+
+		      <td>U+0027</td>
+		    </tr>
+
+		    <tr>
+		      <td>'\\'</td>
+
+		      <td>U+005C</td>
+		    </tr>
+
+		  </tbody>
+		</table>
+	      </li>
+
+	      <li>
+		<p>
+		  <em id="reserved">reserved character escape sequences</em> consist of a '\' followed by one of <code>~.-!$&amp;'()*+,;=/?#@%_</code> and represent the character to the right of the '\'.
+		</p>
+	      </li>
+
+	    </ul>
+
+	    <table class="separated" id="term2escape">
+		  <caption>Context where each kind of escape sequence can be used</caption>
+	      <thead>
+		<tr>
+		  <th></th>
+		  <th><a href="#numeric">numeric<br>escapes</a></th>
+		  <th><a href="#string">string<br>escapes</a></th>
+		  <th><a href="#reserved">reserved character<br>escapes</a></th>
+		</tr>
+	      </thead>
+	      <tbody>
+		<tr>
+		  <td class="r"><span style="font-weight:bold;">IRI</span>s, used as <a href="#grammar-production-IRIREF">RDF terms</a> or as in <a href="#grammar-production-prefixID">@prefix</a> or <a href="#grammar-production-base">@base</a> declarations</td>
+		  <td style="background-color: green; border:1px solid black;">yes</td>
+		  <td>no</td>
+		  <td>no</td>
+		</tr>
+		<tr>
+		  <td class="r"><a href="#grammar-production-PN_LOCAL"><span style="font-weight:bold;">local name</span>s</a></td>
+		  <td>no</td>
+		  <td>no</td>
+		  <td style="background-color: green; border:1px solid black;">yes</td>
+		</tr>
+		<tr>
+		  <td class="r"><span style="font-weight:bold;"><a href="#grammar-production-String">String</a></span>s</td>
+		  <td style="background-color: green; border:1px solid black;">yes</td>
+		  <td style="background-color: green; border:1px solid black;">yes</td>
+		  <td>no</td>
+		</tr>
+	      </tbody>
+	    </table>
+	    <div class="note"><div class="note-title" aria-level="3" role="heading" id="h_note_2"><span>Note</span></div><p class="">%-encoded sequences are in the <a href="#grammar-production-IRIREF">character range for IRIs</a> and are <a href="#grammar-production-PERCENT">explicitly allowed</a> in local names. These appear as a '%' followed by two hex characters and represent that same sequence of three characters. These sequences are <em>not</em> decoded during processing. A term written as <code>&lt;http://a.example/%66oo-bar&gt;</code> in TriG designates the IRI <code>http://a.example/%66oo-bar</code> and not IRI <code>http://a.example/foo-bar</code>. A term written as <code>ex:%66oo-bar</code> with a prefix <code>@prefix ex: &lt;http://a.example/&gt;</code> also designates the IRI <code>http://a.example/%66oo-bar</code>.</p></div>
+
+          </section>
+		  <section id="grammar-ebnf" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+			<h3 aria-level="2" role="heading" id="h3_grammar-ebnf"><span class="secno">4.5 </span>Grammar</h3>
+
+            <p>The <abbr title="Extended Backus–Naur Form">EBNF</abbr> used here is defined in XML 1.0
+              [<cite><a class="bibref" href="#bib-EBNF-NOTATION">EBNF-NOTATION</a></cite>]. Production labels consisting of a number and a final 'g' are unique to TriG. All Production labels consisting of only a number reference the production with that number in the
+Turtle grammar
+[<cite><a class="bibref" href="#bib-TURTLE">TURTLE</a></cite>]. Production labels consisting of a number and a final 's',
+              e.g. [<a href="https://www.w3.org/TR/sparql11-query/#rRDFLiteral"><span class="prodNo">60s</span></a>], reference the production
+              with that number in the document <em>SPARQL 1.1 Query Language grammar</em> [<cite><a class="bibref" href="#bib-SPARQL11-QUERY">SPARQL11-QUERY</a></cite>].
+            </p>
+
+
+	        <div>
+	          <p>Notes:</p>
+	          <ol>
+                <li>A blank node label represents the same blank node
+                  throughout the TriG document.
+                </li>
+	            <li>
+		          Keywords in single quotes (
+                  '<code class="grammar-literal">@base</code>',
+                  '<code class="grammar-literal">@prefix</code>',
+                  '<code class="grammar-literal">a</code>',
+                  '<code class="grammar-literal">true</code>',
+                  '<code class="grammar-literal">false</code>') are
+                  case-sensitive.
+		          Keywords in double quotes (
+                  "<code class="grammar-literal">BASE</code>",
+                  "<code class="grammar-literal">PREFIX</code>"
+                "<code class="grammar-literal">GRAPH</code>"
+                  ) are case-insensitive.
+	            </li>
+	            <li>
+		          Escape sequences markers <code>\u</code>, <code>\U</code>
+                  and those in <code><a href="#grammar-production-ECHAR">ECHAR</a></code>
+                  are case sensitive.
+	            </li>
+	            <li>
+		          When tokenizing the input and choosing grammar rules, the longest match is chosen.
+	            </li>
+	            <li>
+		          The TriG grammar is LL(1) and LALR(1) when the rules with uppercased names are used as terminals.
+	            </li>
+	            <li>
+		          The entry point into the grammar is <code>trigDoc</code>.
+	            </li>
+	            <li>
+		          In signed numbers, no white space is allowed between the sign and the number.
+	            </li>
+	            <li>
+		          The
+		          <span style="font-size: smaller;">
+                    <span>[162s]</span>
+                    <span><code>ANON</code></span>
+                    <span>::=</span>
+                    <span>'<code class="grammar-literal">[</code>' <a href="#grammar-production-WS">WS</a><code class="grammar-star">*</code> '<code class="grammar-literal">]</code>'</span>
+		          </span>
+		          token allows any amount of white space and comments between <code class="grammar-literal">[]</code>s.
+		          The single space version is used in the grammar for clarity.
+	            </li>
+	            <li>
+		          The strings '<a href="#grammar-production-prefixID"><code class="grammar-literal">@prefix</code></a>' and '<a href="#grammar-production-base"><code class="grammar-literal">@base</code></a>' match the pattern for <a href="#grammar-production-LANGTAG">LANGTAG</a>, though neither "<code class="grammar-literal">prefix</code>" nor "<code class="grammar-literal">base</code>" are <a href="http://www.iana.org/assignments/language-subtag-registry">registered language
+subtags</a>.
+		          This specification does not define whether a quoted literal followed by either of these tokens (e.g. <code>"Z"@base</code>) is in the TriG language.
+	            </li>
+	          </ol>
+	        </div>
+
+            <div><table class="grammar">
+    <tbody class="grammar-productions">
+            <tr data-grammar-expression="('*', ('|', [('id', 'directive'), ('id', 'block')]))" data-grammar-original="[1g] trigDoc   ::= ( directive | block )*" id="grammar-production-trigDoc">
+    <td>[1g]</td>
+    <td><code>trigDoc</code></td>
+    <td>::=</td>
+    <td>(<a href="#grammar-production-directive">directive</a> <code>| </code> <a href="#grammar-production-block">block</a>)<code class="grammar-star">*</code></td>
+</tr>
+            <tr data-grammar-expression="('|', [('id', 'triplesOrGraph'), ('id', 'wrappedGraph'), ('id', 'triples2'), (',', [(&quot;'&quot;, 'GRAPH'), ('id', 'labelOrSubject'), ('id', 'wrappedGraph')])])" data-grammar-original="[2g] block   ::=   triplesOrGraph| wrappedGraph| triples2| &quot;GRAPH&quot; labelOrSubject wrappedGraph" id="grammar-production-block">
+    <td>[2g]</td>
+    <td><code>block</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-triplesOrGraph">triplesOrGraph</a> <code>| </code> <a href="#grammar-production-wrappedGraph">wrappedGraph</a> <code>| </code> <a href="#grammar-production-triples2">triples2</a> <code>| </code> "<code class="grammar-literal">GRAPH</code>" <a href="#grammar-production-labelOrSubject">labelOrSubject</a> <a href="#grammar-production-wrappedGraph">wrappedGraph</a></td>
+</tr>
+            <tr data-grammar-expression="(',', [('id', 'labelOrSubject'), ('|', [('id', 'wrappedGraph'), (',', [('id', 'predicateObjectList'), (&quot;'&quot;, '.')])])])" data-grammar-original="[3g] triplesOrGraph   ::=labelOrSubject ( wrappedGraph | predicateObjectList '.' )" id="grammar-production-triplesOrGraph">
+    <td>[3g]</td>
+    <td><code>triplesOrGraph</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-labelOrSubject">labelOrSubject</a> (<a href="#grammar-production-wrappedGraph">wrappedGraph</a> <code>| </code> <a href="#grammar-production-predicateObjectList">predicateObjectList</a> '<code class="grammar-literal">.</code>')</td>
+</tr>
+<tr data-grammar-expression="" data-grammar-original="[4g] triples2   ::= blankNodePropertyList predicateObjectList? '.' | collection predicateObjectList '.' " id="grammar-production-triples2">
+    <td>[4g]</td>
+    <td><code>triples2</code></td>
+    <td>::=</td>
+
+    <td><a href="#grammar-production-blankNodePropertyList">blankNodePropertyList</a> 
+        <a href="#grammar-production-predicateObjectList">predicateObjectList</a>?
+        '<code class="grammar-literal">.</code>'
+      <code>| </code> 
+      <a href="#grammar-production-collection">collection</a>
+      <a href="#grammar-production-predicateObjectList">predicateObjectList</a> 
+      '<code class="grammar-literal">.</code>'
+    </td>
+</tr>
+            <tr data-grammar-expression="(',', [(&quot;'&quot;, '{'), ('?', ('id', 'triplesBlock')), (&quot;'&quot;, '}')])" data-grammar-original="[5g] wrappedGraph   ::='{' triplesBlock? '}'" id="grammar-production-wrappedGraph">
+    <td>[5g]</td>
+    <td><code>wrappedGraph</code></td>
+    <td>::=</td>
+    <td>'<code class="grammar-literal">{</code>' <a href="#grammar-production-triplesBlock">triplesBlock</a>? '<code class="grammar-literal">}</code>'</td>
+</tr>
+            <tr data-grammar-expression="(',', [('id', 'triples'), ('?', (',', [(&quot;'&quot;, '.'), ('?', ('id', 'triplesBlock'))]))])" data-grammar-original="[6g] triplesBlock   ::=   triples ( '.' triplesBlock? )?" id="grammar-production-triplesBlock">
+    <td>[6g]</td>
+    <td><code>triplesBlock</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-triples">triples</a> ('<code class="grammar-literal">.</code>' <a href="#grammar-production-triplesBlock">triplesBlock</a>?)?</td>
+</tr>
+            <tr data-grammar-expression="('|', [('id', 'iri'), ('id', 'BlankNode')])" data-grammar-original="[7g] labelOrSubject ::=( iri | BlankNode )" id="grammar-production-labelOrSubject">
+    <td>[7g]</td>
+    <td><code>labelOrSubject</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-iri">iri</a> <code>| </code> <a href="#grammar-production-BlankNode">BlankNode</a></td>
+</tr>
+            <tr data-grammar-expression="('|', [('id', 'prefixID'), ('id', 'base'), ('id', 'sparqlPrefix'), ('id', 'sparqlBase')])" data-grammar-original="[3] directive ::= prefixID| base | sparqlPrefix | sparqlBase" id="grammar-production-directive">
+    <td>[3]</td>
+    <td><code>directive</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-prefixID">prefixID</a> <code>| </code> <a href="#grammar-production-base">base</a> <code>| </code> <a href="#grammar-production-sparqlPrefix">sparqlPrefix</a> <code>| </code> <a href="#grammar-production-sparqlBase">sparqlBase</a></td>
+</tr>
+            <tr data-grammar-expression="(',', [(&quot;'&quot;, '@prefix'), ('id', 'PNAME_NS'), ('id', 'IRIREF'), (&quot;'&quot;, '.')])" data-grammar-original="[4] prefixID ::= '@prefix' PNAME_NS IRIREF &quot;.&quot;" id="grammar-production-prefixID">
+    <td>[4]</td>
+    <td><code>prefixID</code></td>
+    <td>::=</td>
+    <td>'<code class="grammar-literal">@prefix</code>' <a href="#grammar-production-PNAME_NS">PNAME_NS</a> <a href="#grammar-production-IRIREF">IRIREF</a> '<code class="grammar-literal">.</code>'</td>
+</tr>
+            <tr data-grammar-expression="(',', [(&quot;'&quot;, '@base'), ('id', 'IRIREF'), (&quot;'&quot;, '.')])" data-grammar-original="[5] base ::= '@base' IRIREF &quot;.&quot;" id="grammar-production-base">
+    <td>[5]</td>
+    <td><code>base</code></td>
+    <td>::=</td>
+    <td>'<code class="grammar-literal">@base</code>' <a href="#grammar-production-IRIREF">IRIREF</a> '<code class="grammar-literal">.</code>'</td>
+</tr>
+            <tr data-grammar-expression="(',', [(&quot;'&quot;, 'PREFIX'), ('id', 'PNAME_NS'), ('id', 'IRIREF')])" data-grammar-original="[5s] sparqlPrefix ::= &amp;quotPREFIX&quot; PNAME_NS IRIREF" id="grammar-production-sparqlPrefix">
+    <td>[5s]</td>
+    <td><code>sparqlPrefix</code></td>
+    <td>::=</td>
+    <td>"<code class="grammar-literal">PREFIX</code>" <a href="#grammar-production-PNAME_NS">PNAME_NS</a> <a href="#grammar-production-IRIREF">IRIREF</a></td>
+</tr>
+            <tr data-grammar-expression="(',', [(&quot;'&quot;, 'BASE'), ('id', 'IRIREF')])" data-grammar-original="[6s] sparqlBase ::= &quot;BASE&quot; IRIREF" id="grammar-production-sparqlBase">
+    <td>[6s]</td>
+    <td><code>sparqlBase</code></td>
+    <td>::=</td>
+    <td>"<code class="grammar-literal">BASE</code>" <a href="#grammar-production-IRIREF">IRIREF</a></td>
+</tr>
+            <tr data-grammar-expression="('|', [(',', [('id', 'subject'), ('id', 'predicateObjectList')]), (',', [('id', 'blankNodePropertyList'), ('?', ('id', 'predicateObjectList'))])])" data-grammar-original="[6] triples ::= subject predicateObjectList |blankNodePropertyList predicateObjectList?" id="grammar-production-triples">
+    <td>[6]</td>
+    <td><code>triples</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-subject">subject</a> <a href="#grammar-production-predicateObjectList">predicateObjectList</a> <code>| </code> <a href="#grammar-production-blankNodePropertyList">blankNodePropertyList</a> <a href="#grammar-production-predicateObjectList">predicateObjectList</a>?</td>
+</tr>
+            <tr data-grammar-expression="(',', [('id', 'verb'), ('id', 'objectList'), ('*', (',', [(&quot;'&quot;, ';'), ('?', (',', [('id', 'verb'), ('id', 'objectList')]))]))])" data-grammar-original="[7] predicateObjectList ::= verb objectList (';' (verb objectList)? )*" id="grammar-production-predicateObjectList">
+    <td>[7]</td>
+    <td><code>predicateObjectList</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-verb">verb</a> <a href="#grammar-production-objectList">objectList</a> ('<code class="grammar-literal">;</code>' (<a href="#grammar-production-verb">verb</a> <a href="#grammar-production-objectList">objectList</a>)?)<code class="grammar-star">*</code></td>
+</tr>
+            <tr data-grammar-expression="(',', [('id', 'object'), ('*', (',', [(&quot;'&quot;, ','), ('id', 'object')]))])" data-grammar-original="[8] objectList ::= object ( &quot;,&quot; object )*" id="grammar-production-objectList">
+    <td>[8]</td>
+    <td><code>objectList</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-object">object</a> ('<code class="grammar-literal">,</code>' <a href="#grammar-production-object">object</a>)<code class="grammar-star">*</code></td>
+</tr>
+            <tr data-grammar-expression="('|', [('id', 'predicate'), (&quot;'&quot;, 'a')])" data-grammar-original="[9] verb ::= predicate| &quot;a&quot;" id="grammar-production-verb">
+    <td>[9]</td>
+    <td><code>verb</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-predicate">predicate</a> <code>| </code> '<code class="grammar-literal">a</code>'</td>
+</tr>
+            <tr data-grammar-expression="('|', [('id', 'iri'), ('id', 'blank')])" data-grammar-original="[10] subject ::= iri| blank" id="grammar-production-subject">
+    <td>[10]</td>
+    <td><code>subject</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-iri">iri</a> <code>| </code> <a href="#grammar-production-blank">blank</a></td>
+</tr>
+            <tr data-grammar-expression="('id', 'iri')" data-grammar-original="[11] predicate ::= iri" id="grammar-production-predicate">
+    <td>[11]</td>
+    <td><code>predicate</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-iri">iri</a></td>
+</tr>
+            <tr data-grammar-expression="('|', [('id', 'iri'), ('id', 'blank'), ('id', 'blankNodePropertyList'), ('id', 'literal')])" data-grammar-original="[12] object ::= iri| blank| blankNodePropertyList| literal" id="grammar-production-object">
+    <td>[12]</td>
+    <td><code>object</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-iri">iri</a> <code>| </code> <a href="#grammar-production-blank">blank</a> <code>| </code> <a href="#grammar-production-blankNodePropertyList">blankNodePropertyList</a> <code>| </code> <a href="#grammar-production-literal">literal</a></td>
+</tr>
+            <tr data-grammar-expression="('|', [('id', 'RDFLiteral'), ('id', 'NumericLiteral'), ('id', 'BooleanLiteral')])" data-grammar-original="[13] literal ::= RDFLiteral| NumericLiteral| BooleanLiteral" id="grammar-production-literal">
+    <td>[13]</td>
+    <td><code>literal</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-RDFLiteral">RDFLiteral</a> <code>| </code> <a href="#grammar-production-NumericLiteral">NumericLiteral</a> <code>| </code> <a href="#grammar-production-BooleanLiteral">BooleanLiteral</a></td>
+</tr>
+            <tr data-grammar-expression="('|', [('id', 'BlankNode'), ('id', 'collection')])" data-grammar-original="[14] blank ::= BlankNode| collection" id="grammar-production-blank">
+    <td>[14]</td>
+    <td><code>blank</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-BlankNode">BlankNode</a> <code>| </code> <a href="#grammar-production-collection">collection</a></td>
+</tr>
+            <tr data-grammar-expression="(',', [(&quot;'&quot;, '['), ('id', 'predicateObjectList'), (&quot;'&quot;, ']')])" data-grammar-original="[15] blankNodePropertyList ::= &quot;[&quot; predicateObjectList &quot;]&quot;" id="grammar-production-blankNodePropertyList">
+    <td>[15]</td>
+    <td><code>blankNodePropertyList</code></td>
+    <td>::=</td>
+    <td>'<code class="grammar-literal">[</code>' <a href="#grammar-production-predicateObjectList">predicateObjectList</a> '<code class="grammar-literal">]</code>'</td>
+</tr>
+            <tr data-grammar-expression="(',', [(&quot;'&quot;, '('), ('*', ('id', 'object')), (&quot;'&quot;, ')')])" data-grammar-original="[16] collection ::= &quot;(&quot; object* &quot;)&quot;" id="grammar-production-collection">
+    <td>[16]</td>
+    <td><code>collection</code></td>
+    <td>::=</td>
+    <td>'<code class="grammar-literal">(</code>' <a href="#grammar-production-object">object</a><code class="grammar-star">*</code> '<code class="grammar-literal">)</code>'</td>
+</tr>
+            <tr data-grammar-expression="('|', [('id', 'INTEGER'), ('id', 'DECIMAL'), ('id', 'DOUBLE')])" data-grammar-original="[17] NumericLiteral ::= INTEGER | DECIMAL | DOUBLE" id="grammar-production-NumericLiteral">
+    <td>[17]</td>
+    <td><code>NumericLiteral</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-INTEGER">INTEGER</a> <code>| </code> <a href="#grammar-production-DECIMAL">DECIMAL</a> <code>| </code> <a href="#grammar-production-DOUBLE">DOUBLE</a></td>
+</tr>
+            <tr data-grammar-expression="(',', [('id', 'String'), ('?', ('|', [('id', 'LANGTAG'), (',', [(&quot;'&quot;, '^^'), ('id', 'iri')])]))])" data-grammar-original="[128s] RDFLiteral ::= String ( LANGTAG | ( &quot;^^&quot; iri ) )?" id="grammar-production-RDFLiteral">
+    <td>[128s]</td>
+    <td><code>RDFLiteral</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-String">String</a> (<a href="#grammar-production-LANGTAG">LANGTAG</a> <code>| </code> '<code class="grammar-literal">^^</code>' <a href="#grammar-production-iri">iri</a>)?</td>
+</tr>
+            <tr data-grammar-expression="('|', [(&quot;'&quot;, 'true'), (&quot;'&quot;, 'false')])" data-grammar-original="[133s] BooleanLiteral ::= &quot;true&quot;| &quot;false&quot;" id="grammar-production-BooleanLiteral">
+    <td>[133s]</td>
+    <td><code>BooleanLiteral</code></td>
+    <td>::=</td>
+    <td>'<code class="grammar-literal">true</code>' <code>| </code> '<code class="grammar-literal">false</code>'</td>
+</tr>
+            <tr data-grammar-expression="('|', [('id', 'STRING_LITERAL_QUOTE'), ('id', 'STRING_LITERAL_SINGLE_QUOTE'), ('id', 'STRING_LITERAL_LONG_SINGLE_QUOTE'), ('id', 'STRING_LITERAL_LONG_QUOTE')])" data-grammar-original="[18] String ::= STRING_LITERAL_QUOTE| STRING_LITERAL_SINGLE_QUOTE| STRING_LITERAL_LONG_SINGLE_QUOTE| STRING_LITERAL_LONG_QUOTE" id="grammar-production-String">
+    <td>[18]</td>
+    <td><code>String</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-STRING_LITERAL_QUOTE">STRING_LITERAL_QUOTE</a> <code>| </code> <a href="#grammar-production-STRING_LITERAL_SINGLE_QUOTE">STRING_LITERAL_SINGLE_QUOTE</a> <code>| </code> <a href="#grammar-production-STRING_LITERAL_LONG_SINGLE_QUOTE">STRING_LITERAL_LONG_SINGLE_QUOTE</a> <code>| </code> <a href="#grammar-production-STRING_LITERAL_LONG_QUOTE">STRING_LITERAL_LONG_QUOTE</a></td>
+</tr>
+            <tr data-grammar-expression="('|', [('id', 'IRIREF'), ('id', 'PrefixedName')])" data-grammar-original="[135s] iri ::= IRIREF| PrefixedName" id="grammar-production-iri">
+    <td>[135s]</td>
+    <td><code>iri</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-IRIREF">IRIREF</a> <code>| </code> <a href="#grammar-production-PrefixedName">PrefixedName</a></td>
+</tr>
+            <tr data-grammar-expression="('|', [('id', 'PNAME_LN'), ('id', 'PNAME_NS')])" data-grammar-original="[136s] PrefixedName ::= PNAME_LN| PNAME_NS" id="grammar-production-PrefixedName">
+    <td>[136s]</td>
+    <td><code>PrefixedName</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-PNAME_LN">PNAME_LN</a> <code>| </code> <a href="#grammar-production-PNAME_NS">PNAME_NS</a></td>
+</tr>
+            <tr data-grammar-expression="('|', [('id', 'BLANK_NODE_LABEL'), ('id', 'ANON')])" data-grammar-original="[137s] BlankNode ::= BLANK_NODE_LABEL| ANON" id="grammar-production-BlankNode">
+    <td>[137s]</td>
+    <td><code>BlankNode</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-BLANK_NODE_LABEL">BLANK_NODE_LABEL</a> <code>| </code> <a href="#grammar-production-ANON">ANON</a></td>
+</tr>
+<tr><td colspan="4"><h3 id="terminals">Productions for terminals</h3></td></tr>
+            <tr class="grammar-token" data-grammar-expression="(',', [(&quot;'&quot;, '&lt;'), ('*', ('|', [('[', '^#x00-#x20&lt;&gt;&quot;{}|^`\\'), ('id', 'UCHAR')])), (&quot;'&quot;, '&gt;')])" data-grammar-original="[19] IRIREF ::=  '&lt;' ([^#x00-#x20&lt;&gt;&quot;{}|^`\] | UCHAR)* '&gt;'" id="grammar-production-IRIREF">
+    <td>[19]</td>
+    <td><code>IRIREF</code></td>
+    <td>::=</td>
+    <td>'<code class="grammar-literal">&lt;</code>' ([<code class="grammar-chars">^#x00-#x20&lt;&gt;"{}|^`\</code>] <code>| </code> <a href="#grammar-production-UCHAR">UCHAR</a>)<code class="grammar-star">*</code> '<code class="grammar-literal">&gt;</code>'</td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="(',', [('?', ('id', 'PN_PREFIX')), (&quot;'&quot;, ':')])" data-grammar-original="[139s] PNAME_NS ::= PN_PREFIX? &quot;:&quot;" id="grammar-production-PNAME_NS">
+    <td>[139s]</td>
+    <td><code>PNAME_NS</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-PN_PREFIX">PN_PREFIX</a>? '<code class="grammar-literal">:</code>'</td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="(',', [('id', 'PNAME_NS'), ('id', 'PN_LOCAL')])" data-grammar-original="[140s] PNAME_LN ::= PNAME_NS PN_LOCAL" id="grammar-production-PNAME_LN">
+    <td>[140s]</td>
+    <td><code>PNAME_LN</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-PNAME_NS">PNAME_NS</a> <a href="#grammar-production-PN_LOCAL">PN_LOCAL</a></td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="(',', [(&quot;'&quot;, '_:'), ('|', [('id', 'PN_CHARS_U'), ('[', '0-9')]), ('?', (',', [('*', ('|', [('id', 'PN_CHARS'), (&quot;'&quot;, '.')])), ('id', 'PN_CHARS')]))])" data-grammar-original="[141s] BLANK_NODE_LABEL ::= '_:' ( PN_CHARS_U | [0-9] ) ((PN_CHARS|'.')* PN_CHARS)?" id="grammar-production-BLANK_NODE_LABEL">
+    <td>[141s]</td>
+    <td><code>BLANK_NODE_LABEL</code></td>
+    <td>::=</td>
+    <td>'<code class="grammar-literal">_:</code>' (<a href="#grammar-production-PN_CHARS_U">PN_CHARS_U</a> <code>| </code> [<code class="grammar-chars">0-9</code>]) ((<a href="#grammar-production-PN_CHARS">PN_CHARS</a> <code>| </code> '<code class="grammar-literal">.</code>')<code class="grammar-star">*</code> <a href="#grammar-production-PN_CHARS">PN_CHARS</a>)?</td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="(',', [(&quot;'&quot;, '@'), ('+', ('[', 'a-zA-Z')), ('*', (',', [(&quot;'&quot;, '-'), ('+', ('[', 'a-zA-Z0-9'))]))])" data-grammar-original="[144s] LANGTAG ::= &quot;@&quot; [a-zA-Z]+ ( &quot;-&quot; [a-zA-Z0-9]+ )*" id="grammar-production-LANGTAG">
+    <td>[144s]</td>
+    <td><code>LANGTAG</code></td>
+    <td>::=</td>
+    <td>'<code class="grammar-literal">@</code>' [<code class="grammar-chars">a-zA-Z</code>]<code class="grammar-plus">+</code> ('<code class="grammar-literal">-</code>' [<code class="grammar-chars">a-zA-Z0-9</code>]<code class="grammar-plus">+</code>)<code class="grammar-star">*</code></td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="(',', [('?', ('[', '+-')), ('+', ('[', '0-9'))])" data-grammar-original="[20] INTEGER ::= [+-]? [0-9]+" id="grammar-production-INTEGER">
+    <td>[20]</td>
+    <td><code>INTEGER</code></td>
+    <td>::=</td>
+    <td>[<code class="grammar-chars">+-</code>]? [<code class="grammar-chars">0-9</code>]<code class="grammar-plus">+</code></td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="(',', [('?', ('[', '+-')), (',', [('*', ('[', '0-9')), (&quot;'&quot;, '.'), ('+', ('[', '0-9'))])])" data-grammar-original="[21] DECIMAL ::= [+-]?  ( ([0-9])* '.' ([0-9])+  )" id="grammar-production-DECIMAL">
+    <td>[21]</td>
+    <td><code>DECIMAL</code></td>
+    <td>::=</td>
+    <td>[<code class="grammar-chars">+-</code>]? ([<code class="grammar-chars">0-9</code>]<code class="grammar-star">*</code> '<code class="grammar-literal">.</code>' [<code class="grammar-chars">0-9</code>]<code class="grammar-plus">+</code>)</td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="(',', [('?', ('[', '+-')), ('|', [(',', [('+', ('[', '0-9')), (&quot;'&quot;, '.'), ('*', ('[', '0-9')), ('id', 'EXPONENT')]), (',', [(&quot;'&quot;, '.'), ('+', ('[', '0-9')), ('id', 'EXPONENT')]), (',', [('+', ('[', '0-9')), ('id', 'EXPONENT')])])])" data-grammar-original="[22] DOUBLE ::= [+-]? ( [0-9]+ '.' [0-9]* EXPONENT | '.' ([0-9])+ EXPONENT | ([0-9])+EXPONENT )" id="grammar-production-DOUBLE">
+    <td>[22]</td>
+    <td><code>DOUBLE</code></td>
+    <td>::=</td>
+    <td>[<code class="grammar-chars">+-</code>]? ([<code class="grammar-chars">0-9</code>]<code class="grammar-plus">+</code> '<code class="grammar-literal">.</code>' [<code class="grammar-chars">0-9</code>]<code class="grammar-star">*</code> <a href="#grammar-production-EXPONENT">EXPONENT</a> <code>| </code> '<code class="grammar-literal">.</code>' [<code class="grammar-chars">0-9</code>]<code class="grammar-plus">+</code> <a href="#grammar-production-EXPONENT">EXPONENT</a> <code>| </code> [<code class="grammar-chars">0-9</code>]<code class="grammar-plus">+</code> <a href="#grammar-production-EXPONENT">EXPONENT</a>)</td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="(',', [('[', 'eE'), ('?', ('[', '+-')), ('+', ('[', '0-9'))])" data-grammar-original="[154s] EXPONENT ::= [eE] [+-]? [0-9]+" id="grammar-production-EXPONENT">
+    <td>[154s]</td>
+    <td><code>EXPONENT</code></td>
+    <td>::=</td>
+    <td>[<code class="grammar-chars">eE</code>] [<code class="grammar-chars">+-</code>]? [<code class="grammar-chars">0-9</code>]<code class="grammar-plus">+</code></td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="(',', [(&quot;'&quot;, '&quot;'), ('*', ('|', [('[', '^#x22#x5C#xA#xD'), ('id', 'ECHAR'), ('id', 'UCHAR')])), (&quot;'&quot;, '&quot;')])" data-grammar-original="[23] STRING_LITERAL_QUOTE ::= '&quot;' ( [^#x22#x5C#xA#xD] | ECHAR | UCHAR )* '&quot;'" id="grammar-production-STRING_LITERAL_QUOTE">
+    <td>[23]</td>
+    <td><code>STRING_LITERAL_QUOTE</code></td>
+    <td>::=</td>
+    <td>'<code class="grammar-literal">"</code>' ([<code class="grammar-chars">^#x22#x5C#xA#xD</code>] <code>| </code> <a href="#grammar-production-ECHAR">ECHAR</a> <code>| </code> <a href="#grammar-production-UCHAR">UCHAR</a>)<code class="grammar-star">*</code> '<code class="grammar-literal">"</code>'</td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="(',', [(&quot;'&quot;, &quot;'&quot;), ('*', ('|', [('[', '^#x27#x5C#xA#xD'), ('id', 'ECHAR'), ('id', 'UCHAR')])), (&quot;'&quot;, &quot;'&quot;)])" data-grammar-original="[24] STRING_LITERAL_SINGLE_QUOTE ::= &quot;'&quot; ( [^#x27#x5C#xA#xD] | ECHAR | UCHAR )* &quot;'&quot;" id="grammar-production-STRING_LITERAL_SINGLE_QUOTE">
+    <td>[24]</td>
+    <td><code>STRING_LITERAL_SINGLE_QUOTE</code></td>
+    <td>::=</td>
+    <td>"<code class="grammar-literal">'</code>" ([<code class="grammar-chars">^#x27#x5C#xA#xD</code>] <code>| </code> <a href="#grammar-production-ECHAR">ECHAR</a> <code>| </code> <a href="#grammar-production-UCHAR">UCHAR</a>)<code class="grammar-star">*</code> "<code class="grammar-literal">'</code>"</td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="(',', [(&quot;'&quot;, &quot;'''&quot;), ('*', (',', [('?', ('|', [(&quot;'&quot;, &quot;'&quot;), (&quot;'&quot;, &quot;''&quot;)])), ('|', [('[', &quot;^'\\&quot;), ('id', 'ECHAR'), ('id', 'UCHAR')])])), (&quot;'&quot;, &quot;'''&quot;)])" data-grammar-original="[25] STRING_LITERAL_LONG_SINGLE_QUOTE ::= &quot;'''&quot; ( ( &quot;'&quot; | &quot;''&quot; )? ( [^'\] | ECHAR | UCHAR ) )* &quot;'''&quot;" id="grammar-production-STRING_LITERAL_LONG_SINGLE_QUOTE">
+    <td>[25]</td>
+    <td><code>STRING_LITERAL_LONG_SINGLE_QUOTE</code></td>
+    <td>::=</td>
+    <td>"<code class="grammar-literal">'''</code>" (("<code class="grammar-literal">'</code>" <code>| </code> "<code class="grammar-literal">''</code>")? ([<code class="grammar-chars">^'\</code>] <code>| </code> <a href="#grammar-production-ECHAR">ECHAR</a> <code>| </code> <a href="#grammar-production-UCHAR">UCHAR</a>))<code class="grammar-star">*</code> "<code class="grammar-literal">'''</code>"</td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="(',', [(&quot;'&quot;, '&quot;&quot;&quot;'), ('*', (',', [('?', ('|', [(&quot;'&quot;, '&quot;'), (&quot;'&quot;, '&quot;&quot;')])), ('|', [('[', '^&quot;\\'), ('id', 'ECHAR'), ('id', 'UCHAR')])])), (&quot;'&quot;, '&quot;&quot;&quot;')])" data-grammar-original="[26] STRING_LITERAL_LONG_QUOTE ::= '&quot;&quot;&quot;' ( ( '&quot;' | '&quot;&quot;' )? ( [^&quot;\] | ECHAR | UCHAR ) )* '&quot;&quot;&quot;'" id="grammar-production-STRING_LITERAL_LONG_QUOTE">
+    <td>[26]</td>
+    <td><code>STRING_LITERAL_LONG_QUOTE</code></td>
+    <td>::=</td>
+    <td>'<code class="grammar-literal">"""</code>' (('<code class="grammar-literal">"</code>' <code>| </code> '<code class="grammar-literal">""</code>')? ([<code class="grammar-chars">^"\</code>] <code>| </code> <a href="#grammar-production-ECHAR">ECHAR</a> <code>| </code> <a href="#grammar-production-UCHAR">UCHAR</a>))<code class="grammar-star">*</code> '<code class="grammar-literal">"""</code>'</td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="('|', [(',', [(&quot;'&quot;, '\\u'), ('id', 'HEX'), ('id', 'HEX'), ('id', 'HEX'), ('id', 'HEX')]), (',', [(&quot;'&quot;, '\\U'), ('id', 'HEX'), ('id', 'HEX'), ('id', 'HEX'), ('id', 'HEX'), ('id', 'HEX'), ('id', 'HEX'), ('id', 'HEX'), ('id', 'HEX')])])" data-grammar-original="[27] UCHAR ::= ( &quot;\u&quot; HEX HEX HEX HEX )| ( &quot;\U&quot; HEX HEX HEX HEX HEX HEX HEX HEX )" id="grammar-production-UCHAR">
+    <td>[27]</td>
+    <td><code>UCHAR</code></td>
+    <td>::=</td>
+    <td>'<code class="grammar-literal">\u</code>' <a href="#grammar-production-HEX">HEX</a> <a href="#grammar-production-HEX">HEX</a> <a href="#grammar-production-HEX">HEX</a> <a href="#grammar-production-HEX">HEX</a> <code>| </code> '<code class="grammar-literal">\U</code>' <a href="#grammar-production-HEX">HEX</a> <a href="#grammar-production-HEX">HEX</a> <a href="#grammar-production-HEX">HEX</a> <a href="#grammar-production-HEX">HEX</a> <a href="#grammar-production-HEX">HEX</a> <a href="#grammar-production-HEX">HEX</a> <a href="#grammar-production-HEX">HEX</a> <a href="#grammar-production-HEX">HEX</a></td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="(',', [(&quot;'&quot;, '\\'), ('[', 'tbnrf\\&quot;\'')])" data-grammar-original="[159s] ECHAR ::= &quot;\&quot; [tbnrf\&quot;']" id="grammar-production-ECHAR">
+    <td>[159s]</td>
+    <td><code>ECHAR</code></td>
+    <td>::=</td>
+    <td>'<code class="grammar-literal">\</code>' [<code class="grammar-chars">tbnrf"'\</code>]</td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="(',', [(&quot;'&quot;, '('), ('*', ('id', 'WS')), (&quot;'&quot;, ')')])" data-grammar-original="[160s] NIL ::= &quot;(&quot; WS* &quot;)&quot;" id="grammar-production-NIL">
+    <td>[160s]</td>
+    <td><code>NIL</code></td>
+    <td>::=</td>
+    <td>'<code class="grammar-literal">(</code>' <a href="#grammar-production-WS">WS</a><code class="grammar-star">*</code> '<code class="grammar-literal">)</code>'</td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="('|', [('#', '#x20'), ('#', '#x9'), ('#', '#xD'), ('#', '#xA')])" data-grammar-original="[161s] WS ::= #x20 | #x9 | #xD | #xA" id="grammar-production-WS">
+    <td>[161s]</td>
+    <td><code>WS</code></td>
+    <td>::=</td>
+    <td><code class="grammar-char-escape">#x20</code> <code>| </code> <code class="grammar-char-escape">#x9</code> <code>| </code> <code class="grammar-char-escape">#xD</code> <code>| </code> <code class="grammar-char-escape">#xA</code></td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="(',', [(&quot;'&quot;, '['), ('*', ('id', 'WS')), (&quot;'&quot;, ']')])" data-grammar-original="[162s] ANON ::= &quot;[&quot; WS* &quot;]&quot;" id="grammar-production-ANON">
+    <td>[162s]</td>
+    <td><code>ANON</code></td>
+    <td>::=</td>
+    <td>'<code class="grammar-literal">[</code>' <a href="#grammar-production-WS">WS</a><code class="grammar-star">*</code> '<code class="grammar-literal">]</code>'</td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="('|', [('[', 'A-Z'), ('[', 'a-z'), ('[', '#00C0-#00D6'), ('[', '#00D8-#00F6'), ('[', '#00F8-#02FF'), ('[', '#0370-#037D'), ('[', '#037F-#1FFF'), ('[', '#200C-#200D'), ('[', '#2070-#218F'), ('[', '#2C00-#2FEF'), ('[', '#3001-#D7FF'), ('[', '#F900-#FDCF'), ('[', '#FDF0-#FFFD'), ('[', '#10000-#EFFFF')])" data-grammar-original="[163s] PN_CHARS_BASE ::= [A-Z]| [a-z]| [#00C0-#00D6]| [#00D8-#00F6]| [#00F8-#02FF]| [#0370-#037D]| [#037F-#1FFF]| [#200C-#200D]| [#2070-#218F]| [#2C00-#2FEF]| [#3001-#D7FF]| [#F900-#FDCF]| [#FDF0-#FFFD]| [#10000-#EFFFF]" id="grammar-production-PN_CHARS_BASE">
+    <td>[163s]</td>
+    <td><code>PN_CHARS_BASE</code></td>
+    <td>::=</td>
+    <td>[<code class="grammar-chars">A-Z</code>] <code>| </code> [<code class="grammar-chars">a-z</code>] <code>| </code> [<code class="grammar-chars">#00C0-#00D6</code>] <code>| </code> [<code class="grammar-chars">#00D8-#00F6</code>] <code>| </code> [<code class="grammar-chars">#00F8-#02FF</code>] <code>| </code> [<code class="grammar-chars">#0370-#037D</code>] <code>| </code> [<code class="grammar-chars">#037F-#1FFF</code>] <code>| </code> [<code class="grammar-chars">#200C-#200D</code>] <code>| </code> [<code class="grammar-chars">#2070-#218F</code>] <code>| </code> [<code class="grammar-chars">#2C00-#2FEF</code>] <code>| </code> [<code class="grammar-chars">#3001-#D7FF</code>] <code>| </code> [<code class="grammar-chars">#F900-#FDCF</code>] <code>| </code> [<code class="grammar-chars">#FDF0-#FFFD</code>] <code>| </code> [<code class="grammar-chars">#10000-#EFFFF</code>]</td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="('|', [('id', 'PN_CHARS_BASE'), (&quot;'&quot;, '_')])" data-grammar-original="[164s] PN_CHARS_U  ::=  PN_CHARS_BASE| '_'" id="grammar-production-PN_CHARS_U">
+    <td>[164s]</td>
+    <td><code>PN_CHARS_U</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-PN_CHARS_BASE">PN_CHARS_BASE</a> <code>| </code> '<code class="grammar-literal">_</code>'</td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="('|', [('id', 'PN_CHARS_U'), (&quot;'&quot;, '-'), ('[', '0-9'), ('#', '#00B7'), ('[', '#0300-#036F'), ('[', '#203F-#2040')])" data-grammar-original="[166s] PN_CHARS ::= PN_CHARS_U| &quot;-&quot;| [0-9]| #00B7| [#0300-#036F]| [#203F-#2040]" id="grammar-production-PN_CHARS">
+    <td>[166s]</td>
+    <td><code>PN_CHARS</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-PN_CHARS_U">PN_CHARS_U</a> <code>| </code> '<code class="grammar-literal">-</code>' <code>| </code> [<code class="grammar-chars">0-9</code>] <code>| </code> <code class="grammar-char-escape">#00B7</code> <code>| </code> [<code class="grammar-chars">#0300-#036F</code>] <code>| </code> [<code class="grammar-chars">#203F-#2040</code>]</td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="(',', [('id', 'PN_CHARS_BASE'), ('?', (',', [('*', ('|', [('id', 'PN_CHARS'), (&quot;'&quot;, '.')])), ('id', 'PN_CHARS')]))])" data-grammar-original="[167s] PN_PREFIX ::= PN_CHARS_BASE ( ( PN_CHARS | &quot;.&quot; )* PN_CHARS )?" id="grammar-production-PN_PREFIX">
+    <td>[167s]</td>
+    <td><code>PN_PREFIX</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-PN_CHARS_BASE">PN_CHARS_BASE</a> ((<a href="#grammar-production-PN_CHARS">PN_CHARS</a> <code>| </code> '<code class="grammar-literal">.</code>')<code class="grammar-star">*</code> <a href="#grammar-production-PN_CHARS">PN_CHARS</a>)?</td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="(',', [('|', [('id', 'PN_CHARS_U'), (&quot;'&quot;, ':'), ('[', '0-9'), ('id', 'PLX')]), ('?', (',', [('*', ('|', [('id', 'PN_CHARS'), (&quot;'&quot;, '.'), (&quot;'&quot;, ':'), ('id', 'PLX')])), ('|', [('id', 'PN_CHARS'), (&quot;'&quot;, ':'), ('id', 'PLX')])]))])" data-grammar-original="[168s] PN_LOCAL ::= ( PN_CHARS_U | ':' | [0-9] | PLX ) ( ( PN_CHARS | '.' | ':' | PLX )*  ( PN_CHARS | ':' | PLX ) ) ?" id="grammar-production-PN_LOCAL">
+    <td>[168s]</td>
+    <td><code>PN_LOCAL</code></td>
+    <td>::=</td>
+    <td>(<a href="#grammar-production-PN_CHARS_U">PN_CHARS_U</a> <code>| </code> '<code class="grammar-literal">:</code>' <code>| </code> [<code class="grammar-chars">0-9</code>] <code>| </code> <a href="#grammar-production-PLX">PLX</a>) ((<a href="#grammar-production-PN_CHARS">PN_CHARS</a> <code>| </code> '<code class="grammar-literal">.</code>' <code>| </code> '<code class="grammar-literal">:</code>' <code>| </code> <a href="#grammar-production-PLX">PLX</a>)<code class="grammar-star">*</code> (<a href="#grammar-production-PN_CHARS">PN_CHARS</a> <code>| </code> '<code class="grammar-literal">:</code>' <code>| </code> <a href="#grammar-production-PLX">PLX</a>))?</td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="('|', [('id', 'PERCENT'), ('id', 'PN_LOCAL_ESC')])" data-grammar-original="[169s] PLX ::= PERCENT | PN_LOCAL_ESC" id="grammar-production-PLX">
+    <td>[169s]</td>
+    <td><code>PLX</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-PERCENT">PERCENT</a> <code>| </code> <a href="#grammar-production-PN_LOCAL_ESC">PN_LOCAL_ESC</a></td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="(',', [(&quot;'&quot;, '%'), ('id', 'HEX'), ('id', 'HEX')])" data-grammar-original="[170s] PERCENT ::= '%' HEX HEX" id="grammar-production-PERCENT">
+    <td>[170s]</td>
+    <td><code>PERCENT</code></td>
+    <td>::=</td>
+    <td>'<code class="grammar-literal">%</code>' <a href="#grammar-production-HEX">HEX</a> <a href="#grammar-production-HEX">HEX</a></td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="('|', [('[', '0-9'), ('[', 'A-F'), ('[', 'a-f')])" data-grammar-original="[171s] HEX ::= [0-9] | [A-F] | [a-f]" id="grammar-production-HEX">
+    <td>[171s]</td>
+    <td><code>HEX</code></td>
+    <td>::=</td>
+    <td>[<code class="grammar-chars">0-9</code>] <code>| </code> [<code class="grammar-chars">A-F</code>] <code>| </code> [<code class="grammar-chars">a-f</code>]</td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="(',', [(&quot;'&quot;, '\\'), ('|', [(&quot;'&quot;, '_'), (&quot;'&quot;, '~'), (&quot;'&quot;, '.'), (&quot;'&quot;, '-'), (&quot;'&quot;, '!'), (&quot;'&quot;, '$'), (&quot;'&quot;, '&amp;'), (&quot;'&quot;, &quot;'&quot;), (&quot;'&quot;, '('), (&quot;'&quot;, ')'), (&quot;'&quot;, '*'), (&quot;'&quot;, '+'), (&quot;'&quot;, ','), (&quot;'&quot;, ';'), (&quot;'&quot;, '='), (&quot;'&quot;, '/'), (&quot;'&quot;, '?'), (&quot;'&quot;, '#'), (&quot;'&quot;, '@'), (&quot;'&quot;, '%')])])" data-grammar-original="[172s] PN_LOCAL_ESC ::= '\' ( '_' | '~' | '.' | '-' | '!' | '$' | '&amp;' | &quot;'&quot; | '(' | ')' | '*' | '+' | ',' | ';' | '=' | '/' | '?' | '#' | '@' | '%' )" id="grammar-production-PN_LOCAL_ESC">
+    <td>[172s]</td>
+    <td><code>PN_LOCAL_ESC</code></td>
+    <td>::=</td>
+    <td>'<code class="grammar-literal">\</code>' ('<code class="grammar-literal">_</code>' <code>| </code> '<code class="grammar-literal">~</code>' <code>| </code> '<code class="grammar-literal">.</code>' <code>| </code> '<code class="grammar-literal">-</code>' <code>| </code> '<code class="grammar-literal">!</code>' <code>| </code> '<code class="grammar-literal">$</code>' <code>| </code> '<code class="grammar-literal">&amp;</code>' <code>| </code> "<code class="grammar-literal">'</code>" <code>| </code> '<code class="grammar-literal">(</code>' <code>| </code> '<code class="grammar-literal">)</code>' <code>| </code> '<code class="grammar-literal">*</code>' <code>| </code> '<code class="grammar-literal">+</code>' <code>| </code> '<code class="grammar-literal">,</code>' <code>| </code> '<code class="grammar-literal">;</code>' <code>| </code> '<code class="grammar-literal">=</code>' <code>| </code> '<code class="grammar-literal">/</code>' <code>| </code> '<code class="grammar-literal">?</code>' <code>| </code> '<code class="grammar-literal">#</code>' <code>| </code> '<code class="grammar-literal">@</code>' <code>| </code> '<code class="grammar-literal">%</code>')</td>
+</tr>
+</tbody></table>
+</div>
+
+
+			</section>
+		</section>
+        <section id="sec-parsing" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+          
+<!--OddPage-->
+<h2 aria-level="1" role="heading" id="h2_sec-parsing"><span class="secno">5. </span>Parsing</h2>
+          <p>The RDF Concepts and Abstract Syntax [<cite><a class="bibref" href="#bib-RDF11-CONCEPTS">RDF11-CONCEPTS</a></cite>]
+		specification defines three types of <em>RDF
+		Term</em>: 
+
+          <a href="https://www.w3.org/TR/rdf11-concepts/#dfn-iri">IRIs</a>,
+          <a href="https://www.w3.org/TR/rdf11-concepts/#dfn-literal">literals</a> and
+          <a href="https://www.w3.org/TR/rdf11-concepts/#dfn-blank-node">blank nodes</a>.
+          Literals are composed of a <a href="https://www.w3.org/TR/rdf11-concepts/#dfn-lexical-form">lexical form</a> and an optional <a href="https://www.w3.org/TR/rdf11-concepts/#dfn-language-tag">language tag</a> [<cite><a class="bibref" href="#bib-BCP47">BCP47</a></cite>] or datatype IRI.
+          An extra type, <code class="dfn" id="prefix">prefix</code>, is used during parsing to map string identifiers to namespace IRIs.
+
+          This section maps a string conforming to the grammar in <a class="sectionRef sec-ref" href="#grammar-ebnf">section <span class="secno">4.5</span> <span class="sec-title">Grammar</span></a> to a set of triples by mapping strings matching productions and lexical tokens to RDF terms or their components (e.g. language tags, lexical forms of literals). Grammar productions change the parser state and emit triples.</p>
+          <section id="sec-parsing-state" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+          <h3 aria-level="2" role="heading" id="h3_sec-parsing-state"><span class="secno">5.1 </span>Parser State</h3>
+          <p>Parsing TriG requires a state of six items:</p>
+
+              <ul>
+                <li id="baseURI">IRI <code class="dfn">baseURI</code> — When the <a href="#grammar-production-base">base production</a> is reached, the second rule argument, <code>IRIREF</code>, is the base URI used for relative IRI resolution.</li>
+
+                <li id="namespaces">Map[<a href="#prefix" class="type prefix">prefix</a> -&gt; IRI] <code class="dfn">namespaces</code> — The second and third rule arguments (<code>PNAME_NS</code> and <code>IRIREF</code>) in the <a href="#grammar-production-prefixID">prefixID production</a> assign a namespace name (<code>IRIREF</code>) for the prefix (<code>PNAME_NS</code>). Outside of a <code>prefixID</code> production, any <code>PNAME_NS</code> is substituted with the namespace. Note that the prefix may be an empty string, per the <code>PNAME_NS,</code> production: <code>(PN_PREFIX)? ":"</code>.</li>
+
+                <li id="bnodeLabels">Map[string -&gt; <a href="https://www.w3.org/TR/rdf11-concepts/#dfn-blank-node">blank node</a>] <code class="dfn">bnodeLabels</code> — A mapping from string to blank node.</li>
+                <li id="curSubject">RDF_Term <code class="dfn">curSubject</code> — The <code class="curSubject">curSubject</code> is bound to the <code><a href="#grammar-production-subject">subject</a></code> production.</li>
+
+                <li id="curPredicate">RDF_Term <code class="dfn">curPredicate</code> — The <code class="curPredicate">curPredicate</code> is bound to the <code><a href="#grammar-production-verb">verb</a></code> production. If token matched was "<code>a</code>", <code class="curPredicate">curPredicate</code> is bound to the IRI <code>http://www.w3.org/1999/02/22-rdf-syntax-ns#type</code>.</li>
+
+                <li id="curGraph">RDF_Term <code class="dfn">curGraph</code> —
+                  The <code class="curGraph">curGraph</code> is bound to
+                  the label of the graph that is the destination of triples
+                  produced in parsing.  When undefined, triples are destined
+                  for the default graph.
+                </li>
+              </ul>
+          </section>
+          <section id="sec-parsing-terms" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+          <h3 aria-level="2" role="heading" id="h3_sec-parsing-terms"><span class="secno">5.2 </span>RDF Term Constructors</h3>
+
+              <p>This table maps productions and lexical tokens to <code>RDF terms</code> or components of <code>RDF terms</code> listed in <a class="sectionRef sec-ref" href="#sec-parsing">section <span class="secno">5.</span> <span class="sec-title">Parsing</span></a>:</p>
+
+              <table class="separated">
+                <thead>
+              <tr>                                  <th>                                                                       production               </th><th>                                                                                       type            </th><th>procedure</th></tr>
+                </thead>
+                <tbody>
+              <tr id="handle-IRIREF"><td style="text-align:left;"><a href="#grammar-production-IRIREF" class="type IRI">IRIREF               </a></td><td><a href="https://www.w3.org/TR/rdf11-concepts/#dfn-iri">      IRI         </a></td><td>The characters between "&lt;" and "&gt;" are taken, with the <a href="#numeric">numeric escape sequences</a> unescaped, to form the unicode string of the IRI. Relative IRI resolution is performed per <a class="sectionRef sec-ref" href="#sec-iri-references">section <span class="secno">4.3</span> <span class="sec-title">IRI References</span></a>.</td></tr>
+              <tr id="handle-PNAME_NS"><td rowspan="2" style="text-align:left;"><a href="#grammar-production-PNAME_NS" class="type string">PNAME_NS             </a></td><td><a href="#prefix">                                 prefix      </a></td><td>When used in a <a href="#grammar-production-prefixID">prefixID</a> or <a href="#grammar-production-sparqlPrefix">sparqlPrefix</a> production, the <code>prefix</code> is the potentially empty unicode string matching the first argument of the rule is a key into the <a href="#namespaces">namespaces map</a>.</td></tr>
+              <tr id="handle-PNAME-IRI">                                                                                                                                        <td><a href="https://www.w3.org/TR/rdf11-concepts/#dfn-iri">      IRI         </a></td><td>When used in a <a href="#grammar-production-PrefixedName">PrefixedName</a> production, the <code>iri</code> is the value in the <a href="#namespaces">namespaces map</a> corresponding to the first argument of the rule.</td></tr>
+              <tr id="handle-PNAME_LN"><td style="text-align:left;"><a href="#grammar-production-PNAME_LN" class="type IRI">PNAME_LN             </a></td><td><a href="https://www.w3.org/TR/rdf11-concepts/#dfn-iri">      IRI         </a></td><td>A potentially empty <a href="#prefix">prefix</a> is identified by the first sequence, <code>PNAME_NS</code>. The <a href="#namespaces">namespaces map</a> <em class="rfc2119"><em class="rfc2119" title="MUST">MUST</em></em> have a corresponding <code>namespace</code>. The unicode string of the IRI is formed by unescaping the <a href="#reserved">reserved characters</a> in the second argument, <code>PN_LOCAL</code>, and concatenating this onto the <code>namespace</code>.</td></tr>
+              
+<!-- tr id="handle-PrefixedName"><td style="text-align:left;"><a class="type IRI"         href="#grammar-production-PrefixedName"         >PrefixedName         </a></td><td><a href="http://www.w3.org/TR/rdf11-concepts/#dfn-iri">      IRI         </a></td><td>.</td></tr -->
+
+              <tr id="handle-STRING_LITERAL_SINGLE_QUOTE"><td style="text-align:left;"><a href="#grammar-production-STRING_LITERAL_SINGLE_QUOTE" class="type lexicalForm">STRING_LITERAL_SINGLE_QUOTE      </a></td><td><a href="https://www.w3.org/TR/rdf11-concepts/#dfn-lexical-form">                         lexical form</a></td><td>The characters between the outermost "'"s   are taken, with <a href="#numeric">numeric</a> and <a href="#string">string</a> escape sequences unescaped, to form the unicode string of a lexical form.</td></tr>
+              <tr id="handle-STRING_LITERAL_QUOTE"><td style="text-align:left;"><a href="#grammar-production-STRING_LITERAL_QUOTE" class="type lexicalForm">STRING_LITERAL_QUOTE      </a></td><td><a href="https://www.w3.org/TR/rdf11-concepts/#dfn-lexical-form">                         lexical form</a></td><td>The characters between the outermost '"'s   are taken, with <a href="#numeric">numeric</a> and <a href="#string">string</a> escape sequences unescaped, to form the unicode string of a lexical form.</td></tr>
+              <tr id="handle-STRING_LITERAL_LONG_SINGLE_QUOTE"><td style="text-align:left;"><a href="#grammar-production-STRING_LITERAL_LONG_SINGLE_QUOTE" class="type lexicalForm">STRING_LITERAL_LONG_SINGLE_QUOTE </a></td><td><a href="https://www.w3.org/TR/rdf11-concepts/#dfn-lexical-form">                         lexical form</a></td><td>The characters between the outermost "'''"s are taken, with <a href="#numeric">numeric</a> and <a href="#string">string</a> escape sequences unescaped, to form the unicode string of a lexical form.</td></tr>
+              <tr id="handle-STRING_LITERAL_LONG_QUOTE"><td style="text-align:left;"><a href="#grammar-production-STRING_LITERAL_LONG_QUOTE" class="type lexicalForm">STRING_LITERAL_LONG_QUOTE </a></td><td><a href="https://www.w3.org/TR/rdf11-concepts/#dfn-lexical-form">                         lexical form</a></td><td>The characters between the outermost '"""'s are taken, with <a href="#numeric">numeric</a> and <a href="#string">string</a> escape sequences unescaped, to form the unicode string of a lexical form.</td></tr>
+              <tr id="handle-LANGTAG"><td style="text-align:left;"><a href="#grammar-production-LANGTAG" class="type langTag">LANGTAG              </a></td><td><a href="https://www.w3.org/TR/rdf11-concepts/#dfn-language-tag">language tag</a></td><td>The characters following the <code>@</code> form the unicode string of the language tag.</td></tr>
+              <tr id="handle-RDFLiteral"><td style="text-align:left;"><a href="#grammar-production-RDFLiteral" class="type literal">RDFLiteral           </a></td><td><a href="https://www.w3.org/TR/rdf11-concepts/#dfn-literal">            literal     </a></td><td>The literal has a lexical form of the first rule argument, <code>String</code>, and either a language tag of <code>LANGTAG</code> or a datatype IRI of <code>iri</code>, depending on which rule matched the input. If the <code>LANGTAG</code> rule matched, the datatype is <code>rdf:langString</code> and the language tag is <code>LANGTAG</code>. If neither a language tag nor a datatype IRI is provided, the literal has a datatype of <code>xsd:string</code>.</td></tr>
+              <tr id="handle-INTEGER"><td style="text-align:left;"><a href="#grammar-production-INTEGER" class="type integer">INTEGER              </a></td><td><a href="https://www.w3.org/TR/rdf11-concepts/#dfn-literal">            literal     </a></td><td>The literal has a lexical form of the input string, and a datatype of <code>xsd:integer</code>.</td></tr>
+              <tr id="handle-DECIMAL"><td style="text-align:left;"><a href="#grammar-production-DECIMAL" class="type decimal">DECIMAL              </a></td><td><a href="https://www.w3.org/TR/rdf11-concepts/#dfn-literal">            literal     </a></td><td>The literal has a lexical form of the input string, and a datatype of <code>xsd:decimal</code>.</td></tr>
+              <tr id="handle-DOUBLE"><td style="text-align:left;"><a href="#grammar-production-DOUBLE" class="type double">DOUBLE               </a></td><td><a href="https://www.w3.org/TR/rdf11-concepts/#dfn-literal">            literal     </a></td><td>The literal has a lexical form of the input string, and a datatype of <code>xsd:double</code>.</td></tr>
+              <tr id="handle-BooleanLiteral"><td style="text-align:left;"><a href="#grammar-production-BooleanLiteral" class="type boolean">BooleanLiteral       </a></td><td><a href="https://www.w3.org/TR/rdf11-concepts/#dfn-literal">            literal     </a></td><td>The literal has a lexical form of the <code>true</code> or <code>false</code>, depending on which matched the input, and a datatype of <code>xsd:boolean</code>.</td></tr>
+              <tr id="handle-BLANK_NODE_LABEL"><td style="text-align:left;"><a href="#grammar-production-BLANK_NODE_LABEL" class="type bNode">BLANK_NODE_LABEL     </a></td><td><a href="https://www.w3.org/TR/rdf11-concepts/#dfn-blank-node">         blank node  </a></td><td>The string matching the second argument, <code>PN_LOCAL</code>, is a key in <a href="#bnodeLabels">bnodeLabels</a>. If there is no corresponding blank node in the map, one is allocated.</td></tr>
+              <tr id="handle-ANON"><td style="text-align:left;"><a href="#grammar-production-ANON" class="type bNode">ANON                 </a></td><td><a href="https://www.w3.org/TR/rdf11-concepts/#dfn-blank-node">         blank node  </a></td><td>A blank node is generated.</td></tr>
+              <tr id="handle-blankNodePropertyList"><td style="text-align:left;"><a href="#grammar-production-blankNodePropertyList" class="type bNode">blankNodePropertyList</a></td><td><a href="https://www.w3.org/TR/rdf11-concepts/#dfn-blank-node">         blank node  </a></td><td>A blank node is generated. Note the rules for <code>blankNodePropertyList</code> in the next section.</td></tr>
+              <tr id="handle-collection"><td rowspan="2" style="text-align:left;"><a href="#grammar-production-collection" class="type bNode">collection           </a></td><td><a href="https://www.w3.org/TR/rdf11-concepts/#dfn-blank-node">         blank node  </a></td><td>For non-empty lists, a blank node is generated. Note the rules for <code>collection</code> in the next section.</td></tr>
+              <tr id="handle-collection-IRI">                                                                                                                                                    <td><a href="https://www.w3.org/TR/rdf11-concepts/#dfn-iri">         IRI         </a></td><td>For empty lists, the resulting IRI is <code>rdf:nil</code>. Note the rules for <code>collection</code> in the next section.</td></tr>
+                </tbody>
+              </table>
+
+          </section>
+          <section id="sec-parsing-triples" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+            <h3 aria-level="2" role="heading" id="h3_sec-parsing-triples"><span class="secno">5.3 </span>RDF Triples Construction</h3>
+            <p>
+		      A TriG document defines an <a href="https://www.w3.org/TR/rdf11-concepts/#section-dataset">RDF Dataset</a> composed of one default graph and zero or
+              more named graphs. Each graph is composed of a set of
+              <a href="https://www.w3.org/TR/rdf11-concepts/#dfn-rdf-triple">RDF triple</a>s.
+            </p>
+
+            <section id="output-graph" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+              <h4 aria-level="3" role="heading" id="h4_output-graph"><span class="secno">5.3.1 </span>Output Graph</h4>
+              <p>The state <code class="curGraph">curGraph</code> is
+                initially unset. It records the label of the graph for
+                triples produced during parsing.  If undefined, the default
+                graph is used.</p>
+
+              <p>The rule
+                <code><a href="#grammar-production-labelOrSubject">labelOrSubject</a></code>
+                sets both <code class="curGraph">curGraph</code>
+                and <code class="curSubject">curSubject</code>
+                (only one of these will be used).
+              </p>
+
+              <p>The following grammar production clauses set
+                <code class="curGraph">curGraph</code> to be undefined, indicating the default
+                graph:
+              </p>
+              <ul>
+                <li>
+                  The grammar production clause <code>wrappedGraph</code> in rule <code><a href="#grammar-production-block">block</a></code>.
+                </li>
+                <li>
+                  The grammar production in rule
+                  <code><a href="#grammar-production-triples2">triples2</a></code>.
+                </li>
+              </ul>
+
+              <p>
+                The grammar production
+                <code>labelOrSubject predicateObjectList '.'</code>
+                unsets
+                <code class="curGraph">curGraph</code>
+                before handling <code>predicateObjectLists</code>
+                in rule <code><a href="#grammar-production-triplesOrGraph">triplesOrGraph</a></code>.
+              </p>
+
+            </section>
+            <section id="triple-output">
+              <h4 aria-level="3" role="heading" id="h4_triple-output"><span class="secno">5.3.2 </span>Triple Output</h4>
+              <p>
+                Each RDF triple produced is added to <code class="curGraph">curGraph</code>,
+                or the default graph if <code class="curGraph">curGraph</code>
+                is not set at that
+                point in the parsing process.
+              </p>
+              <p>
+		        The <code><a href="#grammar-production-subject">subject</a></code>
+                production sets the <code class="curSubject">curSubject</code>.
+		        The <code><a href="#grammar-production-verb">verb</a></code>
+                production sets the <code class="curPredicate">curPredicate</code>.
+              </p>
+              <p>Triples are produced at the following points in the
+                parsing process and each RDF triple produced is
+                added to the graph identified
+                by <code class="curGraph">curGraph</code>.
+              </p>
+              <section id="triple-production">
+                <h5 style="padding-bottom:0; margin-bottom:0;" aria-level="4" role="heading" id="h5_triple-production"><span class="secno">5.3.2.1 </span>Triple Production</h5>
+                <p style="padding-top:0; margin-top:0;">
+		          Each <a href="#grammar-production-object" class="grammarRef">object</a>
+                  <code>N</code> in the document produces an RDF triple:
+                  <span class="ntriple"><code class="curSubject">curSubject</code>
+                    <code class="curPredicate">curPredicate</code> <code>N</code>.</span>
+                </p>
+              </section>
+              <section id="propertyList" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+	            <h5 style="padding-bottom:0; margin-bottom:0;" aria-level="4" role="heading" id="h5_propertyList"><span class="secno">5.3.2.2 </span>Property Lists</h5>
+                <p style="padding-top:0; margin-top:0;">
+                  Beginning the <code><a href="#grammar-production-blankNodePropertyList">blankNodePropertyList</a></code> production records the <code class="curSubject">curSubject</code> and <code class="curPredicate">curPredicate</code>, and sets <code class="curSubject">curSubject</code> to a novel <code>blank node</code> <code>B</code>.
+                  Finishing the <code><a href="#grammar-production-blankNodePropertyList">blankNodePropertyList</a></code> production restores <code class="curSubject">curSubject</code> and <code class="curPredicate">curPredicate</code>.
+                  The node produced by matching <code><a href="#grammar-production-blankNodePropertyList">blankNodePropertyList</a></code> is the blank node <code>B</code>.
+                </p>
+              </section>
+              <section id="collection" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+	          <h5 style="padding-bottom:0; margin-bottom:0;" aria-level="4" role="heading" id="h5_collection"><span class="secno">5.3.2.3 </span><span>Collections</span></h5>
+              <p style="padding-top:0; margin-top:0;">
+                Beginning the <code><a href="#grammar-production-collection">collection</a></code> production records the <code class="curSubject">curSubject</code> and <code class="curPredicate">curPredicate</code>.
+	            Each <code>object</code> in the <code><a href="#grammar-production-collection">collection</a></code> production has a <code class="curSubject">curSubject</code> set to a novel <code>blank node</code> <code>B</code> and a <code class="curPredicate">curPredicate</code> set to <code>rdf:first</code>.
+                For each object <code>object<sub>n</sub></code> after the first produces a triple:<span class="ntriple"><code>object<sub>n-1</sub></code> <code>rdf:rest</code> <code>object<sub>n</sub></code> .</span>
+                Finishing the <code><a href="#grammar-production-collection">collection</a></code> production creates an additional triple <span class="ntriple"><code>curSubject rdf:rest rdf:nil</code> .</span> and restores <code class="curSubject">curSubject</code> and <code class="curPredicate">curPredicate</code>
+                The node produced by matching <code><a href="#grammar-production-collection">collection</a></code> is the first blank node <code>B</code> for non-empty lists and <code>rdf:nil</code> for empty lists.
+              </p>
+            </section>
+          </section>
+        </section>
+      </section>
+
+
+<section class="informative" id="acknowledgements" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+  
+<!--OddPage-->
+<h2 aria-level="1" role="heading" id="h2_acknowledgements"><span class="secno">6. </span>Acknowledgements</h2><p><em>This section is non-normative.</em></p>
+  <p>The editors gratefully acknowledge the work of Chris Bizer and
+    Richard Cyganiak in creating the original TriG specification.
+    Valuable contributions to this version were made by Gregg Kellogg, Eric
+    Prud'hommeaux and Sandro Hawke. </p>
+  <p>The document was improved through the review process by the wider community.</p>
+</section>
+
+
+
+     <section class="appendix informative" id="sec-differences" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+       
+<!--OddPage-->
+<h2 aria-level="1" role="heading" id="h2_sec-differences"><span class="secno">A. </span>Differences from Previous TriG</h2><p><em>This section is non-normative.</em></p>
+       <p>This section describes the main differences between TriG, as
+         defined in this document, and earlier forms.
+      	 </p><ul>
+          <li>Syntax is aligned to the
+            Turtle [<cite><a class="bibref" href="#bib-TURTLE">TURTLE</a></cite>] recommendation
+            for RDF terms.</li>
+          <li>Graph labels can be blank nodes.</li>
+          <li>The default graph, or sections of the default graph, do not
+            need to be enclosed in <code>{</code> ... <code>}</code>.</li>
+      	  <li>No support for optional <code>=</code> graph naming operator
+            or optional "." after each graph.</li>
+      	  <li>Graph labels do not have to be unique within a TriG
+              document. Reusing a graph label causes all the triples
+            for that graph to be included in the resulting graph.
+            Sections with the same label are combined by set union.</li>
+          <li>Keywords <code>BASE</code>,
+            <code>PREFIX</code> as in [<cite><a class="bibref" href="#bib-TURTLE">TURTLE</a></cite>].</li>
+          <li>The optional <code>GRAPH</code> keyword is allowed to aid
+            SPARQL alignment.
+  		</li></ul>
+      </section>
+      <section class="appendix" id="sec-mediaReg" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+        
+<!--OddPage-->
+<h2 aria-level="1" role="heading" id="h2_sec-mediaReg"><span class="secno">B. </span>Media Type Registration</h2>
+        <dl>
+          <dt>Contact:</dt>
+          <dd>Eric Prud'hommeaux</dd>
+          <dt>See also:</dt>
+
+          <dd><a href="https://www.w3.org/2002/06/registering-mediatype">How to Register a Media Type for a <abbr title="World Wide Web Consortium">W3C</abbr> Specification</a></dd>
+          <dd><a href="https://www.w3.org/2001/tag/2002/0129-mime">Internet Media Type registration, consistency of use</a><br>TAG Finding 3 June 2002 (Revised 4 September 2002)</dd>
+        </dl>
+        <p>The Internet Media Type / MIME Type for TriG is "application/trig".</p>
+        <p>It is recommended that TriG files have the extension ".trig" (all lowercase) on all platforms.</p>
+
+        <p>It is recommended that TriG files stored on Macintosh HFS file systems be given a file type of "TEXT".</p>
+        <p>This information that follows will be submitted to the IESG for review, approval, and registration with IANA.</p>
+        <dl>
+          <dt>Type name:</dt>
+          <dd>application</dd>
+
+          <dt>Subtype name:</dt>
+          <dd>trig</dd>
+          <dt>Required parameters:</dt>
+          <dd>None</dd>
+          <dt>Optional parameters:</dt>
+          <dd>None</dd>
+
+          <dt>Encoding considerations:</dt>
+          <dd>The syntax of TriG is expressed over code points in Unicode [<cite><a class="bibref" href="#bib-UNICODE">UNICODE</a></cite>]. The encoding is always UTF-8 [<cite><a class="bibref" href="#bib-UTF-8">UTF-8</a></cite>].</dd>
+          <dd>Unicode code points may also be expressed using an \uXXXX (U+0000 to U+FFFF) or \UXXXXXXXX syntax (for U+10000 onwards) where X is a hexadecimal digit [0-9A-Fa-f]</dd>
+          <dt>Security considerations:</dt>
+          <dd>TriG is a general-purpose assertion language; applications may evaluate given data to infer more assertions or to dereference IRIs, invoking the security considerations of the scheme for that IRI. Note in particular, the privacy issues in [<cite><a class="bibref" href="#bib-RFC3023">RFC3023</a></cite>] section 10 for HTTP IRIs. Data obtained from an inaccurate or malicious data source may lead to inaccurate or misleading conclusions, as well as the dereferencing of unintended IRIs. Care must be taken to align the trust in consulted resources with the sensitivity of the intended use of the data; inferences of potential medical treatments would likely require different trust than inferences for trip planning.</dd>
+
+          <dd>TriG is used to express arbitrary application data; security considerations will vary by domain of use. Security tools and protocols applicable to text (e.g. PGP encryption, MD5 sum validation, password-protected compression) may also be used on TriG documents. Security/privacy protocols must be imposed which reflect the sensitivity of the embedded information.</dd>
+          <dd>TriG can express data which is presented to the user, for example, RDF Schema labels. Application rendering strings retrieved from untrusted TriG documents must ensure that malignant strings may not be used to mislead the reader. The security considerations in the media type registration for XML ([<cite><a class="bibref" href="#bib-RFC3023">RFC3023</a></cite>] section 10) provide additional guidance around the expression of arbitrary data and markup.</dd>
+          <dd>TriG uses IRIs as term identifiers. Applications interpreting data expressed in TriG should address the security issues of
+      <em>Internationalized Resource Identifiers (IRIs)</em> [<cite><a class="bibref" href="#bib-RFC3987">RFC3987</a></cite>] Section 8, as well as
+      <em>Uniform Resource Identifier (URI): Generic Syntax</em> [<cite><a class="bibref" href="#bib-RFC3986">RFC3986</a></cite>] Section 7.</dd>
+
+          <dd>Multiple IRIs may have the same appearance. Characters in different scripts may
+    look similar (a Cyrillic "о" may appear similar to a Latin "o"). A character followed
+    by combining characters may have the same visual representation as another character
+    (LATIN SMALL LETTER E followed by COMBINING ACUTE ACCENT has the same visual representation
+    as LATIN SMALL LETTER E WITH ACUTE).
+    
+<!-- (<code>foo:resum&#40751;code> and <code>f&#1086;&#1086;:resume&#769;</code>)-->
+
+    Any person or application that is writing or interpreting data in TriG must take care to use the IRI that matches the intended semantics, and avoid IRIs that make look similar.
+    Further information about matching of similar characters can be found
+    in <em>Unicode Security Considerations</em> [<cite><a class="bibref" href="#bib-UNICODE-SECURITY">UNICODE-SECURITY</a></cite>] and
+    <em>Internationalized Resource Identifiers (IRIs)</em> [<cite><a class="bibref" href="#bib-RFC3987">RFC3987</a></cite>], Section 8.</dd>
+
+          <dt>Interoperability considerations:</dt>
+          <dd>There are no known interoperability issues.</dd>
+          <dt>Published specification:</dt>
+          <dd>This specification.</dd>
+          <dt>Applications which use this media type:</dt>
+          <dd>No widely deployed applications are known to use this media
+            type. It may be used by some web services and clients consuming their data.</dd>
+          <dt>Additional information:</dt>
+          <dt>Magic number(s):</dt>
+          <dd>TriG documents may have the strings 'prefix' or 'base' (case
+            independent) near the beginning of the document.</dd>
+          <dt>File extension(s):</dt>
+          <dd>".trig"</dd>
+
+          <dt>Base URI:</dt>
+          <dd>The TriG base directive can change the current base URI
+            for relative IRIrefs in the language that are used sequentially
+            later in the document.</dd>
+          <dt>Macintosh file type code(s):</dt>
+          <dd>"TEXT"</dd>
+          <dt>Person &amp; email address to contact for further information:</dt>
+
+          <dd>Eric Prud'hommeaux &lt;eric@w3.org&gt;</dd>
+          <dt>Intended usage:</dt>
+          <dd>COMMON</dd>
+          <dt>Restrictions on usage:</dt>
+          <dd>None</dd>
+          <dt>Author/Change controller:</dt>
+
+          <dd>The TriG specification is the product of the RDF WG. The <abbr title="World Wide Web Consortium">W3C</abbr> reserves change control over this specifications.</dd>
+        </dl>
+      </section>
+
+   <section class="appendix" id="sec-changes" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+     
+<!--OddPage-->
+<h2 aria-level="1" role="heading" id="h2_sec-changes"><span class="secno">C. </span>Changes since the last publication of this document</h2>
+     <p><a href="http://lists.w3.org/Archives/Public/public-rdf-comments/2014Feb/0018.html">Error</a>
+     in grammar productions [24] and [25] fixed.</p>
+   </section>
+
+
+<section class="appendix" id="references" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+<!--OddPage-->
+<h2 aria-level="1" role="heading" id="h2_references"><span class="secno">D. </span>References</h2><section id="normative-references" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter"><h3 aria-level="2" role="heading" id="h3_normative-references"><span class="secno">D.1 </span>Normative references</h3><dl class="bibliography" about=""><dt id="bib-BCP47">[BCP47]</dt><dd rel="dcterms:requires">A. Phillips; M. Davis. <a href="http://tools.ietf.org/html/bcp47"><cite>Tags for Identifying Languages</cite></a>. September 2009. IETF Best Current Practice. URL: <a href="http://tools.ietf.org/html/bcp47">http://tools.ietf.org/html/bcp47</a>
+</dd><dt id="bib-EBNF-NOTATION">[EBNF-NOTATION]</dt><dd rel="dcterms:requires">Tim Bray; Jean Paoli; C. M. Sperberg-McQueen; Eve Maler; François Yergeau. <a href="https://www.w3.org/TR/REC-xml/#sec-notation"><cite>EBNF Notation</cite></a> 26 November 2008. W3C Recommendation. URL: <a href="https://www.w3.org/TR/REC-xml/#sec-notation">http://www.w3.org/TR/REC-xml/#sec-notation</a>
+</dd><dt id="bib-RDF11-CONCEPTS">[RDF11-CONCEPTS]</dt><dd rel="dcterms:requires">Richard Cyganiak, David Wood, Markus Lanthaler. <cite><a href="https://www.w3.org/TR/2014/REC-rdf11-concepts-20140225/">RDF 1.1 Concepts and Abstract Syntax.</a></cite> W3C Recommendation, 25 February 2014. URL: <a href="https://www.w3.org/TR/2014/REC-rdf11-concepts-20140225/">http://www.w3.org/TR/2014/REC-rdf11-concepts-20140225/</a>. The latest edition is available at <a href="https://www.w3.org/TR/rdf11-concepts/">http://www.w3.org/TR/rdf11-concepts/</a>
+</dd><dt id="bib-RFC2119">[RFC2119]</dt><dd rel="dcterms:requires">S. Bradner. <a href="http://www.ietf.org/rfc/rfc2119.txt"><cite>Key words for use in RFCs to Indicate Requirement Levels.</cite></a> March 1997. Internet RFC 2119.  URL: <a href="http://www.ietf.org/rfc/rfc2119.txt">http://www.ietf.org/rfc/rfc2119.txt</a> 
+</dd><dt id="bib-RFC3023">[RFC3023]</dt><dd rel="dcterms:requires">M. Murata; S. St.Laurent; D. Kohn. <a href="http://www.ietf.org/rfc/rfc3023.txt"><cite>XML Media Types (RFC 3023)</cite></a>. January 2001. RFC. URL: <a href="http://www.ietf.org/rfc/rfc3023.txt">http://www.ietf.org/rfc/rfc3023.txt</a>
+</dd><dt id="bib-RFC3986">[RFC3986]</dt><dd rel="dcterms:requires">T. Berners-Lee; R. Fielding; L. Masinter. <a href="http://www.ietf.org/rfc/rfc3986.txt"><cite>Uniform Resource Identifier (URI): Generic Syntax (RFC 3986)</cite></a>. January 2005. RFC. URL: <a href="http://www.ietf.org/rfc/rfc3986.txt">http://www.ietf.org/rfc/rfc3986.txt</a>
+</dd><dt id="bib-RFC3987">[RFC3987]</dt><dd rel="dcterms:requires">M. Dürst; M. Suignard. <a href="http://www.ietf.org/rfc/rfc3987.txt"><cite>Internationalized Resource Identifiers (IRIs)</cite></a>. January 2005. RFC. URL: <a href="http://www.ietf.org/rfc/rfc3987.txt">http://www.ietf.org/rfc/rfc3987.txt</a>
+</dd><dt id="bib-TURTLE">[TURTLE]</dt><dd rel="dcterms:requires">Eric Prud'hommeaux, Gavin Carothers. <cite><a href="https://www.w3.org/TR/2014/REC-turtle-20140225/">RDF 1.1 Turtle: Terse RDF Triple Language.</a></cite> W3C Recommendation, 25 February 2014. URL: <a href="https://www.w3.org/TR/2014/REC-turtle-20140225/">http://www.w3.org/TR/2014/REC-turtle-20140225/</a>. The latest edition is available at <a href="https://www.w3.org/TR/turtle/">http://www.w3.org/TR/turtle/</a>
+</dd><dt id="bib-UNICODE">[UNICODE]</dt><dd rel="dcterms:requires"><a href="http://www.unicode.org/versions/latest/"><cite>The Unicode Standard</cite></a>. URL: <a href="http://www.unicode.org/versions/latest/">http://www.unicode.org/versions/latest/</a>
+</dd><dt id="bib-UTF-8">[UTF-8]</dt><dd rel="dcterms:requires">F. Yergeau. <a href="http://www.ietf.org/rfc/rfc3629.txt"><cite>UTF-8, a transformation format of ISO 10646</cite></a>. IETF RFC 3629. November 2003. URL: <a href="http://www.ietf.org/rfc/rfc3629.txt">http://www.ietf.org/rfc/rfc3629.txt</a>
+</dd></dl></section><section id="informative-references" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter"><h3 aria-level="2" role="heading" id="h3_informative-references"><span class="secno">D.2 </span>Informative references</h3><dl class="bibliography" about=""><dt id="bib-SPARQL11-QUERY">[SPARQL11-QUERY]</dt><dd rel="dcterms:references">Steven Harris; Andy Seaborne. <a href="https://www.w3.org/TR/sparql11-query/"><cite>SPARQL 1.1 Query Language</cite></a>. 21 March 2013. W3C Recommendation. URL: <a href="https://www.w3.org/TR/sparql11-query/">http://www.w3.org/TR/sparql11-query/</a>
+</dd><dt id="bib-UNICODE-SECURITY">[UNICODE-SECURITY]</dt><dd rel="dcterms:references">Mark Davis; Michel Suignard. <a href="http://www.unicode.org/reports/tr36/"><cite>Unicode Security Considerations</cite></a>. URL: <a href="http://www.unicode.org/reports/tr36/">http://www.unicode.org/reports/tr36/</a>
+</dd></dl></section></section><script src="https://www.w3.org/scripts/TR/fixup.js"></script></body><div id="codex-agent-overlay-root" data-codex-agent-overlay-root="true"></div></html>

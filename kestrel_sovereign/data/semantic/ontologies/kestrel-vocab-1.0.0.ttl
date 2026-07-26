@@ -1,0 +1,22 @@
+@prefix kestrel: <https://kestrel.ai/vocab/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix time: <http://www.w3.org/2006/time#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+<https://kestrel.ai/vocab/> a owl:Ontology ;
+    owl:versionIRI <https://kestrel.ai/vocab/1.0.0> ;
+    rdfs:label "Kestrel semantic vocabulary"@en ;
+    rdfs:comment "Schema only. This ontology grants no authority, permission, role, or tool access."@en .
+
+kestrel:SemanticAssertion a rdfs:Class ; rdfs:label "semantic assertion"@en .
+kestrel:AssertionRevision a rdfs:Class ; rdfs:label "assertion revision"@en .
+kestrel:SourceOccurrence a rdfs:Class ; rdfs:subClassOf prov:Entity .
+kestrel:hasRevision a rdf:Property ; rdfs:domain kestrel:SemanticAssertion ; rdfs:range kestrel:AssertionRevision .
+kestrel:hasSourceOccurrence a rdf:Property ; rdfs:domain kestrel:AssertionRevision ; rdfs:range kestrel:SourceOccurrence .
+kestrel:validTime a rdf:Property ; rdfs:range time:TemporalEntity .
+kestrel:observedTime a rdf:Property ; rdfs:range time:TemporalEntity .
+kestrel:confidence a rdf:Property ; rdfs:range xsd:decimal .
+kestrel:preferredDeployRegion a rdf:Property ; rdfs:label "preferred deploy region"@en .

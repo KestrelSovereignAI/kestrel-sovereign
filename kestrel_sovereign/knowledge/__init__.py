@@ -1,9 +1,12 @@
-"""Canonical, dependency-free semantic knowledge value contracts.
+"""Canonical assertion contracts and offline semantic knowledge resources.
 
-The names re-exported here are the one public package surface for semantic
-assertions.  Storage, RDF codecs, inference, and training code must consume
-these types rather than define competing assertion dataclasses.
+This package is the public surface for Kestrel's dependency-free assertion
+value model and its versioned, local semantic-resource registry.
 """
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 from .assertion import (
     IDENTITY_VERSION,
@@ -46,8 +49,51 @@ from .assertion import (
     lineage_from_mapping,
     normalize_iri,
 )
+if TYPE_CHECKING:
+    from .rdf_codec import (
+        RdfAssertionCodec,
+        RdfAssertionReadAdapter,
+        RdfBlankNode,
+        RdfCapabilityReport,
+        RdfCodecConfiguration,
+        RdfCodecError,
+        RdfDataset,
+        RdfImportBudgetError,
+        RdfImportDocument,
+        RdfImportLimits,
+        RdfImportOwnership,
+        RdfImportSecurityError,
+        RdfIri,
+        RdfLiteral,
+        RdfOwnershipError,
+        RdfProjectionKind,
+        RdfTerm,
+        RdfTriple,
+        RdfTripleTerm,
+        RdfTypedQuery,
+        Sparql11AssertionReadAdapter,
+        Sparql12AssertionReadAdapter,
+        UnsupportedRdfCapabilityError,
+    )
+    from .registry import (
+        ArtifactPin,
+        ExperimentalCapabilityError,
+        KnowledgeRegistryError,
+        ResolvedSemanticCapability,
+        ResourceKind,
+        ResourceRequirement,
+        SemanticCapabilityContract,
+        SemanticKnowledgeRegistry,
+        SemanticResource,
+        SemanticVersion,
+        StandardsMaturity,
+        VersionConstraint,
+        get_knowledge_registry,
+        load_knowledge_registry,
+    )
 
 __all__ = [
+    "ArtifactPin",
     "Assertion",
     "AssertionObject",
     "AssertionQuery",
@@ -59,10 +105,12 @@ __all__ = [
     "DerivedLineage",
     "DirectLineage",
     "EpistemicState",
+    "ExperimentalCapabilityError",
     "IDENTITY_VERSION",
     "IRI",
     "IRI_PROFILE",
     "Instant",
+    "KnowledgeRegistryError",
     "LITERAL_PROFILE",
     "Lineage",
     "Literal",
@@ -70,10 +118,41 @@ __all__ = [
     "MAPPING_SCHEMA_VERSION",
     "OntologyRef",
     "RDF_LANG_STRING",
+    "RdfAssertionCodec",
+    "RdfAssertionReadAdapter",
+    "RdfBlankNode",
+    "RdfCapabilityReport",
+    "RdfCodecConfiguration",
+    "RdfCodecError",
+    "RdfDataset",
+    "RdfImportBudgetError",
+    "RdfImportDocument",
+    "RdfImportLimits",
+    "RdfImportOwnership",
+    "RdfImportSecurityError",
+    "RdfIri",
+    "RdfLiteral",
+    "RdfOwnershipError",
+    "RdfProjectionKind",
+    "RdfTerm",
+    "RdfTriple",
+    "RdfTripleTerm",
+    "RdfTypedQuery",
+    "ResolvedSemanticCapability",
     "Resource",
+    "ResourceKind",
+    "ResourceRequirement",
+    "SemanticCapabilityContract",
+    "SemanticKnowledgeRegistry",
+    "SemanticResource",
+    "SemanticVersion",
     "SourceOccurrence",
     "SourceProvenance",
+    "Sparql11AssertionReadAdapter",
+    "Sparql12AssertionReadAdapter",
+    "StandardsMaturity",
     "TemporalInterval",
+    "VersionConstraint",
     "Visibility",
     "XSD_BOOLEAN",
     "XSD_DATE",
@@ -83,8 +162,71 @@ __all__ = [
     "XSD_INTEGER",
     "XSD_STRING",
     "XSD_TIME",
+    "UnsupportedRdfCapabilityError",
     "derive_assertion_id",
+    "get_knowledge_registry",
     "identity_preimage",
     "lineage_from_mapping",
+    "load_knowledge_registry",
     "normalize_iri",
 ]
+
+_REGISTRY_EXPORTS = frozenset(
+    {
+        "ArtifactPin",
+        "ExperimentalCapabilityError",
+        "KnowledgeRegistryError",
+        "ResolvedSemanticCapability",
+        "ResourceKind",
+        "ResourceRequirement",
+        "SemanticCapabilityContract",
+        "SemanticKnowledgeRegistry",
+        "SemanticResource",
+        "SemanticVersion",
+        "StandardsMaturity",
+        "VersionConstraint",
+        "get_knowledge_registry",
+        "load_knowledge_registry",
+    }
+)
+
+_RDF_CODEC_EXPORTS = frozenset(
+    {
+        "RdfAssertionCodec",
+        "RdfAssertionReadAdapter",
+        "RdfBlankNode",
+        "RdfCapabilityReport",
+        "RdfCodecConfiguration",
+        "RdfCodecError",
+        "RdfDataset",
+        "RdfImportBudgetError",
+        "RdfImportDocument",
+        "RdfImportLimits",
+        "RdfImportOwnership",
+        "RdfImportSecurityError",
+        "RdfIri",
+        "RdfLiteral",
+        "RdfOwnershipError",
+        "RdfProjectionKind",
+        "RdfTerm",
+        "RdfTriple",
+        "RdfTripleTerm",
+        "RdfTypedQuery",
+        "Sparql11AssertionReadAdapter",
+        "Sparql12AssertionReadAdapter",
+        "UnsupportedRdfCapabilityError",
+    }
+)
+
+
+def __getattr__(name: str):
+    """Lazily expose optional boundaries so registry CLI execution stays clean."""
+    if name in _REGISTRY_EXPORTS:
+        from . import registry
+
+        return getattr(registry, name)
+    if name in _RDF_CODEC_EXPORTS:
+        from . import rdf_codec
+
+        return getattr(rdf_codec, name)
+    raise AttributeError(name)

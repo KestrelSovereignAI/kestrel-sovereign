@@ -1,0 +1,7 @@
+{
+  "profile": "owl2rl-kestrel-v1",
+  "allows": ["rdfs:subClassOf", "rdfs:subPropertyOf", "rdfs:domain", "rdfs:range", "owl:equivalentClass", "owl:equivalentProperty", "owl:inverseOf", "owl:TransitiveProperty", "owl:SymmetricProperty", "owl:propertyChainAxiom:max-3"],
+  "forbids": ["owl:imports", "owl:sameAs", "custom-rules", "sparql-rules", "authorization-effects"],
+  "network_access": false,
+  "forward_only": true
+}
