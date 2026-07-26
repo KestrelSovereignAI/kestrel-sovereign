@@ -140,6 +140,10 @@ class PostgresBackend(DatabaseBackend):
         self._advisory_dsn = dsn
         self._advisory_connect_args: tuple[Any, ...] = (dsn,) if dsn else ()
         self._advisory_connect_kwargs: dict[str, Any] = {}
+        self._advisory_recipe_available = self._has_advisory_connection_recipe(
+            self._advisory_connect_args,
+            self._advisory_connect_kwargs,
+        )
         self._advisory_pool: Optional[asyncpg.Pool] = None
         self._advisory_pool_lock = asyncio.Lock()
         
@@ -219,6 +223,10 @@ class PostgresBackend(DatabaseBackend):
             **pool_kwargs,
             **dict(advisory_connect_kwargs or {}),
         }
+        instance._advisory_recipe_available = cls._has_advisory_connection_recipe(
+            instance._advisory_connect_args,
+            instance._advisory_connect_kwargs,
+        )
         instance._advisory_pool = None
         instance._advisory_pool_lock = asyncio.Lock()
         instance._pool = pool
@@ -256,6 +264,21 @@ class PostgresBackend(DatabaseBackend):
         if record_class is not None:
             kwargs.setdefault("record_class", record_class)
         return raw_args, kwargs
+
+    @staticmethod
+    def _has_advisory_connection_recipe(
+        connect_args: tuple[Any, ...],
+        connect_kwargs: dict[str, Any],
+    ) -> bool:
+        """Whether copied asyncpg settings can create an isolated session."""
+
+        if connect_args and connect_args[0] is not None:
+            return isinstance(connect_args[0], str) and bool(connect_args[0])
+        return all(
+            isinstance(connect_kwargs.get(name), str)
+            and bool(connect_kwargs[name])
+            for name in ("host", "database", "user")
+        )
 
     def _current_txn_conn(self):
         """This task's open transaction connection, or None (#1726).
@@ -391,7 +414,7 @@ class PostgresBackend(DatabaseBackend):
                 return self._advisory_pool
             kwargs = dict(self._advisory_connect_kwargs)
             try:
-                if self._advisory_connect_args:
+                if self._advisory_recipe_available:
                     pool = await asyncpg.create_pool(
                         *self._advisory_connect_args,
                         min_size=0,
@@ -402,7 +425,7 @@ class PostgresBackend(DatabaseBackend):
                     if not self._host or not self._database or not self._user:
                         raise ConnectionError(
                             "Dedicated PostgreSQL advisory locks require connection "
-                            "parameters or advisory_dsn when wrapping an existing pool"
+                            "parameters, advisory_dsn, or a valid wrapped-pool recipe"
                         )
                     pool = await asyncpg.create_pool(
                         host=self._host,

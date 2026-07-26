@@ -77,6 +77,83 @@ async def test_postgres_from_pool_derives_a_dedicated_advisory_pool_recipe():
     shared_pool.acquire.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_postgres_from_pool_derives_keyword_only_advisory_pool_recipe():
+    """asyncpg keyword-only pool settings are a valid dedicated recipe."""
+
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    class _Pool:
+        # Real ``asyncpg.create_pool(host=..., database=..., user=...)``
+        # stores the absent positional DSN as ``(None,)``.
+        _connect_args = (None,)
+        _connect_kwargs = {
+            "host": "postgres.internal",
+            "database": "kestrel",
+            "user": "scheduler",
+            "password": "pool-only-secret",
+        }
+
+        def get_max_size(self):
+            return 2
+
+        acquire = Mock(side_effect=AssertionError("shared pool must not be acquired"))
+
+    shared_pool = _Pool()
+    backend = PostgresBackend.from_pool(shared_pool)
+    assert backend._advisory_recipe_available is True
+    advisory_pool = object()
+    with patch.object(
+        postgres_module.asyncpg,
+        "create_pool",
+        AsyncMock(return_value=advisory_pool),
+    ) as create_pool:
+        assert await backend._ensure_advisory_pool() is advisory_pool
+
+    create_pool.assert_awaited_once_with(
+        None,
+        min_size=0,
+        max_size=2,
+        host="postgres.internal",
+        database="kestrel",
+        user="scheduler",
+        password="pool-only-secret",
+    )
+    shared_pool.acquire.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_postgres_from_pool_rejects_incomplete_advisory_pool_recipe():
+    """Factory/class metadata alone cannot authorize a new DB connection."""
+
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+    from kestrel_sovereign.storage.db.interface import ConnectionError
+
+    class _Pool:
+        _connect_args = ()
+        _connect_kwargs = {}
+        _connect = staticmethod(lambda *_args, **_kwargs: None)
+        _connection_class = object
+        _record_class = object
+
+        def get_max_size(self):
+            return 2
+
+        acquire = Mock(side_effect=AssertionError("shared pool must not be acquired"))
+
+    shared_pool = _Pool()
+    backend = PostgresBackend.from_pool(shared_pool)
+    assert backend._advisory_recipe_available is False
+    with patch.object(postgres_module.asyncpg, "create_pool", AsyncMock()) as create_pool:
+        with pytest.raises(ConnectionError, match="valid wrapped-pool recipe"):
+            await backend._ensure_advisory_pool()
+
+    create_pool.assert_not_awaited()
+    shared_pool.acquire.assert_not_called()
+
+
 def test_postgres_from_pool_explicit_advisory_dsn_ignores_pool_connect_kwargs():
     """An explicit scheduler DSN does not inherit operational credentials."""
 
