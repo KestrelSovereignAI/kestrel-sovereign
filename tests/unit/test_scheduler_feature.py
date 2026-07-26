@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from kestrel_sdk.tools.result import ToolResultStatus
+from kestrel_sovereign.agent.sleep import SleepMixin
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 from kestrel_sovereign.features.scheduler.runner import SchedulerRunner, ScheduledTask
@@ -406,6 +407,32 @@ class TestSleepCronHandler:
         assert kwargs["skip_export"] is True
         assert kwargs["skip_reflection"] is True  # idle → reflection skipped
         assert '"success": true' in out
+
+    @pytest.mark.asyncio
+    async def test_handle_sleep_reports_structured_consolidation_failure(self):
+        """The default no-export cron must not report a failed pass as success."""
+        class _SleepAgent(SleepMixin):
+            pass
+
+        agent = _SleepAgent()
+        agent.agent_id = "did:test:scheduler-agent"
+        agent.did = agent.agent_id
+        agent.features = {}
+        agent.storage = MagicMock()
+        agent.storage.db = _make_mock_db()
+        agent.sleep_hooks = []
+        agent._consolidate_memories = AsyncMock(
+            return_value={"error": "provider unavailable"}
+        )
+        f = SchedulerFeature(agent)
+        with patch.object(SchedulerRunner, "start", new_callable=AsyncMock):
+            await f.initialize()
+
+        payload = json.loads(await f._handle_sleep({"skip_reflection": True}))
+
+        agent._consolidate_memories.assert_awaited_once()
+        assert payload["success"] is False
+        assert payload["error"] == "consolidation_failed"
 
     @pytest.mark.asyncio
     async def test_handle_sleep_reflects_when_active(self):
