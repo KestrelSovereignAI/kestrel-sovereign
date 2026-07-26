@@ -756,8 +756,10 @@ async def test_claim_does_not_adopt_future_version_schedule_marker(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_dynamic_registration_rollback_removes_unshared_owned_state(tmp_path):
-    """An isolated failed registration still removes its own durable state."""
+async def test_dynamic_registration_rollback_locks_control_before_removing_unshared_owned_state(
+    tmp_path, monkeypatch,
+):
+    """Rollback locks its control row before deleting its owned schedules."""
 
     db = await _database(tmp_path / "unshared-registration-rollback.db")
     agent_id = "did:scheduler:unshared-registration-rollback"
@@ -796,8 +798,33 @@ async def test_dynamic_registration_rollback_removes_unshared_owned_state(tmp_pa
         )
         assert reused.data["existing"] is True
 
+        rollback_steps = []
+        execute = db.execute
+        fetchall = db.fetchall
+
+        async def record_execute(sql, params=()):
+            normalized = " ".join(sql.split()).lower()
+            if (
+                normalized.startswith("update scheduler_protocol_rollout")
+                and "set updated_at = updated_at" in normalized
+                and "scheduler_registration_nonce" not in normalized
+            ):
+                rollback_steps.append("rollout")
+            elif normalized.startswith("delete from scheduler_protocol_rollout"):
+                rollback_steps.append("rollout_delete")
+            return await execute(sql, params)
+
+        async def record_fetchall(sql, params=()):
+            normalized = " ".join(sql.split()).lower()
+            if normalized.startswith("delete from scheduled_tasks"):
+                rollback_steps.append("schedules")
+            return await fetchall(sql, params)
+
+        monkeypatch.setattr(db, "execute", record_execute)
+        monkeypatch.setattr(db, "fetchall", record_fetchall)
         await runner.rollback_tenant_registration(registration)
 
+        assert rollback_steps == ["rollout", "schedules", "rollout_delete"]
         assert await db.fetchone(
             "SELECT COUNT(*) FROM scheduled_tasks WHERE agent_id = ?", (agent_id,)
         ) == (0,)

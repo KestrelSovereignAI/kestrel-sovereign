@@ -3439,6 +3439,7 @@ class SchedulerRunner:
         agent_id = registration.agent_id
         async with self._bootstrap_serialization_boundary():
             await self._reject_newer_scheduler_protocol_state()
+            await self._lock_registration_rollout_control(agent_id)
             await self._delete_registration_owned_rows(registration)
             if not registration.rollout_preexisting:
                 await self._db.execute(
@@ -3463,6 +3464,26 @@ class SchedulerRunner:
                         agent_id,
                     ),
                 )
+
+    async def _lock_registration_rollout_control(self, agent_id: str) -> None:
+        """Lock one registration's rollout row before its schedule rows.
+
+        Claims and schedule mutators acquire the per-DID rollout control row
+        before their target schedule row.  Keep rollback in that order too:
+        PostgreSQL otherwise can deadlock when a failed registration deletes
+        an owned schedule while another replica is claiming or mutating it.
+        The no-op write preserves the pending registration nonce; SQLite keeps
+        its existing advisory-gate behavior while using the same SQL path.
+        """
+
+        await self._db.execute(
+            """
+            UPDATE scheduler_protocol_rollout
+            SET updated_at = updated_at
+            WHERE agent_id = ?
+            """,
+            (agent_id,),
+        )
 
     async def _delete_registration_owned_rows(
         self,

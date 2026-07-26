@@ -1601,6 +1601,148 @@ async def test_postgres_registration_rollback_keeps_other_replica_rows(
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_postgres_registration_rollback_locks_rollout_before_owned_schedule(
+    db_backend,
+):
+    """Rollback shares claim/mutator's rollout-then-schedule lock order.
+
+    The probe releases a mutator holding the rollout row only after rollback
+    reaches its first conflicting lock.  A schedule-first rollback holds the
+    schedule, then waits for the control row while the mutator waits for that
+    schedule: PostgreSQL aborts the deadlock.  The fixed control-row-first
+    ordering lets the mutator finish, then cleanup proceed.
+    """
+
+    if db_backend.backend_type != "postgres":
+        pytest.skip("the lock-order regression requires PostgreSQL")
+
+    async with _top_level_scheduler_databases(db_backend, count=2) as databases:
+        db_owner, db_mutator = databases
+        agent_id = f"did:scheduler:rollback-lock-order:{uuid4()}"
+        bootstrap_owner = SchedulerRunner(
+            db_owner,
+            None,
+            _noop_executor,
+            authorized_agent_ids=(agent_id,),
+            owner_id="rollback-lock-order-bootstrap",
+        )
+        registration = await bootstrap_owner.prepare_tenant_registration()
+        task_id = f"rollback-lock-order-task:{uuid4()}"
+        now = datetime.now(timezone.utc).isoformat()
+        await db_owner.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 created_at, scheduler_protocol_version,
+                 scheduler_registration_nonce)
+            VALUES (?, ?, 'backup_snapshot', '@daily', '{}', 1, ?, ?, ?)
+            """,
+            (
+                task_id,
+                agent_id,
+                now,
+                SCHEDULER_PROTOCOL_VERSION,
+                registration.registration_nonce,
+            ),
+        )
+
+        rollback_reached_first_conflicting_lock = asyncio.Event()
+        mutator_locked_rollout = asyncio.Event()
+
+        class RollbackLockOrderDatabase:
+            """Expose the first rollback lock without changing its SQL."""
+
+            def __init__(self, database):
+                self._database = database
+
+            @property
+            def backend(self):
+                return self._database.backend
+
+            def __getattr__(self, name):
+                return getattr(self._database, name)
+
+            async def execute(self, sql, params=()):
+                normalized = " ".join(sql.split()).lower()
+                is_rollout_lock = (
+                    normalized.startswith("update scheduler_protocol_rollout")
+                    and "set updated_at = updated_at" in normalized
+                    and "scheduler_registration_nonce" not in normalized
+                )
+                if is_rollout_lock:
+                    # Signal before the query blocks behind the mutator's
+                    # control-row lock. With the old schedule-first cleanup,
+                    # the CTE below instead signals only after it holds the
+                    # schedule row, deterministically recreating the cycle.
+                    rollback_reached_first_conflicting_lock.set()
+                if "with deleted_schedules as" in normalized:
+                    result = await self._database.execute(sql, params)
+                    rollback_reached_first_conflicting_lock.set()
+                    return result
+                return await self._database.execute(sql, params)
+
+        owner = SchedulerRunner(
+            RollbackLockOrderDatabase(db_owner),
+            None,
+            _noop_executor,
+            authorized_agent_ids=(agent_id,),
+            owner_id="rollback-lock-order-owner",
+        )
+
+        async def mutate_owned_schedule() -> None:
+            async with db_mutator.transaction():
+                await db_mutator.execute(
+                    """
+                    UPDATE scheduler_protocol_rollout
+                    SET updated_at = updated_at
+                    WHERE agent_id = ? AND protocol_version = ? AND state = ?
+                    """,
+                    (
+                        agent_id,
+                        SCHEDULER_PROTOCOL_VERSION,
+                        SCHEDULER_ROLLOUT_STATE_ACTIVE,
+                    ),
+                )
+                mutator_locked_rollout.set()
+                await rollback_reached_first_conflicting_lock.wait()
+                await db_mutator.execute(
+                    """
+                    UPDATE scheduled_tasks SET task_name = task_name
+                    WHERE id = ? AND agent_id = ?
+                    """,
+                    (task_id, agent_id),
+                )
+
+        mutator_task = asyncio.create_task(mutate_owned_schedule())
+        rollback_task = None
+        try:
+            await asyncio.wait_for(mutator_locked_rollout.wait(), timeout=1)
+            rollback_task = asyncio.create_task(
+                owner.rollback_tenant_registration(registration)
+            )
+            await asyncio.wait_for(
+                asyncio.gather(mutator_task, rollback_task), timeout=5
+            )
+        finally:
+            for task in (mutator_task, rollback_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (mutator_task, rollback_task) if task is not None),
+                return_exceptions=True,
+            )
+
+        assert await db_owner.fetchone(
+            "SELECT COUNT(*) FROM scheduled_tasks WHERE id = ?", (task_id,)
+        ) == (0,)
+        assert await db_owner.fetchone(
+            "SELECT COUNT(*) FROM scheduler_protocol_rollout WHERE agent_id = ?",
+            (agent_id,),
+        ) == (0,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 @pytest.mark.parametrize("shared_action", ["claim", "pause"])
 async def test_postgres_registration_rollback_preserves_owner_row_adopted_by_claim_or_mutation(
     db_backend, shared_action,
@@ -1679,13 +1821,15 @@ async def test_postgres_registration_rollback_keeps_claim_log_adopted_after_stal
 ):
     """An adoption between rollback steps cannot strand its claimed schedule.
 
-    The database wrapper forces the former interleaving deterministically:
-    after rollback has read an owned schedule ID (the pre-fix path), or just
-    before its atomic CTE (the fixed path), a second real PostgreSQL
-    connection claims and adopts that schedule.  The old read → log delete →
-    schedule delete sequence removed the claim log after adoption cleared the
-    nonce.  The CTE instead sees the adopted row as ineligible and preserves
-    both pieces of durable execution state.
+    The database wrapper forces the former interleaving deterministically.
+    With the control-row lock, it adopts immediately before rollback locks
+    that row: this is the last point at which the replica can win.  Once
+    rollback has the control-row lock, a replica claim correctly waits, so
+    injecting adoption at the CTE would self-wait.  The legacy read hook and
+    pre-CTE fallback remain for paths without the lock.  The old read → log
+    delete → schedule delete sequence removed the claim log after adoption
+    cleared the nonce.  The CTE instead sees the adopted row as ineligible
+    and preserves both pieces of durable execution state.
     """
 
     if db_backend.backend_type != "postgres":
@@ -1716,7 +1860,7 @@ async def test_postgres_registration_rollback_keeps_claim_log_adopted_after_stal
             adopted = True
 
         class RollbackAdoptionInterleavingDatabase:
-            """Force adoption after a legacy read or before the atomic delete."""
+            """Adopt before rollback's control lock, with legacy fallbacks."""
 
             def __init__(self, database):
                 self._database = database
@@ -1739,7 +1883,20 @@ async def test_postgres_registration_rollback_keeps_claim_log_adopted_after_stal
                 return rows
 
             async def execute(self, sql, params=()):
-                if "with deleted_schedules as" in " ".join(sql.split()).lower():
+                normalized = " ".join(sql.split()).lower()
+                is_rollout_lock = (
+                    normalized.startswith("update scheduler_protocol_rollout")
+                    and "set updated_at = updated_at" in normalized
+                    and "scheduler_registration_nonce" not in normalized
+                )
+                if is_rollout_lock:
+                    # This is the final interleaving point at which adoption
+                    # can acquire the rollout row before rollback does.
+                    await adopt_and_claim()
+                elif "with deleted_schedules as" in normalized:
+                    # Older rollback paths did not lock the control row.
+                    # Keep the old pre-CTE injection to test their atomic
+                    # deletion behavior without blocking on that row.
                     await adopt_and_claim()
                 return await self._database.execute(sql, params)
 
