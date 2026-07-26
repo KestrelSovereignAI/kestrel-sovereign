@@ -522,24 +522,71 @@ class SchedulerFeature(Feature):
             async with self._schedule_transaction():
                 if not await self._lock_active_scheduler_rollout():
                     return self._rollout_mutation_error()
-                existing = await self._db.fetchone(
-                    """
-                    SELECT id, next_run_at, idempotency_key
-                    FROM scheduled_tasks
-                    WHERE agent_id = ?
-                      AND (task_name = ? OR idempotency_key = ?)
-                    ORDER BY CASE WHEN idempotency_key = ? THEN 0 ELSE 1 END,
-                             created_at ASC
-                    LIMIT 1
-                    """,
-                    (
-                        self._agent_id,
-                        task_name,
-                        stable_idempotency,
-                        stable_idempotency,
-                    ),
-                )
-                if existing is not None:
+                while True:
+                    existing = await self._db.fetchone(
+                        """
+                        SELECT id, next_run_at, idempotency_key,
+                               scheduler_registration_nonce
+                        FROM scheduled_tasks
+                        WHERE agent_id = ?
+                          AND (task_name = ? OR idempotency_key = ?)
+                        ORDER BY CASE WHEN idempotency_key = ? THEN 0 ELSE 1 END,
+                                 created_at ASC
+                        LIMIT 1
+                        """,
+                        (
+                            self._agent_id,
+                            task_name,
+                            stable_idempotency,
+                            stable_idempotency,
+                        ),
+                    )
+                    if existing is None:
+                        return await self.schedule_add(
+                            cron_expression=cron_expression,
+                            task_name=task_name,
+                            args_json=args_json,
+                            idempotency_key=stable_idempotency,
+                        )
+
+                    # The prior registration owns this row only while no
+                    # other host has relied on it.  Adopt the exact selected
+                    # built-in before returning it to another registration
+                    # (or a committed host), so that the original owner's
+                    # later rollback cannot remove shared scheduler state.
+                    # A retry by the same pending registration deliberately
+                    # retains its marker: that registration still owns the
+                    # row until onboarding commits.
+                    existing_registration_nonce = existing[3]
+                    pending_registration_nonce = (
+                        self._pending_scheduler_registration_nonce()
+                    )
+                    if (
+                        existing_registration_nonce is not None
+                        and existing_registration_nonce
+                        != pending_registration_nonce
+                    ):
+                        adopted = await self._db.execute(
+                            """
+                            UPDATE scheduled_tasks
+                            SET scheduler_registration_nonce = NULL
+                            WHERE id = ? AND agent_id = ?
+                              AND scheduler_registration_nonce = ?
+                            """,
+                            (
+                                existing[0],
+                                self._agent_id,
+                                existing_registration_nonce,
+                            ),
+                        )
+                        if not self._scheduler_mutation_wrote(adopted):
+                            # The first registration may have rolled the row
+                            # back after our selection but before adoption.
+                            # Do not report a vanished schedule as reusable.
+                            # Recheck while retaining the rollout lock; if a
+                            # competing host has not replaced the row, this
+                            # iteration selects that replacement instead.
+                            continue
                     return ToolResult.ok(
                         confirmation=(
                             f"Built-in schedule '{task_name}' already exists"
@@ -552,12 +599,6 @@ class SchedulerFeature(Feature):
                             "existing": True,
                         },
                     )
-                return await self.schedule_add(
-                    cron_expression=cron_expression,
-                    task_name=task_name,
-                    args_json=args_json,
-                    idempotency_key=stable_idempotency,
-                )
         except Exception as error:
             logger.error(
                 "Failed to ensure built-in schedule %s: %s",

@@ -413,10 +413,18 @@ async def test_dynamic_registration_rollback_removes_unshared_owned_state(tmp_pa
         feature._db = db
         feature._agent_id = agent_id
         agent.features = {"SchedulerFeature": feature}
-        added = await feature.schedule_add(
-            "@daily", "backup_snapshot", idempotency_key="registration:unshared"
+        added = await feature._ensure_builtin_schedule(
+            cron_expression="@daily",
+            task_name="backup_snapshot",
+            args_json="{}",
         )
         assert added.status.value == "ok"
+        reused = await feature._ensure_builtin_schedule(
+            cron_expression="@daily",
+            task_name="backup_snapshot",
+            args_json="{}",
+        )
+        assert reused.data["existing"] is True
 
         await runner.rollback_tenant_registration(registration)
 
@@ -473,6 +481,113 @@ async def test_dynamic_registration_rollback_preserves_controller_adopted_by_pre
         # host has nevertheless adopted this DID's active protocol, so the
         # first host's later failed onboarding cannot remove its control row.
         await owner.rollback_tenant_registration(owner_registration)
+        assert await db_owner.fetchone(
+            "SELECT COUNT(*) FROM scheduler_protocol_rollout WHERE agent_id = ?",
+            (agent_id,),
+        ) == (1,)
+    finally:
+        await db_owner.close()
+        await db_replica.close()
+
+
+@pytest.mark.asyncio
+async def test_dynamic_registration_builtin_reuse_adopts_only_other_owner_row(
+    tmp_path,
+):
+    """A second registration protects the built-in it reuses from rollback."""
+
+    database_path = tmp_path / "registration-builtin-adoption.db"
+    db_owner = await _database(database_path)
+    db_replica = await _database(database_path)
+    agent_id = "did:scheduler:registration-builtin-adoption"
+
+    def scheduler_feature_for(db, registration):
+        agent = SimpleNamespace(
+            did=agent_id,
+            agent_id=agent_id,
+            features={},
+            storage=SimpleNamespace(db=db),
+            _dynamic_scheduler_tenant_registration=SimpleNamespace(
+                registration_nonce=registration.registration_nonce
+            ),
+        )
+        feature = SchedulerFeature(agent)
+        feature._db = db
+        feature._agent_id = agent_id
+        agent.features = {"SchedulerFeature": feature}
+        return feature
+
+    owner = SchedulerRunner(
+        db_owner,
+        None,
+        AsyncMock(),
+        authorized_agent_ids=(agent_id,),
+        owner_id="builtin-owner",
+    )
+    replica = SchedulerRunner(
+        db_replica,
+        None,
+        AsyncMock(),
+        authorized_agent_ids=(agent_id,),
+        owner_id="builtin-replica",
+    )
+    try:
+        owner_registration = await owner.prepare_tenant_registration()
+        owner_feature = scheduler_feature_for(db_owner, owner_registration)
+        seeded = await owner_feature._ensure_builtin_schedule(
+            cron_expression="@daily",
+            task_name="backup_snapshot",
+            args_json="{}",
+        )
+        assert seeded.status.value == "ok"
+        task_id = seeded.data["task_id"]
+
+        # Reusing the row from the same pending registration does not make it
+        # shared, so a failure before another host participates still cleans
+        # up the seed.
+        same_registration = await owner_feature._ensure_builtin_schedule(
+            cron_expression="@daily",
+            task_name="backup_snapshot",
+            args_json="{}",
+        )
+        assert same_registration.data["existing"] is True
+        assert await db_owner.fetchone(
+            "SELECT scheduler_registration_nonce FROM scheduled_tasks WHERE id = ?",
+            (task_id,),
+        ) == (owner_registration.registration_nonce,)
+
+        replica_registration = await replica.prepare_tenant_registration()
+        replica_feature = scheduler_feature_for(db_replica, replica_registration)
+        reused = await replica_feature._ensure_builtin_schedule(
+            cron_expression="@daily",
+            task_name="backup_snapshot",
+            args_json="{}",
+        )
+        assert reused.data["existing"] is True
+        assert reused.data["task_id"] == task_id
+        assert await db_owner.fetchone(
+            "SELECT scheduler_registration_nonce FROM scheduled_tasks WHERE id = ?",
+            (task_id,),
+        ) == (None,)
+
+        now = datetime.now(timezone.utc).isoformat()
+        await db_replica.execute(
+            """
+            INSERT INTO task_execution_log
+                (id, task_id, agent_id, status, result_text, duration_ms, executed_at)
+            VALUES (?, ?, ?, 'success', NULL, 0, ?)
+            """,
+            ("reused-builtin-execution", task_id, agent_id, now),
+        )
+
+        await owner.rollback_tenant_registration(owner_registration)
+
+        assert await db_owner.fetchall(
+            "SELECT id FROM scheduled_tasks WHERE agent_id = ?", (agent_id,)
+        ) == [(task_id,)]
+        assert await db_owner.fetchall(
+            "SELECT id FROM task_execution_log WHERE agent_id = ?", (agent_id,)
+        ) == [("reused-builtin-execution",)]
         assert await db_owner.fetchone(
             "SELECT COUNT(*) FROM scheduler_protocol_rollout WHERE agent_id = ?",
             (agent_id,),

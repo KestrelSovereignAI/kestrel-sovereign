@@ -1292,3 +1292,90 @@ async def test_postgres_registration_rollback_keeps_other_replica_rows(
             "SELECT COUNT(*) FROM scheduler_protocol_rollout WHERE agent_id = ?",
             (agent_id,),
         ) == (1,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_postgres_builtin_reuse_adopts_pending_owner_schedule(
+    db_backend,
+):
+    """A second host's built-in reuse survives the first host's rollback."""
+
+    if db_backend.backend_type != "postgres":
+        pytest.skip("SQLite ownership coverage is in test_scheduler_durability")
+
+    async with _top_level_scheduler_databases(db_backend, count=2) as databases:
+        db_owner, db_replica = databases
+        agent_id = f"did:scheduler:builtin-adoption:{uuid4()}"
+
+        def scheduler_feature_for(db, registration):
+            agent = SimpleNamespace(
+                did=agent_id,
+                agent_id=agent_id,
+                features={},
+                _dynamic_scheduler_tenant_registration=SimpleNamespace(
+                    registration_nonce=registration.registration_nonce
+                ),
+            )
+            feature = SchedulerFeature(agent)
+            feature._db = db
+            feature._agent_id = agent_id
+            return feature
+
+        owner = SchedulerRunner(
+            db_owner,
+            None,
+            _noop_executor,
+            authorized_agent_ids=(agent_id,),
+            owner_id="builtin-owner",
+        )
+        replica = SchedulerRunner(
+            db_replica,
+            None,
+            _noop_executor,
+            authorized_agent_ids=(agent_id,),
+            owner_id="builtin-replica",
+        )
+        owner_registration = await owner.prepare_tenant_registration()
+        owner_feature = scheduler_feature_for(db_owner, owner_registration)
+        seeded = await owner_feature._ensure_builtin_schedule(
+            cron_expression="@daily",
+            task_name="backup_snapshot",
+            args_json="{}",
+        )
+        task_id = seeded.data["task_id"]
+        replica_registration = await replica.prepare_tenant_registration()
+        replica_feature = scheduler_feature_for(db_replica, replica_registration)
+
+        reused = await replica_feature._ensure_builtin_schedule(
+            cron_expression="@daily",
+            task_name="backup_snapshot",
+            args_json="{}",
+        )
+        assert reused.data["existing"] is True
+        assert await db_owner.fetchone(
+            "SELECT scheduler_registration_nonce FROM scheduled_tasks WHERE id = ?",
+            (task_id,),
+        ) == (None,)
+
+        now = datetime.now(timezone.utc).isoformat()
+        await db_replica.execute(
+            """
+            INSERT INTO task_execution_log
+                (id, task_id, agent_id, status, result_text, duration_ms, executed_at)
+            VALUES (?, ?, ?, 'success', NULL, 0, ?)
+            """,
+            (f"builtin-reuse-execution:{uuid4()}", task_id, agent_id, now),
+        )
+        await owner.rollback_tenant_registration(owner_registration)
+
+        assert await db_owner.fetchone(
+            "SELECT COUNT(*) FROM scheduled_tasks WHERE id = ?", (task_id,)
+        ) == (1,)
+        assert await db_owner.fetchone(
+            "SELECT COUNT(*) FROM task_execution_log WHERE task_id = ?", (task_id,)
+        ) == (1,)
+        assert await db_owner.fetchone(
+            "SELECT COUNT(*) FROM scheduler_protocol_rollout WHERE agent_id = ?",
+            (agent_id,),
+        ) == (1,)
