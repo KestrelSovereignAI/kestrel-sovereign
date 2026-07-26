@@ -360,6 +360,16 @@ may prove byte-identical normalization for an explicit compatibility relation,
 but it still uses a new identity version unless that relation is part of a new,
 reviewed identity contract and its conformance corpus.
 
+### Decimal mapping bounds
+
+The versioned public mappings encode assertion confidence and optional result
+scores as exact fixed-point decimal strings. Before fixed-point conversion, a
+finite value must have an absolute Decimal exponent no greater than `1000` and
+its serialized form must be no more than `1024` ASCII characters. This keeps a
+compact untrusted exponent such as `1e-100000000` from creating an unbounded
+mapping allocation; the boundary rejects it rather than rounding, clamping, or
+changing its value.
+
 ### Canonical term algebra and RDF 1.2 boundary
 
 `kestrel-assertion-id-v1` has a deliberately closed `AssertionTerm` algebra:
