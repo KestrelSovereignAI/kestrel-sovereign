@@ -113,6 +113,8 @@ def _use_postgres_clock(feature, database_now, *, scheduled_row=None):
             events.append("schedule_insert")
         elif "UPDATE scheduled_tasks" in sql:
             events.append("schedule_update")
+        elif "UPDATE task_execution_log" in sql:
+            events.append("execution_terminal")
         return 1
 
     feature._db.backend_type = "postgres"
@@ -1983,6 +1985,54 @@ class TestScheduleUpdate:
             "schedule_update",
         ]
         assert events[-1] == "transaction_end"
+
+    @pytest.mark.asyncio
+    async def test_update_terminalizes_claim_with_database_clock_after_schedule_write(
+        self, feature
+    ):
+        """Superseding a claim must not publish a skewed API-host audit time."""
+
+        database_now = datetime(2026, 7, 25, 8, 0, 30, tzinfo=timezone.utc)
+        events = _use_postgres_clock(
+            feature,
+            database_now,
+            scheduled_row=("@daily", 1, "cron", "UTC", 0, 0),
+        )
+
+        with patch(
+            "kestrel_sovereign.features.scheduler.feature.datetime"
+        ) as host_datetime:
+            host_datetime.now.return_value = datetime(
+                2040, 1, 1, 0, 0, tzinfo=timezone.utc
+            )
+            result = await feature.schedule_update(
+                task_id="task-id",
+                cron_expression="* * * * *",
+            )
+
+        assert result.status is ToolResultStatus.OK
+        terminal_call = next(
+            call
+            for call in feature._db.execute.call_args_list
+            if "UPDATE task_execution_log" in call.args[0]
+        )
+        assert "clock_timestamp()" in terminal_call.args[0]
+        assert terminal_call.args[1] == (
+            "superseded",
+            "schedule definition updated before outcome commit",
+            "task-id",
+            feature._agent_id,
+        )
+        assert events == [
+            "transaction_begin",
+            "schema_lock",
+            "rollout_lock",
+            "schedule_read",
+            "database_clock",
+            "schedule_update",
+            "execution_terminal",
+            "transaction_end",
+        ]
 
     @pytest.mark.asyncio
     async def test_update_invalid_cron(self, feature):

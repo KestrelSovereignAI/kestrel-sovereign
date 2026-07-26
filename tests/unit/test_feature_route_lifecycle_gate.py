@@ -25,7 +25,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastapi import APIRouter, WebSocket
+from fastapi import APIRouter, Depends, WebSocket
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -109,6 +109,40 @@ class _InstanceBoundRouterFeature:
         return router
 
 
+async def _overrideable_feature_route_dependency():
+    """A stable dependency key used to exercise app-level overrides."""
+
+
+class _DependencyBoundRouterFeature:
+    """Instance-bound router with a per-feature dependency for live dispatch."""
+
+    def __init__(self, owner: str, events: list[str]):
+        self.enabled = True
+        self.owner = owner
+        self.events = events
+        self._router = None
+
+    async def _selected_router_dependency(self):
+        self.events.append(f"router:{self.owner}")
+
+    def get_router(self):
+        if self._router is not None:
+            return self._router
+        router = APIRouter(
+            dependencies=[
+                Depends(self._selected_router_dependency),
+                Depends(_overrideable_feature_route_dependency),
+            ]
+        )
+
+        @router.get("/test-feature-lifecycle/dependency-bound")
+        async def dependency_bound():
+            return {"owner": self.owner}
+
+        self._router = router
+        return router
+
+
 def _boot(features):
     """Boot the real app with a mock single agent exposing ``features``.
 
@@ -145,7 +179,7 @@ def _boot(features):
     return app, agent, restore
 
 
-def _boot_multi_agent(agents):
+def _boot_multi_agent(agents, *, app_dependencies=()):
     """Boot the real app in multi-agent mode with the given ``{name: agent}`` map.
 
     Installs a fake ``agent_manager`` (``list_agents`` / ``get_agent``) so the
@@ -164,6 +198,7 @@ def _boot_multi_agent(agents):
         yield
 
     original_lifespan = app.router.lifespan_context
+    original_dependencies = list(app.router.dependencies)
     original_agent = getattr(app.state, "agent", None)
     original_manager = getattr(app.state, "agent_manager", None)
 
@@ -175,6 +210,7 @@ def _boot_multi_agent(agents):
     manager.get_agent = MagicMock(side_effect=lambda name: agents.get(name))
 
     app.router.lifespan_context = noop_lifespan
+    app.router.dependencies = [*original_dependencies, *app_dependencies]
     # Multi-agent mode: no single bound agent, only the manager.
     app.state.agent = None
     app.state.agent_manager = manager
@@ -183,6 +219,7 @@ def _boot_multi_agent(agents):
     def restore():
         _unmount_feature_routers(app)
         app.router.lifespan_context = original_lifespan
+        app.router.dependencies = original_dependencies
         app.state.agent = original_agent
         app.state.agent_manager = original_manager
 
@@ -349,6 +386,55 @@ def test_instance_bound_feature_router_dispatches_to_request_agent_and_reload():
                 1 for route in app.routes if getattr(route, "path", None) == path
             ) == 1
     finally:
+        restore()
+
+
+def test_current_feature_route_keeps_app_overrides_and_live_dependencies():
+    """Current feature dispatch must preserve FastAPI's app-bound execution.
+
+    The mounted route belongs to Alice, but this request selects Bob. The
+    router-level dependency must therefore be Bob's, while the app-level
+    dependency and dependency override still run through the app-owned route
+    copy rather than Bob's source ``current.app``.
+    """
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    events: list[str] = []
+
+    async def host_dependency():
+        events.append("host")
+
+    async def dependency_override():
+        events.append("override")
+
+    alice = _DependencyBoundRouterFeature("alice", events)
+    bob = _DependencyBoundRouterFeature("bob", events)
+    agents = {
+        "alice": _make_agent({"ProxyFeature": alice}),
+        "bob": _make_agent({"ProxyFeature": bob}),
+    }
+    app, restore = _boot_multi_agent(
+        agents,
+        app_dependencies=(Depends(host_dependency),),
+    )
+    previous_overrides = dict(app.dependency_overrides)
+    app.dependency_overrides[_overrideable_feature_route_dependency] = (
+        dependency_override
+    )
+    path = "/test-feature-lifecycle/dependency-bound"
+    try:
+        with TestClient(app) as client:
+            response = client.get(
+                f"/api/agents/bob{path}",
+                headers={"X-API-Key": API_KEY},
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {"owner": "bob"}
+        assert events == ["host", "router:bob", "override"]
+    finally:
+        app.dependency_overrides.clear()
+        app.dependency_overrides.update(previous_overrides)
         restore()
 
 

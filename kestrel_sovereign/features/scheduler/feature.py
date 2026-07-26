@@ -76,6 +76,7 @@ from kestrel_sovereign.features.scheduler.runner import (
     SchedulerProtocolVersionIncompatible,
     SchedulerRunner,
     scheduler_database_clock,
+    scheduler_database_now_sql,
     validate_schedule_idempotency_base,
 )
 from kestrel_sovereign.features.storage_access import resolve_feature_database
@@ -2365,6 +2366,24 @@ class SchedulerFeature(Feature):
         helper only closes logs after the mutation has cleared that token, so
         a stale worker cannot later overwrite the operator's intent.
         """
+        if self._database_backend_type() in {"postgres", "sqlite"}:
+            # The caller already owns the schedule transaction. Evaluate the
+            # completion timestamp in the terminal UPDATE itself, matching
+            # runner finalization so a blocked/clock-skewed API replica cannot
+            # write an audit time that precedes its durable mutation.
+            completed_at_sql = scheduler_database_now_sql(self._db)
+            await self._db.execute(
+                f"""
+                UPDATE task_execution_log
+                SET status = ?, result_text = ?, completed_at = {completed_at_sql}
+                WHERE task_id = ? AND agent_id = ? AND status = 'claimed'
+                """,
+                (status, reason, task_id, self._agent_id),
+            )
+            return
+
+        # Preserve the historic lightweight-adapter contract where there is
+        # no durable database clock to query or express in SQL.
         await self._db.execute(
             """
             UPDATE task_execution_log

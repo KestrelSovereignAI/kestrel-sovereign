@@ -10,6 +10,7 @@ import pytest
 from fastapi import FastAPI
 
 from kestrel_sovereign import server
+from kestrel_sovereign.features.scheduler import feature as scheduler_feature_module
 from kestrel_sovereign.features.scheduler import runner as scheduler_runner_module
 from kestrel_sovereign.features.scheduler.cron import next_run
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
@@ -1395,6 +1396,81 @@ async def test_schedule_update_serializes_with_pause_and_resume_interleavings(tm
     finally:
         await db_a.close()
         await db_b.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "terminal_status"),
+    [("pause", "cancelled"), ("update", "superseded")],
+)
+async def test_schedule_mutation_terminal_audit_time_uses_sqlite_clock(
+    tmp_path, monkeypatch, operation, terminal_status
+):
+    """Pause/update audit rows use SQLite time, not a skewed API process."""
+
+    db = await _database(tmp_path / f"schedule-{operation}-audit-time.db")
+    runner = SchedulerRunner(db, "agent-1", AsyncMock(), owner_id="audit-clock")
+    agent = SimpleNamespace(did="agent-1", agent_id="agent-1", features={})
+    feature = SchedulerFeature(agent)
+    feature._db = db
+    feature._agent_id = "agent-1"
+    claimed_at = "2020-01-01T00:00:00+00:00"
+    host_now = datetime(2040, 1, 1, tzinfo=timezone.utc)
+
+    class _SkewedApiClock:
+        @staticmethod
+        def now(_tz):
+            return host_now
+
+    try:
+        await runner._ensure_tables()
+        await _seed_due(db)
+        await db.execute(
+            """
+            INSERT INTO task_execution_log
+                (id, task_id, agent_id, status, result_text, duration_ms,
+                 executed_at, occurrence_at, idempotency_key, attempt_count,
+                 claimed_at)
+            VALUES ('audit-claim', 'task-1', 'agent-1', 'claimed', NULL, 0,
+                    ?, ?, 'audit-clock-key', 1, ?)
+            """,
+            (claimed_at, claimed_at, claimed_at),
+        )
+        database_before = datetime.fromisoformat(
+            await db.fetchval("SELECT strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')")
+        )
+        monkeypatch.setattr(scheduler_feature_module, "datetime", _SkewedApiClock)
+
+        if operation == "pause":
+            result = await feature.schedule_pause("task-1")
+        else:
+            result = await feature.schedule_update("task-1", "@hourly")
+
+        database_after = datetime.fromisoformat(
+            await db.fetchval("SELECT strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')")
+        )
+        assert result.status.value == "ok"
+        status, completed_at = await db.fetchone(
+            "SELECT status, completed_at FROM task_execution_log WHERE id = 'audit-claim'"
+        )
+        completed = datetime.fromisoformat(completed_at)
+        assert status == terminal_status
+        assert datetime.fromisoformat(claimed_at) < completed
+        assert database_before - timedelta(seconds=1) <= completed <= (
+            database_after + timedelta(seconds=1)
+        )
+        assert completed < host_now
+
+        if operation == "pause":
+            assert await db.fetchone(
+                "SELECT enabled FROM scheduled_tasks WHERE id = 'task-1'"
+            ) == (0,)
+        else:
+            assert await db.fetchone(
+                "SELECT enabled, cron_expression FROM scheduled_tasks WHERE id = 'task-1'"
+            ) == (1, "@hourly")
+    finally:
+        await db.close()
 
 
 def test_legacy_generated_idempotency_base_and_occurrence_are_sdk_safe():

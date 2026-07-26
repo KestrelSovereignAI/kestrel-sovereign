@@ -16,10 +16,15 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request, Security, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.routing import APIRoute, APIWebSocketRoute
 from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
-from starlette.routing import Match
+from starlette.routing import (
+    Match,
+    Route as StarletteRoute,
+    WebSocketRoute as StarletteWebSocketRoute,
+)
 from kestrel_sovereign.main import get_agent_did_async
 from kestrel_sovereign.kestrel_agent import (
     KestrelAgent,
@@ -533,12 +538,118 @@ async def _feature_route_gone_response(scope, receive, send) -> None:
     await Response(status_code=404)(scope, receive, send)
 
 
+def _feature_route_host_dependencies(route, initial_current) -> tuple:
+    """Keep dependencies added by the app while a feature route hot-reloads.
+
+    ``include_router`` concatenates the app/router dependencies before the
+    source route's own dependencies. Strip that initial source suffix so a
+    request can use the selected feature's current router dependencies without
+    retaining a stale sibling feature's closure.
+    """
+
+    mounted = tuple(getattr(route, "dependencies", ()) or ())
+    initial = tuple(getattr(initial_current, "dependencies", ()) or ())
+    if not initial or len(mounted) < len(initial):
+        return mounted
+    if all(left == right for left, right in zip(mounted[-len(initial):], initial)):
+        return mounted[:-len(initial)]
+    # An unusual custom router did not preserve FastAPI's normal suffix
+    # identity. Keep the app-bound dependencies rather than dropping a host
+    # authorization dependency.
+    return mounted
+
+
+def _app_bound_current_feature_route_app(
+    app: FastAPI,
+    mounted_route,
+    current_route,
+    host_dependencies: tuple,
+):
+    """Build a current-feature route with FastAPI's app-owned execution seam.
+
+    The mounted copy carries host dependencies and the app's
+    ``dependency_overrides`` provider; the current child supplies the
+    request-target feature's endpoint and per-router dependencies. Rebuilding
+    the tiny route wrapper per request deliberately avoids retaining a stale
+    bound feature across a reload or a multi-agent request.
+    """
+
+    dependencies = [
+        *host_dependencies,
+        *(getattr(current_route, "dependencies", ()) or ()),
+    ]
+    if isinstance(mounted_route, APIRoute) and isinstance(current_route, APIRoute):
+        rebound = type(mounted_route)(
+            path=mounted_route.path,
+            endpoint=current_route.endpoint,
+            response_model=current_route.response_model,
+            status_code=current_route.status_code,
+            tags=current_route.tags,
+            dependencies=dependencies,
+            summary=current_route.summary,
+            description=current_route.description,
+            response_description=current_route.response_description,
+            responses=current_route.responses,
+            deprecated=current_route.deprecated,
+            methods=mounted_route.methods,
+            operation_id=current_route.operation_id,
+            response_model_include=current_route.response_model_include,
+            response_model_exclude=current_route.response_model_exclude,
+            response_model_by_alias=current_route.response_model_by_alias,
+            response_model_exclude_unset=current_route.response_model_exclude_unset,
+            response_model_exclude_defaults=current_route.response_model_exclude_defaults,
+            response_model_exclude_none=current_route.response_model_exclude_none,
+            include_in_schema=mounted_route.include_in_schema,
+            response_class=current_route.response_class,
+            name=current_route.name,
+            dependency_overrides_provider=app,
+            callbacks=current_route.callbacks,
+            openapi_extra=current_route.openapi_extra,
+            generate_unique_id_function=current_route.generate_unique_id_function,
+            strict_content_type=current_route.strict_content_type,
+        )
+        return rebound.app
+    if isinstance(mounted_route, APIWebSocketRoute) and isinstance(
+        current_route, APIWebSocketRoute
+    ):
+        rebound = APIWebSocketRoute(
+            path=mounted_route.path,
+            endpoint=current_route.endpoint,
+            name=current_route.name,
+            dependencies=dependencies,
+            dependency_overrides_provider=app,
+        )
+        return rebound.app
+    if isinstance(mounted_route, StarletteRoute) and isinstance(
+        current_route, StarletteRoute
+    ):
+        rebound = StarletteRoute(
+            path=mounted_route.path,
+            endpoint=current_route.endpoint,
+            methods=mounted_route.methods,
+            name=current_route.name,
+            include_in_schema=mounted_route.include_in_schema,
+        )
+        return rebound.app
+    if isinstance(mounted_route, StarletteWebSocketRoute) and isinstance(
+        current_route, StarletteWebSocketRoute
+    ):
+        rebound = StarletteWebSocketRoute(
+            path=mounted_route.path,
+            endpoint=current_route.endpoint,
+            name=current_route.name,
+        )
+        return rebound.app
+    return None
+
+
 def _gate_feature_route(
     app: FastAPI,
     route,
     feature_name: str,
     mount_agent,
     selector: tuple,
+    initial_current,
 ) -> None:
     """Wrap ``route`` so it only serves while its owning feature is live-enabled.
 
@@ -558,6 +669,7 @@ def _gate_feature_route(
     from both HTTP and WebSocket matching before either protocol is handled.
     """
     original_matches = route.matches
+    host_dependencies = _feature_route_host_dependencies(route, initial_current)
 
     def _gated_matches(scope):
         agent = _resolve_route_agent(scope, mount_agent)
@@ -586,9 +698,10 @@ def _gate_feature_route(
         return original_matches(scope)
 
     route.matches = _gated_matches
-    # Do not call the copied ``route.app`` here.  Its endpoint is bound to the
-    # feature instance that won initial mounting; request-scoped multi-agent
-    # dispatch must run the target agent's current route object instead.
+    # Do not call the copied ``route.app`` directly: it retains the first
+    # feature's bound endpoint. Do not call ``current.app`` either: that source
+    # child bypasses the app's dependency overrides and host dependencies.
+    # Rebind the current endpoint through a fresh app-owned FastAPI route.
     async def _dispatch_current_feature_route(scope, receive, send):
         agent = _resolve_route_agent(scope, mount_agent)
         features = getattr(agent, "features", None) or {}
@@ -600,7 +713,16 @@ def _gate_feature_route(
         if current is None:
             await _feature_route_gone_response(scope, receive, send)
             return
-        await current.app(scope, receive, send)
+        current_app = _app_bound_current_feature_route_app(
+            app,
+            route,
+            current,
+            host_dependencies,
+        )
+        if current_app is None:
+            await _feature_route_gone_response(scope, receive, send)
+            return
+        await current_app(scope, receive, send)
 
     route.app = _dispatch_current_feature_route
 
@@ -670,7 +792,7 @@ def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
                 # Gate exactly the routes this feature just contributed so a
                 # runtime disable/remove makes them 404 (never a core route).
                 selectors = tuple(
-                    _feature_router_route_selector(router, index)
+                    (_feature_router_route_selector(router, index), candidate)
                     for index, candidate in enumerate(
                         tuple(getattr(router, "routes", ()) or ())
                     )
@@ -685,9 +807,9 @@ def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
                     raise RuntimeError(
                         "Feature router mount did not preserve child-route shape"
                     )
-                for added_route, selector in zip(added, selectors):
+                for added_route, (selector, initial_current) in zip(added, selectors):
                     _gate_feature_route(
-                        app, added_route, name, agent, selector
+                        app, added_route, name, agent, selector, initial_current
                     )
                 mounted_keys.add(router_key)
                 mounted.append(name)

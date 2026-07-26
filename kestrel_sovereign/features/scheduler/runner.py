@@ -39,6 +39,20 @@ def _scheduler_database_backend_type(db: Any) -> str:
     return backend_type.lower() if isinstance(backend_type, str) else ""
 
 
+def scheduler_database_now_sql(db: Any) -> str:
+    """Return the scheduler's portable statement-time UTC clock expression."""
+
+    backend_type = _scheduler_database_backend_type(db)
+    if backend_type == "postgres":
+        return (
+            "(to_char(clock_timestamp() AT TIME ZONE 'UTC', "
+            "'YYYY-MM-DD\"T\"HH24:MI:SS.US') || '+00:00')"
+        )
+    if backend_type == "sqlite":
+        return "strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')"
+    raise RuntimeError("scheduler database clock is unavailable for this backend")
+
+
 async def scheduler_database_clock(db: Any) -> datetime:
     """Read the scheduler's wall clock from its durable database.
 
@@ -1265,14 +1279,7 @@ class SchedulerRunner:
         timestamp representation.
         """
 
-        if self._database_backend_type() == "postgres":
-            return (
-                "(to_char(clock_timestamp() AT TIME ZONE 'UTC', "
-                "'YYYY-MM-DD\"T\"HH24:MI:SS.US') || '+00:00')"
-            )
-        if self._database_backend_type() == "sqlite":
-            return "strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')"
-        raise RuntimeError("scheduler database clock is unavailable for this backend")
+        return scheduler_database_now_sql(self._db)
 
     def _database_lease_expiry_sql(self) -> tuple[str, tuple[Any, ...]]:
         """Return a database-time lease expiry expression and its parameters."""
