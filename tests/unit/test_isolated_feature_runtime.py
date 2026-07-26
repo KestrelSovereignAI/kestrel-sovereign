@@ -25,6 +25,10 @@ from kestrel_sovereign.features.scheduler.runner import (
 )
 
 
+_TEST_AGENT_DID = "did:test:isolated-runtime"
+_TEST_CONFIG_NODE_ID = f"feature_config:v2:{_TEST_AGENT_DID}:TestFeature"
+
+
 class FakeIsolatedClient:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -75,7 +79,7 @@ class FakeIsolatedClient:
 
 @pytest.mark.asyncio
 async def test_proxy_feature_mirrors_tools_and_forwards_calls(monkeypatch, tmp_path):
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     agent.features = {}
 
@@ -131,7 +135,7 @@ async def test_scheduled_isolated_call_fails_before_dispatch_without_context_cap
 ):
     """A legacy isolated service must not receive an unkeyed scheduled effect."""
 
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     agent.features = {}
     feature = ProxyFeature(agent, _isolated_runtime(), client_factory=FakeIsolatedClient)
@@ -198,7 +202,7 @@ async def test_scheduler_revokes_context_for_detached_core_child_before_late_iso
         async def _finalize(self, *args, **kwargs):
             return None
 
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     agent.features = {}
     feature = ProxyFeature(agent, _isolated_runtime(), client_factory=FakeIsolatedClient)
@@ -254,7 +258,7 @@ async def test_scheduler_revokes_context_for_detached_core_child_before_late_iso
 
 def test_service_command_console_script(tmp_path):
     """`service` resolves to a console-script in the venv bin/, not `python -m`."""
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     runtime = InstalledFeatureRuntime(
         class_name="WhatsAppWebFeature",
@@ -274,7 +278,7 @@ def test_service_command_console_script(tmp_path):
 
 def test_service_command_module_func(tmp_path):
     """`service` of the form module:func runs via the venv python, not `-m`."""
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     runtime = InstalledFeatureRuntime(
         class_name="SvcFeature",
@@ -379,7 +383,7 @@ async def test_route_link_qr_persists_png_only(tmp_path):
     orphaned on refresh."""
     import base64
 
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     agent.features = {}
     emitted = []
@@ -413,7 +417,7 @@ async def test_route_link_qr_persists_png_only(tmp_path):
 async def test_route_link_cleared_removes_png(tmp_path):
     """Linking clears the persisted PNG so the channel_link card resolves to
     'expired or already linked'. No sticky/SSE state to retract (#2081)."""
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     agent.features = {}
     emitted = []
@@ -438,7 +442,7 @@ async def test_route_link_cleared_removes_png(tmp_path):
 @pytest.mark.asyncio
 async def test_route_link_qr_rejects_malformed_payloads(tmp_path):
     """Bad channel_type / missing PNG / traversal attempts are dropped, no emit."""
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     agent.features = {}
     emitted = []
@@ -468,7 +472,7 @@ async def test_channel_link_tool_emits_persisted_part(monkeypatch, tmp_path):
     from kestrel_sovereign.agent import parts as parts_mod
 
     channel_feature = FakeChannelFeature()
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     agent.features = {"ChannelFeature": channel_feature}
 
@@ -509,7 +513,7 @@ async def test_channel_link_tool_emits_persisted_part(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_proxy_forwards_host_config_into_client(monkeypatch, tmp_path):
     """Persisted host config is loaded and handed to the client (-> initialize handshake)."""
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     agent.features = {}
 
@@ -551,14 +555,14 @@ async def test_transient_startup_config_read_failure_recovers_without_losing_sec
     class TransientReadStorage(_FakeStorage):
         def __init__(self):
             super().__init__()
-            self.fail_reads = True
+            self.fail_reads = False
 
         async def get_node(self, node_id):
             if self.fail_reads:
                 raise OSError("storage temporarily unavailable")
             return await super().get_node(node_id)
 
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.features = {}
     agent.storage = TransientReadStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
@@ -572,6 +576,7 @@ async def test_transient_startup_config_read_failure_recovers_without_losing_sec
 
     feature = ProxyFeature(agent, _cfg_runtime(), client_factory=client_factory)
     await feature.persist_config(stored_config)
+    agent.storage.fail_reads = True
 
     with pytest.raises(RuntimeError, match="failed to load persisted config"):
         await feature.initialize()
@@ -589,7 +594,7 @@ async def test_transient_startup_config_read_failure_recovers_without_losing_sec
     partial_patch["token"] = current["token"]
     await feature.set_config(partial_patch)
 
-    assert agent.storage.nodes["feature_config:TestFeature"].properties["config"] == {
+    assert agent.storage.nodes[_TEST_CONFIG_NODE_ID].properties["config"] == {
         "enabled": False,
         "token": stored_config["token"],
     }
@@ -601,7 +606,7 @@ async def test_proxy_bridges_channel_capability_into_registry(monkeypatch, tmp_p
     """A service advertising a channel capability is registered as a forwarding adapter,
     and channels_send-style routing reaches the service tool."""
     channel_feature = FakeChannelFeature()
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     agent.features = {"ChannelFeature": channel_feature}
 
@@ -642,7 +647,7 @@ async def test_proxy_bridges_channel_capability_into_registry(monkeypatch, tmp_p
 async def test_shutdown_does_not_evict_replacement_adapter(monkeypatch, tmp_path):
     """If another adapter replaced our channel_type, shutdown must not remove it."""
     channel_feature = FakeChannelFeature()
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     agent.features = {"ChannelFeature": channel_feature}
     monkeypatch.setenv("KESTREL_FEATURE_WHATSAPPFEATURE_BIN", "/bin/wa-service")
@@ -666,7 +671,7 @@ async def test_shutdown_does_not_evict_replacement_adapter(monkeypatch, tmp_path
 @pytest.mark.asyncio
 async def test_proxy_send_maps_failure_receipt(monkeypatch, tmp_path):
     channel_feature = FakeChannelFeature()
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     agent.features = {"ChannelFeature": channel_feature}
     monkeypatch.setenv("KESTREL_FEATURE_WHATSAPPFEATURE_BIN", "/bin/wa-service")
@@ -726,7 +731,7 @@ async def test_proxy_send_maps_toolresult_envelopes(monkeypatch, tmp_path):
 
 
 def test_proxy_feature_resolves_default_per_agent_venv(tmp_path):
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     runtime = InstalledFeatureRuntime(
         class_name="VoiceFeature",
@@ -926,7 +931,6 @@ def test_ensure_venv_reprovisions_host_created_override_venv(tmp_path, monkeypat
     """An override venv that KESTREL created earlier (carries our manifest) keeps
     the reprovision lifecycle — a host SDK upgrade still triggers --upgrade. Only
     prebuilt override venvs (no manifest) are left untouched (#2125)."""
-    import json
     import kestrel_sovereign.features.isolated_runtime as ir
 
     override_venv = tmp_path / "hostbuilt" / ".venv"
@@ -1007,7 +1011,7 @@ def test_build_client_passes_stripped_env(monkeypatch, tmp_path):
         captured.update(kwargs)
         return FakeIsolatedClient(**kwargs)
 
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.features = {}
     feature = ProxyFeature(agent, _isolated_runtime(), client_factory=client_factory)
     feature._venv_path = tmp_path / "svc-venv"
@@ -1047,6 +1051,9 @@ class _FakeStorage:
 
     def __init__(self):
         self.nodes = {}
+        # Isolated config migration is only permitted through a graph-store
+        # capability bound to the same DID as the proxy.
+        self.agent_id = _TEST_AGENT_DID
 
     async def add_node(self, node):
         self.nodes[node.node_id] = node
@@ -1083,7 +1090,7 @@ async def test_set_config_persists_node_reflects_in_get_config_and_reloads(monke
     """#2214: set_config must persist to the feature_config:<name> graph node,
     get_config must reflect it (not an empty client passthrough), and the running
     service must be reloaded so the new config actually takes effect."""
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.features = {}
     agent.storage = _FakeStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
@@ -1104,7 +1111,7 @@ async def test_set_config_persists_node_reflects_in_get_config_and_reloads(monke
     await feature.set_config(new_cfg)
 
     # 1) Persisted to the graph node the isolated runtime reads at startup.
-    node = agent.storage.nodes.get("feature_config:TestFeature")
+    node = agent.storage.nodes.get(_TEST_CONFIG_NODE_ID)
     assert node is not None, "set_config did not persist the feature_config node"
     assert node.properties["config"]["allowed_senders"] == ["8825903191"]
     assert "pending_config" not in node.properties
@@ -1145,7 +1152,7 @@ async def test_post_promotion_start_failure_rebuilds_active_child_before_traffic
             self.started = True
             raise RuntimeError("promoted candidate could not start")
 
-    agent = Mock(features={})
+    agent = Mock(did=_TEST_AGENT_DID, features={})
     agent.storage = _CASStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -1198,7 +1205,7 @@ async def test_post_promotion_start_failure_rebuilds_active_child_before_traffic
             "result": {"echo": {"message": "recovered"}},
             "tool": "ping",
         }
-        properties = agent.storage.nodes["feature_config:TestFeature"].properties
+        properties = agent.storage.nodes[_TEST_CONFIG_NODE_ID].properties
         assert properties["config"] == next_config
         assert "pending_config" not in properties
     finally:
@@ -1217,7 +1224,7 @@ async def test_post_promotion_recovery_start_failure_seals_traffic(monkeypatch, 
             self.started = True
             raise RuntimeError("replacement child could not start")
 
-    agent = Mock(features={})
+    agent = Mock(did=_TEST_AGENT_DID, features={})
     agent.storage = _CASStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -1257,7 +1264,7 @@ async def test_post_promotion_recovery_start_failure_seals_traffic(monkeypatch, 
             "tool": "ping",
             "success": False,
         }
-        properties = agent.storage.nodes["feature_config:TestFeature"].properties
+        properties = agent.storage.nodes[_TEST_CONFIG_NODE_ID].properties
         assert properties["config"] == next_config
         assert "pending_config" not in properties
     finally:
@@ -1315,7 +1322,7 @@ async def test_supported_transition_cleans_up_before_replacing_old_service(
             events.append(("stop", None))
             await super().stop()
 
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.features = {}
     agent.storage = _FakeStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
@@ -1367,7 +1374,7 @@ async def test_supported_transition_failure_keeps_old_config_and_service(monkeyp
             assert config == next_config
             raise ConfigTransitionError("config transition failed")
 
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.features = {}
     agent.storage = _FakeStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
@@ -1391,7 +1398,7 @@ async def test_supported_transition_failure_keeps_old_config_and_service(monkeyp
     assert old_client.stopped is False
     assert feature._host_config == old_config
     assert (await feature.get_config()) == old_config
-    assert agent.storage.nodes["feature_config:TestFeature"].properties["config"] == old_config
+    assert agent.storage.nodes[_TEST_CONFIG_NODE_ID].properties["config"] == old_config
 
 
 @pytest.mark.asyncio
@@ -1410,7 +1417,12 @@ async def test_transition_failure_clears_pending_config_when_promotion_fails(
 
         async def compare_and_swap_node(self, node_id, expected, new_node):
             self.cas_calls += 1
-            if self.cas_calls == 2:
+            is_owned_cleanup = (
+                isinstance(expected, dict)
+                and "pending_config" in expected
+                and "pending_config" not in new_node.properties
+            )
+            if is_owned_cleanup and self.cas_calls == 3:
                 raise OSError("storage offline during promotion")
             return await super().compare_and_swap_node(node_id, expected, new_node)
 
@@ -1421,7 +1433,7 @@ async def test_transition_failure_clears_pending_config_when_promotion_fails(
             assert config == next_config
             raise ConfigTransitionError("config transition failed")
 
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.features = {}
     agent.storage = RollbackFailingStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
@@ -1434,11 +1446,12 @@ async def test_transition_failure_clears_pending_config_when_promotion_fails(
     with pytest.raises(ConfigTransitionError, match="config transition failed"):
         await feature.set_config(next_config)
 
-    node = agent.storage.nodes["feature_config:TestFeature"]
+    node = agent.storage.nodes[_TEST_CONFIG_NODE_ID]
     assert node.properties["config"] == old_config
     assert "pending_config" not in node.properties
     assert "_isolated_pending_generation" not in node.properties
-    assert agent.storage.cas_calls == 3
+    # stage → post-reconciliation lease renewal → failed cleanup → retry
+    assert agent.storage.cas_calls == 4
 
     fresh = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
     await fresh.initialize()
@@ -1471,7 +1484,7 @@ async def test_hook_failure_clears_generation_and_allows_immediate_retry(
             assert config == retry_config
             return ConfigTransitionResult.restart_required()
 
-    agent = Mock(features={})
+    agent = Mock(did=_TEST_AGENT_DID, features={})
     agent.storage = _CASStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -1490,7 +1503,7 @@ async def test_hook_failure_clears_generation_and_allows_immediate_retry(
         with pytest.raises(ConfigTransitionError, match="hook rejected"):
             await feature.set_config(failed_config)
 
-        properties = agent.storage.nodes["feature_config:TestFeature"].properties
+        properties = agent.storage.nodes[_TEST_CONFIG_NODE_ID].properties
         assert properties["config"] == old_config
         assert "pending_config" not in properties
         assert "_isolated_pending_generation" not in properties
@@ -1499,7 +1512,7 @@ async def test_hook_failure_clears_generation_and_allows_immediate_retry(
 
         assert clients[0].preparations == 2
         assert feature._host_config == retry_config
-        assert agent.storage.nodes["feature_config:TestFeature"].properties["config"] == retry_config
+        assert agent.storage.nodes[_TEST_CONFIG_NODE_ID].properties["config"] == retry_config
     finally:
         await feature.shutdown()
 
@@ -1520,7 +1533,7 @@ async def test_cancellation_after_stage_clears_owned_generation(monkeypatch, tmp
             hook_started.set()
             await asyncio.Event().wait()
 
-    agent = Mock(features={})
+    agent = Mock(did=_TEST_AGENT_DID, features={})
     agent.storage = _CASStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -1539,7 +1552,7 @@ async def test_cancellation_after_stage_clears_owned_generation(monkeypatch, tmp
         update = asyncio.create_task(feature.set_config(pending_config))
         await asyncio.wait_for(hook_started.wait(), timeout=1)
 
-        staged = agent.storage.nodes["feature_config:TestFeature"].properties
+        staged = agent.storage.nodes[_TEST_CONFIG_NODE_ID].properties
         assert staged["pending_config"] == pending_config
         assert isinstance(staged["_isolated_pending_owner"], str)
         assert isinstance(staged["_isolated_pending_lease_expires_at"], str)
@@ -1548,7 +1561,7 @@ async def test_cancellation_after_stage_clears_owned_generation(monkeypatch, tmp
         with pytest.raises(asyncio.CancelledError):
             await update
 
-        properties = agent.storage.nodes["feature_config:TestFeature"].properties
+        properties = agent.storage.nodes[_TEST_CONFIG_NODE_ID].properties
         assert properties["config"] == old_config
         assert "pending_config" not in properties
         assert all(client.kwargs["config"] != pending_config for client in clients)
@@ -1592,7 +1605,7 @@ async def test_abort_commit_then_raise_is_reconciled_before_retry(monkeypatch, t
             assert config == rejected_config
             raise ConfigTransitionError("hook rejected staged config")
 
-    agent = Mock(features={})
+    agent = Mock(did=_TEST_AGENT_DID, features={})
     agent.storage = CommitThenRaiseAbortStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -1605,7 +1618,7 @@ async def test_abort_commit_then_raise_is_reconciled_before_retry(monkeypatch, t
             await feature.set_config(rejected_config)
 
         assert agent.storage.abort_raised is True
-        properties = agent.storage.nodes["feature_config:TestFeature"].properties
+        properties = agent.storage.nodes[_TEST_CONFIG_NODE_ID].properties
         assert properties["config"] == old_config
         assert "pending_config" not in properties
     finally:
@@ -1634,10 +1647,10 @@ async def test_fresh_replica_cannot_steal_unexpired_pending_generation(
             return ConfigTransitionResult.restart_required()
 
     storage = _CASStorage()
-    first_agent = Mock(features={})
+    first_agent = Mock(did=_TEST_AGENT_DID, features={})
     first_agent.storage = storage
     first_agent.storage_path = str(tmp_path / "first" / "kestrel_prime.db")
-    second_agent = Mock(features={})
+    second_agent = Mock(did=_TEST_AGENT_DID, features={})
     second_agent.storage = storage
     second_agent.storage_path = str(tmp_path / "second" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -1656,13 +1669,13 @@ async def test_fresh_replica_cannot_steal_unexpired_pending_generation(
         await first.initialize()
         first_update = asyncio.create_task(first.set_config(first_config))
         await asyncio.wait_for(hook_started.wait(), timeout=1)
-        staged = dict(storage.nodes["feature_config:TestFeature"].properties)
+        staged = dict(storage.nodes[_TEST_CONFIG_NODE_ID].properties)
 
         await second.initialize()
         with pytest.raises(RuntimeError, match="already in progress"):
             await second.set_config(second_config)
 
-        assert storage.nodes["feature_config:TestFeature"].properties == staged
+        assert storage.nodes[_TEST_CONFIG_NODE_ID].properties == staged
         assert second_clients[0].kwargs["config"] == old_config
         assert all(client.kwargs["config"] != first_config for client in second_clients)
 
@@ -1690,12 +1703,12 @@ async def test_expired_pending_generation_is_cleared_then_retried_from_active_co
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
 
     storage = _CASStorage()
-    agent = Mock(features={})
+    agent = Mock(did=_TEST_AGENT_DID, features={})
     agent.storage = storage
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     seed = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
     await seed.persist_config(old_config)
-    storage.nodes["feature_config:TestFeature"].properties.update(
+    storage.nodes[_TEST_CONFIG_NODE_ID].properties.update(
         {
             "pending_config": abandoned_config,
             "_isolated_pending_generation": "abandoned-generation",
@@ -1718,7 +1731,7 @@ async def test_expired_pending_generation_is_cleared_then_retried_from_active_co
         await feature.initialize()
         await feature.set_config(next_config)
 
-        properties = storage.nodes["feature_config:TestFeature"].properties
+        properties = storage.nodes[_TEST_CONFIG_NODE_ID].properties
         assert properties["config"] == next_config
         assert "pending_config" not in properties
         assert all(client.kwargs["config"] != abandoned_config for client in clients)
@@ -1736,13 +1749,13 @@ async def test_malformed_pending_lease_metadata_fails_closed(monkeypatch, tmp_pa
     malformed_config = {"enabled": False, "token": "malformed-token"}
     next_config = {"enabled": False, "token": "next-token"}
     storage = _CASStorage()
-    agent = Mock(features={})
+    agent = Mock(did=_TEST_AGENT_DID, features={})
     agent.storage = storage
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
     seed = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
     await seed.persist_config(old_config)
-    storage.nodes["feature_config:TestFeature"].properties.update(
+    storage.nodes[_TEST_CONFIG_NODE_ID].properties.update(
         {
             "pending_config": malformed_config,
             "_isolated_pending_generation": "malformed-generation",
@@ -1750,14 +1763,14 @@ async def test_malformed_pending_lease_metadata_fails_closed(monkeypatch, tmp_pa
             "_isolated_pending_lease_expires_at": "not-a-timestamp",
         }
     )
-    original_properties = dict(storage.nodes["feature_config:TestFeature"].properties)
+    original_properties = dict(storage.nodes[_TEST_CONFIG_NODE_ID].properties)
     feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
     try:
         await feature.initialize()
         with pytest.raises(RuntimeError, match="stored pending config lease is invalid"):
             await feature.set_config(next_config)
 
-        assert storage.nodes["feature_config:TestFeature"].properties == original_properties
+        assert storage.nodes[_TEST_CONFIG_NODE_ID].properties == original_properties
         assert feature._host_config == old_config
     finally:
         await feature.shutdown()
@@ -1782,7 +1795,7 @@ async def test_empty_active_config_hides_pending_candidate_from_concurrent_reads
             await release_preparation.wait()
             raise ConfigTransitionError("config transition failed")
 
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.features = {}
     agent.storage = _FakeStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
@@ -1798,7 +1811,7 @@ async def test_empty_active_config_hides_pending_candidate_from_concurrent_reads
     update = asyncio.create_task(feature.set_config(next_config))
     await asyncio.wait_for(preparation_started.wait(), timeout=1)
 
-    properties = agent.storage.nodes["feature_config:TestFeature"].properties
+    properties = agent.storage.nodes[_TEST_CONFIG_NODE_ID].properties
     assert properties["config"] == {}
     assert properties["pending_config"] == next_config
     assert isinstance(properties["_isolated_pending_generation"], str)
@@ -1829,7 +1842,7 @@ async def test_persistence_failure_prevents_transition_hook_from_running(monkeyp
             self.preparation_calls += 1
             return ConfigTransitionResult.restart_required()
 
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.features = {}
     agent.storage = FailingStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
@@ -1869,7 +1882,7 @@ async def test_volatile_privacy_noop_allows_transition_without_durable_config(
             return ConfigTransitionResult.applied()
 
     next_config = {"enabled": True, "token": "volatile-token"}
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.features = {}
     agent.storage = VolatileStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
@@ -1904,7 +1917,7 @@ async def test_fenced_transition_failure_replaces_with_next_config(monkeypatch, 
             self.replacement_required = True
             raise ConfigTransitionError("config transition failed")
 
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.features = {}
     agent.storage = _FakeStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
@@ -1958,8 +1971,12 @@ async def test_fenced_transition_promotion_failure_restores_active_config_for_re
 
         async def compare_and_swap_node(self, node_id, expected, new_node):
             self.cas_calls += 1
-            # Stage candidate, then reject its promotion.
-            if self.cas_calls == 2:
+            # Identify promotion by its exact state shape rather than write
+            # ordinal: a pre-hook lease renewal is now a separate CAS.
+            if (
+                "pending_config" not in new_node.properties
+                and new_node.properties.get("config") == next_config
+            ):
                 raise OSError("storage offline during promotion")
             return await super().compare_and_swap_node(node_id, expected, new_node)
 
@@ -1975,7 +1992,7 @@ async def test_fenced_transition_promotion_failure_restores_active_config_for_re
             self.replacement_required = True
             raise ConfigTransitionError("config transition failed")
 
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.features = {}
     agent.storage = PromotionFailingStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
@@ -2009,7 +2026,7 @@ async def test_fenced_transition_promotion_failure_restores_active_config_for_re
         assert feature._client is clients[1]
         assert feature._host_config == old_config
         assert await feature.get_config() == old_config
-        properties = agent.storage.nodes["feature_config:TestFeature"].properties
+        properties = agent.storage.nodes[_TEST_CONFIG_NODE_ID].properties
         assert properties["config"] == old_config
         assert "pending_config" not in properties
         assert "_isolated_pending_generation" not in properties
@@ -2059,7 +2076,10 @@ async def test_fenced_recovery_never_starts_candidate_before_durable_promotion(
 
         async def compare_and_swap_node(self, node_id, expected, new_node):
             self.cas_calls += 1
-            if self.cas_calls == 2:
+            if (
+                "pending_config" not in new_node.properties
+                and new_node.properties.get("config") == next_config
+            ):
                 promotion_started.set()
                 await release_promotion.wait()
                 raise OSError("storage unavailable during promotion")
@@ -2077,7 +2097,7 @@ async def test_fenced_recovery_never_starts_candidate_before_durable_promotion(
             self.replacement_required = True
             raise ConfigTransitionError("transition outcome unknown")
 
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.features = {}
     agent.storage = BlockingPromotionStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
@@ -2160,7 +2180,7 @@ async def test_promotion_commit_then_raise_reconciles_to_committed_next_config(
                 raise ConnectionError("connection dropped after commit")
             return result
 
-    agent = Mock(features={})
+    agent = Mock(did=_TEST_AGENT_DID, features={})
     agent.storage = CommitThenRaiseStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -2188,7 +2208,7 @@ async def test_promotion_commit_then_raise_reconciles_to_committed_next_config(
         assert clients[1].kwargs["config"] == next_config
         assert feature._client is clients[1]
         assert feature._host_config == next_config
-        properties = agent.storage.nodes["feature_config:TestFeature"].properties
+        properties = agent.storage.nodes[_TEST_CONFIG_NODE_ID].properties
         assert properties["config"] == next_config
         assert "pending_config" not in properties
         assert isinstance(properties["_isolated_config_generation"], str)
@@ -2218,7 +2238,7 @@ async def test_promotion_cancellation_after_commit_reconciles_before_propagating
                 await asyncio.Event().wait()
             return result
 
-    agent = Mock(features={})
+    agent = Mock(did=_TEST_AGENT_DID, features={})
     agent.storage = CommitThenCancelStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -2245,7 +2265,7 @@ async def test_promotion_cancellation_after_commit_reconciles_before_propagating
         assert clients[1].kwargs["config"] == next_config
         assert feature._client is clients[1]
         assert feature._host_config == next_config
-        properties = agent.storage.nodes["feature_config:TestFeature"].properties
+        properties = agent.storage.nodes[_TEST_CONFIG_NODE_ID].properties
         assert properties["config"] == next_config
         assert "pending_config" not in properties
         assert isinstance(properties["_isolated_config_generation"], str)
@@ -2288,10 +2308,10 @@ async def test_stale_replica_cas_conflict_cannot_overwrite_winner_and_reconciles
 
     storage = CoordinatedCASStorage()
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
-    winner_agent = Mock(features={})
+    winner_agent = Mock(did=_TEST_AGENT_DID, features={})
     winner_agent.storage = storage
     winner_agent.storage_path = str(tmp_path / "winner" / "kestrel_prime.db")
-    loser_agent = Mock(features={})
+    loser_agent = Mock(did=_TEST_AGENT_DID, features={})
     loser_agent.storage = storage
     loser_agent.storage_path = str(tmp_path / "loser" / "kestrel_prime.db")
     winner_clients = []
@@ -2326,7 +2346,7 @@ async def test_stale_replica_cas_conflict_cannot_overwrite_winner_and_reconciles
 
         assert loser_config["token"] not in str(exc_info.value)
         assert winner_config["token"] not in str(exc_info.value)
-        properties = storage.nodes["feature_config:TestFeature"].properties
+        properties = storage.nodes[_TEST_CONFIG_NODE_ID].properties
         assert properties["config"] == winner_config
         assert "pending_config" not in properties
         assert loser_clients[0].stopped is True
@@ -2375,7 +2395,7 @@ async def test_promotion_conflict_reconciles_a_live_applied_child_to_durable_win
             assert config == next_config
             return ConfigTransitionResult.applied()
 
-    agent = Mock(features={})
+    agent = Mock(did=_TEST_AGENT_DID, features={})
     agent.storage = PromotionConflictStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -2402,7 +2422,7 @@ async def test_promotion_conflict_reconciles_a_live_applied_child_to_durable_win
         assert feature._client is clients[1]
         assert feature._host_config == winner_config
         assert await feature.get_config() == winner_config
-        properties = agent.storage.nodes["feature_config:TestFeature"].properties
+        properties = agent.storage.nodes[_TEST_CONFIG_NODE_ID].properties
         assert properties["config"] == winner_config
     finally:
         await feature.shutdown()
@@ -2434,7 +2454,7 @@ async def test_promotion_policy_probe_failure_reconciles_live_child_to_staged_ac
             assert config == next_config
             return ConfigTransitionResult.applied()
 
-    agent = Mock(features={})
+    agent = Mock(did=_TEST_AGENT_DID, features={})
     agent.storage = FlappingPolicyStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -2457,7 +2477,7 @@ async def test_promotion_policy_probe_failure_reconciles_live_child_to_staged_ac
         assert clients[1].kwargs["config"] == {}
         assert feature._client is clients[1]
         assert feature._host_config == {}
-        properties = agent.storage.nodes["feature_config:TestFeature"].properties
+        properties = agent.storage.nodes[_TEST_CONFIG_NODE_ID].properties
         assert properties["config"] == {}
         assert "pending_config" not in properties
     finally:
@@ -2480,7 +2500,10 @@ async def test_fenced_promotion_recovery_quarantines_when_old_child_cannot_resta
 
         async def compare_and_swap_node(self, node_id, expected, new_node):
             self.cas_calls += 1
-            if self.cas_calls == 2:
+            if (
+                "pending_config" not in new_node.properties
+                and new_node.properties.get("config") == next_config
+            ):
                 raise OSError("storage offline during promotion")
             return await super().compare_and_swap_node(node_id, expected, new_node)
 
@@ -2499,7 +2522,7 @@ async def test_fenced_promotion_recovery_quarantines_when_old_child_cannot_resta
         async def start(self):
             raise RuntimeError("old-config child could not start")
 
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.features = {}
     agent.storage = PromotionFailingStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
@@ -2531,7 +2554,7 @@ async def test_fenced_promotion_recovery_quarantines_when_old_child_cannot_resta
         assert feature.get_tools() == []
         assert feature._host_config == old_config
         assert feature._stopping is True
-        properties = agent.storage.nodes["feature_config:TestFeature"].properties
+        properties = agent.storage.nodes[_TEST_CONFIG_NODE_ID].properties
         assert properties["config"] == old_config
         assert "pending_config" not in properties
         assert "_isolated_pending_generation" not in properties
@@ -2557,7 +2580,7 @@ async def test_live_applied_transition_retains_the_initialized_service(monkeypat
             self.prepared.append(dict(config))
             return ConfigTransitionResult.applied()
 
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.features = {}
     agent.storage = _FakeStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
@@ -2597,8 +2620,10 @@ async def test_failed_promotion_restores_previous_child_and_config(
 
         async def compare_and_swap_node(self, node_id, expected, new_node):
             self.cas_calls += 1
-            # The second transition write (promotion) fails.
-            if self.cas_calls == 2:
+            if (
+                "pending_config" not in new_node.properties
+                and new_node.properties.get("config") == next_config
+            ):
                 raise OSError("storage offline during promotion")
             return await super().compare_and_swap_node(node_id, expected, new_node)
 
@@ -2615,7 +2640,7 @@ async def test_failed_promotion_restores_previous_child_and_config(
                 return ConfigTransitionResult.applied()
             return ConfigTransitionResult.restart_required()
 
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.features = {}
     agent.storage = PromotionFailingStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
@@ -2642,7 +2667,7 @@ async def test_failed_promotion_restores_previous_child_and_config(
     assert feature._client is clients[1]
     assert feature._host_config == old_config
     assert await feature.get_config() == old_config
-    properties = agent.storage.nodes["feature_config:TestFeature"].properties
+    properties = agent.storage.nodes[_TEST_CONFIG_NODE_ID].properties
     assert properties["config"] == old_config
     assert "pending_config" not in properties
     assert "_isolated_pending_generation" not in properties
@@ -2751,7 +2776,7 @@ async def test_config_transition_serializes_with_a_pending_health_restart(
         replacement_clients.append(client)
         return client
 
-    agent = Mock(storage_path=str(tmp_path / "agent" / "kestrel_prime.db"), features={})
+    agent = Mock(did=_TEST_AGENT_DID, storage_path=str(tmp_path / "agent" / "kestrel_prime.db"), features={})
     agent.storage = _FakeStorage()
     feature = ProxyFeature(agent, _cfg_runtime(), client_factory=client_factory)
     feature._client = old_client
@@ -2795,7 +2820,7 @@ async def test_config_transition_serializes_with_a_pending_health_restart(
 @pytest.mark.asyncio
 async def test_persisted_config_survives_restart(monkeypatch, tmp_path):
     """A config set on one ProxyFeature is loaded by a fresh one (restart)."""
-    agent = Mock()
+    agent = Mock(did=_TEST_AGENT_DID)
     agent.features = {}
     agent.storage = _FakeStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
@@ -2854,7 +2879,7 @@ async def test_reenable_restarts_live_health_supervisor(tmp_path):
         runtime="isolated-venv",
         service="r",
     )
-    agent = Mock(storage_path=str(tmp_path / "a" / "db.db"), features={})
+    agent = Mock(did=_TEST_AGENT_DID, storage_path=str(tmp_path / "a" / "db.db"), features={})
     feature = ProxyFeature(agent, runtime, client_factory=factory)
     os.environ["KESTREL_FEATURE_REENABLEFEATURE_BIN"] = str(tmp_path / "r-bin")
 
@@ -2962,7 +2987,7 @@ async def test_live_apply_blocks_tools_and_channel_but_drops_stale_inbound_until
             return {"ok": True, "data": {"message_id": "receipt"}}
 
     channel_feature = FakeChannelFeature()
-    agent = Mock(features={"ChannelFeature": channel_feature})
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": channel_feature})
     agent.storage = BlockingPromotionStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -2978,7 +3003,7 @@ async def test_live_apply_blocks_tools_and_channel_but_drops_stale_inbound_until
         update = asyncio.create_task(feature.set_config(next_config))
         await asyncio.wait_for(promotion_started.wait(), timeout=1)
         assert client.mode == "next"  # hook already applied locally
-        assert agent.storage.nodes["feature_config:TestFeature"].properties["config"] == old_config
+        assert agent.storage.nodes[_TEST_CONFIG_NODE_ID].properties["config"] == old_config
 
         tool_call = asyncio.create_task(feature.call_isolated_tool("ping", {}))
         channel_send = asyncio.create_task(adapter.send_message(to="+1", content="hello"))
@@ -3047,7 +3072,7 @@ async def test_live_apply_republishes_config_dependent_tool_and_channel_inventor
             return ConfigTransitionResult.applied()
 
     channel_feature = FakeChannelFeature()
-    agent = Mock(features={"ChannelFeature": channel_feature})
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": channel_feature})
     agent.storage = _CASStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -3077,6 +3102,7 @@ async def test_persistent_transition_requires_compare_and_swap_before_hook(monke
     class NoCASStorage:
         def __init__(self):
             self.nodes = {}
+            self.agent_id = _TEST_AGENT_DID
 
         async def add_node(self, node):
             self.nodes[node.node_id] = node
@@ -3095,13 +3121,14 @@ async def test_persistent_transition_requires_compare_and_swap_before_hook(monke
             self.prepare_calls += 1
             return ConfigTransitionResult.restart_required()
 
-    agent = Mock(features={})
+    agent = Mock(did=_TEST_AGENT_DID, features={})
     agent.storage = NoCASStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
     feature = ProxyFeature(agent, _cfg_runtime(), client_factory=TransitionClient)
     try:
-        await feature.persist_config({"enabled": True})
+        with pytest.raises(RuntimeError, match="requires compare_and_swap_node"):
+            await feature.persist_config({"enabled": True})
         await feature.initialize()
         with pytest.raises(RuntimeError, match="failed to persist config"):
             await feature.set_config({"enabled": False})
@@ -3144,15 +3171,22 @@ async def test_healthy_long_hook_renews_lease_before_another_replica_can_takeove
             if isinstance(lease, str):
                 if self.initial_lease is None:
                     self.initial_lease = datetime.fromisoformat(lease)
-                elif lease != self.initial_lease.isoformat():
+                elif (
+                    datetime.fromisoformat(lease)
+                    > self.initial_lease + timedelta(milliseconds=5)
+                ):
+                    # The post-reconciliation fence renewal happens almost
+                    # immediately. Wait for the heartbeat's later renewal so
+                    # this test still proves long-hook ownership beyond the
+                    # original lease deadline.
                     lease_renewed.set()
             return await super().compare_and_swap_node(node_id, expected, new_node)
 
     storage = RenewalObservingStorage()
-    first_agent = Mock(features={})
+    first_agent = Mock(did=_TEST_AGENT_DID, features={})
     first_agent.storage = storage
     first_agent.storage_path = str(tmp_path / "first" / "kestrel_prime.db")
-    second_agent = Mock(features={})
+    second_agent = Mock(did=_TEST_AGENT_DID, features={})
     second_agent.storage = storage
     second_agent.storage_path = str(tmp_path / "second" / "kestrel_prime.db")
     first = ProxyFeature(first_agent, _cfg_runtime(), client_factory=LongHookClient)
@@ -3174,10 +3208,16 @@ async def test_healthy_long_hook_renews_lease_before_another_replica_can_takeove
             "_utc_now",
             lambda: storage.initial_lease + timedelta(milliseconds=1),
         )
+        renewed_expires_at = datetime.fromisoformat(
+            storage.nodes[_TEST_CONFIG_NODE_ID].properties[
+                "_isolated_pending_lease_expires_at"
+            ]
+        )
+        assert renewed_expires_at > isolated_runtime._utc_now()
 
         with pytest.raises(RuntimeError, match="already in progress"):
             await second.set_config(second_config)
-        assert storage.nodes["feature_config:TestFeature"].properties["pending_config"] == first_config
+        assert storage.nodes[_TEST_CONFIG_NODE_ID].properties["pending_config"] == first_config
 
         release_hook.set()
         await first_update
@@ -3220,7 +3260,7 @@ async def test_second_cancellation_waits_for_owned_cleanup_before_releasing_relo
             hook_started.set()
             await asyncio.Event().wait()
 
-    agent = Mock(features={})
+    agent = Mock(did=_TEST_AGENT_DID, features={})
     agent.storage = BlockingCleanupStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -3240,7 +3280,7 @@ async def test_second_cancellation_waits_for_owned_cleanup_before_releasing_relo
         await asyncio.sleep(0)
         assert not update.done()
         assert not second_update.done()
-        assert "pending_config" in agent.storage.nodes["feature_config:TestFeature"].properties
+        assert "pending_config" in agent.storage.nodes[_TEST_CONFIG_NODE_ID].properties
 
         # It is still waiting on the first transition's reload lock, so this
         # cancellation must prevent a second generation from being staged once
@@ -3249,7 +3289,7 @@ async def test_second_cancellation_waits_for_owned_cleanup_before_releasing_relo
         release_cleanup.set()
         with pytest.raises(asyncio.CancelledError):
             await update
-        assert "pending_config" not in agent.storage.nodes["feature_config:TestFeature"].properties
+        assert "pending_config" not in agent.storage.nodes[_TEST_CONFIG_NODE_ID].properties
 
         with pytest.raises(asyncio.CancelledError):
             await second_update
@@ -3295,10 +3335,10 @@ async def test_stale_empty_replica_patch_preserves_concurrent_secret_rotation_at
 
     storage = CoordinatedStorage()
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
-    stale_agent = Mock(features={})
+    stale_agent = Mock(did=_TEST_AGENT_DID, features={})
     stale_agent.storage = storage
     stale_agent.storage_path = str(tmp_path / "stale" / "kestrel_prime.db")
-    writer_agent = Mock(features={})
+    writer_agent = Mock(did=_TEST_AGENT_DID, features={})
     writer_agent.storage = storage
     writer_agent.storage_path = str(tmp_path / "writer" / "kestrel_prime.db")
     stale = ProxyFeature(stale_agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
@@ -3331,7 +3371,7 @@ async def test_stale_empty_replica_patch_preserves_concurrent_secret_rotation_at
         release_stale_stage.set()
         await stale_update
 
-        properties = storage.nodes["feature_config:TestFeature"].properties
+        properties = storage.nodes[_TEST_CONFIG_NODE_ID].properties
         assert properties["config"] == {"enabled": False, "api_key": "rotated-secret"}
         assert "pending_config" not in properties
     finally:
@@ -3360,10 +3400,10 @@ async def test_replica_get_does_not_mask_stale_child_before_next_patch(
     storage = _CASStorage()
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
 
-    winner_agent = Mock(features={})
+    winner_agent = Mock(did=_TEST_AGENT_DID, features={})
     winner_agent.storage = storage
     winner_agent.storage_path = str(tmp_path / "winner" / "kestrel_prime.db")
-    stale_agent = Mock(features={})
+    stale_agent = Mock(did=_TEST_AGENT_DID, features={})
     stale_agent.storage = storage
     stale_agent.storage_path = str(tmp_path / "stale" / "kestrel_prime.db")
     stale_clients = []
@@ -3411,7 +3451,7 @@ async def test_replica_get_does_not_mask_stale_child_before_next_patch(
         assert stale_clients[1].kwargs["config"] == winner_config
         assert stale_clients[1].prepared == [next_config]
         assert (
-            storage.nodes["feature_config:TestFeature"].properties["config"]
+            storage.nodes[_TEST_CONFIG_NODE_ID].properties["config"]
             == next_config
         )
     finally:
@@ -3436,9 +3476,13 @@ async def test_ambiguous_promotion_reread_quarantine_cannot_publish_recovery_chi
 
         async def compare_and_swap_node(self, node_id, expected, new_node):
             self.cas_calls += 1
-            # The stage succeeds.  The promotion response is ambiguous, and
-            # its required durable re-read then fails, latching quarantine.
-            if self.cas_calls == 2:
+            # The stage and pre-hook renewal succeed.  The promotion response
+            # is ambiguous, and its required durable re-read then fails,
+            # latching quarantine.
+            if (
+                "pending_config" not in new_node.properties
+                and new_node.properties.get("config") == next_config
+            ):
                 self.fail_next_read = True
                 raise OSError("promotion transport failed")
             return await super().compare_and_swap_node(node_id, expected, new_node)
@@ -3457,7 +3501,7 @@ async def test_ambiguous_promotion_reread_quarantine_cannot_publish_recovery_chi
             return ConfigTransitionResult.applied()
 
     storage = PromotionReadFailureStorage()
-    agent = Mock(features={})
+    agent = Mock(did=_TEST_AGENT_DID, features={})
     agent.storage = storage
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -3482,7 +3526,7 @@ async def test_ambiguous_promotion_reread_quarantine_cannot_publish_recovery_chi
         # The follow-up cleanup can read storage again and clear its pending
         # generation, but it must not force-start a replacement behind the
         # terminal gate that the ambiguous reread already sealed.
-        properties = storage.nodes["feature_config:TestFeature"].properties
+        properties = storage.nodes[_TEST_CONFIG_NODE_ID].properties
         assert properties["config"] == old_config
         assert "pending_config" not in properties
         assert old_child.stopped is True
@@ -3529,7 +3573,7 @@ async def test_fenced_cancellation_promotes_generation_before_starting_replaceme
                 raise
 
     storage = _CASStorage()
-    agent = Mock(features={})
+    agent = Mock(did=_TEST_AGENT_DID, features={})
     agent.storage = storage
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -3557,7 +3601,7 @@ async def test_fenced_cancellation_promotes_generation_before_starting_replaceme
         with pytest.raises(asyncio.CancelledError):
             await update
 
-        properties = storage.nodes["feature_config:TestFeature"].properties
+        properties = storage.nodes[_TEST_CONFIG_NODE_ID].properties
         assert properties["config"] == next_config
         assert "pending_config" not in properties
         assert clients[0].stopped is True
@@ -3596,7 +3640,7 @@ async def test_fenced_recovery_old_client_stop_error_cleans_owned_pending_and_qu
             raise OSError("old child would not stop")
 
     storage = _CASStorage()
-    agent = Mock(features={})
+    agent = Mock(did=_TEST_AGENT_DID, features={})
     agent.storage = storage
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -3607,7 +3651,7 @@ async def test_fenced_recovery_old_client_stop_error_cleans_owned_pending_and_qu
         with pytest.raises(OSError, match="old child would not stop"):
             await feature.set_config(next_config)
 
-        properties = storage.nodes["feature_config:TestFeature"].properties
+        properties = storage.nodes[_TEST_CONFIG_NODE_ID].properties
         assert properties["config"] == old_config
         assert "pending_config" not in properties
         assert feature._client is None
@@ -3632,7 +3676,7 @@ async def test_set_config_cancellation_while_gate_drains_reopens_before_staging(
             await release_active.wait()
             return {"echo": args}
 
-    agent = Mock(features={})
+    agent = Mock(did=_TEST_AGENT_DID, features={})
     agent.storage = _CASStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -3662,7 +3706,7 @@ async def test_set_config_cancellation_while_gate_drains_reopens_before_staging(
         assert feature._traffic_gate.closed is False
         assert feature._traffic_gate.sealed is False
         assert feature._reloading is False
-        assert agent.storage.nodes["feature_config:TestFeature"].properties["config"] == {
+        assert agent.storage.nodes[_TEST_CONFIG_NODE_ID].properties["config"] == {
             "enabled": True
         }
     finally:
@@ -3693,7 +3737,7 @@ async def test_reload_cancellation_while_gate_drains_reopens_without_restart(
             await release_active.wait()
             return {"echo": args}
 
-    agent = Mock(features={})
+    agent = Mock(did=_TEST_AGENT_DID, features={})
     agent.storage = _CASStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -3752,7 +3796,7 @@ async def test_second_cancellation_during_gate_reopen_waits_for_final_boundary(
             await release_active.wait()
             return {"echo": args}
 
-    agent = Mock(features={})
+    agent = Mock(did=_TEST_AGENT_DID, features={})
     agent.storage = _CASStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -3829,7 +3873,7 @@ async def test_terminal_quarantine_wakes_tool_and_channel_waiters_without_rpc(
             return {"ok": True}
 
     channel_feature = FakeChannelFeature()
-    agent = Mock(features={"ChannelFeature": channel_feature})
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": channel_feature})
     agent.storage = _CASStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -3897,7 +3941,7 @@ async def test_terminal_shutdown_wakes_tool_waiter(monkeypatch, tmp_path):
                 await release_active.wait()
             return {"echo": args}
 
-    agent = Mock(features={})
+    agent = Mock(did=_TEST_AGENT_DID, features={})
     agent.storage = _CASStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -3975,7 +4019,7 @@ async def test_repeated_cancellation_during_terminal_seal_finishes_gate_boundary
                 await release_active.wait()
             return {"echo": args}
 
-    agent = Mock(features={})
+    agent = Mock(did=_TEST_AGENT_DID, features={})
     agent.storage = _CASStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -4025,7 +4069,7 @@ async def test_repeated_cancellation_during_terminal_seal_finishes_gate_boundary
 async def test_terminal_inbound_event_is_dropped_without_callback_error(monkeypatch, tmp_path):
     """A terminal SDK callback is deliberately ignored rather than propagated."""
 
-    agent = Mock(features={})
+    agent = Mock(did=_TEST_AGENT_DID, features={})
     agent.storage = _CASStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -4069,7 +4113,7 @@ async def test_reinitialize_after_terminal_quarantine_reopens_only_after_child_i
         clients.append(client)
         return client
 
-    agent = Mock(features={})
+    agent = Mock(did=_TEST_AGENT_DID, features={})
     agent.storage = _CASStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -4129,7 +4173,7 @@ async def test_soft_disabled_terminal_proxy_persists_repaired_config_until_reena
         clients.append(client)
         return client
 
-    agent = Mock(features={})
+    agent = Mock(did=_TEST_AGENT_DID, features={})
     agent.storage = _CASStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -4148,7 +4192,7 @@ async def test_soft_disabled_terminal_proxy_persists_repaired_config_until_reena
 
         await feature.set_config(repaired_config)
 
-        properties = agent.storage.nodes["feature_config:TestFeature"].properties
+        properties = agent.storage.nodes[_TEST_CONFIG_NODE_ID].properties
         assert properties["config"] == repaired_config
         assert "pending_config" not in properties
         # A config repair is storage-only while disabled: no transition hook,
@@ -4189,7 +4233,7 @@ async def test_shutdown_cancellation_waiting_for_lifecycle_lock_finishes_teardow
             }
 
     channel_feature = FakeChannelFeature()
-    agent = Mock(features={"ChannelFeature": channel_feature})
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": channel_feature})
     agent.storage = _CASStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -4258,7 +4302,7 @@ async def test_quarantine_repeated_cancellation_waits_for_lock_and_retires_child
             }
 
     channel_feature = FakeChannelFeature()
-    agent = Mock(features={"ChannelFeature": channel_feature})
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": channel_feature})
     agent.storage = _CASStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -4329,7 +4373,7 @@ async def test_initialize_cancellation_after_gate_reset_unpublishes_and_retires_
             }
 
     channel_feature = FakeChannelFeature()
-    agent = Mock(features={"ChannelFeature": channel_feature})
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": channel_feature})
     agent.storage = _CASStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -4419,7 +4463,7 @@ async def test_shutdown_during_event_registration_keeps_initialize_terminal(
         return client
 
     channel_feature = FakeChannelFeature()
-    agent = Mock(features={"ChannelFeature": channel_feature})
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": channel_feature})
     agent.storage = _CASStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -4483,7 +4527,7 @@ async def test_initialize_gate_reset_failure_unpublishes_and_retires_child(monke
             }
 
     channel_feature = FakeChannelFeature()
-    agent = Mock(features={"ChannelFeature": channel_feature})
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": channel_feature})
     agent.storage = _CASStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -4539,7 +4583,7 @@ async def test_reload_candidate_start_failure_quarantines_stopped_old_child(
             raise RuntimeError("candidate start failed")
 
     channel_feature = FakeChannelFeature()
-    agent = Mock(features={"ChannelFeature": channel_feature})
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": channel_feature})
     agent.storage = _CASStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
@@ -4599,7 +4643,7 @@ async def test_reload_cancellation_after_old_stop_quarantines_publication(
             await release_candidate.wait()
 
     channel_feature = FakeChannelFeature()
-    agent = Mock(features={"ChannelFeature": channel_feature})
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": channel_feature})
     agent.storage = _CASStorage()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")

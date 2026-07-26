@@ -77,9 +77,22 @@ _PENDING_CONFIG_CLOCK_SKEW = timedelta(seconds=30)
 _PENDING_CLEANUP_WRITE_ATTEMPTS = 2
 _TERMINAL_TRAFFIC_ERROR = "isolated feature traffic is unavailable"
 
+# Isolated feature config used to share the in-process feature key
+# ``feature_config:<class-name>``. Graph-node IDs are globally unique even
+# though each AsyncGraphStore is tenant-bound, so fresh agents need a DID
+# scoped key. A visible pre-scoping key is *adopted in place* by a new proxy:
+# copying it would leave old replicas writing one CAS authority while new
+# replicas write another.
+_SCOPED_CONFIG_NODE_PREFIX = "feature_config:v2"
+_DID_IDENTITY_RE = re.compile(r"^did:[a-z0-9]+:[^\s\x00]+$")
+
 
 class _ConfigTransitionLeaseLost(RuntimeError):
     """The durable lease for an in-flight lifecycle transition was not renewed."""
+
+
+class _ConfigAuthorityChanged(RuntimeError):
+    """A visible legacy config row superseded scoped rolling-upgrade authority."""
 
 
 class _TrafficGateTerminalError(RuntimeError):
@@ -240,6 +253,10 @@ class _ConfigState:
 
     properties: Optional[Dict[str, Any]] = field(repr=False)
     config: Dict[str, Any] = field(repr=False)
+    # Every durable read carries the exact graph node identity it observed.
+    # A transition pins that identity through every later lease, cleanup, and
+    # promotion write instead of re-resolving midway through the lifecycle.
+    node_id: Optional[str] = None
     has_pending: bool = False
     pending_generation: Optional[str] = None
     pending_owner: Optional[str] = None
@@ -262,6 +279,7 @@ class _ConfigTransition:
     expected_properties: Optional[Dict[str, Any]] = field(repr=False)
     staged_properties: Optional[Dict[str, Any]] = field(repr=False)
     promoted_properties: Optional[Dict[str, Any]] = field(repr=False)
+    config_node_id: Optional[str] = None
     generation: Optional[str] = None
     owner: Optional[str] = None
 
@@ -631,6 +649,11 @@ class ProxyFeature(Feature):
         # durable transition state while a service is still running the empty
         # config.
         self._host_config_loaded = False
+        # A visible legacy row wins during rolling overlap.  Scoped authority
+        # is cached only while that legacy row remains absent; every scoped
+        # operation revalidates the absence before it reads or writes.
+        self._resolved_config_node_id: Optional[str] = None
+        self._config_identity_lock = asyncio.Lock()
         self._channel_adapter: Optional["ProxyChannelAdapter"] = None
         # Channel-link plumbing (#2081): the bridged channel type and the name of
         # its pairing tool. When that tool runs on the streaming turn, the host
@@ -645,6 +668,265 @@ class ProxyFeature(Feature):
         if self.runtime.description:
             return self.runtime.description
         return f"Isolated feature service for {self.name}"
+
+    def _config_agent_did(self) -> str:
+        """Return the stable DID that scopes this proxy's durable config.
+
+        ``agent_id`` is deliberately not accepted as a fallback.  It is an
+        alias in Kestrel today, but accepting an arbitrary display/process ID
+        here would turn a durable secret/config namespace back into ambient
+        global state when an embedding gets its construction wrong.
+        """
+
+        did = getattr(self.agent, "did", None)
+        if not isinstance(did, str) or not _DID_IDENTITY_RE.fullmatch(did):
+            raise RuntimeError(
+                f"Cannot use durable config for isolated feature {self.name}: "
+                "agent DID is missing or invalid"
+            )
+        return did
+
+    def _config_node_id(self) -> str:
+        """Return the DID-scoped ID used when no legacy authority is visible.
+
+        This is intentionally deterministic rather than the resolved identity:
+        callers that need the actual durable authority must await
+        :meth:`_resolve_config_node_id` so an owned legacy row can remain the
+        only live CAS target during a rolling upgrade.
+        """
+
+        return f"{_SCOPED_CONFIG_NODE_PREFIX}:{self._config_agent_did()}:{self.name}"
+
+    def _legacy_config_node_id(self) -> str:
+        """Return the pre-DID-scoping config key for in-place adoption."""
+
+        return super()._config_node_id()
+
+    def _require_config_storage_scope(self, storage: Any) -> None:
+        """Prove the config store is bound to this exact agent DID.
+
+        A legacy key has no DID in its global node ID. Reading it through an
+        unbound store could expose another agent's config, so identity
+        resolution is permitted only through the same agent-bound storage
+        capability used by normal graph operations.
+        """
+
+        did = self._config_agent_did()
+        storage_agent_id = getattr(storage, "agent_id", None)
+        if not isinstance(storage_agent_id, str) or storage_agent_id != did:
+            raise RuntimeError(
+                f"Cannot use durable config for isolated feature {self.name}: "
+                "storage is not bound to the current agent DID"
+            )
+
+    @staticmethod
+    def _validate_config_node(node: Any, *, node_kind: str) -> None:
+        """Validate a visible config row before accepting it as authority."""
+
+        if getattr(node, "node_type", None) != Feature._CONFIG_NODE_TYPE:
+            raise RuntimeError(f"{node_kind} config node has an invalid type")
+        if not isinstance(getattr(node, "properties", None), dict):
+            raise RuntimeError(f"{node_kind} config node has invalid properties")
+
+    async def _resolve_config_node_id(
+        self,
+        storage: Any,
+        *,
+        fence_cached_scoped_authority: bool = False,
+    ) -> str:
+        """Resolve the presently visible config authority.
+
+        During a rolling upgrade a same-agent legacy row is the only safe
+        authority whenever it is visible, even if an empty DID-scoped row also
+        exists.  We therefore check it before every scoped use, including a
+        cached identity.  A transition that had already cached scoped identity
+        receives :class:`_ConfigAuthorityChanged` rather than silently drifting
+        to legacy midway through its lifecycle.
+
+        The final legacy recheck narrows the creation race but cannot make two
+        independently-written keys atomic with an old binary.  A scoped CAS is
+        consequently revalidated again before any lifecycle hook or traffic can
+        proceed; a visible mixed-authority result fails closed.  If an old
+        binary writes legacy after that final recheck, an orphaned scoped
+        candidate can remain.  Kestrel intentionally does not delete it: after
+        the rolling overlap is over, an operator must inspect and remove that
+        orphan only after confirming no old replica remains.  All future
+        proxies still converge on the visible legacy row.
+        """
+
+        self._require_config_storage_scope(storage)
+        get_node = getattr(storage, "get_node", None)
+        if not callable(get_node):
+            raise RuntimeError("storage cannot resolve isolated config identity")
+
+        async with self._config_identity_lock:
+            cached = self._resolved_config_node_id
+            legacy_node_id = self._legacy_config_node_id()
+            legacy = await _maybe_await(get_node(legacy_node_id))
+            if legacy is not None:
+                self._validate_config_node(legacy, node_kind="legacy")
+                self._resolved_config_node_id = legacy_node_id
+                if (
+                    fence_cached_scoped_authority
+                    and cached == self._config_node_id()
+                ):
+                    raise _ConfigAuthorityChanged(
+                        "legacy isolated config authority became visible "
+                        "during a rolling upgrade"
+                    )
+                return legacy_node_id
+
+            if cached is not None:
+                return cached
+
+            scoped_node_id = self._config_node_id()
+            scoped = await _maybe_await(get_node(scoped_node_id))
+            if scoped is not None:
+                self._validate_config_node(scoped, node_kind="scoped")
+
+            # This does not claim cross-key atomicity: an old binary can still
+            # create legacy immediately afterwards.  It does ensure that a
+            # legacy row visible while resolving wins over scoped, and every
+            # later scoped read/write repeats the same fence.
+            legacy = await _maybe_await(get_node(legacy_node_id))
+            if legacy is not None:
+                self._validate_config_node(legacy, node_kind="legacy")
+                self._resolved_config_node_id = legacy_node_id
+                return legacy_node_id
+
+            self._resolved_config_node_id = scoped_node_id
+            return scoped_node_id
+
+    async def _resolved_config_node_id_for(
+        self,
+        storage: Any,
+        *,
+        expected_node_id: Optional[str] = None,
+        fence_cached_scoped_authority: bool = False,
+    ) -> str:
+        """Return the resolved identity and reject a pinned transition drift.
+
+        A caller that pins ``expected_node_id`` is always fencing a durable
+        transition, so a newly visible legacy authority must interrupt it.
+        Read-only callers can instead adopt that legacy authority before any
+        transition is pinned by leaving both arguments unset.
+        """
+
+        node_id = await self._resolve_config_node_id(
+            storage,
+            fence_cached_scoped_authority=(
+                fence_cached_scoped_authority or expected_node_id is not None
+            ),
+        )
+        if expected_node_id is not None and node_id != expected_node_id:
+            raise _ConfigAuthorityChanged(
+                "isolated config authority changed during transition"
+            )
+        return node_id
+
+    async def persist_config(self, config: Dict) -> None:
+        """Best-effort compatibility persist without clobbering transitions.
+
+        This helper is used to seed boot-time config, not to apply a hosted
+        runtime transition.  Its read/modify/write must still use the graph
+        store CAS primitive: ``add_node`` can erase a different replica's
+        pending generation or newer promotion.  A contention loss is therefore
+        left intact as best effort; an invalid identity, policy boundary, or
+        missing CAS capability remains a hard error rather than being hidden.
+        """
+
+        storage = getattr(self.agent, "storage", None)
+        if storage is None:
+            logger.debug("No storage available to persist config for %s", self.name)
+            return
+        get_node = getattr(storage, "get_node", None)
+        # Keep Feature's historical absent-storage treatment for loose mocks;
+        # a real graph-store contract is asynchronous and therefore must pass
+        # the DID-bound identity checks below.
+        if not inspect.iscoroutinefunction(get_node):
+            return
+        if not await self._persistent_config_writes_allowed(storage):
+            logger.debug(
+                "Skipping durable config persist for %s — persistent writes are disabled",
+                self.name,
+            )
+            return
+
+        compare_and_swap = getattr(storage, "compare_and_swap_node", None)
+        if not callable(compare_and_swap):
+            raise RuntimeError(
+                "persistent isolated config requires compare_and_swap_node"
+            )
+
+        state = await self._read_config_state(storage)
+        if state.has_pending:
+            # ``config`` and ``pending_config`` are one generation-owned state
+            # machine.  Updating only the active half would corrupt that
+            # relationship even if we preserved the metadata fields verbatim.
+            logger.debug(
+                "Skipping compatibility config persist for %s — a transition is active",
+                self.name,
+            )
+            return
+
+        properties = dict(state.properties or {})
+        properties["config"] = dict(config)
+        write = await self._write_config_state(
+            storage,
+            state.properties,
+            properties,
+            expected_node_id=state.node_id,
+        )
+        if write.committed:
+            return
+        if write.error is not None:
+            logger.warning("Failed to persist config for %s", self.name)
+            return
+        logger.debug(
+            "Skipped compatibility config persist for %s — durable config changed",
+            self.name,
+        )
+
+    async def load_persisted_config(
+        self, *, raise_on_error: bool = False
+    ) -> Optional[Dict]:
+        """Load config from this proxy's resolved durable authority."""
+
+        storage = getattr(self.agent, "storage", None)
+        if storage is None:
+            return None
+        get_node = getattr(storage, "get_node", None)
+        if not inspect.iscoroutinefunction(get_node):
+            return None
+        try:
+            node_id = await self._resolve_config_node_id(storage)
+            node = await _maybe_await(get_node(node_id))
+            if node_id == self._config_node_id():
+                # Recheck after the scoped read.  This narrows (but does not
+                # close) the old-writer cross-key race described above.
+                resolved_node_id = await self._resolve_config_node_id(storage)
+                if resolved_node_id != node_id:
+                    node_id = resolved_node_id
+                    node = await _maybe_await(get_node(node_id))
+            if node is None:
+                return None
+            self._validate_config_node(node, node_kind="stored")
+            raw_properties = node.properties
+            config = raw_properties.get("config")
+            if isinstance(config, str):
+                config = json.loads(config)
+            if not isinstance(config, dict):
+                config = {}
+            config = dict(config)
+            disabled = config.get("disabled_skills")
+            if isinstance(disabled, list):
+                self.disabled_skills = set(disabled)
+            return config
+        except Exception:
+            if raise_on_error:
+                raise
+            logger.warning("Failed to load persisted config for %s", self.name)
+            return None
 
     @property
     def config_schema(self) -> Optional[Dict]:
@@ -1101,7 +1383,7 @@ class ProxyFeature(Feature):
 
         The SDK client exposes no ``get_config`` (config only flows host→service
         at initialize), so read from the in-memory host config, falling back to
-        the persisted ``feature_config:<name>`` node — NOT an empty passthrough,
+        the resolved durable config node — NOT an empty passthrough,
         which made the config API/UI show blank and drop write-only secrets on a
         partial PATCH (#2214).
         """
@@ -1112,7 +1394,12 @@ class ProxyFeature(Feature):
         # deliberately exposes its *active* config here; the candidate remains
         # private until promotion.
         storage = getattr(self.agent, "storage", None)
-        if storage is not None and await self._persistent_config_writes_allowed(storage):
+        get_node = getattr(storage, "get_node", None) if storage is not None else None
+        if (
+            storage is not None
+            and inspect.iscoroutinefunction(get_node)
+            and await self._persistent_config_writes_allowed(storage)
+        ):
             state = await self._read_config_state(storage)
             # A durable read can describe a winner from another replica while
             # this process still has a child running an older config.  Return
@@ -1142,8 +1429,8 @@ class ProxyFeature(Feature):
         The previous implementation forwarded to ``self._client.set_config`` —
         which the SDK client does not implement — so config set via the API/UI
         was silently dropped: never persisted (so lost on restart) and never
-        applied (#2214). Persist to the ``feature_config:<name>`` graph node (the
-        same node ``_load_host_config`` reads at startup). A service that
+        applied (#2214). Persist to the resolved durable graph node (the same
+        authority ``_load_host_config`` reads at startup). A service that
         advertises the SDK config-transition capability receives the full next
         effective config while it still owns the old one. Its successful typed
         result decides whether to replace the process or retain it after a
@@ -1211,6 +1498,12 @@ class ProxyFeature(Feature):
                     preserve_secret_fields=_preserve_secret_fields,
                     validate_effective_config=_validate_effective_config,
                 )
+                # A scoped compare-and-create cannot atomically exclude an old
+                # binary's independent legacy write.  Fence the exact staged
+                # authority before reconciliation can do any lifecycle work;
+                # the post-reconciliation lease renewal below remains the
+                # final fence immediately before a live SDK hook.
+                await self._assert_staged_transition_authority(transition)
                 await self._reconcile_client_to_authoritative_config(
                     transition.active_config,
                     force=False,
@@ -1234,6 +1527,15 @@ class ProxyFeature(Feature):
                     return
 
                 if self._supports_config_transition():
+                    # Staging precedes local reconciliation so every replica
+                    # agrees on the active config it must restore.  That
+                    # reconciliation can itself stop/start a stale child and
+                    # take longer than the lease.  Re-prove this exact
+                    # owner/generation *after* it finishes and before marking
+                    # the SDK hook attempted; otherwise a replica that lost
+                    # its expired stage could still invoke external live-apply
+                    # work against a candidate it no longer owns.
+                    await self._renew_transition_lease(transition)
                     transition_attempted = True
                     lifecycle_result = await self._prepare_config_transition_with_lease(
                         transition
@@ -1281,6 +1583,12 @@ class ProxyFeature(Feature):
                 # transport outcome rather than a false success.
                 if promotion.error is not None:
                     self._raise_promotion_failure(promotion)
+            except _ConfigAuthorityChanged as authority_error:
+                await self._handle_config_authority_change(transition)
+                raise RuntimeError(
+                    f"Cannot apply config for isolated feature {self.name}: "
+                    "legacy config authority became visible during rolling upgrade"
+                ) from authority_error
             except asyncio.CancelledError:
                 if transition is not None:
                     # Every await after staging enters this path. The cleanup
@@ -1480,6 +1788,72 @@ class ProxyFeature(Feature):
             preserve_cancellation=preserve_cancellation,
         )
 
+    async def _handle_config_authority_change(
+        self,
+        transition: Optional[_ConfigTransition],
+    ) -> None:
+        """Reconcile or quarantine after legacy supersedes scoped authority.
+
+        Before staging, the proxy can safely replace a stale scoped *live*
+        child from the visible legacy active config and leave traffic closed
+        until that reconciliation completes.  A clientless proxy instead
+        caches the legacy active config: config-only ``set_config`` must not
+        create an external child before explicit initialization.  After a
+        scoped stage may have committed, deleting or promoting it would be a
+        cross-key guess against an old writer, so the proxy is terminally
+        quarantined instead.  The legacy row remains the authority for the
+        next proxy; the orphan candidate is an explicit post-rollout
+        operator-cleanup concern.
+        """
+
+        storage = transition.storage if transition is not None else getattr(
+            self.agent, "storage", None
+        )
+        try:
+            if storage is None:
+                raise RuntimeError("storage is unavailable after config authority change")
+            state = await self._read_config_state(storage)
+            if transition is None:
+                if self._client is None:
+                    self._host_config = dict(state.config)
+                    self._host_config_loaded = True
+                    return
+                await self._reconcile_client_to_authoritative_config(
+                    state.config,
+                    force=True,
+                )
+                return
+
+            # A scoped candidate may have committed before the visible legacy
+            # row was revalidated.  Cache the legacy active config for a later
+            # explicit initialize, then retire the potentially divergent child.
+            self._host_config = dict(state.config)
+            self._host_config_loaded = True
+        except BaseException:
+            self._host_config_loaded = False
+        await self._quarantine_unreconciled_client(lifecycle_lock_held=True)
+
+    async def _assert_staged_transition_authority(
+        self,
+        transition: _ConfigTransition,
+    ) -> None:
+        """Prove a freshly staged generation still owns its pinned authority."""
+
+        if not transition.persistent:
+            return
+        state = await self._read_config_state(
+            transition.storage,
+            expected_node_id=transition.config_node_id,
+        )
+        if not self._state_matches_pending_generation(
+            state,
+            generation=transition.generation,
+            owner=transition.owner,
+        ):
+            raise _ConfigTransitionLeaseLost(
+                "isolated config transition was lost immediately after staging"
+            )
+
     async def _recover_fenced_transition(
         self,
         transition: _ConfigTransition,
@@ -1617,7 +1991,10 @@ class ProxyFeature(Feature):
         if not transition.persistent:
             return
         try:
-            state = await self._read_config_state(transition.storage)
+            state = await self._read_config_state(
+                transition.storage,
+                expected_node_id=transition.config_node_id,
+            )
             if not self._state_matches_pending_generation(
                 state,
                 generation=transition.generation,
@@ -1707,7 +2084,14 @@ class ProxyFeature(Feature):
         transition: Optional[_ConfigTransition] = None
         try:
             while True:
-                state = await self._read_config_state(storage)
+                # This is the first durable read of a new lifecycle
+                # transition.  A cached scoped identity must not silently
+                # drift to a legacy row here: surface the rolling-upgrade
+                # retry before any scoped candidate is staged.
+                state = await self._read_config_state(
+                    storage,
+                    fence_cached_scoped_authority=True,
+                )
                 if state.has_pending:
                     if not self._pending_lease_is_expired(state):
                         await self._reconcile_client_to_authoritative_config(
@@ -1782,6 +2166,7 @@ class ProxyFeature(Feature):
                     ),
                     staged_properties=staged_properties,
                     promoted_properties=promoted_properties,
+                    config_node_id=state.node_id,
                     generation=generation,
                     owner=owner,
                 )
@@ -1789,6 +2174,7 @@ class ProxyFeature(Feature):
                     storage,
                     transition.expected_properties,
                     staged_properties,
+                    expected_node_id=transition.config_node_id,
                 )
                 if write.committed:
                     return transition
@@ -1797,7 +2183,10 @@ class ProxyFeature(Feature):
                 # Read before deciding this is a failed stage or a concurrent
                 # winner. Cancellation follows the same owned-abort path as
                 # every later await boundary.
-                observed = await self._read_config_state(storage)
+                observed = await self._read_config_state(
+                    storage,
+                    expected_node_id=transition.config_node_id,
+                )
                 if observed.properties == staged_properties:
                     if isinstance(write.error, asyncio.CancelledError):
                         await self._run_owned_transition_cleanup(
@@ -1870,7 +2259,10 @@ class ProxyFeature(Feature):
         ):
             raise _ConfigTransitionLeaseLost("isolated config transition lease is invalid")
 
-        current_state = await self._read_config_state(transition.storage)
+        current_state = await self._read_config_state(
+            transition.storage,
+            expected_node_id=transition.config_node_id,
+        )
         if not self._state_matches_pending_generation(
             current_state,
             generation=generation,
@@ -1882,7 +2274,12 @@ class ProxyFeature(Feature):
         renewed[_PENDING_LEASE_EXPIRES_AT_KEY] = (
             _utc_now() + _PENDING_CONFIG_LEASE_TTL
         ).isoformat()
-        write = await self._write_config_state(transition.storage, staged, renewed)
+        write = await self._write_config_state(
+            transition.storage,
+            staged,
+            renewed,
+            expected_node_id=transition.config_node_id,
+        )
         if write.committed:
             transition.staged_properties = renewed
             transition.promoted_properties = self._promoted_properties_from_staged(
@@ -1892,7 +2289,10 @@ class ProxyFeature(Feature):
             )
             return
 
-        observed = await self._read_config_state(transition.storage)
+        observed = await self._read_config_state(
+            transition.storage,
+            expected_node_id=transition.config_node_id,
+        )
         if observed.properties == renewed:
             # The CAS committed before its caller lost the response.  Preserve
             # the refreshed predicate for a later promotion.
@@ -2019,17 +2419,22 @@ class ProxyFeature(Feature):
                 storage,
                 expected_properties,
                 cleared_properties,
+                expected_node_id=state.node_id,
             )
             if write.committed:
                 return _PendingCleanupResolution(
                     state=_ConfigState(
                         properties=cleared_properties,
                         config=dict(state.config),
+                        node_id=state.node_id,
                     ),
                     cleared=True,
                 )
 
-            observed = await self._read_config_state(storage)
+            observed = await self._read_config_state(
+                storage,
+                expected_node_id=state.node_id,
+            )
             if observed.properties == cleared_properties:
                 return _PendingCleanupResolution(state=observed, cleared=True)
             if not self._state_matches_pending_generation(
@@ -2060,7 +2465,10 @@ class ProxyFeature(Feature):
             return state
 
         try:
-            state = await self._read_config_state(transition.storage)
+            state = await self._read_config_state(
+                transition.storage,
+                expected_node_id=transition.config_node_id,
+            )
             if self._state_matches_pending_generation(
                 state,
                 generation=transition.generation,
@@ -2121,6 +2529,7 @@ class ProxyFeature(Feature):
             observed = await self._read_config_state_after_promotion_failure(
                 transition.storage,
                 probe_error,
+                expected_node_id=transition.config_node_id,
             )
             return _PromotionResolution(
                 state=observed,
@@ -2132,6 +2541,7 @@ class ProxyFeature(Feature):
             observed = await self._read_config_state_after_promotion_failure(
                 transition.storage,
                 RuntimeError("persistent config writes became unavailable"),
+                expected_node_id=transition.config_node_id,
             )
             return _PromotionResolution(
                 state=observed,
@@ -2146,12 +2556,14 @@ class ProxyFeature(Feature):
             transition.storage,
             transition.staged_properties,
             transition.promoted_properties,
+            expected_node_id=transition.config_node_id,
         )
         if write.committed:
             return _PromotionResolution(
                 state=_ConfigState(
                     properties=dict(transition.promoted_properties or {}),
                     config=dict(transition.next_config),
+                    node_id=transition.config_node_id,
                 ),
                 committed=True,
             )
@@ -2159,6 +2571,7 @@ class ProxyFeature(Feature):
         observed = await self._read_config_state_after_promotion_failure(
             transition.storage,
             write.error,
+            expected_node_id=transition.config_node_id,
         )
         # The generation stamp makes this proof specific to this transition;
         # matching only ``config`` would let a different replica's same-valued
@@ -2176,6 +2589,8 @@ class ProxyFeature(Feature):
         storage: Any,
         expected_properties: Optional[Dict[str, Any]],
         properties: Optional[Dict[str, Any]],
+        *,
+        expected_node_id: Optional[str] = None,
     ) -> _ConfigWriteResult:
         """Conditionally write one complete transition state without swallowing.
 
@@ -2187,8 +2602,13 @@ class ProxyFeature(Feature):
 
         from kestrel_sovereign.storage.async_graph_store import GraphNode
 
+        node_id = await self._resolved_config_node_id_for(
+            storage,
+            expected_node_id=expected_node_id,
+        )
+
         node = GraphNode(
-            node_id=self._config_node_id(),
+            node_id=node_id,
             node_type=self._CONFIG_NODE_TYPE,
             label=f"{self.name} config",
             properties=dict(properties or {}),
@@ -2204,7 +2624,7 @@ class ProxyFeature(Feature):
             )
         try:
             result = await _maybe_await(
-                compare_and_swap(self._config_node_id(), expected_properties, node)
+                compare_and_swap(node_id, expected_properties, node)
             )
             return _ConfigWriteResult(committed=result == "swapped")
         except BaseException as exc:
@@ -2226,8 +2646,19 @@ class ProxyFeature(Feature):
                 "could not determine persistence policy"
             ) from exc
 
-    async def _read_config_state(self, storage: Any) -> _ConfigState:
-        """Read one complete config-node snapshot without consulting the cache."""
+    async def _read_config_state(
+        self,
+        storage: Any,
+        *,
+        expected_node_id: Optional[str] = None,
+        fence_cached_scoped_authority: bool = False,
+    ) -> _ConfigState:
+        """Read one snapshot from the visible durable authority.
+
+        A read made before a transition is pinned may safely adopt a newly
+        visible legacy row.  Expected-node reads and callers explicitly
+        beginning a transition retain the strict cached-scoped authority fence.
+        """
 
         get_node = getattr(storage, "get_node", None)
         if not callable(get_node):
@@ -2236,22 +2667,39 @@ class ProxyFeature(Feature):
                 "storage cannot read config transition state"
             )
         try:
-            node = await _maybe_await(get_node(self._config_node_id()))
+            node_id = await self._resolved_config_node_id_for(
+                storage,
+                expected_node_id=expected_node_id,
+                fence_cached_scoped_authority=fence_cached_scoped_authority,
+            )
+            node = await _maybe_await(get_node(node_id))
+            if node_id == self._config_node_id():
+                # A read-only lookup can adopt a legacy row that appeared
+                # between its scoped lookup and this recheck. Once an exact
+                # node is pinned, keep the strict fence instead.
+                pinned_authority = (
+                    expected_node_id is not None or fence_cached_scoped_authority
+                )
+                revalidated_node_id = await self._resolved_config_node_id_for(
+                    storage,
+                    expected_node_id=node_id if pinned_authority else None,
+                    fence_cached_scoped_authority=fence_cached_scoped_authority,
+                )
+                if revalidated_node_id != node_id:
+                    node_id = revalidated_node_id
+                    node = await _maybe_await(get_node(node_id))
+        except _ConfigAuthorityChanged:
+            raise
         except Exception as exc:  # noqa: BLE001 - durable read is a hard boundary
             raise RuntimeError(
                 f"Cannot apply config for isolated feature {self.name}: "
                 "failed to load config transition state"
             ) from exc
         if node is None:
-            return _ConfigState(properties=None, config={})
+            return _ConfigState(properties=None, config={}, node_id=node_id)
 
-        raw_properties = getattr(node, "properties", None)
-        if not isinstance(raw_properties, dict):
-            raise RuntimeError(
-                f"Cannot apply config for isolated feature {self.name}: "
-                "stored config transition state is invalid"
-            )
-        properties = dict(raw_properties)
+        self._validate_config_node(node, node_kind="stored")
+        properties = dict(node.properties)
         raw_config = properties.get("config")
         if isinstance(raw_config, str):
             try:
@@ -2267,7 +2715,11 @@ class ProxyFeature(Feature):
         )
         has_pending = any(key in properties for key in pending_keys)
         if not has_pending:
-            return _ConfigState(properties=properties, config=config)
+            return _ConfigState(
+                properties=properties,
+                config=config,
+                node_id=node_id,
+            )
 
         pending_config = properties.get("pending_config")
         generation = properties.get(_PENDING_GENERATION_KEY)
@@ -2301,6 +2753,7 @@ class ProxyFeature(Feature):
         return _ConfigState(
             properties=properties,
             config=config,
+            node_id=node_id,
             has_pending=True,
             pending_generation=generation,
             pending_owner=owner,
@@ -2311,11 +2764,16 @@ class ProxyFeature(Feature):
         self,
         storage: Any,
         write_error: Optional[BaseException],
+        *,
+        expected_node_id: Optional[str] = None,
     ) -> _ConfigState:
         """Read durable state after an ambiguous promotion or quarantine."""
 
         try:
-            return await self._read_config_state(storage)
+            return await self._read_config_state(
+                storage,
+                expected_node_id=expected_node_id,
+            )
         except BaseException as read_error:
             # We cannot prove which config won, so no live child may remain.
             self._host_config_loaded = False

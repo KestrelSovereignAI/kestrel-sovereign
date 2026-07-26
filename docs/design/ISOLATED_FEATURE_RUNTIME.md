@@ -116,6 +116,29 @@ feature, instead of importing the class it instantiates a **proxy `Feature`**:
 4. On-demand provision: `uv venv` + `uv pip install` of the service project
    (opt-in; gives true "feature brings its own venv" UX).
 
+#### Rolling config authority and operator boundary
+
+An isolated proxy's durable config is DID-scoped for new agents.  Older
+proxies used the unscoped `feature_config:<class-name>` row, however, so a
+same-agent visible legacy row remains the authority for the duration of a
+mixed-version rollout.  A proxy never copies that row to a scoped key: old and
+new replicas must contend on the same CAS row.
+
+The graph store cannot atomically compare an old binary's legacy key with the
+new scoped key.  The proxy checks for visible legacy authority before every
+scoped read and write, then again before an SDK lifecycle hook or traffic can
+continue.  If legacy appears after a scoped stage, it fences the transition and
+quarantines the proxy rather than promoting, deleting, or live-applying across
+two authorities.  This may leave an orphaned scoped *candidate* in the final
+cross-key race; a second read narrows that window but does not close it.
+
+After all old replicas have been drained, an operator must inspect the two
+same-agent rows, choose the intended active config, and remove or reconcile an
+orphan only in an exclusive maintenance window.  Do not delete a legacy row
+while an old replica may still write it, and never perform this cleanup against
+another tenant's invisible rows.  New proxies continue to converge on legacy
+for as long as that row is visible.
+
 ### 3.3 IPC + lifecycle contract (SDK)
 
 A shared contract in `kestrel-sovereign-sdk` so every isolated feature (and,

@@ -17,6 +17,13 @@ from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
 from kestrel_sovereign.features.isolated_runtime import ProxyFeature
 
 
+_TEST_AGENT_DID = "did:test:isolated-integration"
+
+
+def _config_node_id(feature_name: str) -> str:
+    return f"feature_config:v2:{_TEST_AGENT_DID}:{feature_name}"
+
+
 class _QueueReader:
     def __init__(self):
         self._queue: asyncio.Queue[bytes] = asyncio.Queue()
@@ -39,6 +46,7 @@ class _QueueWriter:
 class _Storage:
     def __init__(self):
         self.nodes = {}
+        self.agent_id = _TEST_AGENT_DID
 
     async def add_node(self, node) -> None:
         self.nodes[node.node_id] = node
@@ -141,7 +149,7 @@ async def test_proxy_forwards_empty_config_through_real_subprocess_wrapper(
         runtime="isolated-venv",
         service="empty-config-service",
     )
-    agent = Mock(storage_path=str(tmp_path / "agent" / "kestrel_prime.db"), features={})
+    agent = Mock(did=_TEST_AGENT_DID, storage_path=str(tmp_path / "agent" / "kestrel_prime.db"), features={})
     agent.storage = _Storage()
     monkeypatch.setenv("EMPTY_CONFIG_MARKER", str(configured))
     monkeypatch.setenv("KESTREL_FEATURE_EMPTYCONFIGFEATURE_BIN", str(service_script))
@@ -209,7 +217,7 @@ async def test_proxy_uses_negotiated_sdk_transition_before_replacement(
         runtime="isolated-venv",
         service="test-service",
     )
-    agent = Mock(storage_path=str(tmp_path / "agent" / "kestrel_prime.db"), features={})
+    agent = Mock(did=_TEST_AGENT_DID, storage_path=str(tmp_path / "agent" / "kestrel_prime.db"), features={})
     agent.storage = _Storage()
     monkeypatch.setenv("KESTREL_FEATURE_TRANSITIONFEATURE_BIN", "/bin/test-service")
     feature = ProxyFeature(agent, runtime, client_factory=client_factory)
@@ -264,8 +272,12 @@ async def test_real_sdk_fenced_transition_promotion_failure_restores_durable_con
 
         async def compare_and_swap_node(self, node_id, expected, new_node):
             self.cas_calls += 1
-            # Stage candidate, then reject its conditional promotion.
-            if self.cas_calls == 2:
+            # The post-reconciliation lease renewal is a distinct CAS; fault
+            # the promotion state itself rather than relying on call order.
+            if (
+                "pending_config" not in new_node.properties
+                and new_node.properties.get("config") == next_config
+            ):
                 raise OSError("storage offline during promotion")
             return await super().compare_and_swap_node(node_id, expected, new_node)
 
@@ -306,7 +318,7 @@ async def test_real_sdk_fenced_transition_promotion_failure_restores_durable_con
         runtime="isolated-venv",
         service="test-service",
     )
-    agent = Mock(storage_path=str(tmp_path / "agent" / "kestrel_prime.db"), features={})
+    agent = Mock(did=_TEST_AGENT_DID, storage_path=str(tmp_path / "agent" / "kestrel_prime.db"), features={})
     agent.storage = PromotionFailingStorage()
     monkeypatch.setenv("KESTREL_FEATURE_FENCEDRECOVERYFEATURE_BIN", "/bin/test-service")
     feature = ProxyFeature(agent, runtime, client_factory=client_factory)
@@ -344,7 +356,7 @@ async def test_real_sdk_fenced_transition_promotion_failure_restores_durable_con
         assert clients[1].stopped is False
         assert feature._host_config == old_config
         assert feature._client is clients[1]
-        properties = agent.storage.nodes["feature_config:FencedRecoveryFeature"].properties
+        properties = agent.storage.nodes[_config_node_id("FencedRecoveryFeature")].properties
         assert properties["config"] == old_config
         assert "pending_config" not in properties
         assert "_isolated_pending_generation" not in properties
