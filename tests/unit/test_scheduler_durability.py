@@ -809,6 +809,29 @@ async def test_dynamic_registration_post_load_adopts_other_owner_builtins(
             owner.prepare_tenant_registration(),
             replica.prepare_tenant_registration(),
         )
+        registration_contexts = (
+            (owner, db_owner, owner_registration),
+            (replica, db_replica, replica_registration),
+        )
+        # These preparations intentionally race for the bootstrap lock. The
+        # lock guarantees one first registration, but not that the coroutine
+        # named ``owner`` reaches it first. Bind the roles below to the
+        # durable outcome so the post-load adoption contract is tested without
+        # imposing a scheduler-dependent coroutine ordering.
+        assert sorted(
+            registration.rollout_preexisting
+            for _, _, registration in registration_contexts
+        ) == [False, True]
+        owner, db_owner, owner_registration = next(
+            registration
+            for registration in registration_contexts
+            if not registration[2].rollout_preexisting
+        )
+        replica, db_replica, replica_registration = next(
+            registration
+            for registration in registration_contexts
+            if registration[2].rollout_preexisting
+        )
         assert owner_registration.rollout_preexisting is False
         assert replica_registration.rollout_preexisting is True
         owner_feature, owner_agent = scheduler_feature_for(
