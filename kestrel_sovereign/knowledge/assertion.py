@@ -74,16 +74,16 @@ _REG_NAME_RE = re.compile(r"^(?:[A-Za-z0-9._~!$&'()*+,;=-]|%[0-9A-Fa-f]{2})+$")
 _USERINFO_RE = re.compile(r"^(?:[A-Za-z0-9._~!$&'()*+,;=:%-])*$")
 _PATH_RE = re.compile(r"^(?:[A-Za-z0-9._~!$&'()*+,;=:@%/-])*$")
 _QUERY_FRAGMENT_RE = re.compile(r"^(?:[A-Za-z0-9._~!$&'()*+,;=:@%/?-])*$")
-_IPV_FUTURE_RE = re.compile(r"^v[0-9A-Fa-f]+\.[A-Za-z0-9._~!$&'()*+,;=:-]+$")
+_IPV_FUTURE_RE = re.compile(r"^[Vv][0-9A-Fa-f]+\.[A-Za-z0-9._~!$&'()*+,;=:-]+$")
 _INTEGER_RE = re.compile(r"^[+-]?[0-9]+$")
 _DECIMAL_RE = re.compile(r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)$")
-_DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+_DATE_RE = re.compile(r"^([0-9]{4})-([0-9]{2})-([0-9]{2})$")
 _TIME_RE = re.compile(
-    r"^(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$"
+    r"^([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{1,9}))?(Z|[+-][0-9]{2}:[0-9]{2})$"
 )
 _TIMESTAMP_RE = re.compile(
-    r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})"
-    r"(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$"
+    r"^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})"
+    r"(?:\.([0-9]{1,9}))?(Z|[+-][0-9]{2}:[0-9]{2})$"
 )
 _LANGUAGE_RE = re.compile(
     r"^(?:(?:[A-Za-z]{2,3}(?:-[A-Za-z]{3}){0,3}|[A-Za-z]{4}|[A-Za-z]{5,8})"
@@ -1077,8 +1077,6 @@ class Assertion:
             object.__setattr__(self, "supersedes_revision_id", _plain_identifier(self.supersedes_revision_id, "supersedes_revision_id"))
             if self.supersedes_revision_id == self.revision_id:
                 _fail("an assertion revision cannot supersede itself")
-        if self.status is AssertionStatus.SUPERSEDED and self.supersedes_revision_id is None:
-            _fail("a superseded revision must identify its predecessor revision")
         if self.status in {AssertionStatus.RETRACTED, AssertionStatus.QUARANTINED, AssertionStatus.DELETED} and self.supersedes_revision_id is not None:
             _fail("retracted, quarantined, or deleted revisions cannot supersede another revision")
         if self.epistemic_state is EpistemicState.RETRACTED and self.status is not AssertionStatus.RETRACTED:

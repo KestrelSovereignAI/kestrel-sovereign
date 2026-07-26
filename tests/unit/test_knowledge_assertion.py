@@ -14,9 +14,12 @@ from kestrel_sovereign.knowledge import (
     IDENTITY_VERSION,
     RDF_LANG_STRING,
     XSD_BOOLEAN,
+    XSD_DATE,
+    XSD_DATETIME,
     XSD_DECIMAL,
     XSD_INTEGER,
     XSD_STRING,
+    XSD_TIME,
     Assertion,
     AssertionQuery,
     AssertionResult,
@@ -137,6 +140,10 @@ def test_pinned_iri_profile_normalizes_contract_vectors(raw: str, expected: str)
     assert normalize_iri(raw) == expected
 
 
+def test_pinned_iri_profile_normalizes_case_insensitive_ipvfuture_marker() -> None:
+    assert normalize_iri("https://[Vf.Example-Host]/a") == "https://[vf.example-host]/a"
+
+
 def test_host_percent_equivalence_has_same_identity_preimage() -> None:
     first = IRI("HTTP://%45XAMPLE.test/a")
     second = IRI("http://example.test/a")
@@ -210,6 +217,19 @@ def test_timezone_normalization_and_interval_validation() -> None:
         TemporalInterval(start="2026-07-26T14:00:00.1Z", end="2026-07-26T14:00:00Z")
 
 
+@pytest.mark.parametrize(
+    ("lexical_form", "datatype_iri"),
+    [
+        ("٢٠٢٦-07-26", XSD_DATE),
+        ("14:02:١١Z", XSD_TIME),
+        ("2026-07-26T14:02:11.١Z", XSD_DATETIME),
+    ],
+)
+def test_literal_temporal_forms_reject_non_ascii_digits(lexical_form: str, datatype_iri: str) -> None:
+    with pytest.raises(AssertionValidationError):
+        Literal(lexical_form, datatype_iri)
+
+
 def test_direct_and_derived_provenance_round_trip_including_derivation_reference() -> None:
     source = SourceOccurrence(
         source_occurrence_id="conversation_history:884#message-body",
@@ -251,7 +271,6 @@ def test_direct_and_derived_provenance_round_trip_including_derivation_reference
         {"confidence": 0.5},
         {"object": "not-a-term"},
         {"status": "not-a-status"},
-        {"status": AssertionStatus.SUPERSEDED, "supersedes_revision_id": None},
         {"supersedes_revision_id": "revision-1"},
         {"status": AssertionStatus.RETRACTED, "epistemic_state": EpistemicState.REPORTED},
         {"epistemic_state": EpistemicState.INFERRED},
@@ -260,6 +279,19 @@ def test_direct_and_derived_provenance_round_trip_including_derivation_reference
 def test_fail_fast_validation_for_tenant_confidence_type_status_and_supersession(overrides: dict[str, object]) -> None:
     with pytest.raises(AssertionValidationError):
         direct_assertion(**overrides)
+
+
+def test_atomic_supersession_can_append_an_unlinked_old_state_revision() -> None:
+    old_state_revision = direct_assertion(status=AssertionStatus.SUPERSEDED)
+    replacement = direct_assertion(
+        revision_id="replacement-revision",
+        supersedes_revision_id=old_state_revision.revision_id,
+    )
+
+    assert old_state_revision.supersedes_revision_id is None
+    assert Assertion.from_mapping(old_state_revision.to_mapping()) == old_state_revision
+    assert replacement.status is AssertionStatus.ACTIVE
+    assert replacement.supersedes_revision_id == old_state_revision.revision_id
 
 
 def test_caller_assertion_id_must_match_the_derived_identity() -> None:
