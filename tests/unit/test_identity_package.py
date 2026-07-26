@@ -19,6 +19,7 @@ from kestrel_sovereign.identity import (
     create_package_hash,
     create_migration_id,
 )
+from kestrel_sovereign.inception_service import public_key_to_ethereum_address
 
 
 class TestPersonalityFingerprint:
@@ -332,8 +333,7 @@ class TestDIDDocumentVerification:
         )
         public_key_hex = public_key_bytes.hex()
 
-        import hashlib
-        address = "0x" + hashlib.sha3_256(public_key_bytes[1:]).hexdigest()[-40:]
+        address = public_key_to_ethereum_address(public_key)
         did = f"did:pkh:eip155:1:{address}"
         key_id = f"kestrel_{address}"
 
@@ -397,8 +397,7 @@ class TestDIDDocumentVerification:
             Encoding.X962, PublicFormat.UncompressedPoint
         )
 
-        import hashlib
-        address = "0x" + hashlib.sha3_256(public_key_bytes[1:]).hexdigest()[-40:]
+        address = public_key_to_ethereum_address(public_key)
         did = f"did:pkh:eip155:1:{address}"
         key_id = f"kestrel_{address}"
 
