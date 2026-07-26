@@ -802,6 +802,14 @@ class AsyncDatabase:
             if statement:
                 await self._backend.execute(statement)
 
+        # Canonical semantic assertions are an additive, normalized authority
+        # behind this same AsyncDatabase.  Do not place their lifecycle and
+        # provenance state in graph JSON: the migration owns one transactional
+        # schema on both SQLite and PostgreSQL and propagates failure so a
+        # partial authority is never treated as ready.
+        from .sqla.migrations import migrate_semantic_assertion_store
+        await migrate_semantic_assertion_store(self)
+
         # #2649: legacy graph/file/chunk rows predate the authoritative
         # ownership ledgers above. These backfills prove ownership only from
         # existing agent tags/roots/edges, leaving ambiguous rows unowned so

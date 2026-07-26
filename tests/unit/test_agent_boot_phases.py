@@ -804,15 +804,24 @@ async def test_concurrent_initialize_is_refused(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_storage_phase_uses_shared_postgres_pool():
+async def test_storage_phase_uses_shared_postgres_pool(tmp_path):
+    from kestrel_sovereign.inception_service import create_kestrel_identity_async
+
+    credentials = await create_kestrel_identity_async(
+        str(tmp_path),
+        identity_method="did:pkh",
+        agent_name="Shared pool semantic authority test",
+    )
     pool = MagicMock()
     agent = KestrelAgent(
-        did="did:test:pg",
+        did=credentials.agent_did,
+        storage_path=str(tmp_path / "kestrel_prime.db"),
         db_backend="postgres",
         pg_pool=pool,
         database_url="postgresql://scheduler-test/kestrel",
         llm_service=MagicMock(),
     )
+    assert agent.identity is not None
     ctx = BootContext()
     with patch("kestrel_sovereign.kestrel_agent.AsyncStorage") as MockStorage, patch(
         "kestrel_sovereign.storage.db.postgres.PostgresBackend"
@@ -835,6 +844,8 @@ async def test_storage_phase_uses_shared_postgres_pool():
         )
         _, kwargs = MockStorage.call_args
         assert kwargs.get("backend") is pg_backend
+        capability = kwargs.get("_assertion_tenant_capability")
+        assert capability is not None and capability.tenant_id == agent.did
     assert agent._raw_storage is storage
     # Storage teardown was registered for reverse-order rollback.
     assert "storage" in ctx.rollback_labels

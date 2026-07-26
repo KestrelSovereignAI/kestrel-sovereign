@@ -1,5 +1,6 @@
 """SQLite/PostgreSQL semantic parity contracts for storage seams."""
 
+import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -29,9 +30,142 @@ from kestrel_sovereign.storage.async_file_store import AsyncFileStore
 from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore, GraphNode
 from kestrel_sovereign.storage.async_rag_store import AsyncRAGStore
 from kestrel_sovereign.storage.async_storage import AsyncStorage
+from kestrel_sovereign.storage.db.interface import QueryError
 from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
 from kestrel_sovereign.storage.saved_items_store import SavedItemsStore
 from kestrel_sovereign.storage.schema_router import SchemaRouter
+from kestrel_sovereign.security.assertion_tenant_resolver import (
+    _resolve_authenticated_agent_assertion_capability,
+)
+from kestrel_sovereign.identity.runtime_identity import (
+    AgentIdentity,
+    load_agent_identity,
+)
+from kestrel_sovereign.inception_service import create_kestrel_identity_async
+
+
+def _semantic_source(source_id: str):
+    from kestrel_sovereign.knowledge import SourceOccurrence
+
+    return SourceOccurrence(
+        source_occurrence_id=source_id,
+        source_kind="parity-test",
+        locator=f"parity:{source_id}",
+        received_at="2026-07-26T14:02:11Z",
+        content_digest="sha256:parity",
+        actor="test",
+        selector="record",
+    )
+
+
+def _semantic_assertion(tenant_id: str, revision_id: str, *, value: str = "value"):
+    from kestrel_sovereign.knowledge import (
+        Assertion,
+        DirectLineage,
+        EpistemicState,
+        IRI,
+        Literal,
+        OntologyRef,
+        XSD_STRING,
+    )
+
+    return Assertion(
+        tenant_id=tenant_id,
+        owning_agent_id=tenant_id,
+        subject=IRI(f"urn:kestrel:agent:{tenant_id}:principal:user"),
+        predicate=IRI("https://kestrel.ai/vocab/parity"),
+        object=Literal(value, XSD_STRING),
+        revision_id=revision_id,
+        confidence="1",
+        confidence_method="test",
+        confidence_basis="parity",
+        epistemic_state=EpistemicState.REPORTED,
+        asserted_at="2026-07-26T14:02:11Z",
+        ontology_version=OntologyRef("parity", "1", "sha256:parity", "semantic-kb-v1"),
+        lineage=DirectLineage(("parity-source",)),
+        privacy_classification="normal",
+        release_policy_reference="policy:private-v1",
+    )
+
+
+def _derived_semantic_assertion(tenant_id: str, revision_id: str, input_revision_id: str, marker: str):
+    from kestrel_sovereign.knowledge import (
+        Assertion,
+        DerivedLineage,
+        EpistemicState,
+        IRI,
+        Literal,
+        OntologyRef,
+        XSD_STRING,
+    )
+
+    return Assertion(
+        tenant_id=tenant_id,
+        owning_agent_id=tenant_id,
+        subject=IRI(f"urn:kestrel:agent:{tenant_id}:principal:user"),
+        predicate=IRI(f"https://kestrel.ai/vocab/parityDerived/{marker}"),
+        object=Literal("true", XSD_STRING),
+        revision_id=revision_id,
+        confidence="1",
+        confidence_method="rule",
+        confidence_basis="parity",
+        epistemic_state=EpistemicState.INFERRED,
+        asserted_at="2026-07-26T14:02:12Z",
+        ontology_version=OntologyRef("parity", "1", "sha256:parity", "semantic-kb-v1"),
+        lineage=DerivedLineage(
+            rule_id=f"parity-{marker}", engine_version="1", profile_version="1",
+            input_revision_ids=(input_revision_id,), input_digest="sha256:parity-inputs",
+            run_id=f"parity-{marker}", generated_at="2026-07-26T14:02:12Z",
+        ),
+        privacy_classification="normal",
+        release_policy_reference="policy:private-v1",
+    )
+
+
+async def _incepted_assertion_identity(
+    identity_dir,
+    label: str,
+) -> tuple[str, AgentIdentity]:
+    """Create and load a real identity for semantic authority parity tests."""
+    credentials = await create_kestrel_identity_async(
+        str(identity_dir / label),
+        identity_method="did:pkh",
+        agent_name=f"Semantic parity {label}",
+    )
+    tenant_id = credentials.agent_did
+    key_id = f"kestrel_{tenant_id.rsplit(':', 1)[-1]}"
+    return tenant_id, load_agent_identity(key_id, identity_dir / label)
+
+
+async def _assertion_storage_for_backend(
+    db_backend,
+    tenant_id: str,
+    identity: AgentIdentity,
+) -> AsyncStorage:
+    """Open a boot-resolver-authorized assertion store for parity coverage."""
+    capability = _resolve_authenticated_agent_assertion_capability(
+        tenant_id,
+        identity,
+    )
+    if db_backend.backend_type == "sqlite":
+        storage = AsyncStorage(
+            db_backend.db_path,
+            agent_id=tenant_id,
+            _assertion_tenant_capability=capability,
+        )
+        await storage.initialize()
+        return storage
+    dsn = getattr(db_backend, "_dsn", None)
+    if not dsn:
+        raise RuntimeError("PostgreSQL parity backend did not expose its test DSN")
+    storage = AsyncStorage(
+        backend="postgres",
+        dsn=dsn,
+        agent_id=tenant_id,
+        _assertion_tenant_capability=capability,
+    )
+    await storage.initialize()
+    return storage
 
 
 @pytest.mark.asyncio
@@ -83,6 +217,246 @@ async def test_constitution_runtime_state_round_trips_on_both_backends(db_backen
     assert restored.bootstrap_pending is True
     assert restored.safe_mode_entered_at.tzinfo == timezone.utc
     assert restored.last_successful_audit_at.tzinfo == timezone.utc
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_canonical_assertion_store_has_tenant_and_lifecycle_parity(
+    db_backend,
+    tmp_path,
+):
+    """The normalized assertion authority has the same observable contract on SQLite and PostgreSQL."""
+    tenant, identity = await _incepted_assertion_identity(tmp_path, "primary")
+    other_tenant, other_identity = await _incepted_assertion_identity(tmp_path, "foreign")
+    storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    other_storage = await _assertion_storage_for_backend(
+        db_backend,
+        other_tenant,
+        other_identity,
+    )
+    try:
+        store = storage
+        assertion = _semantic_assertion(tenant, "parity-revision")
+        written = await store.put_assertion(assertion, source_occurrences=(_semantic_source("parity-source"),))
+
+        assert await store.get_assertion(assertion.assertion_id) == assertion
+        assert (await store.assertion_changes_since(0))[0].event_id == written.event_id
+        assert await other_storage.get_assertion(assertion.assertion_id) is None
+
+        retracted = await store.retract_assertion(assertion.assertion_id, assertion.revision_id)
+        assert len(retracted.retracted) == 1
+        assert await store.get_assertion(assertion.assertion_id) is None
+        assert await storage.db.fetchval(
+            "SELECT eligible FROM semantic_projection_eligibility WHERE tenant_id = ? AND revision_id = ?",
+            (tenant, assertion.revision_id),
+        ) == 0
+        with pytest.raises(QueryError):
+            await storage.db.execute(
+                "INSERT INTO semantic_projection_outbox "
+                "(event_id, tenant_id, assertion_id, revision_id, operation, generation, eligible, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("invalid-parity-event", tenant, "assertion", "revision", "accepted", 0, 2, "2026-07-26T14:02:11Z"),
+            )
+    finally:
+        await other_storage.close()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_derived_assertion_lifecycle_parity(db_backend, tmp_path):
+    """All lifecycle transitions preserve derived lineage on both backends."""
+    tenant, identity = await _incepted_assertion_identity(tmp_path, "lifecycle")
+    storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    try:
+        store = storage
+
+        async def write_pair(marker: str):
+            root = _semantic_assertion(tenant, f"{marker}-root", value=marker)
+            await store.put_assertion(root, source_occurrences=(_semantic_source("parity-source"),))
+            child = _derived_semantic_assertion(tenant, f"{marker}-derived", root.revision_id, marker)
+            await store.put_assertion(child)
+            return root, child
+
+        superseded_root, superseded_child = await write_pair("supersede")
+        replacement = _semantic_assertion(tenant, "supersede-replacement", value="replacement")
+        supersession = await store.supersede_assertion(
+            superseded_root.revision_id,
+            replacement,
+            source_occurrences=(_semantic_source("parity-source"),),
+        )
+        assert superseded_child.revision_id in supersession.invalidated_revision_ids
+        assert await store.get_assertion(superseded_child.assertion_id) is None
+        assert (await store.list_assertion_revisions(superseded_child.assertion_id))[-1].status.value == "retracted"
+
+        retracted_root, retracted_child = await write_pair("retract")
+        retraction = await store.retract_assertion(retracted_root.assertion_id, retracted_root.revision_id)
+        assert {item.assertion_id for item in retraction.retracted} == {
+            retracted_root.assertion_id,
+            retracted_child.assertion_id,
+        }
+        assert (await store.list_assertion_revisions(retracted_child.assertion_id))[-1].status.value == "retracted"
+
+        deleted_root, deleted_child = await write_pair("delete")
+        deletion = await store.delete_assertion(deleted_root.assertion_id, deleted_root.revision_id)
+        assert deletion.invalidated_revision_ids == (
+            deleted_root.revision_id,
+            deleted_child.revision_id,
+        )
+        assert [item.assertion_id for item in deletion.invalidated] == [deleted_child.assertion_id]
+        assert (await store.list_assertion_revisions(deleted_child.assertion_id))[-1].status.value == "retracted"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_erasure_scrubs_historical_derived_lineage_on_both_backends(
+    db_backend,
+    tmp_path,
+):
+    """Erasure removes stale links from current and historical direct revisions."""
+    from kestrel_sovereign.knowledge import Assertion, DirectLineage, EpistemicState
+
+    tenant, identity = await _incepted_assertion_identity(tmp_path, "historical-lineage")
+    storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    try:
+        root = _semantic_assertion(tenant, "historical-root", value="historical-root")
+        await storage.put_assertion(
+            root,
+            source_occurrences=(_semantic_source("parity-source"),),
+        )
+        derived = _derived_semantic_assertion(
+            tenant,
+            "historical-derived",
+            root.revision_id,
+            "historical",
+        )
+        await storage.put_assertion(derived)
+
+        replacement_mapping = derived.to_mapping()
+        replacement_mapping["revision_id"] = "historical-direct-replacement"
+        replacement_mapping["lineage"] = DirectLineage(
+            ("historical-direct-source",)
+        ).to_mapping()
+        replacement_mapping["epistemic_state"] = EpistemicState.REPORTED.value
+        replacement = Assertion.from_mapping(replacement_mapping)
+        assert replacement.assertion_id == derived.assertion_id
+        supersession = await storage.supersede_assertion(
+            derived.revision_id,
+            replacement,
+            source_occurrences=(_semantic_source("historical-direct-source"),),
+        )
+
+        second_mapping = replacement.to_mapping()
+        second_mapping["revision_id"] = "historical-direct-second-replacement"
+        second_mapping["lineage"] = DirectLineage(
+            ("historical-direct-second-source",)
+        ).to_mapping()
+        second_replacement = Assertion.from_mapping(second_mapping)
+        second_supersession = await storage.supersede_assertion(
+            supersession.replacement.revision_id,
+            second_replacement,
+            source_occurrences=(_semantic_source("historical-direct-second-source"),),
+        )
+
+        erased = await storage.erase_assertion(root.assertion_id)
+
+        assert derived.assertion_id not in erased.erased_assertion_ids
+        assert derived.revision_id in erased.erased_revision_ids
+        assert supersession.predecessor.revision_id in erased.erased_revision_ids
+        surviving = await storage.get_assertion(derived.assertion_id)
+        assert surviving is not None
+        assert surviving.revision_id == second_supersession.replacement.revision_id
+        assert surviving.supersedes_revision_id == second_supersession.predecessor.revision_id
+        historical_row = await storage.db.fetchone(
+            "SELECT supersedes_revision_id, assertion_mapping "
+            "FROM semantic_assertion_revisions WHERE tenant_id = ? AND revision_id = ?",
+            (tenant, supersession.replacement.revision_id),
+        )
+        assert historical_row is not None
+        assert historical_row[0] is None
+        assert Assertion.from_mapping(
+            json.loads(historical_row[1])
+        ).supersedes_revision_id is None
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM semantic_derivation_inputs WHERE tenant_id = ?",
+            (tenant,),
+        ) == 0
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_erasure_emits_an_opaque_retryable_change_on_both_backends(
+    db_backend,
+    tmp_path,
+):
+    """An incremental consumer can resynchronize after identity-free erasure."""
+    tenant, identity = await _incepted_assertion_identity(tmp_path, "erasure")
+    storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    try:
+        store = storage
+        assertion = _semantic_assertion(tenant, "erasure-revision", value="erasure")
+        written = await store.put_assertion(
+            assertion,
+            source_occurrences=(_semantic_source("parity-source"),),
+        )
+
+        erased = await store.erase_assertion(assertion.assertion_id, operation_id="parity-erasure")
+        replay = await store.erase_assertion(assertion.assertion_id, operation_id="parity-erasure")
+        assert replay.idempotent is True
+        assert replay.erased_assertion_ids == erased.erased_assertion_ids
+        assert replay.erased_revision_ids == erased.erased_revision_ids
+        first_read = await store.assertion_changes_since(written.generation)
+        retry_read = await store.assertion_changes_since(written.generation)
+
+        assert first_read == retry_read
+        assert len(first_read) == 1
+        change = first_read[0]
+        assert change.operation == "erased"
+        assert change.assertion_id is None
+        assert change.revision_id is None
+        assert change.eligible is False
+        assert change.generation == erased.generation
+        assert (await store.assertion_checkpoint()).latest_event_id == change.event_id
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM semantic_projection_outbox WHERE tenant_id = ?",
+            (tenant,),
+        ) == 0
+        assert await storage.db.fetchall(
+            "SELECT operation, generation FROM semantic_projection_erasure_outbox WHERE tenant_id = ?",
+            (tenant,),
+        ) == [("erased", erased.generation)]
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_concurrent_postgres_initializers_serialize_semantic_migration(db_backend):
+    """A shared PostgreSQL fleet must not race assertion-schema DDL at boot."""
+    if db_backend.backend_type != "postgres":
+        pytest.skip("PostgreSQL-specific concurrent schema regression")
+    dsn = getattr(db_backend, "_dsn", None)
+    if not dsn:
+        raise RuntimeError("PostgreSQL parity backend did not expose its test DSN")
+
+    storages = [
+        AsyncStorage(backend="postgres", dsn=dsn, agent_id=f"did:test:{uuid4()}")
+        for _ in range(4)
+    ]
+    try:
+        await asyncio.gather(*(storage.initialize() for storage in storages))
+        marker_rows = await db_backend.fetch_all(
+            "SELECT version FROM semantic_schema_migrations "
+            "WHERE version = ?",
+            ("semantic_assertion_store_v2",),
+        )
+        assert marker_rows == [("semantic_assertion_store_v2",)]
+    finally:
+        await asyncio.gather(*(storage.close() for storage in storages))
 
 
 def _project_rows(rows):

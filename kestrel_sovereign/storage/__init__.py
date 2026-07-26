@@ -32,6 +32,20 @@ from .async_file_store import AsyncFileStore
 from .async_conversation_store import AsyncConversationStore
 from .destructive_audit import DestructiveAuditLog, destructive_audit_caller
 from .async_graph_store import AsyncGraphStore, GraphNode, Edge, NodeSwapResult
+from .async_assertion_store import (
+    AsyncAssertionStore,
+    AssertionChange,
+    AssertionCheckpoint,
+    AssertionConflictError,
+    AssertionStoreError,
+    AssertionWriteResult,
+    DeletionResult,
+    ErasureResult,
+    RetractionResult,
+    SemanticAssertionStore,
+    SupersessionResult,
+    TenantIsolationError,
+)
 from .async_rag_store import AsyncRAGStore
 from .agent_resource_store import (
     AgentResourceStore,
@@ -91,6 +105,7 @@ __all__ = [
     "AsyncConversationStore",
     "DestructiveAuditLog",
     "AsyncGraphStore",
+    "AsyncAssertionStore",
     "AsyncRAGStore",
     "AgentResourceStore",
     "AgentResourceVersion",
@@ -103,6 +118,17 @@ __all__ = [
     "GraphNode",
     "Edge",
     "NodeSwapResult",
+    "AssertionChange",
+    "AssertionCheckpoint",
+    "AssertionConflictError",
+    "AssertionStoreError",
+    "AssertionWriteResult",
+    "DeletionResult",
+    "ErasureResult",
+    "RetractionResult",
+    "SemanticAssertionStore",
+    "SupersessionResult",
+    "TenantIsolationError",
     # Privacy
     "PrivacyEnforcingStorage",
     "PrivacyViolationError",
