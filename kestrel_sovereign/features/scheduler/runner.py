@@ -2464,30 +2464,36 @@ class SchedulerRunner:
                     result_text: Optional[str] = None
                     outcome_signal: Optional[float] = None
                     pause_schedule = False
+                    scope = _SchedulerExecutionScope(execution)
+                    token = _current_execution.set(scope)
                     try:
-                        scope = _SchedulerExecutionScope(execution)
-                        token = _current_execution.set(scope)
+                        # This is the final effect boundary. Preparation is
+                        # complete (and, for AgentManager, the target is
+                        # already cold-loaded under its lifecycle lock), so
+                        # the non-locking exact-token read and live-authority
+                        # check occur as late as possible without making an
+                        # ``ACCESS SHARE`` lock block feature bootstrap DDL.
+                        #
+                        # These are admission reads, not target work: a
+                        # provider/database error must escape to the outer
+                        # scheduler-infrastructure path without consuming the
+                        # claimed occurrence. Only errors after admission are
+                        # normalized as target failures below.
+                        if (
+                            renewal_state.lost.is_set()
+                            or not await self._agent_is_currently_authorized(
+                                task.agent_id
+                            )
+                            or not await self._claim_token_is_live(task)
+                            or renewal_state.lost.is_set()
+                        ):
+                            logger.warning(
+                                "Refusing scheduler effect for %s: agent was revoked, "
+                                "claim was fenced or expired, or renewal was lost",
+                                execution.id,
+                            )
+                            return
                         try:
-                            # This is the final effect boundary. Preparation is
-                            # complete (and, for AgentManager, the target is
-                            # already cold-loaded under its lifecycle lock), so
-                            # the non-locking exact-token read and live-authority
-                            # check occur as late as possible without making an
-                            # ``ACCESS SHARE`` lock block feature bootstrap DDL.
-                            if (
-                                renewal_state.lost.is_set()
-                                or not await self._agent_is_currently_authorized(
-                                    task.agent_id
-                                )
-                                or not await self._claim_token_is_live(task)
-                                or renewal_state.lost.is_set()
-                            ):
-                                logger.warning(
-                                    "Refusing scheduler effect for %s: agent was revoked, "
-                                    "claim was fenced or expired, or renewal was lost",
-                                    execution.id,
-                                )
-                                return
                             completed, raw = await self._run_dispatch_while_lease_live(
                                 dispatch,
                                 execution,
@@ -2496,44 +2502,44 @@ class SchedulerRunner:
                             if not completed:
                                 self._log_lease_loss(execution, phase="effect")
                                 return
-                        finally:
-                            # Invalidate before the parent context is reset.
-                            # Child tasks created by a target inherit this same
-                            # scope, so they can no longer present a completed
-                            # occurrence as trusted scheduler work after the
-                            # runner cancels or completes its owned effect.
-                            scope.revoke()
-                            _current_execution.reset(token)
-                        (
-                            status,
-                            result_text,
-                            outcome_signal,
-                            pause_schedule,
-                        ) = self._normalise_result(raw, task)
-                    except asyncio.CancelledError:
-                        raise
-                    except SchedulerFeatureUnavailable:
-                        # A runtime disable can race preparation/admission.
-                        # It is not a task failure and must not advance this
-                        # occurrence. Leaving the exact claim live prevents a
-                        # hot retry; once it expires, a later re-enable can
-                        # recover the same durable execution identity.
-                        logger.info(
-                            "Deferring scheduler claim %s because %s has no enabled "
-                            "SchedulerFeature",
-                            execution.id,
-                            task.agent_id,
-                        )
-                        return
-                    except Exception as e:
-                        status = "failed"
-                        result_text = f"{type(e).__name__}: {e}"
-                        logger.error(
-                            "Scheduled task %s (%s) failed: %s",
-                            task.id,
-                            task.task_name,
-                            e,
-                        )
+                            (
+                                status,
+                                result_text,
+                                outcome_signal,
+                                pause_schedule,
+                            ) = self._normalise_result(raw, task)
+                        except asyncio.CancelledError:
+                            raise
+                        except SchedulerFeatureUnavailable:
+                            # A runtime disable can race preparation/admission.
+                            # It is not a task failure and must not advance this
+                            # occurrence. Leaving the exact claim live prevents a
+                            # hot retry; once it expires, a later re-enable can
+                            # recover the same durable execution identity.
+                            logger.info(
+                                "Deferring scheduler claim %s because %s has no enabled "
+                                "SchedulerFeature",
+                                execution.id,
+                                task.agent_id,
+                            )
+                            return
+                        except Exception as e:
+                            status = "failed"
+                            result_text = f"{type(e).__name__}: {e}"
+                            logger.error(
+                                "Scheduled task %s (%s) failed: %s",
+                                task.id,
+                                task.task_name,
+                                e,
+                            )
+                    finally:
+                        # Invalidate before the parent context is reset.
+                        # Child tasks created by a target inherit this same
+                        # scope, so they can no longer present a completed
+                        # occurrence as trusted scheduler work after the
+                        # runner cancels or completes its owned effect.
+                        scope.revoke()
+                        _current_execution.reset(token)
                     if renewal_state.lost.is_set():
                         self._log_lease_loss(execution, phase="finalization")
                         return

@@ -3452,6 +3452,94 @@ async def test_renewal_exception_before_effect_fails_closed(tmp_path, caplog):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_source", "expected_message"),
+    [
+        ("authority_provider", "authority provider unavailable"),
+        ("claim_token_read", "claim-token read unavailable"),
+    ],
+)
+async def test_final_admission_read_failure_preserves_claim_without_dispatch(
+    tmp_path, failure_source, expected_message
+):
+    """Final authority/token-read failures are infrastructure failures, not outcomes."""
+
+    db = await _database(tmp_path / f"admission-{failure_source}.db")
+    executor = AsyncMock(return_value="must-not-run")
+    runner = SchedulerRunner(
+        db, "agent-1", executor, owner_id=f"admission-{failure_source}"
+    )
+
+    async def renew_until_cancelled(_task):
+        await asyncio.Event().wait()
+
+    runner._renew_lease = renew_until_cancelled
+    try:
+        await runner._ensure_tables()
+        due = await _seed_due(db)
+
+        if failure_source == "authority_provider":
+            authorization_reads = 0
+
+            async def authorize_final_admission(_agent_id):
+                nonlocal authorization_reads
+                authorization_reads += 1
+                if authorization_reads == 4:
+                    raise RuntimeError(expected_message)
+                return True
+
+            # Claim, initial execution, and fresh renewal admission all pass;
+            # fail only the final pre-effect authority read.
+            runner._is_agent_authorized = authorize_final_admission
+        else:
+            token_reads = 0
+            original_claim_token_is_live = runner._claim_token_is_live
+
+            async def read_final_claim_token(task):
+                nonlocal token_reads
+                token_reads += 1
+                if token_reads == 2:
+                    raise RuntimeError(expected_message)
+                return await original_claim_token_is_live(task)
+
+            # The initial renewal verifies the token once; fail the second
+            # verification at the final pre-effect admission boundary.
+            runner._claim_token_is_live = read_final_claim_token
+
+        await runner._tick()
+
+        executor.assert_not_awaited()
+        assert isinstance(runner.readiness_failure, RuntimeError)
+        assert str(runner.readiness_failure) == expected_message
+        if failure_source == "authority_provider":
+            assert authorization_reads == 4
+        else:
+            assert token_reads == 2
+        claim = await db.fetchone(
+            """
+            SELECT enabled, scheduler_claim_fenced, lease_owner,
+                   lease_expires_at, claim_token, claim_execution_id,
+                   claim_scheduled_for, next_run_at, last_run_at, terminal_status
+            FROM scheduled_tasks WHERE id = ?
+            """,
+            ("task-1",),
+        )
+        assert claim is not None
+        assert claim[:3] == (0, 1, f"admission-{failure_source}")
+        assert claim[3] is not None
+        assert claim[4] is not None
+        assert claim[5] is not None
+        assert claim[6:] == (due, due, None, None)
+        assert await db.fetchall(
+            "SELECT status, attempt_count, completed_at FROM task_execution_log "
+            "WHERE task_id = ?",
+            ("task-1",),
+        ) == [("claimed", 1, None)]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_renewal_loss_during_preparation_never_enters_effect(tmp_path):
     """The renewal monitor runs during cold preparation and gates admission."""
 
