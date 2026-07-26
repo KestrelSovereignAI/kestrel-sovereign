@@ -8,6 +8,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from kestrel_sdk.isolated_feature import ConfigTransitionError, ConfigTransitionResult
 from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
 from kestrel_sovereign.features.isolated_runtime import (
     ProxyFeature,
@@ -956,6 +957,29 @@ def test_build_client_passes_stripped_env(monkeypatch, tmp_path):
     assert "PYTHONPATH" not in captured["env"]
 
 
+def test_build_client_preserves_explicit_empty_config(tmp_path):
+    """An effective empty config is sent as ``{}``, not omitted as ``None``."""
+
+    captured = {}
+
+    def client_factory(**kwargs):
+        captured.update(kwargs)
+        return FakeIsolatedClient(**kwargs)
+
+    feature = ProxyFeature(
+        Mock(features={}),
+        _isolated_runtime(),
+        client_factory=client_factory,
+    )
+    feature._venv_path = tmp_path / "svc-venv"
+    feature._bin_path = tmp_path / "test-service"
+    feature._host_config = {}
+
+    feature._build_client()
+
+    assert captured["config"] == {}
+
+
 class _FakeStorage:
     """Minimal graph store double: records add_node, serves get_node."""
 
@@ -1009,6 +1033,7 @@ async def test_set_config_persists_node_reflects_in_get_config_and_reloads(monke
     node = agent.storage.nodes.get("feature_config:TestFeature")
     assert node is not None, "set_config did not persist the feature_config node"
     assert node.properties["config"]["allowed_senders"] == ["8825903191"]
+    assert "pending_config" not in node.properties
 
     # 2) get_config reflects it (previously always returned {}), incl. the secret
     #    so the endpoint's write-only-secret preservation works.
@@ -1021,6 +1046,621 @@ async def test_set_config_persists_node_reflects_in_get_config_and_reloads(monke
     assert clients[0].stopped is True
     assert len(clients) == 2
     assert clients[1].kwargs.get("config") == new_cfg
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "next_config",
+    [
+        {
+            "enabled": False,
+            "token": "12345678:old-token",
+            "transport": "webhook",
+            "webhook_url": "https://ingress.example.test/telegram",
+            "webhook_secret": "old-webhook-secret",
+        },
+        {
+            "enabled": True,
+            "token": "87654321:new-token",
+            "transport": "webhook",
+            "webhook_url": "https://ingress.example.test/telegram",
+            "webhook_secret": "new-webhook-secret",
+        },
+    ],
+    ids=["disable", "credential-rotation"],
+)
+async def test_supported_transition_cleans_up_before_replacing_old_service(
+    monkeypatch, tmp_path, caplog, next_config
+):
+    """A webhook-shaped service prepares both disable and token-rotation first.
+
+    The test deliberately records only ordering and public config shape. It
+    never logs the credentials it carries, which proves the host can honor the
+    generic SDK lifecycle without introducing Telegram-specific dispatch.
+    """
+
+    old_config = {
+        "enabled": True,
+        "token": "12345678:old-token",
+        "transport": "webhook",
+        "webhook_url": "https://ingress.example.test/telegram",
+        "webhook_secret": "old-webhook-secret",
+    }
+    events = []
+
+    class WebhookCleanupClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        async def prepare_config_transition(self, config):
+            events.append(("cleanup", dict(config)))
+            return ConfigTransitionResult.restart_required()
+
+        async def stop(self):
+            events.append(("stop", None))
+            await super().stop()
+
+    agent = Mock()
+    agent.features = {}
+    agent.storage = _FakeStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+
+    clients = []
+
+    def client_factory(**kwargs):
+        client = (
+            WebhookCleanupClient(**kwargs)
+            if not clients
+            else FakeIsolatedClient(**kwargs)
+        )
+        clients.append(client)
+        return client
+
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=client_factory)
+    await feature.persist_config(old_config)
+    await feature.initialize()
+
+    await feature.set_config(next_config)
+
+    # The lifecycle RPC receives the complete effective next config and its
+    # ordered resource cleanup completes before the old process is stopped.
+    assert events == [("cleanup", next_config), ("stop", None)]
+    assert clients[0].kwargs["config"] == old_config
+    assert clients[1].kwargs["config"] == next_config
+    assert clients[0].stopped is True
+    for secret in (
+        old_config["token"],
+        old_config["webhook_secret"],
+        next_config["token"],
+        next_config["webhook_secret"],
+    ):
+        assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_supported_transition_failure_keeps_old_config_and_service(monkeypatch, tmp_path):
+    """A failed negotiated cleanup cannot masquerade as a successful apply."""
+
+    old_config = {"enabled": True, "token": "old-token"}
+    next_config = {"enabled": True, "token": "next-token"}
+
+    class FailingTransitionClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        async def prepare_config_transition(self, config):
+            assert config == next_config
+            raise ConfigTransitionError("config transition failed")
+
+    agent = Mock()
+    agent.features = {}
+    agent.storage = _FakeStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(
+        agent,
+        _cfg_runtime(),
+        client_factory=FailingTransitionClient,
+    )
+    await feature.persist_config(old_config)
+    await feature.initialize()
+    old_client = feature._client
+
+    with pytest.raises(ConfigTransitionError, match="config transition failed"):
+        await feature.set_config(next_config)
+
+    # The normal SDK failure contract preserves the known-safe old child. The
+    # host also restores durable/in-memory config so a later restart cannot
+    # launch the candidate without the cleanup that failed above.
+    assert feature._client is old_client
+    assert old_client.stopped is False
+    assert feature._host_config == old_config
+    assert (await feature.get_config()) == old_config
+    assert agent.storage.nodes["feature_config:TestFeature"].properties["config"] == old_config
+
+
+@pytest.mark.asyncio
+async def test_transition_failure_never_promotes_pending_config_when_rollback_storage_fails(
+    monkeypatch, tmp_path
+):
+    """A failed hook cannot make its candidate the next-start config.
+
+    The storage double rejects a third write, matching the old implementation's
+    candidate-write then failed-hook then rollback-write sequence.  The proxy
+    now needs only the staged write: the durable active value stays old and a
+    fresh proxy ignores the rejected pending candidate.
+    """
+
+    old_config = {"enabled": True, "token": "old-token"}
+    next_config = {"enabled": True, "token": "next-token"}
+
+    class RollbackFailingStorage(_FakeStorage):
+        def __init__(self):
+            super().__init__()
+            self.add_calls = 0
+
+        async def add_node(self, node):
+            self.add_calls += 1
+            if self.add_calls >= 3:
+                raise OSError("storage offline during rollback")
+            await super().add_node(node)
+
+    class FailingTransitionClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        async def prepare_config_transition(self, config):
+            assert config == next_config
+            raise ConfigTransitionError("config transition failed")
+
+    agent = Mock()
+    agent.features = {}
+    agent.storage = RollbackFailingStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FailingTransitionClient)
+    await feature.persist_config(old_config)
+    await feature.initialize()
+
+    with pytest.raises(ConfigTransitionError, match="config transition failed"):
+        await feature.set_config(next_config)
+
+    node = agent.storage.nodes["feature_config:TestFeature"]
+    assert node.properties == {
+        "config": old_config,
+        "pending_config": next_config,
+    }
+    assert agent.storage.add_calls == 2
+
+    fresh = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    await fresh.initialize()
+    assert fresh._host_config == old_config
+    assert (await fresh.get_config()) == old_config
+
+
+@pytest.mark.asyncio
+async def test_empty_active_config_hides_pending_candidate_from_concurrent_reads(
+    monkeypatch, tmp_path
+):
+    """An initialized empty config is active, not a signal to read persistence."""
+
+    next_config = {"enabled": True, "token": "next-token"}
+    preparation_started = asyncio.Event()
+    release_preparation = asyncio.Event()
+
+    class SlowFailingTransitionClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        async def prepare_config_transition(self, config):
+            assert config == next_config
+            preparation_started.set()
+            await release_preparation.wait()
+            raise ConfigTransitionError("config transition failed")
+
+    agent = Mock()
+    agent.features = {}
+    agent.storage = _FakeStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(
+        agent,
+        _cfg_runtime(),
+        client_factory=SlowFailingTransitionClient,
+    )
+    await feature.initialize()
+    assert feature._host_config == {}
+
+    update = asyncio.create_task(feature.set_config(next_config))
+    await asyncio.wait_for(preparation_started.wait(), timeout=1)
+
+    assert agent.storage.nodes["feature_config:TestFeature"].properties == {
+        "config": {},
+        "pending_config": next_config,
+    }
+    assert await feature.get_config() == {}
+
+    release_preparation.set()
+    with pytest.raises(ConfigTransitionError, match="config transition failed"):
+        await update
+    assert await feature.get_config() == {}
+
+
+@pytest.mark.asyncio
+async def test_persistence_failure_prevents_transition_hook_from_running(monkeypatch, tmp_path):
+    """A non-privacy storage failure is a fail-closed transition boundary."""
+
+    class FailingStorage(_FakeStorage):
+        async def add_node(self, node):
+            raise OSError("storage unavailable")
+
+    class TransitionClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.preparation_calls = 0
+
+        async def prepare_config_transition(self, config):
+            self.preparation_calls += 1
+            return ConfigTransitionResult.restart_required()
+
+    agent = Mock()
+    agent.features = {}
+    agent.storage = FailingStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=TransitionClient)
+    await feature.initialize()
+    old_client = feature._client
+
+    with pytest.raises(RuntimeError, match="failed to persist config"):
+        await feature.set_config({"enabled": True, "token": "next-token"})
+
+    assert old_client.preparation_calls == 0
+    assert old_client.stopped is False
+    assert feature._client is old_client
+    assert feature._host_config == {}
+
+
+@pytest.mark.asyncio
+async def test_volatile_privacy_noop_allows_transition_without_durable_config(
+    monkeypatch, tmp_path
+):
+    """The explicit privacy-policy no-op is the one allowed write exception."""
+
+    class VolatileStorage(_FakeStorage):
+        def allows_persistent_writes(self):
+            return False
+
+    class TransitionClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.prepared = []
+
+        async def prepare_config_transition(self, config):
+            self.prepared.append(dict(config))
+            return ConfigTransitionResult.applied()
+
+    next_config = {"enabled": True, "token": "volatile-token"}
+    agent = Mock()
+    agent.features = {}
+    agent.storage = VolatileStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=TransitionClient)
+    await feature.initialize()
+    client = feature._client
+
+    await feature.set_config(next_config)
+
+    assert client.prepared == [next_config]
+    assert feature._client is client
+    assert feature._host_config == next_config
+    assert agent.storage.nodes == {}
+
+
+@pytest.mark.asyncio
+async def test_fenced_transition_failure_replaces_with_next_config(monkeypatch, tmp_path):
+    """An unknown lifecycle outcome follows the SDK's required replacement path."""
+
+    old_config = {"enabled": True, "token": "old-token"}
+    next_config = {"enabled": True, "token": "next-token"}
+
+    class FencedTransitionClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.replacement_required = False
+
+        async def prepare_config_transition(self, config):
+            self.replacement_required = True
+            raise ConfigTransitionError("config transition failed")
+
+    agent = Mock()
+    agent.features = {}
+    agent.storage = _FakeStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    clients = []
+
+    def client_factory(**kwargs):
+        client = (
+            FencedTransitionClient(**kwargs)
+            if not clients
+            else FakeIsolatedClient(**kwargs)
+        )
+        clients.append(client)
+        return client
+
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=client_factory)
+    await feature.persist_config(old_config)
+    await feature.initialize()
+
+    with pytest.raises(ConfigTransitionError, match="config transition failed"):
+        await feature.set_config(next_config)
+
+    # A cancellation or transport break can leave the child partly transitioned;
+    # the SDK marks that state explicitly. The apply still fails to its caller,
+    # but the host must not keep using that fenced old process.
+    assert clients[0].stopped is True
+    assert clients[1].kwargs["config"] == next_config
+    assert feature._host_config == next_config
+
+
+@pytest.mark.asyncio
+async def test_live_applied_transition_retains_the_initialized_service(monkeypatch, tmp_path):
+    """An SDK ``applied`` result keeps the existing process alive."""
+
+    old_config = {"enabled": True, "token": "old-token"}
+    next_config = {"enabled": False, "token": "next-token"}
+
+    class LiveApplyClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.prepared = []
+
+        async def prepare_config_transition(self, config):
+            self.prepared.append(dict(config))
+            return ConfigTransitionResult.applied()
+
+    agent = Mock()
+    agent.features = {}
+    agent.storage = _FakeStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=LiveApplyClient)
+    await feature.persist_config(old_config)
+    await feature.initialize()
+    client = feature._client
+
+    await feature.set_config(next_config)
+
+    assert feature._client is client
+    assert client.prepared == [next_config]
+    assert client.stopped is False
+    assert feature._host_config == next_config
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transition_action", ["applied", "restart"])
+async def test_failed_promotion_restores_previous_child_and_config(
+    monkeypatch, tmp_path, transition_action
+):
+    """A failed second write cannot leave a successful hook's config live.
+
+    Both negotiated outcomes can mutate or retire the current service before
+    durable promotion. The host must therefore replace it from the staged
+    active config when that promotion write fails.
+    """
+
+    old_config = {"enabled": True, "token": "old-token"}
+    next_config = {"enabled": False, "token": "next-token"}
+
+    class PromotionFailingStorage(_FakeStorage):
+        def __init__(self):
+            super().__init__()
+            self.add_calls = 0
+
+        async def add_node(self, node):
+            self.add_calls += 1
+            # First write seeds old config, second stages the candidate, and
+            # the second transition write (promotion) fails.
+            if self.add_calls == 3:
+                raise OSError("storage offline during promotion")
+            await super().add_node(node)
+
+    class TransitionClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.transitioned_to = None
+
+        async def prepare_config_transition(self, config):
+            self.transitioned_to = dict(config)
+            if transition_action == "applied":
+                return ConfigTransitionResult.applied()
+            return ConfigTransitionResult.restart_required()
+
+    agent = Mock()
+    agent.features = {}
+    agent.storage = PromotionFailingStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    clients = []
+
+    def client_factory(**kwargs):
+        client = TransitionClient(**kwargs) if not clients else FakeIsolatedClient(**kwargs)
+        clients.append(client)
+        return client
+
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=client_factory)
+    await feature.persist_config(old_config)
+    await feature.initialize()
+
+    with pytest.raises(RuntimeError, match="failed to persist config"):
+        await feature.set_config(next_config)
+
+    # The child that ran the successful transition is retired. Its replacement,
+    # proxy state, and durable active value all agree on the prior config.
+    assert clients[0].transitioned_to == next_config
+    assert clients[0].stopped is True
+    assert clients[1].kwargs["config"] == old_config
+    assert feature._client is clients[1]
+    assert feature._host_config == old_config
+    assert await feature.get_config() == old_config
+    assert agent.storage.nodes["feature_config:TestFeature"].properties == {
+        "config": old_config,
+        "pending_config": next_config,
+    }
+
+
+@pytest.mark.asyncio
+async def test_supervision_restarts_on_sdk_fenced_health_response(tmp_path, monkeypatch):
+    """The real SDK's fenced health envelope is not a healthy non-empty dict."""
+
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    health_checked = asyncio.Event()
+    restarted = asyncio.Event()
+
+    class FencedHealthClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.stop_calls = 0
+            self.start_calls = 0
+
+        async def health(self):
+            health_checked.set()
+            if self.start_calls:
+                return {"status": "ready", "ready": True}
+            # This is the exact return shape from SDK health() after a
+            # transition fences a child for replacement.
+            return {"status": "restart-required", "ready": False}
+
+        async def stop(self):
+            self.stop_calls += 1
+            await super().stop()
+
+        async def start(self):
+            self.start_calls += 1
+            restarted.set()
+            await super().start()
+
+    client = FencedHealthClient()
+    feature = ProxyFeature(
+        Mock(storage_path=str(tmp_path / "agent" / "kestrel_prime.db"), features={}),
+        _cfg_runtime(),
+        client_factory=FakeIsolatedClient,
+    )
+    feature._client = client
+
+    real_sleep = asyncio.sleep
+
+    async def immediate_sleep(_delay):
+        await real_sleep(0)
+
+    monkeypatch.setattr(ir.asyncio, "sleep", immediate_sleep)
+    supervisor = asyncio.create_task(feature._supervise())
+    try:
+        await asyncio.wait_for(health_checked.wait(), timeout=1)
+        await asyncio.wait_for(restarted.wait(), timeout=1)
+        assert client.stop_calls == 1
+        assert client.start_calls == 1
+    finally:
+        feature._stopping = True
+        supervisor.cancel()
+        try:
+            await supervisor
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_config_transition_serializes_with_a_pending_health_restart(
+    monkeypatch, tmp_path
+):
+    """A stale failed health probe cannot restart through a config transition."""
+
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    health_started = asyncio.Event()
+    release_health = asyncio.Event()
+    preparation_started = asyncio.Event()
+    release_preparation = asyncio.Event()
+
+    class HealthAndTransitionClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.stop_calls = 0
+
+        async def health(self):
+            health_started.set()
+            await release_health.wait()
+            return False
+
+        async def prepare_config_transition(self, config):
+            preparation_started.set()
+            await release_preparation.wait()
+            return ConfigTransitionResult.restart_required()
+
+        async def stop(self):
+            self.stop_calls += 1
+            await super().stop()
+
+    old_client = HealthAndTransitionClient()
+    replacement_clients = []
+
+    def client_factory(**kwargs):
+        client = FakeIsolatedClient(**kwargs)
+        replacement_clients.append(client)
+        return client
+
+    agent = Mock(storage_path=str(tmp_path / "agent" / "kestrel_prime.db"), features={})
+    agent.storage = _FakeStorage()
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=client_factory)
+    feature._client = old_client
+    feature._host_config = {"enabled": True, "token": "old-token"}
+
+    real_sleep = asyncio.sleep
+
+    async def immediate_sleep(_delay):
+        await real_sleep(0)
+
+    monkeypatch.setattr(ir.asyncio, "sleep", immediate_sleep)
+    supervisor = asyncio.create_task(feature._supervise())
+    try:
+        await asyncio.wait_for(health_started.wait(), timeout=1)
+        update = asyncio.create_task(
+            feature.set_config({"enabled": False, "token": "next-token"})
+        )
+        await asyncio.wait_for(preparation_started.wait(), timeout=1)
+
+        # The supervisor has a stale unhealthy result but cannot acquire the
+        # shared lifecycle lock until the transition has fully prepared and
+        # replaced the child.
+        release_health.set()
+        release_preparation.set()
+        await update
+        await real_sleep(0)
+
+        assert old_client.stop_calls == 1
+        assert len(replacement_clients) == 1
+        assert replacement_clients[0].started is True
+        assert replacement_clients[0].stopped is False
+    finally:
+        feature._stopping = True
+        supervisor.cancel()
+        try:
+            await supervisor
+        except asyncio.CancelledError:
+            pass
 
 
 @pytest.mark.asyncio

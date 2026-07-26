@@ -29,6 +29,10 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from kestrel_sdk.channels import ChannelAdapter
+from kestrel_sdk.isolated_feature import (
+    CONFIG_TRANSITION_APPLIED,
+    ConfigTransitionResult,
+)
 from kestrel_sdk.tools.base import AgentTool, ToolCategory, ToolParameter, ToolSchema
 
 from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
@@ -368,6 +372,11 @@ class ProxyFeature(Feature):
         self._venv_path: Optional[Path] = None
         self._bin_path: Optional[Path] = None
         self._host_config: Dict[str, Any] = {}
+        # ``{}`` is a valid, fully-loaded config.  Keep its loaded state
+        # separate from its truthiness so a concurrent read never falls back to
+        # durable transition state while a service is still running the empty
+        # config.
+        self._host_config_loaded = False
         self._channel_adapter: Optional["ProxyChannelAdapter"] = None
         # Channel-link plumbing (#2081): the bridged channel type and the name of
         # its pairing tool. When that tool runs on the streaming turn, the host
@@ -403,10 +412,16 @@ class ProxyFeature(Feature):
         # forwarded to the isolated service through the initialize handshake (the
         # service is otherwise launched bare, with only env vars).
         self._host_config = await self._load_host_config()
+        self._host_config_loaded = True
         await self._connect_client()
         self._supervision_task = self._start_supervision()
 
-    async def _connect_client(self) -> None:
+    async def _connect_client(
+        self,
+        config: Optional[Dict[str, Any]] = None,
+        *,
+        register_channel_bridge: bool = True,
+    ) -> None:
         """Build + start the isolated client from the current ``_host_config``,
         then wire event handling, tools, and the channel bridge.
 
@@ -415,12 +430,14 @@ class ProxyFeature(Feature):
         service's initialize handshake, so rebuilding here is how new config
         actually reaches a running service.
         """
-        self._client = self._build_client()
+        child_config = self._host_config if config is None else config
+        self._client = self._build_client(config=child_config)
         await _maybe_await(self._client.start())
         await self._register_event_handler()
         advertised_tools = await _maybe_await(self._client.list_tools())
         self._tools = [IsolatedFeatureTool(self, meta) for meta in advertised_tools]
-        self._register_channel_bridge()
+        if register_channel_bridge:
+            self._register_channel_bridge()
 
     async def reload(self) -> None:
         """Restart the isolated service so the current ``_host_config`` takes
@@ -428,15 +445,44 @@ class ProxyFeature(Feature):
         config change requires a re-launch). Guarded so the health supervisor
         doesn't treat the intentional stop as a crash and double-restart."""
         async with self._reload_lock:
-            self._reloading = True
-            self._reload_gen += 1
+            self._begin_reload()
             try:
-                self._unregister_channel_bridge()
-                if self._client is not None:
-                    await _maybe_await(self._client.stop())
-                await self._connect_client()
+                await self._replace_client()
             finally:
-                self._reloading = False
+                self._end_reload()
+
+    def _begin_reload(self) -> None:
+        """Fence health supervision while this proxy owns client lifecycle."""
+
+        self._reloading = True
+        self._reload_gen += 1
+
+    def _end_reload(self) -> None:
+        self._reloading = False
+
+    async def _replace_client(
+        self,
+        config: Optional[Dict[str, Any]] = None,
+        *,
+        register_channel_bridge: bool = True,
+    ) -> None:
+        """Stop the current child and start one using ``_host_config``.
+
+        Callers must already hold ``_reload_lock`` and have established whether
+        an advertised config-transition lifecycle hook must run first.
+
+        ``config`` lets a fenced transition start a known-next child before its
+        pending config can be promoted to durable active state.  The caller then
+        commits ``_host_config`` and registers the bridge only after promotion.
+        """
+
+        self._unregister_channel_bridge()
+        if self._client is not None:
+            await _maybe_await(self._client.stop())
+        await self._connect_client(
+            config,
+            register_channel_bridge=register_channel_bridge,
+        )
 
     async def shutdown(self):
         self._stopping = True
@@ -493,31 +539,248 @@ class ProxyFeature(Feature):
         which made the config API/UI show blank and drop write-only secrets on a
         partial PATCH (#2214).
         """
-        if self._client is not None and hasattr(self._client, "get_config"):
-            live = await _maybe_await(self._client.get_config())
-            if live:
-                return dict(live)
-        if self._host_config:
+        # The SDK has no config-read RPC.  Once this proxy has initialized, its
+        # host config is authoritative even if it is empty: durable storage may
+        # contain a pending candidate while the running service still owns the
+        # active empty config.
+        if self._host_config_loaded or self._client is not None or self._host_config:
             return dict(self._host_config)
         persisted = await self.load_persisted_config()
         return dict(persisted) if isinstance(persisted, dict) else {}
 
     async def set_config(self, config: Dict) -> None:
-        """Persist the config AND apply it to the running service.
+        """Persist an effective config and apply it to the running service.
 
         The previous implementation forwarded to ``self._client.set_config`` —
         which the SDK client does not implement — so config set via the API/UI
         was silently dropped: never persisted (so lost on restart) and never
         applied (#2214). Persist to the ``feature_config:<name>`` graph node (the
-        same node ``_load_host_config`` reads at startup), update the in-memory
-        host config, then ``reload`` so the new values reach the running service
-        through a fresh initialize handshake.
+        same node ``_load_host_config`` reads at startup). A service that
+        advertises the SDK config-transition capability receives the full next
+        effective config while it still owns the old one. Its successful typed
+        result decides whether to replace the process or retain it after a
+        live apply. Legacy services retain the existing safe replacement path.
+
+        The candidate is durably staged as ``pending_config`` while the active
+        ``config`` remains unchanged.  This is deliberately not implemented
+        through :meth:`Feature.persist_config`: that compatibility helper
+        swallows storage failures, whereas an apply may only continue after a
+        durable write succeeds (apart from an intentional volatile-privacy
+        no-op).  A failed hook therefore leaves a fresh proxy on the old active
+        config even if the storage backend becomes unavailable while handling
+        the failure.
+
+        SDK clients fence an unknown/out-of-process transition outcome with
+        ``replacement_required``.  In that exceptional case the host replaces
+        the child using the pending config, then promotes it only after the
+        replacement completes.  The original lifecycle error still propagates
+        to the caller, so a fenced recovery never masquerades as a successful
+        live apply.
         """
         cfg = dict(config) if isinstance(config, dict) else {}
-        await self.persist_config(cfg)
-        self._host_config = cfg
-        if self._client is not None:
-            await self.reload()
+        async with self._reload_lock:
+            self._begin_reload()
+            previous_config = dict(self._host_config)
+            transition_attempted = False
+            transition_succeeded = False
+            try:
+                # Stage the candidate without changing the durable active
+                # config.  A failed write must stop here; otherwise we could
+                # successfully clean up the old service but lose the config
+                # required for its safe replacement after a host restart.
+                await self._stage_pending_config(previous_config, cfg)
+                if self._client is None:
+                    await self._promote_config(cfg)
+                    self._host_config = cfg
+                    self._host_config_loaded = True
+                    return
+
+                transition = None
+                if self._supports_config_transition():
+                    transition_attempted = True
+                    transition = await self._prepare_config_transition(cfg)
+                    transition_succeeded = True
+
+                # A legacy service has no preparation phase; a supported
+                # service reaches this point only after its preparation
+                # completed.  Either way, make the next config durable before
+                # exposing it through the host or launching a normal child.
+                try:
+                    await self._promote_config(cfg)
+                except BaseException:
+                    if transition is not None:
+                        # A successful hook may already have live-applied the
+                        # candidate or retired the current child's resources.
+                        # The staged node still names ``previous_config`` as
+                        # active, so restore a child from that authoritative
+                        # value before exposing this failed apply.  Without
+                        # this, the service and proxy/storage can disagree
+                        # about which configuration is active.
+                        await self._restore_previous_config_after_failed_promotion(
+                            previous_config
+                        )
+                    raise
+                self._host_config = cfg
+                self._host_config_loaded = True
+
+                if transition is None:
+                    # Legacy SDK/service: no negotiated hook, so preserve the
+                    # established stop-and-replace behavior.
+                    await self._replace_client()
+                elif transition.action == CONFIG_TRANSITION_APPLIED:
+                    # The service atomically adopted the config in-process.
+                    # Its channel bridge still carries host-side config (enabled
+                    # and sender filters), so refresh that forwarding adapter.
+                    self._unregister_channel_bridge()
+                    self._register_channel_bridge()
+                else:
+                    # The SDK validates result actions; the non-live outcome is
+                    # the normal prepare-then-restart protocol.
+                    await self._replace_client()
+            except BaseException:
+                if transition_attempted and not transition_succeeded:
+                    if self._client_requires_replacement():
+                        # A cancelled or transport-failed lifecycle request may
+                        # already have reached the child.  Start a replacement
+                        # from the pending config first; only then promote the
+                        # config and make it visible to host readers.
+                        await self._replace_client(
+                            cfg,
+                            register_channel_bridge=False,
+                        )
+                        await self._promote_config(cfg)
+                        self._host_config = cfg
+                        self._host_config_loaded = True
+                        self._register_channel_bridge()
+                raise
+            finally:
+                self._end_reload()
+
+    async def _restore_previous_config_after_failed_promotion(
+        self, previous_config: Dict[str, Any]
+    ) -> None:
+        """Reconcile a transitioned child after its durable promotion failed.
+
+        The pending-state write keeps ``previous_config`` as the active durable
+        value. A negotiated hook, however, has already been allowed to modify
+        or fence the live child. Replace that child from the still-authoritative
+        active config before returning the promotion failure to the caller.
+        """
+
+        await self._replace_client(previous_config)
+        self._host_config = dict(previous_config)
+        self._host_config_loaded = True
+
+    async def _stage_pending_config(
+        self,
+        active_config: Dict[str, Any],
+        pending_config: Dict[str, Any],
+    ) -> None:
+        """Durably stage a candidate without changing the active config.
+
+        The boolean-free return contract is intentional: privacy policy is the
+        only permitted no-op, and every other inability to write propagates to
+        the caller before it can contact the service lifecycle hook.
+        """
+
+        await self._write_config_state(active_config, pending_config)
+
+    async def _promote_config(self, config: Dict[str, Any]) -> None:
+        """Make a previously staged config the sole durable active config."""
+
+        await self._write_config_state(config, pending_config=None)
+
+    async def _write_config_state(
+        self,
+        active_config: Dict[str, Any],
+        pending_config: Optional[Dict[str, Any]],
+    ) -> None:
+        """Write isolated-config transition state without swallowing failures.
+
+        ``Feature.persist_config`` deliberately provides best-effort behaviour
+        to the broad in-process Feature API.  An isolated lifecycle transition
+        has a stronger invariant: if persistence is expected but unavailable,
+        do not touch the child.  Volatile privacy modes remain the single
+        exception because their policy expressly forbids the durable write.
+        """
+
+        storage = getattr(self.agent, "storage", None)
+        if storage is None:
+            raise RuntimeError(
+                f"Cannot apply config for isolated feature {self.name}: storage is unavailable"
+            )
+
+        allows_persistent_writes = getattr(storage, "allows_persistent_writes", None)
+        if callable(allows_persistent_writes):
+            try:
+                permitted = bool(await _maybe_await(allows_persistent_writes()))
+            except Exception as exc:  # noqa: BLE001 - surface a failed policy probe
+                raise RuntimeError(
+                    f"Cannot apply config for isolated feature {self.name}: "
+                    "could not determine persistence policy"
+                ) from exc
+            if not permitted:
+                return
+
+        from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+        properties: Dict[str, Any] = {"config": dict(active_config)}
+        if pending_config is not None:
+            properties["pending_config"] = dict(pending_config)
+        node = GraphNode(
+            node_id=self._config_node_id(),
+            node_type=self._CONFIG_NODE_TYPE,
+            label=f"{self.name} config",
+            properties=properties,
+        )
+        try:
+            await storage.add_node(node)
+        except Exception as exc:  # noqa: BLE001 - storage boundary must fail closed
+            raise RuntimeError(
+                f"Cannot apply config for isolated feature {self.name}: failed to persist config"
+            ) from exc
+
+    async def _prepare_config_transition(
+        self, next_config: Dict[str, Any]
+    ) -> ConfigTransitionResult | None:
+        """Run the public SDK lifecycle hook when the live client opted in.
+
+        Capability negotiation is intentionally limited to the SDK client's
+        typed property and lifecycle method. The host neither knows nor sends
+        feature-private RPC method names.
+        """
+
+        if self._client is None:
+            return None
+        if not self._supports_config_transition():
+            return None
+
+        prepare = getattr(self._client, "prepare_config_transition", None)
+        if not callable(prepare):
+            raise RuntimeError(
+                f"Isolated feature {self.name} advertised config-transition support "
+                "without the SDK lifecycle method"
+            )
+
+        result = await _maybe_await(prepare(next_config))
+        if not isinstance(result, ConfigTransitionResult):
+            raise RuntimeError(
+                f"Isolated feature {self.name} returned an invalid config-transition result"
+            )
+        return result
+
+    def _supports_config_transition(self) -> bool:
+        """Whether the initialized SDK client explicitly opted into transitions."""
+
+        return (
+            self._client is not None
+            and getattr(self._client, "supports_config_transition", False) is True
+        )
+
+    def _client_requires_replacement(self) -> bool:
+        """Whether the SDK fenced the current child after an unknown outcome."""
+
+        return getattr(self._client, "replacement_required", False) is True
 
     async def _load_host_config(self) -> Dict[str, Any]:
         """Resolve persisted/UI host config to forward into the service.
@@ -897,12 +1160,14 @@ class ProxyFeature(Feature):
             raise RuntimeError(f"Required executable not found: {cmd[0]}")
         subprocess.run(cmd, check=True)
 
-    def _build_client(self) -> Any:
+    def _build_client(self, config: Optional[Dict[str, Any]] = None) -> Any:
         factory = self._client_factory
         if factory is None:
             from kestrel_sdk.isolated_feature import SubprocessIsolatedFeatureClient
 
             factory = SubprocessIsolatedFeatureClient
+
+        child_config = self._host_config if config is None else config
 
         kwargs = {
             "feature_name": self.name,
@@ -912,12 +1177,16 @@ class ProxyFeature(Feature):
             "executable": str(self._bin_path) if self._bin_path else None,
             "event_handler": self._handle_event,
             "notification_handler": self._handle_event,
-            "config": self._host_config or None,
+            # An empty object is an explicit effective config: the SDK sends
+            # ``config`` only when this value is not ``None``, and its service
+            # then calls ``configure({})``. Do not collapse it into a missing
+            # config field.
+            "config": child_config,
             # Launch env with interpreter-shadowing vars stripped (F023) so the
             # host PYTHONPATH/VIRTUAL_ENV can't defeat the venv isolation.
             "env": _isolated_child_env(self._venv_path),
         }
-        kwargs = {key: value for key, value in kwargs.items() if value}
+        kwargs = {key: value for key, value in kwargs.items() if value is not None}
 
         try:
             signature = inspect.signature(factory)
@@ -1038,9 +1307,7 @@ class ProxyFeature(Feature):
                         _maybe_await(self._client.health()),
                         timeout=_HEALTH_PROBE_TIMEOUT,
                     )
-                    healthy = bool(health)
-                    if isinstance(health, dict):
-                        healthy = bool(health.get("ok", health.get("healthy", True)))
+                    healthy = self._is_healthy_response(health)
                     if healthy:
                         backoff = 1.0
                         continue
@@ -1084,6 +1351,32 @@ class ProxyFeature(Feature):
                     await _maybe_await(self._client.stop())
                 except Exception:  # noqa: BLE001
                     pass
+
+    @staticmethod
+    def _is_healthy_response(health: Any) -> bool:
+        """Interpret the SDK health envelope without treating an error as ready.
+
+        Legacy client doubles may return a boolean. SDK clients return an
+        object, including ``{\"status\": \"restart-required\", \"ready\": false}``
+        after a child has been fenced. A non-empty mapping is not evidence of
+        readiness, so unknown envelopes fail closed rather than suppressing a
+        required replacement.
+        """
+
+        if not isinstance(health, dict):
+            return bool(health)
+        if health.get("replacement_required") is True:
+            return False
+        if "ready" in health:
+            return health["ready"] is True
+        if "ok" in health:
+            return health["ok"] is True
+        if "healthy" in health:
+            return health["healthy"] is True
+        status = health.get("status")
+        if isinstance(status, str):
+            return status.lower() in {"ready", "ok", "healthy", "running"}
+        return False
 
     async def _handle_event(self, event: Any) -> None:
         kind = _meta_get(event, "type") or _meta_get(event, "event") or _meta_get(event, "kind")
