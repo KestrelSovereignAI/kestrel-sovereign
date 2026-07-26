@@ -296,6 +296,9 @@ def test_multi_agent_prefixed_detailed_health_keeps_auth_then_routes():
     original_lifespan = app.router.lifespan_context
     original_agent = getattr(app.state, "agent", None)
     original_manager = getattr(app.state, "agent_manager", None)
+    original_scheduler_failures = getattr(
+        app.state, "scheduler_readiness_failures", None
+    )
 
     health_feature = MagicMock()
     health_feature.get_latest = AsyncMock(
@@ -312,6 +315,10 @@ def test_multi_agent_prefixed_detailed_health_keeps_auth_then_routes():
         app.router.lifespan_context = noop_lifespan
         app.state.agent = None
         app.state.agent_manager = manager
+        # This shared application may have a deliberately latched scheduler
+        # failure from a prior test. This test owns a healthy mock fleet, so it
+        # must not inherit that unrelated readiness state.
+        app.state.scheduler_readiness_failures = []
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
             with TestClient(app, client=("203.0.113.10", 55000)) as client:
                 unauthenticated = client.get(
@@ -325,6 +332,7 @@ def test_multi_agent_prefixed_detailed_health_keeps_auth_then_routes():
         app.router.lifespan_context = original_lifespan
         app.state.agent = original_agent
         app.state.agent_manager = original_manager
+        app.state.scheduler_readiness_failures = original_scheduler_failures
 
     assert unauthenticated.status_code == 401
     assert authenticated.status_code == 200
