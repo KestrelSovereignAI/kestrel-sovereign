@@ -878,6 +878,12 @@ def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
     # old state field.  Teardown uses ``_feature_routes`` as its authority.
     app.state._feature_route_count = len(tracked_routes)
 
+    # FastAPI memoizes the generated schema. A scheduler cold wake can mount a
+    # feature router after a client has already fetched /openapi.json, so leave
+    # no stale schema that omits the newly reachable API surface.
+    if added_routes:
+        app.openapi_schema = None
+
     if mounted:
         logger.info("Dynamically mounted routers from features: %s", ", ".join(mounted))
 
@@ -954,6 +960,9 @@ def _unmount_feature_routers(app: FastAPI) -> None:
         logger.info(
             "Removed %d dynamically-mounted feature routes", len(tracked_routes)
         )
+        # The cached schema can still describe these endpoints after their
+        # owning feature routes are gone. Rebuild it on the next OpenAPI read.
+        app.openapi_schema = None
     app.state._feature_routes = []
     app.state._feature_route_count = 0
     app.state._feature_router_keys = set()

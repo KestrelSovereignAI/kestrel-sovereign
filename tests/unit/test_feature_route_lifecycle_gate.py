@@ -25,7 +25,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastapi import APIRouter, Depends, WebSocket
+from fastapi import APIRouter, Depends, FastAPI, WebSocket
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -316,6 +316,34 @@ def test_repeated_feature_mounts_are_deduplicated_and_unmounted():
         restore()
 
     assert _bridge_health_route_count(app) == 0
+
+
+def test_dynamic_feature_routes_invalidate_openapi_schema_on_mount_and_unmount():
+    """A cold feature mount cannot leave a previously-served schema stale."""
+    from kestrel_sovereign import server
+
+    bridge = _make_bridge_feature()
+    app = FastAPI()
+    app.state.agent = _make_agent({"BridgeFeature": bridge})
+    app.state.agent_manager = None
+    path = "/api/bridge/health"
+
+    # Simulate a client fetching OpenAPI before the scheduler cold-wakes this
+    # agent. FastAPI caches that first result on the application instance.
+    with TestClient(app) as client:
+        initial_schema = client.get("/openapi.json").json()
+        assert path not in initial_schema["paths"]
+        assert app.openapi_schema is not None
+
+        server._mount_feature_routers(app)
+        assert app.openapi_schema is None
+        mounted_schema = client.get("/openapi.json").json()
+        assert path in mounted_schema["paths"]
+        assert app.openapi_schema is not None
+
+        server._unmount_feature_routers(app)
+        assert app.openapi_schema is None
+        assert path not in client.get("/openapi.json").json()["paths"]
 
 
 def test_disabled_websocket_feature_route_is_not_matched():
