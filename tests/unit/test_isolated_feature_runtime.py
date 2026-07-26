@@ -1,13 +1,26 @@
 """Tests for isolated feature runtime proxy behavior."""
 
+import asyncio
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 
 from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
-from kestrel_sovereign.features.isolated_runtime import ProxyFeature
+from kestrel_sovereign.features.isolated_runtime import (
+    ProxyFeature,
+    SchedulerExecutionContextUnavailable,
+)
+from kestrel_sovereign.features.scheduler.runner import (
+    SchedulerExecution,
+    SchedulerRunner,
+    ScheduledTask,
+    _SchedulerExecutionScope,
+    _current_execution,
+    get_current_scheduler_execution,
+)
 
 
 class FakeIsolatedClient:
@@ -108,6 +121,133 @@ async def test_proxy_feature_mirrors_tools_and_forwards_calls(monkeypatch, tmp_p
 
     await feature.shutdown()
     assert clients[0].stopped is True
+
+
+@pytest.mark.asyncio
+async def test_scheduled_isolated_call_fails_before_dispatch_without_context_capability(
+    tmp_path,
+):
+    """A legacy isolated service must not receive an unkeyed scheduled effect."""
+
+    agent = Mock()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    agent.features = {}
+    feature = ProxyFeature(agent, _isolated_runtime(), client_factory=FakeIsolatedClient)
+    client = FakeIsolatedClient()
+    feature._client = client
+    execution = SchedulerExecution(
+        id="execution-1",
+        schedule_id="schedule-1",
+        agent_id="agent-1",
+        task_name="ping",
+        args={"message": "hello"},
+        scheduled_for="2026-07-25T15:00:00+00:00",
+        idempotency_key="stable-effect-key",
+        attempt=1,
+        owner="runner-1",
+    )
+
+    token = _current_execution.set(_SchedulerExecutionScope(execution))
+    try:
+        with pytest.raises(SchedulerExecutionContextUnavailable, match="advertises"):
+            await feature.call_isolated_tool("ping", {"message": "hello"})
+    finally:
+        _current_execution.reset(token)
+
+    # No RPC is attempted, so a legacy child can never perform a duplicate
+    # effect without the scheduler's stable idempotency key.
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_revokes_context_for_detached_core_child_before_late_isolated_call(
+    tmp_path,
+):
+    """A child that outlives dispatch cannot reuse a completed occurrence.
+
+    ``asyncio.create_task`` copies the scheduler ContextVar.  Exercise the
+    production runner and proxy together: the child inherits the context
+    during dispatch, waits for the runner to clear the occurrence, then calls
+    the isolated tool.  That late call must be a normal untrusted call, never
+    an RPC bearing the stale scheduler idempotency identity.
+    """
+
+    class ContextAwareClient(FakeIsolatedClient):
+        supports_tool_execution_context = True
+
+        async def call_tool(self, name, args, *, context=None):
+            self.calls.append((name, args, context))
+            return {"echo": args}
+
+    class NoStorageRunner(SchedulerRunner):
+        # This test isolates context revocation rather than persistence. The
+        # real runner proves its durable token before and at effect admission;
+        # retain that precondition without giving this deliberately storageless
+        # test double a database implementation.
+        async def _renew_lease_once(self, task):
+            return True
+
+        async def _claim_token_is_live(self, task):
+            return True
+
+        async def _renew_lease(self, task):
+            await asyncio.Future()
+
+        async def _finalize(self, *args, **kwargs):
+            return None
+
+    agent = Mock()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    agent.features = {}
+    feature = ProxyFeature(agent, _isolated_runtime(), client_factory=FakeIsolatedClient)
+    client = ContextAwareClient()
+    feature._client = client
+
+    child_started = asyncio.Event()
+    release_child = asyncio.Event()
+    child: asyncio.Task[None] | None = None
+
+    async def late_isolated_call() -> None:
+        child_started.set()
+        await release_child.wait()
+        await feature.call_isolated_tool("ping", {"message": "late"})
+
+    async def executor(name, args):
+        nonlocal child
+        assert get_current_scheduler_execution() is not None
+        child = asyncio.create_task(late_isolated_call())
+        await child_started.wait()
+        return "dispatched"
+
+    now = datetime.now(timezone.utc).isoformat()
+    task = ScheduledTask(
+        id="schedule-1",
+        agent_id="agent-1",
+        task_name="ping",
+        cron_expression="* * * * *",
+        args_json='{"message": "scheduled"}',
+        enabled=True,
+        last_run_at=None,
+        next_run_at=now,
+        created_at=now,
+        idempotency_key="stable-effect-key",
+        claim_token="claim-token",
+        claim_execution_id="execution-1",
+        claim_scheduled_for=now,
+        attempt_count=1,
+    )
+    runner = NoStorageRunner(object(), "agent-1", executor, owner_id="runner-1")
+
+    await runner._execute_claim(task)
+    assert get_current_scheduler_execution() is None
+
+    release_child.set()
+    assert child is not None
+    await child
+
+    # A stale scope would give this call a ToolExecutionContext with the
+    # completed occurrence ID and stable idempotency key.  It must be absent.
+    assert client.calls == [("ping", {"message": "late"}, None)]
 
 
 def test_service_command_console_script(tmp_path):

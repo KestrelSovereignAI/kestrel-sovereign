@@ -25,7 +25,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastapi import APIRouter, WebSocket
+from fastapi import APIRouter, Depends, FastAPI, WebSocket
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -92,6 +92,74 @@ class _WebSocketFeatureStub:
         return router
 
 
+class _InstanceBoundRouterFeature:
+    """Feature whose endpoint deliberately closes over its own instance."""
+
+    def __init__(self, owner: str):
+        self.enabled = True
+        self.owner = owner
+
+    def get_router(self):
+        router = APIRouter()
+
+        @router.get("/test-feature-lifecycle/instance-bound")
+        async def instance_bound():
+            return {"owner": self.owner}
+
+        return router
+
+
+class _PartiallyCopiedRouterFeature:
+    """A router whose mounted child FastAPI cannot be copied by include_router."""
+
+    def __init__(self):
+        self.enabled = True
+
+    def get_router(self):
+        router = APIRouter()
+
+        @router.get("/test-feature-lifecycle/partial-normal")
+        async def normal_route():
+            return {"partial": False}
+
+        router.mount("/test-feature-lifecycle/partial-child", FastAPI())
+        return router
+
+
+async def _overrideable_feature_route_dependency():
+    """A stable dependency key used to exercise app-level overrides."""
+
+
+class _DependencyBoundRouterFeature:
+    """Instance-bound router with a per-feature dependency for live dispatch."""
+
+    def __init__(self, owner: str, events: list[str]):
+        self.enabled = True
+        self.owner = owner
+        self.events = events
+        self._router = None
+
+    async def _selected_router_dependency(self):
+        self.events.append(f"router:{self.owner}")
+
+    def get_router(self):
+        if self._router is not None:
+            return self._router
+        router = APIRouter(
+            dependencies=[
+                Depends(self._selected_router_dependency),
+                Depends(_overrideable_feature_route_dependency),
+            ]
+        )
+
+        @router.get("/test-feature-lifecycle/dependency-bound")
+        async def dependency_bound():
+            return {"owner": self.owner}
+
+        self._router = router
+        return router
+
+
 def _boot(features):
     """Boot the real app with a mock single agent exposing ``features``.
 
@@ -128,7 +196,7 @@ def _boot(features):
     return app, agent, restore
 
 
-def _boot_multi_agent(agents):
+def _boot_multi_agent(agents, *, app_dependencies=()):
     """Boot the real app in multi-agent mode with the given ``{name: agent}`` map.
 
     Installs a fake ``agent_manager`` (``list_agents`` / ``get_agent``) so the
@@ -147,14 +215,19 @@ def _boot_multi_agent(agents):
         yield
 
     original_lifespan = app.router.lifespan_context
+    original_dependencies = list(app.router.dependencies)
     original_agent = getattr(app.state, "agent", None)
     original_manager = getattr(app.state, "agent_manager", None)
 
     manager = MagicMock()
-    manager.list_agents = MagicMock(return_value=list(agents.keys()))
+    # Match AgentManager's production contract: list_agents returns the live
+    # name -> agent mapping, not merely a list of names.  Keep it dynamic so
+    # removal/reload assertions observe the current test fleet.
+    manager.list_agents = MagicMock(side_effect=lambda: dict(agents))
     manager.get_agent = MagicMock(side_effect=lambda name: agents.get(name))
 
     app.router.lifespan_context = noop_lifespan
+    app.router.dependencies = [*original_dependencies, *app_dependencies]
     # Multi-agent mode: no single bound agent, only the manager.
     app.state.agent = None
     app.state.agent_manager = manager
@@ -163,6 +236,7 @@ def _boot_multi_agent(agents):
     def restore():
         _unmount_feature_routers(app)
         app.router.lifespan_context = original_lifespan
+        app.router.dependencies = original_dependencies
         app.state.agent = original_agent
         app.state.agent_manager = original_manager
 
@@ -239,13 +313,13 @@ def test_bridge_route_404s_when_feature_removed():
         restore()
 
 
-def test_repeated_feature_mounts_are_all_unmounted():
-    """An outer teardown owns every route batch from repeated mounts.
+def test_repeated_feature_mounts_are_deduplicated_and_unmounted():
+    """Cold registration does not duplicate routes before outer teardown.
 
-    A restart can mount feature routers again before the previous outer
-    lifecycle cleanup runs.  Tracking only the most recent batch's count used
-    to leave earlier Bridge routes behind, so later tests (and a restarted
-    process) could resolve a stale route ahead of the live-gated one.
+    The host now invokes the mount pass for every scheduler-woken agent.  A
+    repeated feature shape must therefore reuse the live-gated route instead
+    of inserting a stale duplicate ahead of it; outer teardown still owns the
+    one concrete route batch that was mounted.
     """
     from kestrel_sovereign.server import _mount_feature_routers
 
@@ -254,11 +328,63 @@ def test_repeated_feature_mounts_are_all_unmounted():
     try:
         assert _bridge_health_route_count(app) == 1
         _mount_feature_routers(app)
-        assert _bridge_health_route_count(app) == 2
+        assert _bridge_health_route_count(app) == 1
     finally:
         restore()
 
     assert _bridge_health_route_count(app) == 0
+
+
+def test_invalid_feature_router_rolls_back_partially_included_routes():
+    """A non-copyable child cannot leave an ungated route or retry duplicate."""
+
+    from kestrel_sovereign import server
+
+    feature = _PartiallyCopiedRouterFeature()
+    app = FastAPI()
+    app.state.agent = _make_agent({"PartialFeature": feature})
+    app.state.agent_manager = None
+    normal_path = "/test-feature-lifecycle/partial-normal"
+
+    server._mount_feature_routers(app)
+    assert not any(getattr(route, "path", None) == normal_path for route in app.routes)
+    assert getattr(app.state, "_feature_routes", []) == []
+    assert getattr(app.state, "_feature_router_keys", set()) == set()
+
+    # A retry sees the same invalid shape but cannot accumulate an earlier
+    # copied route; this guards both runtime reloads and repeated cold wakes.
+    server._mount_feature_routers(app)
+    assert not any(getattr(route, "path", None) == normal_path for route in app.routes)
+    assert getattr(app.state, "_feature_routes", []) == []
+    assert getattr(app.state, "_feature_router_keys", set()) == set()
+
+
+def test_dynamic_feature_routes_invalidate_openapi_schema_on_mount_and_unmount():
+    """A cold feature mount cannot leave a previously-served schema stale."""
+    from kestrel_sovereign import server
+
+    bridge = _make_bridge_feature()
+    app = FastAPI()
+    app.state.agent = _make_agent({"BridgeFeature": bridge})
+    app.state.agent_manager = None
+    path = "/api/bridge/health"
+
+    # Simulate a client fetching OpenAPI before the scheduler cold-wakes this
+    # agent. FastAPI caches that first result on the application instance.
+    with TestClient(app) as client:
+        initial_schema = client.get("/openapi.json").json()
+        assert path not in initial_schema["paths"]
+        assert app.openapi_schema is not None
+
+        server._mount_feature_routers(app)
+        assert app.openapi_schema is None
+        mounted_schema = client.get("/openapi.json").json()
+        assert path in mounted_schema["paths"]
+        assert app.openapi_schema is not None
+
+        server._unmount_feature_routers(app)
+        assert app.openapi_schema is None
+        assert path not in client.get("/openapi.json").json()["paths"]
 
 
 def test_disabled_websocket_feature_route_is_not_matched():
@@ -281,6 +407,103 @@ def test_disabled_websocket_feature_route_is_not_matched():
                 ):
                     pass
     finally:
+        restore()
+
+
+def test_instance_bound_feature_router_dispatches_to_request_agent_and_reload():
+    """One shape-mounted route must never retain the first tenant's callable.
+
+    ``include_router`` copies Alice's bound endpoint during startup.  Bob has
+    the same route shape, so mounting his router would be deduplicated; the
+    physically mounted route must instead resolve Bob's *current* feature on
+    each agent-prefixed request.  This also proves an in-place feature reload
+    replaces the callable without adding a duplicate route.
+    """
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    alice = _InstanceBoundRouterFeature("alice-v1")
+    bob = _InstanceBoundRouterFeature("bob-v1")
+    agents = {
+        "alice": _make_agent({"ProxyFeature": alice}),
+        "bob": _make_agent({"ProxyFeature": bob}),
+    }
+    app, restore = _boot_multi_agent(agents)
+    path = "/test-feature-lifecycle/instance-bound"
+    try:
+        assert sum(1 for route in app.routes if getattr(route, "path", None) == path) == 1
+        headers = {"X-API-Key": API_KEY}
+        with TestClient(app) as client:
+            assert client.get(f"/api/agents/alice{path}", headers=headers).json() == {
+                "owner": "alice-v1"
+            }
+            assert client.get(f"/api/agents/bob{path}", headers=headers).json() == {
+                "owner": "bob-v1"
+            }
+
+            # A reload swaps the instance but deliberately keeps the route
+            # shape identical.  It must use Bob-v2, not the first mount nor
+            # the prior Bob instance.
+            agents["bob"].features["ProxyFeature"] = _InstanceBoundRouterFeature(
+                "bob-v2"
+            )
+            assert client.get(f"/api/agents/bob{path}", headers=headers).json() == {
+                "owner": "bob-v2"
+            }
+
+            agents["bob"].features.pop("ProxyFeature")
+            assert client.get(f"/api/agents/bob{path}", headers=headers).status_code == 404
+            assert sum(
+                1 for route in app.routes if getattr(route, "path", None) == path
+            ) == 1
+    finally:
+        restore()
+
+
+def test_current_feature_route_keeps_app_overrides_and_live_dependencies():
+    """Current feature dispatch must preserve FastAPI's app-bound execution.
+
+    The mounted route belongs to Alice, but this request selects Bob. The
+    router-level dependency must therefore be Bob's, while the app-level
+    dependency and dependency override still run through the app-owned route
+    copy rather than Bob's source ``current.app``.
+    """
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    events: list[str] = []
+
+    async def host_dependency():
+        events.append("host")
+
+    async def dependency_override():
+        events.append("override")
+
+    alice = _DependencyBoundRouterFeature("alice", events)
+    bob = _DependencyBoundRouterFeature("bob", events)
+    agents = {
+        "alice": _make_agent({"ProxyFeature": alice}),
+        "bob": _make_agent({"ProxyFeature": bob}),
+    }
+    app, restore = _boot_multi_agent(
+        agents,
+        app_dependencies=(Depends(host_dependency),),
+    )
+    previous_overrides = dict(app.dependency_overrides)
+    app.dependency_overrides[_overrideable_feature_route_dependency] = (
+        dependency_override
+    )
+    path = "/test-feature-lifecycle/dependency-bound"
+    try:
+        with TestClient(app) as client:
+            response = client.get(
+                f"/api/agents/bob{path}",
+                headers={"X-API-Key": API_KEY},
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {"owner": "bob"}
+        assert events == ["host", "router:bob", "override"]
+    finally:
+        app.dependency_overrides.clear()
+        app.dependency_overrides.update(previous_overrides)
         restore()
 
 

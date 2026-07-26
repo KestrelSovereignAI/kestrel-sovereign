@@ -326,14 +326,15 @@ GITHUB_WRITE_TOOLS = frozenset(
 # Scheduler mutation tools (verified against features/scheduler/feature.py @tool
 # names). SchedulerFeature is in the ceiling for the read/status surface
 # (schedule_list / schedule_history / schedule_engagement, which feed the
-# kestrel-claws Signals tab), but its cron-mutating tools would let the agent
-# create/alter scheduled tasks — including built-in signal sources — so they are
-# hard-denied. The `reflect` triage sweep (REFLECTION_SCHEDULE) is seeded by the
-# operator at materialization time, not by the agent, so denying schedule_add
-# here does not block it.
+# kestrel-claws Signals tab), but its schedule-mutating tools would let the
+# agent create/alter recurring or one-shot scheduled tasks — including built-in
+# signal sources — so they are hard-denied. The `reflect` triage sweep
+# (REFLECTION_SCHEDULE) is seeded by the operator at materialization time, not
+# by the agent, so denying schedule_add here does not block it.
 SCHEDULER_MUTATION_TOOLS = frozenset(
     {
         "schedule_add",
+        "schedule_add_deadline",
         "schedule_remove",
         "schedule_pause",
         "schedule_resume",

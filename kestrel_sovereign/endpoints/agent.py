@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Query, UploadFil
 from fastapi.responses import StreamingResponse
 from typing import Any, Dict, List, Optional
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -1708,6 +1709,128 @@ def _a2a_did_resolver(agent):
     return getattr(agent, "a2a_did_resolver", None)
 
 
+def _a2a_inbound_sender_authorizer(agent):
+    """Return the recipient's post-verification A2A authorization seam."""
+    return getattr(agent, "a2a_inbound_sender_authorizer", None)
+
+
+def _a2a_inbound_scope_snapshot(agent):
+    """Capture seam identities around asynchronous trust decisions."""
+    from kestrel_sovereign.a2a.inbound_authorization import (
+        has_a2a_inbound_scoped_policy,
+    )
+
+    return (
+        _a2a_inbound_sender_authorizer(agent),
+        _a2a_did_resolver(agent),
+        getattr(agent, "peer_directory_router", None),
+        getattr(agent, "peer_requester", None),
+        has_a2a_inbound_scoped_policy(agent),
+    )
+
+
+def _a2a_inbound_scope_unchanged(agent, snapshot) -> bool:
+    """Require the exact authorizer/router/requester objects to remain live."""
+    current = _a2a_inbound_scope_snapshot(agent)
+    return (
+        current[0] is snapshot[0]
+        and current[1] is snapshot[1]
+        and current[2] is snapshot[2]
+        and current[3] is snapshot[3]
+        and current[4] is snapshot[4]
+    )
+
+
+def _a2a_sender_witness_unchanged(before, after) -> bool:
+    """Compare manager-owned sender witnesses without invoking object equality."""
+    return (
+        before[0] == after[0]
+        and before[1] is after[1]
+        and before[2] is after[2]
+        and before[3] == after[3]
+    )
+
+
+def _a2a_inbound_requires_verified_sender(agent, authorizer) -> bool:
+    """Fail closed when hosted scope is present or its seam is malformed."""
+    from kestrel_sovereign.a2a.inbound_authorization import (
+        has_a2a_inbound_scoped_policy,
+    )
+
+    if has_a2a_inbound_scoped_policy(agent):
+        return True
+    if authorizer is not None:
+        try:
+            required = authorizer.requires_verified_sender
+        except Exception:  # noqa: BLE001 - injected host policy boundary
+            return True
+        return (
+            required is not False
+            or getattr(agent, "peer_directory_router", None) is not None
+            or getattr(agent, "peer_requester", None) is not None
+        )
+    return (
+        getattr(agent, "peer_directory_router", None) is not None
+        or getattr(agent, "peer_requester", None) is not None
+    )
+
+
+def _a2a_inbound_current_scope_is_valid(
+    authorizer,
+    hosted_policy=None,
+) -> bool:
+    """Validate the installed scoped seam without another provider await."""
+    if hosted_policy is not None:
+        validator = getattr(authorizer, "has_valid_policy_scope", None)
+        arguments = (hosted_policy.router, hosted_policy.requester)
+    else:
+        validator = getattr(authorizer, "has_valid_current_scope", None)
+        arguments = ()
+    if not callable(validator):
+        return False
+    try:
+        return validator(*arguments) is True
+    except Exception:  # noqa: BLE001 - injected host policy boundary
+        return False
+
+
+async def _authorize_verified_a2a_sender(
+    authorizer,
+    sender_did: str,
+    hosted_policy=None,
+) -> bool:
+    """Invoke the explicit inbound seam, requiring a literal True verdict."""
+    if authorizer is None or not callable(
+        getattr(authorizer, "authorize", None)
+    ):
+        return False
+    try:
+        if hosted_policy is not None:
+            policy_authorize = getattr(
+                authorizer,
+                "authorize_with_policy",
+                None,
+            )
+            if not callable(policy_authorize):
+                return False
+            result = policy_authorize(
+                sender_did,
+                router=hosted_policy.router,
+                requester=hosted_policy.requester,
+            )
+        else:
+            result = authorizer.authorize(sender_did)
+        if inspect.isawaitable(result):
+            result = await result
+    except Exception:  # noqa: BLE001 - injected host policy boundary
+        logger.warning(
+            "Inbound A2A sender authorization provider failed",
+            exc_info=True,
+        )
+        return False
+    return result is True
+
+
 def _a2a_replay_store(agent):
     """Return a cached shared replay-nonce store for signed A2A envelopes."""
     existing = getattr(agent, "_a2a_replay_nonce_store", None)
@@ -1727,6 +1850,295 @@ def _a2a_replay_store(agent):
     except Exception:
         return store
     return store
+
+
+async def _create_a2a_task_under_lifecycle_lease(
+    agent,
+    params,
+    parts,
+    raw_artifacts,
+    sender_artifacts,
+    manager,
+    hosted_policy=None,
+):
+    """Verify, authorize, and persist one task under a stable hosted topology."""
+    from kestrel_sovereign.a2a.envelope_signing import (
+        canonical_message,
+        verify_inbound_envelope,
+    )
+
+    if hosted_policy is not None:
+        inbound_authorizer = hosted_policy.authorizer
+        # Hosted recipients normally require a verified sender.  Keep the
+        # envelope verifier open only long enough to identify a genuinely
+        # absent signature: the manager-owned legacy path below then permits
+        # one exact current same-host pre-ceremony sender.  A present malformed
+        # or invalid signature remains a hard verification failure.
+        scoped_sender_required = True
+        verification_scope = None
+        resolver = hosted_policy.resolver
+    else:
+        inbound_authorizer = _a2a_inbound_sender_authorizer(agent)
+        scoped_sender_required = _a2a_inbound_requires_verified_sender(
+            agent,
+            inbound_authorizer,
+        )
+        # Capture after requires_verified_sender has monotonically observed any
+        # newly attached scope, avoiding a self-induced marker transition.
+        verification_scope = _a2a_inbound_scope_snapshot(agent)
+        resolver = verification_scope[1]
+    globally_required_signed = os.environ.get(
+        "KESTREL_A2A_REQUIRE_SIGNED", ""
+    ).lower() in (
+        "1", "true", "yes",
+    )
+    require_signed = (
+        globally_required_signed
+        or (hosted_policy is None and scoped_sender_required)
+    )
+    claimed_sender = str(params.metadata.get("sender") or "")
+    sender_witness = (
+        manager.a2a_sender_identity_witness(claimed_sender)
+        if manager is not None and claimed_sender
+        else None
+    )
+    signed_message_text = canonical_message([part.text for part in parts])
+    sender_verdict = await verify_inbound_envelope(
+        params.metadata,
+        task_id=params.id,
+        message=signed_message_text,
+        session_id=params.sessionId,
+        artifacts=raw_artifacts,
+        resolver=resolver,
+        require_signed=require_signed,
+        replay_store=_a2a_replay_store(agent),
+    )
+    if not sender_verdict.ok:
+        raise HTTPException(
+            status_code=403,
+            detail=f"A2A sender verification failed: {sender_verdict.reason}",
+        )
+    if hosted_policy is not None:
+        if manager.a2a_hosted_policy_for(agent) is not hosted_policy:
+            raise HTTPException(
+                status_code=403,
+                detail="A2A hosted policy changed during verification",
+            )
+    elif not _a2a_inbound_scope_unchanged(agent, verification_scope):
+        raise HTTPException(
+            status_code=403,
+            detail="A2A sender authorization context changed during verification",
+        )
+    if sender_verdict.verified and sender_witness is not None:
+        current_witness = manager.a2a_sender_identity_witness(
+            sender_verdict.sender
+        )
+        if (
+            sender_witness[0] == "ambiguous"
+            or not _a2a_sender_witness_unchanged(
+                sender_witness,
+                current_witness,
+            )
+            or (
+                sender_witness[0] == "local"
+                and sender_verdict.verification_document_fingerprint
+                != sender_witness[3]
+            )
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="A2A sender identity changed during verification",
+            )
+
+    if hosted_policy is not None:
+        authorization_scope = None
+        inbound_authorizer = hosted_policy.authorizer
+        scoped_sender_required = True
+    else:
+        authorization_scope = _a2a_inbound_scope_snapshot(agent)
+        inbound_authorizer = authorization_scope[0]
+        scoped_sender_required = _a2a_inbound_requires_verified_sender(
+            agent,
+            inbound_authorizer,
+        )
+    if sender_verdict.verified:
+        if inbound_authorizer is not None:
+            if (
+                scoped_sender_required
+                and not _a2a_inbound_current_scope_is_valid(
+                    inbound_authorizer,
+                    hosted_policy,
+                )
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="A2A sender authorization context is invalid",
+                )
+            authorized = await _authorize_verified_a2a_sender(
+                inbound_authorizer,
+                sender_verdict.sender,
+                hosted_policy,
+            )
+            if not authorized:
+                raise HTTPException(
+                    status_code=403,
+                    detail="A2A sender authorization failed",
+                )
+            if (
+                hosted_policy is not None
+                and manager.a2a_hosted_policy_for(agent) is not hosted_policy
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="A2A hosted policy changed during authorization",
+                )
+            if (
+                hosted_policy is None
+                and not _a2a_inbound_scope_unchanged(
+                    agent,
+                    authorization_scope,
+                )
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        "A2A sender authorization context changed "
+                        "during authorization"
+                    ),
+                )
+            if (
+                scoped_sender_required
+                and not _a2a_inbound_current_scope_is_valid(
+                    inbound_authorizer,
+                    hosted_policy,
+                )
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="A2A sender authorization context is invalid",
+                )
+            if sender_witness is not None:
+                current_witness = manager.a2a_sender_identity_witness(
+                    sender_verdict.sender
+                )
+                if not _a2a_sender_witness_unchanged(
+                    sender_witness,
+                    current_witness,
+                ):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="A2A sender identity changed during authorization",
+                    )
+        elif scoped_sender_required:
+            raise HTTPException(
+                status_code=403,
+                detail="A2A sender authorization unavailable",
+            )
+    elif hosted_policy is not None:
+        # Hosted unsigned compatibility is deliberately narrower than the
+        # historic same-host API-key fallback.  The manager, while holding its
+        # lifecycle lease, proves the claimed name is an exact current local
+        # non-hybrid sender and asks the immutable recipient directory policy
+        # to authorize its stable DID. Unknown, cross-user, external, and
+        # hybrid-downgrade claims fail closed.
+        authorize_legacy = getattr(
+            manager,
+            "authorize_a2a_legacy_unsigned_sender",
+            None,
+        )
+        authorized = False
+        if callable(authorize_legacy):
+            try:
+                authorized = await authorize_legacy(
+                    agent,
+                    claimed_sender,
+                    hosted_policy,
+                )
+            except Exception:  # noqa: BLE001 - manager policy boundary
+                logger.warning(
+                    "Hosted legacy unsigned A2A sender authorization failed",
+                    exc_info=True,
+                )
+        if authorized is not True:
+            raise HTTPException(
+                status_code=403,
+                detail="A2A unsigned sender is not an authorized local legacy peer",
+            )
+        if manager.a2a_hosted_policy_for(agent) is not hosted_policy:
+            raise HTTPException(
+                status_code=403,
+                detail="A2A hosted policy changed during legacy authorization",
+            )
+    elif scoped_sender_required:
+        raise HTTPException(
+            status_code=403,
+            detail="A2A scoped recipients require a verified sender",
+        )
+
+    params.metadata["sender_verified"] = sender_verdict.verified
+    local_name = (
+        getattr(agent, "did", None)
+        or getattr(agent, "_agent_name", None)
+        or "unknown"
+    )
+    try:
+        return await agent.task_manager.create_task(
+            params=params,
+            agent_name=local_name,
+            artifacts=sender_artifacts or None,
+        )
+    except Exception as exc:
+        logger.error(
+            "Failed to create A2A task from peer submission: %s",
+            exc,
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="Failed to create task")
+
+
+async def _create_verified_a2a_task(
+    agent,
+    params,
+    parts,
+    raw_artifacts,
+    sender_artifacts,
+):
+    """Use a shared manager lease for hosted recipients; preserve standalone flow."""
+    manager = getattr(agent, "_a2a_host_manager", None)
+    # Current managers expose a reader lease so independent hosted recipients
+    # can verify and commit concurrently. Retain the old lifecycle-lock seam
+    # for compatibility hosts; it remains exclusive and therefore safe.
+    lease_factory = getattr(manager, "a2a_execution_lease", None)
+    if not callable(lease_factory):
+        lease_factory = getattr(manager, "a2a_lifecycle_lease", None)
+    if callable(lease_factory):
+        async with lease_factory():
+            hosted_policy = manager.a2a_hosted_policy_for(agent)
+            if hosted_policy is None:
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        "A2A recipient is no longer published "
+                        "with hosted policy"
+                    ),
+                )
+            return await _create_a2a_task_under_lifecycle_lease(
+                agent,
+                params,
+                parts,
+                raw_artifacts,
+                sender_artifacts,
+                manager,
+                hosted_policy,
+            )
+    return await _create_a2a_task_under_lifecycle_lease(
+        agent,
+        params,
+        parts,
+        raw_artifacts,
+        sender_artifacts,
+        None,
+    )
 
 
 @router.post("/tasks/send")
@@ -1771,19 +2183,19 @@ async def send_task(request: Request):
     ``metadata["signature"]`` block, it is verified against the sender's
     resolved DID document via ``verify_inbound_envelope`` (hybrid Ed25519 +
     ML-DSA-65, replay-windowed, DID-bound). A present-but-invalid signature is
-    always rejected; an unsigned envelope is allowed by default (the same-host
-    shared-API-key boundary still applies) unless ``KESTREL_A2A_REQUIRE_SIGNED``
-    is set. The verdict is recorded as ``metadata["sender_verified"]`` for
-    downstream governance tiering.
+    always rejected; an unsigned envelope is allowed for standalone/local
+    shared-API-key compatibility unless ``KESTREL_A2A_REQUIRE_SIGNED`` is set.
+    A scoped hosted recipient always requires a verified signature. The verdict
+    is recorded as ``metadata["sender_verified"]`` for downstream governance
+    tiering.
 
-    Remaining for full cross-host federation: the DID *resolver*
-    (``agent.a2a_did_resolver``) — a same-host registry of peer agents' DID
-    documents (local-first; federated ``did:web`` optional) — and sign-on-send,
-    which needs the sending agent's runtime keypair. Until the resolver is
-    attached, signed envelopes from unresolvable senders are rejected because a
-    present signature is a verification claim, not an unsigned fallback. The
-    richer identity-injection middleware (a system-context note "verified
-    message from agent X") builds on ``sender_verified``.
+    DID-document resolution and recipient authorization are separate trust
+    decisions. After successful cryptographic verification, a recipient-scoped
+    ``agent.a2a_inbound_sender_authorizer`` must approve the verified sender
+    before ``sender_verified`` is set or a task is created. Hosted scoped
+    recipients require a signed envelope and fail closed if that seam or its
+    live scope is missing/revoked. Standalone shared-API-key deployments retain
+    unsigned compatibility.
     """
     agent = get_agent(request)
     body = await _parse_json_body(request)
@@ -1860,76 +2272,13 @@ async def send_task(request: Request):
             detail="TaskSendParams.id and TaskSendParams.sessionId are required",
         )
 
-    # Cryptographic sender verification (#1673). If the envelope carries a
-    # ``metadata["signature"]`` block, verify it against the sender's resolved
-    # DID document — a present-but-invalid signature is ALWAYS rejected (an
-    # attack signal, never downgraded). Unsigned envelopes are allowed by
-    # default: the same-host shared-API-key boundary (this endpoint sits behind
-    # the host API-key middleware) still applies. Set
-    # ``KESTREL_A2A_REQUIRE_SIGNED=1`` to require a verified signature.
-    from kestrel_sovereign.a2a.envelope_signing import (
-        canonical_message,
-        verify_inbound_envelope,
+    task = await _create_verified_a2a_task(
+        agent,
+        params,
+        parts,
+        raw_artifacts,
+        sender_artifacts,
     )
-
-    require_signed = os.environ.get("KESTREL_A2A_REQUIRE_SIGNED", "").lower() in (
-        "1", "true", "yes",
-    )
-    # Structure-preserving message form (a JSON array of part texts, not a
-    # lossy join) and the AUTHORITATIVE top-level sessionId — both bound into
-    # the signature so neither the multipart structure nor the session can be
-    # swapped after signing.
-    signed_message_text = canonical_message([p.text for p in parts])
-    sender_verdict = await verify_inbound_envelope(
-        params.metadata,
-        task_id=params.id,
-        message=signed_message_text,
-        session_id=params.sessionId,
-        # Bind the RAW wire artifacts (the same dicts the signer bound as
-        # ``payload["artifacts"]``); ``TaskSendParams`` has no artifacts field —
-        # they are parsed separately into ``sender_artifacts`` (#1721).
-        artifacts=raw_artifacts,
-        resolver=_a2a_did_resolver(agent),
-        require_signed=require_signed,
-        replay_store=_a2a_replay_store(agent),
-    )
-    if not sender_verdict.ok:
-        raise HTTPException(
-            status_code=403,
-            detail=f"A2A sender verification failed: {sender_verdict.reason}",
-        )
-    # Record the outcome so downstream governance can apply the right trust
-    # tier. The inbound-task signal source reads ``sender_verified`` and marks
-    # an unverified peer's wake UNTRUSTED (#1721) — a cryptographically-verified
-    # peer keeps the registration's TRUSTED tier; an unsigned/unverified claim
-    # is downgraded so the dispatcher routes it through the untrusted path.
-    params.metadata["sender_verified"] = sender_verdict.verified
-
-    # ``agent_name`` here is the local (recipient) agent's identifier —
-    # the same value `create_task` logs as ``agent_name`` for the
-    # observability row. Use the agent's DID for stable identity.
-    local_name = (
-        getattr(agent, "did", None)
-        or getattr(agent, "_agent_name", None)
-        or "unknown"
-    )
-
-    try:
-        task = await agent.task_manager.create_task(
-            params=params, agent_name=local_name,
-            artifacts=sender_artifacts or None,
-        )
-    except Exception as e:
-        # The replay nonce was consumed at verification time and is NOT released
-        # here: create_task is not idempotent (it appends a session event), so
-        # releasing the nonce on a partial-create failure could double-process a
-        # re-accepted retry (#1721 codex r5). A client retrying must send a
-        # freshly-signed envelope (Kestrel peers re-sign every send).
-        logger.error(
-            "Failed to create A2A task from peer submission: %s",
-            e, exc_info=True,
-        )
-        raise HTTPException(status_code=500, detail="Failed to create task")
 
     # Return the canonical A2A Task envelope (model_dump produces the
     # standard JSON-RPC-friendly shape).

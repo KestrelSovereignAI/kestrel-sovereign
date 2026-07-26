@@ -256,6 +256,51 @@ kestrel update --allow-dirty         # bypass the old refusal a single time
 
 After the new code lands in your checkout, `kestrel update` alone handles subsequent refreshes.
 
+#### Scheduler protocol-v2 cutover is not an ordinary update
+
+If this database has ever been served by a pre-protocol-v2 scheduler, do **not**
+run a normal rolling `kestrel update` or restart an old image after a failed
+first v2 start. The first v2 process deliberately fences legacy-visible
+schedules and waits for a drain acknowledgement; an old binary against that
+fenced database can leave work dormant or duplicate an occurrence. This applies
+to both local SQLite and shared PostgreSQL deployments.
+
+Stop every legacy poller and schedule writer, take a backend-appropriate backup,
+perform the controlled v2 acknowledgement, and use forward-only recovery unless
+you deliberately restore the complete pre-cutover database while all writers
+remain stopped. The exact local, systemd, PyPI, SQLite, and PostgreSQL commands
+are in the [scheduler protocol-v2 deployment runbook](docs/deployment/README.md#scheduler-protocol-v2-upgrade-sqlite-and-postgresql).
+
+Shared PostgreSQL hosts pre-seed database-global scheduler provenance and every
+resolvable configured DID before parallel agent runners start. That lets a new
+DID join a known fresh-v2 fleet safely, but an absent/unknown provenance marker
+is always treated as a legacy migration; do not seed or unfence scheduler rows
+manually.
+
+#### SDK 0.32 release cascade
+
+Core requires `kestrel-sovereign-sdk[tracing]>=0.32.0,<0.33`; the
+`observability` extra carries the same SDK line with `metrics`. This is a
+runtime contract for durable isolated scheduler execution, not a preference
+that a downstream package may relax. The Core-owned release-cascade contract is:
+
+| Downstream release gate | Required published SDK constraint before Core ships | Core assertion |
+|---|---|---|
+| Frinz | `kestrel-sovereign-sdk>=0.32.0,<0.33` | External prerequisite; Core does not claim Frinz has changed. |
+| Observability fleet | `kestrel-sovereign-sdk>=0.32.0,<0.33` | External prerequisite; Core does not claim observability has changed. |
+
+Frinz main and the observability fleet currently have constraints below this
+line, so their compatible releases and tests must precede the Core publish. Do
+not weaken Core's requirement to make an older sibling resolver succeed.
+
+The Core dependency-contract test verifies the base and observability
+declarations and lockfile resolve the same SDK line. It cannot validate another
+repository's working tree, so the downstream release verification remains an
+explicit release gate owned by those repositories.
+
+Windows base installs also include `tzdata`, so default `UTC` and named-IANA
+scheduler time zones work without optional Pandas or Phoenix extras.
+
 ### Feature management (`kestrel feature`)
 
 Kestrel ships a self-contained core with the local storage, identity, governance, and built-in LLM-routing dependencies needed to run an agent. Optional feature packages register `Feature` classes through the `kestrel_sovereign.features` entry-point group. Provider packages, such as cloud, voice, and storage backends, register with provider-specific entry-point groups and are consumed by their owning core or feature module.

@@ -2900,11 +2900,11 @@ class TalonCoordinatorFeature(Feature):
                 data={"schedule_request": request},
             )
 
-        result = await scheduler.schedule_add(
-            cron_expression=request["cron_expression"],
-            task_name=request["task_name"],
-            args_json=request["args_json"],
-        )
+        # ``build_recurring_schedule_request`` is the one canonical shape for
+        # this safety-sensitive schedule.  Forward it wholesale so a newly
+        # added contract field (notably the stable idempotency key) cannot be
+        # silently dropped at this boundary.
+        result = await scheduler.schedule_add(**request)
         # Surface the request shape alongside whatever the scheduler returned.
         data = dict(getattr(result, "data", None) or {})
         data["schedule_request"] = request

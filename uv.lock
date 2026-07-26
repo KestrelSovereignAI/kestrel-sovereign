@@ -2876,6 +2876,7 @@ dependencies = [
     { name = "toml" },
     { name = "tree-sitter" },
     { name = "tree-sitter-bash" },
+    { name = "tzdata", marker = "sys_platform == 'win32'" },
     { name = "urllib3" },
     { name = "uvicorn" },
 ]
@@ -3057,8 +3058,8 @@ requires-dist = [
     { name = "kestrel-sovereign", extras = ["search"], marker = "extra == 'all-features'" },
     { name = "kestrel-sovereign", extras = ["test"], marker = "extra == 'full'" },
     { name = "kestrel-sovereign", extras = ["wallet"], marker = "extra == 'all-features'" },
-    { name = "kestrel-sovereign-sdk", extras = ["metrics", "tracing"], marker = "extra == 'observability'", specifier = ">=0.31.0,<0.32" },
-    { name = "kestrel-sovereign-sdk", extras = ["tracing"], specifier = ">=0.31.1,<0.32" },
+    { name = "kestrel-sovereign-sdk", extras = ["metrics", "tracing"], marker = "extra == 'observability'", specifier = ">=0.32.0,<0.33" },
+    { name = "kestrel-sovereign-sdk", extras = ["tracing"], specifier = ">=0.32.0,<0.33" },
     { name = "networkx", specifier = "==3.6.1" },
     { name = "numpy", specifier = ">=2.3.1" },
     { name = "numpy", marker = "extra == 'local'", specifier = "==2.4.6" },
@@ -3114,6 +3115,7 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'ml'", specifier = ">=5.5.0,<6" },
     { name = "tree-sitter", specifier = ">=0.25,<1" },
     { name = "tree-sitter-bash", specifier = ">=0.25,<1" },
+    { name = "tzdata", marker = "sys_platform == 'win32'" },
     { name = "twilio", marker = "extra == 'delivery'", specifier = ">=9.9.1" },
     { name = "urllib3", specifier = ">=2.7.0" },
     { name = "uvicorn", specifier = "==0.48.0" },
@@ -3141,14 +3143,14 @@ test = [
 
 [[package]]
 name = "kestrel-sovereign-sdk"
-version = "0.31.1"
+version = "0.32.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/5a/75/7dfbe63432e6fbdd8af90c440cc908f94d59e1420535fad8759998496652/kestrel_sovereign_sdk-0.31.1.tar.gz", hash = "sha256:3ed3badc059be979cc99070b622179b3238570cc0973ec04acd13b050ef55eeb", size = 128936, upload-time = "2026-07-21T15:37:19.654Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/be/4e/0209a82261a8a1daf042035d1d565b7e2684040f5758e34cae40c803ede9/kestrel_sovereign_sdk-0.32.0.tar.gz", hash = "sha256:24b7fa79e66fa85f8d0fe4bb55c6ffb90a3c255ac81e4a052c83ca111c691cfc", size = 141727, upload-time = "2026-07-25T14:40:40.445Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ca/ba/1787ed8d67113c87986abf5d18841565fc6642c70deea6be87bcbe8c92f6/kestrel_sovereign_sdk-0.31.1-py3-none-any.whl", hash = "sha256:aa1948bd68a10dfd96e80a8589c3d2514a9bf12c47b0beef0c317f455c6bc848", size = 161101, upload-time = "2026-07-21T15:37:18.315Z" },
+    { url = "https://files.pythonhosted.org/packages/78/43/1c6db3b73a9313982a882309589b5599f6f683cf44e89b01d7fbe852140e/kestrel_sovereign_sdk-0.32.0-py3-none-any.whl", hash = "sha256:ca8ecef0b9e0760f4f0b771bd89964bf0f3defba48ae56f79d6a3016f7ef7312", size = 174115, upload-time = "2026-07-25T14:40:38.976Z" },
 ]
 
 [package.optional-dependencies]

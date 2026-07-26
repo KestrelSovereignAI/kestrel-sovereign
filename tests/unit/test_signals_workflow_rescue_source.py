@@ -422,7 +422,8 @@ import json
 def test_recurring_schedule_request_shape_defaults():
     req = build_recurring_schedule_request()
     # Maps 1:1 onto SchedulerFeature.schedule_add kwargs.
-    assert set(req) == {"cron_expression", "task_name", "args_json"}
+    assert set(req) == {"cron_expression", "task_name", "args_json", "idempotency_key"}
+    assert req["idempotency_key"] == "workflow:stalled_work_rescue"
     assert req["cron_expression"] == RECURRING_DEFAULT_CRON
     # Runs the schedulable workflows-feature tool, not a bespoke task name.
     assert req["task_name"] == RECURRING_SCHEDULE_TASK_NAME == "workflow_run"

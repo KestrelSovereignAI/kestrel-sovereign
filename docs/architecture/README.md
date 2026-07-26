@@ -65,6 +65,7 @@ Only **Active** and **Design of record** rows belong here.
 | [AGENT_IDENTITY_CONTRACT.md](AGENT_IDENTITY_CONTRACT.md) | **Active** | `kestrel-sovereign`: `kestrel_sovereign/kestrel_agent.py` and `kestrel_sovereign/identity/` | DID identity and the derived `agent_id` compatibility property. |
 | [CONTEXT_SYSTEM_DESIGN.md](CONTEXT_SYSTEM_DESIGN.md) | **Active** | `kestrel-sovereign`: `kestrel_sovereign/agent/context_manager.py`, `kestrel_sovereign/agent/context_builder.py`, `kestrel_sovereign/agent/context_stages.py`, `kestrel_sovereign/agent/token_budget.py`, `kestrel_sovereign/storage/async_conversation_store.py`, `kestrel_sovereign/llm/`, and `kestrel_sovereign/endpoints/agent.py` | Canonical current contract from stored history through budgeting, retrieval, cache-stable pruning, provider transport, and explicitly approximate diagnostics. |
 | [LLM_SERVICE_ARCHITECTURE.md](LLM_SERVICE_ARCHITECTURE.md) | **Active** | `kestrel-sovereign`: `kestrel_sovereign/llm/`; shared adapter types are owned by `kestrel-sovereign-sdk` | Canonical vendor / route / model service and routing contract. |
+| [SCHEDULER_DURABILITY.md](SCHEDULER_DURABILITY.md) | **Active** | `kestrel-sovereign`: `kestrel_sovereign/features/scheduler/` | Durable scheduler claims, protocol rollout fencing, and hosted execution contract. |
 | [FEATURE_CLI_ADAPTERS.md](FEATURE_CLI_ADAPTERS.md) | **Active** | `kestrel-sovereign`: `kestrel_sovereign/features/cli/` | Allowlisted local CLI adapter contract; remote GitHub access is excluded. |
 
 ### LLM substrate

@@ -15,6 +15,7 @@ mistaken for a pip target or a `python -m` module.
 """
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
@@ -22,6 +23,7 @@ import os
 import re
 import shutil
 import subprocess
+from datetime import datetime, timezone
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
@@ -38,6 +40,101 @@ logger = logging.getLogger(__name__)
 # answers health() must not silently kill supervision forever (F013) — treat a
 # probe that exceeds this as unhealthy and fall through to the restart path.
 _HEALTH_PROBE_TIMEOUT = 5.0
+
+# ``ToolExecutionTrigger`` validates identifiers by UTF-8 byte length, not
+# Python character count.  Schedule IDs normally fit unchanged, but legacy
+# imports can contain arbitrarily long IDs while the SDK context permits at
+# most 512 bytes.  Keep the full ID in SchedulerExecution/storage and expose a
+# deterministic, plainly tagged provenance surrogate only at that bounded wire
+# boundary.
+_SDK_CONTEXT_IDENTIFIER_MAX_BYTES = 512
+_SCHEDULE_TRIGGER_SOURCE_HASH_PREFIX = "schedule-sha256:"
+
+
+class SchedulerExecutionContextUnavailable(RuntimeError):
+    """A scheduled isolated call cannot carry its trusted effect identity.
+
+    A normal interactive isolated-tool invocation remains compatible with
+    legacy SDK services.  A scheduler delivery does not: omitting its
+    occurrence identity would let an isolated tool perform an effect without
+    the idempotency key that makes lease recovery safe.
+    """
+
+
+def _scheduler_trigger_source_id(schedule_id: str) -> str:
+    """Return an SDK-safe, stable source ID for a scheduler occurrence.
+
+    The SDK's execution context uses a 512-byte UTF-8 identifier limit.  A
+    migrated schedule can legitimately have a longer database ID, so passing
+    it through would reject an otherwise safe execution *after* it was
+    claimed.  Retain fitting IDs verbatim for compatibility; hash only the
+    oversized representation.  Invalid persisted IDs fail closed rather than
+    being erased or silently replaced.
+    """
+
+    if not isinstance(schedule_id, str) or not schedule_id:
+        raise SchedulerExecutionContextUnavailable(
+            "scheduled occurrence has an invalid schedule_id"
+        )
+    if len(schedule_id.encode("utf-8")) <= _SDK_CONTEXT_IDENTIFIER_MAX_BYTES:
+        return schedule_id
+    digest = hashlib.sha256(schedule_id.encode("utf-8")).hexdigest()
+    return f"{_SCHEDULE_TRIGGER_SOURCE_HASH_PREFIX}{digest}"
+
+
+def _scheduled_tool_execution_context() -> Any | None:
+    """Translate the active scheduler occurrence into the public SDK context.
+
+    Keep this lookup lazy so the core continues to start with the currently
+    published SDK.  Once a scheduled isolated invocation is attempted, the
+    missing SDK contract is a safety failure rather than a reason to smuggle
+    scheduler fields into user-controlled tool arguments.
+    """
+
+    from kestrel_sovereign.features.scheduler.runner import (
+        get_current_scheduler_execution,
+    )
+
+    execution = get_current_scheduler_execution()
+    if execution is None:
+        return None
+
+    try:
+        from kestrel_sdk.isolated_feature import (
+            ToolExecutionContext,
+            ToolExecutionTrigger,
+        )
+    except ImportError as exc:
+        raise SchedulerExecutionContextUnavailable(
+            "scheduled isolated tool calls require an SDK with "
+            "ToolExecutionContext support"
+        ) from exc
+
+    try:
+        scheduled_for = datetime.fromisoformat(
+            execution.scheduled_for.replace("Z", "+00:00")
+        )
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise SchedulerExecutionContextUnavailable(
+            "scheduled occurrence has an invalid scheduled_for timestamp"
+        ) from exc
+    if scheduled_for.tzinfo is None or scheduled_for.utcoffset() is None:
+        raise SchedulerExecutionContextUnavailable(
+            "scheduled occurrence has a timezone-naive scheduled_for timestamp"
+        )
+
+    return ToolExecutionContext(
+        invocation_id=execution.id,
+        idempotency_key=execution.idempotency_key,
+        attempt=execution.attempt,
+        trigger=ToolExecutionTrigger(
+            kind="scheduler",
+            id=execution.id,
+            source_id=_scheduler_trigger_source_id(execution.schedule_id),
+            triggered_at=datetime.now(timezone.utc),
+            scheduled_for=scheduled_for.astimezone(timezone.utc),
+        ),
+    )
 
 
 def _host_sdk_version() -> str:
@@ -452,6 +549,27 @@ class ProxyFeature(Feature):
                 caps = inner_caps
         return caps if isinstance(caps, dict) else {}
 
+    def _supports_tool_execution_context(self, context: Any) -> bool:
+        """Whether the initialized service accepts this SDK context version.
+
+        New SDK clients expose a typed boolean property.  Reading the raw
+        initialize capability as a fallback keeps compatible wrappers usable,
+        while malformed or legacy capability data fails closed for scheduler
+        delivery.
+        """
+
+        supported = getattr(self._client, "supports_tool_execution_context", None)
+        if isinstance(supported, bool):
+            return supported
+
+        capability = self._client_capabilities().get("tool_execution_context")
+        versions = capability.get("versions") if isinstance(capability, dict) else None
+        return (
+            isinstance(versions, list)
+            and not isinstance(getattr(context, "version", None), bool)
+            and getattr(context, "version", None) in versions
+        )
+
     def _register_channel_bridge(self) -> None:
         """If the service advertises a channel capability, register a forwarding
         ``ChannelAdapter`` so the generic channels API works against this
@@ -541,8 +659,23 @@ class ProxyFeature(Feature):
         )
 
     async def call_isolated_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        context = _scheduled_tool_execution_context()
+        if context is not None and not self._supports_tool_execution_context(context):
+            raise SchedulerExecutionContextUnavailable(
+                "scheduled isolated tool calls require a service that advertises "
+                "ToolExecutionContext support"
+            )
         try:
-            result = await _maybe_await(self._client.call_tool(name, args))
+            if context is None:
+                # Preserve the existing wire format for chat/API/legacy calls.
+                result = await _maybe_await(self._client.call_tool(name, args))
+            else:
+                # Context is reserved JSON-RPC metadata.  It must not be merged
+                # into ``args``: those remain entirely user-controlled tool
+                # input, while the isolated SDK authenticates this envelope.
+                result = await _maybe_await(
+                    self._client.call_tool(name, args, context=context)
+                )
             from kestrel_sovereign.features.base import is_flat_toolresult_envelope
             if is_flat_toolresult_envelope(result):
                 # Service returned the flat ToolResult envelope. Pass it through
@@ -565,7 +698,17 @@ class ProxyFeature(Feature):
                 "result": result,
                 "tool": name,
             }
+        except SchedulerExecutionContextUnavailable:
+            raise
         except Exception as exc:  # noqa: BLE001
+            if context is not None:
+                # No scheduler effect may proceed if the negotiated context was
+                # rejected or the context-aware RPC could not be delivered.
+                # Raising lets SchedulerRunner persist a failed occurrence and
+                # retain its stable idempotency key for recovery.
+                raise SchedulerExecutionContextUnavailable(
+                    "scheduled isolated tool call rejected its execution context"
+                ) from exc
             logger.warning("Isolated feature tool %s.%s failed: %s", self.name, name, exc)
             # Transport/RPC failure — emit the flat error envelope so callers
             # and the honesty layer read a top-level ``status: error``.

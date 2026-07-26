@@ -810,6 +810,7 @@ async def test_storage_phase_uses_shared_postgres_pool():
         did="did:test:pg",
         db_backend="postgres",
         pg_pool=pool,
+        database_url="postgresql://scheduler-test/kestrel",
         llm_service=MagicMock(),
     )
     ctx = BootContext()
@@ -828,12 +829,104 @@ async def test_storage_phase_uses_shared_postgres_pool():
         await agent._boot_phase_storage_privacy(ctx)
 
         # The shared pool was adopted (not a fresh DSN connection).
-        MockPGBackend.from_pool.assert_called_once_with(pool)
+        MockPGBackend.from_pool.assert_called_once_with(
+            pool,
+            advisory_dsn="postgresql://scheduler-test/kestrel",
+        )
         _, kwargs = MockStorage.call_args
         assert kwargs.get("backend") is pg_backend
     assert agent._raw_storage is storage
     # Storage teardown was registered for reverse-order rollback.
     assert "storage" in ctx.rollback_labels
+
+
+@pytest.mark.asyncio
+async def test_storage_phase_keeps_pool_recipe_when_database_url_is_ambient(
+    monkeypatch,
+):
+    """An ambient URL must not replace a custom pool's advisory connector."""
+
+    async def custom_connector(*_args, **_kwargs):
+        return None
+
+    ssl_context = object()
+
+    class CustomConnectorPool:
+        _connect_args = ()
+        _connect_kwargs = {"ssl": ssl_context}
+        _connect = staticmethod(custom_connector)
+        _connection_class = object
+        _record_class = object
+
+        def get_max_size(self):
+            return 3
+
+    pool = CustomConnectorPool()
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://ambient/kestrel")
+    agent = KestrelAgent(
+        did="did:test:pg-ambient-url",
+        db_backend="postgres",
+        pg_pool=pool,
+        llm_service=MagicMock(),
+    )
+    ctx = BootContext()
+    with patch("kestrel_sovereign.kestrel_agent.AsyncStorage") as MockStorage:
+        storage = AsyncMock()
+        storage.initialize = AsyncMock()
+        storage.get_node = AsyncMock(return_value=None)
+        storage.db = MagicMock()
+        storage.close = AsyncMock()
+        MockStorage.return_value = storage
+
+        await agent._boot_phase_storage_privacy(ctx)
+
+    backend = MockStorage.call_args.kwargs["backend"]
+    assert agent._database_url == "postgresql://ambient/kestrel"
+    assert backend._advisory_dsn is None
+    assert backend._advisory_connect_args == ()
+    assert backend._advisory_connect_kwargs["connect"] is custom_connector
+    assert backend._advisory_connect_kwargs["ssl"] is ssl_context
+
+
+@pytest.mark.asyncio
+async def test_storage_phase_supports_pool_only_postgres_embedding():
+    """A pool-only embedder retains an independent scheduler gate recipe."""
+
+    class PoolOnlyAsyncpgDouble:
+        _connect_args = ("postgresql://pool-only/kestrel",)
+        _connect_kwargs = {"server_settings": {"application_name": "host"}}
+        _connect = staticmethod(lambda *_args, **_kwargs: None)
+        _connection_class = object
+        _record_class = object
+
+        def get_max_size(self):
+            return 3
+
+    pool = PoolOnlyAsyncpgDouble()
+    agent = KestrelAgent(
+        did="did:test:pg-pool-only",
+        db_backend="postgres",
+        pg_pool=pool,
+        llm_service=MagicMock(),
+    )
+    ctx = BootContext()
+    with patch("kestrel_sovereign.kestrel_agent.AsyncStorage") as MockStorage:
+        storage = AsyncMock()
+        storage.initialize = AsyncMock()
+        storage.get_node = AsyncMock(return_value=None)
+        storage.db = MagicMock()
+        storage.close = AsyncMock()
+        MockStorage.return_value = storage
+
+        await agent._boot_phase_storage_privacy(ctx)
+
+    backend = MockStorage.call_args.kwargs["backend"]
+    assert backend._pool is pool
+    assert backend._advisory_connect_args == ("postgresql://pool-only/kestrel",)
+    assert backend._advisory_connect_kwargs["server_settings"] == {
+        "application_name": "host"
+    }
+    assert backend._advisory_max_pool_size == 3
 
 
 @pytest.mark.asyncio

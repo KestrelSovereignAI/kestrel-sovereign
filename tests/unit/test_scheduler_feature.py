@@ -13,6 +13,7 @@ import json
 import logging
 import pytest
 import pytest_asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -34,9 +35,33 @@ def _make_mock_db():
     db = MagicMock()
     db.execute = AsyncMock()
     db.fetchall = AsyncMock(return_value=[])
-    db.fetchone = AsyncMock(return_value=None)
+
+    async def _fetchone(sql, *args):
+        if "FROM scheduler_protocol_schema" in sql:
+            if "provenance" in sql:
+                return ("fresh-v2", 2)
+            return (2,)
+        if "FROM scheduler_protocol_rollout" in sql:
+            if "activation_nonce" in sql:
+                return (2, "active", None)
+            return (2, "active")
+        # The runner's exact effect-entry fence is deliberately a real
+        # token-guarded read. This generic, storageless double models its
+        # otherwise-valid claimed row while leaving unrelated lookups absent.
+        if (
+            "SELECT 1 FROM scheduled_tasks" in sql
+            and "lease_owner = ?" in sql
+            and "claim_token = ?" in sql
+        ):
+            return (1,)
+        return None
+
+    db.fetchone = AsyncMock(side_effect=_fetchone)
     db.fetchval = AsyncMock(return_value=0)
-    db.table_exists = AsyncMock(return_value=True)
+    # This generic unit double models a newly-created scheduler schema. Tests
+    # that need a legacy table set this explicitly; a preexisting table now
+    # correctly requires the durable rollout acknowledgement.
+    db.table_exists = AsyncMock(return_value=False)
     return db
 
 
@@ -51,6 +76,56 @@ def _make_mock_agent(db=None):
     agent.storage.db = mock_db
 
     return agent
+
+
+def _use_postgres_clock(feature, database_now, *, scheduled_row=None):
+    """Make one feature exercise the concrete DB-clock path in order."""
+
+    events = []
+
+    @asynccontextmanager
+    async def _transaction():
+        events.append("transaction_begin")
+        try:
+            yield
+        finally:
+            events.append("transaction_end")
+
+    async def _fetchone(sql, params=()):
+        if "FROM scheduler_protocol_schema" in sql:
+            events.append("schema_lock")
+            return (2,)
+        if "FROM scheduler_protocol_rollout" in sql:
+            events.append("rollout_lock")
+            return (2, "active")
+        if "SELECT scheduler_protocol_version" in sql:
+            events.append("schedule_lock")
+            return (2, None)
+        if "FROM scheduled_tasks" in sql:
+            events.append("schedule_read")
+            return scheduled_row
+        return None
+
+    async def _fetchval(sql, params=()):
+        events.append("database_clock")
+        assert sql == "SELECT clock_timestamp()"
+        return database_now
+
+    async def _execute(sql, params=()):
+        if "INSERT INTO scheduled_tasks" in sql:
+            events.append("schedule_insert")
+        elif "UPDATE scheduled_tasks" in sql:
+            events.append("schedule_update")
+        elif "UPDATE task_execution_log" in sql:
+            events.append("execution_terminal")
+        return 1
+
+    feature._db.backend_type = "postgres"
+    feature._db.transaction = _transaction
+    feature._db.fetchone = AsyncMock(side_effect=_fetchone)
+    feature._db.fetchval = AsyncMock(side_effect=_fetchval)
+    feature._db.execute = AsyncMock(side_effect=_execute)
+    return events
 
 
 class _StubJobFeature:
@@ -192,6 +267,26 @@ class TestScheduleList:
         bad_ids = {e["task_id"] for e in result.data["load_errors"]}
         assert bad_ids == {"id-2", "id-3"}
 
+    @pytest.mark.asyncio
+    async def test_list_exposes_durable_execution_and_misfire_state(self, feature):
+        feature._db.fetchall = AsyncMock(return_value=[
+            (
+                "deadline-1", "workflow_run", "", "{}", 0, None, None,
+                "2026-07-24T00:00:00+00:00", "one_shot",
+                "2026-07-24T01:00:00+00:00", "UTC", "fire_once", 30,
+                "workflow-deadline", None, None, 2, "success",
+                "2026-07-24T01:00:00+00:00",
+            ),
+        ])
+
+        result = await feature.schedule_list()
+        task = result.data["tasks"][0]
+        assert task["schedule_kind"] == "one_shot"
+        assert task["misfire_policy"] == "fire_once"
+        assert task["idempotency_key"] == "workflow-deadline"
+        assert task["attempt_count"] == 2
+        assert task["terminal_status"] == "success"
+
 
 # =========================================================================
 # post_all_features_loaded — retired-cron cutover cleanup (#1674)
@@ -220,7 +315,7 @@ class TestRetiredCronCleanup:
             ]},
         ))
         f.schedule_remove = AsyncMock(return_value=ToolResult.ok(confirmation="removed"))
-        f.schedule_add = AsyncMock(return_value=ToolResult.ok(
+        f._ensure_builtin_schedule = AsyncMock(return_value=ToolResult.ok(
             confirmation="added", data={"next_run_at": None}))
 
         await f.post_all_features_loaded(agent)
@@ -228,10 +323,14 @@ class TestRetiredCronCleanup:
         # The orphaned built-in was removed by id...
         f.schedule_remove.assert_awaited_once_with("orphan-1")
         # ...and never re-seeded (it's no longer a default).
-        readded = [c.kwargs.get("task_name") for c in f.schedule_add.await_args_list]
+        readded = [
+            c.kwargs.get("task_name")
+            for c in f._ensure_builtin_schedule.await_args_list
+        ]
         assert "cognition_retention" not in readded
-        # An already-present live default is not duplicated.
-        assert "backup_snapshot" not in readded
+        # Existing defaults still take the authoritative transaction path so
+        # a second pending host adopts a first host's registration-owned row.
+        assert "backup_snapshot" in readded
 
     @pytest.mark.asyncio
     async def test_post_load_removes_autoseeded_consolidate_reflect_keeps_custom(self):
@@ -263,7 +362,7 @@ class TestRetiredCronCleanup:
             ]},
         ))
         f.schedule_remove = AsyncMock(return_value=ToolResult.ok(confirmation="removed"))
-        f.schedule_add = AsyncMock(return_value=ToolResult.ok(
+        f._ensure_builtin_schedule = AsyncMock(return_value=ToolResult.ok(
             confirmation="added", data={"next_run_at": None}))
 
         await f.post_all_features_loaded(agent)
@@ -271,7 +370,10 @@ class TestRetiredCronCleanup:
         removed_ids = {c.args[0] for c in f.schedule_remove.await_args_list}
         assert "mc-auto" in removed_ids and "rf-auto" in removed_ids
         assert "mc-custom" not in removed_ids  # user schedule preserved
-        seeded = [c.kwargs.get("task_name") for c in f.schedule_add.await_args_list]
+        seeded = [
+            c.kwargs.get("task_name")
+            for c in f._ensure_builtin_schedule.await_args_list
+        ]
         assert "sleep" in seeded                # the one memory-maintenance cron
         assert "memory_consolidate" not in seeded
         assert "reflect" not in seeded
@@ -282,8 +384,6 @@ class TestSleepCronHandler:
     async def test_handle_sleep_calls_agent_sleep_skip_export(self):
         """The sleep cron handler runs the agent's sleep cycle with
         skip_export=True (backups own DR) and surfaces the report."""
-        from types import SimpleNamespace
-
         class _Report:
             def to_dict(self):
                 return {"success": True, "consolidation": {"episodes_deleted": 2}}
@@ -437,6 +537,111 @@ class TestScheduleAdd:
             args_json='{"threshold": 100}',
         )
         assert result.status is ToolResultStatus.OK
+
+    @pytest.mark.asyncio
+    async def test_add_anchors_first_cron_occurrence_to_database_clock(self, feature):
+        """A skewed API host cannot choose a different first minute than PG."""
+
+        database_now = datetime(2026, 7, 25, 8, 0, 30, tzinfo=timezone.utc)
+        events = _use_postgres_clock(feature, database_now)
+
+        # If schedule_add used the API process wall clock, this would select a
+        # 2040 occurrence instead of 08:01 on the scheduler's database clock.
+        with patch(
+            "kestrel_sovereign.features.scheduler.feature.datetime"
+        ) as host_datetime:
+            host_datetime.now.return_value = datetime(
+                2040, 1, 1, 0, 0, tzinfo=timezone.utc
+            )
+            result = await feature.schedule_add(
+                cron_expression="* * * * *",
+                task_name="memory_consolidate",
+            )
+
+        assert result.status is ToolResultStatus.OK
+        assert result.data["next_run_at"] == "2026-07-25T08:01:00+00:00"
+        assert result.data["created_at"] == database_now.isoformat()
+        assert events == [
+            "transaction_begin",
+            "schema_lock",
+            "rollout_lock",
+            "database_clock",
+            "schedule_insert",
+            "transaction_end",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_add_timezone_aware_cron_persists_policy_and_identity(self, feature):
+        result = await feature.schedule_add(
+            cron_expression="30 9 * * *",
+            task_name="memory_consolidate",
+            timezone_name="America/Chicago",
+            misfire_policy="fire_once",
+            idempotency_key="daily-memory",
+        )
+        assert result.status is ToolResultStatus.OK
+        assert result.data["timezone"] == "America/Chicago"
+        assert result.data["misfire_policy"] == "fire_once"
+        assert result.data["idempotency_key"] == "daily-memory"
+
+    @pytest.mark.asyncio
+    async def test_add_accepts_idempotency_base_at_447_utf8_byte_boundary(self, feature):
+        """447 + ':' + SHA-256 hex exactly fits the SDK's 512-byte cap."""
+
+        ascii_boundary = "a" * 447
+        result = await feature.schedule_add(
+            cron_expression="@daily",
+            task_name="memory_consolidate",
+            idempotency_key=ascii_boundary,
+        )
+
+        assert result.status is ToolResultStatus.OK
+        assert result.data["idempotency_key"] == ascii_boundary
+
+        # A multibyte key with the same UTF-8 byte length is accepted too;
+        # validation is deliberately bytes, not Python character count.
+        multibyte_boundary = ("é" * 223) + "a"  # 446 + 1 bytes
+        result = await feature.schedule_add(
+            cron_expression="@daily",
+            task_name="memory_consolidate",
+            idempotency_key=multibyte_boundary,
+        )
+        assert result.status is ToolResultStatus.OK
+        assert len(result.data["idempotency_key"].encode("utf-8")) == 447
+
+    @pytest.mark.asyncio
+    async def test_add_rejects_idempotency_base_over_447_utf8_bytes(self, feature):
+        for key in ("a" * 448, "é" * 224):
+            result = await feature.schedule_add(
+                cron_expression="@daily",
+                task_name="memory_consolidate",
+                idempotency_key=key,
+            )
+            assert result.status is ToolResultStatus.ERROR
+            assert "at most 447 bytes" in result.error
+        feature._db.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_add_deadline_is_one_shot(self, feature):
+        result = await feature.schedule_add_deadline(
+            run_at="2026-12-01T12:00:00+00:00",
+            task_name="memory_consolidate",
+            idempotency_key="workflow-deadline-9",
+        )
+        assert result.status is ToolResultStatus.OK
+        assert result.data["schedule_kind"] == "one_shot"
+        assert result.data["run_at"] == "2026-12-01T12:00:00+00:00"
+        assert result.data["idempotency_key"] == "workflow-deadline-9"
+
+    @pytest.mark.asyncio
+    async def test_add_rejects_unknown_iana_timezone(self, feature):
+        result = await feature.schedule_add(
+            cron_expression="@daily",
+            task_name="memory_consolidate",
+            timezone_name="Mars/Olympus_Mons",
+        )
+        assert result.status is ToolResultStatus.ERROR
+        assert "timezone" in result.error.lower()
 
     @pytest.mark.asyncio
     async def test_add_invalid_cron(self, feature):
@@ -678,6 +883,27 @@ class TestScheduleRemove:
         assert result.data["status"] == "removed"
 
     @pytest.mark.asyncio
+    async def test_remove_locks_schedule_before_execution_log(self, feature):
+        """Match runner finalization's schedule-row-then-log lock order."""
+        feature._db.fetchone = AsyncMock(return_value=("task-id",))
+
+        result = await feature.schedule_remove(task_id="task-id")
+
+        assert result.status is ToolResultStatus.OK
+        statements = [call.args[0] for call in feature._db.execute.await_args_list]
+        schedule_mutation = next(
+            index
+            for index, statement in enumerate(statements)
+            if "DELETE FROM scheduled_tasks" in statement
+        )
+        log_terminalization = next(
+            index
+            for index, statement in enumerate(statements)
+            if "UPDATE task_execution_log" in statement
+        )
+        assert schedule_mutation < log_terminalization
+
+    @pytest.mark.asyncio
     async def test_remove_not_found(self, feature):
         feature._db.fetchone = AsyncMock(return_value=None)
         result = await feature.schedule_remove(task_id="nonexistent")
@@ -741,6 +967,39 @@ class TestScheduleResume:
         assert result.data["status"] == "already_running"
 
     @pytest.mark.asyncio
+    async def test_resume_reanchors_cron_occurrence_to_database_clock(self, feature):
+        """A resumed schedule must use the runner's clock, not host time."""
+
+        database_now = datetime(2026, 7, 25, 8, 0, 30, tzinfo=timezone.utc)
+        events = _use_postgres_clock(
+            feature,
+            database_now,
+            scheduled_row=(
+                "task-id", 0, "* * * * *", "cron", None, "UTC", None, 0, 0,
+            ),
+        )
+
+        with patch(
+            "kestrel_sovereign.features.scheduler.feature.datetime"
+        ) as host_datetime:
+            host_datetime.now.return_value = datetime(
+                2040, 1, 1, 0, 0, tzinfo=timezone.utc
+            )
+            result = await feature.schedule_resume(task_id="task-id")
+
+        assert result.status is ToolResultStatus.OK
+        assert result.data["next_run_at"] == "2026-07-25T08:01:00+00:00"
+        assert events[:6] == [
+            "transaction_begin",
+            "schema_lock",
+            "rollout_lock",
+            "schedule_lock",
+            "schedule_read",
+            "database_clock",
+        ]
+        assert events[-1] == "transaction_end"
+
+    @pytest.mark.asyncio
     async def test_resume_not_found(self, feature):
         feature._db.fetchone = AsyncMock(return_value=None)
         result = await feature.schedule_resume(task_id="nonexistent")
@@ -778,7 +1037,7 @@ class TestScheduleHistory:
 
     @pytest.mark.asyncio
     async def test_history_respects_limit(self, feature):
-        result = await feature.schedule_history(limit=5)
+        await feature.schedule_history(limit=5)
         # Verify the limit was passed to the DB query
         call_args = feature._db.fetchall.call_args
         assert call_args[0][1][1] == 5  # second positional param tuple
@@ -808,25 +1067,49 @@ class TestSchedulerRunner:
 
     @pytest.mark.asyncio
     async def test_ensure_tables_is_idempotent_when_column_exists(self):
-        """ALTER TABLE ADD COLUMN fails if the column already exists — that
-        specific error must be swallowed so re-running _ensure_tables stays safe."""
+        """PostgreSQL migrations use native duplicate-safe DDL.
+
+        Catching a duplicate-column error is not safe here: PostgreSQL marks
+        the caller's transaction failed before Python could catch it.
+        """
         db = _make_mock_db()
+        db.backend_type = "postgres"
 
         async def _exec(sql, *args):
             if "ALTER TABLE" in sql:
-                raise Exception("duplicate column name: outcome_signal")
+                assert "ADD COLUMN IF NOT EXISTS" in sql
 
         db.execute = AsyncMock(side_effect=_exec)
         executor = AsyncMock(return_value="ok")
         runner = SchedulerRunner(db, "test-agent", executor)
-        # Must not raise even though ALTER fails with duplicate-column
         await runner._ensure_tables()
+
+    @pytest.mark.asyncio
+    async def test_ensure_tables_skips_existing_sqlite_columns_before_alter(self):
+        """SQLite checks pragma metadata instead of relying on ALTER errors."""
+        db = _make_mock_db()
+        db.backend_type = "sqlite"
+
+        async def _fetchone(sql, *args):
+            if "pragma_table_info" in sql:
+                return (1,)
+            return None
+
+        db.fetchone = AsyncMock(side_effect=_fetchone)
+        runner = SchedulerRunner(db, "test-agent", AsyncMock(return_value="ok"))
+
+        await runner._ensure_tables()
+
+        assert not any(
+            "ALTER TABLE" in call.args[0] for call in db.execute.call_args_list
+        )
 
     @pytest.mark.asyncio
     async def test_ensure_tables_reraises_unexpected_migration_error(self):
         """The migration must NOT swallow non-duplicate errors — a locked DB,
         permission failure, or schema corruption must surface."""
         db = _make_mock_db()
+        db.backend_type = "sqlite"
 
         async def _exec(sql, *args):
             if "ALTER TABLE" in sql:
@@ -961,17 +1244,18 @@ class TestSchedulerRunner:
         runner = SchedulerRunner(db, "test-agent", executor)
         await runner._tick()
 
-        # Should have recorded execution (INSERT into task_execution_log)
-        # and updated the task (UPDATE scheduled_tasks)
+        # A durable scheduler first claims the row, records a ``claimed``
+        # execution identity, and only then commits the terminal outcome.
         execute_calls = db.execute.call_args_list
-        assert len(execute_calls) >= 2  # INSERT + UPDATE
-
-        # Check the INSERT call
-        insert_call = execute_calls[0]
-        assert "task_execution_log" in insert_call[0][0]
-        insert_params = insert_call[0][1]
-        assert insert_params[1] == "task-1"  # task_id
-        assert insert_params[3] == "success"  # status
+        claim_call = next(c for c in execute_calls if "INSERT INTO task_execution_log" in c[0][0])
+        claim_params = claim_call[0][1]
+        assert claim_params[1] == "task-1"  # task_id
+        assert "'claimed'" in claim_call[0][0]
+        outcome_call = next(
+            c for c in execute_calls
+            if "UPDATE task_execution_log" in c[0][0]
+        )
+        assert outcome_call[0][1][0] == "success"
 
     @pytest.mark.asyncio
     async def test_tick_records_failure(self):
@@ -985,10 +1269,12 @@ class TestSchedulerRunner:
         runner = SchedulerRunner(db, "test-agent", executor)
         await runner._tick()
 
-        # Should record "failed" status
-        insert_call = db.execute.call_args_list[0]
-        insert_params = insert_call[0][1]
-        assert insert_params[3] == "failed"
+        # The durable log starts claimed then transitions to failed via CAS.
+        outcome_call = next(
+            c for c in db.execute.call_args_list
+            if "UPDATE task_execution_log" in c[0][0]
+        )
+        assert outcome_call[0][1][0] == "failed"
 
     @pytest.mark.asyncio
     async def test_tick_records_blocked_reason_and_pauses_schedule(self):
@@ -1009,17 +1295,33 @@ class TestSchedulerRunner:
 
         await runner._tick()
 
-        insert_call = db.execute.call_args_list[0]
-        insert_params = insert_call[0][1]
-        assert insert_params[3] == "blocked"
-        assert "headless scheduler" in insert_params[4]
-        assert "Schedule id: restart-task" in insert_params[4]
-        assert "resume the schedule" in insert_params[4]
+        outcome_call = next(
+            c for c in db.execute.call_args_list
+            if "UPDATE task_execution_log" in c[0][0]
+        )
+        outcome_params = outcome_call[0][1]
+        assert outcome_params[0] == "blocked"
+        assert "headless scheduler" in outcome_params[1]
+        assert "Schedule id: restart-task" in outcome_params[1]
+        assert "resume the schedule" in outcome_params[1]
 
-        pause_call = db.execute.call_args_list[1]
-        assert "SET enabled = 0" in pause_call[0][0]
-        assert pause_call[0][1][1] == "restart-task"
-        db.fetchone.assert_not_awaited()
+        pause_call = next(
+            c for c in db.execute.call_args_list
+            if "UPDATE scheduled_tasks" in c[0][0] and "terminal_status" in c[0][0]
+        )
+        assert "enabled = ?" in pause_call[0][0]
+        # Protocol/lease CAS parameters intentionally evolve; assert the
+        # schedule identity semantically rather than a brittle SQL offset.
+        assert "restart-task" in pause_call[0][1]
+        # A successful CAS rereads the authoritative claim metadata, then the
+        # final effect-entry guard verifies the exact live token.
+        reads = [call.args[0] for call in db.fetchone.call_args_list]
+        assert any("SELECT claim_execution_id" in sql for sql in reads)
+        assert any(
+            "SELECT 1 FROM scheduled_tasks" in sql
+            and "claim_token = ?" in sql
+            for sql in reads
+        )
 
     @pytest.mark.asyncio
     async def test_blocked_schedule_is_durable_and_not_retried(self, tmp_path):
@@ -1043,8 +1345,9 @@ class TestSchedulerRunner:
                 """
                 INSERT INTO scheduled_tasks
                     (id, agent_id, task_name, cron_expression, args_json,
-                     enabled, next_run_at, created_at)
-                VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                     enabled, next_run_at, created_at,
+                     scheduler_protocol_version)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?, 2)
                 """,
                 (
                     "restart-task",
@@ -1099,9 +1402,12 @@ class TestSchedulerRunner:
         runner = SchedulerRunner(db, "test-agent", executor)
         await runner._tick()
 
-        # Check the UPDATE call
-        update_call = db.execute.call_args_list[1]
-        assert "UPDATE scheduled_tasks" in update_call[0][0]
+        # Locate the claim-CAS completion update (the first writes are claim
+        # metadata and the durable ``claimed`` execution log).
+        update_call = next(
+            c for c in db.execute.call_args_list
+            if "UPDATE scheduled_tasks" in c[0][0] and "terminal_status" in c[0][0]
+        )
         update_params = update_call[0][1]
         # next_run_at should be set (not None)
         assert update_params[1] is not None  # next_run_at
@@ -1165,8 +1471,9 @@ class TestSchedulerRunner:
                 """
                 INSERT INTO scheduled_tasks
                     (id, agent_id, task_name, cron_expression, args_json,
-                     enabled, next_run_at, created_at)
-                VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                     enabled, next_run_at, created_at,
+                     scheduler_protocol_version)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?, 2)
                 """,
                 (
                     "job-task", agent.did, "job", "* * * * *", "{}",
@@ -1262,6 +1569,48 @@ class TestSchedulerInit:
         feature._runner.stop = AsyncMock()
         await feature.shutdown()
         feature._runner.stop.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_initialize_prepares_but_agent_ready_arms_polling(self):
+        agent = _make_mock_agent()
+        agent.did = agent.agent_id
+        scheduler = SchedulerFeature(agent)
+        with (
+            patch.object(
+                SchedulerRunner,
+                "start",
+                new_callable=AsyncMock,
+            ) as prepare,
+            patch.object(
+                SchedulerRunner,
+                "arm",
+                new_callable=AsyncMock,
+            ) as arm,
+        ):
+            await scheduler.initialize()
+            prepare.assert_awaited_once_with(polling=False)
+            arm.assert_not_awaited()
+
+            await scheduler.on_agent_ready(agent)
+            arm.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_host_managed_postgres_agent_never_creates_scoped_runner(self):
+        agent = _make_mock_agent()
+        agent.did = agent.agent_id
+        agent._scheduler_polling_managed_by_host = True
+        scheduler = SchedulerFeature(agent)
+        with patch.object(
+            SchedulerRunner,
+            "start",
+            new_callable=AsyncMock,
+        ) as start:
+            await scheduler.initialize()
+            await scheduler.on_agent_ready(agent)
+
+        assert scheduler._polling_managed_by_host is True
+        assert scheduler._runner is None
+        start.assert_not_awaited()
 
 
 # =========================================================================
@@ -1600,8 +1949,95 @@ class TestScheduleUpdate:
         )
         assert result.status is ToolResultStatus.OK
         assert result.data["status"] == "unchanged"
-        # Must not UPDATE when nothing changed
-        feature._db.execute.assert_not_called()
+        # The durable rollout control row is locked before the in-transaction
+        # read, but an unchanged definition must not write scheduled_tasks.
+        assert all(
+            "UPDATE scheduled_tasks" not in call.args[0]
+            for call in feature._db.execute.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_reanchors_cron_occurrence_to_database_clock(self, feature):
+        """Changing cadence cannot create a host-clock-skewed next run."""
+
+        database_now = datetime(2026, 7, 25, 8, 0, 30, tzinfo=timezone.utc)
+        events = _use_postgres_clock(
+            feature,
+            database_now,
+            scheduled_row=("@daily", 1, "cron", "UTC", 0, 0),
+        )
+
+        with patch(
+            "kestrel_sovereign.features.scheduler.feature.datetime"
+        ) as host_datetime:
+            host_datetime.now.return_value = datetime(
+                2040, 1, 1, 0, 0, tzinfo=timezone.utc
+            )
+            result = await feature.schedule_update(
+                task_id="task-id",
+                cron_expression="* * * * *",
+            )
+
+        assert result.status is ToolResultStatus.OK
+        assert result.data["next_run_at"] == "2026-07-25T08:01:00+00:00"
+        assert events[:6] == [
+            "transaction_begin",
+            "schema_lock",
+            "rollout_lock",
+            "schedule_lock",
+            "schedule_read",
+            "database_clock",
+        ]
+        assert events[-1] == "transaction_end"
+
+    @pytest.mark.asyncio
+    async def test_update_terminalizes_claim_with_database_clock_after_schedule_write(
+        self, feature
+    ):
+        """Superseding a claim must not publish a skewed API-host audit time."""
+
+        database_now = datetime(2026, 7, 25, 8, 0, 30, tzinfo=timezone.utc)
+        events = _use_postgres_clock(
+            feature,
+            database_now,
+            scheduled_row=("@daily", 1, "cron", "UTC", 0, 0),
+        )
+
+        with patch(
+            "kestrel_sovereign.features.scheduler.feature.datetime"
+        ) as host_datetime:
+            host_datetime.now.return_value = datetime(
+                2040, 1, 1, 0, 0, tzinfo=timezone.utc
+            )
+            result = await feature.schedule_update(
+                task_id="task-id",
+                cron_expression="* * * * *",
+            )
+
+        assert result.status is ToolResultStatus.OK
+        terminal_call = next(
+            call
+            for call in feature._db.execute.call_args_list
+            if "UPDATE task_execution_log" in call.args[0]
+        )
+        assert "clock_timestamp()" in terminal_call.args[0]
+        assert terminal_call.args[1] == (
+            "superseded",
+            "schedule definition updated before outcome commit",
+            "task-id",
+            feature._agent_id,
+        )
+        assert events == [
+            "transaction_begin",
+            "schema_lock",
+            "rollout_lock",
+            "schedule_lock",
+            "schedule_read",
+            "database_clock",
+            "schedule_update",
+            "execution_terminal",
+            "transaction_end",
+        ]
 
     @pytest.mark.asyncio
     async def test_update_invalid_cron(self, feature):
@@ -1768,10 +2204,12 @@ class TestRunnerOutcomeSignal:
         runner = SchedulerRunner(db, "test-agent", executor)
         await runner._tick()
 
-        insert_call = db.execute.call_args_list[0]
-        insert_params = insert_call[0][1]
-        # outcome_signal is the 8th positional arg in the INSERT
-        assert insert_params[7] == 0.75
+        outcome_call = next(
+            c for c in db.execute.call_args_list
+            if "UPDATE task_execution_log" in c[0][0]
+        )
+        # outcome_signal is committed with the terminal CAS outcome.
+        assert outcome_call[0][1][4] == 0.75
 
     @pytest.mark.asyncio
     async def test_plain_string_return_has_null_signal(self):
@@ -1786,8 +2224,8 @@ class TestRunnerOutcomeSignal:
         runner = SchedulerRunner(db, "test-agent", executor)
         await runner._tick()
 
-        insert_params = db.execute.call_args_list[0][0][1]
-        assert insert_params[7] is None
+        outcome_call = next(c for c in db.execute.call_args_list if "UPDATE task_execution_log" in c[0][0])
+        assert outcome_call[0][1][4] is None
 
     @pytest.mark.asyncio
     async def test_non_numeric_tuple_signal_is_dropped(self):
@@ -1803,8 +2241,8 @@ class TestRunnerOutcomeSignal:
         runner = SchedulerRunner(db, "test-agent", executor)
         await runner._tick()
 
-        insert_params = db.execute.call_args_list[0][0][1]
-        assert insert_params[7] is None
+        outcome_call = next(c for c in db.execute.call_args_list if "UPDATE task_execution_log" in c[0][0])
+        assert outcome_call[0][1][4] is None
 
     @pytest.mark.asyncio
     async def test_tuple_signal_is_clamped(self):
@@ -1820,8 +2258,8 @@ class TestRunnerOutcomeSignal:
         runner = SchedulerRunner(db, "test-agent", executor)
         await runner._tick()
 
-        insert_params = db.execute.call_args_list[0][0][1]
-        assert insert_params[7] == 1.0
+        outcome_call = next(c for c in db.execute.call_args_list if "UPDATE task_execution_log" in c[0][0])
+        assert outcome_call[0][1][4] == 1.0
 
 
 class TestRunnerCronReload:
@@ -1862,55 +2300,47 @@ class TestRunnerCronReload:
         )
 
     @pytest.mark.asyncio
-    async def test_paused_mid_flight_does_not_reschedule(self):
-        """If schedule_pause runs while the task is executing, the runner
-        must NOT set a new next_run_at — that would silently undo the pause."""
+    async def test_completion_is_guarded_by_claim_token(self):
+        """A pause/update clears the claim token, so an old worker's final
+        write has a CAS guard instead of being able to resurrect the schedule."""
         db = _make_mock_db()
         now_iso = datetime.now(timezone.utc).isoformat()
         db.fetchall = AsyncMock(return_value=[
             ("task-1", "test-agent", "test_task", "@daily", "{}",
              1, None, now_iso, "2026-03-04T00:00:00"),
         ])
-        # Re-fetch shows enabled=0 — pause happened between SELECT and recompute.
-        db.fetchone = AsyncMock(return_value=("@daily", 0))
         executor = AsyncMock(return_value="ok")
         runner = SchedulerRunner(db, "test-agent", executor)
         await runner._tick()
 
-        # The UPDATE must only touch last_run_at, not next_run_at.
-        update_calls = [
+        completion = next(
             c for c in db.execute.call_args_list
-            if "UPDATE scheduled_tasks" in c[0][0]
-        ]
-        assert len(update_calls) == 1
-        assert "next_run_at" not in update_calls[0][0][0]
-        # Only last_run_at + task id should be in params
-        assert len(update_calls[0][0][1]) == 2
+            if "UPDATE scheduled_tasks" in c[0][0] and "terminal_status" in c[0][0]
+        )
+        assert "claim_token = ?" in completion[0][0]
+        assert "claim_execution_id = ?" in completion[0][0]
 
     @pytest.mark.asyncio
-    async def test_deleted_mid_flight_does_not_crash(self):
-        """If the task row was deleted mid-execution, only last_run_at gets
-        written (for the audit trail); no next_run_at resurrection."""
+    async def test_deleted_before_effect_entry_does_not_execute(self):
+        """A vanished claim loses the final token/live admission check."""
         db = _make_mock_db()
         now_iso = datetime.now(timezone.utc).isoformat()
         db.fetchall = AsyncMock(return_value=[
             ("task-1", "test-agent", "test_task", "@daily", "{}",
              1, None, now_iso, "2026-03-04T00:00:00"),
         ])
+        # The claim was selected and recorded, but an administrative delete
+        # wins before the exact effect-entry read.
         db.fetchone = AsyncMock(return_value=None)
         executor = AsyncMock(return_value="ok")
         runner = SchedulerRunner(db, "test-agent", executor)
-        # Must not raise
         await runner._tick()
 
-        update_calls = [
-            c for c in db.execute.call_args_list
-            if "UPDATE scheduled_tasks" in c[0][0]
-        ]
-        # Either no UPDATE (row gone, DELETE will fail with no-op) or
-        # last_run_at only. Current code takes the last_run_at-only path.
-        if update_calls:
-            assert "next_run_at" not in update_calls[0][0][0]
+        executor.assert_not_awaited()
+        assert not any(
+            "UPDATE task_execution_log" in call.args[0]
+            for call in db.execute.call_args_list
+        )
 
 
 # =========================================================================

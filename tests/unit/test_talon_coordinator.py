@@ -1797,6 +1797,7 @@ class TestTalonScheduleWorkRescue:
         kwargs = scheduler.schedule_add.await_args.kwargs
         assert kwargs["task_name"] == "workflow_run"
         assert kwargs["cron_expression"] == "0 */6 * * *"
+        assert kwargs["idempotency_key"] == "workflow:stalled_work_rescue"
         args = json.loads(kwargs["args_json"])
         assert args["name"] == "stalled_work_rescue"
         # Observation-only: never a pre-seeded target or standing approval.

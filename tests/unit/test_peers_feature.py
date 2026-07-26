@@ -276,6 +276,28 @@ async def test_send_a2a_message_fire_and_forget():
 
 
 @pytest.mark.asyncio
+async def test_unsigned_a2a_uses_live_display_name_after_volatile_rename():
+    """Legacy sender metadata follows the same live name as the agent card."""
+    feature = _make_a2a_feature("before-rename")
+    feature.agent._agent_name = "after-rename"
+    feature.agent.resolve_effective_name = lambda *, default=None: (
+        feature.agent._agent_name or default
+    )
+    client = _async_client_with(post_resp=_mock_post_response(task_id="renamed"))
+
+    with patch(
+        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
+        return_value=client,
+    ):
+        result = await feature.send_a2a_message("meridian", "hello after rename")
+
+    assert result.status is ToolResultStatus.OK
+    assert client.post.call_args.kwargs["json"]["metadata"]["sender"] == (
+        "after-rename"
+    )
+
+
+@pytest.mark.asyncio
 async def test_send_a2a_message_rejects_self_target():
     feature = _make_a2a_feature("emma")
     client = _async_client_with()

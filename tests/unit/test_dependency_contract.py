@@ -47,10 +47,42 @@ SECURITY_FLOORS = {
     "web3": "7.15.0",
 }
 
+# Durable scheduler dispatch requires the 0.32 execution-context wire
+# contract.  This is intentionally a Core-only release gate: sibling packages
+# are released from their own repositories, but Core must never silently lower
+# its declared/locked line to accommodate an older Frinz or observability
+# constraint.  Their compatible releases remain a documented release-cascade
+# prerequisite in README.md.
+SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.32.0"), ("<", "0.33")})
+SDK_RELEASE_CASCADE_CONTRACTS = {
+    "base": frozenset({"tracing"}),
+    "observability": frozenset({"metrics", "tracing"}),
+}
+SDK_RELEASE_CASCADE_DOWNSTREAM_REQUIREMENTS = {
+    # These are release prerequisites, not declarations about sibling repos'
+    # current branches. Each downstream must publish/test this line before a
+    # Core release can be cut.
+    "frinz": ">=0.32.0,<0.33",
+    "observability fleet": ">=0.32.0,<0.33",
+}
+
 
 def _pyproject() -> dict:
     with open(REPO_ROOT / "pyproject.toml", "rb") as f:
         return tomllib.load(f)
+
+
+def _lock() -> dict:
+    with open(REPO_ROOT / "uv.lock", "rb") as f:
+        return tomllib.load(f)
+
+
+def _locked_root_package(lock: dict) -> dict:
+    return next(
+        package
+        for package in lock["package"]
+        if package["name"] == "kestrel-sovereign" and package.get("source") == {"editable": "."}
+    )
 
 
 def _declared_dependency_lines(pyproject: dict):
@@ -89,8 +121,7 @@ def test_banned_packages_not_declared():
 
 
 def test_banned_packages_not_locked():
-    with open(REPO_ROOT / "uv.lock", "rb") as f:
-        lock = tomllib.load(f)
+    lock = _lock()
     locked = {pkg["name"].lower() for pkg in lock.get("package", [])}
     offenders = sorted(locked & {b.lower() for b in BANNED_PACKAGES})
     assert not offenders, (
@@ -125,8 +156,7 @@ def test_security_floors_are_declared():
 
 
 def test_security_floors_are_locked():
-    with open(REPO_ROOT / "uv.lock", "rb") as f:
-        lock = tomllib.load(f)
+    lock = _lock()
 
     locked = {}
     for package in lock.get("package", []):
@@ -141,3 +171,110 @@ def test_security_floors_are_locked():
         assert all(version >= floor for version in versions), (
             f"uv.lock contains {package} below {floor}: {versions}"
         )
+
+
+def test_windows_tzdata_is_a_direct_base_dependency_and_is_locked():
+    """Windows IANA scheduling cannot depend on optional Pandas/Phoenix trees."""
+
+    direct = [
+        Requirement(raw)
+        for raw in _pyproject()["project"]["dependencies"]
+        if canonicalize_name(Requirement(raw).name) == "tzdata"
+    ]
+    assert len(direct) == 1
+    marker = direct[0].marker
+    assert marker is not None
+    assert marker.evaluate({"sys_platform": "win32"})
+    assert not marker.evaluate({"sys_platform": "linux"})
+
+    root = _locked_root_package(_lock())
+    locked_direct = [
+        dependency
+        for dependency in root["dependencies"]
+        if dependency["name"] == "tzdata"
+    ]
+    assert locked_direct == [
+        {"name": "tzdata", "marker": "sys_platform == 'win32'"}
+    ]
+
+    locked_metadata = [
+        requirement
+        for requirement in root["metadata"]["requires-dist"]
+        if requirement["name"] == "tzdata"
+    ]
+    assert locked_metadata == locked_direct
+    assert any(package["name"] == "tzdata" for package in _lock()["package"])
+
+
+def _sdk_contract_requirement(raw_requirements, *, extras):
+    requirements = [
+        Requirement(raw)
+        for raw in raw_requirements
+        if canonicalize_name(Requirement(raw).name)
+        == canonicalize_name("kestrel-sovereign-sdk")
+    ]
+    assert len(requirements) == 1
+    requirement = requirements[0]
+    assert requirement.extras == extras
+    assert {
+        (specifier.operator, specifier.version)
+        for specifier in requirement.specifier
+    } == SDK_RELEASE_CASCADE_SPECIFIERS
+    return requirement
+
+
+def test_sdk_032_release_cascade_contract_is_declared_and_locked():
+    """Core and its observability extra must share the v0.32 SDK line.
+
+    This deliberately does not inspect sibling worktrees: their compatible
+    Frinz/observability releases are an external release prerequisite, while
+    this repository can reliably guard only its own published constraints and
+    resolved lock graph.
+    """
+
+    pyproject = _pyproject()
+    _sdk_contract_requirement(
+        pyproject["project"]["dependencies"],
+        extras=SDK_RELEASE_CASCADE_CONTRACTS["base"],
+    )
+    _sdk_contract_requirement(
+        pyproject["project"]["optional-dependencies"]["observability"],
+        extras=SDK_RELEASE_CASCADE_CONTRACTS["observability"],
+    )
+
+    root = _locked_root_package(_lock())
+    locked_contracts = {
+        (
+            frozenset(requirement.get("extras", [])),
+            requirement.get("marker"),
+            requirement.get("specifier"),
+        )
+        for requirement in root["metadata"]["requires-dist"]
+        if requirement["name"] == "kestrel-sovereign-sdk"
+    }
+    assert locked_contracts == {
+        (SDK_RELEASE_CASCADE_CONTRACTS["base"], None, ">=0.32.0,<0.33"),
+        (
+            SDK_RELEASE_CASCADE_CONTRACTS["observability"],
+            "extra == 'observability'",
+            ">=0.32.0,<0.33",
+        ),
+    }
+
+    sdk_versions = [
+        Version(package["version"])
+        for package in _lock()["package"]
+        if package["name"] == "kestrel-sovereign-sdk"
+    ]
+    assert sdk_versions
+    assert all(
+        Version("0.32.0") <= version < Version("0.33.0")
+        for version in sdk_versions
+    )
+
+    # The human release contract identifies downstream gates without probing
+    # their (possibly dirty or unavailable) repositories from Core CI.
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8").casefold()
+    for downstream, specifier in SDK_RELEASE_CASCADE_DOWNSTREAM_REQUIREMENTS.items():
+        assert downstream in readme
+        assert f"kestrel-sovereign-sdk{specifier}" in readme

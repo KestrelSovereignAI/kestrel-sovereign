@@ -533,6 +533,10 @@ class KestrelAgent(
             privacy_mode: Privacy mode for this session.
             pg_pool: Optional PostgreSQL pool for feedback feature.
             database_url: PostgreSQL connection string (for postgres backend).
+                With ``pg_pool``, an explicitly supplied value also configures
+                the separate scheduler advisory-lock pool.  An ambient
+                ``KESTREL_DATABASE_URL`` does not replace the connection recipe
+                copied from the supplied pool.
             db_backend: Database backend type ('sqlite' or 'postgres').
                        Defaults to KESTREL_DB_BACKEND env var or 'sqlite'.
             allowed_features: Optional set of feature class names to load.
@@ -781,6 +785,14 @@ class KestrelAgent(
         # Determine database backend
         self._db_backend = db_backend or os.environ.get("KESTREL_DB_BACKEND", "sqlite")
         self._database_url = database_url or os.environ.get("KESTREL_DATABASE_URL")
+        # ``_database_url`` is deliberately the resolved storage setting, but
+        # a shared pool has an independent advisory-lock pool.  Preserve the
+        # constructor provenance so an ambient URL cannot discard a custom
+        # connector, SSL context, or other connection recipe copied from that
+        # pool.  A non-empty explicit ``database_url`` remains the backwards-
+        # compatible override for callers that intentionally configure the
+        # scheduler pool independently.
+        self._explicit_advisory_dsn = database_url or None
 
         # Storage will be initialized asynchronously.
         #
@@ -1455,7 +1467,15 @@ class KestrelAgent(
             # PostgreSQL backend - reuse shared pool if available
             if self.pg_pool:
                 from kestrel_sovereign.storage.db.postgres import PostgresBackend
-                pg_backend = PostgresBackend.from_pool(self.pg_pool)
+                # A PostgreSQL scheduler effect holds a session advisory gate
+                # across target execution. Its bounded dedicated pool needs the
+                # same DSN, never the shared operational pool, or a waiting
+                # fence could consume the connection required for renewal/final
+                # CAS. A missing DSN fails clearly at the first scheduler gate.
+                pg_backend = PostgresBackend.from_pool(
+                    self.pg_pool,
+                    advisory_dsn=self._explicit_advisory_dsn,
+                )
                 self._raw_storage = AsyncStorage(
                     backend=pg_backend,
                     agent_id=self.did,

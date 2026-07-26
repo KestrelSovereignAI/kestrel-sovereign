@@ -527,7 +527,8 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
-| `schedule_add` | `!schedule add` | `utility` | `cron_expression`, `task_name`, `args_json` | 125 | `enabled` |
+| `schedule_add` | `!schedule add` | `utility` | `cron_expression`, `task_name`, `args_json`, `timezone_name`, `misfire_policy`, `misfire_grace_seconds`, `idempotency_key` | 320 | `enabled` |
+| `schedule_add_deadline` | `!schedule deadline` | `utility` | `run_at`, `task_name`, `args_json`, `misfire_policy`, `misfire_grace_seconds`, `idempotency_key` | 141 | `enabled` |
 | `schedule_engagement` | `!schedule engagement` | `utility` | `days` | 55 | `enabled` |
 | `schedule_history` | `!schedule history` | `utility` | `limit` | 55 | `enabled` |
 | `schedule_list` | `!schedule list` | `utility` |  | 19 | `enabled` |
@@ -535,7 +536,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `schedule_record_outcome` | `!schedule outcome` | `utility` | `execution_id`, `signal` | 79 | `enabled` |
 | `schedule_remove` | `!schedule remove` | `utility` | `task_id` | 42 | `enabled` |
 | `schedule_resume` | `!schedule resume` | `utility` | `task_id` | 42 | `enabled` |
-| `schedule_update` | `!schedule update` | `utility` | `task_id`, `cron_expression` | 79 | `enabled` |
+| `schedule_update` | `!schedule update` | `utility` | `task_id`, `cron_expression`, `timezone_name` | 119 | `enabled` |
 
 ### `security` (SecurityFeature)
 
@@ -1053,7 +1054,8 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!save excerpt` | `save` | `<target> <name> [summary] [tags]` | Save conversation messages for later retrieval. Use this to preserve important discussions, decisions, or information. The target selects which messages: 'last_N' (e.g. last_10) for the most recent N messages, or 'ids:1,2,3' for specific message ids. |
 | `!save item` | `save` | `<name> <content> [item_type] [summary] [tags] [schema_id]` | Save arbitrary content (text, JSON) for later retrieval. Good for recipes, notes, decisions, and other content you want to recall. item_type must be one of: stash, file, excerpt, structured (default: structured) — do NOT invent your own type or the item becomes unfindable via recall. To finely type a 'structured' item (recipe, user_story, etc.) pass schema_id, not a custom item_type. |
 | `!save stash` | `save` | `[stash_id] [name] [summary] [tags]` | Save a stash to long-term storage for later retrieval. The stash content gets an embedding so you can find it later with semantic search. |
-| `!schedule add` | `scheduler` | `<cron_expression> <task_name> [args_json]` | Add a new scheduled task with a cron expression |
+| `!schedule add` | `scheduler` | `<cron_expression> <task_name> [args_json] [timezone_name] [misfire_policy] [misfire_grace_seconds] [idempotency_key]` | Add a new scheduled task with a cron expression |
+| `!schedule deadline` | `scheduler` | `<run_at> <task_name> [args_json] [misfire_policy] [misfire_grace_seconds] [idempotency_key]` | Add a one-shot scheduled task that fires at an absolute deadline |
 | `!schedule engagement` | `scheduler` | `[days]` | Report aggregate engagement scores per scheduled task |
 | `!schedule history` | `scheduler` | `[limit]` | Show recent task execution history |
 | `!schedule list` | `scheduler` |  | List all scheduled tasks for this agent |
@@ -1061,7 +1063,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!schedule pause` | `scheduler` | `<task_id>` | Pause a scheduled task (stops it from running until resumed) |
 | `!schedule remove` | `scheduler` | `<task_id>` | Remove a scheduled task by ID |
 | `!schedule resume` | `scheduler` | `<task_id>` | Resume a paused scheduled task |
-| `!schedule update` | `scheduler` | `<task_id> <cron_expression>` | Update the cron expression of an existing scheduled task |
+| `!schedule update` | `scheduler` | `<task_id> <cron_expression> [timezone_name]` | Update the cron expression of an existing scheduled task |
 | `!security-approve` | `security` | `<request_id> [scope]` | Approve a pending request. scope: 'once', 'session', or 'always'. |
 | `!security-audit` | `security` | `[limit]` | Show recent security audit log |
 | `!security-deny` | `security` | `<request_id>` | Deny a pending request |
@@ -1122,6 +1124,8 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!wellness-history` | `wellness` | `[limit]` | View wellness trends over time |
 
 <!-- END AUTO-GENERATED FEATURE INVENTORY -->
+
+
 
 
 

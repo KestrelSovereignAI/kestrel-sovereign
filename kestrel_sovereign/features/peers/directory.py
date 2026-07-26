@@ -142,6 +142,20 @@ class PeerDirectoryRouter(Protocol):
         scope before returning a current routing key.
         """
 
+    async def authorize_inbound_sender(
+        self,
+        requester: PeerRequester,
+        sender_id: str,
+    ) -> bool:
+        """Authorize one cryptographically verified inbound A2A sender.
+
+        This is a distinct trust decision from automatic-peer resolution.
+        ``sender_id`` is a loaded sender's stable agent identity, or the
+        verified signing DID for an external sender. Implementations must
+        evaluate the requester's current scope and return the literal
+        singleton ``True`` only when delivery is authorized.
+        """
+
     async def invoke(
         self, requester: PeerRequester, peer: PeerIdentity, message: str,
     ) -> Mapping[str, Any]:
@@ -347,6 +361,21 @@ class LocalHostPeerDirectory:
         ]
         # A stable identity must remain unique within a scoped directory.
         return matches[0] if len(matches) == 1 else None
+
+    async def authorize_inbound_sender(
+        self,
+        requester: PeerRequester,
+        sender_id: str,
+    ) -> bool:
+        """Authorize a verified sender through the live local directory."""
+        if not isinstance(sender_id, str) or not sender_id.strip():
+            return False
+        matches = [
+            peer
+            for peer in await self._directory_entries(requester)
+            if peer.agent_id == sender_id
+        ]
+        return len(matches) == 1
 
     async def _authorize_peer(
         self, requester: PeerRequester, peer: PeerIdentity,

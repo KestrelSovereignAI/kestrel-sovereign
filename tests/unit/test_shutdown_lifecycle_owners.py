@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import FastAPI
+from starlette.routing import Mount, Route
 
 from kestrel_sovereign import cli, main, server
 from kestrel_sovereign.kestrel_agent import (
@@ -289,6 +290,92 @@ async def test_server_shutdown_drains_host_agent_and_phoenix_after_failures(
 
 
 @pytest.mark.asyncio
+async def test_host_scheduler_drains_cold_onboarding_before_feature_unmount(
+    monkeypatch,
+):
+    """A cold wake cannot remount routes/UI after the host teardown pass."""
+
+    app = FastAPI()
+    events: list[str] = []
+    onboarding_entered = asyncio.Event()
+    release_onboarding = asyncio.Event()
+    stale_route = None
+    stale_asset = None
+
+    async def cold_onboarding_remount() -> None:
+        nonlocal stale_route, stale_asset
+        onboarding_entered.set()
+        await release_onboarding.wait()
+        stale_route = Route("/cold-onboarding-route", endpoint=lambda _request: None)
+        stale_asset = Mount("/features/cold/static", app=lambda *_args: None)
+        app.routes.extend((stale_route, stale_asset))
+        app.state._feature_routes = [stale_route]
+        app.state._feature_ui_mounts = [stale_asset]
+        app.state._feature_ui_mount_paths = {"/features/cold/static"}
+        events.append("cold_onboarding_remounted")
+
+    onboarding = asyncio.create_task(cold_onboarding_remount())
+    await asyncio.wait_for(onboarding_entered.wait(), timeout=1.0)
+
+    class _DrainingRunner:
+        def __init__(self) -> None:
+            self.stop_entered = asyncio.Event()
+            self.drained = asyncio.Event()
+
+        async def stop(self) -> None:
+            events.append("scheduler_stop")
+            self.stop_entered.set()
+            await onboarding
+            self.drained.set()
+            events.append("scheduler_drained")
+
+    class _Storage:
+        async def close(self) -> None:
+            events.append("scheduler_storage_closed")
+
+    runner = _DrainingRunner()
+    app.state.host_scheduler_runner = runner
+    app.state.host_scheduler_storage = _Storage()
+    app.state._feature_routes = []
+    app.state._feature_ui_mounts = []
+    app.state._feature_ui_mount_paths = set()
+
+    async def host_feature_teardown(target_app) -> None:
+        assert runner.drained.is_set()
+        events.append("host_features_unmounted")
+        server._unmount_feature_routers(target_app)
+        server._unmount_feature_ui_assets(target_app)
+
+    monkeypatch.setattr(server, "_shutdown_host_features", host_feature_teardown)
+
+    shutdown = asyncio.create_task(server._shutdown_server_resources(app))
+    await asyncio.wait_for(runner.stop_entered.wait(), timeout=1.0)
+    assert "host_features_unmounted" not in events
+
+    release_onboarding.set()
+    cancelled, failure = await asyncio.wait_for(shutdown, timeout=1.0)
+
+    assert cancelled is False
+    assert failure is None
+    assert events.index("scheduler_drained") < events.index("host_features_unmounted")
+    assert stale_route not in app.routes
+    assert stale_asset not in app.routes
+    assert app.state._feature_routes == []
+    assert app.state._feature_ui_mounts == []
+    assert app.state._feature_ui_mount_paths == set()
+
+    # A next lifespan can mount a new copy without inheriting the cold wake's
+    # stale route or static mount.
+    fresh_route = Route("/cold-onboarding-route", endpoint=lambda _request: None)
+    fresh_asset = Mount("/features/cold/static", app=lambda *_args: None)
+    app.routes.extend((fresh_route, fresh_asset))
+    assert sum(
+        route.path == "/cold-onboarding-route" for route in app.routes
+    ) == 1
+    assert sum(route.path == "/features/cold/static" for route in app.routes) == 1
+
+
+@pytest.mark.asyncio
 async def test_phoenix_cleanup_survives_repeated_cancellation() -> None:
     """The server joins Phoenix work and reaps its child before re-raising cancel."""
     app = SimpleNamespace(state=SimpleNamespace())
@@ -464,6 +551,9 @@ async def test_lifespan_reaps_phoenix_after_agent_manager_cancellation(
     class _CancelledManager:
         init_failures = []
 
+        def set_agent_registration_hook(self, _hook) -> None:
+            return None
+
         async def load_from_config(self, config) -> int:
             assert config is fake_config
             return 0
@@ -500,6 +590,313 @@ async def test_lifespan_reaps_phoenix_after_agent_manager_cancellation(
 
     assert supervisor.close_entered.is_set()
     assert supervisor.stopped is True
+
+
+@pytest.mark.asyncio
+async def test_host_scheduler_startup_failure_rolls_back_loaded_agents(
+    monkeypatch, tmp_path,
+) -> None:
+    """A failed hosted scheduler cannot orphan already-loaded agents."""
+    from kestrel_sovereign import host_features as hf
+    from kestrel_sovereign.a2a import did_registry
+    from kestrel_sovereign.multi_agent import agent_manager, config as ma_config
+
+    config_path = tmp_path / "multi_agent.toml"
+    config_path.write_text("[host]\nport = 8888\n")
+    fake_config = SimpleNamespace(
+        host=SimpleNamespace(bind="127.0.0.1", port=8888), agents={}
+    )
+    loaded_agent = SimpleNamespace(shutdown=AsyncMock())
+
+    class _Manager:
+        init_failures = []
+
+        def __init__(self) -> None:
+            self._agents = {"already-loaded": loaded_agent}
+            self.shutdown_calls = 0
+
+        def set_agent_registration_hook(self, _hook) -> None:
+            return None
+
+        async def load_from_config(self, config) -> int:
+            assert config is fake_config
+            return 1
+
+        def list_agents(self):
+            return dict(self._agents)
+
+        async def shutdown_all(self) -> None:
+            self.shutdown_calls += 1
+            await loaded_agent.shutdown()
+            self._agents.clear()
+
+    manager = _Manager()
+    monkeypatch.setenv("KESTREL_MULTI_AGENT", "1")
+    monkeypatch.setenv("KESTREL_PHOENIX_ENABLED", "0")
+    monkeypatch.setattr(server, "resolve_multi_agent_path", lambda _env: config_path)
+    monkeypatch.setattr(ma_config.MultiAgentConfig, "load", lambda *_a, **_k: fake_config)
+    monkeypatch.setattr(agent_manager, "AgentManager", lambda **_k: manager)
+    monkeypatch.setattr(did_registry, "install_a2a_did_resolver", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        server, "_start_host_scheduler", AsyncMock(side_effect=RuntimeError("scheduler boot failed"))
+    )
+    monkeypatch.setattr(server, "_mount_feature_ui_assets", lambda _app: None)
+    monkeypatch.setattr(server, "_mount_feature_routers", lambda _app: None)
+    monkeypatch.setattr(server, "setup_tracing", lambda _app: None)
+    monkeypatch.setattr(hf, "instantiate_host_features", lambda **_k: [])
+
+    app = FastAPI()
+    async with server._lifespan_startup(app):
+        pass
+
+    assert manager.shutdown_calls == 1
+    loaded_agent.shutdown.assert_awaited_once()
+    assert manager.list_agents() == {}
+    assert app.state.agent_manager is None
+    assert app.state.agent is None
+    assert "scheduler boot failed" in app.state.startup_error
+
+
+@pytest.mark.asyncio
+async def test_host_scheduler_cancellation_closes_storage_published_before_initialize(
+    monkeypatch,
+) -> None:
+    """Cancellation during initialize cannot strand an invisible DB owner."""
+    entered_initialize = asyncio.Event()
+    release_initialize = asyncio.Event()
+    storage_instances = []
+
+    class _BlockingStorage:
+        def __init__(self, *, backend, dsn) -> None:
+            assert backend == "postgres"
+            assert dsn == "postgresql://scheduler-test"
+            self.db = None
+            self.closed = False
+            storage_instances.append(self)
+
+        async def initialize(self) -> None:
+            entered_initialize.set()
+            await release_initialize.wait()
+
+        async def close(self) -> None:
+            self.closed = True
+
+    manager = SimpleNamespace(
+        local_agent_configs_by_did=AsyncMock(
+            return_value={"did:pkh:warm": ("Warm", object())}
+        ),
+        cold_scheduler_identity_failures=[],
+    )
+    app = FastAPI()
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://scheduler-test")
+    monkeypatch.setattr(
+        "kestrel_sovereign.storage.async_storage.AsyncStorage", _BlockingStorage
+    )
+
+    startup = asyncio.create_task(server._start_host_scheduler(app, manager, object()))
+    await asyncio.wait_for(entered_initialize.wait(), timeout=1.0)
+    assert app.state.host_scheduler_storage is storage_instances[0]
+    assert app.state.host_scheduler_runner is None
+
+    startup.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(startup, timeout=1.0)
+
+    assert storage_instances[0].closed is True
+    assert app.state.host_scheduler_storage is None
+    assert app.state.host_scheduler_runner is None
+
+
+@pytest.mark.asyncio
+async def test_host_scheduler_start_failure_closes_storage_even_when_runner_stop_fails(
+    monkeypatch,
+) -> None:
+    """The startup cleanup finally block owns storage after a stop failure."""
+    storage_instances = []
+    runner_instances = []
+
+    class _Storage:
+        def __init__(self, *, backend, dsn) -> None:
+            assert backend == "postgres"
+            assert dsn == "postgresql://scheduler-test"
+            self.db = object()
+            self.closed = False
+            storage_instances.append(self)
+
+        async def initialize(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class _FailingRunner:
+        def __init__(self, *args, **kwargs) -> None:
+            self.stop_calls = 0
+            runner_instances.append(self)
+
+        async def start(self) -> None:
+            raise RuntimeError("runner start failed")
+
+        async def stop(self) -> None:
+            self.stop_calls += 1
+            raise RuntimeError("runner stop failed")
+
+    manager = SimpleNamespace(
+        local_agent_configs_by_did=AsyncMock(
+            return_value={"did:pkh:warm": ("Warm", object())}
+        ),
+        cold_scheduler_identity_failures=[],
+    )
+    app = FastAPI()
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://scheduler-test")
+    monkeypatch.setattr(
+        "kestrel_sovereign.storage.async_storage.AsyncStorage", _Storage
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.scheduler.runner.SchedulerRunner",
+        _FailingRunner,
+    )
+
+    with pytest.raises(RuntimeError, match="runner start failed"):
+        await server._start_host_scheduler(app, manager, object())
+
+    assert runner_instances[0].stop_calls == 1
+    assert storage_instances[0].closed is True
+    assert app.state.host_scheduler_storage is None
+    assert app.state.host_scheduler_runner is None
+
+
+@pytest.mark.asyncio
+async def test_host_scheduler_keeps_healthy_agents_when_cold_identity_is_unavailable(
+    monkeypatch,
+) -> None:
+    """An unresolved configured tenant is omitted without rolling back peers."""
+    storage_instances = []
+    runner_instances = []
+
+    class _Storage:
+        def __init__(self, *, backend, dsn) -> None:
+            assert backend == "postgres"
+            assert dsn == "postgresql://scheduler-test"
+            self.db = object()
+            self.closed = False
+            storage_instances.append(self)
+
+        async def initialize(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class _Runner:
+        def __init__(self, *args, **kwargs) -> None:
+            self.authorized_agent_ids = tuple(kwargs["authorized_agent_ids"])
+            self.stopped = False
+            runner_instances.append(self)
+
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            self.stopped = True
+
+    missing_identity = RuntimeError("identity database is not initialized")
+    manager = SimpleNamespace(
+        local_agent_configs_by_did=AsyncMock(
+            return_value={"did:pkh:warm": ("Warm", object())}
+        ),
+        cold_scheduler_identity_failures=[("Unincepted", missing_identity)],
+    )
+    app = FastAPI()
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://scheduler-test")
+    monkeypatch.setattr(
+        "kestrel_sovereign.storage.async_storage.AsyncStorage", _Storage
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.scheduler.runner.SchedulerRunner", _Runner
+    )
+
+    try:
+        await server._start_host_scheduler(app, manager, object())
+
+        assert runner_instances[0].authorized_agent_ids == ("did:pkh:warm",)
+        assert app.state.scheduler_cold_agent_failures == [
+            {
+                "agent": "Unincepted",
+                "scope": "identity",
+                "state": "unavailable",
+                "error_code": "scheduler_identity_unavailable",
+                "cause_type": "RuntimeError",
+            }
+        ]
+        assert app.state.scheduler_readiness_failures == (
+            app.state.scheduler_cold_agent_failures
+        )
+        assert storage_instances[0].closed is False
+    finally:
+        await server._shutdown_host_scheduler(app)
+
+    assert runner_instances[0].stopped is True
+    assert storage_instances[0].closed is True
+
+
+@pytest.mark.asyncio
+async def test_host_scheduler_latches_runtime_protocol_failure_for_readiness(
+    monkeypatch,
+) -> None:
+    """A post-start protocol outage is observable as a sticky readiness fault."""
+    class _Storage:
+        def __init__(self, *, backend, dsn) -> None:
+            self.db = object()
+
+        async def initialize(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+    class _Runner:
+        def __init__(self, *args, **kwargs) -> None:
+            self._on_protocol_failure = kwargs["on_protocol_failure"]
+
+        async def start(self) -> None:
+            self._on_protocol_failure(RuntimeError("rollout state rejected"))
+
+        async def stop(self) -> None:
+            return None
+
+    manager = SimpleNamespace(
+        local_agent_configs_by_did=AsyncMock(
+            return_value={"did:pkh:warm": ("Warm", object())}
+        ),
+        cold_scheduler_identity_failures=[],
+        is_scheduler_agent_authorized=lambda _did: True,
+    )
+    app = FastAPI()
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://scheduler-test")
+    monkeypatch.setattr(
+        "kestrel_sovereign.storage.async_storage.AsyncStorage", _Storage
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.scheduler.runner.SchedulerRunner", _Runner
+    )
+
+    try:
+        await server._start_host_scheduler(app, manager, object())
+        assert app.state.scheduler_readiness_failures == [
+            {
+                "scope": "protocol",
+                "state": "unavailable",
+                "error_code": "scheduler_protocol_unavailable",
+                "cause_type": "RuntimeError",
+            }
+        ]
+    finally:
+        await server._shutdown_host_scheduler(app)
 
 
 @pytest.mark.asyncio

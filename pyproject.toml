@@ -63,20 +63,25 @@ dependencies = [
     # spans without importing a feature package (stays on the right side of the
     # core-never-imports-features boundary). Tracing is still a runtime no-op
     # unless an OTLP endpoint is configured.
-    # 0.31.1 floor: first-class typed parts on the ToolResult envelope (#2641).
+    # 0.32.0 floor: capability-negotiated isolated tool execution context
+    # required by durable scheduler dispatch (#2715). This also includes the
+    # first-class typed parts on the ToolResult envelope (#2641).
     # kestrel_sdk.tools.parts hosts the pending-parts buffer ContextVar that
     # agent/parts.py re-exports (emit_part's tool-result fallback), and
     # DynamicTool.execute attaches buffered/explicit parts to the serialized
     # envelope — the SDK owns the buffer so in-tree and external features share
     # it. This floor also covers the obs#32 KESTREL_OTEL_PROJECT reader that
-    # landed in 0.30.2. The floor is 0.31.1 — NOT 0.31.0 — because parts.py
-    # landed in the SDK without a version bump: source/editable builds of
-    # pre-parts trees are also labeled 0.31.0, and uv's build cache (keyed on
-    # source + version) served such a stale build during feature
+    # landed in 0.30.2. The earlier floor was 0.31.1 — not 0.31.0 — because
+    # parts.py landed in the SDK without a version bump: source/editable builds
+    # of pre-parts trees are also labeled 0.31.0, and uv's build cache (keyed
+    # on source + version) served such a stale build during feature
     # reconciliation, repeatedly breaking the CLI with ModuleNotFoundError
-    # (2026-07-20/21 host incidents). >=0.31.1 makes every pre-parts artifact
-    # unsatisfiable regardless of cache state.
-    "kestrel-sovereign-sdk[tracing]>=0.31.1,<0.32",
+    # (2026-07-20/21 host incidents). Requiring 0.32.0 now makes both those
+    # pre-parts artifacts and pre-execution-context services unsatisfiable.
+    # Release cascade: Frinz and the observability fleet must publish/test
+    # constraints that admit this line before Core is released. Do not weaken
+    # Core's safety floor to make an older downstream resolver succeed.
+    "kestrel-sovereign-sdk[tracing]>=0.32.0,<0.33",
     # Core web framework
     "fastapi==0.136.3",
     "uvicorn==0.48.0",
@@ -183,6 +188,9 @@ dependencies = [
     # Runtime utilities
     "psutil>=7.1.3",
     "numpy>=2.3.1",
+    # Windows does not ship the IANA zoneinfo database. Scheduler cron parsing
+    # must work in the base install, without the optional Pandas/Phoenix trees.
+    "tzdata; sys_platform == 'win32'",
     # CAR file support (sovereignty exports)
     # >=5.9.0 fixes an uncontrolled-recursion DoS on malformed input.
     "cbor2>=5.9.0",
@@ -247,7 +255,7 @@ observability = [
     "opentelemetry-sdk>=1.20.0",
     "opentelemetry-instrumentation-fastapi>=0.41b0",
     "opentelemetry-exporter-otlp-proto-grpc>=1.20.0",
-    "kestrel-sovereign-sdk[metrics,tracing]>=0.31.0,<0.32",
+    "kestrel-sovereign-sdk[metrics,tracing]>=0.32.0,<0.33",
 ]
 # Host-supervised Arize Phoenix trace backend (OTel pivot, #2570). Installing
 # this extra is the ONLY step needed to get traces flowing: on host start the

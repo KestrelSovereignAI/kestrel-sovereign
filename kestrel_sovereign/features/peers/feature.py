@@ -348,6 +348,27 @@ class PeersFeature(Feature):
 
         return "unknown"
 
+    def _current_legacy_outbound_sender(self) -> str:
+        """Return the current public display name for an unsigned envelope.
+
+        ``_own_name`` is intentionally retained as this feature's startup
+        identity for logs and legacy fallbacks, but it is stale after a
+        volatile rename. The hosted receiver authorizes unsigned legacy A2A
+        against the live name it publishes on its agent card, so this sender
+        metadata must resolve through the same live source. Hybrid envelopes
+        subsequently overwrite this value with their signing DID.
+        """
+
+        resolver = getattr(self.agent, "resolve_effective_name", None)
+        if callable(resolver):
+            resolved = resolver(default=None)
+            if isinstance(resolved, str) and resolved.strip():
+                return resolved
+        live_name = getattr(self.agent, "_agent_name", None)
+        if isinstance(live_name, str) and live_name.strip():
+            return live_name
+        return self._own_name
+
     def _install_local_host_router(self) -> None:
         """Install the legacy local-host adapter with a private local scope."""
         host_url = getattr(self, "_host_url", None)
@@ -398,6 +419,51 @@ class PeersFeature(Feature):
             self._install_local_host_router()
             return self._peer_directory_context()
         return None
+
+    def hosted_peer_directory_context(
+        self,
+    ) -> Optional[Tuple[PeerDirectoryRouter, PeerRequester]]:
+        """Return this feature's live trusted directory pair for host policy.
+
+        A normal ``KestrelAgent`` keeps constructor-injected directory fields
+        on the agent object, but the compatibility local-host adapter belongs
+        to this feature instance. The multi-agent host must install its
+        immutable inbound A2A policy from the effective feature context,
+        rather than assuming those public construction fields still describe
+        the route in use.
+        """
+
+        return self._peer_directory_context()
+
+    def refresh_local_host_peer_directory(
+        self,
+        *,
+        host_url: str,
+        api_key: str,
+    ) -> Optional[Tuple[PeerDirectoryRouter, PeerRequester]]:
+        """Refresh only the local compatibility adapter for hosted policy.
+
+        Host registration can occur after platform port resolution or API-key
+        generation. Those are host-owned runtime facts, so the local adapter
+        must be reconstructed from them before the host freezes its inbound
+        policy. An injected scoped router is intentionally never replaced.
+        """
+
+        router = getattr(self, "_peer_router", None)
+        requester = getattr(self, "_peer_requester", None)
+        if (router is None) != (requester is None):
+            raise PeerDirectoryConfigurationError(
+                "Injected peer router and trusted requester identity must "
+                "be supplied together"
+            )
+        if router is not None and not isinstance(router, LocalHostPeerDirectory):
+            return self._peer_directory_context()
+        self._host_url = host_url.rstrip("/")
+        self._api_key = api_key
+        self._peer_router = None
+        self._peer_requester = None
+        self._install_local_host_router()
+        return self._peer_directory_context()
 
     def _requires_durable_peer_binding(self) -> bool:
         """Whether retained routes must have a durable stable identity.
@@ -919,7 +985,13 @@ class PeersFeature(Feature):
 
         task_id = uuid4().hex
         sess_id = session_id or uuid4().hex
-        outbound_metadata: Dict[str, Any] = {"sender": self._own_name}
+        # An unsigned legacy envelope is authorized by the receiver against
+        # its current published display name. Do not reuse the feature's
+        # startup-cached name after a volatile rename. Hybrid signing below
+        # replaces this with the authenticated DID before any routing occurs.
+        outbound_metadata: Dict[str, Any] = {
+            "sender": self._current_legacy_outbound_sender()
+        }
         if skill_id:
             outbound_metadata["skill"] = skill_id
         if extra_metadata:

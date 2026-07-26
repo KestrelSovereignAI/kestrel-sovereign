@@ -22,6 +22,7 @@ Special shorthand strings:
 """
 
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Optional, Set
 
 
@@ -50,6 +51,22 @@ FIELD_NAMES = ["minute", "hour", "day_of_month", "month", "day_of_week"]
 
 class CronParseError(ValueError):
     """Raised when a cron expression cannot be parsed."""
+
+
+def get_timezone(timezone_name: str = "UTC") -> ZoneInfo:
+    """Resolve an IANA time-zone name used by a cron schedule.
+
+    Scheduler timestamps are always persisted as UTC instants.  A zone only
+    controls which local wall-clock times match a cron expression.  We reject
+    invalid names at schedule creation instead of accepting a schedule that
+    can never be evaluated.
+    """
+    if not isinstance(timezone_name, str) or not timezone_name.strip():
+        raise CronParseError("timezone must be a non-empty IANA timezone name")
+    try:
+        return ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError) as e:
+        raise CronParseError(f"Unknown IANA timezone '{timezone_name}'") from e
 
 
 def _parse_field(field: str, min_val: int, max_val: int) -> Set[int]:
@@ -187,7 +204,11 @@ def matches(expression: str, dt: datetime) -> bool:
     )
 
 
-def next_run(expression: str, after: Optional[datetime] = None) -> datetime:
+def next_run(
+    expression: str,
+    after: Optional[datetime] = None,
+    timezone_name: str = "UTC",
+) -> datetime:
     """
     Calculate the next datetime that matches the cron expression.
 
@@ -198,6 +219,11 @@ def next_run(expression: str, after: Optional[datetime] = None) -> datetime:
     Args:
         expression: A cron expression string
         after: Starting point (exclusive). Defaults to now (UTC).
+        timezone_name: IANA zone whose local wall clock is matched.  The
+            returned timestamp remains an aware UTC instant.  A non-existent
+            local time during a DST spring-forward gap is skipped.  During a
+            fall-back fold, a matching local time runs once at its earlier
+            occurrence (``fold=0``), never twice.
 
     Returns:
         The next matching datetime (timezone-aware UTC)
@@ -207,23 +233,39 @@ def next_run(expression: str, after: Optional[datetime] = None) -> datetime:
     """
     fields = parse(expression)  # parse once, reuse below
     minutes_set, hours_set, dom_set, months_set, dow_set = fields
+    schedule_tz = get_timezone(timezone_name)
 
     if after is None:
         after = datetime.now(timezone.utc)
+    elif after.tzinfo is None:
+        # Historic callers supplied naive UTC values.  Retain that compatible
+        # interpretation while returning a UTC instant below.
+        after = after.replace(tzinfo=timezone.utc)
+    else:
+        after = after.astimezone(timezone.utc)
 
-    # Start from the next whole minute
+    # Advance *UTC instants*, then test their local representations.  This
+    # avoids manufacturing non-existent gap times and lets us explicitly skip
+    # the second representation of an ambiguous fold minute.
     candidate = after.replace(second=0, microsecond=0) + timedelta(minutes=1)
 
     # Safety limit: ~4 years of minutes
     max_iterations = 4 * 366 * 24 * 60
 
     for _ in range(max_iterations):
-        cron_dow = candidate.isoweekday() % 7
+        local_candidate = candidate.astimezone(schedule_tz)
+        # ``fold=1`` is the repeated wall-clock hour after a fall-back.  The
+        # scheduler's contract is one run per local matching minute, at the
+        # first (earlier UTC) occurrence.
+        if local_candidate.fold:
+            candidate += timedelta(minutes=1)
+            continue
+        cron_dow = local_candidate.isoweekday() % 7
         if (
-            candidate.minute in minutes_set
-            and candidate.hour in hours_set
-            and candidate.day in dom_set
-            and candidate.month in months_set
+            local_candidate.minute in minutes_set
+            and local_candidate.hour in hours_set
+            and local_candidate.day in dom_set
+            and local_candidate.month in months_set
             and cron_dow in dow_set
         ):
             return candidate
