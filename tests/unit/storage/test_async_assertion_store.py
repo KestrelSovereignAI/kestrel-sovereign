@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
+from kestrel_sovereign.identity.runtime_identity import (
+    AgentIdentity,
+    load_agent_identity,
+)
+from kestrel_sovereign.inception_service import create_kestrel_identity
 from kestrel_sovereign.knowledge import (
     Assertion,
     AssertionQuery,
@@ -31,6 +37,9 @@ from kestrel_sovereign.storage.async_storage import AsyncStorage
 from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage, PrivacyViolationError
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage.sqla.migrations import migrate_semantic_assertion_store
+from kestrel_sovereign.security.assertion_tenant_resolver import (
+    _resolve_authenticated_agent_assertion_capability,
+)
 
 
 TENANT = "did:example:semantic-test"
@@ -39,12 +48,44 @@ OWNER = "did:example:semantic-test"
 ONTOLOGY = OntologyRef("kestrel-test", "1", "sha256:test", "semantic-kb-v1")
 SUBJECT = IRI("urn:kestrel:agent:did:example:semantic-test:principal:user")
 PREDICATE = IRI("https://kestrel.ai/vocab/preferredRegion")
+_LOADER_VERIFIED_IDENTITY: AgentIdentity | None = None
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _incept_loader_verified_assertion_tenant(tmp_path_factory) -> None:
+    """Use the same incept → load boundary that production boot uses."""
+    global TENANT, OWNER, SUBJECT, _LOADER_VERIFIED_IDENTITY
+
+    identity_dir = tmp_path_factory.mktemp("semantic-assertion-identity")
+    credentials = create_kestrel_identity(
+        str(identity_dir),
+        identity_method="did:pkh",
+        agent_name="Semantic Assertion Store Test",
+    )
+    tenant_id = credentials.agent_did
+    key_id = f"kestrel_{tenant_id.rsplit(':', 1)[-1]}"
+    _LOADER_VERIFIED_IDENTITY = load_agent_identity(key_id, identity_dir)
+    TENANT = tenant_id
+    OWNER = tenant_id
+    SUBJECT = IRI(f"urn:kestrel:agent:{tenant_id}:principal:user")
 
 
 async def _storage() -> AsyncStorage:
-    storage = AsyncStorage(":memory:", agent_id=TENANT)
+    storage = AsyncStorage(
+        ":memory:",
+        agent_id=TENANT,
+        _assertion_tenant_capability=_assertion_capability(TENANT),
+    )
     await storage.initialize()
     return storage
+
+
+def _assertion_capability(tenant_id: str):
+    assert _LOADER_VERIFIED_IDENTITY is not None
+    return _resolve_authenticated_agent_assertion_capability(
+        tenant_id,
+        _LOADER_VERIFIED_IDENTITY,
+    )
 
 
 def source(identifier: str) -> SourceOccurrence:
@@ -64,13 +105,15 @@ def direct(
     value: str = "us-central1",
     source_id: str = "source-1",
     *,
-    tenant: str = TENANT,
-    owner: str = OWNER,
+    tenant: str | None = None,
+    owner: str | None = None,
 ) -> Assertion:
+    tenant = tenant or TENANT
+    owner = owner or tenant
     return Assertion(
         tenant_id=tenant,
         owning_agent_id=owner,
-        subject=SUBJECT,
+        subject=IRI(f"urn:kestrel:agent:{tenant}:principal:user"),
         predicate=PREDICATE,
         object=Literal(value, XSD_STRING),
         revision_id=revision_id,
@@ -91,11 +134,13 @@ def derived(
     input_revision_id: str,
     *,
     marker: str = "eligibleForRegion",
+    tenant: str | None = None,
 ) -> Assertion:
+    tenant = tenant or TENANT
     return Assertion(
-        tenant_id=TENANT,
-        owning_agent_id=OWNER,
-        subject=SUBJECT,
+        tenant_id=tenant,
+        owning_agent_id=tenant,
+        subject=IRI(f"urn:kestrel:agent:{tenant}:principal:user"),
         predicate=IRI(f"https://kestrel.ai/vocab/{marker}"),
         object=Literal("true", XSD_STRING),
         revision_id=revision_id,
@@ -168,23 +213,59 @@ async def test_raw_database_cannot_issue_a_forged_assertion_tenant_scope() -> No
         await storage.close()
 
 
+def test_assertion_authority_requires_a_loader_verified_identity() -> None:
+    assert _LOADER_VERIFIED_IDENTITY is not None
+    assert _resolve_authenticated_agent_assertion_capability(TENANT, None) is None
+    with pytest.raises(TypeError, match="loader-verified AgentIdentity"):
+        _resolve_authenticated_agent_assertion_capability(
+            TENANT,
+            SimpleNamespace(legacy_did=TENANT, new_did=None),
+        )
+    with pytest.raises(TypeError, match="loader-verified AgentIdentity"):
+        _resolve_authenticated_agent_assertion_capability(
+            TENANT,
+            AgentIdentity(
+                legacy_did=TENANT,
+                legacy_keypair=_LOADER_VERIFIED_IDENTITY.legacy_keypair,
+                legacy_did_document=_LOADER_VERIFIED_IDENTITY.legacy_did_document,
+            ),
+        )
+    with pytest.raises(ValueError, match="not bound"):
+        _resolve_authenticated_agent_assertion_capability(
+            OTHER_TENANT,
+            _LOADER_VERIFIED_IDENTITY,
+        )
+    capability = _assertion_capability(TENANT)
+    assert capability is not None and capability.tenant_id == TENANT
+
+
 @pytest.mark.asyncio
-async def test_sqlite_factory_issues_assertion_authority_for_its_agent(tmp_path) -> None:
-    """The documented SQLite factory accepts an assertion tenant binding."""
-    storage = await AsyncStorage.create_sqlite(
+async def test_public_sqlite_factory_cannot_mint_assertion_authority(tmp_path) -> None:
+    """Public storage factories scope ordinary data but cannot grant semantic authority."""
+    raw_storage = AsyncStorage(":memory:", agent_id=TENANT)
+    await raw_storage.initialize()
+    try:
+        assertion = direct("factory-revision", source_id="factory-source")
+        with pytest.raises(RuntimeError, match="agent-bound AsyncStorage"):
+            await raw_storage.put_assertion(
+                assertion,
+                source_occurrences=(source("factory-source"),),
+            )
+    finally:
+        await raw_storage.close()
+
+    factory = await AsyncStorage.create_sqlite(
         str(tmp_path / "factory-semantic.db"),
         agent_id=TENANT,
     )
     try:
-        assertion = direct("factory-revision", source_id="factory-source")
-        written = await storage.put_assertion(
-            assertion,
-            source_occurrences=(source("factory-source"),),
-        )
-        assert written.assertion == assertion
-        assert await storage.get_assertion(assertion.assertion_id) == assertion
+        with pytest.raises(RuntimeError, match="agent-bound AsyncStorage"):
+            await factory.put_assertion(
+                direct("factory-result", source_id="factory-result-source"),
+                source_occurrences=(source("factory-result-source"),),
+            )
     finally:
-        await storage.close()
+        await factory.close()
 
 
 @pytest.mark.asyncio
@@ -259,6 +340,75 @@ async def test_retraction_and_erasure_cascade_to_derived_and_eligibility() -> No
         assert changes[0].eligible is False
         assert changes[0].generation == erased.generation
         assert (await store.assertion_checkpoint()).latest_event_id == changes[0].event_id
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_derived_supports_must_be_current_active_and_eligible() -> None:
+    storage = await _storage()
+    try:
+        root = direct("support-root", source_id="support-source")
+        await storage.put_assertion(root, source_occurrences=(source("support-source"),))
+
+        await storage.db.execute(
+            "UPDATE semantic_projection_eligibility SET eligible = 0 "
+            "WHERE tenant_id = ? AND revision_id = ?",
+            (TENANT, root.revision_id),
+        )
+        with pytest.raises(AssertionStoreError, match="current, active, and eligible"):
+            await storage.put_assertion(derived("ineligible-support", root.revision_id))
+
+        await storage.db.execute(
+            "UPDATE semantic_projection_eligibility SET eligible = 1 "
+            "WHERE tenant_id = ? AND revision_id = ?",
+            (TENANT, root.revision_id),
+        )
+        await storage.retract_assertion(root.assertion_id, root.revision_id)
+        with pytest.raises(AssertionStoreError, match="current, active, and eligible"):
+            await storage.put_assertion(derived("retracted-support", root.revision_id))
+
+        active = direct("superseded-support", value="old", source_id="superseded-source")
+        await storage.put_assertion(active, source_occurrences=(source("superseded-source"),))
+        replacement = direct(
+            "superseded-support-replacement", value="new", source_id="replacement-source",
+        )
+        await storage.supersede_assertion(
+            active.revision_id,
+            replacement,
+            source_occurrences=(source("replacement-source"),),
+        )
+        with pytest.raises(AssertionStoreError, match="current, active, and eligible"):
+            await storage.put_assertion(derived("superseded-support-derived", active.revision_id))
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_closure_preserves_independent_current_replacements() -> None:
+    storage = await _storage()
+    try:
+        root = direct("lineage-root", source_id="lineage-root-source")
+        await storage.put_assertion(root, source_occurrences=(source("lineage-root-source"),))
+        derived_child = derived("lineage-child", root.revision_id)
+        await storage.put_assertion(derived_child)
+
+        independent = direct(
+            "lineage-independent", value="independent", source_id="lineage-independent-source",
+        )
+        replacement = await storage.supersede_assertion(
+            derived_child.revision_id,
+            independent,
+            source_occurrences=(source("lineage-independent-source"),),
+        )
+
+        await storage.retract_assertion(root.assertion_id, root.revision_id)
+        assert await storage.get_assertion(independent.assertion_id) == replacement.replacement
+
+        erased = await storage.erase_assertion(root.assertion_id)
+        assert derived_child.assertion_id in erased.erased_assertion_ids
+        assert independent.assertion_id not in erased.erased_assertion_ids
+        assert await storage.get_assertion(independent.assertion_id) == replacement.replacement
     finally:
         await storage.close()
 
@@ -345,7 +495,11 @@ async def test_dependent_invalidation_order_is_stable() -> None:
 @pytest.mark.asyncio
 async def test_erasure_replay_survives_restart_without_retaining_semantic_ids(tmp_path) -> None:
     db_path = tmp_path / "erasure-replay.db"
-    storage = AsyncStorage(str(db_path), agent_id=TENANT)
+    storage = AsyncStorage(
+        str(db_path),
+        agent_id=TENANT,
+        _assertion_tenant_capability=_assertion_capability(TENANT),
+    )
     await storage.initialize()
     try:
         root = direct("restart-root", source_id="restart-source")
@@ -356,7 +510,11 @@ async def test_erasure_replay_survives_restart_without_retaining_semantic_ids(tm
     finally:
         await storage.close()
 
-    restarted = AsyncStorage(str(db_path), agent_id=TENANT)
+    restarted = AsyncStorage(
+        str(db_path),
+        agent_id=TENANT,
+        _assertion_tenant_capability=_assertion_capability(TENANT),
+    )
     await restarted.initialize()
     try:
         replay = await restarted.erase_assertion(root.assertion_id, operation_id="erasure-replay")
@@ -524,7 +682,11 @@ async def test_migration_rolls_back_its_partial_schema_on_ddl_failure() -> None:
 
 @pytest.mark.asyncio
 async def test_privacy_wrapper_governs_assertions_and_graph_proxy_denies_new_surface(tmp_path) -> None:
-    storage = AsyncStorage(str(tmp_path / "semantic.db"), agent_id=TENANT)
+    storage = AsyncStorage(
+        str(tmp_path / "semantic.db"),
+        agent_id=TENANT,
+        _assertion_tenant_capability=_assertion_capability(TENANT),
+    )
     await storage.initialize()
     try:
         assertion = direct("privacy-revision", source_id="privacy-source")
@@ -572,5 +734,37 @@ async def test_privacy_wrapper_governs_assertions_and_graph_proxy_denies_new_sur
             pass
         written = await normal.put_assertion(assertion, source_occurrences=(source("privacy-source"),))
         assert written.assertion == assertion
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [PrivacyMode.EPHEMERAL, PrivacyMode.ISOLATED])
+async def test_volatile_privacy_modes_cannot_read_populated_assertion_authority(mode) -> None:
+    storage = await _storage()
+    try:
+        assertion = direct("volatile-read-revision", source_id="volatile-read-source")
+        await storage.put_assertion(
+            assertion,
+            source_occurrences=(source("volatile-read-source"),),
+        )
+        wrapper = PrivacyEnforcingStorage(storage, mode)
+
+        reads = (
+            wrapper.get_assertion(assertion.assertion_id),
+            wrapper.get_assertion_revision(assertion.revision_id),
+            wrapper.query_assertions(),
+            wrapper.list_assertion_revisions(assertion.assertion_id),
+            wrapper.list_assertion_sources(assertion.assertion_id),
+            wrapper.get_source_occurrence("volatile-read-source"),
+            wrapper.get_derivation_inputs(assertion.revision_id),
+            wrapper.assertion_checkpoint(),
+            wrapper.assertion_changes_since(0),
+            wrapper.assertion_inference_inputs(),
+            wrapper.export_assertion_snapshot(),
+        )
+        for read in reads:
+            with pytest.raises(PrivacyViolationError, match="volatile privacy modes"):
+                await read
     finally:
         await storage.close()

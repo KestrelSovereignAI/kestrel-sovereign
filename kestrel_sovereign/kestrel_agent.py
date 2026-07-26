@@ -16,6 +16,9 @@ from kestrel_sovereign.storage.privacy_wrapper import (
     PurgeOutcome,
 )
 from kestrel_sovereign.security.encryption import DecryptionError
+from kestrel_sovereign.security.assertion_tenant_resolver import (
+    _resolve_authenticated_agent_assertion_capability,
+)
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.llm.adapter import LLMResponse
 from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
@@ -1462,6 +1465,16 @@ class KestrelAgent(
             except Exception as e:
                 logging.warning(f"Cold-start restore from Lighthouse failed: {e}", exc_info=True)
 
+        # Assertion authority is minted only after this agent boot path has
+        # resolved its DID.  Passing an agent_id to AsyncStorage is ordinary
+        # resource scoping, not authority issuance; the opaque capability is
+        # required for the normalized semantic assertion store on every backend.
+        assertion_tenant_capability = (
+            _resolve_authenticated_agent_assertion_capability(self.did, self.identity)
+            if self.did
+            else None
+        )
+
         # Initialize async storage based on backend type
         if self._db_backend.lower() == "postgres" and (self.pg_pool or self._database_url):
             # PostgreSQL backend - reuse shared pool if available
@@ -1480,6 +1493,7 @@ class KestrelAgent(
                     backend=pg_backend,
                     agent_id=self.did,
                     llm_service=self.llm_service,
+                    _assertion_tenant_capability=assertion_tenant_capability,
                 )
                 logging.info(f"Using shared PostgreSQL pool for Kestrel storage (agent: {self.did})")
             else:
@@ -1488,6 +1502,7 @@ class KestrelAgent(
                     dsn=self._database_url,
                     agent_id=self.did,
                     llm_service=self.llm_service,
+                    _assertion_tenant_capability=assertion_tenant_capability,
                 )
                 logging.info(f"Using PostgreSQL backend for Kestrel storage (agent: {self.did})")
         else:
@@ -1496,6 +1511,7 @@ class KestrelAgent(
                 self.storage_path,
                 agent_id=self.did,
                 llm_service=self.llm_service,
+                _assertion_tenant_capability=assertion_tenant_capability,
             )
             logging.info(f"Using SQLite backend for Kestrel storage: {self.storage_path}")
 

@@ -34,6 +34,14 @@ from kestrel_sovereign.storage.db.interface import QueryError
 from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
 from kestrel_sovereign.storage.saved_items_store import SavedItemsStore
 from kestrel_sovereign.storage.schema_router import SchemaRouter
+from kestrel_sovereign.security.assertion_tenant_resolver import (
+    _resolve_authenticated_agent_assertion_capability,
+)
+from kestrel_sovereign.identity.runtime_identity import (
+    AgentIdentity,
+    load_agent_identity,
+)
+from kestrel_sovereign.inception_service import create_kestrel_identity_async
 
 
 def _semantic_source(source_id: str):
@@ -114,14 +122,50 @@ def _derived_semantic_assertion(tenant_id: str, revision_id: str, input_revision
     )
 
 
-async def _assertion_storage_for_backend(db_backend, tenant_id: str) -> AsyncStorage:
-    """Open a factory-owned assertion store against the parametrized backend."""
+async def _incepted_assertion_identity(
+    identity_dir,
+    label: str,
+) -> tuple[str, AgentIdentity]:
+    """Create and load a real identity for semantic authority parity tests."""
+    credentials = await create_kestrel_identity_async(
+        str(identity_dir / label),
+        identity_method="did:pkh",
+        agent_name=f"Semantic parity {label}",
+    )
+    tenant_id = credentials.agent_did
+    key_id = f"kestrel_{tenant_id.rsplit(':', 1)[-1]}"
+    return tenant_id, load_agent_identity(key_id, identity_dir / label)
+
+
+async def _assertion_storage_for_backend(
+    db_backend,
+    tenant_id: str,
+    identity: AgentIdentity,
+) -> AsyncStorage:
+    """Open a boot-resolver-authorized assertion store for parity coverage."""
+    capability = _resolve_authenticated_agent_assertion_capability(
+        tenant_id,
+        identity,
+    )
     if db_backend.backend_type == "sqlite":
-        return await AsyncStorage.create_sqlite(db_backend.db_path, agent_id=tenant_id)
+        storage = AsyncStorage(
+            db_backend.db_path,
+            agent_id=tenant_id,
+            _assertion_tenant_capability=capability,
+        )
+        await storage.initialize()
+        return storage
     dsn = getattr(db_backend, "_dsn", None)
     if not dsn:
         raise RuntimeError("PostgreSQL parity backend did not expose its test DSN")
-    return await AsyncStorage.create_postgres(dsn, agent_id=tenant_id)
+    storage = AsyncStorage(
+        backend="postgres",
+        dsn=dsn,
+        agent_id=tenant_id,
+        _assertion_tenant_capability=capability,
+    )
+    await storage.initialize()
+    return storage
 
 
 @pytest.mark.asyncio
@@ -177,12 +221,19 @@ async def test_constitution_runtime_state_round_trips_on_both_backends(db_backen
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
-async def test_canonical_assertion_store_has_tenant_and_lifecycle_parity(db_backend):
+async def test_canonical_assertion_store_has_tenant_and_lifecycle_parity(
+    db_backend,
+    tmp_path,
+):
     """The normalized assertion authority has the same observable contract on SQLite and PostgreSQL."""
-    tenant = f"did:test:{uuid4()}"
-    other_tenant = f"did:test:{uuid4()}"
-    storage = await _assertion_storage_for_backend(db_backend, tenant)
-    other_storage = await _assertion_storage_for_backend(db_backend, other_tenant)
+    tenant, identity = await _incepted_assertion_identity(tmp_path, "primary")
+    other_tenant, other_identity = await _incepted_assertion_identity(tmp_path, "foreign")
+    storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    other_storage = await _assertion_storage_for_backend(
+        db_backend,
+        other_tenant,
+        other_identity,
+    )
     try:
         store = storage
         assertion = _semantic_assertion(tenant, "parity-revision")
@@ -213,10 +264,10 @@ async def test_canonical_assertion_store_has_tenant_and_lifecycle_parity(db_back
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
-async def test_derived_assertion_lifecycle_parity(db_backend):
+async def test_derived_assertion_lifecycle_parity(db_backend, tmp_path):
     """All lifecycle transitions preserve derived lineage on both backends."""
-    tenant = f"did:test:{uuid4()}"
-    storage = await _assertion_storage_for_backend(db_backend, tenant)
+    tenant, identity = await _incepted_assertion_identity(tmp_path, "lifecycle")
+    storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
     try:
         store = storage
 
@@ -260,10 +311,13 @@ async def test_derived_assertion_lifecycle_parity(db_backend):
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
-async def test_erasure_emits_an_opaque_retryable_change_on_both_backends(db_backend):
+async def test_erasure_emits_an_opaque_retryable_change_on_both_backends(
+    db_backend,
+    tmp_path,
+):
     """An incremental consumer can resynchronize after identity-free erasure."""
-    tenant = f"did:test:{uuid4()}"
-    storage = await _assertion_storage_for_backend(db_backend, tenant)
+    tenant, identity = await _incepted_assertion_identity(tmp_path, "erasure")
+    storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
     try:
         store = storage
         assertion = _semantic_assertion(tenant, "erasure-revision", value="erasure")

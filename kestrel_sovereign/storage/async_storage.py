@@ -27,7 +27,6 @@ from .async_assertion_store import (
     AsyncAssertionStore,
     _AssertionTenantCapability,
     _create_agent_bound_assertion_store,
-    _issue_assertion_tenant_capability,
 )
 from .async_rag_store import AsyncRAGStore
 from .agent_resource_store import (
@@ -138,13 +137,6 @@ class AsyncStorage:
         self.db_path: Optional[str] = None
         self.agent_id = agent_id
         self.llm_service = llm_service
-        # A caller that supplies an already-reachable backend has not thereby
-        # established authority over an arbitrary assertion tenant.  Only
-        # storage that created/connected its own configured backend resolves a
-        # capability from its authenticated agent scope.  Shared-backend users
-        # must receive an opaque capability from their tenant resolver.
-        externally_supplied_backend = isinstance(backend, DatabaseBackend)
-
         # If backend is already a DatabaseBackend instance, use it directly
         if isinstance(backend, DatabaseBackend):
             self._backend = backend
@@ -186,8 +178,6 @@ class AsyncStorage:
             if _assertion_tenant_capability.tenant_id != agent_id:
                 raise ValueError("assertion tenant capability does not match AsyncStorage.agent_id")
             self._assertion_tenant_capability = _assertion_tenant_capability
-        elif agent_id and not externally_supplied_backend:
-            self._assertion_tenant_capability = _issue_assertion_tenant_capability(agent_id)
         else:
             self._assertion_tenant_capability = None
 
@@ -231,14 +221,18 @@ class AsyncStorage:
 
     @classmethod
     async def create_sqlite(cls, db_path: str, *, agent_id: str = "") -> "AsyncStorage":
-        """Factory method to create and initialize SQLite-backed storage."""
+        """Create SQLite storage without granting semantic tenant authority.
+
+        Assertion authority is issued only by the authenticated agent boot
+        resolver and then injected through the private capability seam.
+        """
         storage = cls(db_path=db_path, agent_id=agent_id)
         await storage.initialize()
         return storage
 
     @classmethod
     async def create_postgres(cls, dsn: str, *, agent_id: str = "") -> "AsyncStorage":
-        """Factory method to create and initialize PostgreSQL-backed storage."""
+        """Create PostgreSQL storage without granting semantic tenant authority."""
         storage = cls(backend="postgres", dsn=dsn, agent_id=agent_id)
         await storage.initialize()
         return storage

@@ -2472,29 +2472,14 @@ class PrivacyEnforcingStorage:
         # derived reference.  The normalized store computes its full closure.
         return await self._storage.erase_assertion(assertion_id, operation_id=operation_id)
 
-    async def get_assertion(self, assertion_id, *, include_inactive=False):
-        return await self._storage.get_assertion(assertion_id, include_inactive=include_inactive)
+    def _assert_semantic_assertion_read_allowed(self, operation: str) -> None:
+        """Keep volatile sessions from observing durable semantic knowledge.
 
-    async def get_assertion_revision(self, revision_id):
-        return await self._storage.get_assertion_revision(revision_id)
-
-    async def query_assertions(self, query=None):
-        return await self._storage.query_assertions(query)
-
-    async def list_assertion_revisions(self, assertion_id):
-        return await self._storage.list_assertion_revisions(assertion_id)
-
-    async def list_assertion_sources(self, assertion_id):
-        return await self._storage.list_assertion_sources(assertion_id)
-
-    async def get_source_occurrence(self, source_occurrence_id):
-        return await self._storage.get_source_occurrence(source_occurrence_id)
-
-    async def get_derivation_inputs(self, revision_id):
-        return await self._storage.get_derivation_inputs(revision_id)
-
-    def _assert_semantic_assertion_incremental_read_allowed(self, operation: str) -> None:
-        """Prevent volatile modes from observing durable semantic progress."""
+        Canonical assertions have no session-local implementation.  Returning
+        durable rows in EPHEMERAL or ISOLATED mode would silently cross the
+        privacy boundary, so each explicit read surface fails closed until an
+        approved session-local assertion store exists.
+        """
         if (
             not self._policy.allow_persistent_read
             or self._privacy_config.is_ephemeral()
@@ -2503,6 +2488,38 @@ class PrivacyEnforcingStorage:
             raise PrivacyViolationError(
                 f"Canonical assertion {operation} is disabled in volatile privacy modes"
             )
+
+    async def get_assertion(self, assertion_id, *, include_inactive=False):
+        self._assert_semantic_assertion_read_allowed("reads")
+        return await self._storage.get_assertion(assertion_id, include_inactive=include_inactive)
+
+    async def get_assertion_revision(self, revision_id):
+        self._assert_semantic_assertion_read_allowed("revision reads")
+        return await self._storage.get_assertion_revision(revision_id)
+
+    async def query_assertions(self, query=None):
+        self._assert_semantic_assertion_read_allowed("queries")
+        return await self._storage.query_assertions(query)
+
+    async def list_assertion_revisions(self, assertion_id):
+        self._assert_semantic_assertion_read_allowed("revision listing")
+        return await self._storage.list_assertion_revisions(assertion_id)
+
+    async def list_assertion_sources(self, assertion_id):
+        self._assert_semantic_assertion_read_allowed("provenance reads")
+        return await self._storage.list_assertion_sources(assertion_id)
+
+    async def get_source_occurrence(self, source_occurrence_id):
+        self._assert_semantic_assertion_read_allowed("provenance reads")
+        return await self._storage.get_source_occurrence(source_occurrence_id)
+
+    async def get_derivation_inputs(self, revision_id):
+        self._assert_semantic_assertion_read_allowed("derivation traversal")
+        return await self._storage.get_derivation_inputs(revision_id)
+
+    def _assert_semantic_assertion_incremental_read_allowed(self, operation: str) -> None:
+        """Prevent volatile modes from observing durable semantic progress."""
+        self._assert_semantic_assertion_read_allowed(operation)
 
     async def assertion_checkpoint(self):
         self._assert_semantic_assertion_incremental_read_allowed("checkpoint")
@@ -2513,19 +2530,11 @@ class PrivacyEnforcingStorage:
         return await self._storage.assertion_changes_since(generation, limit=limit)
 
     async def assertion_inference_inputs(self, query=None):
-        if self._privacy_config.is_ephemeral() or self._policy.use_session_storage:
-            raise PrivacyViolationError(
-                "Canonical assertion inference inputs are disabled in volatile privacy modes"
-            )
+        self._assert_semantic_assertion_read_allowed("inference inputs")
         return await self._storage.assertion_inference_inputs(query)
 
     async def export_assertion_snapshot(self, query=None):
-        if (
-            not self._policy.allow_persistent_read
-            or self._privacy_config.is_ephemeral()
-            or self._policy.use_session_storage
-        ):
-            raise PrivacyViolationError("Canonical assertion export is disabled in the current privacy config")
+        self._assert_semantic_assertion_read_allowed("export")
         return await self._storage.export_assertion_snapshot(query)
 
     # === Private Agent Identity Resources (privacy-governed durable writes) ===

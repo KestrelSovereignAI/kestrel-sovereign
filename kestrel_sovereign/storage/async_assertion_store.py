@@ -453,8 +453,13 @@ class AsyncAssertionStore:
             if sources:
                 raise AssertionStoreError("derived assertions must not attach direct source occurrences")
             for revision_id in assertion.lineage.input_revision_ids:
-                if await self._revision(revision_id) is None:
+                support = await self._revision(revision_id)
+                if support is None:
                     raise TenantIsolationError("derived assertion input revision is absent from the bound tenant")
+                if not await self._is_current_active_eligible_revision(revision_id):
+                    raise AssertionStoreError(
+                        "derived assertion inputs must be current, active, and eligible"
+                    )
             return
         expected = set(assertion.lineage.source_occurrence_ids)
         supplied = {source.source_occurrence_id for source in sources}
@@ -463,6 +468,31 @@ class AsyncAssertionStore:
         for source_id in expected:
             if source_id not in supplied and not await self._source_exists(source_id):
                 raise AssertionStoreError("direct lineage references an unknown tenant-local source occurrence")
+
+    async def _is_current_active_eligible_revision(self, revision_id: str) -> bool:
+        """Return whether one bound-tenant revision is a valid derived support.
+
+        Derived facts are valid only while every support is the current active
+        revision and remains projection-eligible.  Looking up the revision alone
+        would admit historical, superseded, retracted, or invalidated facts and
+        make a new derived assertion appear valid after its support was removed.
+        """
+        tenant_id, _ = self._require_scope()
+        row = await self._database.fetchone(
+            "SELECT r.status, r.eligible, e.eligible FROM semantic_assertions a "
+            "JOIN semantic_assertion_revisions r ON r.tenant_id = a.tenant_id "
+            "  AND r.revision_id = a.current_revision_id "
+            "LEFT JOIN semantic_projection_eligibility e ON e.tenant_id = r.tenant_id "
+            "  AND e.revision_id = r.revision_id "
+            "WHERE a.tenant_id = ? AND r.revision_id = ?",
+            (tenant_id, revision_id),
+        )
+        return bool(
+            row is not None
+            and row[0] == AssertionStatus.ACTIVE.value
+            and bool(row[1])
+            and bool(row[2])
+        )
 
     @staticmethod
     def _flat_terms(assertion: Assertion) -> tuple[str, str, str, str, str | None, str | None]:
@@ -879,12 +909,10 @@ class AsyncAssertionStore:
             pending.clear()
             rows = await self._database.fetchall(
                 "SELECT DISTINCT r.assertion_id, r.revision_id, r.assertion_mapping FROM semantic_derivation_inputs d "
-                "JOIN semantic_assertion_revisions derived ON derived.tenant_id = d.tenant_id "
-                "  AND derived.revision_id = d.derived_revision_id "
-                "JOIN semantic_assertions a ON a.tenant_id = derived.tenant_id "
-                "  AND a.assertion_id = derived.assertion_id "
+                "JOIN semantic_assertions a ON a.tenant_id = d.tenant_id "
+                "  AND a.current_revision_id = d.derived_revision_id "
                 "JOIN semantic_assertion_revisions r ON r.tenant_id = a.tenant_id "
-                "  AND r.revision_id = a.current_revision_id "
+                "  AND r.revision_id = d.derived_revision_id "
                 f"WHERE d.tenant_id = ? AND d.input_revision_id IN ({_placeholders(batch)}) "
                 "ORDER BY r.assertion_id ASC, r.revision_id ASC",
                 (tenant_id,) + batch,
@@ -1049,7 +1077,10 @@ class AsyncAssertionStore:
                 pending.clear()
                 rows = await self._database.fetchall(
                     "SELECT DISTINCT r.assertion_id FROM semantic_derivation_inputs d "
-                    "JOIN semantic_assertion_revisions r ON r.tenant_id = d.tenant_id AND r.revision_id = d.derived_revision_id "
+                    "JOIN semantic_assertions a ON a.tenant_id = d.tenant_id "
+                    "  AND a.current_revision_id = d.derived_revision_id "
+                    "JOIN semantic_assertion_revisions r ON r.tenant_id = d.tenant_id "
+                    "  AND r.revision_id = d.derived_revision_id "
                     f"WHERE d.tenant_id = ? AND d.input_revision_id IN ({_placeholders(batch)}) "
                     "ORDER BY r.assertion_id ASC",
                     (tenant_id,) + batch,

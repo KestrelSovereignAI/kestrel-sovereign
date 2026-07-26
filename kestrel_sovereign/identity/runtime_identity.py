@@ -35,7 +35,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -60,6 +60,15 @@ from kestrel_sovereign.security.key_storage import SecureKeyStorage
 
 
 logger = logging.getLogger(__name__)
+
+
+# A runtime ``AgentIdentity`` is only assertion-authoritative after the loader
+# has validated its on-disk key material and DID binding.  Keep that fact
+# separate from the public identity data: callers may construct an
+# ``AgentIdentity`` for signing tests or other local work, but that does not
+# establish authority over a persisted semantic tenant.
+_LOADER_VERIFIED_IDENTITY_WITNESS = object()
+_LOADER_VERIFIED_IDENTITY_FACTORY_TOKEN = object()
 
 
 class RuntimeIdentityError(Exception):
@@ -186,6 +195,12 @@ class AgentIdentity:
     succession_chain: Optional[SuccessionChain] = None
     archival_keypair: Optional[Keypair] = None
     succession_statement: Optional[SuccessionStatement] = None
+    _loader_verified_witness: object | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if self.hybrid_keypair is None and self.legacy_keypair is None:
@@ -212,6 +227,35 @@ class AgentIdentity:
         Legacy-only: the ``did:pkh``.
         """
         return self.new_did if self.is_hybrid else self.legacy_did
+
+
+def _loader_verified_agent_identity(
+    token: object,
+    **kwargs: object,
+) -> AgentIdentity:
+    """Construct an identity that passed this module's persisted-key checks."""
+    if token is not _LOADER_VERIFIED_IDENTITY_FACTORY_TOKEN:
+        raise TypeError("loader verification witness is issued only by load_agent_identity")
+    identity = AgentIdentity(**kwargs)
+    object.__setattr__(
+        identity,
+        "_loader_verified_witness",
+        _LOADER_VERIFIED_IDENTITY_WITNESS,
+    )
+    return identity
+
+
+def _is_loader_verified_agent_identity(identity: object) -> bool:
+    """Whether ``identity`` was produced by :func:`load_agent_identity`.
+
+    This is intentionally an internal boot boundary, rather than a general
+    identity predicate.  It prevents an attribute-compatible object—or a
+    directly constructed runtime identity—from becoming storage authority.
+    """
+    return (
+        type(identity) is AgentIdentity
+        and identity._loader_verified_witness is _LOADER_VERIFIED_IDENTITY_WITNESS
+    )
 
 
 def _validate_hybrid_key_binding(
@@ -709,7 +753,8 @@ def _load_born_hybrid(
     )
 
     logger.info(f"Loaded born-hybrid agent identity: {new_did}")
-    return AgentIdentity(
+    return _loader_verified_agent_identity(
+        _LOADER_VERIFIED_IDENTITY_FACTORY_TOKEN,
         hybrid_keypair=hybrid,
         new_did=new_did,
         new_verification_methods=signing_vms,
@@ -790,7 +835,8 @@ def load_agent_identity(
     )
 
     if succession_path is None:
-        return AgentIdentity(
+        return _loader_verified_agent_identity(
+            _LOADER_VERIFIED_IDENTITY_FACTORY_TOKEN,
             legacy_did=legacy_did,
             legacy_keypair=legacy_kp,
             legacy_did_document=legacy_did_doc,
@@ -816,7 +862,8 @@ def load_agent_identity(
         f"Loaded hybrid agent identity: legacy={legacy_did} "
         f"-> new={statement.successor_did}"
     )
-    return AgentIdentity(
+    return _loader_verified_agent_identity(
+        _LOADER_VERIFIED_IDENTITY_FACTORY_TOKEN,
         legacy_did=legacy_did,
         legacy_keypair=legacy_kp,
         legacy_did_document=legacy_did_doc,
