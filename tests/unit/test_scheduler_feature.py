@@ -325,8 +325,9 @@ class TestRetiredCronCleanup:
             for c in f._ensure_builtin_schedule.await_args_list
         ]
         assert "cognition_retention" not in readded
-        # An already-present live default is not duplicated.
-        assert "backup_snapshot" not in readded
+        # Existing defaults still take the authoritative transaction path so
+        # a second pending host adopts a first host's registration-owned row.
+        assert "backup_snapshot" in readded
 
     @pytest.mark.asyncio
     async def test_post_load_removes_autoseeded_consolidate_reflect_keeps_custom(self):

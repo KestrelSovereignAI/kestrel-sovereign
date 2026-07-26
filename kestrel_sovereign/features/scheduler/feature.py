@@ -473,9 +473,11 @@ class SchedulerFeature(Feature):
             defaults.append(("restart_coordinator", "* * * * *", "{}"))
 
         for task_name, cron, args in defaults:
-            if task_name in existing_names:
-                logger.debug("Schedule '%s' already exists, skipping", task_name)
-                continue
+            # ``schedule_list`` is a snapshot used only for migration cleanup
+            # above.  Every default must still take the transactional path:
+            # a concurrent host can rely on a pending registration's already
+            # listed row, which atomically adopts that exact row before
+            # returning it.
             result = await self._ensure_builtin_schedule(
                 cron_expression=cron,
                 task_name=task_name,

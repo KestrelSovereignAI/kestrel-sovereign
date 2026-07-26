@@ -491,10 +491,10 @@ async def test_dynamic_registration_rollback_preserves_controller_adopted_by_pre
 
 
 @pytest.mark.asyncio
-async def test_dynamic_registration_builtin_reuse_adopts_only_other_owner_row(
+async def test_dynamic_registration_post_load_adopts_other_owner_builtins(
     tmp_path,
 ):
-    """A second registration protects the built-in it reuses from rollback."""
+    """Post-load adoption preserves a second host's reused built-ins."""
 
     database_path = tmp_path / "registration-builtin-adoption.db"
     db_owner = await _database(database_path)
@@ -515,7 +515,7 @@ async def test_dynamic_registration_builtin_reuse_adopts_only_other_owner_row(
         feature._db = db
         feature._agent_id = agent_id
         agent.features = {"SchedulerFeature": feature}
-        return feature
+        return feature, agent
 
     owner = SchedulerRunner(
         db_owner,
@@ -532,39 +532,32 @@ async def test_dynamic_registration_builtin_reuse_adopts_only_other_owner_row(
         owner_id="builtin-replica",
     )
     try:
-        owner_registration = await owner.prepare_tenant_registration()
-        owner_feature = scheduler_feature_for(db_owner, owner_registration)
-        seeded = await owner_feature._ensure_builtin_schedule(
-            cron_expression="@daily",
-            task_name="backup_snapshot",
-            args_json="{}",
+        owner_registration, replica_registration = await asyncio.gather(
+            owner.prepare_tenant_registration(),
+            replica.prepare_tenant_registration(),
         )
-        assert seeded.status.value == "ok"
-        task_id = seeded.data["task_id"]
-
-        # Reusing the row from the same pending registration does not make it
-        # shared, so a failure before another host participates still cleans
-        # up the seed.
-        same_registration = await owner_feature._ensure_builtin_schedule(
-            cron_expression="@daily",
-            task_name="backup_snapshot",
-            args_json="{}",
+        assert owner_registration.rollout_preexisting is False
+        assert replica_registration.rollout_preexisting is True
+        owner_feature, owner_agent = scheduler_feature_for(
+            db_owner, owner_registration
         )
-        assert same_registration.data["existing"] is True
+        await owner_feature.post_all_features_loaded(owner_agent)
+        task_id = await db_owner.fetchval(
+            """
+            SELECT id FROM scheduled_tasks
+            WHERE agent_id = ? AND idempotency_key = ?
+            """,
+            (agent_id, "scheduler:builtin:v1:backup_snapshot"),
+        )
         assert await db_owner.fetchone(
             "SELECT scheduler_registration_nonce FROM scheduled_tasks WHERE id = ?",
             (task_id,),
         ) == (owner_registration.registration_nonce,)
 
-        replica_registration = await replica.prepare_tenant_registration()
-        replica_feature = scheduler_feature_for(db_replica, replica_registration)
-        reused = await replica_feature._ensure_builtin_schedule(
-            cron_expression="@daily",
-            task_name="backup_snapshot",
-            args_json="{}",
+        replica_feature, replica_agent = scheduler_feature_for(
+            db_replica, replica_registration
         )
-        assert reused.data["existing"] is True
-        assert reused.data["task_id"] == task_id
+        await replica_feature.post_all_features_loaded(replica_agent)
         assert await db_owner.fetchone(
             "SELECT scheduler_registration_nonce FROM scheduled_tasks WHERE id = ?",
             (task_id,),
@@ -583,8 +576,18 @@ async def test_dynamic_registration_builtin_reuse_adopts_only_other_owner_row(
         await owner.rollback_tenant_registration(owner_registration)
 
         assert await db_owner.fetchall(
-            "SELECT id FROM scheduled_tasks WHERE agent_id = ?", (agent_id,)
-        ) == [(task_id,)]
+            """
+            SELECT task_name FROM scheduled_tasks
+            WHERE agent_id = ? ORDER BY task_name
+            """,
+            (agent_id,),
+        ) == [
+            ("backup_snapshot",),
+            ("morning_signal",),
+            ("signal_dispatch",),
+            ("trash_retention",),
+            ("wait_reconcile",),
+        ]
         assert await db_owner.fetchall(
             "SELECT id FROM task_execution_log WHERE agent_id = ?", (agent_id,)
         ) == [("reused-builtin-execution",)]
