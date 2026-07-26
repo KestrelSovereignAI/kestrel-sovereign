@@ -69,6 +69,7 @@ the following; `null` is permitted only where explicitly stated.
 | Field | Type / invariant |
 |---|---|
 | `assertion_id` | Deterministic `urn:kestrel:assertion:sha256:<64 lowercase hex>` identity defined below. It is never recycled or reassigned. |
+| `identity_version` | Required immutable identity grammar/version, initially `kestrel-assertion-id-v1`. It names the complete preimage term algebra, IRI profile, and literal-normalization contract; the digest is never interpreted without it. |
 | `revision_id` | Generated immutable identifier (UUIDv7 or ULID) for this revision. It is not content identity. |
 | `tenant_id` | Required immutable isolation scope, normalized by the exact opaque-ID rules below. Every read, write, inference, index, export, and deletion query is tenant-filtered before any semantic filtering. |
 | `owning_agent_id` | Required agent DID/identity within the tenant. It is an ownership and audit field, not an authorization bypass. |
@@ -84,16 +85,17 @@ the following; `null` is permitted only where explicitly stated.
 | `status` and `supersedes_revision_id` | Status is `active`, `superseded`, `retracted`, `quarantined`, or `deleted`. A superseding revision points to the immediately prior revision; an active assertion has at most one current active revision. |
 | `visibility` and `privacy_classification` | `visibility` is `private`, `tenant`, `delegated`, or `public`, with an explicit release policy reference. `privacy_classification` is a policy label such as `ephemeral`, `isolated`, `anonymous`, `deidentified`, `normal`, `public`, or a stricter domain label. The effective policy is the more restrictive one. |
 | `ontology_version` | Required immutable `OntologyRef(namespace, version, content_digest, compatibility_profile)`. It identifies the vocabulary/shapes interpretation used to accept the revision. |
+| `iri_profile` | Required immutable IRI canonicalization profile, initially `iri-normalization-v1-rfc3986-200501`. It is the exact algorithm that produced every IRI identity term before hashing. |
 | `literal_profile` | Required immutable, selected literal canonicalization profile (initially `literal-v1-xsd11-20120405`). It is the exact profile that normalized the literal before identity hashing and acceptance; it is never inferred from the installed RDF/XSD library. |
 | `derivation_lineage` | Required structured lineage: `direct` source occurrence(s), or `derived` rule/engine/profile version, input assertion revision IDs, input ontology/shapes digests, run ID, and generation time. It is a DAG; cycles are rejected. |
 
 The canonical store additionally records actor, operation ID/idempotency key,
-reason code, a structured validation outcome (including selected literal
-profile and validation snapshot), and retention/erasure metadata. Those audit
-fields do not alter assertion identity. The literal profile is an
-acceptance/normalization pin rather than a separate identity field: an
-`identity_version` change is still required if a future profile changes the
-term algebra or the identity preimage grammar.
+reason code, a structured validation outcome (including selected IRI/literal
+profiles and validation snapshot), and retention/erasure metadata. Those audit
+fields do not alter assertion identity. The IRI and literal profile names are
+acceptance/normalization pins rather than extra preimage members: a changed
+profile always requires an `identity_version` change when it can change any
+identity-term value, term algebra, or identity preimage grammar.
 
 ### Invariants
 
@@ -221,12 +223,14 @@ that already-resolved tenant, but it is deliberately not an identity field.
 
 ### Normalization rules
 
-1. The input adapter resolves relative IRIs against a declared base before the
-   canonical boundary. Canonical terms are absolute IRIs. IRI comparison follows
-   RDF's simple string equality; Kestrel only applies the documented minting
-   normalization (Unicode NFC, lowercase scheme/host, no default port,
-   normalized percent escapes, and no dot segments) before hashing. It does not
-   silently equate arbitrary different IRIs.
+1. Every IRI identity term uses exactly
+   `iri-normalization-v1-rfc3986-200501`, the closed ASCII URI subset of RDF
+   1.1 IRI terms defined in this section. Its normative algorithm source is
+   [RFC 3986, *Uniform Resource Identifier (URI): Generic Syntax*, January
+   2005](https://www.rfc-editor.org/rfc/rfc3986.html), sections 3, 5.2.4, and
+   6.2.2. The profile registry pins that dated RFC artifact and its SHA-256;
+   no URL-library, RDF-library, browser, DNS, redirect, or "latest" IRI
+   behavior is part of the contract.
 2. Subjects and predicates must be IRIs. Objects are IRIs or typed literals.
    Imported blank nodes are rejected for assertion identity unless the importer
    mints a deterministic, source-scoped skolem IRI and records that mapping in
@@ -244,6 +248,71 @@ that already-resolved tenant, but it is deliberately not an identity field.
 6. Imported RDF dataset digests use the pinned RDF Dataset Canonicalization
    algorithm only for source evidence and reproducibility. They do not replace
    Kestrel assertion identity, which must work for non-RDF inputs too.
+
+#### IRI profile `iri-normalization-v1-rfc3986-200501`
+
+This profile is deliberately narrower than the RDF 1.1 IRI space so different
+implementations cannot hash different Unicode/IDNA or URI-library outputs. Its
+canonical output is an absolute ASCII URI, which is also a valid RDF IRI. An
+adapter may resolve a relative source IRI against its declared source base, but
+the resolved result must then pass this complete profile before it reaches the
+canonical boundary. The profile never dereferences a term or resolves a name;
+it also does not translate an internationalized IRI into another spelling.
+
+The algorithm is exact:
+
+1. Reject a non-string, a string containing a surrogate, C0/C1 control,
+   whitespace, or a non-ASCII code point, an invalid `%` escape, or a value
+   without an RFC 3986 scheme (`ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
+   ":"`). This is an `unsupported_iri_form` pre-publication outcome; callers
+   that need an internationalized source term must quarantine it as evidence
+   until a future IRI profile defines its exact conversion and fixtures. A
+   source adapter may not invent that conversion before proposing a v1 term.
+2. Parse the remaining ASCII value with RFC 3986's generic grammar. Lowercase
+   the scheme. When an authority is present, split it into user-info, raw host,
+   and raw port; the raw host must be a valid RFC 3986 `IP-literal`,
+   `IPv4address`, or `reg-name`. Preserve user-info byte-for-byte. **Do not
+   lowercase the host yet**: a `reg-name` can contain an unreserved percent
+   escape whose decoded ASCII letter must participate in host lowercasing. An
+   IPv4 address is not numerically reinterpreted. An empty port, a non-decimal
+   port, or a port outside `0`–`65535` is rejected. Render an accepted port
+   without leading zeroes.
+3. Normalize every percent escape to uppercase hex. Decode an escape only when
+   it encodes an RFC 3986 *unreserved* ASCII octet
+   (`ALPHA`, `DIGIT`, `-`, `.`, `_`, or `~`). Never decode an escaped reserved
+   character, `%`, or non-ASCII octet. Do this in user-info, host, path, query,
+   and fragment before the next step. For a `reg-name` host, then lowercase
+   every ASCII letter in the decoded-and-normalized host; for a validated
+   `IP-literal`, lowercase its ASCII letters after this escape processing. Thus
+   `%45XAMPLE.test` becomes `example.test`, not `Example.test`. This host step
+   is complete before default-port handling or serialization.
+4. Apply RFC 3986 section 5.2.4 `remove_dot_segments` exactly once to the
+   normalized path. Do not add or remove a trailing slash, reorder query
+   parameters, change query/fragment case, decode reserved escapes, apply IDNA,
+   normalize an IPv4 address, or make any scheme-specific rewrite.
+5. Omit the normalized port only for this fixed table: `http` → `80`, `https`
+   → `443`, `ws` → `80`, `wss` → `443`, and `ftp` → `21`. Retain every other
+   port, including the same numeric value under an unlisted scheme. Serialize
+   the normalized components with RFC 3986 delimiters. That serialization is
+   the IRI value used in the assertion-ID preimage.
+
+The profile fixture corpus is normative. At minimum it contains these vectors
+and asserts both its output string and its assertion-ID preimage bytes:
+
+| Fixture | Input | Required result |
+|---|---|---|
+| `iri-v1-http-normalize` | `HTTP://Example.COM:080/a/./b/../%7Ealice?q=%7e%2f#F%2a` | `http://example.com/a/~alice?q=~%2F#F%2A` |
+| `iri-v1-https-dot-port` | `https://EXAMPLE.com:0443/%2e%2E/a` | `https://example.com/a` |
+| `iri-v1-host-percent-equivalence` | Pair: `HTTP://%45XAMPLE.test/a`; `http://example.test/a` | Both normalize to `http://example.test/a`; when substituted into the same fixed assertion fixture, the RFC 8785 UTF-8 assertion-ID preimage bytes are identical. |
+| `iri-v1-unlisted-port` | `did:Example:agent:443` | `did:Example:agent:443` |
+| `iri-v1-reject-unicode-host` | `https://exämple.test/a` | reject: `unsupported_iri_form` |
+| `iri-v1-reject-bad-port` | `https://example.test:65536/a` | reject: `unsupported_iri_form` |
+| `iri-v1-reject-bad-escape` | `https://example.test/%zz` | reject: `unsupported_iri_form` |
+
+The first implementation must add these and adversarial variants as executable
+fixtures. Any altered parsing rule, default-port table, output grammar, or
+accepted Unicode/IRI mapping is a new `iri_profile` and identity-version
+migration; it may not be silently substituted under this profile.
 
 ### Literal canonicalization profile `literal-v1-xsd11-20120405`
 
@@ -281,7 +350,15 @@ a supported datatype is `invalid_literal_lexical_form`. Both are record-level
 quarantine outcomes. They create no canonical assertion, `assertion_id`,
 revision, outbox event, projection, inference result, or training candidate.
 Adding a datatype is a new named profile with canonical fixtures and a
-compatibility decision, never a library-dependent fallback.
+compatibility decision, never a library-dependent fallback. For
+`semantic-kb-v1`, it also requires a **new `identity_version`**: the
+`literal_profile` is not itself in the preimage, so a profile change that can
+change any normalized datatype, language, or lexical value must never mint an
+indistinguishable v1 identity. No alternative literal profile is v1-compatible,
+including one that merely expands the accepted datatype set. A future contract
+may prove byte-identical normalization for an explicit compatibility relation,
+but it still uses a new identity version unless that relation is part of a new,
+reviewed identity contract and its conformance corpus.
 
 ### Canonical term algebra and RDF 1.2 boundary
 
@@ -494,9 +571,10 @@ flowchart LR
     I["Evidence input\nconversation · saved item · RAG document · import · tool"]
     G["Governed invocation\nwrite · read · export · system work"]
     C["Trusted capability resolver\nopaque tenant · purpose · privacy/retention decision"]
-    P["Writer gate\nnormalize + unpublished proposal"]
-    V["Required validation\nversioned tenant snapshot + selected profile"]
-    B["Atomic import / system batch gate\nvalidate all mutations or publish none"]
+    P["Writer gate\nnormalize + unpublished candidate"]
+    BI["Stage import batch\ncomplete fixed scope; no canonical rows"]
+    BS["Stage system batch\ncomplete fixed scope; no canonical rows"]
+    V["Required post-state validation\nversioned snapshot + full tentative graph"]
     W[("Semantic Assertion Store\ncanonical revision + outbox")]
     F["Infer\nRDFS / allowlisted OWL 2 RL"]
     X["Indexes\nproperty graph · RDF · BM25/vector"]
@@ -506,16 +584,19 @@ flowchart LR
     Q["Tenant-private quarantine / rejection report\nno canonical ID, revision, or outbox"]
     D["Record deferred/failed run\nno partial derived facts"]
 
-    I --> G --> C --> P --> V
+    I --> G --> C --> P
     W -->|versioned tenant snapshot| V
-    V -->|accepted foreground proposal| W
-    V -->|accepted import batch member| B
-    V -->|reject, timeout, or profile failure| Q
+    P -->|one foreground mutation| V
+    P -->|complete import batch| BI -->|full tentative post-state| V
+    BS -->|full tentative post-state| V
+    V -->|accepted conditional commit; then outbox| W
+    V -->|foreground/import rejection, timeout, or profile failure| Q
+    V -->|system-batch rejection, timeout, or profile failure| D
     W -->|committed outbox| X --> R
     G --> C --> R
     W -->|change set / checkpoint| G
-    C -->|system inference context| F --> B --> W
-    C -->|system maintenance context + lease token| S --> B
+    C -->|system inference context| F --> BS
+    C -->|system maintenance context + lease token| S --> BS
     F -->|bounded failure| D
     S -->|bounded failure| D
     C -->|single-use export context| T
@@ -538,53 +619,92 @@ validation profile before canonical publication. Only an accepted proposal is
 allowed to receive a durable canonical revision, current-pointer update,
 source-occurrence linkage, or outbox event.
 
-Required validation is bound to what is committed; a report from an old view is
-never reusable. The writer first obtains a read-only
-`SemanticValidationSnapshot` for the context's tenant, containing a monotonic
-`tenant_generation`, canonical-data digest, selected shapes/ontology/literal
-profile pins, and validation scope. It validates the proposal against that
-exact snapshot. It then conditionally commits the revision, all current-pointer
-changes, the new generation, and its outbox rows in one transaction only if the
-tenant generation still equals the validated generation. A failed conditional
-write is `validation_conflict`: it publishes nothing, obtains a fresh snapshot,
+Required validation is bound to exactly what is committed; a report from an old
+view or from one member of a group is never reusable. The writer first obtains a
+read-only
+`SemanticValidationSnapshot` for the context's tenant. The snapshot and the
+verified validation grant carry the same immutable
+`ResolvedSemanticValidationContract`: the tenant, validation scope, and exact
+identity, IRI, literal, **validation**, shapes, and ontology profile pins
+selected by the resolver. `validation_profile` identifies the selected SHACL
+implementation/feature profile (not just the shapes it happens to load), and
+`validation_artifact_pins` identify its dated, digested implementation and any
+profile-defining artifacts. It then materializes a writer-created,
+`GenerationPinnedSemanticValidationView`: a read-only, immutable view of the
+**entire resulting canonical graph** at that generation with the complete
+tentative changes overlaid. The view can expose an implementation's native
+records, but must also materialize the full deterministic validation dataset
+used by SHACL; it must not lazily reread an advancing canonical store. For a
+foreground transition it contains the snapshot graph plus the one requested
+mutation. For an import or system batch it contains the **entire fixed
+scope**—all candidate assertions, supersessions, retractions, and
+current-pointer effects. The authoritative SHACL/profile validator receives
+that view, its snapshot, and its tentative-post-state digest, not a change set
+or one proposal at a time. Diagnostics may be per-record, but they are never a
+publication decision.
+
+The writer conditionally commits only the validated complete post-state:
+revisions, all current-pointer changes, the new generation, capability-use
+record, and outbox rows share one transaction and commit only if the tenant
+generation still equals the validated generation. Before treating a report as
+accepted, the writer verifies all of the following exact matches: the view's
+generation, canonical-data digest, and `ResolvedSemanticValidationContract`
+equal the supplied snapshot; the view's post-state digest equals the staged
+post-state digest; and the report's snapshot, post-state digest, and immutable
+contract equal both that view and the resolver-selected contract in the
+verified grant. Equality includes the contract's tenant/scope, identity version
+and pins, IRI profile and pins, literal profile and pins, **validation profile
+and pins**, and shapes/ontology pins. Any mismatch is
+`validation_binding_mismatch`,
+publishes nothing, and is never repaired by trusting the validator's preferred
+profile. A failed conditional write is `validation_conflict`: it publishes
+nothing, obtains a fresh snapshot,
 and retries within the operation's bounded retry/time budget. An implementation
 may instead use serializable isolation or equivalent tenant/profile locks for
 the validation and commit, but it must retry a serialization conflict and
-provide the same no-stale-validation guarantee. This protects SHACL
-cardinality, disjointness, and every other cross-assertion constraint from two
-individually valid concurrent writes. An accepted validation report persists its
-snapshot, post-commit generation, selected literal profile, and all profile
-pins with the revision. Every canonical transition that can change a later
-validation result—including accepted writes, supersession, retraction,
-quarantine, and erasure—advances that tenant generation in its own atomic
-transaction before its outbox event becomes visible.
+provide the same no-stale-validation guarantee. Thus two individually plausible
+proposals that jointly violate `sh:maxCount 1`, disjointness, or any other
+cross-assertion constraint cannot each publish. An accepted validation report
+persists its snapshot, tentative-post-state digest, post-commit generation, and
+immutable selected contract with the committed revisions.
+Every canonical transition that can change a later validation result—including
+accepted writes, supersession, retraction, quarantine, and erasure—advances
+that tenant generation in its own atomic transaction before its outbox event
+becomes visible.
 
 Inference and sleep never write derived rows directly. After the resolver has
 minted their distinct system capability, the reasoner or maintenance planner
 returns a bounded `SemanticWriteBatch`: every derived proposal includes its
 complete support set and rule/profile proof, while every maintenance transition
 names its expected current revision. `AssertionWriter.commit_batch()` verifies
-the **system-only** capability and each proof, validates every member against
-one conditional tenant generation, and commits **all** revisions, pointer
-changes, lineage, capability-use record, and outbox events in one
-transaction—or commits none of them. `propose()` verifies only the foreground
-operation kind and therefore rejects a system context even when the private
-capability implementation shares signing code. A validation, fencing, budget,
-or conditional-generation failure returns no partially published derived or
-maintenance facts. A sleep retraction/quarantine is likewise a batch writer
-state-transition command with tenant/current-pointer checks. Projectors receive
-committed events only and cannot mutate canonical state.
+the **system-only** capability and each proof, then validates the one full
+tentative post-state made from every batch mutation against one conditional
+tenant generation. It commits **all** revisions, pointer changes, lineage,
+capability-use record, and outbox events in one transaction—or commits none of
+them. `propose()` verifies only the foreground operation kind and therefore
+rejects a system context even when the private capability implementation shares
+signing code. A validation, fencing, budget, or conditional-generation failure
+returns no partially published derived or maintenance facts. A sleep
+retraction/quarantine is likewise a batch writer state-transition command with
+tenant/current-pointer checks. Projectors receive committed events only and
+cannot mutate canonical state.
 
-A rejection, required-profile failure, timeout, or validator error produces a
-tenant-private pre-publication quarantine/rejection artifact, subject to the
-same privacy and retention gate as the source. It has no canonical
-`assertion_id`, `revision_id`, current pointer, source occurrence, or outbox
-event. A transient calculation used only to validate a proposal must not be
+A rejection, required-profile failure, timeout, or validator error for a
+foreground proposal or import produces a tenant-private pre-publication
+quarantine/rejection artifact, subject to the same privacy and retention gate
+as the source. It has no canonical `assertion_id`, `revision_id`, current
+pointer, source occurrence, or outbox event. The same failure for an inference
+or sleep **system batch** instead returns and durably records a `deferred` or
+`failed` `AssertionBatchWriteReceipt`, with a bounded run-report reference and
+optional resumable-cursor reference, and no partial derived or maintenance
+facts; it does not turn each generated proposal into a foreground/import
+quarantine record. A transient calculation used only to validate a proposal must not be
 persisted or logged as an assertion identity. In `EPHEMERAL` and currently
-fail-closed `DEIDENTIFIED` contexts, even that quarantine artifact may not be
-durable. `status=quarantined` is reserved for a previously accepted canonical
-revision later hidden pending revalidation or recomputation; it cannot be used
-to smuggle an initial required-profile failure into the canonical store.
+fail-closed `DEIDENTIFIED` contexts, even a foreground/import quarantine
+artifact may not be durable. `status=quarantined` is reserved for a previously
+accepted canonical revision later hidden pending revalidation or recomputation;
+it cannot be used to smuggle an initial required-profile failure into the
+canonical store.
 
 ## Standards and compatibility matrix
 
@@ -599,15 +719,15 @@ or an undated moving URL as a compatibility contract.
 | XML Schema 1.1 Part 2: Datatypes | W3C Recommendation, [5 April 2012](https://www.w3.org/TR/2012/REC-xmlschema11-2-20120405/datatypes.html) | The dated, digest-pinned normative source for the closed `literal-v1-xsd11-20120405` profile; the profile deliberately accepts fewer types than XSD/RDF permit. | Stable, tightly allowlisted |
 | RDF Schema 1.1 | W3C Recommendation, [25 February 2014](https://www.w3.org/TR/2014/REC-rdf-schema-20140225/) | Allowed vocabulary/modeling and bounded RDFS entailment profile. No implicit remote vocabulary fetch. | Stable baseline |
 | RDF Dataset Canonicalization | W3C Recommendation, [21 May 2024](https://www.w3.org/TR/2024/REC-rdf-canon-20240521/) | Optional source-dataset digest/canonicalization for signed or reproducible RDF imports/exports. | Stable optional capability |
-| RDF 1.2 Concepts | Current W3C [Candidate Recommendation Snapshot, 07 April 2026](https://www.w3.org/TR/2026/CR-rdf12-concepts-20260407/); the corresponding [N-Triples syntax is a Working Draft dated 23 July 2026](https://www.w3.org/TR/2026/WD-rdf12-n-triples-20260723/) and the latest Recommendation remains RDF 1.1 | Negotiated, snapshot-pinned **transport-recognition** capability only. RDF 1.1-representable terms may be imported/exported under the exact syntax pin; RDF 1.2 triple terms and directional language-tagged strings are rejected/quarantined by the `semantic-kb-v1` canonical boundary as specified above. RDF 1.2 is not the persisted baseline. | Experimental, opt-in; term extension deferred |
+| RDF 1.2 Concepts | Current W3C [Candidate Recommendation Snapshot, 07 April 2026](https://www.w3.org/TR/2026/CR-rdf12-concepts-20260407/); its latest published [N-Triples syntax is a Working Draft dated 15 May 2026](https://www.w3.org/TR/2026/WD-rdf12-n-triples-20260515/), while the latest Recommendation remains RDF 1.1 | Negotiated, snapshot-pinned **transport-recognition** capability only. RDF 1.1-representable terms may be imported/exported under the exact syntax pin; RDF 1.2 triple terms and directional language-tagged strings are rejected/quarantined by the `semantic-kb-v1` canonical boundary as specified above. RDF 1.2 is not the persisted baseline. | Experimental, opt-in; term extension deferred |
 | OWL 2 and OWL 2 RL | OWL 2 Overview and [Profiles](https://www.w3.org/TR/2012/REC-owl2-profiles-20121211/), W3C Recommendations, [11 December 2012](https://www.w3.org/TR/2012/REC-owl2-overview-20121211/) | Only the explicit `owl2rl-kestrel-v1` rule allowlist below may run. No OWL DL/full reasoner, arbitrary imports, `owl:sameAs` global merging, or open-ended rule execution. **OWL has no claimed upcoming 1.2 revision.** | Stable, tightly allowlisted |
 | SHACL Core | W3C Recommendation, [20 July 2017](https://www.w3.org/TR/2017/REC-shacl-20170720/) | Required validation baseline. Shapes are pinned, tenant-scoped schema data; results are reports. | Stable baseline |
-| SHACL 1.2 Core and SPARQL extensions | Current W3C Working Drafts, [Core 23 July 2026](https://www.w3.org/TR/2026/WD-shacl12-core-20260723/) and [SPARQL extensions 24 July 2026](https://www.w3.org/TR/2026/WD-shacl12-sparql-20260724/); latest Recommendation remains SHACL 2017 | Sandboxed, snapshot-pinned experiments only. No draft feature participates in a default acceptance, authorization, or destructive workflow. | Experimental, opt-in |
+| SHACL 1.2 Core and SPARQL extensions | Current W3C Working Drafts, [Core 2 June 2026](https://www.w3.org/TR/2026/WD-shacl12-core-20260602/) and [SPARQL extensions 30 January 2026](https://www.w3.org/TR/2026/WD-shacl12-sparql-20260130/); latest Recommendation remains SHACL 2017 | Sandboxed, snapshot-pinned experiments only. No draft feature participates in a default acceptance, authorization, or destructive workflow. | Experimental, opt-in |
 | SPARQL 1.1 Query Language | W3C Recommendation, [21 March 2013](https://www.w3.org/TR/2013/REC-sparql11-query-20130321/) | Optional read-only query capability over a tenant-filtered canonical/projection view. | Stable optional capability |
-| SPARQL 1.2 Query Language | Current W3C Working Draft, [25 June 2026](https://www.w3.org/TR/2026/WD-sparql12-query-20260625/); latest Recommendation remains SPARQL 1.1 | Read-only, budgeted experimental query profile against a tenant-filtered view. Updates, `SERVICE`, filesystem/network functions, and arbitrary functions are forbidden. | Experimental, opt-in |
+| SPARQL 1.2 Query Language | Current W3C Working Draft, [5 June 2026](https://www.w3.org/TR/2026/WD-sparql12-query-20260605/); latest Recommendation remains SPARQL 1.1 | Read-only, budgeted experimental query profile against a tenant-filtered view. Updates, `SERVICE`, filesystem/network functions, and arbitrary functions are forbidden. | Experimental, opt-in |
 | SKOS | W3C Recommendation, [18 August 2009](https://www.w3.org/TR/2009/REC-skos-reference-20090818/) | Controlled concepts, labels, mappings, and vocabularies; labels never become identifier normalization rules. | Stable optional vocabulary |
 | PROV-O | W3C Recommendation, [30 April 2013](https://www.w3.org/TR/2013/REC-prov-o-20130430/) | RDF projection of source occurrence and derivation lineage, not a substitute for Kestrel's transactional lineage tables. | Stable optional vocabulary |
-| OWL-Time | W3C Recommendation, [19 October 2017](https://www.w3.org/TR/2017/REC-owl-time-20171019/); the mutable [/TR/owl-time/ page](https://www.w3.org/TR/owl-time/) currently resolves to a Candidate Recommendation Draft | RDF projection of valid/observed temporal intervals. The dated Recommendation is the only baseline pin. | Stable optional vocabulary |
+| OWL-Time | W3C Recommendation, [19 October 2017](https://www.w3.org/TR/2017/REC-owl-time-20171019/); the mutable [/TR/owl-time/ page](https://www.w3.org/TR/owl-time/) currently identifies itself as a non-Recommendation Public Draft | RDF projection of valid/observed temporal intervals. The dated Recommendation is the only baseline pin. | Stable optional vocabulary |
 
 ### OWL 2 RL allowlist
 
@@ -640,38 +760,47 @@ or widen that selected profile after resolution:
 
 ```text
 contract_version: "semantic-kb-v1"
+identity_version: "kestrel-assertion-id-v1"
 rdf_profile: "rdf11" | "rdf12-cr-20260407"
 term_profile: "assertion-term-v1-rdf11-subset"
+iri_profile: "iri-normalization-v1-rfc3986-200501"
 literal_profile: "literal-v1-xsd11-20120405"
 serialization: "turtle-20140225" | "nquads-20140225" | ...
 reasoning_profile: "none" | "rdfs-v1" | "owl2rl-kestrel-v1"
-validation_profile: "shacl-core-20170720" | "shacl12-core-20260723-experimental"
-query_profile: "none" | "sparql11-readonly" | "sparql12-20260625-experimental"
+validation_profile: "shacl-core-20170720" | "shacl12-core-20260602-experimental"
+query_profile: "none" | "sparql11-readonly" | "sparql12-20260605-experimental"
 artifact_pins: [{uri, published_date, sha256}]
 ```
 
-The resolver's selected profile includes an explicit `literal_profile`, all
-artifact pins, and a capability decision. `literal_profile` is mandatory even
-for an IRI-object record: it pins the complete canonicalization environment for
-the batch and prevents an implementation from silently selecting its installed
-XSD/RDF library's behavior. For `semantic-kb-v1`, the only accepted value is
+The resolver's selected profile includes an explicit `identity_version`,
+`iri_profile`, `literal_profile`, all artifact pins, and a capability decision.
+`literal_profile` is mandatory even for an IRI-object record: it pins the
+complete canonicalization environment for the batch and prevents an
+implementation from silently selecting its installed XSD/RDF library's
+behavior. For `semantic-kb-v1`, the only accepted value is
 `literal-v1-xsd11-20120405`, and the receiver returns the dated XSD 1.1 Part 2
-artifact pin with it. The selected literal profile is persisted in every
-accepted revision and validation outcome, together with its snapshot; it is not
+artifact pin with it. The selected identity version, IRI profile, literal
+profile, and their respective artifact pins are persisted in every accepted
+revision and validation outcome, together with its snapshot; none is
 represented only by a generic artifact list. A new datatype/canonicalization
-profile requires a new named `literal_profile`, compatibility assessment,
-migration path, and conformance fixtures before negotiation can select it.
+profile requires a new named `literal_profile`, a **new `identity_version`**,
+compatibility assessment, migration path, and conformance fixtures before
+negotiation can select it. V1 cannot reuse its identity version for an alternate
+literal profile, because no alternate profile is permitted to prove it cannot
+change an identity-term value.
 
 For `semantic-kb-v1`, the selected `term_profile` is always
 `assertion-term-v1-rdf11-subset`, even when the source serialization is RDF
 1.2; the receiver reports `unsupported_rdf12_term` per record rather than
-claiming that an RDF 1.2 syntax profile made the term representable. A missing,
-unknown, undated, digest-mismatched, or disallowed profile fails closed; it is
-never silently upgraded to “latest.” Draft-to-draft or draft-to-Recommendation
-changes require a new named profile, migration assessment, and dual-read/export
-period. A persisted assertion always names the ontology profile that
-interpreted it and the literal profile that normalized it, even if a later
-profile is selected for retrieval.
+claiming that an RDF 1.2 syntax profile made the term representable. The
+selected `iri_profile` is likewise mandatory and is the only IRI normalizer
+that may feed the identity preimage. A missing, unknown, undated,
+digest-mismatched, or disallowed profile fails closed; it is never silently
+upgraded to “latest.” Draft-to-draft or draft-to-Recommendation changes require
+a new named profile, migration assessment, and dual-read/export period. A
+persisted assertion always names the ontology profile that interpreted it and
+the IRI/literal profiles that normalized it, even if a later profile is selected
+for retrieval.
 
 ## Lifecycle: correction, deletion, inference, import, vectors, and training
 
@@ -756,33 +885,43 @@ projection version, and the minimum routing metadata; it never carries an
 assertion/revision ID, source locator, digest, identity preimage, or target
 selector. The outbox transport is not trusted merely because it delivered an
 event. Before a worker can resolve targets, the authenticated projection
-dispatcher mints an opaque, short-lived `ErasureProjectionContext` for that
+dispatcher mints both an opaque, short-lived `ErasureProjectionContext` and a
+resolver-verifiable, channel-bound `AuthenticatedProjectionPeerProof` for that
 delivery over the projection service's authenticated service-to-service channel
 (for example, a mutually authenticated channel whose peer identity is verified
-by the dispatcher). The context is not placed in the event and is not a
-caller-supplied `ProjectionServiceIdentity`; its protected claims bind the
-exact `erasure_job_id`, event ID, projection version, authenticated projector
-principal, semantic-resolver audience, attempt/work-lease binding, and expiry.
+by the dispatcher). Neither is placed in the event and neither accepts a
+caller-supplied `ProjectionServiceIdentity`; together their protected claims
+bind the exact `erasure_job_id`, event ID, projection version, authenticated
+projector principal, semantic-resolver audience, delivery ID, attempt/work
+lease, channel binding, and expiry.
 
-The projector passes that context to the access-controlled
-`ErasureJobResolver`; the resolver independently verifies its issuer,
-signature/MAC, authenticated transport peer, audience, expiry, exact job/event/
-projection binding, and single-attempt use before returning only that
-projection's private deletion work plan. It consumes the resolution attempt in
-the same private work-lease transaction that records the plan handoff. A retry
-receives a freshly minted context bound to the same idempotency key and a new
-attempt lease; a captured old context cannot resolve another plan. This is the
+The projector passes both the context and peer proof to the access-controlled
+`ErasureJobResolver` for plan resolution **and** completion acknowledgement.
+The resolver independently verifies their issuer, signature/MAC, exact
+authenticated transport peer and channel binding, audience, expiry, exact
+job/event/projection/delivery/attempt binding, and single-attempt use before
+returning only that projection's private deletion work plan **and a one-time
+completion token**. It consumes the resolution attempt in the same private
+work-lease transaction that records the plan handoff. A retry receives freshly
+minted context and peer proof bound to the same idempotency key and a new
+attempt lease; a captured old pair cannot resolve another plan. This is the
 sole mapping-resolver interface. A projector cannot enumerate jobs, obtain
 another projection's targets, or retain the work plan after it acknowledges
-completion. Acknowledgement also derives the projector identity from that
-authenticated channel—never from a caller argument—and is accepted only for
-the active leased work record.
+completion. Completion presents the original per-delivery context, peer proof,
+and resolver-issued token. The resolver atomically verifies and consumes that
+exact active leased delivery, records the projection completion, and returns a
+resolver-issued, delivery-bound `ErasureProjectionCompletionReceipt`. The
+dispatcher independently verifies that receipt before it may acknowledge its
+lease. The resolver derives the projector identity from the verified peer proof
+and authenticated channel—never from a caller argument—and accepts completion
+only for the active leased work record.
 
 Erasure projection acknowledgement and retry idempotency use the unique key
 `(erasure_job_id, projection_version)`, not `(revision_id, projection_version)`.
-The same key records an in-progress lease/fencing token and the durable success
-receipt, so a redelivered opaque event either resumes safely or returns the
-already-recorded acknowledgement. Regular assertion projection events retain
+The same key records an in-progress lease/fencing token, the resolver-issued
+completion receipt, and the dispatcher's verified delivery acknowledgement, so
+a redelivered opaque event either resumes safely or returns the already-recorded
+acknowledgement. Regular assertion projection events retain
 their `(revision_id, projection_version)` key. The erasure-job mapping remains
 until every required projection acknowledgement, cache/index identity sweep,
 export/training cleanup, and backup/replica/WAL outcome is durably recorded.
@@ -825,28 +964,37 @@ selected snapshot-pinned profile, and one `import_operation_id` into the
 context. The staged importer re-parses the exact bytes and rejects the entire
 operation if its computed manifest differs from the protected scope. It then
 resolves terms against the selected term profile; derives
-tenant/privacy/retention policy from the context; and validates every
-unpublished candidate against a versioned tenant snapshot. The preflight is
-not a semantic write and, especially in `EPHEMERAL` or fail-closed
-`DEIDENTIFIED`, leaves no stored source, canonical identity, quarantine, or
-semantic audit artifact. The importer submits the complete
-`SemanticImportBatch` only to `commit_import_batch()`.
+tenant/privacy/retention policy from the context; and stages every unpublished
+candidate and declared noncanonical record outcome. The preflight is not a
+semantic write and, especially in `EPHEMERAL` or fail-closed `DEIDENTIFIED`,
+leaves no stored source, canonical identity, quarantine, or semantic audit
+artifact. The importer submits the complete `SemanticImportBatch` only to
+`commit_import_batch()`.
 
 The batch has an explicit final outcome for every scoped record: accepted
 candidate, governed rejection, or allowed tenant-private quarantine. A
-structural/profile/required-validation failure for one record never creates a
-canonical row or event for that record; it is not silently omitted or retried
-as an unscoped fragment. Once all per-record outcomes are known, one
-conditional transaction writes every accepted canonical revision, occurrence
-link, capability-use record, final aggregate receipt, and accepted-record
-outbox event—or writes none of those canonical effects. It may write the
-already-authorized noncanonical quarantine outcomes in that same transaction.
-An operational, fencing, budget, or conditional-generation failure records no
-final aggregate receipt and retries the entire fixed scope; it can never
-publish a prefix of accepted records. A replay returns the stored aggregate
-receipt, including every record's opaque final disposition. A one-record import
-may use the same batch interface; ordinary `SemanticWriteContext` is reserved
-for a single interactive proposal.
+structural/profile failure for one record never creates a canonical row or
+event for that record; it is not silently omitted or retried as an unscoped
+fragment. After excluding those declared noncanonical records, the writer
+builds **one full tentative post-state graph** from every remaining candidate
+and every requested transition in the fixed scope. It validates that graph
+once against the versioned snapshot. If a required profile rejects that graph,
+the batch's candidate set is rejected/quarantined as a whole: no member may be
+published merely because it was valid against the pre-commit snapshot. This
+includes two source records that independently satisfy `sh:maxCount 1` but
+would violate it together.
+
+Only a passing full post-state permits one conditional transaction to write
+every accepted canonical revision, occurrence link, capability-use record,
+final aggregate receipt, and accepted-record outbox event—or to write none of
+those canonical effects. It may write already-authorized noncanonical
+quarantine outcomes in that same transaction. An operational, fencing, budget,
+or conditional-generation failure records no final aggregate receipt and
+retries the entire fixed scope; it can never publish a prefix of accepted
+records. A replay returns the stored aggregate receipt, including every
+record's opaque final disposition. A one-record import may use the same batch
+interface; ordinary `SemanticWriteContext` is reserved for a single interactive
+proposal.
 
 Imports must preserve source-occurrence provenance and must not import another
 tenant's assertion ID as authoritative. Under
@@ -944,10 +1092,10 @@ assertion, export, deletion, or training job.
 | Operation | Bound and failure result |
 |---|---|
 | Import | Enforce byte, triple/assertion, nesting, blank-node, parse-time, and transaction-size limits before acceptance. A structural/profile/tenant/privacy failure commits no canonical rows. An RDF 1.2 triple term or directional language-tagged string produces the record-level `unsupported_rdf12_term` pre-publication quarantine outcome; it has no canonical identity and is not active, inferred, indexed, exported, or trainable. Other record-level semantic failures use the same tenant-private quarantine boundary. |
-| Validation | Run against a named `SemanticValidationSnapshot` (tenant generation, canonical-data digest, profile pins, and scope) with time, recursion, and result caps. The writer conditionally commits only against that generation, and retries a `validation_conflict` from a fresh snapshot. Required-profile timeout/error returns `validation_unavailable` and leaves a newly proposed assertion in the noncanonical quarantine boundary; it never treats “validator unavailable” as conformant or emits a canonical event. Informational validation is explicitly labeled and cannot decide acceptance. |
+| Validation | Run against a named `SemanticValidationSnapshot` and its writer-created, read-only `GenerationPinnedSemanticValidationView` (full materialized post-state, tenant generation, canonical-data digest, and immutable `ResolvedSemanticValidationContract`) with time, recursion, and result caps. The writer rejects a report unless its snapshot, post-state digest, and complete immutable contract exactly match the view and verified validation grant; that equality covers tenant/scope and every identity/IRI/literal/**validation**/shapes/ontology profile name and pin. It conditionally commits only against that generation and retries a `validation_conflict` from a fresh snapshot. Required-profile timeout/error on a foreground/import proposal returns `validation_unavailable` and leaves it in the noncanonical quarantine boundary; the same failure for an inference or sleep system batch returns a `deferred`/`failed` receipt with `SystemBatchRunReport` and no partial facts. Neither path treats “validator unavailable” as conformant or emits a canonical event. Informational validation is explicitly labeled and cannot decide acceptance. |
 | Inference | Allowlisted deterministic rules only, with depth, derived-row, memory, and wall-clock budgets. The reasoner runs only under a resolver-minted system context bound to the tenant, change set, rule/profile pins, and run budget. A completed inference batch returns derived proposals with complete support sets; the writer validates and conditionally commits the entire batch, its capability-use record, and its outbox events through the atomic canonical path, or commits no new derived assertions and records a failed/deferred run. Existing valid derived revisions remain readable until a support change requires hiding them. |
 | Projection/index | Canonical commit succeeds independently of a rebuildable projection. Regular outbox retries are idempotent by `(revision_id, projection_version)`; erasure retries are idempotent by `(erasure_job_id, projection_version)` through `ErasureJobResolver`, and both expose lag. Retrieval verifies a read context, canonical-filters candidates, and offers a bounded non-vector fallback; it does not fabricate completeness. |
-| Sleep maintenance | The current scheduled `sleep` source declares process-local `ResourceLock.MEMORY` in `signals/sources/scheduler.py`; `OrderedLockManager` serializes it only within one dispatcher process. It is not a tenant-scoped, cross-process/database maintenance lock. Semantic maintenance must acquire the durable `SemanticMaintenanceLease` specified below, then obtain a resolver-minted system context bound to its tenant, checkpoint, fencing token, and bounded batch. It sends every new/recomputed proposal and retraction/quarantine command through the validation-snapshot conditional batch writer and outbox path. A failed batch records a resumable cursor and report; it may not partially supersede, erase, infer, or train. |
+| Sleep maintenance | The current scheduled `sleep` source declares process-local `ResourceLock.MEMORY` in `signals/sources/scheduler.py`; `OrderedLockManager` serializes it only within one dispatcher process. It is not a tenant-scoped, cross-process/database maintenance lock. Semantic maintenance must acquire the durable `SemanticMaintenanceLease` specified below, then obtain a resolver-minted system context bound to its tenant, checkpoint, fencing token, and bounded batch. It sends every new/recomputed proposal and retraction/quarantine command through the validation-snapshot conditional batch writer and outbox path. A deferred/failed batch returns a `SystemBatchRunReport` with a durable bounded report reference and an optional resumable cursor reference; it may not partially supersede, erase, infer, or train. |
 | Training export | Materialize only a complete, policy-checked manifest under a verified, single-use export context bound to its purpose and destination. If a selected assertion is revoked before sealing, abort/recompute; do not emit a partial corpus under the original manifest ID. |
 
 ### Semantic maintenance lease
@@ -1151,6 +1299,54 @@ class ErasureProjectionContext: ...
 # principal, resolver audience, attempt/work lease, issuer/key, and expiry; it
 # reveals no target selector and is not serialized in ErasureOutboxEvent.
 
+class AuthenticatedProjectionChannel: ...
+# Opaque proof owned by the mutually authenticated projection-service transport.
+# It has no public constructor and is accepted only at the dispatcher transport
+# boundary, which derives its peer principal rather than accepting one from a
+# caller or event payload.
+
+class AuthenticatedProjectionPeerProof: ...
+# Opaque, non-serializable, resolver-verifiable attestation minted by the
+# dispatcher from one active AuthenticatedProjectionChannel. It is signed/MACed
+# for the resolver and binds the derived peer principal, channel binding,
+# resolver audience, event/job/projection, durable delivery ID, attempt/work
+# lease, and expiry. A caller cannot create, substitute, or replay it for a
+# different delivery; it contains no raw transport credential.
+
+class ErasureProjectionDelivery:
+    @property
+    def event(self) -> ErasureOutboxEvent: ...
+    @property
+    def context(self) -> ErasureProjectionContext: ...
+    @property
+    def peer_proof(self) -> AuthenticatedProjectionPeerProof: ...
+# Opaque, non-serializable dispatcher result carrying exactly one opaque
+# ErasureOutboxEvent plus its freshly minted ErasureProjectionContext and
+# AuthenticatedProjectionPeerProof. It also binds the dispatcher's durable
+# delivery ID/lease to the authenticated peer and attempt. A projector can
+# consume it, but cannot construct, alter, replay, or substitute either
+# capability for another event. The accessors are read-only so the projector can
+# pass the exact event/context/proof triple to ErasureJobResolver; its verifier
+# still rejects a lookalike or a triple from another delivery.
+
+class ErasureProjectionCompletionToken: ...
+# Opaque, single-use resolver output bound to the same job, event, projection,
+# authenticated projector principal, delivery ID/attempt/work lease, audience,
+# and expiry as its ErasureProjectionContext. It conveys no target selector.
+
+class ErasureProjectionCompletionReceipt: ...
+# Opaque, resolver-issued and dispatcher-verifiable proof of one accepted
+# completion. It is signed/MACed for the dispatcher and binds the resolver
+# issuer, erasure job/event/projection, authenticated peer principal, durable
+# delivery ID, attempt/work lease, completion-token disposition, and expiry.
+# It contains no target selector and is valid only to acknowledge this exact
+# active dispatcher lease.
+
+@dataclass(frozen=True)
+class ResolvedErasureProjectionWork:
+    work_plan: ErasureWorkPlan  # private, target-bearing, and lease-bound
+    completion_token: ErasureProjectionCompletionToken
+
 @dataclass(frozen=True)
 class SemanticAccessDenied:
     code: str  # includes deidentification_evidence_unavailable
@@ -1211,21 +1407,76 @@ class SemanticAccessCapabilityVerifier(Protocol):
     ) -> VerifiedSemanticSystemWriteGrant: ...
     async def verify_erasure_projection(
         self, context: ErasureProjectionContext, *, event: ErasureOutboxEvent,
+        peer_proof: AuthenticatedProjectionPeerProof,
     ) -> VerifiedErasureProjectionGrant: ...
 
 @dataclass(frozen=True)
-class SemanticValidationSnapshot:
+class ResolvedSemanticValidationContract:
+    # The complete immutable contract selected by the resolver. `contract_digest`
+    # is computed over every other field in this dataclass; a differently pinned
+    # or scoped profile is a different contract, never an implementation default.
     tenant_id: str
+    validation_scope: str
+    identity_version: str
+    identity_artifact_pins: tuple[ArtifactPin, ...]
+    iri_profile: str
+    iri_artifact_pins: tuple[ArtifactPin, ...]
+    literal_profile: str
+    literal_artifact_pins: tuple[ArtifactPin, ...]
+    validation_profile: str
+    validation_artifact_pins: tuple[ArtifactPin, ...]
+    shapes_ontology_pins: tuple[ArtifactPin, ...]
+    contract_digest: str
+
+@dataclass(frozen=True)
+class VerifiedSemanticValidationGrant:
+    # Derived by the writer after it verifies the foreground/import/system grant.
+    # It is non-authorizing, but it contains the complete resolver-selected
+    # contract so neither writer nor validator can silently choose another
+    # identity, IRI, literal, SHACL, shapes, or ontology profile.
+    operation_id: str
+    contract: ResolvedSemanticValidationContract
+
+@dataclass(frozen=True)
+class SemanticValidationSnapshot:
+    # Versioned canonical-state boundary plus the exact same immutable contract
+    # carried in VerifiedSemanticValidationGrant and ValidationReport.
     tenant_generation: int
     canonical_data_digest: str
-    validation_scope: str
-    shapes_ontology_literal_pins: tuple[ArtifactPin, ...]
+    contract: ResolvedSemanticValidationContract
+
+class CanonicalSemanticDataset: ...
+# Immutable full semantic dataset for one validation scope after staged changes,
+# including the canonical assertion/revision/current-pointer state that SHACL
+# must see. It is a validation input, not a second persistence owner or index.
+
+class GenerationPinnedSemanticValidationView(Protocol):
+    # Writer-created and read-only. It is bound to exactly one snapshot and one
+    # fully materialized tentative post-state; it cannot read a later generation.
+    snapshot: SemanticValidationSnapshot
+    tentative_post_state_digest: str
+    async def materialize_full_post_state(self) -> CanonicalSemanticDataset: ...
+    # The returned immutable dataset contains every canonical assertion visible
+    # in scope after all staged changes, so SHACL can evaluate whole-graph
+    # constraints rather than only the change set.
+
+@dataclass(frozen=True)
+class TentativeSemanticPostState:
+    # Complete deterministic change set (candidate assertions and every
+    # supersession/retraction/current-pointer effect) plus its canonical digest.
+    # It is ephemeral until the writer conditionally commits it after validation.
+    snapshot: SemanticValidationSnapshot
+    changes: SemanticCandidateChangeSet
+    digest: str
 
 @dataclass(frozen=True)
 class ValidationReport:
     outcome: Literal["accepted", "rejected", "unavailable"]
     snapshot: SemanticValidationSnapshot
-    literal_profile: str
+    tentative_post_state_digest: str
+    # Explicit rather than inferred from a generic pin list: the writer checks
+    # report.contract == snapshot.contract == grant.contract before commit.
+    contract: ResolvedSemanticValidationContract
     post_commit_tenant_generation: int | None  # validator returns None; writer persists a new report with this set after conditional commit
 
 @dataclass(frozen=True)
@@ -1250,10 +1501,25 @@ class SemanticImportBatch: ...
 # resolution. Canonical identity is derived only after validation.
 
 @dataclass(frozen=True)
+class SystemBatchRunReport:
+    # Bounded, tenant-private durable report for one complete system batch.
+    # `report_ref` is an opaque reference, never an assertion/revision ID or
+    # target-bearing error payload. `resume_cursor_ref` is present only when a
+    # retry may safely resume under a freshly resolved system context.
+    run_id: str
+    outcome: Literal["accepted", "deferred", "failed"]
+    report_ref: str
+    resume_cursor_ref: str | None
+
+@dataclass(frozen=True)
 class AssertionBatchWriteReceipt:
-    outcome: Literal["accepted", "rejected", "quarantined", "deferred"]
+    # commit_batch() is system-only: accepted means every member committed;
+    # deferred is retryable and failed is terminal. Deferred/failed receipts
+    # require revisions == () and no canonical outbox/pointer effects. Its
+    # outcome must equal run_report.outcome.
+    outcome: Literal["accepted", "deferred", "failed"]
     revisions: tuple[AssertionRevision, ...]
-    rejection: ProposalRejection | None
+    run_report: SystemBatchRunReport
 
 @dataclass(frozen=True)
 class ImportBatchWriteReceipt:
@@ -1325,28 +1591,72 @@ class AssertionReader(Protocol):
 class SemanticProjector(Protocol):
     async def apply(self, event: AssertionOutboxEvent) -> ProjectionReceipt: ...
     async def invalidate(self, event: AssertionOutboxEvent) -> ProjectionReceipt: ...
-    async def apply_erasure(self, event: ErasureOutboxEvent) -> ErasureProjectionReceipt: ...
+    async def apply_erasure(
+        self, delivery: ErasureProjectionDelivery
+    ) -> ErasureProjectionReceipt: ...
+# The authenticated dispatcher mints the per-delivery context after the transport
+# authenticates its peer, then supplies it only inside this delivery envelope.
+# The projector must give it to ErasureJobResolver before obtaining targets or
+# side effects; an event alone is never an erasure grant.
+
+class ErasureDeliveryDispatcher(Protocol):
+    async def claim_authenticated_delivery(
+        self, channel: AuthenticatedProjectionChannel,
+    ) -> ErasureProjectionDelivery | None: ...
+    async def acknowledge_completed_delivery(
+        self, delivery: ErasureProjectionDelivery, *,
+        completion_receipt: ErasureProjectionCompletionReceipt,
+    ) -> None: ...
+    async def release_delivery_for_retry(
+        self, delivery: ErasureProjectionDelivery, *, error: str,
+    ) -> None: ...
+# `claim_authenticated_delivery()` first verifies the active transport channel,
+# claims the durable delivery lease, derives the projector principal from that
+# channel, and only then mints the short-lived context. It never mints from an
+# outbox event alone. The dispatcher verifies the resolver's issuer/signature,
+# audience, expiry, and exact delivery/attempt/peer/lease binding on
+# `completion_receipt` before atomically acknowledging its lease. A projector
+# result or completion token alone is never enough; retry releases the same
+# leased delivery without treating it as complete.
 
 class ErasureJobResolver(Protocol):
     async def resolve_for_projection(
-        self, event: ErasureOutboxEvent, *, context: ErasureProjectionContext
-    ) -> ErasureWorkPlan: ...  # private target-bearing plan; no job enumeration
+        self, event: ErasureOutboxEvent, *, context: ErasureProjectionContext,
+        peer_proof: AuthenticatedProjectionPeerProof,
+    ) -> ResolvedErasureProjectionWork: ...
     async def acknowledge_projection(
-        self, event: ErasureOutboxEvent, receipt: ErasureProjectionReceipt,
-    ) -> None: ...
-# The resolver derives the projector principal from the authenticated transport;
-# it never accepts a caller-supplied ProjectionServiceIdentity.
+        self, event: ErasureOutboxEvent, receipt: ErasureProjectionReceipt, *,
+        context: ErasureProjectionContext,
+        peer_proof: AuthenticatedProjectionPeerProof,
+        completion_token: ErasureProjectionCompletionToken,
+    ) -> ErasureProjectionCompletionReceipt: ...
+# `resolve_for_projection()` returns a private plan and completion token only
+# after verifier-checked context and peer-proof resolution.
+# `acknowledge_projection()` accepts neither a bare event nor receipt: it
+# atomically verifies and consumes the context/proof/token's matching active
+# delivery lease before recording completion and issuing the receipt that alone
+# can let ErasureDeliveryDispatcher acknowledge the lease. The resolver derives
+# the projector principal from the authenticated proof; it never accepts a
+# caller-supplied ProjectionServiceIdentity.
 
 class SemanticValidator(Protocol):
-    async def validate(
+    async def validate_post_state(
         self,
         grant: VerifiedSemanticValidationGrant,
-        proposal: AssertionProposal,
+        post_state: TentativeSemanticPostState,
         snapshot: SemanticValidationSnapshot,
+        view: GenerationPinnedSemanticValidationView,
     ) -> ValidationReport: ...
 # The writer derives this non-authorizing validation grant from the already
 # verified foreground, import-batch, or system-batch grant. The validator never
-# receives a broad write context that it could reinterpret as an operation.
+# receives a broad write context that it could reinterpret as an operation, and
+# it must validate `view.materialize_full_post_state()`—the complete pinned
+# tentative post-state—not one member or a delta. Before committing, the writer
+# rejects a report unless `view.snapshot == snapshot == post_state.snapshot`,
+# `view.tentative_post_state_digest == post_state.digest`, and
+# `report.contract == snapshot.contract == grant.contract`; that immutable
+# equality covers tenant/scope and every identity/IRI/literal/validation/
+# shapes/ontology profile name and pin.
 
 class SemanticReasoner(Protocol):
     async def infer(
@@ -1368,28 +1678,46 @@ capability disposition with the result. The writer derives canonical
 tenant/owner/effective privacy fields from the verified grant, checks every
 target against it, and owns the validation-snapshot conditional commit and
 retry. `commit_import_batch` returns one complete aggregate receipt for its
-fixed scope, and `commit_batch` has no partial-success receipt: all batch
-members and outbox events commit with the capability-use record or none do.
+fixed scope. `commit_batch` has only `accepted`, `deferred`, and `failed`
+outcomes: all batch members and outbox events commit with the capability-use
+record or none do, and every outcome includes its bounded `SystemBatchRunReport`.
 Constitutional/approval code remains outside the semantic layer but is a
 required input to minting the context. `SemanticProjector` receives only
-committed outbox events and has no capability to write canonical state; for an
-opaque erasure event it must obtain its private plan through
-`ErasureJobResolver` with a verifier-checked `ErasureProjectionContext` over
-an authenticated projection-service transport. The training feature consumes
-`export_snapshot` with a verified purpose-specific export context; it does not
-query tables or embeddings directly.
+committed outbox events and has no capability to write canonical state. Its
+`apply_erasure(delivery)` method accepts only an
+`ErasureProjectionDelivery` minted after authenticated transport claim. It must
+obtain its private plan and one-time completion token through
+`ErasureJobResolver`, passing that delivery's context **and resolver-verifiable
+peer proof** on both resolver calls. Its completion acknowledgement returns the
+resolver-issued, delivery-bound completion receipt; only that receipt lets
+`ErasureDeliveryDispatcher` acknowledge the leased delivery. It cannot accept
+an event alone, a caller-built projector identity, a bare projector receipt, or
+ambient authority. The training feature consumes `export_snapshot` with a
+verified purpose-specific export context; it does not query tables or embeddings
+directly.
 
 ## Verification gates for implementation tickets
 
 Each later implementation ticket must provide unit, SQLite/PostgreSQL
-integration, and live-path evidence for: deterministic identity; duplicate
-occurrence idempotency; capability issuer/audience/expiry/request binding and
+integration, and live-path evidence for: deterministic identity, including
+every `iri-normalization-v1-rfc3986-200501` fixture and literal-profile
+identity-version migration; duplicate occurrence idempotency; capability
+issuer/audience/expiry/request binding and
 single-use replay rejection; exact operation-kind rejection (a system or import
 context cannot reach `propose()`); typed `DEIDENTIFIED` denial with no writer
 argument; tenant isolation; privacy modes; read/export scope that cannot be
 widened by a query or request; validation/profile pin rejection;
+generation-pinned full-post-state validation (including rejection of a report
+whose snapshot, view digest, identity version, IRI profile, literal profile,
+validation profile, or any artifact pin differs from the resolver-selected
+contract); host percent-
+escape equivalence proving `HTTP://%45XAMPLE.test/a` and
+`http://example.test/a` have identical normalized output and UTF-8 identity
+preimage bytes;
 supersession/time queries; complete fixed-scope import receipts and
-all-or-none canonical import effects; all-or-none inference and sleep batches;
+all-or-none canonical import effects after full tentative-post-state validation
+(including a two-record `sh:maxCount 1` conflict); all-or-none inference and
+sleep batches;
 inference retraction; projection and vector invalidation; RDF import/export
 round trip; verifier-checked erasure contexts bound to job/projector/audience/
 expiry plus mapping/outbox atomicity and retry after a worker crash; erasure
