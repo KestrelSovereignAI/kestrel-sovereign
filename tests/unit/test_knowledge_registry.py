@@ -73,6 +73,20 @@ def test_lookup_has_exact_version_and_digest_round_trip():
         registry.resolve("kestrel-vocab", None)
 
 
+def test_new_codec_vocabulary_release_preserves_the_existing_immutable_pin():
+    registry = load_knowledge_registry()
+
+    original = registry.resolve("kestrel-vocab", "1.0.0")
+    codec_release = registry.resolve("kestrel-vocab", "1.1.0")
+    selected = registry.select_capability("ontology:kestrel-vocab-1.1")
+
+    assert original.package_resource.endswith("kestrel-vocab-1.0.0.ttl")
+    assert original.sha256 == "db708b6790e5212bcbfd5040a1d7883da1161b05e73c809ee8d924c31b2a8044"
+    assert codec_release.package_resource.endswith("kestrel-vocab-1.1.0.ttl")
+    assert codec_release.uri == "https://kestrel.ai/vocab/1.1.0"
+    assert selected.resource == codec_release
+
+
 def test_loading_and_resolution_are_offline(monkeypatch):
     def forbid_network(*_args, **_kwargs):
         raise AssertionError("semantic registry attempted network access")
@@ -373,6 +387,30 @@ def test_package_resources_are_available_from_an_installed_wheel(tmp_path):
     assert check.returncode == 0, check.stderr
     assert "semantic registry OK:" in check.stdout
 
+    fixture_check = subprocess.run(
+        [
+            str(python),
+            "-W",
+            "error",
+            "-c",
+            (
+                "from importlib import resources; "
+                "fixture = resources.files('kestrel_sovereign').joinpath("
+                "'data', 'semantic', 'fixtures', 'rdf11-direct-language.nt'); "
+                "digests = resources.files('kestrel_sovereign').joinpath("
+                "'data', 'semantic', 'fixtures', 'rdf11-projection-digests.txt'); "
+                "assert fixture.read_bytes().startswith(b'<urn:kestrel:assertion:sha256:'); "
+                "assert b'language-derived' in digests.read_bytes()"
+            ),
+        ],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert fixture_check.returncode == 0, fixture_check.stderr
+
 
 def test_contract_rejects_non_exact_capability_version_request():
     registry = load_knowledge_registry()
@@ -421,6 +459,37 @@ def test_refresh_is_explicit_and_uses_a_local_snapshot(tmp_path):
     assert digest in manifest.read_text()
     refreshed = load_knowledge_registry(manifest)
     assert refreshed.resolve("kestrel-vocab", "1.0.0").sha256 == digest
+
+
+def test_refreshing_a_version_qualified_table_preserves_the_prior_immutable_release(tmp_path):
+    package_root = tmp_path / "kestrel_sovereign"
+    semantic_root = package_root / "data" / "semantic"
+    manifest = semantic_root / "registry.toml"
+    shutil.copytree(
+        resources.files("kestrel_sovereign").joinpath("data", "semantic"),
+        semantic_root,
+    )
+    before = load_knowledge_registry(manifest).resolve("kestrel-vocab", "1.0.0").sha256
+    snapshot = tmp_path / "kestrel-vocab-1.1.0.ttl"
+    refreshed_bytes = (
+        resources.files("kestrel_sovereign")
+        .joinpath("data", "semantic", "ontologies", "kestrel-vocab-1.1.0.ttl")
+        .read_bytes()
+        + b"\n# reviewed 1.1 pin refresh\n"
+    )
+    snapshot.write_bytes(refreshed_bytes)
+    (semantic_root / "ontologies" / "kestrel-vocab-1.1.0.ttl").write_bytes(refreshed_bytes)
+
+    digest = refresh_manifest_digest(
+        manifest,
+        identifier="kestrel-vocab",
+        version="1.1.0",
+        snapshot_path=snapshot,
+    )
+
+    refreshed = load_knowledge_registry(manifest)
+    assert refreshed.resolve("kestrel-vocab", "1.0.0").sha256 == before
+    assert refreshed.resolve("kestrel-vocab", "1.1.0").sha256 == digest
 
 
 def test_refresh_rejects_a_snapshot_that_does_not_replace_the_package_resource(tmp_path):

@@ -1,0 +1,8 @@
+# Golden SHA-256 digests of deterministic RDF 1.1 N-Triples projections.
+# Snapshot: rdf11-concepts-20140225@1.0.0; serialization:ntriples-20140225@1.0.0
+iri-direct-active b9d70348d2060ff5412251679706c2079a11f1506c3393d92df49a262a1808c2
+typed-direct-superseded 498393d241b2ab456e9041f908ae775ccd85d6d1267bc6a18491e27c8e3a3612
+language-derived 80d4c5bd5e3fc57fe2bad18bedabade55737c55d2b543871d953d6e0f9aa3c3d
+retracted 74f027d7c4abe1277d744672123b4f7df309c327e3f2077e221fb849649588c1
+quarantined d71c277a154fbcf3a292225b8772acc106e359e548751b4a7ad1e4f000f544a7
+deleted 6f41bc4fdf3c09601a77b37a1c257332f28d6d4f3cf1dafa4acb0db2f88afbce

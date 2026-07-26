@@ -36,11 +36,14 @@ through `importlib.resources`, so the same check operates from an installed
 wheel.
 
 `https://kestrel.ai/vocab/` is the Kestrel term namespace. Its ontology IRI is
-versioned (`https://kestrel.ai/vocab/1.0.0`); this preserves stable term IRIs
-such as `https://kestrel.ai/vocab/preferredDeployRegion` while pinning the
-schema interpretation. The Kestrel ontology contains assertion/revision/source
-and temporal/provenance schema only. It explicitly grants no permission, role,
-approval, visibility change, or tool access.
+versioned (`https://kestrel.ai/vocab/1.0.0`,
+`https://kestrel.ai/vocab/1.1.0`); this preserves stable term IRIs such as
+`https://kestrel.ai/vocab/preferredDeployRegion` while pinning each schema
+interpretation. The original `1.0.0` bytes and digest remain immutable; the RDF
+assertion codec selects its expanded vocabulary through the separate exact
+`ontology:kestrel-vocab-1.1` capability. The Kestrel ontology contains
+assertion/revision/source and temporal/provenance schema only. It explicitly
+grants no permission, role, approval, visibility change, or tool access.
 
 The stable registry packages and pins the dated RFC 3986 artifact used by
 the IRI profile, plus the dated W3C source documents for RDF 1.1 Concepts,

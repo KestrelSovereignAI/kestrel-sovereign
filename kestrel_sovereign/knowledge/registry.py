@@ -624,23 +624,30 @@ def _parse_resource(identifier: str, row: Mapping[str, object]) -> SemanticResou
         raise KnowledgeRegistryError(
             f"semantic resource {identifier!r} missing required fields: {', '.join(missing)}"
         )
+    # TOML table names must be unique, while a semantic resource identifier is
+    # intentionally stable across immutable releases.  A version-qualified
+    # table can therefore name its durable identifier explicitly; older rows
+    # retain the concise table-name form unchanged.
+    resource_identifier = (
+        _string_field(identifier, row, "identifier") if "identifier" in row else identifier
+    )
     return SemanticResource(
-        identifier=identifier,
-        version=SemanticVersion.parse(_string_field(identifier, row, "version")),
-        namespace=_string_field(identifier, row, "namespace"),
-        package_resource=_string_field(identifier, row, "package_resource"),
-        sha256=_string_field(identifier, row, "sha256"),
-        maturity=_enum_field(identifier, row, "maturity", StandardsMaturity),
-        kind=_enum_field(identifier, row, "kind", ResourceKind),
-        uri=_string_field(identifier, row, "uri"),
-        published_date=_string_field(identifier, row, "published_date"),
-        description=_string_field(identifier, row, "description"),
-        selected_terms=_string_tuple(identifier, row, "selected_terms"),
+        identifier=resource_identifier,
+        version=SemanticVersion.parse(_string_field(resource_identifier, row, "version")),
+        namespace=_string_field(resource_identifier, row, "namespace"),
+        package_resource=_string_field(resource_identifier, row, "package_resource"),
+        sha256=_string_field(resource_identifier, row, "sha256"),
+        maturity=_enum_field(resource_identifier, row, "maturity", StandardsMaturity),
+        kind=_enum_field(resource_identifier, row, "kind", ResourceKind),
+        uri=_string_field(resource_identifier, row, "uri"),
+        published_date=_string_field(resource_identifier, row, "published_date"),
+        description=_string_field(resource_identifier, row, "description"),
+        selected_terms=_string_tuple(resource_identifier, row, "selected_terms"),
         imports=tuple(
             ResourceRequirement.parse(value)
-            for value in _string_tuple(identifier, row, "imports")
+            for value in _string_tuple(resource_identifier, row, "imports")
         ),
-        capabilities=_string_tuple(identifier, row, "capabilities"),
+        capabilities=_string_tuple(resource_identifier, row, "capabilities"),
     )
 
 
@@ -762,11 +769,27 @@ def refresh_manifest_digest(
         )
     digest = hashlib.sha256(snapshot).hexdigest()
 
-    escaped_identifier = re.escape(resource.identifier)
+    resource_rows = parsed["resource"]
+    matching_table_names: list[str] = []
+    for table_name, row in resource_rows.items():
+        if not isinstance(table_name, str) or not isinstance(row, Mapping):
+            continue
+        table_resource = _parse_resource(table_name, row)
+        if (
+            table_resource.identifier == resource.identifier
+            and table_resource.version == resource.version
+        ):
+            matching_table_names.append(table_name)
+    if len(matching_table_names) != 1:
+        raise KnowledgeRegistryError(
+            f"could not locate a unique manifest table for {resource.key} in {manifest_path}"
+        )
+    escaped_table_name = re.escape(matching_table_names[0])
     # TOML permits both a bare dotted-key segment and a quoted segment. The
     # shipped manifest uses bare segments, while a developer-maintained one
-    # may quote an identifier that needs it.
-    header = rf'\[resource\.(?:"{escaped_identifier}"|{escaped_identifier})\]'
+    # may quote a table name that needs it.  The table name, rather than the
+    # durable logical identifier, distinguishes immutable versioned releases.
+    header = rf'\[resource\.(?:"{escaped_table_name}"|{escaped_table_name})\]'
     block = re.compile(
         rf"(?ms)^({header}\n.*?^sha256\s*=\s*)\"[0-9a-f]+\"(?=\s*(?:#.*)?$)(.*?)(?=^\[resource\.|\Z)"
     )

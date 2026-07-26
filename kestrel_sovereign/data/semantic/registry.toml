@@ -370,6 +370,24 @@ selected_terms = ["kestrel:SemanticAssertion", "kestrel:AssertionRevision", "kes
 imports = ["rdfs-20140225@1.0.0", "skos-20090818@1.0.0", "prov-o-20130430@1.0.0", "owl-time-20171019@1.0.0"]
 capabilities = ["ontology:kestrel-vocab"]
 
+[resource.kestrel-vocab-1-1]
+# The TOML table name is version-qualified so two immutable releases of the
+# same logical ontology can coexist. `identifier` remains the durable logical
+# name used by imports and exact capability pins.
+identifier = "kestrel-vocab"
+version = "1.1.0"
+namespace = "https://kestrel.ai/vocab/"
+package_resource = "data/semantic/ontologies/kestrel-vocab-1.1.0.ttl"
+sha256 = "2d14444f4f42fd8beda98f8da5b052e44652a624755943a0a6e7927fef395ebb"
+maturity = "stable"
+kind = "ontology"
+uri = "https://kestrel.ai/vocab/1.1.0"
+published_date = "2026-07-26"
+description = "Versioned Kestrel ontology for the RDF assertion codec's lossless assertion, provenance, and temporal projection; it grants no authority."
+selected_terms = ["kestrel:SemanticAssertion", "kestrel:AssertionRevision", "kestrel:SourceOccurrence", "kestrel:hasRevision", "kestrel:hasSourceOccurrence", "kestrel:validTime", "kestrel:observedTime", "kestrel:confidence", "kestrel:projectedTenantId", "kestrel:lineagePosition"]
+imports = ["rdfs-20140225@1.0.0", "skos-20090818@1.0.0", "prov-o-20130430@1.0.0", "owl-time-20171019@1.0.0"]
+capabilities = ["ontology:kestrel-vocab-1.1"]
+
 [resource.kestrel-assertion-shapes]
 version = "1.0.0"
 namespace = "https://kestrel.ai/shapes/"

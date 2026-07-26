@@ -1416,6 +1416,18 @@
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],
+      "path": "docs/architecture/storage/RDF_ASSERTION_CODEC.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "active",
+      "title": "RDF Assertion Codec Boundary",
+      "type": "Architecture Reference"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
       "path": "docs/architecture/storage/SEMANTIC_KNOWLEDGE_ARCHITECTURE.md",
       "privacy": "public",
       "render": "public",
