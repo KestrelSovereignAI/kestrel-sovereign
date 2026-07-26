@@ -689,16 +689,27 @@ class Feature(_SdkFeature):
         """Return the graph node ID used to persist this feature's config."""
         return f"feature_config:{self.name}"
 
-    async def load_persisted_config(self) -> Optional[Dict]:
+    async def load_persisted_config(
+        self, *, raise_on_error: bool = False
+    ) -> Optional[Dict]:
         """Load persisted config from agent storage (graph store).
 
-        Returns the stored config dict, or None if nothing is persisted.
+        Returns the stored config dict, or None if nothing is persisted.  The
+        default remains best-effort for existing feature implementations;
+        callers that must not confuse a failed durable read with an absent
+        config can request the original storage exception.
         """
         storage = getattr(self.agent, "storage", None)
         if storage is None:
             return None
+        # The graph-store contract is asynchronous. A non-async ``get_node``
+        # surface is not a configured graph store, so retain the historical
+        # absent-storage result rather than treating it as a durable read.
+        get_node = getattr(storage, "get_node", None)
+        if not inspect.iscoroutinefunction(get_node):
+            return None
         try:
-            node = await storage.get_node(self._config_node_id())
+            node = await get_node(self._config_node_id())
             if node is not None:
                 config = node.properties.get("config")
                 if isinstance(config, str):
@@ -708,8 +719,10 @@ class Feature(_SdkFeature):
                 if isinstance(disabled, list):
                     self.disabled_skills = set(disabled)
                 return config
-        except Exception as e:
-            logger.warning(f"Failed to load persisted config for {self.name}: {e}")
+        except Exception:
+            if raise_on_error:
+                raise
+            logger.warning("Failed to load persisted config for %s", self.name)
         return None
 
     async def persist_config(self, config: Dict) -> None:

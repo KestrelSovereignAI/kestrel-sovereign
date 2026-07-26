@@ -521,7 +521,7 @@ async def test_proxy_forwards_host_config_into_client(monkeypatch, tmp_path):
 
     feature = ProxyFeature(agent, _isolated_runtime(), client_factory=client_factory)
 
-    async def fake_load():
+    async def fake_load(**_kwargs):
         return {"provider": "web", "allowed_senders": ["+13035551234"]}
 
     feature.load_persisted_config = fake_load  # type: ignore[assignment]
@@ -530,6 +530,67 @@ async def test_proxy_forwards_host_config_into_client(monkeypatch, tmp_path):
     assert captured["config"] == {
         "provider": "web",
         "allowed_senders": ["+13035551234"],
+    }
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_transient_startup_config_read_failure_recovers_without_losing_secret(
+    monkeypatch, tmp_path
+):
+    """A failed durable read must not boot an authoritative empty config.
+
+    The feature starts only after storage recovers, at which point a
+    write-only-secret-preserving PATCH receives the actual durable value rather
+    than replacing it with the empty config used by the old best-effort path.
+    """
+
+    stored_config = {"enabled": True, "token": "stored-secret-not-for-logs"}
+
+    class TransientReadStorage(_FakeStorage):
+        def __init__(self):
+            super().__init__()
+            self.fail_reads = True
+
+        async def get_node(self, node_id):
+            if self.fail_reads:
+                raise OSError("storage temporarily unavailable")
+            return await super().get_node(node_id)
+
+    agent = Mock()
+    agent.features = {}
+    agent.storage = TransientReadStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    clients = []
+
+    def client_factory(**kwargs):
+        client = FakeIsolatedClient(**kwargs)
+        clients.append(client)
+        return client
+
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=client_factory)
+    await feature.persist_config(stored_config)
+
+    with pytest.raises(RuntimeError, match="failed to load persisted config"):
+        await feature.initialize()
+    assert clients == []
+    assert feature._host_config_loaded is False
+
+    agent.storage.fail_reads = False
+    await feature.initialize()
+    assert clients[0].kwargs["config"] == stored_config
+
+    # This mirrors the endpoint's write-only-secret preservation: the request
+    # omits ``token``, so the recovered current config supplies it before save.
+    partial_patch = {"enabled": False}
+    current = await feature.get_config()
+    partial_patch["token"] = current["token"]
+    await feature.set_config(partial_patch)
+
+    assert agent.storage.nodes["feature_config:TestFeature"].properties["config"] == {
+        "enabled": False,
+        "token": stored_config["token"],
     }
     await feature.shutdown()
 
@@ -1508,6 +1569,137 @@ async def test_fenced_transition_promotion_failure_restores_active_config_for_re
     finally:
         if fresh is not None:
             await fresh.shutdown()
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_fenced_candidate_stays_quarantined_until_promotion_then_restores(
+    monkeypatch, tmp_path
+):
+    """A pending fenced candidate cannot expose tools or receive host events.
+
+    Hold the promotion write open after the candidate completes its public SDK
+    startup.  During that window the candidate must remain detached; after the
+    forced promotion failure it is retired and a child on durable old config is
+    restored.
+    """
+
+    old_config = {"enabled": True, "token": "old-token-not-for-logs"}
+    next_config = {"enabled": False, "token": "next-token-not-for-logs"}
+    promotion_started = asyncio.Event()
+    release_promotion = asyncio.Event()
+
+    class BlockingPromotionStorage(_FakeStorage):
+        def __init__(self):
+            super().__init__()
+            self.add_calls = 0
+
+        async def add_node(self, node):
+            self.add_calls += 1
+            if self.add_calls == 3:
+                promotion_started.set()
+                await release_promotion.wait()
+                raise OSError("storage unavailable during promotion")
+            await super().add_node(node)
+
+    class FencedTransitionClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.replacement_required = False
+
+        async def prepare_config_transition(self, config):
+            assert config == next_config
+            self.replacement_required = True
+            raise ConfigTransitionError("transition outcome unknown")
+
+    class EventingCandidateClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.event_registrations = 0
+
+        def on_event(self, handler):
+            self.event_registrations += 1
+            self.event_handler = handler
+            asyncio.create_task(handler({"type": "candidate.ready"}))
+
+    agent = Mock()
+    agent.features = {}
+    agent.storage = BlockingPromotionStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    clients = []
+
+    def client_factory(**kwargs):
+        if not clients:
+            client = FencedTransitionClient(**kwargs)
+        elif len(clients) == 1:
+            client = EventingCandidateClient(**kwargs)
+        else:
+            client = FakeIsolatedClient(**kwargs)
+        clients.append(client)
+        return client
+
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=client_factory)
+    handled_events = []
+
+    async def record_event(event):
+        handled_events.append(event)
+
+    try:
+        await feature.persist_config(old_config)
+        await feature.initialize()
+        feature._handle_event = record_event  # type: ignore[method-assign]
+
+        update = asyncio.create_task(feature.set_config(next_config))
+        await asyncio.wait_for(promotion_started.wait(), timeout=1)
+        await asyncio.sleep(0)
+
+        candidate = clients[1]
+        assert isinstance(candidate, EventingCandidateClient)
+        assert feature._client is None
+        assert feature.get_tools() == []
+        assert candidate.event_registrations == 0
+        assert handled_events == []
+
+        # A host-visible direct call must fail closed instead of reaching the
+        # detached next-config child. Scheduled calls take the same client path
+        # after their context gate.
+        result = await feature.call_isolated_tool("ping", {"message": "blocked"})
+        assert result["success"] is False
+        assert candidate.calls == []
+
+        execution = SchedulerExecution(
+            id="blocked-execution",
+            schedule_id="blocked-schedule",
+            agent_id="agent-1",
+            task_name="ping",
+            args={"message": "blocked"},
+            scheduled_for="2026-07-26T00:00:00+00:00",
+            idempotency_key="blocked-effect-key",
+            attempt=1,
+            owner="runner-1",
+        )
+        token = _current_execution.set(_SchedulerExecutionScope(execution))
+        try:
+            with pytest.raises(SchedulerExecutionContextUnavailable, match="advertises"):
+                await feature.call_isolated_tool("ping", {"message": "blocked"})
+        finally:
+            _current_execution.reset(token)
+        assert candidate.calls == []
+
+        release_promotion.set()
+        with pytest.raises(RuntimeError, match="failed to persist config"):
+            await update
+
+        assert candidate.stopped is True
+        assert clients[2].kwargs["config"] == old_config
+        assert feature._client is clients[2]
+        assert feature._host_config == old_config
+        assert handled_events == []
+    finally:
+        release_promotion.set()
         await feature.shutdown()
 
 

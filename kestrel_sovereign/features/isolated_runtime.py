@@ -405,14 +405,18 @@ class ProxyFeature(Feature):
         # its first ``while not self._stopping`` check — leaving a re-enabled
         # service with no health supervisor (kestrel-sovereign#2522 P2).
         self._stopping = False
+        # A previous enable cycle may have left an intentional empty config (or
+        # a stopped client) on this same object. A fresh initialize must never
+        # let that in-memory state stand in for the durable read below.
+        self._host_config = {}
+        self._host_config_loaded = False
         self._venv_path, self._bin_path = self.resolve_runtime_paths()
         if self._bin_path is None:
             self.ensure_venv()
         # Resolve persisted/UI host config BEFORE building the client so it can be
         # forwarded to the isolated service through the initialize handshake (the
         # service is otherwise launched bare, with only env vars).
-        self._host_config = await self._load_host_config()
-        self._host_config_loaded = True
+        await self._ensure_host_config_loaded()
         await self._connect_client()
         self._supervision_task = self._start_supervision()
 
@@ -430,14 +434,89 @@ class ProxyFeature(Feature):
         service's initialize handshake, so rebuilding here is how new config
         actually reaches a running service.
         """
+        client, tools = await self._start_detached_client(config)
+        self._publish_client(
+            client,
+            tools,
+            register_channel_bridge=register_channel_bridge,
+        )
+        try:
+            await self._register_event_handler(client)
+        except BaseException:
+            # A client whose event registration failed must not remain
+            # reachable through host tools while its caller unwinds.
+            self._unpublish_client(client)
+            await self._retire_detached_client(client)
+            raise
+
+    async def _start_detached_client(
+        self, config: Optional[Dict[str, Any]] = None
+    ) -> tuple[Any, List[AgentTool]]:
+        """Start a child without making it reachable through this proxy.
+
+        Fenced config recovery needs a process that has completed the public
+        SDK startup handshake, but it cannot expose that process's tools,
+        channel bridge, or event handler until its config is durably active.
+        Keep those ownership boundaries explicit instead of temporarily
+        assigning a candidate to ``self._client``.
+        """
+
         child_config = self._host_config if config is None else config
-        self._client = self._build_client(config=child_config)
-        await _maybe_await(self._client.start())
-        await self._register_event_handler()
-        advertised_tools = await _maybe_await(self._client.list_tools())
-        self._tools = [IsolatedFeatureTool(self, meta) for meta in advertised_tools]
+        client = self._build_client(config=child_config)
+        try:
+            await _maybe_await(client.start())
+            advertised_tools = await _maybe_await(client.list_tools())
+        except BaseException:
+            await self._retire_detached_client(client)
+            raise
+        return client, [IsolatedFeatureTool(self, meta) for meta in advertised_tools]
+
+    def _publish_client(
+        self,
+        client: Any,
+        tools: List[AgentTool],
+        *,
+        register_channel_bridge: bool,
+    ) -> None:
+        """Atomically make a started child available to host traffic.
+
+        Callers hold ``_reload_lock`` whenever replacing a live child.  The
+        paired assignments deliberately happen before any event registration:
+        once an event can enter the host, the child and its advertised tools are
+        already the single live proxy state.
+        """
+
+        self._client = client
+        self._tools = tools
         if register_channel_bridge:
             self._register_channel_bridge()
+
+    def _unpublish_client(self, expected_client: Any = None) -> Any:
+        """Remove the current child from host-visible proxy state.
+
+        ``expected_client`` prevents an error path for an old detached child
+        from removing a newer restored child.
+        """
+
+        if expected_client is not None and self._client is not expected_client:
+            return None
+        self._unregister_channel_bridge()
+        client = self._client
+        self._client = None
+        self._tools = []
+        return client
+
+    async def _retire_detached_client(self, client: Any) -> None:
+        """Stop a child which was never published to the host."""
+
+        try:
+            await _maybe_await(client.stop())
+        except BaseException:
+            logger.error(
+                "Isolated feature %s could not stop its detached client",
+                self.name,
+            )
+            raise
 
     async def reload(self) -> None:
         """Restart the isolated service so the current ``_host_config`` takes
@@ -471,9 +550,9 @@ class ProxyFeature(Feature):
         Callers must already hold ``_reload_lock`` and have established whether
         an advertised config-transition lifecycle hook must run first.
 
-        ``config`` lets a fenced transition start a known-next child before its
-        pending config can be promoted to durable active state.  The caller then
-        commits ``_host_config`` and registers the bridge only after promotion.
+        ``config`` selects an explicit effective config for a normal
+        replacement. Fenced transitions use the detached-candidate path so a
+        pending config cannot become host-visible before durable promotion.
         """
 
         self._unregister_channel_bridge()
@@ -493,8 +572,9 @@ class ProxyFeature(Feature):
                 await self._supervision_task
             except asyncio.CancelledError:
                 pass
-        if self._client is not None:
-            await _maybe_await(self._client.stop())
+        client = self._unpublish_client()
+        if client is not None:
+            await _maybe_await(client.stop())
 
     def get_tools(self) -> List[AgentTool]:
         return list(self._tools)
@@ -539,14 +619,12 @@ class ProxyFeature(Feature):
         which made the config API/UI show blank and drop write-only secrets on a
         partial PATCH (#2214).
         """
-        # The SDK has no config-read RPC.  Once this proxy has initialized, its
-        # host config is authoritative even if it is empty: durable storage may
-        # contain a pending candidate while the running service still owns the
-        # active empty config.
-        if self._host_config_loaded or self._client is not None or self._host_config:
-            return dict(self._host_config)
-        persisted = await self.load_persisted_config()
-        return dict(persisted) if isinstance(persisted, dict) else {}
+        # The SDK has no config-read RPC. A successful durable read makes the
+        # host config authoritative even if it is empty; client existence alone
+        # never does, because a failed initialize/re-enable must not turn a
+        # stale or fallback value into the next PATCH's active config.
+        await self._ensure_host_config_loaded()
+        return dict(self._host_config)
 
     async def set_config(self, config: Dict) -> None:
         """Persist an effective config and apply it to the running service.
@@ -582,10 +660,15 @@ class ProxyFeature(Feature):
         cfg = dict(config) if isinstance(config, dict) else {}
         async with self._reload_lock:
             self._begin_reload()
-            previous_config = dict(self._host_config)
             transition_attempted = False
             transition_succeeded = False
             try:
+                # A caller may invoke set_config after a failed startup or
+                # before normal initialization. Reload the authoritative
+                # durable value first; otherwise a partial PATCH could stage
+                # an empty config over a write-only secret.
+                await self._ensure_host_config_loaded()
+                previous_config = dict(self._host_config)
                 # Stage the candidate without changing the durable active
                 # config.  A failed write must stop here; otherwise we could
                 # successfully clean up the old service but lose the config
@@ -676,31 +759,63 @@ class ProxyFeature(Feature):
         feature-specific config is never inspected or logged.
         """
 
+        # The fenced child may already have applied ``next_config``. Remove it
+        # from every host-visible route before awaiting either its shutdown or
+        # the candidate startup; direct and scheduled calls then fail closed
+        # instead of reaching an unknown-config process.
+        active_client = self._unpublish_client()
+        if active_client is not None:
+            try:
+                await _maybe_await(active_client.stop())
+            except BaseException:
+                await self._restore_previous_config_after_failed_promotion(
+                    previous_config
+                )
+                raise
+
+        candidate = None
         try:
-            await self._replace_client(
-                next_config,
-                register_channel_bridge=False,
-            )
+            candidate, candidate_tools = await self._start_detached_client(next_config)
         except BaseException:
-            # The old fenced child may already have applied the request.  Even
-            # when the candidate cannot start, durable state still names the
-            # previous config, so restore from that source of truth.
-            await self._restore_previous_config_after_failed_promotion(
-                previous_config
-            )
+            # Durable state still names the previous config, so a failed
+            # candidate startup must restore from that source of truth.
+            await self._restore_previous_config_after_failed_promotion(previous_config)
             raise
 
         try:
             await self._promote_config(next_config)
         except BaseException:
-            await self._restore_previous_config_after_failed_promotion(
-                previous_config
-            )
+            # The candidate never had a handler, tools, or channel bridge in
+            # this proxy. Retire it before restoring the still-active child.
+            try:
+                await self._retire_detached_client(candidate)
+            except BaseException:
+                self._host_config = dict(previous_config)
+                self._host_config_loaded = True
+                await self._quarantine_unreconciled_client()
+                raise
+            await self._restore_previous_config_after_failed_promotion(previous_config)
             raise
 
+        # Promotion succeeded while the candidate was quarantined. Publish its
+        # tools and bridge as one lifecycle-locked state change, then allow
+        # host events to enter through the registered handler.
         self._host_config = dict(next_config)
         self._host_config_loaded = True
-        self._register_channel_bridge()
+        self._publish_client(
+            candidate,
+            candidate_tools,
+            register_channel_bridge=True,
+        )
+        try:
+            await self._register_event_handler(candidate)
+        except BaseException:
+            # Durable state is now next_config, so do not resurrect the old
+            # config. Detach and retire the candidate; normal lifecycle start
+            # can recreate the promoted child from durable state.
+            self._unpublish_client(candidate)
+            await self._retire_detached_client(candidate)
+            raise
 
     async def _restore_previous_config_after_failed_promotion(
         self, previous_config: Dict[str, Any]
@@ -871,15 +986,26 @@ class ProxyFeature(Feature):
         """Resolve persisted/UI host config to forward into the service.
 
         Reads the same graph-store node the in-process Feature base persists to
-        (``feature_config:<name>``). Best-effort: any failure yields an empty
-        config rather than blocking feature startup.
+        (``feature_config:<name>``). An absent node is an intentional empty
+        config. A failed read is not: starting with ``{}`` would make that
+        transient failure authoritative and could overwrite a write-only secret
+        in a later partial update, so initialization fails until storage recovers.
         """
         try:
-            persisted = await self.load_persisted_config()
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("No persisted config for isolated feature %s: %s", self.name, exc)
-            return {}
+            persisted = await self.load_persisted_config(raise_on_error=True)
+        except Exception as exc:  # noqa: BLE001 - durable read is a hard boundary
+            raise RuntimeError(
+                f"Cannot initialize isolated feature {self.name}: failed to load persisted config"
+            ) from exc
         return persisted if isinstance(persisted, dict) else {}
+
+    async def _ensure_host_config_loaded(self) -> None:
+        """Load durable config exactly before it may become host-authoritative."""
+
+        if self._host_config_loaded:
+            return
+        self._host_config = await self._load_host_config()
+        self._host_config_loaded = True
 
     # ------------------------------------------------------------------
     # Channel bridge
@@ -1331,17 +1457,24 @@ class ProxyFeature(Feature):
             return [str(_venv_bin_dir(self._venv_path) / service)]
         return [service]
 
-    async def _register_event_handler(self) -> None:
+    async def _register_event_handler(self, client: Any = None) -> None:
+        """Attach the host event handler to a published client.
+
+        Accepting the client explicitly lets fenced recovery keep a started
+        candidate detached until durable promotion has completed.
+        """
+
+        target = self._client if client is None else client
         register = (
-            getattr(self._client, "set_event_handler", None)
-            or getattr(self._client, "add_event_handler", None)
-            or getattr(self._client, "subscribe", None)
+            getattr(target, "set_event_handler", None)
+            or getattr(target, "add_event_handler", None)
+            or getattr(target, "subscribe", None)
         )
         if register is not None:
             await _maybe_await(register(self._handle_event))
             return
 
-        on_event = getattr(self._client, "on_event", None)
+        on_event = getattr(target, "on_event", None)
         if on_event is None:
             return
         try:
