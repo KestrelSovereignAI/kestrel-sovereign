@@ -461,6 +461,37 @@ def test_refresh_is_explicit_and_uses_a_local_snapshot(tmp_path):
     assert refreshed.resolve("kestrel-vocab", "1.0.0").sha256 == digest
 
 
+def test_refreshing_a_version_qualified_table_preserves_the_prior_immutable_release(tmp_path):
+    package_root = tmp_path / "kestrel_sovereign"
+    semantic_root = package_root / "data" / "semantic"
+    manifest = semantic_root / "registry.toml"
+    shutil.copytree(
+        resources.files("kestrel_sovereign").joinpath("data", "semantic"),
+        semantic_root,
+    )
+    before = load_knowledge_registry(manifest).resolve("kestrel-vocab", "1.0.0").sha256
+    snapshot = tmp_path / "kestrel-vocab-1.1.0.ttl"
+    refreshed_bytes = (
+        resources.files("kestrel_sovereign")
+        .joinpath("data", "semantic", "ontologies", "kestrel-vocab-1.1.0.ttl")
+        .read_bytes()
+        + b"\n# reviewed 1.1 pin refresh\n"
+    )
+    snapshot.write_bytes(refreshed_bytes)
+    (semantic_root / "ontologies" / "kestrel-vocab-1.1.0.ttl").write_bytes(refreshed_bytes)
+
+    digest = refresh_manifest_digest(
+        manifest,
+        identifier="kestrel-vocab",
+        version="1.1.0",
+        snapshot_path=snapshot,
+    )
+
+    refreshed = load_knowledge_registry(manifest)
+    assert refreshed.resolve("kestrel-vocab", "1.0.0").sha256 == before
+    assert refreshed.resolve("kestrel-vocab", "1.1.0").sha256 == digest
+
+
 def test_refresh_rejects_a_snapshot_that_does_not_replace_the_package_resource(tmp_path):
     package_root = tmp_path / "kestrel_sovereign"
     semantic_root = package_root / "data" / "semantic"

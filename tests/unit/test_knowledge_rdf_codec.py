@@ -45,6 +45,7 @@ from kestrel_sovereign.knowledge.rdf_codec import (
     RDF_PREDICATE,
     RDF_REIFIES,
     RDF_SUBJECT,
+    RDF_TYPE,
 )
 from kestrel_sovereign.knowledge.registry import get_knowledge_registry
 
@@ -382,6 +383,70 @@ def test_rdf12_projection_requires_exact_explicit_registry_capability_without_fa
 
 
 @pytest.mark.parametrize(
+    ("status", "epistemic_state"),
+    (
+        (AssertionStatus.ACTIVE, EpistemicState.HYPOTHESIS),
+        (AssertionStatus.SUPERSEDED, EpistemicState.OBSERVED),
+        (AssertionStatus.RETRACTED, EpistemicState.RETRACTED),
+        (AssertionStatus.QUARANTINED, EpistemicState.DISPUTED),
+        (AssertionStatus.DELETED, EpistemicState.REPORTED),
+    ),
+)
+def test_rdf12_reifier_projection_never_materializes_a_canonical_claim_as_a_fact(
+    status, epistemic_state
+):
+    registry = get_knowledge_registry()
+    capability = registry.select_capability(
+        "rdf-profile:rdf12-cr-20260407-experimental", allow_experimental=True
+    )
+    codec = RdfAssertionCodec(
+        configuration=RdfCodecConfiguration(
+            rdf12_capability="rdf-profile:rdf12-cr-20260407-experimental",
+            rdf12_version=str(capability.resource.version),
+        )
+    )
+    value = assertion(status=status, epistemic_state=epistemic_state)
+
+    projection = codec.project(value, projection=RdfProjectionKind.RDF12_TRIPLE_TERM)
+    revision = next(
+        triple.object
+        for triple in projection.triples
+        if triple.predicate.value.endswith("hasRevision")
+    )
+    assert isinstance(revision, RdfIri)
+    assert any(
+        triple.subject == revision
+        and triple.predicate.value == RDF_TYPE
+        and triple.object == RdfIri("https://kestrel.ai/vocab/AssertionRevision")
+        for triple in projection.triples
+    )
+    assert not any(
+        triple.subject == revision
+        and triple.predicate.value == RDF_TYPE
+        and triple.object == RdfIri("http://www.w3.org/1999/02/22-rdf-syntax-ns#Reifier")
+        for triple in projection.triples
+    )
+    assert [
+        triple
+        for triple in projection.triples
+        if (
+            triple.subject == RdfIri(value.subject.value)
+            and triple.predicate == RdfIri(value.predicate.value)
+            and triple.object
+            == RdfLiteral(value.object.lexical_form, value.object.datatype_iri, value.object.language)
+        )
+    ] == []
+    reifying_triples = [
+        triple
+        for triple in projection.triples
+        if triple.subject == revision
+        and triple.predicate.value == RDF_REIFIES
+        and isinstance(triple.object, RdfTripleTerm)
+    ]
+    assert len(reifying_triples) == 1
+
+
+@pytest.mark.parametrize(
     "configuration",
     (
         RdfCodecConfiguration(
@@ -499,6 +564,41 @@ def test_import_rejects_statement_and_nesting_budgets_and_structural_cycles():
         )
 
 
+def test_deep_rdf12_triple_term_exceeds_nesting_budget_without_recursing():
+    registry = get_knowledge_registry()
+    selected = registry.select_capability(
+        "rdf-profile:rdf12-cr-20260407-experimental", allow_experimental=True
+    )
+    rdf12 = RdfAssertionCodec(
+        configuration=RdfCodecConfiguration(
+            rdf12_capability="rdf-profile:rdf12-cr-20260407-experimental",
+            rdf12_version=str(selected.resource.version),
+        )
+    )
+    nested: RdfIri | RdfTripleTerm = RdfIri("https://example.test/leaf")
+    for _ in range(1_200):
+        nested = RdfTripleTerm(
+            RdfIri("https://example.test/subject"),
+            RdfIri("https://example.test/predicate"),
+            nested,
+        )
+
+    with pytest.raises(RdfImportBudgetError, match="nesting"):
+        rdf12.import_projected_dataset(
+            RdfDataset(
+                (
+                    RdfTriple(
+                        RdfIri("https://example.test/revision"),
+                        RdfIri(RDF_REIFIES),
+                        nested,
+                    ),
+                )
+            ),
+            ownership=ownership(),
+            limits=RdfImportLimits(max_nesting=32),
+        )
+
+
 @pytest.mark.parametrize("ownership_field", ("projectedTenantId", "projectedOwnerId"))
 def test_import_uses_governed_ownership_instead_of_rdf_tenant_claim(ownership_field):
     codec = RdfAssertionCodec()
@@ -559,6 +659,8 @@ def test_typed_query_compiles_all_supported_narrowing_fields_deterministically()
     assert "VALUES ?assertionId" in seen[0]
     assert "VALUES ?status" in seen[0]
     assert "VALUES ?epistemicState" in seen[0]
+    assert "projectedOwnerId" in seen[0]
+    assert f'"{OWNER}"^^<http://www.w3.org/2001/XMLSchema#string>' in seen[0]
     assert "?validInterval" in seen[0]
     assert "?observedInterval" in seen[0]
     assert "ORDER BY ?assertionId ?revisionId LIMIT 2" in seen[0]
@@ -566,6 +668,33 @@ def test_typed_query_compiles_all_supported_narrowing_fields_deterministically()
     assert profiles[0][1] > 0
     with pytest.raises(RdfCodecError):
         RdfTypedQuery("not-an-assertion-query", ownership())
+
+
+@pytest.mark.parametrize(
+    ("field", "foreign_value"),
+    (
+        ("tenant_id", "did:example:another-tenant"),
+        ("owning_agent_id", "did:example:another-source"),
+    ),
+)
+def test_sparql_typed_read_filters_and_post_validates_governed_ownership(field, foreign_value):
+    codec = RdfAssertionCodec()
+    unsafe_result = AssertionResult(
+        assertion(**{field: foreign_value}), matched_revision_id="revision-rdf-1"
+    )
+
+    class Backend:
+        def execute_readonly(self, query_text: str, *, profile, timeout_seconds: float):
+            assert "projectedTenantId" in query_text
+            assert "projectedOwnerId" in query_text
+            return ({"result": unsafe_result},)
+
+        def cancel_readonly(self, *, profile):
+            pytest.fail("one result must not be cancelled")
+
+    adapter = codec.sparql11_read_adapter(Backend(), lambda row, owner: row["result"])
+    with pytest.raises(RdfOwnershipError, match="governed tenant/source ownership"):
+        adapter.read_assertions(codec.typed_query(AssertionQuery(limit=1), ownership()))
 
 
 def test_sparql_cursor_is_explicitly_rejected_until_the_canonical_encoding_is_negotiated():

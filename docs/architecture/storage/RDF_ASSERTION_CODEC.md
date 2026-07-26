@@ -56,11 +56,13 @@ authoritative tenant or source owner.
 The RDF 1.2 form is never selected as a fallback.  Construct the codec with an
 `RdfCodecConfiguration` naming both the registry capability and its exact
 version; e.g. the currently packaged draft capability is discovered from the
-semantic registry rather than assumed by callers.  The experimental projection
-uses `rdf:Reifier` / `rdf:reifies` and a typed `RdfTripleTerm`; all Kestrel
-metadata remains attached to the revision resource.  A codec without that
-exact selection raises `UnsupportedRdfCapabilityError` for an RDF 1.2 request
-instead of emitting an RDF 1.1 shape.
+semantic registry rather than assumed by callers. The experimental projection
+uses a typed `RdfTripleTerm`. The Kestrel revision resource is the reifier and
+relates to that triple term solely through `rdf:reifies`; it does not emit or
+require an `rdf:Reifier` class assertion. All Kestrel metadata remains attached
+to the revision resource. A codec without that exact selection raises
+`UnsupportedRdfCapabilityError` for an RDF 1.2 request instead of emitting an
+RDF 1.1 shape.
 
 `RdfCapabilityReport` returns the selected digest-pinned registry artifacts,
 including the Kestrel ontology, PROV-O, and OWL-Time resources used by a

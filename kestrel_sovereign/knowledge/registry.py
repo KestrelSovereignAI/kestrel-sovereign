@@ -769,11 +769,27 @@ def refresh_manifest_digest(
         )
     digest = hashlib.sha256(snapshot).hexdigest()
 
-    escaped_identifier = re.escape(resource.identifier)
+    resource_rows = parsed["resource"]
+    matching_table_names: list[str] = []
+    for table_name, row in resource_rows.items():
+        if not isinstance(table_name, str) or not isinstance(row, Mapping):
+            continue
+        table_resource = _parse_resource(table_name, row)
+        if (
+            table_resource.identifier == resource.identifier
+            and table_resource.version == resource.version
+        ):
+            matching_table_names.append(table_name)
+    if len(matching_table_names) != 1:
+        raise KnowledgeRegistryError(
+            f"could not locate a unique manifest table for {resource.key} in {manifest_path}"
+        )
+    escaped_table_name = re.escape(matching_table_names[0])
     # TOML permits both a bare dotted-key segment and a quoted segment. The
     # shipped manifest uses bare segments, while a developer-maintained one
-    # may quote an identifier that needs it.
-    header = rf'\[resource\.(?:"{escaped_identifier}"|{escaped_identifier})\]'
+    # may quote a table name that needs it.  The table name, rather than the
+    # durable logical identifier, distinguishes immutable versioned releases.
+    header = rf'\[resource\.(?:"{escaped_table_name}"|{escaped_table_name})\]'
     block = re.compile(
         rf"(?ms)^({header}\n.*?^sha256\s*=\s*)\"[0-9a-f]+\"(?=\s*(?:#.*)?$)(.*?)(?=^\[resource\.|\Z)"
     )

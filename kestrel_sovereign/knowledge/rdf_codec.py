@@ -64,8 +64,9 @@ RDF_STATEMENT = RDF_NAMESPACE + "Statement"
 RDF_SUBJECT = RDF_NAMESPACE + "subject"
 RDF_PREDICATE = RDF_NAMESPACE + "predicate"
 RDF_OBJECT = RDF_NAMESPACE + "object"
-# These names are deliberately confined to this module's experimental branch.
-RDF_REIFIER = RDF_NAMESPACE + "Reifier"
+# This draft predicate is deliberately confined to this module's experimental
+# branch.  The selected snapshot defines the reifying relation without a
+# companion class assertion.
 RDF_REIFIES = RDF_NAMESPACE + "reifies"
 
 
@@ -483,7 +484,20 @@ class _SparqlAssertionReadAdapter:
             raise RdfImportBudgetError(
                 "SPARQL backend returned more rows than the typed query limit"
             )
-        return tuple(self._decode_row(row, request.ownership) for row in rows)
+        results: list[AssertionResult] = []
+        for row in rows:
+            result = self._decode_row(row, request.ownership)
+            if not isinstance(result, AssertionResult):
+                raise RdfCodecError("SPARQL assertion decoder must return AssertionResult")
+            if (
+                result.assertion.tenant_id != request.ownership.tenant_id
+                or result.assertion.owning_agent_id != request.ownership.owning_agent_id
+            ):
+                raise RdfOwnershipError(
+                    "SPARQL typed read result contradicts the governed tenant/source ownership"
+                )
+            results.append(result)
+        return tuple(results)
 
 
 class Sparql11AssertionReadAdapter(_SparqlAssertionReadAdapter):
@@ -611,6 +625,8 @@ def _compile_typed_assertion_read(
     filters = [
         f'?revision <{vocabulary_namespace}projectedTenantId> '
         f'{_ntriples_term(RdfLiteral(request.ownership.tenant_id))} .',
+        f'?revision <{vocabulary_namespace}projectedOwnerId> '
+        f'{_ntriples_term(RdfLiteral(request.ownership.owning_agent_id))} .',
         f"?revision <{vocabulary_namespace}assertionId> ?assertionId .",
         f"?revision <{vocabulary_namespace}revisionId> ?revisionId .",
     ]
@@ -910,11 +926,7 @@ class RdfAssertionCodec:
             add(revision, RDF_PREDICATE, predicate)
             add(revision, RDF_OBJECT, object_)
         else:
-            add(revision, RDF_TYPE, RdfIri(RDF_REIFIER))
             add(revision, RDF_REIFIES, RdfTripleTerm(subject, predicate, object_))
-            # The direct triple is a view convenience, while the revision
-            # resource is where Kestrel metadata remains attached.
-            add(subject, predicate.value, object_)
 
         self._project_metadata(add, assertion, revision)
         return RdfDataset(tuple(triples))
@@ -1042,7 +1054,10 @@ class RdfAssertionCodec:
         limits = limits or RdfImportLimits()
         document = RdfImportDocument(
             dataset=dataset,
-            received_bytes=_dataset_byte_weight(dataset),
+            # The decoded graph budget is calculated only after the iterative
+            # nesting validation below.  A hostile deeply-nested triple term
+            # must produce a budget error, never recurse while estimating size.
+            received_bytes=0,
         )
         return self._decode_import_document(document, ownership=ownership, limits=limits)
 
@@ -1123,11 +1138,7 @@ class RdfAssertionCodec:
                     "RDF 1.2 triple-term/reifier input requires an explicitly selected "
                     "registry-pinned RDF 1.2 capability"
                 )
-            if (
-                not _has(triples, RDF_TYPE, RDF_REIFIER)
-                or len(reifies) != 1
-                or not isinstance(reifies[0], RdfTripleTerm)
-            ):
+            if len(reifies) != 1 or not isinstance(reifies[0], RdfTripleTerm):
                 raise RdfCodecError("RDF 1.2 reifier projection must contain one rdf:reifies triple term")
             triple_term = reifies[0]
             return _canonical_statement_terms(triple_term.subject, triple_term.predicate, triple_term.object)
@@ -1253,51 +1264,61 @@ class RdfAssertionCodec:
                 edges[triple.subject].add(triple.object)
         visiting: set[RdfIri] = set()
         completed: set[RdfIri] = set()
-
-        def visit(node: RdfIri, depth: int) -> None:
-            if depth > limits.max_nesting:
-                raise RdfImportBudgetError("RDF structural graph exceeds the nesting budget")
-            if node in visiting:
-                raise RdfImportBudgetError("RDF structural graph contains a cycle")
-            if node in completed:
-                return
-            visiting.add(node)
-            for child in edges.get(node, ()):
-                visit(child, depth + 1)
-            visiting.remove(node)
-            completed.add(node)
-
-        for node in tuple(edges):
-            visit(node, 0)
+        for root in tuple(edges):
+            if root in completed:
+                continue
+            stack: list[tuple[RdfIri, int, bool]] = [(root, 0, False)]
+            while stack:
+                node, depth, leaving = stack.pop()
+                if leaving:
+                    visiting.remove(node)
+                    completed.add(node)
+                    continue
+                if depth > limits.max_nesting:
+                    raise RdfImportBudgetError("RDF structural graph exceeds the nesting budget")
+                if node in completed:
+                    continue
+                if node in visiting:
+                    raise RdfImportBudgetError("RDF structural graph contains a cycle")
+                visiting.add(node)
+                stack.append((node, depth, True))
+                stack.extend((child, depth + 1, False) for child in edges.get(node, ()))
 
     def _validate_term(self, term: RdfTerm, limits: RdfImportLimits, *, depth: int) -> None:
-        if depth > limits.max_nesting:
-            raise RdfImportBudgetError("RDF term exceeds the nesting budget")
-        if isinstance(term, RdfIri):
-            if len(term.value.encode("utf-8")) > limits.max_term_bytes:
-                raise RdfImportBudgetError("RDF IRI exceeds the term-size budget")
-            self._validate_term_iri(term.value)
-            return
-        if isinstance(term, RdfBlankNode):
-            raise RdfCodecError(
-                "RDF blank/local identifiers cannot be promoted into a canonical assertion identity"
-            )
-        if isinstance(term, RdfLiteral):
-            if len(term.lexical_form.encode("utf-8")) > limits.max_term_bytes:
-                raise RdfImportBudgetError("RDF literal exceeds the term-size budget")
-            self._validate_term_iri(term.datatype_iri)
-            if term.direction is not None:
-                raise UnsupportedRdfCapabilityError(
-                    "RDF 1.2 directional literals cannot be represented by the canonical assertion contract"
+        pending: list[tuple[RdfTerm, int]] = [(term, depth)]
+        while pending:
+            current, current_depth = pending.pop()
+            if current_depth > limits.max_nesting:
+                raise RdfImportBudgetError("RDF term exceeds the nesting budget")
+            if isinstance(current, RdfIri):
+                if len(current.value.encode("utf-8")) > limits.max_term_bytes:
+                    raise RdfImportBudgetError("RDF IRI exceeds the term-size budget")
+                self._validate_term_iri(current.value)
+                continue
+            if isinstance(current, RdfBlankNode):
+                raise RdfCodecError(
+                    "RDF blank/local identifiers cannot be promoted into a canonical assertion identity"
                 )
-            return
-        if self._rdf12 is None:
-            raise UnsupportedRdfCapabilityError(
-                "RDF 1.2 triple terms require an explicitly selected registry-pinned capability"
+            if isinstance(current, RdfLiteral):
+                if len(current.lexical_form.encode("utf-8")) > limits.max_term_bytes:
+                    raise RdfImportBudgetError("RDF literal exceeds the term-size budget")
+                self._validate_term_iri(current.datatype_iri)
+                if current.direction is not None:
+                    raise UnsupportedRdfCapabilityError(
+                        "RDF 1.2 directional literals cannot be represented by the canonical assertion contract"
+                    )
+                continue
+            if self._rdf12 is None:
+                raise UnsupportedRdfCapabilityError(
+                    "RDF 1.2 triple terms require an explicitly selected registry-pinned capability"
+                )
+            pending.extend(
+                (
+                    (current.object, current_depth + 1),
+                    (current.predicate, current_depth + 1),
+                    (current.subject, current_depth + 1),
+                )
             )
-        self._validate_term(term.subject, limits, depth=depth + 1)
-        self._validate_term(term.predicate, limits, depth=depth + 1)
-        self._validate_term(term.object, limits, depth=depth + 1)
 
     @staticmethod
     def _validate_term_iri(value: str) -> None:
@@ -1381,21 +1402,23 @@ def _canonical_statement_terms(
 
 def _term_byte_weight(term: RdfTerm) -> int:
     """Bound decoded graph expansion even when an adapter underreports bytes."""
-    if isinstance(term, RdfIri):
-        return len(term.value.encode("utf-8"))
-    if isinstance(term, RdfBlankNode):
-        return len(term.identifier.encode("utf-8"))
-    if isinstance(term, RdfLiteral):
-        return (
-            len(term.lexical_form.encode("utf-8"))
-            + len(term.datatype_iri.encode("utf-8"))
-            + (len(term.language.encode("utf-8")) if term.language is not None else 0)
-        )
-    return (
-        _term_byte_weight(term.subject)
-        + _term_byte_weight(term.predicate)
-        + _term_byte_weight(term.object)
-    )
+    weight = 0
+    pending: list[RdfTerm] = [term]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, RdfIri):
+            weight += len(current.value.encode("utf-8"))
+        elif isinstance(current, RdfBlankNode):
+            weight += len(current.identifier.encode("utf-8"))
+        elif isinstance(current, RdfLiteral):
+            weight += (
+                len(current.lexical_form.encode("utf-8"))
+                + len(current.datatype_iri.encode("utf-8"))
+                + (len(current.language.encode("utf-8")) if current.language is not None else 0)
+            )
+        else:
+            pending.extend((current.object, current.predicate, current.subject))
+    return weight
 
 
 def _dataset_byte_weight(dataset: RdfDataset) -> int:
@@ -1492,7 +1515,6 @@ __all__ = [
     "RDF_OBJECT",
     "RDF_PREDICATE",
     "RDF_REIFIES",
-    "RDF_REIFIER",
     "RDF_STATEMENT",
     "RDF_SUBJECT",
     "RDF_TYPE",
