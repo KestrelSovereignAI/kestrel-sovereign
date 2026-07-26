@@ -7,7 +7,7 @@ tags:
 - docs
 - architecture
 - architecture-spec
-timestamp: '2026-07-24T00:00:00Z'
+timestamp: '2026-07-26T00:00:00Z'
 status: active
 owner: architecture
 canonical: true
@@ -18,11 +18,19 @@ privacy: public
 # Kestrel Storage Architecture
 
 **Status:** Active implementation snapshot
-**Last updated:** 2026-05-31
+**Last updated:** 2026-07-26
 
 This document describes the storage stack that is in the current repository.
 Older versions of this page described a pre-async, pre-SQLAlchemy migration plan;
 that plan is no longer the source of truth.
+
+> **Semantic knowledge boundary:** The current graph, RAG, saved-item, memory,
+> and vector surfaces described here are implementation storage surfaces; they
+> are not competing semantic truth stores. The design-of-record for the planned
+> canonical assertion layer, standards profiles, lifecycle, privacy, and
+> migration boundary is [Semantic Knowledge Architecture](SEMANTIC_KNOWLEDGE_ARCHITECTURE.md).
+> Nothing in this page claims that its current tables already implement that
+> layer.
 
 ## Current Shape
 
@@ -124,14 +132,29 @@ falls back to the legacy search path and logs the failure for the next boot.
 | Saved items | `saved_items` | Embedding search through SQLAlchemy/vector backend with legacy fallback. |
 | A2A task archive | A2A memory service tables | Full-text search for archived task transcripts. |
 
+These retrieval surfaces return stored material or ranked candidates. A vector
+hit, property-graph node, conversation summary, or RAG chunk is not a canonical
+semantic assertion merely because it is retrieved. The future assertion layer
+will filter lifecycle and privacy state before ranking these projections; see
+[Semantic Knowledge Architecture](SEMANTIC_KNOWLEDGE_ARCHITECTURE.md).
+
 ## Privacy And Encryption Notes
 
 - `EPHEMERAL` privacy mode avoids persistent conversation storage.
+- `DEIDENTIFIED` is a current fail-closed preset: `PrivacyEnforcingStorage`
+  denies durable user-derived writes until a Safe Harbor or Expert
+  Determination transformation and evidence pipeline exists. It is not a
+  synonym for `NORMAL` or `ANONYMOUS`; the target `storage=deidentified`
+  setting alone does not authorize a semantic, graph, vector, memory, export,
+  or training write.
 - Conversation content can be encrypted at rest through the conversation store.
 - The SQLAlchemy vector backends operate on precomputed embedding columns and do
   not decrypt `content` / `rendered_content`.
 - Export/import and backup behavior is owned by sovereignty/storage-tier code,
   not by the vector backend.
+- `AsyncGraphStore` ownership ledgers constrain current graph rows by agent;
+  they do not supply the planned assertion revision, provenance, ontology, or
+  inference-retraction contract. That contract is intentionally additive.
 
 ## Operational Notes
 

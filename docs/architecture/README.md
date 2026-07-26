@@ -8,7 +8,7 @@ tags:
 - docs
 - architecture
 - architecture-spec
-timestamp: '2026-07-25T00:00:00Z'
+timestamp: '2026-07-26T00:00:00Z'
 status: active
 owner: documentation
 canonical: true
@@ -82,6 +82,7 @@ Only **Active** and **Design of record** rows belong here.
 | [MEMORY_SYSTEM.md](MEMORY_SYSTEM.md) | **Active** | `kestrel-sovereign`: `kestrel_sovereign/storage/memory_system.py`, `kestrel_sovereign/storage/memory_retriever.py`, and `kestrel_sovereign/storage/memory_consolidator.py` | Cognitive memory, scoring, consolidation, and documented deployment deviations. |
 | [MEMORY_OWNERSHIP.md](MEMORY_OWNERSHIP.md) | **Active** | `kestrel-sovereign`: `kestrel_sovereign/storage/`, `kestrel_sovereign/agent/`, and bundled memory feature modules | Current facade, context, feature, RAG, and A2A ownership boundaries. |
 | [storage/STORAGE_ARCHITECTURE.md](storage/STORAGE_ARCHITECTURE.md) | **Active** | `kestrel-sovereign`: `kestrel_sovereign/storage/` | Current async SQLite/PostgreSQL, SQLAlchemy, and vector-storage layers. |
+| [storage/SEMANTIC_KNOWLEDGE_ARCHITECTURE.md](storage/SEMANTIC_KNOWLEDGE_ARCHITECTURE.md) | **Design of record** | Planned contract in `kestrel_sovereign/storage/`; optional training consumer is `kestrel-feature-parametric-self` | Canonical assertion identity, standards profiles, provenance, lifecycle, privacy, projection, and migration contract before runtime implementation. |
 
 ### Security and privacy
 
