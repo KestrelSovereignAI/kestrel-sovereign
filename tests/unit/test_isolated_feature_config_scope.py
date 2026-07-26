@@ -689,6 +689,127 @@ async def test_legacy_after_scoped_stage_quarantines_before_hook_and_future_prox
 
 
 @pytest.mark.asyncio
+async def test_legacy_after_scoped_lease_renewal_fences_before_hook_or_traffic(
+    monkeypatch, tmp_path
+):
+    """Every scoped CAS, not only staging, fences a late legacy authority."""
+
+    did = "did:test:late-legacy-after-renewal"
+    candidate_config = {"revision": "new-candidate"}
+    legacy_config = {"revision": "old-binary-winner"}
+    graph = _GlobalGraph()
+    clients: list[_NoopClient] = []
+
+    class _LegacyAfterRenewalStorage(_AgentScopedStorage):
+        def __init__(self) -> None:
+            super().__init__(graph, did)
+            self._legacy_written = False
+
+        async def compare_and_swap_node(self, node_id, expected, new_node):
+            result = await super().compare_and_swap_node(node_id, expected, new_node)
+            # The second scoped write is the lease renewal that immediately
+            # precedes a live config-transition hook.  An old replica can
+            # publish its legacy authority while that CAS is awaiting.
+            if (
+                result == "swapped"
+                and not self._legacy_written
+                and node_id == _scoped_node_id(did)
+                and self.cas_node_ids.count(node_id) == 2
+            ):
+                self._legacy_written = True
+                graph.seed(
+                    did,
+                    GraphNode(
+                        node_id=_LEGACY_NODE_ID,
+                        node_type="feature_config",
+                        label=f"{_FEATURE_NAME} config",
+                        properties={"config": dict(legacy_config)},
+                    ),
+                )
+            return result
+
+    class _HookClient(_NoopClient):
+        supports_config_transition = True
+
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.prepare_calls = 0
+
+        async def prepare_config_transition(self, _config: dict[str, Any]) -> Any:
+            self.prepare_calls += 1
+            raise AssertionError("late legacy authority must fence the live hook")
+
+    def client_factory(**kwargs: Any) -> _HookClient:
+        client = _HookClient(**kwargs)
+        clients.append(client)
+        return client
+
+    monkeypatch.setenv("KESTREL_FEATURE_SCOPEDFEATURE_BIN", "/bin/test-service")
+    storage = _LegacyAfterRenewalStorage()
+    feature = ProxyFeature(
+        _agent(did, storage, tmp_path), _runtime(), client_factory=client_factory
+    )
+    try:
+        await feature.initialize()
+
+        with pytest.raises(RuntimeError, match="legacy config authority became visible"):
+            await feature.set_config(candidate_config)
+
+        assert storage.cas_node_ids == [_scoped_node_id(did), _scoped_node_id(did)]
+        assert clients[0].prepare_calls == 0
+        assert clients[0].stopped is True
+        assert feature._client is None
+        assert feature._traffic_gate.sealed is True
+        assert await feature.get_config() == legacy_config
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_secret_patch_foreign_scoped_not_found_fails_once_without_foreign_mutation(
+    tmp_path,
+):
+    """A hidden foreign global collision cannot make secret PATCH retry forever."""
+
+    did = "did:test:secret-patch-owner"
+    foreign_did = "did:test:secret-patch-foreign"
+    foreign_properties = {"config": {"token": "foreign-secret", "enabled": True}}
+    graph = _GlobalGraph()
+    graph.seed(
+        foreign_did,
+        GraphNode(
+            node_id=_scoped_node_id(did),
+            node_type="feature_config",
+            label=f"{_FEATURE_NAME} config",
+            properties=dict(foreign_properties),
+        ),
+    )
+    storage = _AgentScopedStorage(graph, did)
+    feature = ProxyFeature(_agent(did, storage, tmp_path), _runtime())
+
+    try:
+        with pytest.raises(RuntimeError, match="conflicts with a newer durable state") as error:
+            await asyncio.wait_for(
+                feature.set_config_with_secret_preservation(
+                    {"enabled": False},
+                    {"token"},
+                    lambda _effective: None,
+                ),
+                timeout=0.5,
+            )
+
+        # A tenant-bound read remains absent, so ``not_found`` is permanent
+        # for this attempt rather than evidence of a readable concurrent
+        # winner.  The foreign row and its secret must stay untouched.
+        assert storage.cas_node_ids == [_scoped_node_id(did)]
+        assert graph.owners[_scoped_node_id(did)] == foreign_did
+        assert graph.nodes[_scoped_node_id(did)].properties == foreign_properties
+        assert "foreign-secret" not in str(error.value)
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_persist_config_cas_preserves_metadata_and_never_clobbers_new_stage(
     tmp_path,
 ):

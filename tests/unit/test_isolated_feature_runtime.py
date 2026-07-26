@@ -4,18 +4,22 @@ import asyncio
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from kestrel_sdk.isolated_feature import ConfigTransitionError, ConfigTransitionResult
+from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
 from kestrel_sovereign.features import isolated_runtime
 from kestrel_sovereign.features.isolated_runtime import (
     ProxyFeature,
     SchedulerExecutionContextUnavailable,
+    SchedulerTerminalAdmissionError,
 )
 from kestrel_sovereign.features.scheduler.runner import (
+    SCHEDULER_PROTOCOL_VERSION,
     ScheduledTask,
     SchedulerExecution,
     SchedulerRunner,
@@ -23,6 +27,8 @@ from kestrel_sovereign.features.scheduler.runner import (
     _SchedulerExecutionScope,
     get_current_scheduler_execution,
 )
+from kestrel_sovereign.storage.async_database import AsyncDatabase
+from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
 
 _TEST_AGENT_DID = "did:test:isolated-runtime"
@@ -163,6 +169,66 @@ async def test_scheduled_isolated_call_fails_before_dispatch_without_context_cap
     # No RPC is attempted, so a legacy child can never perform a duplicate
     # effect without the scheduler's stable idempotency key.
     assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_records_terminal_isolated_admission_as_failed(tmp_path, monkeypatch):
+    """A sealed proxy raises for scheduler delivery, so the durable row fails."""
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+
+    backend = SQLiteBackend(str(tmp_path / "scheduler.db"))
+    await backend.connect()
+    db = AsyncDatabase(backend)
+
+    async def dispatch_terminal_isolated_call(_task_name, _args):
+        return await feature.call_isolated_tool("ping", {})
+
+    runner = SchedulerRunner(
+        db,
+        _TEST_AGENT_DID,
+        dispatch_terminal_isolated_call,
+        owner_id="terminal-admission-runner",
+    )
+    try:
+        await feature.initialize()
+        client = feature._client
+        await feature.shutdown()
+        assert feature._traffic_gate.sealed is True
+
+        await runner._ensure_tables()
+        due = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        await db.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 next_run_at, created_at, schedule_kind, timezone_name,
+                 misfire_policy, idempotency_key, scheduler_protocol_version)
+            VALUES (?, ?, 'isolated_ping', '* * * * *', '{}', 1, ?, ?,
+                    'cron', 'UTC', 'skip', 'terminal-admission', ?)
+            """,
+            ("terminal-admission-task", _TEST_AGENT_DID, due, due, SCHEDULER_PROTOCOL_VERSION),
+        )
+
+        await runner._tick()
+
+        status, result_text = await db.fetchone(
+            "SELECT status, result_text FROM task_execution_log WHERE task_id = ?",
+            ("terminal-admission-task",),
+        )
+        assert status == "failed"
+        assert result_text == (
+            "SchedulerTerminalAdmissionError: isolated feature traffic is unavailable"
+        )
+        assert client.calls == []
+    finally:
+        if not feature._stopping:
+            await feature.shutdown()
+        await db.close()
 
 
 @pytest.mark.asyncio
@@ -641,6 +707,117 @@ async def test_proxy_bridges_channel_capability_into_registry(monkeypatch, tmp_p
 
     await feature.shutdown()
     assert "whatsapp" not in channel_feature.registry.adapters
+
+
+@pytest.mark.asyncio
+async def test_replacement_bridge_uses_effective_config_for_outbound_and_inbound_authorization(
+    monkeypatch, tmp_path
+):
+    """A replacement bridge must not inherit stale sender/enabled policy."""
+
+    from kestrel_sovereign.features.channels.feature import ChannelFeature
+    from kestrel_sovereign.features.channels.models import (
+        ChannelMessage,
+        MessageDirection,
+    )
+
+    old_config = {
+        "agent_id": "old-agent",
+        "enabled": False,
+        "allowed_senders": ["old-sender"],
+    }
+    target_config = {
+        "agent_id": "target-agent",
+        "enabled": True,
+        "allowed_senders": ["target-sender"],
+    }
+    routed_senders: list[str] = []
+
+    async def route_inbound(message):
+        routed_senders.append(message.sender)
+
+    channel_agent = SimpleNamespace(
+        did=_TEST_AGENT_DID,
+        storage=SimpleNamespace(agent_id=_TEST_AGENT_DID),
+        dispatcher=None,
+        signal_registry=None,
+        features={},
+    )
+    channel_feature = ChannelFeature(channel_agent)
+    await channel_feature.initialize()
+    channel_feature.registry.set_inbound_router(route_inbound)
+
+    class ChannelClient(FakeIsolatedClient):
+        capabilities = {
+            "channel": {
+                "channel_type": "whatsapp",
+                "send_tool": "whatsapp_send",
+            }
+        }
+
+        async def call_tool(self, name, args):
+            self.calls.append((name, args))
+            return {"ok": True, "data": {"message_id": "WAMID.target"}}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": channel_feature})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_WHATSAPPFEATURE_BIN", "/bin/wa-service")
+    clients: list[ChannelClient] = []
+
+    def client_factory(**kwargs):
+        client = ChannelClient(**kwargs)
+        clients.append(client)
+        return client
+
+    feature = ProxyFeature(agent, _isolated_runtime(), client_factory=client_factory)
+    feature._host_config = dict(old_config)
+    feature._host_config_loaded = True
+    try:
+        await feature._connect_client(old_config)
+        # ``_replace_client(target_config)`` models forced reconciliation: the
+        # target child starts before the caller updates ``_host_config``.
+        await feature._replace_client(target_config)
+
+        adapter = channel_feature.registry.get("whatsapp")
+        assert adapter is not None
+        assert feature._host_config == old_config
+        assert adapter.config.enabled is True
+        assert adapter.config.allowed_senders == ["target-sender"]
+        assert adapter.config.agent_id == "target-agent"
+
+        # Outbound authorization reads ``enabled`` from the bridge config.
+        outbound = await channel_feature.channels_send("whatsapp", "+1", "hello")
+        assert outbound.status is ToolResultStatus.OK
+        assert clients[1].calls == [
+            ("whatsapp_send", {"to": "+1", "message": "hello"})
+        ]
+
+        # Inbound authorization reads ``allowed_senders`` from that same
+        # bridge config, so old policy neither admits old senders nor blocks
+        # the target sender.
+        await channel_feature.handle_inbound(
+            ChannelMessage(
+                channel_type="whatsapp",
+                direction=MessageDirection.INBOUND,
+                sender="old-sender",
+                recipient="bot",
+                content="stale policy",
+            )
+        )
+        await channel_feature.handle_inbound(
+            ChannelMessage(
+                channel_type="whatsapp",
+                direction=MessageDirection.INBOUND,
+                sender="target-sender",
+                recipient="bot",
+                content="target policy",
+            )
+        )
+        assert routed_senders == ["target-sender"]
+    finally:
+        await feature.shutdown()
+        await channel_feature.shutdown()
 
 
 @pytest.mark.asyncio
@@ -3979,10 +4156,13 @@ async def test_terminal_shutdown_wakes_tool_waiter(monkeypatch, tmp_path):
         )
         token = _current_execution.set(_SchedulerExecutionScope(execution))
         try:
-            scheduled_result = await feature.call_isolated_tool("ping", {})
+            with pytest.raises(
+                SchedulerTerminalAdmissionError,
+                match="isolated feature traffic is unavailable",
+            ):
+                await feature.call_isolated_tool("ping", {})
         finally:
             _current_execution.reset(token)
-        assert scheduled_result["error"] == "isolated feature traffic is unavailable"
 
         release_active.set()
         await active

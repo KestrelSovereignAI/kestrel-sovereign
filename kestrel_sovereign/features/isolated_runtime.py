@@ -94,6 +94,13 @@ class _ConfigTransitionLeaseLost(RuntimeError):
 class _ConfigAuthorityChanged(RuntimeError):
     """A visible legacy config row superseded scoped rolling-upgrade authority."""
 
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        # A stage can commit before its post-CAS authority fence reports the
+        # legacy row.  The owning lifecycle method has not received the local
+        # transition return value yet, so preserve it on the signal.
+        self.transition: Optional["_ConfigTransition"] = None
+
 
 class _TrafficGateTerminalError(RuntimeError):
     """The proxy has entered a terminal no-admission lifecycle state."""
@@ -290,6 +297,11 @@ class _ConfigWriteResult:
 
     committed: bool
     error: Optional[BaseException] = field(default=None, repr=False)
+    # Keep the storage predicate outcome so PATCH preservation retries only
+    # genuine concurrent winners.  A globally colliding foreign scoped node,
+    # for example, is reported as ``not_found`` to this tenant and must not
+    # spin forever against an unchanged absent read.
+    outcome: Optional[str] = None
 
 
 @dataclass
@@ -318,6 +330,19 @@ class SchedulerExecutionContextUnavailable(RuntimeError):
     occurrence identity would let an isolated tool perform an effect without
     the idempotency key that makes lease recovery safe.
     """
+
+
+class SchedulerTerminalAdmissionError(RuntimeError):
+    """A scheduled occurrence reached a terminal isolated traffic gate.
+
+    SchedulerRunner treats exceptions as durable failed occurrences.  Returning
+    the ordinary direct-call error envelope here would instead serialize that
+    envelope as a successful scheduled result, concealing a shut down or
+    quarantined effect boundary.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(_TERMINAL_TRAFFIC_ERROR)
 
 
 def _scheduler_trigger_source_id(schedule_id: str) -> str:
@@ -1045,16 +1070,18 @@ class ProxyFeature(Feature):
         *,
         register_channel_bridge: bool = True,
     ) -> None:
-        """Build + start the isolated client from the current ``_host_config``,
-        then wire event handling, tools, and the channel bridge.
+        """Build + start the isolated client from its effective config, then
+        wire event handling, tools, and the channel bridge.
 
         Shared by ``initialize`` (first launch) and ``reload`` (re-launch after a
-        config change). ``_build_client`` snapshots ``_host_config`` into the
-        service's initialize handshake, so rebuilding here is how new config
-        actually reaches a running service.
+        config change). A forced reconciliation can start a child with an
+        explicit authoritative config before ``_host_config`` is updated, so
+        the bridge must receive that same effective config rather than reading
+        the stale host cache.
         """
         self._assert_child_start_allowed()
-        client, tools = await self._start_detached_client(config)
+        effective_config = self._host_config if config is None else config
+        client, tools = await self._start_detached_client(effective_config)
         # A terminal cleanup can latch while a detached start awaits.  Do not
         # publish that child behind a sealed gate; retire it before reporting
         # the terminal lifecycle boundary to the caller.
@@ -1065,6 +1092,7 @@ class ProxyFeature(Feature):
             client,
             tools,
             register_channel_bridge=register_channel_bridge,
+            channel_config=effective_config,
         )
         try:
             await self._register_event_handler(client)
@@ -1127,6 +1155,7 @@ class ProxyFeature(Feature):
         tools: List[AgentTool],
         *,
         register_channel_bridge: bool,
+        channel_config: Dict[str, Any],
     ) -> None:
         """Atomically make a started child available to host traffic.
 
@@ -1139,7 +1168,7 @@ class ProxyFeature(Feature):
         self._client = client
         self._tools = tools
         if register_channel_bridge:
-            self._register_channel_bridge()
+            self._register_channel_bridge(channel_config)
 
     def _unpublish_client(self, expected_client: Any = None) -> Any:
         """Remove the current child from host-visible proxy state.
@@ -1584,7 +1613,10 @@ class ProxyFeature(Feature):
                 if promotion.error is not None:
                     self._raise_promotion_failure(promotion)
             except _ConfigAuthorityChanged as authority_error:
-                await self._handle_config_authority_change(transition)
+                staged_transition = transition or getattr(
+                    authority_error, "transition", None
+                )
+                await self._handle_config_authority_change(staged_transition)
                 raise RuntimeError(
                     f"Cannot apply config for isolated feature {self.name}: "
                     "legacy config authority became visible during rolling upgrade"
@@ -2170,12 +2202,22 @@ class ProxyFeature(Feature):
                     generation=generation,
                     owner=owner,
                 )
-                write = await self._write_config_state(
-                    storage,
-                    transition.expected_properties,
-                    staged_properties,
-                    expected_node_id=transition.config_node_id,
-                )
+                try:
+                    write = await self._write_config_state(
+                        storage,
+                        transition.expected_properties,
+                        staged_properties,
+                        expected_node_id=transition.config_node_id,
+                    )
+                except _ConfigAuthorityChanged as authority_error:
+                    # The write can commit before its post-CAS legacy fence
+                    # observes an old replica.  ``set_config`` has not yet
+                    # received this local transition return value, so carry
+                    # its exact scoped candidate with the fence signal; the
+                    # lifecycle owner must quarantine rather than treating it
+                    # as a pre-stage authority change and reconciling traffic.
+                    authority_error.transition = transition
+                    raise
                 if write.committed:
                     return transition
 
@@ -2197,13 +2239,19 @@ class ProxyFeature(Feature):
                         raise write.error
                     return transition
 
-                if write.error is None and preserve_secret_fields:
+                if (
+                    write.error is None
+                    and write.outcome == "predicate_failed"
+                    and observed.properties != transition.expected_properties
+                    and preserve_secret_fields
+                ):
                     # An atomic PATCH preservation attempt deliberately retries
-                    # from the newer durable winner.  This is the only path
-                    # where a stale pre-stage read may be repaired without
-                    # surfacing a conflict: each loop re-merges omitted
-                    # write-only fields from the exact CAS predicate snapshot,
-                    # so it can never reintroduce the stale secret that lost.
+                    # only after a newer same-tenant durable winner.  Each
+                    # loop re-merges omitted write-only fields from the exact
+                    # CAS predicate snapshot, so it can never reintroduce the
+                    # stale secret that lost.  Other outcomes (notably a
+                    # foreign globally-colliding node reported as not_found)
+                    # have no newer readable predicate and must fail closed.
                     continue
 
                 await self._reconcile_client_to_authoritative_config(
@@ -2626,7 +2674,29 @@ class ProxyFeature(Feature):
             result = await _maybe_await(
                 compare_and_swap(node_id, expected_properties, node)
             )
-            return _ConfigWriteResult(committed=result == "swapped")
+            if result == "swapped":
+                if node_id == self._config_node_id():
+                    # The first authority resolution cannot make a scoped key
+                    # atomic with an old binary's legacy key.  A legacy row
+                    # can appear while this CAS awaits, so every successful
+                    # scoped write must fence that outcome *before* lease
+                    # renewal, promotion, lifecycle hooks, or traffic can
+                    # continue under the scoped authority.
+                    await self._resolved_config_node_id_for(
+                        storage,
+                        expected_node_id=node_id,
+                        fence_cached_scoped_authority=True,
+                    )
+                return _ConfigWriteResult(committed=True, outcome="swapped")
+            return _ConfigWriteResult(
+                committed=False,
+                outcome=result if isinstance(result, str) else None,
+            )
+        except _ConfigAuthorityChanged:
+            # This is a post-commit rolling-upgrade fence, not an ambiguous
+            # storage failure.  It must reach the lifecycle owner immediately
+            # so it quarantines before any hook or traffic can continue.
+            raise
         except BaseException as exc:
             # A write boundary may raise after commit. Its caller performs the
             # authoritative read needed to classify the result.
@@ -3011,7 +3081,9 @@ class ProxyFeature(Feature):
             and getattr(context, "version", None) in versions
         )
 
-    def _register_channel_bridge(self) -> None:
+    def _register_channel_bridge(
+        self, config: Optional[Dict[str, Any]] = None
+    ) -> None:
         """If the service advertises a channel capability, register a forwarding
         ``ChannelAdapter`` so the generic channels API works against this
         isolated feature (otherwise only the feature's own tools + inbound
@@ -3045,7 +3117,7 @@ class ProxyFeature(Feature):
             channel_type=str(channel_type),
             send_tool=str(send_tool),
             status_tool=channel.get("status_tool"),
-            config=self._channel_config(str(channel_type)),
+            config=self._channel_config(str(channel_type), config),
         )
         registry.register(adapter)
         self._channel_adapter = adapter
@@ -3082,7 +3154,9 @@ class ProxyFeature(Feature):
         getter = getattr(features, "get", None)
         return getter("ChannelFeature") if callable(getter) else None
 
-    def _channel_config(self, channel_type: str):
+    def _channel_config(
+        self, channel_type: str, config: Optional[Dict[str, Any]] = None
+    ):
         """Build a ChannelConfig from host config for sender-filtering / enabled.
 
         Inbound sender filtering and the disabled-channel guard both read the
@@ -3091,7 +3165,8 @@ class ProxyFeature(Feature):
         """
         from kestrel_sdk.channels import ChannelConfig
 
-        cfg = self._host_config or {}
+        cfg = self._host_config if config is None else config
+        cfg = cfg if isinstance(cfg, dict) else {}
         return ChannelConfig(
             channel_type=channel_type,
             agent_id=str(cfg.get("agent_id", "") or ""),
@@ -3117,6 +3192,12 @@ class ProxyFeature(Feature):
                     )
                 return await self._call_isolated_tool_admitted(name, args, context)
         except _TrafficGateTerminalError:
+            if context is not None:
+                # Scheduled work must surface terminal admission as an
+                # exception so SchedulerRunner records a failed occurrence.
+                # Direct tools and channel sends retain their established flat
+                # error envelope for compatibility.
+                raise SchedulerTerminalAdmissionError()
             # Unlike an ordinary RPC error, terminal admission has no client to
             # retry against. Keep the public result stable and secret-free for
             # both direct tools and ProxyChannelAdapter sends.
