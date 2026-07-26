@@ -13,6 +13,7 @@ import json
 import logging
 import pytest
 import pytest_asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -75,6 +76,51 @@ def _make_mock_agent(db=None):
     agent.storage.db = mock_db
 
     return agent
+
+
+def _use_postgres_clock(feature, database_now, *, scheduled_row=None):
+    """Make one feature exercise the concrete DB-clock path in order."""
+
+    events = []
+
+    @asynccontextmanager
+    async def _transaction():
+        events.append("transaction_begin")
+        try:
+            yield
+        finally:
+            events.append("transaction_end")
+
+    async def _fetchone(sql, params=()):
+        if "FROM scheduler_protocol_schema" in sql:
+            events.append("schema_lock")
+            return (2,)
+        if "FROM scheduler_protocol_rollout" in sql:
+            events.append("rollout_lock")
+            return (2, "active")
+        if "FROM scheduled_tasks" in sql:
+            events.append("schedule_read")
+            return scheduled_row
+        return None
+
+    async def _fetchval(sql, params=()):
+        events.append("database_clock")
+        assert sql == "SELECT clock_timestamp()"
+        return database_now
+
+    async def _execute(sql, params=()):
+        if "INSERT INTO scheduled_tasks" in sql:
+            events.append("schedule_insert")
+        elif "UPDATE scheduled_tasks" in sql:
+            events.append("schedule_update")
+        return 1
+
+    feature._db.backend_type = "postgres"
+    feature._db.transaction = _transaction
+    feature._db.fetchone = AsyncMock(side_effect=_fetchone)
+    feature._db.fetchval = AsyncMock(side_effect=_fetchval)
+    feature._db.execute = AsyncMock(side_effect=_execute)
+    return events
 
 
 class _StubJobFeature:
@@ -332,8 +378,6 @@ class TestSleepCronHandler:
     async def test_handle_sleep_calls_agent_sleep_skip_export(self):
         """The sleep cron handler runs the agent's sleep cycle with
         skip_export=True (backups own DR) and surfaces the report."""
-        from types import SimpleNamespace
-
         class _Report:
             def to_dict(self):
                 return {"success": True, "consolidation": {"episodes_deleted": 2}}
@@ -487,6 +531,38 @@ class TestScheduleAdd:
             args_json='{"threshold": 100}',
         )
         assert result.status is ToolResultStatus.OK
+
+    @pytest.mark.asyncio
+    async def test_add_anchors_first_cron_occurrence_to_database_clock(self, feature):
+        """A skewed API host cannot choose a different first minute than PG."""
+
+        database_now = datetime(2026, 7, 25, 8, 0, 30, tzinfo=timezone.utc)
+        events = _use_postgres_clock(feature, database_now)
+
+        # If schedule_add used the API process wall clock, this would select a
+        # 2040 occurrence instead of 08:01 on the scheduler's database clock.
+        with patch(
+            "kestrel_sovereign.features.scheduler.feature.datetime"
+        ) as host_datetime:
+            host_datetime.now.return_value = datetime(
+                2040, 1, 1, 0, 0, tzinfo=timezone.utc
+            )
+            result = await feature.schedule_add(
+                cron_expression="* * * * *",
+                task_name="memory_consolidate",
+            )
+
+        assert result.status is ToolResultStatus.OK
+        assert result.data["next_run_at"] == "2026-07-25T08:01:00+00:00"
+        assert result.data["created_at"] == database_now.isoformat()
+        assert events == [
+            "transaction_begin",
+            "schema_lock",
+            "rollout_lock",
+            "database_clock",
+            "schedule_insert",
+            "transaction_end",
+        ]
 
     @pytest.mark.asyncio
     async def test_add_timezone_aware_cron_persists_policy_and_identity(self, feature):
@@ -885,6 +961,39 @@ class TestScheduleResume:
         assert result.data["status"] == "already_running"
 
     @pytest.mark.asyncio
+    async def test_resume_reanchors_cron_occurrence_to_database_clock(self, feature):
+        """A resumed schedule must use the runner's clock, not host time."""
+
+        database_now = datetime(2026, 7, 25, 8, 0, 30, tzinfo=timezone.utc)
+        events = _use_postgres_clock(
+            feature,
+            database_now,
+            scheduled_row=(
+                "task-id", 0, "* * * * *", "cron", None, "UTC", None, 0, 0,
+            ),
+        )
+
+        with patch(
+            "kestrel_sovereign.features.scheduler.feature.datetime"
+        ) as host_datetime:
+            host_datetime.now.return_value = datetime(
+                2040, 1, 1, 0, 0, tzinfo=timezone.utc
+            )
+            result = await feature.schedule_resume(task_id="task-id")
+
+        assert result.status is ToolResultStatus.OK
+        assert result.data["next_run_at"] == "2026-07-25T08:01:00+00:00"
+        assert events[:6] == [
+            "transaction_begin",
+            "schema_lock",
+            "rollout_lock",
+            "schedule_read",
+            "database_clock",
+            "schedule_update",
+        ]
+        assert events[-1] == "transaction_end"
+
+    @pytest.mark.asyncio
     async def test_resume_not_found(self, feature):
         feature._db.fetchone = AsyncMock(return_value=None)
         result = await feature.schedule_resume(task_id="nonexistent")
@@ -922,7 +1031,7 @@ class TestScheduleHistory:
 
     @pytest.mark.asyncio
     async def test_history_respects_limit(self, feature):
-        result = await feature.schedule_history(limit=5)
+        await feature.schedule_history(limit=5)
         # Verify the limit was passed to the DB query
         call_args = feature._db.fetchall.call_args
         assert call_args[0][1][1] == 5  # second positional param tuple
@@ -1840,6 +1949,40 @@ class TestScheduleUpdate:
             "UPDATE scheduled_tasks" not in call.args[0]
             for call in feature._db.execute.call_args_list
         )
+
+    @pytest.mark.asyncio
+    async def test_update_reanchors_cron_occurrence_to_database_clock(self, feature):
+        """Changing cadence cannot create a host-clock-skewed next run."""
+
+        database_now = datetime(2026, 7, 25, 8, 0, 30, tzinfo=timezone.utc)
+        events = _use_postgres_clock(
+            feature,
+            database_now,
+            scheduled_row=("@daily", 1, "cron", "UTC", 0, 0),
+        )
+
+        with patch(
+            "kestrel_sovereign.features.scheduler.feature.datetime"
+        ) as host_datetime:
+            host_datetime.now.return_value = datetime(
+                2040, 1, 1, 0, 0, tzinfo=timezone.utc
+            )
+            result = await feature.schedule_update(
+                task_id="task-id",
+                cron_expression="* * * * *",
+            )
+
+        assert result.status is ToolResultStatus.OK
+        assert result.data["next_run_at"] == "2026-07-25T08:01:00+00:00"
+        assert events[:6] == [
+            "transaction_begin",
+            "schema_lock",
+            "rollout_lock",
+            "schedule_read",
+            "database_clock",
+            "schedule_update",
+        ]
+        assert events[-1] == "transaction_end"
 
     @pytest.mark.asyncio
     async def test_update_invalid_cron(self, feature):

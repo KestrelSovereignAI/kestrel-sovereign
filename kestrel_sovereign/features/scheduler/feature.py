@@ -75,6 +75,7 @@ from kestrel_sovereign.features.scheduler.runner import (
     SCHEDULER_PROTOCOL_VERSION,
     SchedulerProtocolVersionIncompatible,
     SchedulerRunner,
+    scheduler_database_clock,
     validate_schedule_idempotency_base,
 )
 from kestrel_sovereign.features.storage_access import resolve_feature_database
@@ -572,7 +573,7 @@ class SchedulerFeature(Feature):
         Per-task mode (ACTION/ARTIFACT) and resource locks come from the
         SourceRegistration built in `signals/sources/scheduler.py`.
         """
-        from kestrel_sdk.signals import Signal, SignalMode, Status, Visibility
+        from kestrel_sdk.signals import Signal, Visibility
         from kestrel_sovereign.signals.sources.scheduler import (
             CRON_TASKS,
             cron_source_name,
@@ -1775,17 +1776,11 @@ class SchedulerFeature(Feature):
         except CronParseError as e:
             return ToolResult.failed(f"Invalid cron expression or timezone: {e}")
 
-        now = datetime.now(timezone.utc)
-        try:
-            first_run = next_run(cron_expression, after=now, timezone_name=timezone_name)
-            next_run_at = first_run.isoformat()
-        except CronParseError as e:
-            return ToolResult.failed(f"Cannot compute next run: {e}")
         return await self._create_schedule(
             task_name=task_name,
             args_json=args_json,
             cron_expression=cron_expression,
-            next_run_at=next_run_at,
+            next_run_at=None,
             schedule_kind="cron",
             run_at=None,
             timezone_name=timezone_name,
@@ -1841,7 +1836,7 @@ class SchedulerFeature(Feature):
         task_name: str,
         args_json: str,
         cron_expression: str,
-        next_run_at: str,
+        next_run_at: Optional[str],
         schedule_kind: str,
         run_at: Optional[str],
         timezone_name: str,
@@ -1886,7 +1881,6 @@ class SchedulerFeature(Feature):
             )
 
         task_id = str(uuid.uuid4())
-        now_iso = datetime.now(timezone.utc).isoformat()
         # Every persisted schedule has a base key, including legacy-style
         # callers that do not supply one.  The runner derives a deterministic
         # occurrence key from this base and exposes it to the target tool.
@@ -1905,6 +1899,21 @@ class SchedulerFeature(Feature):
             async with self._schedule_transaction():
                 if not await self._lock_active_scheduler_rollout():
                     return self._rollout_mutation_error()
+                # The runner evaluates due work against database time. Read
+                # that same clock while this schedule transaction owns its
+                # rollout control row, so an API replica's skew cannot select
+                # the wrong first cron occurrence across a minute boundary.
+                schedule_now = await scheduler_database_clock(self._db)
+                now_iso = schedule_now.isoformat()
+                if schedule_kind == "cron":
+                    try:
+                        next_run_at = next_run(
+                            cron_expression,
+                            after=schedule_now,
+                            timezone_name=timezone_name,
+                        ).isoformat()
+                    except CronParseError as e:
+                        return ToolResult.failed(f"Cannot compute next run: {e}")
                 inserted = await self._db.execute(
                     """
                     INSERT INTO scheduled_tasks
@@ -2129,7 +2138,6 @@ class SchedulerFeature(Feature):
                     return ToolResult.failed(
                         f"Task {task_id} is a terminal one-shot deadline ({terminal_status}) and cannot be resumed"
                     )
-                now = datetime.now(timezone.utc)
                 cron_now_invalid = False
                 if schedule_kind == "one_shot":
                     next_run_at = run_at
@@ -2137,7 +2145,12 @@ class SchedulerFeature(Feature):
                         return ToolResult.failed(f"One-shot task {task_id} has no run_at deadline")
                 else:
                     try:
-                        nxt = next_run(cron_expr, after=now, timezone_name=timezone_name)
+                        schedule_now = await scheduler_database_clock(self._db)
+                        nxt = next_run(
+                            cron_expr,
+                            after=schedule_now,
+                            timezone_name=timezone_name,
+                        )
                         next_run_at = nxt.isoformat()
                     except CronParseError:
                         next_run_at = None
@@ -2278,12 +2291,14 @@ class SchedulerFeature(Feature):
                         },
                     )
 
-                now = datetime.now(timezone.utc)
                 next_run_at: Optional[str] = None
                 if enabled:
                     try:
+                        schedule_now = await scheduler_database_clock(self._db)
                         next_run_at = next_run(
-                            cron_expression, after=now, timezone_name=effective_timezone
+                            cron_expression,
+                            after=schedule_now,
+                            timezone_name=effective_timezone,
                         ).isoformat()
                     except CronParseError as e:
                         return ToolResult.failed(f"Cannot compute next run: {e}")

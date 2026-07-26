@@ -31,6 +31,52 @@ from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 
 logger = logging.getLogger(__name__)
 
+
+def _scheduler_database_backend_type(db: Any) -> str:
+    """Return a concrete scheduler DB type without trusting loose doubles."""
+
+    backend_type = getattr(db, "backend_type", "")
+    return backend_type.lower() if isinstance(backend_type, str) else ""
+
+
+async def scheduler_database_clock(db: Any) -> datetime:
+    """Read the scheduler's wall clock from its durable database.
+
+    Cron progression must use the same authority as the due-work predicates.
+    Concrete PostgreSQL and SQLite backends therefore read their statement-time
+    clocks; deliberately minimal test/adaptor doubles retain the historical
+    host-clock fallback.
+    """
+
+    backend_type = _scheduler_database_backend_type(db)
+    if backend_type == "postgres":
+        value = await db.fetchval("SELECT clock_timestamp()")
+    elif backend_type == "sqlite":
+        value = await db.fetchval(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')"
+        )
+    else:
+        return datetime.now(timezone.utc)
+
+    if isinstance(value, datetime):
+        return (
+            value.replace(tzinfo=timezone.utc)
+            if value.tzinfo is None
+            else value.astimezone(timezone.utc)
+        )
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        parsed = None
+    if parsed is None:
+        raise RuntimeError("scheduler database returned an invalid wall-clock timestamp")
+    return (
+        parsed.replace(tzinfo=timezone.utc)
+        if parsed.tzinfo is None
+        else parsed.astimezone(timezone.utc)
+    )
+
+
 POLL_INTERVAL = 30
 DEFAULT_MISFIRE_GRACE_SECONDS = 600
 DEFAULT_MAX_CONCURRENT_TASKS = 4
@@ -1201,8 +1247,7 @@ class SchedulerRunner:
     def _database_backend_type(self) -> str:
         """Return the concrete backend type without trusting loose test doubles."""
 
-        backend_type = getattr(self._db, "backend_type", "")
-        return backend_type.lower() if isinstance(backend_type, str) else ""
+        return _scheduler_database_backend_type(self._db)
 
     def _uses_database_clock(self) -> bool:
         """Whether this DB supports the portable statement-time SQL paths."""
@@ -1330,24 +1375,7 @@ class SchedulerRunner:
     async def _database_clock(self) -> datetime:
         """Read the database wall clock after a row lock for cron calculations."""
 
-        if self._database_backend_type() == "postgres":
-            value = await self._db.fetchval("SELECT clock_timestamp()")
-        elif self._database_backend_type() == "sqlite":
-            value = await self._db.fetchval(
-                "SELECT strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')"
-            )
-        else:
-            return datetime.now(timezone.utc)
-        if isinstance(value, datetime):
-            return (
-                value.replace(tzinfo=timezone.utc)
-                if value.tzinfo is None
-                else value.astimezone(timezone.utc)
-            )
-        parsed = self._parse_utc(str(value))
-        if parsed is None:
-            raise RuntimeError("scheduler database returned an invalid wall-clock timestamp")
-        return parsed
+        return await scheduler_database_clock(self._db)
 
     async def _lock_claim_candidate(self, task: ScheduledTask) -> bool:
         """Acquire the schedule-row lock before taking a durable claim.
