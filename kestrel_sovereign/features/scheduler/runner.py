@@ -313,6 +313,47 @@ class SchedulerProtocolVersionIncompatible(RuntimeError):
         )
 
 
+async def adopt_scheduler_registration_ownership(
+    db: Any,
+    *,
+    task_id: str,
+    agent_id: str,
+    observed_registration_nonce: Optional[str],
+    pending_registration_nonce: Optional[str],
+) -> bool:
+    """Clear a foreign pending-registration marker from one locked schedule.
+
+    Dynamic tenant registration rollback may delete rows carrying its private
+    nonce.  Once a different host claims or mutates such a row, that row has
+    become shared durable state and must no longer be attributable to the
+    original registration.  The caller supplies the nonce read while holding
+    the schedule-row/transaction lock; the exact-nonce predicate makes this a
+    compare-and-clear operation rather than accidentally adopting a freshly
+    replaced row.  A retry by the same pending registration deliberately
+    keeps its marker.
+    """
+
+    if (
+        not observed_registration_nonce
+        or observed_registration_nonce == pending_registration_nonce
+    ):
+        return True
+    updated = await db.execute(
+        """
+        UPDATE scheduled_tasks
+        SET scheduler_registration_nonce = NULL
+        WHERE id = ? AND agent_id = ? AND scheduler_registration_nonce = ?
+        """,
+        (task_id, agent_id, observed_registration_nonce),
+    )
+    if isinstance(updated, bool):
+        return updated
+    if isinstance(updated, int):
+        return updated > 0
+    rowcount = getattr(updated, "rowcount", None)
+    return not isinstance(rowcount, int) or rowcount > 0
+
+
 class SchedulerFeatureUnavailable(RuntimeError):
     """A hosted agent loaded without a live SchedulerFeature dispatcher.
 
@@ -1395,13 +1436,27 @@ class SchedulerRunner:
         if self._database_backend_type() == "postgres":
             row = await self._db.fetchone(
                 """
-                SELECT id FROM scheduled_tasks
+                SELECT id, scheduler_protocol_version, scheduler_registration_nonce
+                FROM scheduled_tasks
                 WHERE id = ? AND agent_id = ?
                 FOR UPDATE
                 """,
                 (task.id, task.agent_id),
             )
-            return row is not None
+            if row is None:
+                return False
+            try:
+                if int(row[1]) > SCHEDULER_PROTOCOL_VERSION:
+                    return False
+            except (TypeError, ValueError):
+                return False
+            return await adopt_scheduler_registration_ownership(
+                self._db,
+                task_id=task.id,
+                agent_id=task.agent_id,
+                observed_registration_nonce=row[2] if len(row) > 2 else None,
+                pending_registration_nonce=None,
+            )
         if self._database_backend_type() == "sqlite":
             result = await self._db.execute(
                 """
@@ -1411,7 +1466,30 @@ class SchedulerRunner:
                 """,
                 (task.id, task.agent_id),
             )
-            return self._updated(result)
+            if not self._updated(result):
+                return False
+            row = await self._db.fetchone(
+                """
+                SELECT scheduler_protocol_version, scheduler_registration_nonce
+                FROM scheduled_tasks
+                WHERE id = ? AND agent_id = ?
+                """,
+                (task.id, task.agent_id),
+            )
+            if row is None:
+                return False
+            try:
+                if int(row[0]) > SCHEDULER_PROTOCOL_VERSION:
+                    return False
+            except (TypeError, ValueError):
+                return False
+            return await adopt_scheduler_registration_ownership(
+                self._db,
+                task_id=task.id,
+                agent_id=task.agent_id,
+                observed_registration_nonce=row[1] if len(row) > 1 else None,
+                pending_registration_nonce=None,
+            )
         return True
 
     async def _lock_active_rollout_control(self, agent_id: str) -> bool:

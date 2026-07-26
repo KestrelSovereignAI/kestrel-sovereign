@@ -386,6 +386,277 @@ async def test_dynamic_registration_rollback_preserves_other_replica_rows(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("shared_action", ["claim", "pause"])
+async def test_dynamic_registration_rollback_preserves_schedule_adopted_by_claim_or_mutation(
+    tmp_path, shared_action,
+):
+    """A replica relying on an owned row adopts it before owner rollback."""
+
+    database_path = tmp_path / f"registration-{shared_action}-adoption.db"
+    db_owner = await _database(database_path)
+    db_replica = await _database(database_path)
+    agent_id = f"did:scheduler:registration-{shared_action}-adoption"
+
+    def feature_for(db, registration=None):
+        agent = SimpleNamespace(
+            did=agent_id,
+            agent_id=agent_id,
+            features={},
+            storage=SimpleNamespace(db=db),
+        )
+        if registration is not None:
+            agent._dynamic_scheduler_tenant_registration = registration
+        feature = SchedulerFeature(agent)
+        feature._db = db
+        feature._agent_id = agent_id
+        agent.features = {"SchedulerFeature": feature}
+        return feature
+
+    owner = SchedulerRunner(
+        db_owner, None, AsyncMock(), authorized_agent_ids=(agent_id,),
+        owner_id="registration-owner",
+    )
+    replica = SchedulerRunner(
+        db_replica, None, AsyncMock(return_value="done"),
+        authorized_agent_ids=(agent_id,), owner_id="registration-replica",
+    )
+    try:
+        registration = await owner.prepare_tenant_registration()
+        owner_feature = feature_for(
+            db_owner,
+            SimpleNamespace(registration_nonce=registration.registration_nonce),
+        )
+        added = await owner_feature.schedule_add(
+            "@daily", "backup_snapshot", idempotency_key=f"registration:{shared_action}",
+        )
+        assert added.status.value == "ok"
+        task_id = added.data["task_id"]
+        assert await db_owner.fetchone(
+            "SELECT scheduler_registration_nonce FROM scheduled_tasks WHERE id = ?",
+            (task_id,),
+        ) == (registration.registration_nonce,)
+
+        if shared_action == "claim":
+            due = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+            await db_owner.execute(
+                "UPDATE scheduled_tasks SET next_run_at = ? WHERE id = ?",
+                (due, task_id),
+            )
+            await replica._tick()
+        else:
+            now = datetime.now(timezone.utc).isoformat()
+            await db_replica.execute(
+                """
+                INSERT INTO task_execution_log
+                    (id, task_id, agent_id, status, result_text, duration_ms, executed_at)
+                VALUES (?, ?, ?, 'success', 'replica history', 0, ?)
+                """,
+                (f"{shared_action}-history", task_id, agent_id, now),
+            )
+            paused = await feature_for(db_replica).schedule_pause(task_id)
+            assert paused.status.value == "ok"
+
+        assert await db_owner.fetchone(
+            "SELECT scheduler_registration_nonce FROM scheduled_tasks WHERE id = ?",
+            (task_id,),
+        ) == (None,)
+        assert await db_owner.fetchone(
+            "SELECT COUNT(*) FROM task_execution_log WHERE task_id = ?",
+            (task_id,),
+        ) == (1,)
+
+        await owner.rollback_tenant_registration(registration)
+        assert await db_owner.fetchone(
+            "SELECT COUNT(*) FROM scheduled_tasks WHERE id = ?", (task_id,)
+        ) == (1,)
+        assert await db_owner.fetchone(
+            "SELECT COUNT(*) FROM task_execution_log WHERE task_id = ?",
+            (task_id,),
+        ) == (1,)
+    finally:
+        await db_owner.close()
+        await db_replica.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation", ["remove", "pause", "resume", "update", "record_outcome"],
+)
+async def test_mutators_reject_future_target_schedule_without_overwriting_it(
+    tmp_path, operation,
+):
+    """A v2 control row never authorizes writes to an individual v3 task."""
+
+    db = await _database(tmp_path / f"future-target-{operation}.db")
+    agent_id = f"did:scheduler:future-target:{operation}"
+    runner = SchedulerRunner(
+        db, None, AsyncMock(), authorized_agent_ids=(agent_id,), owner_id="future-target",
+    )
+    try:
+        await runner._ensure_tables()
+        feature = SchedulerFeature(SimpleNamespace(did=agent_id, agent_id=agent_id, features={}))
+        feature._db = db
+        feature._agent_id = agent_id
+        added = await feature.schedule_add(
+            "@daily", "backup_snapshot", idempotency_key=f"future-target:{operation}",
+        )
+        task_id = added.data["task_id"]
+        if operation == "resume":
+            assert (await feature.schedule_pause(task_id)).status.value == "ok"
+        execution_id = f"future-target-execution:{operation}"
+        now = datetime.now(timezone.utc).isoformat()
+        await db.execute(
+            """
+            INSERT INTO task_execution_log
+                (id, task_id, agent_id, status, result_text, duration_ms, executed_at)
+            VALUES (?, ?, ?, 'success', 'before', 0, ?)
+            """,
+            (execution_id, task_id, agent_id, now),
+        )
+        await db.execute(
+            """
+            UPDATE scheduled_tasks
+            SET scheduler_protocol_version = ?, scheduler_claim_fenced = 1,
+                scheduler_rollout_fenced = 1, scheduler_rollout_nonce = 'future-row'
+            WHERE id = ?
+            """,
+            (SCHEDULER_PROTOCOL_VERSION + 1, task_id),
+        )
+        schedule_before = await db.fetchone(
+            """
+            SELECT scheduler_protocol_version, scheduler_claim_fenced,
+                   scheduler_rollout_fenced, scheduler_rollout_nonce, enabled
+            FROM scheduled_tasks WHERE id = ?
+            """,
+            (task_id,),
+        )
+        control_before = await db.fetchone(
+            "SELECT protocol_version, state FROM scheduler_protocol_rollout WHERE agent_id = ?",
+            (agent_id,),
+        )
+        log_before = await db.fetchone(
+            "SELECT status, result_text, outcome_signal FROM task_execution_log WHERE id = ?",
+            (execution_id,),
+        )
+
+        if operation == "remove":
+            result = await feature.schedule_remove(task_id)
+        elif operation == "pause":
+            result = await feature.schedule_pause(task_id)
+        elif operation == "resume":
+            result = await feature.schedule_resume(task_id)
+        elif operation == "update":
+            result = await feature.schedule_update(task_id, "@weekly")
+        else:
+            result = await feature.schedule_record_outcome(execution_id, 0.8)
+
+        assert result.status.value == "error"
+        assert "newer than this runner" in result.error
+        assert await db.fetchone(
+            """
+            SELECT scheduler_protocol_version, scheduler_claim_fenced,
+                   scheduler_rollout_fenced, scheduler_rollout_nonce, enabled
+            FROM scheduled_tasks WHERE id = ?
+            """,
+            (task_id,),
+        ) == schedule_before
+        assert await db.fetchone(
+            "SELECT protocol_version, state FROM scheduler_protocol_rollout WHERE agent_id = ?",
+            (agent_id,),
+        ) == control_before
+        assert await db.fetchone(
+            "SELECT status, result_text, outcome_signal FROM task_execution_log WHERE id = ?",
+            (execution_id,),
+        ) == log_before
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_record_outcome_rejects_claimed_execution_but_accepts_terminal_log(tmp_path):
+    """Runner-owned claimed logs cannot be modified before finalization."""
+
+    db = await _database(tmp_path / "claimed-outcome.db")
+    agent_id = "did:scheduler:claimed-outcome"
+    runner = SchedulerRunner(
+        db, None, AsyncMock(), authorized_agent_ids=(agent_id,), owner_id="claimed-outcome",
+    )
+    try:
+        await runner._ensure_tables()
+        feature = SchedulerFeature(SimpleNamespace(did=agent_id, agent_id=agent_id, features={}))
+        feature._db = db
+        feature._agent_id = agent_id
+        added = await feature.schedule_add("@daily", "backup_snapshot")
+        task_id = added.data["task_id"]
+        execution_id = "claimed-outcome-execution"
+        now = datetime.now(timezone.utc).isoformat()
+        await db.execute(
+            """
+            INSERT INTO task_execution_log
+                (id, task_id, agent_id, status, result_text, duration_ms, executed_at)
+            VALUES (?, ?, ?, 'claimed', NULL, 0, ?)
+            """,
+            (execution_id, task_id, agent_id, now),
+        )
+        rejected = await feature.schedule_record_outcome(execution_id, 0.8)
+        assert rejected.status.value == "error"
+        assert "claimed execution" in rejected.error
+        assert await db.fetchone(
+            "SELECT outcome_signal FROM task_execution_log WHERE id = ?", (execution_id,)
+        ) == (None,)
+
+        await db.execute(
+            "UPDATE task_execution_log SET status = 'success' WHERE id = ?", (execution_id,)
+        )
+        accepted = await feature.schedule_record_outcome(execution_id, 0.8)
+        assert accepted.status.value == "ok"
+        assert await db.fetchone(
+            "SELECT outcome_signal FROM task_execution_log WHERE id = ?", (execution_id,)
+        ) == (0.8,)
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_claim_does_not_adopt_future_version_schedule_marker(tmp_path):
+    """Claim admission leaves a future row entirely untouched."""
+
+    db = await _database(tmp_path / "future-claim-marker.db")
+    agent_id = "did:scheduler:future-claim-marker"
+    runner = SchedulerRunner(
+        db, None, AsyncMock(), authorized_agent_ids=(agent_id,), owner_id="future-claim",
+    )
+    try:
+        await runner._ensure_tables()
+        task_id = "future-claim-task"
+        nonce = "foreign-pending-registration"
+        due = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        await db.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 next_run_at, created_at, scheduler_protocol_version,
+                 scheduler_registration_nonce)
+            VALUES (?, ?, 'backup_snapshot', '* * * * *', '{}', 1, ?, ?, ?, ?)
+            """,
+            (task_id, agent_id, due, due, SCHEDULER_PROTOCOL_VERSION + 1, nonce),
+        )
+        task = ScheduledTask(
+            id=task_id, agent_id=agent_id, task_name="backup_snapshot",
+            cron_expression="* * * * *", args_json="{}", enabled=True,
+            last_run_at=None, next_run_at=due, created_at=due,
+            scheduler_protocol_version=SCHEDULER_PROTOCOL_VERSION + 1,
+        )
+        assert await runner._claim(task, datetime.now(timezone.utc)) is None
+        assert await db.fetchone(
+            "SELECT scheduler_registration_nonce FROM scheduled_tasks WHERE id = ?",
+            (task_id,),
+        ) == (nonce,)
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_dynamic_registration_rollback_removes_unshared_owned_state(tmp_path):
     """An isolated failed registration still removes its own durable state."""
 

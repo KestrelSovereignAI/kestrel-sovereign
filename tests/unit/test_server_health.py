@@ -123,7 +123,6 @@ def test_health_latches_loaded_scheduler_runner_safety_failure():
     original_scheduler_failures = getattr(
         app.state, "scheduler_readiness_failures", None
     )
-
     failed_runner = SimpleNamespace(
         readiness_failure=RuntimeError("postgres://operator:secret@db/internal")
     )
@@ -299,6 +298,9 @@ def test_multi_agent_prefixed_detailed_health_keeps_auth_then_routes():
     original_scheduler_failures = getattr(
         app.state, "scheduler_readiness_failures", None
     )
+    original_host_scheduler_runner = getattr(
+        app.state, "host_scheduler_runner", None
+    )
 
     health_feature = MagicMock()
     health_feature.get_latest = AsyncMock(
@@ -319,6 +321,7 @@ def test_multi_agent_prefixed_detailed_health_keeps_auth_then_routes():
         # failure from a prior test. This test owns a healthy mock fleet, so it
         # must not inherit that unrelated readiness state.
         app.state.scheduler_readiness_failures = []
+        app.state.host_scheduler_runner = None
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
             with TestClient(app, client=("203.0.113.10", 55000)) as client:
                 unauthenticated = client.get(
@@ -333,6 +336,7 @@ def test_multi_agent_prefixed_detailed_health_keeps_auth_then_routes():
         app.state.agent = original_agent
         app.state.agent_manager = original_manager
         app.state.scheduler_readiness_failures = original_scheduler_failures
+        app.state.host_scheduler_runner = original_host_scheduler_runner
 
     assert unauthenticated.status_code == 401
     assert authenticated.status_code == 200

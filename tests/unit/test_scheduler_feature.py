@@ -98,6 +98,9 @@ def _use_postgres_clock(feature, database_now, *, scheduled_row=None):
         if "FROM scheduler_protocol_rollout" in sql:
             events.append("rollout_lock")
             return (2, "active")
+        if "SELECT scheduler_protocol_version" in sql:
+            events.append("schedule_lock")
+            return (2, None)
         if "FROM scheduled_tasks" in sql:
             events.append("schedule_read")
             return scheduled_row
@@ -990,9 +993,9 @@ class TestScheduleResume:
             "transaction_begin",
             "schema_lock",
             "rollout_lock",
+            "schedule_lock",
             "schedule_read",
             "database_clock",
-            "schedule_update",
         ]
         assert events[-1] == "transaction_end"
 
@@ -1981,9 +1984,9 @@ class TestScheduleUpdate:
             "transaction_begin",
             "schema_lock",
             "rollout_lock",
+            "schedule_lock",
             "schedule_read",
             "database_clock",
-            "schedule_update",
         ]
         assert events[-1] == "transaction_end"
 
@@ -2028,6 +2031,7 @@ class TestScheduleUpdate:
             "transaction_begin",
             "schema_lock",
             "rollout_lock",
+            "schedule_lock",
             "schedule_read",
             "database_clock",
             "schedule_update",

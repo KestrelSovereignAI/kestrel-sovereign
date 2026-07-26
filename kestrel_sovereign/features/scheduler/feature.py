@@ -75,6 +75,7 @@ from kestrel_sovereign.features.scheduler.runner import (
     SCHEDULER_PROTOCOL_VERSION,
     SchedulerProtocolVersionIncompatible,
     SchedulerRunner,
+    adopt_scheduler_registration_ownership,
     scheduler_database_clock,
     scheduler_database_now_sql,
     validate_schedule_idempotency_base,
@@ -568,20 +569,14 @@ class SchedulerFeature(Feature):
                         and existing_registration_nonce
                         != pending_registration_nonce
                     ):
-                        adopted = await self._db.execute(
-                            """
-                            UPDATE scheduled_tasks
-                            SET scheduler_registration_nonce = NULL
-                            WHERE id = ? AND agent_id = ?
-                              AND scheduler_registration_nonce = ?
-                            """,
-                            (
-                                existing[0],
-                                self._agent_id,
-                                existing_registration_nonce,
-                            ),
+                        adopted = await adopt_scheduler_registration_ownership(
+                            self._db,
+                            task_id=existing[0],
+                            agent_id=self._agent_id,
+                            observed_registration_nonce=existing_registration_nonce,
+                            pending_registration_nonce=pending_registration_nonce,
                         )
-                        if not self._scheduler_mutation_wrote(adopted):
+                        if not adopted:
                             # The first registration may have rolled the row
                             # back after our selection but before adoption.
                             # Do not report a vanished schedule as reusable.
@@ -2041,6 +2036,11 @@ class SchedulerFeature(Feature):
             async with self._schedule_transaction():
                 if not await self._lock_scheduler_rollout_for_pause():
                     return self._rollout_mutation_error()
+                if not await self._lock_mutable_scheduler_row(task_id):
+                    return ToolResult.failed(
+                        f"Task {task_id} not found",
+                        data={"task_id": task_id},
+                    )
                 row = await self._db.fetchone(
                     "SELECT id FROM scheduled_tasks WHERE id = ? AND agent_id = ?",
                     (task_id, self._agent_id),
@@ -2093,6 +2093,11 @@ class SchedulerFeature(Feature):
                 # row is an intentional pause or a rollout fence.
                 if not await self._lock_scheduler_rollout_for_pause():
                     return self._rollout_mutation_error()
+                if not await self._lock_mutable_scheduler_row(task_id):
+                    return ToolResult.failed(
+                        f"Task {task_id} not found",
+                        data={"task_id": task_id},
+                    )
                 row = await self._db.fetchone(
                     """
                     SELECT id, enabled, scheduler_claim_fenced,
@@ -2165,6 +2170,11 @@ class SchedulerFeature(Feature):
             async with self._schedule_transaction():
                 if not await self._lock_active_scheduler_rollout():
                     return self._rollout_mutation_error()
+                if not await self._lock_mutable_scheduler_row(task_id):
+                    return ToolResult.failed(
+                        f"Task {task_id} not found",
+                        data={"task_id": task_id},
+                    )
                 row = await self._db.fetchone(
                     """
                     SELECT id, enabled, cron_expression, schedule_kind, run_at,
@@ -2308,6 +2318,11 @@ class SchedulerFeature(Feature):
             async with self._schedule_transaction():
                 if not await self._lock_active_scheduler_rollout():
                     return self._rollout_mutation_error()
+                if not await self._lock_mutable_scheduler_row(task_id):
+                    return ToolResult.failed(
+                        f"Task {task_id} not found",
+                        data={"task_id": task_id},
+                    )
                 row = await self._db.fetchone(
                     """
                     SELECT cron_expression, enabled, schedule_kind, timezone_name,
@@ -2472,6 +2487,47 @@ class SchedulerFeature(Feature):
 
         backend_type = getattr(self._db, "backend_type", "")
         return backend_type.lower() if isinstance(backend_type, str) else ""
+
+    async def _lock_mutable_scheduler_row(self, task_id: str) -> Optional[bool]:
+        """Lock, version-check, and adopt a schedule before mutating it.
+
+        Global and control-row compatibility alone is insufficient: a newer
+        writer can create an individual future-version schedule after this
+        feature starts.  Every API that changes that schedule must inspect its
+        version under the same transaction before overwriting fences or claim
+        state.  The locked row is also the authoritative place to adopt a
+        foreign dynamic-registration marker.
+        """
+
+        backend_type = self._database_backend_type()
+        if backend_type not in {"postgres", "sqlite"}:
+            # Keep deliberately minimal legacy test adapters usable. Concrete
+            # scheduler backends always take the durable path below.
+            return True
+        sql = """
+            SELECT scheduler_protocol_version, scheduler_registration_nonce
+            FROM scheduled_tasks
+            WHERE id = ? AND agent_id = ?
+        """
+        if backend_type == "postgres":
+            sql += " FOR UPDATE"
+        row = await self._db.fetchone(sql, (task_id, self._agent_id))
+        if row is None:
+            return None
+        version = row[0] if row else None
+        if version is not None:
+            try:
+                if int(version) > SCHEDULER_PROTOCOL_VERSION:
+                    raise SchedulerProtocolVersionIncompatible()
+            except (TypeError, ValueError):
+                return False
+        return await adopt_scheduler_registration_ownership(
+            self._db,
+            task_id=task_id,
+            agent_id=self._agent_id,
+            observed_registration_nonce=row[1] if len(row) > 1 else None,
+            pending_registration_nonce=self._pending_scheduler_registration_nonce(),
+        )
 
     async def _lock_compatible_scheduler_protocol(
         self,
@@ -2661,7 +2717,10 @@ class SchedulerFeature(Feature):
                 if not await self._lock_scheduler_rollout_for_pause():
                     return self._rollout_mutation_error()
                 row = await self._db.fetchone(
-                    "SELECT id FROM task_execution_log WHERE id = ? AND agent_id = ?",
+                    """
+                    SELECT id, status, task_id
+                    FROM task_execution_log WHERE id = ? AND agent_id = ?
+                    """,
                     (execution_id, self._agent_id),
                 )
                 if not row:
@@ -2669,11 +2728,27 @@ class SchedulerFeature(Feature):
                         f"Execution {execution_id} not found",
                         data={"execution_id": execution_id},
                     )
+                if len(row) > 1 and row[1] == "claimed":
+                    return ToolResult.failed(
+                        "Cannot record an outcome for a claimed execution; "
+                        "the scheduler still owns its finalization",
+                        data={"execution_id": execution_id},
+                    )
+                # Retain historic outcome recording for a terminal log whose
+                # schedule was intentionally removed, while protecting any
+                # extant future-version task that owns this log.
+                if len(row) > 2 and isinstance(row[2], str):
+                    compatible = await self._lock_mutable_scheduler_row(row[2])
+                    if compatible is False:
+                        return ToolResult.failed(
+                            f"Task {row[2]} not found",
+                            data={"task_id": row[2]},
+                        )
 
                 updated = await self._db.execute(
                     """
                     UPDATE task_execution_log SET outcome_signal = ?
-                    WHERE id = ? AND agent_id = ?
+                    WHERE id = ? AND agent_id = ? AND status <> 'claimed'
                     """,
                     (clamped, execution_id, self._agent_id),
                 )

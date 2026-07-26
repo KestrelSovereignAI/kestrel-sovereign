@@ -697,6 +697,96 @@ async def test_every_mutating_api_rejects_future_global_protocol_before_write(
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+@pytest.mark.parametrize(
+    "operation", ["remove", "pause", "resume", "update", "record_outcome"],
+)
+async def test_every_target_mutator_rejects_future_schedule_without_writes(
+    db_backend, operation,
+):
+    """An active v2 schema/control pair cannot downgrade one future task."""
+
+    agent_id = f"did:scheduler:future-target-api:{operation}:{uuid4()}"
+    async with _isolated_scheduler_schema(db_backend) as db:
+        await _host_runner(db, {agent_id})._ensure_tables()
+        feature = SchedulerFeature(
+            SimpleNamespace(did=agent_id, agent_id=agent_id, features={})
+        )
+        feature._db = db
+        feature._agent_id = agent_id
+        added = await feature.schedule_add(
+            "@daily", "backup_snapshot", idempotency_key=f"future-target:{operation}",
+        )
+        task_id = added.data["task_id"]
+        if operation == "resume":
+            assert (await feature.schedule_pause(task_id)).status.value == "ok"
+        execution_id = f"future-target-execution:{uuid4()}"
+        now = datetime.now(timezone.utc).isoformat()
+        await db.execute(
+            """
+            INSERT INTO task_execution_log
+                (id, task_id, agent_id, status, result_text, duration_ms, executed_at)
+            VALUES (?, ?, ?, 'success', 'before', 0, ?)
+            """,
+            (execution_id, task_id, agent_id, now),
+        )
+        await db.execute(
+            """
+            UPDATE scheduled_tasks
+            SET scheduler_protocol_version = ?, scheduler_claim_fenced = 1,
+                scheduler_rollout_fenced = 1, scheduler_rollout_nonce = 'future-target'
+            WHERE id = ?
+            """,
+            (SCHEDULER_PROTOCOL_VERSION + 1, task_id),
+        )
+        before = await db.fetchone(
+            """
+            SELECT scheduler_protocol_version, scheduler_claim_fenced,
+                   scheduler_rollout_fenced, scheduler_rollout_nonce, enabled
+            FROM scheduled_tasks WHERE id = ?
+            """,
+            (task_id,),
+        )
+        control_before = await db.fetchone(
+            "SELECT protocol_version, state FROM scheduler_protocol_rollout WHERE agent_id = ?",
+            (agent_id,),
+        )
+        log_before = await db.fetchone(
+            "SELECT status, result_text, outcome_signal FROM task_execution_log WHERE id = ?",
+            (execution_id,),
+        )
+        if operation == "remove":
+            result = await feature.schedule_remove(task_id)
+        elif operation == "pause":
+            result = await feature.schedule_pause(task_id)
+        elif operation == "resume":
+            result = await feature.schedule_resume(task_id)
+        elif operation == "update":
+            result = await feature.schedule_update(task_id, "@weekly")
+        else:
+            result = await feature.schedule_record_outcome(execution_id, 0.5)
+
+        assert result.status.value == "error"
+        assert "newer than this runner" in result.error
+        assert await db.fetchone(
+            """
+            SELECT scheduler_protocol_version, scheduler_claim_fenced,
+                   scheduler_rollout_fenced, scheduler_rollout_nonce, enabled
+            FROM scheduled_tasks WHERE id = ?
+            """,
+            (task_id,),
+        ) == before
+        assert await db.fetchone(
+            "SELECT protocol_version, state FROM scheduler_protocol_rollout WHERE agent_id = ?",
+            (agent_id,),
+        ) == control_before
+        assert await db.fetchone(
+            "SELECT status, result_text, outcome_signal FROM task_execution_log WHERE id = ?",
+            (execution_id,),
+        ) == log_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 @pytest.mark.parametrize("operation", ["pause", "remove"])
 async def test_pause_and_remove_reject_future_did_without_clearing_fence(
     db_backend,
@@ -1291,6 +1381,79 @@ async def test_postgres_registration_rollback_keeps_other_replica_rows(
         assert await db_owner.fetchone(
             "SELECT COUNT(*) FROM scheduler_protocol_rollout WHERE agent_id = ?",
             (agent_id,),
+        ) == (1,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("shared_action", ["claim", "pause"])
+async def test_postgres_registration_rollback_preserves_owner_row_adopted_by_claim_or_mutation(
+    db_backend, shared_action,
+):
+    """A second PostgreSQL connection adopts the exact owner row before rollback."""
+
+    if db_backend.backend_type != "postgres":
+        pytest.skip("cross-connection row adoption requires PostgreSQL")
+
+    async with _top_level_scheduler_databases(db_backend, count=2) as databases:
+        db_owner, db_replica = databases
+        agent_id = f"did:scheduler:row-adoption:{shared_action}:{uuid4()}"
+        owner = SchedulerRunner(
+            db_owner, None, _noop_executor, authorized_agent_ids=(agent_id,),
+            owner_id="row-adoption-owner",
+        )
+        replica = SchedulerRunner(
+            db_replica, None, _noop_executor, authorized_agent_ids=(agent_id,),
+            owner_id="row-adoption-replica",
+        )
+        registration = await owner.prepare_tenant_registration()
+        task_id = f"row-adoption-task:{uuid4()}"
+        now = datetime.now(timezone.utc).isoformat()
+        due = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        await db_owner.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 next_run_at, created_at, scheduler_protocol_version,
+                 scheduler_registration_nonce)
+            VALUES (?, ?, 'backup_snapshot', '* * * * *', '{}', 1, ?, ?, ?, ?)
+            """,
+            (task_id, agent_id, due, now, SCHEDULER_PROTOCOL_VERSION,
+             registration.registration_nonce),
+        )
+
+        if shared_action == "claim":
+            await replica._tick()
+        else:
+            await db_replica.execute(
+                """
+                INSERT INTO task_execution_log
+                    (id, task_id, agent_id, status, result_text, duration_ms,
+                     executed_at)
+                VALUES (?, ?, ?, 'success', 'replica history', 0, ?)
+                """,
+                (f"row-adoption-history:{uuid4()}", task_id, agent_id, now),
+            )
+            feature = SchedulerFeature(
+                SimpleNamespace(did=agent_id, agent_id=agent_id, features={})
+            )
+            feature._db = db_replica
+            feature._agent_id = agent_id
+            assert (await feature.schedule_pause(task_id)).status.value == "ok"
+
+        assert await db_owner.fetchone(
+            "SELECT scheduler_registration_nonce FROM scheduled_tasks WHERE id = ?",
+            (task_id,),
+        ) == (None,)
+        assert await db_owner.fetchone(
+            "SELECT COUNT(*) FROM task_execution_log WHERE task_id = ?", (task_id,)
+        ) == (1,)
+        await owner.rollback_tenant_registration(registration)
+        assert await db_owner.fetchone(
+            "SELECT COUNT(*) FROM scheduled_tasks WHERE id = ?", (task_id,)
+        ) == (1,)
+        assert await db_owner.fetchone(
+            "SELECT COUNT(*) FROM task_execution_log WHERE task_id = ?", (task_id,)
         ) == (1,)
 
 
