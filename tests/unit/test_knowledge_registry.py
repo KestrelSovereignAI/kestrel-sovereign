@@ -213,6 +213,90 @@ def test_experimental_profiles_require_explicit_opt_in():
 
 
 @pytest.mark.parametrize(
+    ("identifier", "version"),
+    (
+        ("rdf12-cr-20260407", "0.1.0"),
+        ("shacl12-core-20260602-experimental", "0.1.0"),
+        ("sparql12-20260605-experimental", "0.1.0"),
+    ),
+)
+def test_public_import_closure_requires_experimental_opt_in(identifier, version):
+    registry = load_knowledge_registry()
+    requirement = ResourceRequirement.exact(identifier, version)
+
+    with pytest.raises(ExperimentalCapabilityError, match="experimental"):
+        registry.resolve_import_closure(requirement)
+
+    closure = registry.resolve_import_closure(requirement, allow_experimental=True)
+
+    assert closure[-1].identifier == identifier
+    assert any(resource.maturity is StandardsMaturity.EXPERIMENTAL for resource in closure)
+
+
+@pytest.mark.parametrize(
+    ("resource_path", "required_declarations", "rejected_declarations"),
+    (
+        (
+            "vocabularies/prov-o-20130430.ttl",
+            (
+                "prov:Entity a owl:Class .",
+                "prov:Activity a owl:Class .",
+                "prov:Agent a owl:Class .",
+                "prov:wasDerivedFrom a owl:ObjectProperty ;",
+                "prov:wasGeneratedBy a owl:ObjectProperty ;",
+                "prov:wasAttributedTo a owl:ObjectProperty ;",
+            ),
+            (
+                "prov:Entity a prov:Entity .",
+                "prov:wasDerivedFrom a prov:Entity .",
+            ),
+        ),
+        (
+            "vocabularies/owl-time-20171019.ttl",
+            (
+                "time:TemporalEntity a owl:Class .",
+                "time:Interval a owl:Class ;",
+                "time:Instant a owl:Class ;",
+                "time:hasBeginning a owl:ObjectProperty ;",
+                "time:hasEnd a owl:ObjectProperty ;",
+            ),
+            (
+                "time:TemporalEntity a time:TemporalEntity .",
+                "time:hasBeginning a time:TemporalEntity .",
+            ),
+        ),
+        (
+            "vocabularies/skos-20090818.ttl",
+            (
+                "skos:Concept a owl:Class .",
+                "skos:prefLabel a owl:AnnotationProperty .",
+                "skos:altLabel a owl:AnnotationProperty .",
+                "skos:exactMatch a owl:ObjectProperty , owl:SymmetricProperty , owl:TransitiveProperty .",
+                "skos:closeMatch a owl:ObjectProperty , owl:SymmetricProperty .",
+            ),
+            (
+                "skos:Concept a skos:Concept .",
+                "skos:prefLabel a skos:Concept .",
+            ),
+        ),
+    ),
+)
+def test_selected_vocabulary_terms_preserve_their_rdf_kinds(
+    resource_path, required_declarations, rejected_declarations
+):
+    vocabulary = (
+        resources.files("kestrel_sovereign")
+        .joinpath("data", "semantic", *resource_path.split("/"))
+        .read_text(encoding="utf-8")
+    )
+
+    for declaration in required_declarations:
+        assert declaration in vocabulary
+    for declaration in rejected_declarations:
+        assert declaration not in vocabulary
+
+
+@pytest.mark.parametrize(
     "capability",
     (
         "serialization:turtle-20140225",

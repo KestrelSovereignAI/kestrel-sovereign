@@ -24,9 +24,12 @@ semantic-KB artifact contract. Its package-data manifest is
 identifier, exact semantic version, local package-resource path, SHA-256,
 dated URI, maturity, selected terms, and explicit imports.
 
-The registry resolves imports locally in dependency-first order. It rejects a
-missing import, cycle, version conflict, duplicate namespace, absent resource,
-or digest mismatch. It does not dereference a standards URI, follow
+The registry resolves imports locally in dependency-first order. Its public
+closure and capability resolvers require `allow_experimental=True` for any
+experimental resource in the selected closure. Manifest validation uses the
+same resolver privately to validate every declared resource without selecting
+it. The registry rejects a missing import, cycle, version conflict, duplicate
+namespace, absent resource, or digest mismatch. It does not dereference a standards URI, follow
 `owl:imports`, choose a latest version, or use the network at startup, sleep,
 import, inference, validation, or query time. Package resources are verified
 through `importlib.resources`, so the same check operates from an installed

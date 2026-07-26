@@ -1,7 +1,19 @@
 @prefix time: <http://www.w3.org/2006/time#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
 
-time:TemporalEntity a time:TemporalEntity .
-time:Interval a time:TemporalEntity .
-time:Instant a time:TemporalEntity .
-time:hasBeginning a time:TemporalEntity .
-time:hasEnd a time:TemporalEntity .
+time:TemporalEntity a owl:Class .
+
+time:Interval a owl:Class ;
+    rdfs:subClassOf time:TemporalEntity .
+
+time:Instant a owl:Class ;
+    rdfs:subClassOf time:TemporalEntity .
+
+time:hasBeginning a owl:ObjectProperty ;
+    rdfs:domain time:TemporalEntity ;
+    rdfs:range time:Instant .
+
+time:hasEnd a owl:ObjectProperty ;
+    rdfs:domain time:TemporalEntity ;
+    rdfs:range time:Instant .

@@ -386,9 +386,20 @@ class SemanticKnowledgeRegistry:
     resolve_resource = resolve
 
     def resolve_import_closure(
+        self,
+        roots: ResourceRequirement | Sequence[ResourceRequirement],
+        *,
+        allow_experimental: bool = False,
+    ) -> tuple[SemanticResource, ...]:
+        """Return a selected dependency closure, gating experimental artifacts."""
+        closure = self._resolve_import_closure(roots)
+        self._require_experimental_opt_in(closure, allow_experimental)
+        return closure
+
+    def _resolve_import_closure(
         self, roots: ResourceRequirement | Sequence[ResourceRequirement]
     ) -> tuple[SemanticResource, ...]:
-        """Return a deterministic dependency-first closure and reject conflicts."""
+        """Resolve a closure for internal manifest validation without selection policy."""
         requested_roots = (roots,) if isinstance(roots, ResourceRequirement) else tuple(roots)
         if not requested_roots:
             raise KnowledgeRegistryError("at least one semantic resource root is required")
@@ -459,7 +470,7 @@ class SemanticKnowledgeRegistry:
     def validate_imports(self) -> None:
         """Fail manifest loading when any declared local import is invalid."""
         for resource in self.resources:
-            self.resolve_import_closure(
+            self._resolve_import_closure(
                 ResourceRequirement.exact(resource.identifier, resource.version)
             )
 
@@ -471,19 +482,10 @@ class SemanticKnowledgeRegistry:
         allow_experimental: bool = False,
     ) -> ResolvedSemanticCapability:
         resource = self.resolve(identifier, version)
-        if resource.maturity is StandardsMaturity.EXPERIMENTAL and not allow_experimental:
-            raise ExperimentalCapabilityError(
-                f"{resource.key} is experimental; pass allow_experimental=True to select it"
-            )
         closure = self.resolve_import_closure(
-            ResourceRequirement.exact(resource.identifier, resource.version)
+            ResourceRequirement.exact(resource.identifier, resource.version),
+            allow_experimental=allow_experimental,
         )
-        experimental = [entry.key for entry in closure if entry.maturity is StandardsMaturity.EXPERIMENTAL]
-        if experimental and not allow_experimental:
-            raise ExperimentalCapabilityError(
-                "selected semantic capability imports experimental resources: "
-                + ", ".join(experimental)
-            )
         self.verify_resources(closure)
         return ResolvedSemanticCapability(resource=resource, import_closure=closure)
 
@@ -518,17 +520,10 @@ class SemanticKnowledgeRegistry:
             )
             for requirement in requirements
         )
-        closure = self.resolve_import_closure(roots)
-        experimental = [
-            resource.key
-            for resource in closure
-            if resource.maturity is StandardsMaturity.EXPERIMENTAL
-        ]
-        if experimental and not allow_experimental:
-            raise ExperimentalCapabilityError(
-                "selected semantic capability contract imports experimental resources: "
-                + ", ".join(experimental)
-            )
+        closure = self.resolve_import_closure(
+            roots,
+            allow_experimental=allow_experimental,
+        )
         self.verify_resources(closure)
         capabilities = tuple(
             self.resolve_capability(
@@ -598,6 +593,18 @@ class SemanticKnowledgeRegistry:
                 raise KnowledgeRegistryError(
                     f"experimental resource {resource.key} must declare an explicit capability"
                 )
+
+    @staticmethod
+    def _require_experimental_opt_in(
+        closure: Sequence[SemanticResource], allow_experimental: bool
+    ) -> None:
+        experimental = [resource.key for resource in closure if resource.maturity is StandardsMaturity.EXPERIMENTAL]
+        if experimental and not allow_experimental:
+            raise ExperimentalCapabilityError(
+                "semantic import closure contains experimental resources: "
+                + ", ".join(experimental)
+                + "; pass allow_experimental=True to select them"
+            )
 
 
 def _parse_resource(identifier: str, row: Mapping[str, object]) -> SemanticResource:

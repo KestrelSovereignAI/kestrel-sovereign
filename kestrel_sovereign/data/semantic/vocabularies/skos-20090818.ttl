@@ -1,7 +1,10 @@
 @prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
 
-skos:Concept a skos:Concept .
-skos:prefLabel a skos:Concept .
-skos:altLabel a skos:Concept .
-skos:exactMatch a skos:Concept .
-skos:closeMatch a skos:Concept .
+skos:Concept a owl:Class .
+
+skos:prefLabel a owl:AnnotationProperty .
+skos:altLabel a owl:AnnotationProperty .
+
+skos:exactMatch a owl:ObjectProperty , owl:SymmetricProperty , owl:TransitiveProperty .
+skos:closeMatch a owl:ObjectProperty , owl:SymmetricProperty .

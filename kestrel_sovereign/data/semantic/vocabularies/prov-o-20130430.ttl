@@ -1,8 +1,19 @@
 @prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
 
-prov:Entity a prov:Entity .
-prov:Activity a prov:Entity .
-prov:Agent a prov:Entity .
-prov:wasDerivedFrom a prov:Entity .
-prov:wasGeneratedBy a prov:Entity .
-prov:wasAttributedTo a prov:Entity .
+prov:Entity a owl:Class .
+prov:Activity a owl:Class .
+prov:Agent a owl:Class .
+
+prov:wasDerivedFrom a owl:ObjectProperty ;
+    rdfs:domain prov:Entity ;
+    rdfs:range prov:Entity .
+
+prov:wasGeneratedBy a owl:ObjectProperty ;
+    rdfs:domain prov:Entity ;
+    rdfs:range prov:Activity .
+
+prov:wasAttributedTo a owl:ObjectProperty ;
+    rdfs:domain prov:Entity ;
+    rdfs:range prov:Agent .
