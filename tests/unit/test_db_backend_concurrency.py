@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 
 def test_postgres_from_pool_keeps_advisory_dsn_outside_operational_pool_state():
     """A wrapped pool needs an explicit, scheduler-only connection source."""
@@ -152,3 +154,115 @@ def test_autocommit_write_gives_up_after_max_retries():
     with pytest.raises(QueryError):
         asyncio.run(main())
     assert pool.calls == 5  # initial + 4 retries
+
+
+@pytest.mark.asyncio
+async def test_postgres_close_cleans_primary_after_advisory_failure_and_retries():
+    """A failed advisory close cannot strand its handle or skip primary cleanup."""
+
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    class _Pool:
+        def __init__(self, *, fail_once: bool = False) -> None:
+            self.fail_once = fail_once
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            if self.fail_once and self.close_calls == 1:
+                raise RuntimeError("advisory close failed")
+
+    advisory = _Pool(fail_once=True)
+    primary = _Pool(fail_once=True)
+    backend = PostgresBackend.__new__(PostgresBackend)
+    backend._advisory_pool = advisory
+    backend._pool = primary
+    backend._owns_pool = True
+
+    with pytest.raises(RuntimeError, match="advisory close failed"):
+        await backend.close()
+
+    assert advisory.close_calls == 1
+    assert primary.close_calls == 1
+    assert backend._advisory_pool is advisory
+    assert backend._pool is primary
+
+    await backend.close()
+    assert advisory.close_calls == 2
+    assert primary.close_calls == 2
+    assert backend._advisory_pool is None
+    assert backend._pool is None
+
+
+@pytest.mark.asyncio
+async def test_postgres_close_releases_external_primary_after_advisory_failure():
+    """from_pool never closes its primary pool, even when advisory close fails."""
+
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    class _AdvisoryPool:
+        async def close(self) -> None:
+            raise RuntimeError("advisory close failed")
+
+    class _ExternalPool:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    advisory = _AdvisoryPool()
+    primary = _ExternalPool()
+    backend = PostgresBackend.__new__(PostgresBackend)
+    backend._advisory_pool = advisory
+    backend._pool = primary
+    backend._owns_pool = False
+
+    with pytest.raises(RuntimeError, match="advisory close failed"):
+        await backend.close()
+
+    assert backend._advisory_pool is advisory
+    assert backend._pool is None
+    assert primary.close_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_postgres_close_drains_both_pools_through_repeated_cancellation():
+    """Caller cancellation is delayed until owned advisory and primary closes finish."""
+
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    class _BlockingPool:
+        def __init__(self) -> None:
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            self.entered.set()
+            await self.release.wait()
+
+    advisory = _BlockingPool()
+    primary = _BlockingPool()
+    backend = PostgresBackend.__new__(PostgresBackend)
+    backend._advisory_pool = advisory
+    backend._pool = primary
+    backend._owns_pool = True
+
+    closing = asyncio.create_task(backend.close())
+    await asyncio.wait_for(advisory.entered.wait(), timeout=1.0)
+    closing.cancel()
+    await asyncio.sleep(0)
+    closing.cancel()
+    advisory.release.set()
+    await asyncio.wait_for(primary.entered.wait(), timeout=1.0)
+    primary.release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(closing, timeout=1.0)
+
+    assert advisory.close_calls == 1
+    assert primary.close_calls == 1
+    assert backend._advisory_pool is None
+    assert backend._pool is None

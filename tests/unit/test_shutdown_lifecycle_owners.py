@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import FastAPI
+from starlette.routing import Mount, Route
 
 from kestrel_sovereign import cli, main, server
 from kestrel_sovereign.kestrel_agent import (
@@ -286,6 +287,92 @@ async def test_server_shutdown_drains_host_agent_and_phoenix_after_failures(
     assert cancelled is False
     assert isinstance(failure, RuntimeError)
     assert str(failure) == "host failure"
+
+
+@pytest.mark.asyncio
+async def test_host_scheduler_drains_cold_onboarding_before_feature_unmount(
+    monkeypatch,
+):
+    """A cold wake cannot remount routes/UI after the host teardown pass."""
+
+    app = FastAPI()
+    events: list[str] = []
+    onboarding_entered = asyncio.Event()
+    release_onboarding = asyncio.Event()
+    stale_route = None
+    stale_asset = None
+
+    async def cold_onboarding_remount() -> None:
+        nonlocal stale_route, stale_asset
+        onboarding_entered.set()
+        await release_onboarding.wait()
+        stale_route = Route("/cold-onboarding-route", endpoint=lambda _request: None)
+        stale_asset = Mount("/features/cold/static", app=lambda *_args: None)
+        app.routes.extend((stale_route, stale_asset))
+        app.state._feature_routes = [stale_route]
+        app.state._feature_ui_mounts = [stale_asset]
+        app.state._feature_ui_mount_paths = {"/features/cold/static"}
+        events.append("cold_onboarding_remounted")
+
+    onboarding = asyncio.create_task(cold_onboarding_remount())
+    await asyncio.wait_for(onboarding_entered.wait(), timeout=1.0)
+
+    class _DrainingRunner:
+        def __init__(self) -> None:
+            self.stop_entered = asyncio.Event()
+            self.drained = asyncio.Event()
+
+        async def stop(self) -> None:
+            events.append("scheduler_stop")
+            self.stop_entered.set()
+            await onboarding
+            self.drained.set()
+            events.append("scheduler_drained")
+
+    class _Storage:
+        async def close(self) -> None:
+            events.append("scheduler_storage_closed")
+
+    runner = _DrainingRunner()
+    app.state.host_scheduler_runner = runner
+    app.state.host_scheduler_storage = _Storage()
+    app.state._feature_routes = []
+    app.state._feature_ui_mounts = []
+    app.state._feature_ui_mount_paths = set()
+
+    async def host_feature_teardown(target_app) -> None:
+        assert runner.drained.is_set()
+        events.append("host_features_unmounted")
+        server._unmount_feature_routers(target_app)
+        server._unmount_feature_ui_assets(target_app)
+
+    monkeypatch.setattr(server, "_shutdown_host_features", host_feature_teardown)
+
+    shutdown = asyncio.create_task(server._shutdown_server_resources(app))
+    await asyncio.wait_for(runner.stop_entered.wait(), timeout=1.0)
+    assert "host_features_unmounted" not in events
+
+    release_onboarding.set()
+    cancelled, failure = await asyncio.wait_for(shutdown, timeout=1.0)
+
+    assert cancelled is False
+    assert failure is None
+    assert events.index("scheduler_drained") < events.index("host_features_unmounted")
+    assert stale_route not in app.routes
+    assert stale_asset not in app.routes
+    assert app.state._feature_routes == []
+    assert app.state._feature_ui_mounts == []
+    assert app.state._feature_ui_mount_paths == set()
+
+    # A next lifespan can mount a new copy without inheriting the cold wake's
+    # stale route or static mount.
+    fresh_route = Route("/cold-onboarding-route", endpoint=lambda _request: None)
+    fresh_asset = Mount("/features/cold/static", app=lambda *_args: None)
+    app.routes.extend((fresh_route, fresh_asset))
+    assert sum(
+        route.path == "/cold-onboarding-route" for route in app.routes
+    ) == 1
+    assert sum(route.path == "/features/cold/static" for route in app.routes) == 1
 
 
 @pytest.mark.asyncio

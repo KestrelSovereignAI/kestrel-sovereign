@@ -29,6 +29,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, AsyncIterator, List, Optional, Sequence, Tuple
 
+from kestrel_sovereign._async_ownership import await_owned_task
+
 from .interface import (
     ConnectionError,
     DatabaseBackend,
@@ -262,22 +264,67 @@ class PostgresBackend(DatabaseBackend):
             raise ConnectionError(f"Failed to connect to PostgreSQL: {e}") from e
     
     async def close(self) -> None:
-        """Close connection pool (only if we own it)."""
-        if self._advisory_pool is not None:
-            advisory_pool = self._advisory_pool
-            self._advisory_pool = None
-            await advisory_pool.close()
-        if self._pool is not None:
-            if self._owns_pool:
-                try:
-                    await self._pool.close()
-                    logger.debug("Closed PostgreSQL connection pool")
-                finally:
-                    self._pool = None
+        """Close every owned pool before surfacing a close failure or cancel.
+
+        The advisory pool is a separate owned resource even when the primary
+        pool was supplied by ``from_pool``.  Keep each handle until its own
+        close task reaches a successful terminal state, so a failure or an
+        owned-task cancellation remains retryable instead of stranding a
+        dedicated advisory session behind a cleared reference.
+        """
+
+        pending_cancellation: asyncio.CancelledError | None = None
+        failures: list[BaseException] = []
+
+        advisory_pool = self._advisory_pool
+        if advisory_pool is not None:
+            outcome = await await_owned_task(
+                asyncio.create_task(advisory_pool.close()),
+                pending_cancellation,
+            )
+            pending_cancellation = outcome.cancellation
+            if outcome.error is None:
+                if self._advisory_pool is advisory_pool:
+                    self._advisory_pool = None
             else:
-                # We don't own the pool (from from_pool), just release reference
+                failures.append(outcome.error)
+
+        primary_pool = self._pool
+        if primary_pool is not None:
+            if self._owns_pool:
+                outcome = await await_owned_task(
+                    asyncio.create_task(primary_pool.close()),
+                    pending_cancellation,
+                )
+                pending_cancellation = outcome.cancellation
+                if outcome.error is None:
+                    if self._pool is primary_pool:
+                        self._pool = None
+                    logger.debug("Closed PostgreSQL connection pool")
+                else:
+                    failures.append(outcome.error)
+            else:
+                # We don't own the pool (from from_pool), just release our
+                # reference even when advisory cleanup failed or was cancelled.
                 logger.debug("Released PostgreSQL pool reference (not owned)")
-                self._pool = None
+                if self._pool is primary_pool:
+                    self._pool = None
+
+        if pending_cancellation is not None:
+            if failures:
+                pending_cancellation.add_note(
+                    "PostgreSQL pool cleanup also failed: "
+                    + "; ".join(str(error) for error in failures)
+                )
+                raise pending_cancellation from failures[0]
+            raise pending_cancellation
+        if failures:
+            if len(failures) > 1:
+                failures[0].add_note(
+                    "Additional PostgreSQL pool cleanup failures: "
+                    + "; ".join(str(error) for error in failures[1:])
+                )
+            raise failures[0]
     
     def _ensure_connected(self) -> asyncpg.Pool:
         """Ensure we have an active pool."""
