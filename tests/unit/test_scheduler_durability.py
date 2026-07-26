@@ -575,6 +575,103 @@ async def test_mutators_reject_future_target_schedule_without_overwriting_it(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_marker", [None, SCHEDULER_PROTOCOL_VERSION - 1])
+@pytest.mark.parametrize("operation", ["remove", "pause", "resume", "update"])
+async def test_schedule_mutators_preserve_legacy_target_for_rollout_fencing(
+    tmp_path, operation, legacy_marker,
+):
+    """No mutator may normalize or erase a legacy row before it is fenced."""
+
+    db = await _database(tmp_path / f"legacy-target-{operation}-{legacy_marker}.db")
+    agent_id = f"did:scheduler:legacy-target:{operation}:{legacy_marker}"
+    runner = SchedulerRunner(
+        db,
+        None,
+        AsyncMock(),
+        authorized_agent_ids=(agent_id,),
+        owner_id="legacy-target",
+    )
+    try:
+        await runner._ensure_tables()
+        feature = SchedulerFeature(
+            SimpleNamespace(did=agent_id, agent_id=agent_id, features={})
+        )
+        feature._db = db
+        feature._agent_id = agent_id
+        added = await feature.schedule_add(
+            "@daily",
+            "backup_snapshot",
+            idempotency_key=f"legacy-target:{operation}",
+        )
+        task_id = added.data["task_id"]
+        if operation == "resume":
+            assert (await feature.schedule_pause(task_id)).status.value == "ok"
+        await db.execute(
+            "UPDATE scheduled_tasks SET scheduler_protocol_version = ? WHERE id = ?",
+            (legacy_marker, task_id),
+        )
+        before = await db.fetchone(
+            """
+            SELECT scheduler_protocol_version, enabled, cron_expression,
+                   scheduler_rollout_fenced, scheduler_rollout_nonce
+            FROM scheduled_tasks WHERE id = ?
+            """,
+            (task_id,),
+        )
+
+        if operation == "remove":
+            result = await feature.schedule_remove(task_id)
+        elif operation == "pause":
+            result = await feature.schedule_pause(task_id)
+        elif operation == "resume":
+            result = await feature.schedule_resume(task_id)
+        else:
+            result = await feature.schedule_update(task_id, "@weekly")
+
+        assert result.status.value == "error"
+        # Resume/update did not stamp this as v2; remove did not delete the
+        # durable evidence needed for the subsequent quiescing transition.
+        assert await db.fetchone(
+            """
+            SELECT scheduler_protocol_version, enabled, cron_expression,
+                   scheduler_rollout_fenced, scheduler_rollout_nonce
+            FROM scheduled_tasks WHERE id = ?
+            """,
+            (task_id,),
+        ) == before
+
+        with pytest.raises(SchedulerRolloutQuiescenceRequired):
+            await runner._ensure_tables()
+        protocol_version, state, nonce = await db.fetchone(
+            """
+            SELECT protocol_version, state, activation_nonce
+            FROM scheduler_protocol_rollout WHERE agent_id = ?
+            """,
+            (agent_id,),
+        )
+        assert (protocol_version, state) == (
+            SCHEDULER_PROTOCOL_VERSION,
+            "quiescing",
+        )
+        assert nonce
+        fenced = await db.fetchone(
+            """
+            SELECT scheduler_protocol_version, enabled, scheduler_rollout_fenced,
+                   scheduler_rollout_nonce, scheduler_rollout_snapshot
+            FROM scheduled_tasks WHERE id = ?
+            """,
+            (task_id,),
+        )
+        assert fenced[0] == legacy_marker
+        assert fenced[1] == 0
+        assert fenced[2] == (1 if before[1] else 0)
+        assert fenced[3] == nonce
+        assert fenced[4]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_record_outcome_rejects_claimed_execution_but_accepts_terminal_log(tmp_path):
     """Runner-owned claimed logs cannot be modified before finalization."""
 

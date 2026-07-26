@@ -2515,12 +2515,17 @@ class SchedulerFeature(Feature):
         if row is None:
             return None
         version = row[0] if row else None
-        if version is not None:
-            try:
-                if int(version) > SCHEDULER_PROTOCOL_VERSION:
-                    raise SchedulerProtocolVersionIncompatible()
-            except (TypeError, ValueError):
-                return False
+        try:
+            protocol_version = int(version)
+        except (TypeError, ValueError):
+            return False
+        if protocol_version > SCHEDULER_PROTOCOL_VERSION:
+            raise SchedulerProtocolVersionIncompatible()
+        if protocol_version != SCHEDULER_PROTOCOL_VERSION:
+            # A NULL/older marker is evidence of a legacy writer. Do not
+            # stamp it as v2 (or let removal erase it) before reconciliation
+            # can fence that writer and require an explicit rollout ACK.
+            return False
         return await adopt_scheduler_registration_ownership(
             self._db,
             task_id=task_id,
