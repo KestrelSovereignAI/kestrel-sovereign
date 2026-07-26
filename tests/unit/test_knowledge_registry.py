@@ -260,7 +260,7 @@ def test_package_resources_are_available_from_an_installed_wheel(tmp_path):
         check=True,
     )
     check = subprocess.run(
-        [str(python), "-m", "kestrel_sovereign.knowledge.registry", "check"],
+        [str(python), "-W", "error", "-m", "kestrel_sovereign.knowledge.registry", "check"],
         cwd=tmp_path,
         env=environment,
         text=True,
