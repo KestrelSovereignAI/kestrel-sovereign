@@ -141,11 +141,12 @@ class _TrafficGate:
     unrelated calls when no transition is taking place.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, before_reset: Callable[[], None] | None = None) -> None:
         self._condition = asyncio.Condition()
         self._closed = False
         self._sealed = False
         self._active = 0
+        self._before_reset = before_reset
 
     @property
     def closed(self) -> bool:
@@ -194,6 +195,12 @@ class _TrafficGate:
         """Reset terminal admission after a durable child initialization."""
 
         async with self._condition:
+            # The lifecycle predicate must be checked while the gate lock is
+            # held.  Checking only before scheduling this coroutine leaves a
+            # window where shutdown can latch while this call awaits the
+            # condition and the stale initializer then reopens traffic.
+            if self._before_reset is not None:
+                self._before_reset()
             self._sealed = False
             self._closed = False
             self._condition.notify_all()
@@ -594,6 +601,11 @@ class ProxyFeature(Feature):
         # caller cancellation cannot strand a second cleanup behind
         # ``_reload_lock`` after the first caller has unwound.
         self._terminal_cleanup_task: Optional[asyncio.Task[None]] = None
+        # Shutdown and quarantine make the current enable cycle terminal.  A
+        # durable config repair remains allowed while soft-disabled, but no
+        # normal reconciliation may build or publish another child until an
+        # explicit later ``initialize()`` begins a fresh cycle.
+        self._terminal_lifecycle_latched = False
         self._stopping = False
         # Coordinate ``set_config``'s reload with the health supervisor so they
         # never stop/start the client concurrently. ``_reloading`` skips probes
@@ -604,7 +616,7 @@ class ProxyFeature(Feature):
         self._reloading = False
         self._reload_lock = asyncio.Lock()
         self._reload_gen = 0
-        self._traffic_gate = _TrafficGate()
+        self._traffic_gate = _TrafficGate(before_reset=self._assert_child_start_allowed)
         self._fenced_recovery_failed = False
         self._venv_path: Optional[Path] = None
         self._bin_path: Optional[Path] = None
@@ -677,6 +689,7 @@ class ProxyFeature(Feature):
             # the new ``_supervise()`` task sees a stale ``_stopping`` and exits on
             # its first ``while not self._stopping`` check — leaving a re-enabled
             # service with no health supervisor (kestrel-sovereign#2522 P2).
+            self._terminal_lifecycle_latched = False
             self._stopping = False
             # A previous enable cycle may have left an intentional empty config (or
             # a stopped client) on this same object. A fresh initialize must never
@@ -690,10 +703,13 @@ class ProxyFeature(Feature):
             # forwarded to the isolated service through the initialize handshake (the
             # service is otherwise launched bare, with only env vars).
             await self._ensure_host_config_loaded()
+            self._assert_child_start_allowed()
             await self._connect_client()
+            self._assert_child_start_allowed()
             # A previously quarantined instance is only made reachable after its
             # fresh child was initialized from durable config.
             await self._reset_traffic_gate_after_initialize()
+            self._assert_child_start_allowed()
             self._supervision_task = self._start_supervision()
 
     async def _run_traffic_gate_operation(
@@ -755,7 +771,14 @@ class ProxyFeature(Feature):
         service's initialize handshake, so rebuilding here is how new config
         actually reaches a running service.
         """
+        self._assert_child_start_allowed()
         client, tools = await self._start_detached_client(config)
+        # A terminal cleanup can latch while a detached start awaits.  Do not
+        # publish that child behind a sealed gate; retire it before reporting
+        # the terminal lifecycle boundary to the caller.
+        if self._terminal_lifecycle_latched:
+            await self._retire_detached_client(client)
+            self._assert_child_start_allowed()
         self._publish_client(
             client,
             tools,
@@ -769,6 +792,11 @@ class ProxyFeature(Feature):
             self._unpublish_client(client)
             await self._retire_detached_client(client)
             raise
+        # Registration is an awaited post-publication operation.  Shutdown may
+        # have latched while it was in flight and be waiting for this lifecycle
+        # owner to release ``_reload_lock``.  Do not let that terminal cycle
+        # reset admission, start supervision, or report initialization success.
+        self._assert_child_start_allowed()
 
     async def _refresh_published_client_inventory(self) -> None:
         """Republish tools and channel capability after a live apply.
@@ -921,6 +949,7 @@ class ProxyFeature(Feature):
         authoritative active generation).
         """
 
+        self._assert_child_start_allowed()
         # The old child must lose every host-visible handle before a stop that
         # can succeed while candidate startup fails.  Restoring it only on a
         # stop failure gives terminal quarantine one last best-effort retirement
@@ -940,6 +969,7 @@ class ProxyFeature(Feature):
     async def shutdown(self):
         # Set the latch before scheduling the transaction so a health probe
         # cannot decide to restart the child in the tiny interval before seal.
+        self._terminal_lifecycle_latched = True
         self._stopping = True
         await self._complete_terminal_cleanup()
 
@@ -957,6 +987,7 @@ class ProxyFeature(Feature):
         have reached their final state.
         """
 
+        self._terminal_lifecycle_latched = True
         self._stopping = True
         if lifecycle_lock_held:
             # A set-config/reload owner cannot await the shared terminal task:
@@ -1083,10 +1114,13 @@ class ProxyFeature(Feature):
         storage = getattr(self.agent, "storage", None)
         if storage is not None and await self._persistent_config_writes_allowed(storage):
             state = await self._read_config_state(storage)
-            # Do not overwrite the local candidate while its traffic gate is
-            # closed during an in-process applied hook.  The return value is
-            # nevertheless authoritative for this read.
-            if not self._reloading:
+            # A durable read can describe a winner from another replica while
+            # this process still has a child running an older config.  Return
+            # the durable value, but retain the locally applied identity until
+            # reconciliation replaces or live-applies that child.  Otherwise a
+            # later PATCH can mistake the stale child for the durable winner
+            # and invoke a transition hook against stale resources.
+            if self._client is None:
                 self._host_config = dict(state.config)
                 self._host_config_loaded = True
             return dict(state.config)
@@ -1136,6 +1170,13 @@ class ProxyFeature(Feature):
         """
         cfg = dict(config) if isinstance(config, dict) else {}
         async with self._reload_lock:
+            if self._terminal_lifecycle_latched:
+                await self._persist_terminal_config(
+                    cfg,
+                    preserve_secret_fields=_preserve_secret_fields,
+                    validate_effective_config=_validate_effective_config,
+                )
+                return
             self._begin_reload()
             # This intent marker deliberately precedes the await below. A
             # cancelled close/drain has already made the gate finite-closed,
@@ -1324,6 +1365,62 @@ class ProxyFeature(Feature):
                             await self._seal_traffic_gate()
                         else:
                             await self._reopen_traffic_gate()
+
+    async def _persist_terminal_config(
+        self,
+        config: Dict[str, Any],
+        *,
+        preserve_secret_fields: set[str] | None,
+        validate_effective_config: Callable[[Dict[str, Any]], None] | None,
+    ) -> None:
+        """Durably repair config without reviving a terminal enable cycle.
+
+        A loaded soft-disabled feature retains its proxy so the config API can
+        rotate credentials before a later re-enable.  Its traffic gate is
+        terminal by design, however, so this path performs only the same
+        generation-owned stage/promote protocol; it never closes or reopens
+        admission, invokes a child hook, or starts a child.
+        """
+
+        transition: Optional[_ConfigTransition] = None
+        transition_settled = False
+        promotion: Optional[_PromotionResolution] = None
+        try:
+            # The volatile path preserves omitted fields from this cache.  For
+            # durable stores the stage always derives from a fresh CAS snapshot,
+            # but loading here keeps the two paths equally safe after a failed
+            # startup that never reached a child.
+            await self._ensure_host_config_loaded()
+            transition = await self._stage_pending_config(
+                config,
+                preserve_secret_fields=preserve_secret_fields,
+                validate_effective_config=validate_effective_config,
+            )
+            promotion = await self._promote_config(transition)
+            if not promotion.committed:
+                await self._run_owned_transition_cleanup(
+                    transition,
+                    force=False,
+                    preserve_cancellation=False,
+                )
+                transition_settled = True
+                self._raise_promotion_failure(promotion)
+
+            transition_settled = True
+            # There is no applied child to keep in sync.  This is the durable
+            # config that a later explicit initialize will load.
+            self._host_config = dict(transition.next_config)
+            self._host_config_loaded = True
+            if promotion.error is not None:
+                self._raise_promotion_failure(promotion)
+        except BaseException:
+            if transition is not None and not transition_settled:
+                await self._run_owned_transition_cleanup(
+                    transition,
+                    force=False,
+                    preserve_cancellation=False,
+                )
+            raise
 
     async def set_config_with_secret_preservation(
         self,
@@ -1557,6 +1654,7 @@ class ProxyFeature(Feature):
         # a cancellation delivered after seal cannot skip unpublication,
         # adapter removal, supervision cancellation, or best-effort retirement
         # while the task is still waiting on another lifecycle owner.
+        self._terminal_lifecycle_latched = True
         self._stopping = True
         await self._complete_terminal_cleanup(
             best_effort=True,
@@ -2238,6 +2336,17 @@ class ProxyFeature(Feature):
         """Make the local child match a config freshly read from storage."""
 
         authoritative_config = dict(config)
+        if self._terminal_lifecycle_latched:
+            # Terminal cleanup has already made this enable cycle unavailable.
+            # A cleanup re-read may recover storage after quarantine, but it
+            # must never turn that recovery into a new, unsupervised child.
+            # Retain the actual child's config if retirement has not completed;
+            # otherwise cache the durable value for the later explicit
+            # initialize.
+            if self._client is None:
+                self._host_config = authoritative_config
+                self._host_config_loaded = True
+            return
         try:
             # Forced reconciliation owns recovery after a lifecycle operation
             # whose outcome made the current publication unsafe.  In
@@ -2252,12 +2361,21 @@ class ProxyFeature(Feature):
             ):
                 await self._replace_client(authoritative_config)
         except BaseException:
+            await self._quarantine_unreconciled_client(lifecycle_lock_held=True)
             self._host_config = authoritative_config
             self._host_config_loaded = True
-            await self._quarantine_unreconciled_client(lifecycle_lock_held=True)
             raise
         self._host_config = authoritative_config
         self._host_config_loaded = True
+
+    def _assert_child_start_allowed(self) -> None:
+        """Refuse normal child-lifecycle work after terminal cleanup starts."""
+
+        if self._terminal_lifecycle_latched:
+            raise RuntimeError(
+                f"Cannot continue isolated feature {self.name}: terminal lifecycle "
+                "is latched; explicit initialize is required"
+            )
 
     def _raise_storage_write_error(self, error: BaseException) -> None:
         """Surface storage failure without leaking feature config or secrets."""
@@ -3001,6 +3119,7 @@ class ProxyFeature(Feature):
             # This is terminal rather than a finite restart: release pending
             # admissions with the stable fail-closed result before retirement.
             if not self._stopping:
+                self._terminal_lifecycle_latched = True
                 self._stopping = True
                 await self._seal_traffic_gate()
                 client = self._unpublish_client()

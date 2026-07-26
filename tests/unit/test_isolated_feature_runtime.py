@@ -3343,6 +3343,167 @@ async def test_stale_empty_replica_patch_preserves_concurrent_secret_rotation_at
 
 
 @pytest.mark.asyncio
+async def test_replica_get_does_not_mask_stale_child_before_next_patch(
+    monkeypatch, tmp_path
+):
+    """A durable GET cannot make a stale local child skip reconciliation.
+
+    Replica two is still running ``old_config`` when replica one promotes
+    ``winner_config``.  Its GET must return the durable winner, but a later
+    PATCH must first replace the locally stale child before it invokes the
+    negotiated hook.
+    """
+
+    old_config = {"enabled": True, "revision": "old"}
+    winner_config = {"enabled": True, "revision": "winner"}
+    next_config = {"enabled": False, "revision": "next"}
+    storage = _CASStorage()
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+
+    winner_agent = Mock(features={})
+    winner_agent.storage = storage
+    winner_agent.storage_path = str(tmp_path / "winner" / "kestrel_prime.db")
+    stale_agent = Mock(features={})
+    stale_agent.storage = storage
+    stale_agent.storage_path = str(tmp_path / "stale" / "kestrel_prime.db")
+    stale_clients = []
+
+    class ConfigAwareClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.prepared = []
+
+        async def prepare_config_transition(self, config):
+            # This hook owns resources created by the child config supplied at
+            # initialize.  It must never receive the next PATCH while those
+            # resources still describe the old durable generation.
+            assert self.kwargs["config"] == winner_config
+            self.prepared.append(dict(config))
+            return ConfigTransitionResult.applied()
+
+    def stale_factory(**kwargs):
+        client = ConfigAwareClient(**kwargs)
+        stale_clients.append(client)
+        return client
+
+    winner = ProxyFeature(
+        winner_agent, _cfg_runtime(), client_factory=FakeIsolatedClient
+    )
+    stale = ProxyFeature(stale_agent, _cfg_runtime(), client_factory=stale_factory)
+    try:
+        await winner.persist_config(old_config)
+        await winner.initialize()
+        await stale.initialize()
+        stale_child = stale_clients[0]
+
+        await winner.set_config(winner_config)
+        assert await stale.get_config() == winner_config
+        # GET reports durable state without rewriting the identity of the
+        # child that is actually still running old_config.
+        assert stale._host_config == old_config
+
+        await stale.set_config(next_config)
+
+        assert stale_child.stopped is True
+        assert stale._client is stale_clients[1]
+        assert stale_clients[1].kwargs["config"] == winner_config
+        assert stale_clients[1].prepared == [next_config]
+        assert (
+            storage.nodes["feature_config:TestFeature"].properties["config"]
+            == next_config
+        )
+    finally:
+        await stale.shutdown()
+        await winner.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_promotion_reread_quarantine_cannot_publish_recovery_child(
+    monkeypatch, tmp_path
+):
+    """Storage recovery after quarantine stays terminal until initialize()."""
+
+    old_config = {"enabled": True, "revision": "old"}
+    next_config = {"enabled": False, "revision": "next"}
+
+    class PromotionReadFailureStorage(_CASStorage):
+        def __init__(self):
+            super().__init__()
+            self.cas_calls = 0
+            self.fail_next_read = False
+
+        async def compare_and_swap_node(self, node_id, expected, new_node):
+            self.cas_calls += 1
+            # The stage succeeds.  The promotion response is ambiguous, and
+            # its required durable re-read then fails, latching quarantine.
+            if self.cas_calls == 2:
+                self.fail_next_read = True
+                raise OSError("promotion transport failed")
+            return await super().compare_and_swap_node(node_id, expected, new_node)
+
+        async def get_node(self, node_id):
+            if self.fail_next_read:
+                self.fail_next_read = False
+                raise OSError("promotion reread unavailable")
+            return await super().get_node(node_id)
+
+    class LiveApplyClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        async def prepare_config_transition(self, config):
+            assert config == next_config
+            return ConfigTransitionResult.applied()
+
+    storage = PromotionReadFailureStorage()
+    agent = Mock(features={})
+    agent.storage = storage
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    clients = []
+
+    def client_factory(**kwargs):
+        client = (
+            LiveApplyClient(**kwargs) if not clients else FakeIsolatedClient(**kwargs)
+        )
+        clients.append(client)
+        return client
+
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=client_factory)
+    try:
+        await feature.persist_config(old_config)
+        await feature.initialize()
+        old_child = clients[0]
+
+        with pytest.raises(RuntimeError, match="could not reconcile durable config"):
+            await feature.set_config(next_config)
+
+        # The follow-up cleanup can read storage again and clear its pending
+        # generation, but it must not force-start a replacement behind the
+        # terminal gate that the ambiguous reread already sealed.
+        properties = storage.nodes["feature_config:TestFeature"].properties
+        assert properties["config"] == old_config
+        assert "pending_config" not in properties
+        assert old_child.stopped is True
+        assert clients == [old_child]
+        assert feature._client is None
+        assert feature.get_tools() == []
+        assert feature._supervision_task is None
+        assert feature._stopping is True
+        assert feature._traffic_gate.sealed is True
+
+        # Only an explicit enable-cycle initialization may create a new child.
+        await feature.initialize()
+        assert len(clients) == 2
+        assert clients[1].kwargs["config"] == old_config
+        assert feature._client is clients[1]
+        assert feature._traffic_gate.sealed is False
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_fenced_cancellation_promotes_generation_before_starting_replacement(
     monkeypatch, tmp_path
 ):
@@ -3943,6 +4104,75 @@ async def test_reinitialize_after_terminal_quarantine_reopens_only_after_child_i
 
 
 @pytest.mark.asyncio
+async def test_soft_disabled_terminal_proxy_persists_repaired_config_until_reenable(
+    monkeypatch, tmp_path
+):
+    """A disabled proxy can rotate config without reviving its sealed child."""
+
+    old_config = {"enabled": True, "token": "old-token"}
+    repaired_config = {"enabled": True, "token": "rotated-token"}
+    clients = []
+
+    class TransitionClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.prepared = []
+
+        async def prepare_config_transition(self, config):
+            self.prepared.append(dict(config))
+            return ConfigTransitionResult.applied()
+
+    def client_factory(**kwargs):
+        client = TransitionClient(**kwargs)
+        clients.append(client)
+        return client
+
+    agent = Mock(features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=client_factory)
+    try:
+        await feature.persist_config(old_config)
+        await feature.initialize()
+        old_child = clients[0]
+        await feature.shutdown()
+
+        assert old_child.stopped is True
+        assert feature._client is None
+        assert feature._supervision_task is None
+        assert feature._stopping is True
+        assert feature._traffic_gate.sealed is True
+
+        await feature.set_config(repaired_config)
+
+        properties = agent.storage.nodes["feature_config:TestFeature"].properties
+        assert properties["config"] == repaired_config
+        assert "pending_config" not in properties
+        # A config repair is storage-only while disabled: no transition hook,
+        # child, supervision task, or admission reset is permitted.
+        assert old_child.prepared == []
+        assert clients == [old_child]
+        assert feature._client is None
+        assert feature._supervision_task is None
+        assert feature._stopping is True
+        assert feature._traffic_gate.sealed is True
+
+        await feature.initialize()
+
+        assert len(clients) == 2
+        assert clients[1].kwargs["config"] == repaired_config
+        assert feature._client is clients[1]
+        assert feature._supervision_task is not None
+        assert feature._stopping is False
+        assert feature._traffic_gate.sealed is False
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_shutdown_cancellation_waiting_for_lifecycle_lock_finishes_teardown(
     monkeypatch, tmp_path
 ):
@@ -4154,6 +4384,87 @@ async def test_initialize_cancellation_after_gate_reset_unpublishes_and_retires_
             initialize_task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await initialize_task
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_during_event_registration_keeps_initialize_terminal(
+    monkeypatch, tmp_path
+):
+    """A terminal latch during post-publication registration cannot revive the proxy."""
+
+    registration_started = asyncio.Event()
+    release_registration = asyncio.Event()
+    clients = []
+
+    class ChannelClient(FakeIsolatedClient):
+        @property
+        def capabilities(self):
+            return {
+                "channel": {
+                    "channel_type": "whatsapp",
+                    "send_tool": "whatsapp_send",
+                }
+            }
+
+        async def set_event_handler(self, handler):
+            if self is clients[0]:
+                registration_started.set()
+                await release_registration.wait()
+            self.event_handler = handler
+
+    def client_factory(**kwargs):
+        client = ChannelClient(**kwargs)
+        clients.append(client)
+        return client
+
+    channel_feature = FakeChannelFeature()
+    agent = Mock(features={"ChannelFeature": channel_feature})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=client_factory)
+    initialize_task = None
+    shutdown_task = None
+    try:
+        initialize_task = asyncio.create_task(feature.initialize())
+        await asyncio.wait_for(registration_started.wait(), timeout=1)
+        first_child = clients[0]
+        assert feature._client is first_child
+        assert feature.get_tools()
+        assert channel_feature.registry.get("whatsapp") is not None
+
+        shutdown_task = asyncio.create_task(feature.shutdown())
+        await asyncio.sleep(0)
+        assert feature._terminal_lifecycle_latched is True
+
+        release_registration.set()
+        with pytest.raises(RuntimeError, match="terminal lifecycle is latched"):
+            await asyncio.wait_for(initialize_task, timeout=1)
+        await asyncio.wait_for(shutdown_task, timeout=1)
+
+        assert first_child.stopped is True
+        assert feature._client is None
+        assert feature.get_tools() == []
+        assert feature._supervision_task is None
+        assert feature._channel_adapter is None
+        assert channel_feature.registry.get("whatsapp") is None
+        assert feature._traffic_gate.sealed is True
+
+        # Cleanup has completed, so a later explicit initialize owns a new
+        # lifecycle and may open admission again.
+        await feature.initialize()
+        assert len(clients) == 2
+        assert feature._client is clients[1]
+        assert feature._supervision_task is not None
+        assert feature._traffic_gate.sealed is False
+    finally:
+        release_registration.set()
+        for task in (initialize_task, shutdown_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
         await feature.shutdown()
 
 
