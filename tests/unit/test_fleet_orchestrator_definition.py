@@ -98,6 +98,7 @@ def test_allowlist_denies_write_edit_and_talon_dispatch_tools():
     # Scheduler mutation tools are denied (P1 #2321).
     for tool in (
         "schedule_add",
+        "schedule_add_deadline",
         "schedule_remove",
         "schedule_pause",
         "schedule_resume",
@@ -129,7 +130,7 @@ def test_allowed_dispatch_and_read_tools_are_not_denied():
 
 def test_scheduler_read_status_tools_remain_available():
     """The Signals-view read/status scheduler tools are NOT denied — only the
-    cron-mutating tools are (P1 #2321)."""
+    schedule-mutating tools are (P1 #2321)."""
     for tool in ("schedule_list", "schedule_history", "schedule_engagement"):
         assert not fo.is_tool_denied(tool)
 
@@ -235,6 +236,7 @@ async def test_restriction_hook_hard_denies_dispatch_and_write_tools():
         "create_github_pull_request",
         "workflow_cancel",
         "schedule_add",
+        "schedule_add_deadline",
     ):
         out = await hook.execute(
             HookInput(
