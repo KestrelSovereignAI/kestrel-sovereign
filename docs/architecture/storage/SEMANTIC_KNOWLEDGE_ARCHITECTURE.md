@@ -718,6 +718,11 @@ canonical store.
 
 ## Standards and compatibility matrix
 
+The executable, offline artifact pins and import closure for this matrix live
+in [Semantic Knowledge Registry](SEMANTIC_KNOWLEDGE_REGISTRY.md). The registry
+is schema/profile metadata only; it does not participate in constitutional,
+approval, privacy, or tool-authorization decisions.
+
 The status below is checked **as of 2026-07-26**. “Pinned” means Kestrel stores
 the dated publication URL and a SHA-256 of the exact retrieved artifact in the
 ontology/shapes/profile registry; it never persists “latest,” an editor's draft,

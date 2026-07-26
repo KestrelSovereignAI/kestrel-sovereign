@@ -1,0 +1,6 @@
+{
+  "profile": "literal-v1-xsd11-20120405",
+  "normative_source": "XSD 1.1 Part 2, 2012-04-05",
+  "accepted_datatypes": ["xsd:string", "xsd:boolean", "xsd:integer", "xsd:decimal", "xsd:date", "xsd:time", "xsd:dateTime", "xsd:dateTimeStamp"],
+  "network_access": false
+}

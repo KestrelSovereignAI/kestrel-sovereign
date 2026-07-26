@@ -1,9 +1,12 @@
-"""Canonical, dependency-free semantic knowledge value contracts.
+"""Canonical assertion contracts and offline semantic knowledge resources.
 
-The names re-exported here are the one public package surface for semantic
-assertions.  Storage, RDF codecs, inference, and training code must consume
-these types rather than define competing assertion dataclasses.
+This package is the public surface for Kestrel's dependency-free assertion
+value model and its versioned, local semantic-resource registry.
 """
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 from .assertion import (
     IDENTITY_VERSION,
@@ -47,7 +50,26 @@ from .assertion import (
     normalize_iri,
 )
 
+if TYPE_CHECKING:
+    from .registry import (
+        ArtifactPin,
+        ExperimentalCapabilityError,
+        KnowledgeRegistryError,
+        ResolvedSemanticCapability,
+        ResourceKind,
+        ResourceRequirement,
+        SemanticCapabilityContract,
+        SemanticKnowledgeRegistry,
+        SemanticResource,
+        SemanticVersion,
+        StandardsMaturity,
+        VersionConstraint,
+        get_knowledge_registry,
+        load_knowledge_registry,
+    )
+
 __all__ = [
+    "ArtifactPin",
     "Assertion",
     "AssertionObject",
     "AssertionQuery",
@@ -59,10 +81,12 @@ __all__ = [
     "DerivedLineage",
     "DirectLineage",
     "EpistemicState",
+    "ExperimentalCapabilityError",
     "IDENTITY_VERSION",
     "IRI",
     "IRI_PROFILE",
     "Instant",
+    "KnowledgeRegistryError",
     "LITERAL_PROFILE",
     "Lineage",
     "Literal",
@@ -70,10 +94,19 @@ __all__ = [
     "MAPPING_SCHEMA_VERSION",
     "OntologyRef",
     "RDF_LANG_STRING",
+    "ResolvedSemanticCapability",
     "Resource",
+    "ResourceKind",
+    "ResourceRequirement",
+    "SemanticCapabilityContract",
+    "SemanticKnowledgeRegistry",
+    "SemanticResource",
+    "SemanticVersion",
     "SourceOccurrence",
     "SourceProvenance",
+    "StandardsMaturity",
     "TemporalInterval",
+    "VersionConstraint",
     "Visibility",
     "XSD_BOOLEAN",
     "XSD_DATE",
@@ -84,7 +117,37 @@ __all__ = [
     "XSD_STRING",
     "XSD_TIME",
     "derive_assertion_id",
+    "get_knowledge_registry",
     "identity_preimage",
     "lineage_from_mapping",
+    "load_knowledge_registry",
     "normalize_iri",
 ]
+
+_REGISTRY_EXPORTS = frozenset(
+    {
+        "ArtifactPin",
+        "ExperimentalCapabilityError",
+        "KnowledgeRegistryError",
+        "ResolvedSemanticCapability",
+        "ResourceKind",
+        "ResourceRequirement",
+        "SemanticCapabilityContract",
+        "SemanticKnowledgeRegistry",
+        "SemanticResource",
+        "SemanticVersion",
+        "StandardsMaturity",
+        "VersionConstraint",
+        "get_knowledge_registry",
+        "load_knowledge_registry",
+    }
+)
+
+
+def __getattr__(name: str):
+    """Lazily expose registry exports so its CLI can run as a module."""
+    if name not in _REGISTRY_EXPORTS:
+        raise AttributeError(name)
+    from . import registry
+
+    return getattr(registry, name)

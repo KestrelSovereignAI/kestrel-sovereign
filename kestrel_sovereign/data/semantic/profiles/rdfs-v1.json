@@ -1,0 +1,6 @@
+{
+  "profile": "rdfs-v1",
+  "entailment": ["rdfs:subClassOf", "rdfs:subPropertyOf", "rdfs:domain", "rdfs:range"],
+  "network_access": false,
+  "forward_only": true
+}

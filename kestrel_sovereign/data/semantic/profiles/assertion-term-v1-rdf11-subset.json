@@ -1,0 +1,5 @@
+{
+  "profile": "assertion-term-v1-rdf11-subset",
+  "terms": ["absolute-iri", "typed-literal", "language-literal"],
+  "excludes": ["blank-node", "rdf12-triple-term", "rdf12-directional-language-string"]
+}
