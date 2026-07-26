@@ -17,6 +17,7 @@ from kestrel_sovereign.features.scheduler import runner as scheduler_runner_modu
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
 from kestrel_sovereign.features.scheduler.runner import (
     SCHEDULER_PROTOCOL_VERSION,
+    SCHEDULER_ROLLOUT_ACK_ENV,
     SCHEDULER_ROLLOUT_STATE_ACTIVE,
     SCHEDULER_ROLLOUT_STATE_QUIESCING,
     SCHEDULER_SCHEMA_PROVENANCE_FRESH_V2,
@@ -874,6 +875,219 @@ async def test_pause_and_remove_reject_future_did_without_clearing_fence(
             "future-state",
             "future-control-nonce",
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_pause_current_quiescing_fenced_legacy_row_becomes_durable_pause(
+    db_backend,
+    monkeypatch,
+):
+    """A current rollout fence is the sole legacy-row pause exception.
+
+    The target began enabled with a future occurrence. Fencing makes it
+    disabled only for rollout safety; pausing it clears that fence while
+    preserving the current nonce, so acknowledgement must retain the explicit
+    disabled state instead of restoring the formerly enabled schedule.
+    """
+
+    agent_id = f"did:scheduler:legacy-pause:{uuid4()}"
+    nonce = f"legacy-pause-nonce:{uuid4()}"
+    async with _isolated_scheduler_schema(db_backend) as db:
+        runner = _host_runner(db, {agent_id})
+        await runner._ensure_tables()
+        feature = SchedulerFeature(
+            SimpleNamespace(did=agent_id, agent_id=agent_id, features={})
+        )
+        feature._db = db
+        feature._agent_id = agent_id
+        added = await feature.schedule_add(
+            "@daily",
+            "backup_snapshot",
+            idempotency_key=f"legacy-pause:{uuid4()}",
+        )
+        assert added.status.value == "ok"
+        task_id = added.data["task_id"]
+        (next_run_at,) = await db.fetchone(
+            "SELECT next_run_at FROM scheduled_tasks WHERE id = ?",
+            (task_id,),
+        )
+        assert next_run_at > datetime.now(timezone.utc).isoformat()
+
+        # Model a formerly enabled legacy writer's row before the current
+        # quiescing epoch fences it.
+        await db.execute(
+            "UPDATE scheduled_tasks SET scheduler_protocol_version = NULL WHERE id = ?",
+            (task_id,),
+        )
+        await db.execute(
+            """
+            UPDATE scheduler_protocol_rollout
+            SET state = ?, activation_nonce = ?
+            WHERE agent_id = ?
+            """,
+            (SCHEDULER_ROLLOUT_STATE_QUIESCING, nonce, agent_id),
+        )
+        async with runner._transaction():
+            await runner._fence_legacy_agent_rows(agent_id, nonce)
+        assert await db.fetchone(
+            """
+            SELECT enabled, next_run_at, scheduler_protocol_version,
+                   scheduler_rollout_fenced, scheduler_rollout_nonce
+            FROM scheduled_tasks WHERE id = ?
+            """,
+            (task_id,),
+        ) == (0, next_run_at, None, 1, nonce)
+
+        paused = await feature.schedule_pause(task_id)
+        assert paused.status.value == "ok", paused.error
+        # The nonce remains for ACK baseline membership, while the cleared
+        # fence records the operator's intentional durable pause.
+        assert await db.fetchone(
+            """
+            SELECT enabled, next_run_at, scheduler_protocol_version,
+                   scheduler_rollout_fenced, scheduler_rollout_nonce
+            FROM scheduled_tasks WHERE id = ?
+            """,
+            (task_id,),
+        ) == (0, next_run_at, None, 0, nonce)
+
+        monkeypatch.setenv(SCHEDULER_ROLLOUT_ACK_ENV, nonce)
+        await _host_runner(db, {agent_id})._ensure_tables()
+        assert await db.fetchone(
+            """
+            SELECT enabled, next_run_at, scheduler_protocol_version,
+                   scheduler_rollout_fenced, scheduler_rollout_nonce
+            FROM scheduled_tasks WHERE id = ?
+            """,
+            (task_id,),
+        ) == (0, next_run_at, SCHEDULER_PROTOCOL_VERSION, 0, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize(
+    ("scheduler_rollout_fenced", "scheduler_rollout_nonce"),
+    [(0, "current-fence"), (1, "stale-fence")],
+    ids=["unfenced", "stale-nonce"],
+)
+async def test_pause_rejects_unfenced_or_stale_nonce_legacy_row(
+    db_backend,
+    scheduler_rollout_fenced,
+    scheduler_rollout_nonce,
+):
+    """Legacy rows outside the locked current rollout fence remain immutable."""
+
+    agent_id = f"did:scheduler:legacy-pause-reject:{uuid4()}"
+    current_nonce = "current-fence"
+    async with _isolated_scheduler_schema(db_backend) as db:
+        await _host_runner(db, {agent_id})._ensure_tables()
+        feature = SchedulerFeature(
+            SimpleNamespace(did=agent_id, agent_id=agent_id, features={})
+        )
+        feature._db = db
+        feature._agent_id = agent_id
+        added = await feature.schedule_add(
+            "@daily",
+            "backup_snapshot",
+            idempotency_key=f"legacy-pause-reject:{uuid4()}",
+        )
+        assert added.status.value == "ok"
+        task_id = added.data["task_id"]
+        await db.execute(
+            """
+            UPDATE scheduler_protocol_rollout
+            SET state = ?, activation_nonce = ?
+            WHERE agent_id = ?
+            """,
+            (SCHEDULER_ROLLOUT_STATE_QUIESCING, current_nonce, agent_id),
+        )
+        await db.execute(
+            """
+            UPDATE scheduled_tasks
+            SET enabled = 0, scheduler_protocol_version = NULL,
+                scheduler_rollout_fenced = ?, scheduler_rollout_nonce = ?
+            WHERE id = ?
+            """,
+            (scheduler_rollout_fenced, scheduler_rollout_nonce, task_id),
+        )
+        before = await db.fetchone(
+            """
+            SELECT enabled, scheduler_protocol_version,
+                   scheduler_rollout_fenced, scheduler_rollout_nonce
+            FROM scheduled_tasks WHERE id = ?
+            """,
+            (task_id,),
+        )
+
+        rejected = await feature.schedule_pause(task_id)
+        assert rejected.status.value == "error"
+        assert await db.fetchone(
+            """
+            SELECT enabled, scheduler_protocol_version,
+                   scheduler_rollout_fenced, scheduler_rollout_nonce
+            FROM scheduled_tasks WHERE id = ?
+            """,
+            (task_id,),
+        ) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("operation", ["remove", "resume", "update"])
+async def test_only_pause_can_mutate_a_current_fenced_legacy_row(db_backend, operation):
+    """Current rollout evidence does not admit any other legacy mutator."""
+
+    agent_id = f"did:scheduler:legacy-other-mutator:{operation}:{uuid4()}"
+    async with _isolated_scheduler_schema(db_backend) as db:
+        await _host_runner(db, {agent_id})._ensure_tables()
+        feature = SchedulerFeature(
+            SimpleNamespace(did=agent_id, agent_id=agent_id, features={})
+        )
+        feature._db = db
+        feature._agent_id = agent_id
+        added = await feature.schedule_add(
+            "@daily",
+            "backup_snapshot",
+            idempotency_key=f"legacy-other-mutator:{operation}:{uuid4()}",
+        )
+        assert added.status.value == "ok"
+        task_id = added.data["task_id"]
+        await db.execute(
+            """
+            UPDATE scheduled_tasks
+            SET enabled = 0, scheduler_protocol_version = NULL,
+                scheduler_rollout_fenced = 1,
+                scheduler_rollout_nonce = 'legacy-current-fence'
+            WHERE id = ?
+            """,
+            (task_id,),
+        )
+        before = await db.fetchone(
+            """
+            SELECT enabled, scheduler_protocol_version,
+                   scheduler_rollout_fenced, scheduler_rollout_nonce
+            FROM scheduled_tasks WHERE id = ?
+            """,
+            (task_id,),
+        )
+
+        if operation == "remove":
+            rejected = await feature.schedule_remove(task_id)
+        elif operation == "resume":
+            rejected = await feature.schedule_resume(task_id)
+        else:
+            rejected = await feature.schedule_update(task_id, "@hourly")
+
+        assert rejected.status.value == "error"
+        assert await db.fetchone(
+            """
+            SELECT enabled, scheduler_protocol_version,
+                   scheduler_rollout_fenced, scheduler_rollout_nonce
+            FROM scheduled_tasks WHERE id = ?
+            """,
+            (task_id,),
+        ) == before
 
 
 @pytest.mark.asyncio

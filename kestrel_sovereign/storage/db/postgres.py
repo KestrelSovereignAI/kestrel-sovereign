@@ -296,7 +296,7 @@ class PostgresBackend(DatabaseBackend):
         return all(
             isinstance(connect_kwargs.get(name), str)
             and bool(connect_kwargs[name])
-            for name in ("host", "database", "user")
+            for name in ("host", "database")
         )
 
     def _current_txn_conn(self):
@@ -441,7 +441,7 @@ class PostgresBackend(DatabaseBackend):
                         **kwargs,
                     )
                 else:
-                    if not self._host or not self._database or not self._user:
+                    if not self._host or not self._database:
                         raise ConnectionError(
                             "Dedicated PostgreSQL advisory locks require connection "
                             "parameters, advisory_dsn, or a valid wrapped-pool recipe"

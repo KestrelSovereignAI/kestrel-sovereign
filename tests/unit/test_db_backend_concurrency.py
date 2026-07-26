@@ -221,6 +221,56 @@ async def test_postgres_from_pool_derives_keyword_only_advisory_pool_recipe():
 
 
 @pytest.mark.asyncio
+async def test_postgres_advisory_pool_allows_asyncpg_default_user_from_parameters():
+    """Host and database are a complete explicit recipe without a user."""
+
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    backend = PostgresBackend(host="postgres.internal", database="kestrel")
+    backend._pool = object()
+    advisory_pool = object()
+    with patch.object(
+        postgres_module.asyncpg,
+        "create_pool",
+        AsyncMock(return_value=advisory_pool),
+    ) as create_pool:
+        assert await backend._ensure_advisory_pool() is advisory_pool
+
+    create_pool.assert_awaited_once_with(
+        host="postgres.internal",
+        port=5432,
+        database="kestrel",
+        user=None,
+        password=None,
+        min_size=0,
+        max_size=4,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("host", "database"),
+    [(None, "kestrel"), ("postgres.internal", None)],
+    ids=["missing-host", "missing-database"],
+)
+async def test_postgres_advisory_pool_rejects_incomplete_explicit_recipe(host, database):
+    """The default asyncpg user does not authorize a missing endpoint or DB."""
+
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+    from kestrel_sovereign.storage.db.interface import ConnectionError
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    backend = PostgresBackend(host=host, database=database)
+    backend._pool = object()
+    with patch.object(postgres_module.asyncpg, "create_pool", AsyncMock()) as create_pool:
+        with pytest.raises(ConnectionError, match="require connection parameters"):
+            await backend._ensure_advisory_pool()
+
+    create_pool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_postgres_from_pool_rejects_incomplete_advisory_pool_recipe():
     """asyncpg's default connector needs explicit connection settings."""
 

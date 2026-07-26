@@ -73,6 +73,7 @@ from kestrel_sovereign.features.scheduler.cron import (
 )
 from kestrel_sovereign.features.scheduler.runner import (
     SCHEDULER_PROTOCOL_VERSION,
+    SCHEDULER_ROLLOUT_STATE_QUIESCING,
     SchedulerProtocolVersionIncompatible,
     SchedulerRunner,
     adopt_scheduler_registration_ownership,
@@ -2093,7 +2094,17 @@ class SchedulerFeature(Feature):
                 # row is an intentional pause or a rollout fence.
                 if not await self._lock_scheduler_rollout_for_pause():
                     return self._rollout_mutation_error()
-                if not await self._lock_mutable_scheduler_row(task_id):
+                # A legacy row may be paused only after this transaction has
+                # locked the current quiescing control epoch and verified that
+                # the row belongs to its exact rollout fence. It stays
+                # otherwise immutable: remove/resume/update use the ordinary
+                # v2-only target lock.
+                if not await self._lock_mutable_scheduler_row(
+                    task_id,
+                    pause_legacy_rollout_nonce=(
+                        await self._locked_quiescing_scheduler_rollout_nonce()
+                    ),
+                ):
                     return ToolResult.failed(
                         f"Task {task_id} not found",
                         data={"task_id": task_id},
@@ -2488,7 +2499,12 @@ class SchedulerFeature(Feature):
         backend_type = getattr(self._db, "backend_type", "")
         return backend_type.lower() if isinstance(backend_type, str) else ""
 
-    async def _lock_mutable_scheduler_row(self, task_id: str) -> Optional[bool]:
+    async def _lock_mutable_scheduler_row(
+        self,
+        task_id: str,
+        *,
+        pause_legacy_rollout_nonce: Optional[str] = None,
+    ) -> Optional[bool]:
         """Lock, version-check, and adopt a schedule before mutating it.
 
         Global and control-row compatibility alone is insufficient: a newer
@@ -2496,7 +2512,9 @@ class SchedulerFeature(Feature):
         feature starts.  Every API that changes that schedule must inspect its
         version under the same transaction before overwriting fences or claim
         state.  The locked row is also the authoritative place to adopt a
-        foreign dynamic-registration marker.
+        foreign dynamic-registration marker.  ``schedule_pause`` alone may
+        supply a locked quiescing activation nonce to turn a legacy row that
+        is fenced by that exact epoch into an intentional durable pause.
         """
 
         backend_type = self._database_backend_type()
@@ -2505,7 +2523,8 @@ class SchedulerFeature(Feature):
             # scheduler backends always take the durable path below.
             return True
         sql = """
-            SELECT scheduler_protocol_version, scheduler_registration_nonce
+            SELECT scheduler_protocol_version, scheduler_registration_nonce,
+                   scheduler_rollout_fenced, scheduler_rollout_nonce
             FROM scheduled_tasks
             WHERE id = ? AND agent_id = ?
         """
@@ -2515,16 +2534,32 @@ class SchedulerFeature(Feature):
         if row is None:
             return None
         version = row[0] if row else None
-        try:
-            protocol_version = int(version)
-        except (TypeError, ValueError):
-            return False
-        if protocol_version > SCHEDULER_PROTOCOL_VERSION:
+        if version is None:
+            protocol_version = None
+        else:
+            try:
+                protocol_version = int(version)
+            except (TypeError, ValueError):
+                return False
+        if (
+            protocol_version is not None
+            and protocol_version > SCHEDULER_PROTOCOL_VERSION
+        ):
             raise SchedulerProtocolVersionIncompatible()
         if protocol_version != SCHEDULER_PROTOCOL_VERSION:
             # A NULL/older marker is evidence of a legacy writer. Do not
             # stamp it as v2 (or let removal erase it) before reconciliation
-            # can fence that writer and require an explicit rollout ACK.
+            # can fence that writer and require an explicit rollout ACK. The
+            # sole exception is pause: after the control row and this target
+            # have both been locked in this transaction, a current rollout
+            # fence may be converted into an intentional durable pause. A
+            # stale or absent nonce remains immutable.
+            if (
+                pause_legacy_rollout_nonce is not None
+                and bool(row[2])
+                and row[3] == pause_legacy_rollout_nonce
+            ):
+                return True
             return False
         return await adopt_scheduler_registration_ownership(
             self._db,
@@ -2533,6 +2568,46 @@ class SchedulerFeature(Feature):
             observed_registration_nonce=row[1] if len(row) > 1 else None,
             pending_registration_nonce=self._pending_scheduler_registration_nonce(),
         )
+
+    async def _locked_quiescing_scheduler_rollout_nonce(self) -> Optional[str]:
+        """Return the locked quiescing epoch that can authorize legacy pause.
+
+        :meth:`_lock_scheduler_rollout_for_pause` has already taken the
+        control-row lock in the enclosing schedule transaction. Re-reading it
+        with ``FOR UPDATE`` on PostgreSQL makes the dependency explicit at the
+        point where the target-row lock is evaluated; SQLite's write
+        transaction provides the corresponding serialization. Only a nonempty
+        activation nonce from the current v2 quiescing control row can relax
+        the legacy-row rejection for ``schedule_pause``.
+        """
+
+        backend_type = self._database_backend_type()
+        if backend_type not in {"postgres", "sqlite"}:
+            return None
+
+        sql = """
+            SELECT protocol_version, state, activation_nonce
+            FROM scheduler_protocol_rollout
+            WHERE agent_id = ?
+        """
+        if backend_type == "postgres":
+            sql += " FOR UPDATE"
+        row = await self._db.fetchone(sql, (self._agent_id,))
+        if row is None or len(row) < 3:
+            return None
+        try:
+            protocol_version = int(row[0])
+        except (TypeError, ValueError):
+            return None
+        nonce = row[2]
+        if (
+            protocol_version == SCHEDULER_PROTOCOL_VERSION
+            and row[1] == SCHEDULER_ROLLOUT_STATE_QUIESCING
+            and isinstance(nonce, str)
+            and nonce
+        ):
+            return nonce
+        return None
 
     async def _lock_compatible_scheduler_protocol(
         self,
