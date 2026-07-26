@@ -573,9 +573,11 @@ class ProxyFeature(Feature):
         SDK clients fence an unknown/out-of-process transition outcome with
         ``replacement_required``.  In that exceptional case the host replaces
         the child using the pending config, then promotes it only after the
-        replacement completes.  The original lifecycle error still propagates
-        to the caller, so a fenced recovery never masquerades as a successful
-        live apply.
+        replacement completes.  If that promotion cannot be made durable, the
+        host replaces the candidate child with one on the still-active config
+        before surfacing the failure.  A fenced recovery therefore never
+        masquerades as a successful live apply or leaves its live child ahead
+        of durable state.
         """
         cfg = dict(config) if isinstance(config, dict) else {}
         async with self._reload_lock:
@@ -643,18 +645,62 @@ class ProxyFeature(Feature):
                         # A cancelled or transport-failed lifecycle request may
                         # already have reached the child.  Start a replacement
                         # from the pending config first; only then promote the
-                        # config and make it visible to host readers.
-                        await self._replace_client(
+                        # config and make it visible to host readers.  If any
+                        # part of that recovery fails, its helper restores the
+                        # still-durable previous config (or quarantines the
+                        # runtime when it cannot prove that restoration).
+                        await self._recover_fenced_transition(
+                            previous_config,
                             cfg,
-                            register_channel_bridge=False,
                         )
-                        await self._promote_config(cfg)
-                        self._host_config = cfg
-                        self._host_config_loaded = True
-                        self._register_channel_bridge()
                 raise
             finally:
                 self._end_reload()
+
+    async def _recover_fenced_transition(
+        self,
+        previous_config: Dict[str, Any],
+        next_config: Dict[str, Any],
+    ) -> None:
+        """Recover an SDK-fenced transition without exposing split-brain state.
+
+        The typed SDK sets ``replacement_required`` when a transition request
+        may have reached the child but its result is unknown.  Its subprocess
+        wrapper intentionally retains ``next_config`` for the replacement, so
+        launch that candidate before promotion.  The graph node still names
+        ``previous_config`` as active until promotion succeeds.  Consequently,
+        a promotion failure must retire the candidate and restore a child from
+        ``previous_config`` before it reaches the caller.
+
+        This uses only config dictionaries and the public client lifecycle;
+        feature-specific config is never inspected or logged.
+        """
+
+        try:
+            await self._replace_client(
+                next_config,
+                register_channel_bridge=False,
+            )
+        except BaseException:
+            # The old fenced child may already have applied the request.  Even
+            # when the candidate cannot start, durable state still names the
+            # previous config, so restore from that source of truth.
+            await self._restore_previous_config_after_failed_promotion(
+                previous_config
+            )
+            raise
+
+        try:
+            await self._promote_config(next_config)
+        except BaseException:
+            await self._restore_previous_config_after_failed_promotion(
+                previous_config
+            )
+            raise
+
+        self._host_config = dict(next_config)
+        self._host_config_loaded = True
+        self._register_channel_bridge()
 
     async def _restore_previous_config_after_failed_promotion(
         self, previous_config: Dict[str, Any]
@@ -667,9 +713,48 @@ class ProxyFeature(Feature):
         active config before returning the promotion failure to the caller.
         """
 
-        await self._replace_client(previous_config)
+        try:
+            await self._replace_client(previous_config)
+        except BaseException:
+            # A generic/future client may itself fail while restoring the
+            # authoritative config.  Do not retain a reachable child that was
+            # launched with the rejected candidate; quarantine it and stop
+            # supervision until the normal feature lifecycle initializes a
+            # fresh child from durable state.
+            self._host_config = dict(previous_config)
+            self._host_config_loaded = True
+            await self._quarantine_unreconciled_client()
+            raise
         self._host_config = dict(previous_config)
         self._host_config_loaded = True
+
+    async def _quarantine_unreconciled_client(self) -> None:
+        """Fail closed when a recovery child cannot be reconciled to storage.
+
+        The SDK subprocess client stops/terminates its child even when graceful
+        RPC shutdown fails.  Other client implementations may not provide that
+        guarantee, so remove the client and its host-visible tools before
+        attempting best-effort retirement.  No config values enter logs or
+        exception messages.
+        """
+
+        self._unregister_channel_bridge()
+        client = self._client
+        self._client = None
+        self._tools = []
+        # A supervisor restart of an unreconciled client could revive a
+        # candidate config.  ``initialize`` resets this latch when the feature
+        # is explicitly started again from durable state.
+        self._stopping = True
+        if client is not None:
+            try:
+                await _maybe_await(client.stop())
+            except BaseException:  # noqa: BLE001 - quarantine must not retain it
+                logger.error(
+                    "Isolated feature %s could not stop its unreconciled client; "
+                    "the proxy has been quarantined",
+                    self.name,
+                )
 
     async def _stage_pending_config(
         self,

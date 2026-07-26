@@ -59,6 +59,10 @@ class _SDKWireClient:
     def supports_config_transition(self) -> bool:
         return self._rpc.supports_config_transition
 
+    @property
+    def replacement_required(self) -> bool:
+        return self._rpc.replacement_required
+
     async def start(self) -> None:
         await self._rpc.initialize(config=self._config)
         await self._rpc.health()
@@ -219,5 +223,133 @@ async def test_proxy_uses_negotiated_sdk_transition_before_replacement(
         assert clients[0].stopped is True
         assert clients[1].stopped is False
     finally:
+        await feature.shutdown()
+        await asyncio.gather(*service_tasks)
+
+
+@pytest.mark.asyncio
+async def test_real_sdk_fenced_transition_promotion_failure_restores_durable_config(
+    monkeypatch, tmp_path
+):
+    """A real SDK cancellation fence cannot strand a next-config child.
+
+    The transition request is cancelled only after the service received it, so
+    ``IsolatedFeatureClient`` takes its documented unknown-outcome path and
+    fences the client for replacement.  The storage fault then rejects the
+    candidate's *promotion* write, not its initial pending write.  Recovery
+    must retire that candidate, restore the active config, and keep a restart
+    on the same durable value.
+    """
+
+    old_config = {"enabled": True, "token": "old-token-not-for-logs"}
+    next_config = {"enabled": False, "token": "next-token-not-for-logs"}
+    transition_started = asyncio.Event()
+    release_transition = asyncio.Event()
+    observed = []
+    service_tasks = []
+    clients = []
+
+    class PromotionFailingStorage(_Storage):
+        def __init__(self):
+            super().__init__()
+            self.add_calls = 0
+
+        async def add_node(self, node) -> None:
+            self.add_calls += 1
+            # Seed old config; stage candidate; reject candidate promotion.
+            if self.add_calls == 3:
+                raise OSError("storage offline during promotion")
+            await super().add_node(node)
+
+    class FencedRecoveryService(IsolatedFeatureService):
+        def __init__(self) -> None:
+            super().__init__(name="fenced-recovery", version="1.0.0")
+            self.advertise_config_transition()
+
+        async def configure(self, config):
+            observed.append(("initialize", dict(config)))
+
+        async def on_config_transition(self, config):
+            observed.append(("transition", dict(self.host_config), dict(config)))
+            transition_started.set()
+            await release_transition.wait()
+            return ConfigTransitionResult.restart_required()
+
+        async def on_shutdown(self):
+            observed.append(("shutdown", dict(self.host_config)))
+            return await super().on_shutdown()
+
+    def client_factory(**kwargs):
+        host_reader = _QueueReader()
+        service_reader = _QueueReader()
+        service = FencedRecoveryService()
+        service_tasks.append(
+            asyncio.create_task(service.serve(service_reader, _QueueWriter(host_reader)))
+        )
+        rpc = IsolatedFeatureClient(host_reader, _QueueWriter(service_reader))
+        client = _SDKWireClient(rpc, dict(kwargs.get("config") or {}))
+        clients.append(client)
+        return client
+
+    runtime = InstalledFeatureRuntime(
+        class_name="FencedRecoveryFeature",
+        entry_point="test_pkg.feature:FencedRecoveryFeature",
+        distribution="test-pkg",
+        runtime="isolated-venv",
+        service="test-service",
+    )
+    agent = Mock(storage_path=str(tmp_path / "agent" / "kestrel_prime.db"), features={})
+    agent.storage = PromotionFailingStorage()
+    monkeypatch.setenv("KESTREL_FEATURE_FENCEDRECOVERYFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, runtime, client_factory=client_factory)
+    fresh = None
+
+    try:
+        await feature.persist_config(old_config)
+        await feature.initialize()
+        update = asyncio.create_task(feature.set_config(next_config))
+        await asyncio.wait_for(transition_started.wait(), timeout=1)
+
+        # The request has reached the service.  Cancelling the host waiter
+        # triggers the SDK's unknown-outcome fence before the service is allowed
+        # to return its late response and process the replacement shutdown.
+        update.cancel()
+        await asyncio.sleep(0)
+        assert clients[0].replacement_required is True
+        release_transition.set()
+
+        with pytest.raises(RuntimeError, match="failed to persist config"):
+            await update
+
+        assert observed == [
+            ("initialize", old_config),
+            ("transition", old_config, next_config),
+            ("shutdown", old_config),
+            ("initialize", next_config),
+            ("shutdown", next_config),
+            ("initialize", old_config),
+        ]
+        assert clients[0].stopped is True
+        assert clients[1].stopped is True
+        assert clients[2].stopped is False
+        assert feature._host_config == old_config
+        assert feature._client is clients[2]
+        assert agent.storage.nodes["feature_config:FencedRecoveryFeature"].properties == {
+            "config": old_config,
+            "pending_config": next_config,
+        }
+        assert feature._supervision_task is not None
+        assert feature._supervision_task.done() is False
+
+        # A fresh host proxy performs the restart handshake with durable active
+        # config, never the rejected pending candidate.
+        fresh = ProxyFeature(agent, runtime, client_factory=client_factory)
+        await fresh.initialize()
+        assert fresh._host_config == old_config
+        assert observed[-1] == ("initialize", old_config)
+    finally:
+        release_transition.set()
+        if fresh is not None:
+            await fresh.shutdown()
         await feature.shutdown()
         await asyncio.gather(*service_tasks)

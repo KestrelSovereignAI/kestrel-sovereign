@@ -1410,6 +1410,187 @@ async def test_fenced_transition_failure_replaces_with_next_config(monkeypatch, 
 
 
 @pytest.mark.asyncio
+async def test_fenced_transition_promotion_failure_restores_active_config_for_restart(
+    monkeypatch, tmp_path
+):
+    """A fenced candidate is retired when its durable promotion fails.
+
+    A cancelled/transport-broken SDK transition can have applied ``next_config``
+    in the old child, so the proxy first replaces it with a candidate child on
+    that config.  Fault the *following* promotion write: the live replacement,
+    host state, and a fresh proxy must all return to the still-durable old
+    config.  The existing supervisor must remain live on that restored child.
+    """
+
+    old_config = {"enabled": True, "token": "old-token"}
+    next_config = {"enabled": False, "token": "next-token"}
+
+    class PromotionFailingStorage(_FakeStorage):
+        def __init__(self):
+            super().__init__()
+            self.add_calls = 0
+
+        async def add_node(self, node):
+            self.add_calls += 1
+            # Seed old config; stage candidate; then reject its promotion.
+            if self.add_calls == 3:
+                raise OSError("storage offline during promotion")
+            await super().add_node(node)
+
+    class FencedTransitionClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.replacement_required = False
+
+        async def prepare_config_transition(self, config):
+            assert config == next_config
+            self.replacement_required = True
+            raise ConfigTransitionError("config transition failed")
+
+    agent = Mock()
+    agent.features = {}
+    agent.storage = PromotionFailingStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    clients = []
+
+    def client_factory(**kwargs):
+        client = (
+            FencedTransitionClient(**kwargs)
+            if not clients
+            else FakeIsolatedClient(**kwargs)
+        )
+        clients.append(client)
+        return client
+
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=client_factory)
+    fresh = None
+    try:
+        await feature.persist_config(old_config)
+        await feature.initialize()
+
+        with pytest.raises(RuntimeError, match="failed to persist config"):
+            await feature.set_config(next_config)
+
+        # The fenced old process and the candidate next-config process are both
+        # retired.  The restored child and host-facing config agree with the
+        # durable active value; the rejected candidate remains pending only.
+        assert clients[0].stopped is True
+        assert clients[1].kwargs["config"] == next_config
+        assert clients[1].stopped is True
+        assert clients[2].kwargs["config"] == old_config
+        assert feature._client is clients[2]
+        assert feature._host_config == old_config
+        assert await feature.get_config() == old_config
+        assert agent.storage.nodes["feature_config:TestFeature"].properties == {
+            "config": old_config,
+            "pending_config": next_config,
+        }
+
+        # The recovery stays inside the serialized reload section without
+        # disabling supervision. A later fresh proxy (host restart) also sees
+        # and launches only the durable old config.
+        assert feature._supervision_task is not None
+        assert feature._supervision_task.done() is False
+        restart_clients = []
+
+        def restart_factory(**kwargs):
+            client = FakeIsolatedClient(**kwargs)
+            restart_clients.append(client)
+            return client
+
+        fresh = ProxyFeature(agent, _cfg_runtime(), client_factory=restart_factory)
+        await fresh.initialize()
+        assert fresh._host_config == old_config
+        assert restart_clients[0].kwargs["config"] == old_config
+    finally:
+        if fresh is not None:
+            await fresh.shutdown()
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_fenced_promotion_recovery_quarantines_when_old_child_cannot_restart(
+    monkeypatch, tmp_path
+):
+    """A failed restoration exposes no candidate-config client to the host."""
+
+    old_config = {"enabled": True, "token": "old-token"}
+    next_config = {"enabled": False, "token": "next-token"}
+
+    class PromotionFailingStorage(_FakeStorage):
+        def __init__(self):
+            super().__init__()
+            self.add_calls = 0
+
+        async def add_node(self, node):
+            self.add_calls += 1
+            if self.add_calls == 3:
+                raise OSError("storage offline during promotion")
+            await super().add_node(node)
+
+    class FencedTransitionClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.replacement_required = False
+
+        async def prepare_config_transition(self, config):
+            self.replacement_required = True
+            raise ConfigTransitionError("config transition failed")
+
+    class FailingRestoreClient(FakeIsolatedClient):
+        async def start(self):
+            raise RuntimeError("old-config child could not start")
+
+    agent = Mock()
+    agent.features = {}
+    agent.storage = PromotionFailingStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    clients = []
+
+    def client_factory(**kwargs):
+        if not clients:
+            client = FencedTransitionClient(**kwargs)
+        elif len(clients) == 1:
+            client = FakeIsolatedClient(**kwargs)
+        else:
+            client = FailingRestoreClient(**kwargs)
+        clients.append(client)
+        return client
+
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=client_factory)
+    try:
+        await feature.persist_config(old_config)
+        await feature.initialize()
+
+        with pytest.raises(RuntimeError, match="old-config child could not start"):
+            await feature.set_config(next_config)
+
+        # The next-config candidate was stopped before the old-config startup
+        # failed. Its failed replacement is also stopped and detached; the
+        # supervisor latch prevents it from reviving a candidate on its own.
+        assert clients[1].kwargs["config"] == next_config
+        assert clients[1].stopped is True
+        assert clients[2].kwargs["config"] == old_config
+        assert clients[2].stopped is True
+        assert feature._client is None
+        assert feature.get_tools() == []
+        assert feature._host_config == old_config
+        assert feature._stopping is True
+        assert agent.storage.nodes["feature_config:TestFeature"].properties == {
+            "config": old_config,
+            "pending_config": next_config,
+        }
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_live_applied_transition_retains_the_initialized_service(monkeypatch, tmp_path):
     """An SDK ``applied`` result keeps the existing process alive."""
 
