@@ -1,0 +1,7 @@
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+
+skos:Concept a skos:Concept .
+skos:prefLabel a skos:Concept .
+skos:altLabel a skos:Concept .
+skos:exactMatch a skos:Concept .
+skos:closeMatch a skos:Concept .

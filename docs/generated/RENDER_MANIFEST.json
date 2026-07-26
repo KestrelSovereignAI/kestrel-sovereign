@@ -1425,6 +1425,20 @@
     },
     {
       "existing_code_refs": [
+        "kestrel_sovereign/data/semantic/registry.toml"
+      ],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/storage/SEMANTIC_KNOWLEDGE_REGISTRY.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "active",
+      "title": "Semantic Knowledge Registry",
+      "type": "Architecture Reference"
+    },
+    {
+      "existing_code_refs": [
         "tests/integration/test_sovereignty_e2e.py",
         "tests/integration/test_sovereignty_guarantees.py",
         "tests/integration/test_sovereignty_import.py",

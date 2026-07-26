@@ -1,0 +1,6 @@
+{
+  "profile": "iri-normalization-v1-rfc3986-200501",
+  "normative_source": "RFC 3986 (January 2005)",
+  "network_access": false,
+  "output": "absolute-ascii-uri"
+}

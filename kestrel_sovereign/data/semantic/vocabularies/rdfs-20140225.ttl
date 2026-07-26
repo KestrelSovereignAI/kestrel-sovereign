@@ -1,0 +1,6 @@
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+
+rdfs:subClassOf a rdfs:Property .
+rdfs:subPropertyOf a rdfs:Property .
+rdfs:domain a rdfs:Property .
+rdfs:range a rdfs:Property .

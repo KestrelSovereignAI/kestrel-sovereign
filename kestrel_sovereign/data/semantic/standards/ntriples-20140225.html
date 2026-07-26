@@ -1,0 +1,831 @@
+<html lang="en" dir="ltr" typeof="bibo:Document w3p:REC" about="" property="dcterms:language" content="en" prefix="bibo: http://purl.org/ontology/bibo/ w3p: http://www.w3.org/2001/02pd/rec54#" xmlns="http://www.w3.org/1999/xhtml"><head>
+    <title>RDF 1.1 N-Triples</title>
+    <meta content="text/html;charset=utf-8" http-equiv="Content-Type">
+    
+    
+    
+      <style type="text/css">
+    /* Style Turtle script blocks to be visible */
+    pre.example script {
+        display:block;
+        overflow-x: auto;
+    }
+    .separated thead tr th { border:1px solid black; padding: .2em; }
+    .separated tbody tr td { border:1px solid black; text-align: center; }
+    .separated tbody tr td.r { text-align: right; padding: .5em; }
+    .grammar td { font-family: monospace;}
+    .grammar-literal { color: gray;}
+    </style>
+  <style>/*****************************************************************
+ * ReSpec 3 CSS
+ * Robin Berjon - http://berjon.com/
+ *****************************************************************/
+
+/* --- INLINES --- */
+em.rfc2119 { 
+    text-transform:     lowercase;
+    font-variant:       small-caps;
+    font-style:         normal;
+    color:              #900;
+}
+
+h1 acronym, h2 acronym, h3 acronym, h4 acronym, h5 acronym, h6 acronym, a acronym,
+h1 abbr, h2 abbr, h3 abbr, h4 abbr, h5 abbr, h6 abbr, a abbr {
+    border: none;
+}
+
+dfn {
+    font-weight:    bold;
+}
+
+a.internalDFN {
+    color:  inherit;
+    border-bottom:  1px solid #99c;
+    text-decoration:    none;
+}
+
+a.externalDFN {
+    color:  inherit;
+    border-bottom:  1px dotted #ccc;
+    text-decoration:    none;
+}
+
+a.bibref {
+    text-decoration:    none;
+}
+
+cite .bibref {
+    font-style: normal;
+}
+
+code {
+    color:  #ff4500;
+}
+
+/* --- TOC --- */
+.toc a, .tof a {
+    text-decoration:    none;
+}
+
+a .secno, a .figno {
+    color:  #000;
+}
+
+ul.tof, ol.tof {
+    list-style: none outside none;
+}
+
+.caption {
+    margin-top: 0.5em;
+    font-style:   italic;
+}
+
+/* --- TABLE --- */
+table.simple {
+    border-spacing: 0;
+    border-collapse:    collapse;
+    border-bottom:  3px solid #005a9c;
+}
+
+.simple th {
+    background: #005a9c;
+    color:  #fff;
+    padding:    3px 5px;
+    text-align: left;
+}
+
+.simple th[scope="row"] {
+    background: inherit;
+    color:  inherit;
+    border-top: 1px solid #ddd;
+}
+
+.simple td {
+    padding:    3px 10px;
+    border-top: 1px solid #ddd;
+}
+
+.simple tr:nth-child(even) {
+    background: #f0f6ff;
+}
+
+/* --- DL --- */
+.section dd > p:first-child {
+    margin-top: 0;
+}
+
+.section dd > p:last-child {
+    margin-bottom: 0;
+}
+
+.section dd {
+    margin-bottom:  1em;
+}
+
+.section dl.attrs dd, .section dl.eldef dd {
+    margin-bottom:  0;
+}
+
+@media print {
+    .removeOnSave {
+        display: none;
+    }
+}
+</style><style>/* --- EXAMPLES --- */
+div.example-title {
+    min-width: 7.5em;
+    color: #b9ab2d;
+}
+div.example-title span {
+    text-transform: uppercase;   
+}
+aside.example, div.example, div.illegal-example {
+    padding: 0.5em;
+    margin: 1em 0;
+    position: relative;
+    clear: both;
+}
+div.illegal-example { color: red }
+div.illegal-example p { color: black }
+aside.example, div.example {
+    padding: .5em;
+    border-left-width: .5em;
+    border-left-style: solid;
+    border-color: #e0cb52;
+    background: #fcfaee;    
+}
+
+aside.example div.example {
+    border-left-width: .1em;
+    border-color: #999;
+    background: #fff;
+}
+aside.example div.example div.example-title {
+    color: #999;
+}
+</style><link rel="stylesheet" href="https://www.w3.org/StyleSheets/TR/W3C-REC">
+<!--[if lt IE 9]><script src='https://www.w3.org/2008/site/js/html5shiv.js'></script><![endif]-->
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20data-codex-favicon-badge%3D%22codex-favicon-badge%22%20width%3D%2232%22%20height%3D%2232%22%20viewBox%3D%220%200%2032%2032%22%3E%3Cimage%20href%3D%22data%3Aimage%2Fbmp%3Bbase64%2CiVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAGyElEQVR4nMRXCUxUVxQ9MwwM%2ByKKDIuIG6KgVCyiouJSqbHV1qYmrQvYxrQ0TW1TNbVNrTVtbIxpXJLGRLs30S42Ja0tdQFUXBBEUBQGcFhlB5VdGKDn%2FpkhAwahrbQ3Ofkz8%2B%2B8e9695933ngZDsJ6eHg0fk4hFRDQRSngTTmaXFqKKuE6cIU4T%2BSqVyjjY2KpBAtvwMZOII54k%2FAgNHm4StJxIJL4irjyMiOohwX342GQO7oV%2FZrVmEntJogJDJcDgEXzsIaIwSJaGYD1EKrGZJC4PSoDBF%2FJxEKaaP0rLJ%2BJJImlAAuaZf0MEYXhMT6y3zoTKKrjU%2FAgxH8Nr54gXSOK2fFGbg4vaNw1H8K7uHjS1d6Ktw6iIgTaPeIMxldgqM4FIPhIIrx561Te3o%2FJuK9QqFXw9nODuZPfAwB3GbtQ1taO9swsjnLRwc7SDqp%2Birpc14LOTucgqaYCjVoNl0%2F3wUvQk8a%2Fh65XMwiWNefaxEryxrQOHk%2FPxXWohSuubFQLjR7sibv5ErI2aACcOIjM6k1uJQ8l6ZBbVo63TCG93Rzw7MwAvRwfBy9VeCX6fxN7%2F4QoS0opgZ28Lo7ELKTkVKKlrxqdrZnnZatSxjJ1us2PHjmD6b2%2FtMHps%2Bz4DnyRkoaKuBfc5Q%2F6G8pomnOAf2zjggsneSDfUYvX%2BZKTpq1DPDDS2dtK%2FCUk3K5Ff1Yj59HFxsIVarQK5YlrgSLz3TBhcHbW4VFiLMk5sRXgARrrYezLuCelq0l79f8koweGkPHTxTzEzxmDt3PFKmr8%2BV4CznPH%2BxBtKmucFjYbW1gaTx4zA6shx8OHsE6%2BV43hmKRLSi%2BHprMW%2B9ZFw5qzXcAyL3W5oISkoWTWXyl9iC4Fopktz9IIB7RTLrCBvHN4YBb8Rpja%2FOMQHGw%2Bl4mR2GXYxO47Pz8TxLUuVAAGjnBURvThnPLYeuYyDp3LxLQlPYNm2Pj0NNszCT5eLcChJj7yKu7DT2OCVJcFKWWFq6dGixJDGtk4YahoVTcZM8%2BsNLhYw0hkH4mYjksRa6bfz50xkFNX1BheTlH%2Fw3AzEUGSdLNXuX6%2FhR9ZerIBluVBQw9S3wMHOBpN0rtCoe9UaIhr4uLOrW3v0ogEVrM84nRuWh%2FkrNbQY64Vw1vIia1hKTZzPr8YYEgvx9%2Bj1kYyEBXjiHN%2BJTwYFGj5uJMU5VhGoB0tz6noFV8YdLH%2FMHx5cOTQ7IfCRva2NWl95Dxfza2CobVIGn84aW5uOtZ7G31IZoKy2mWRqOBs3BBEW83JzwARvV0WQ5RTm1dIGRDFzQkxmLVlpaL6PmFC%2F3jIIge38oA70cuXgNShhyjKK6xE21hOBo1z6kBjj6YzJvu44m1fFAM2KqkMD%2BvrJwKNJJCW3CsXVjThNMjnld3CEGjPwu7ebI15bGszl6iDuPULgbX7Qinon%2B7gjhYOXVjchu7yBS0qHUeZ13RuARAO9XBQ%2FIZFuqEPE%2BFHwtdLNVD8PeLpokXarTlnGmQW1iq%2B91hZvLgvBqsfHKquB1iQE4qTM8m0sheXPWSZz2RmYiUL%2BeeEUHVwd%2BnZCISolScmrZDmakMWON5eptpCVwSXt0hN0JObLkkZMHI3NT4Viw4JJymowW7EQiOaHKZZfgjm4COYMZ3iTqSuleqWOonRrC%2FUfATcnk5%2BkOpcakoBmcSkkdB6ObGhdGMeMvbUsVCFFuVkPkyIE5LSzFOaNSTIznY7Su1P11cguqcfN23cVAUptpRX%2FnlXOlq3HCjYsCSLCLKxshJ5E5nCmQkL2iM9T9Ij%2F4jx%2BY5NaEuLL7DpZB5dj2kFpBnJAKCMCLW9Esa8%2FMQVGtsWdxzKReLWUbfaeErC1owvH2FzqG1rhyqX3zsrpkD1kD9d%2B4tUyrLpzCguCdShiaZLYwltaOxA%2B0Qs%2BJNrPJGayEJBDwp%2FEq9ZvuVlQMFPZdtX4kCQM7GR7mQlzfhHMVbI41FdJ6bsrw9iUVNibmINs7hXZt2oVNxXfRbB1H4idrTS0fiaHVv0D23F%2FLyNTnnSjgi22EIVMsXQzUX0sd0jRi8Wk1n%2BwNNLQZPbu3DcWTfVR2nS%2F1ItVw7Qdp1kISP13EVsxgAkROVRIeextNQ%2Fs%2FRZjV6VfF5Wupp%2FNQMPtJraRQPf%2FcSQ7C9ORTDmm964J8w9bYNLEcJmMvcX6jtBnUZpPq%2FEYHhIyZnz%2Fu4G6vxcdkvlYB1OqevDvTcaQk%2FA689h94w34r0d3NfuS2Pe3rmZWJETG4cQGIgamY9R%2FczntR0SCToTp%2FChXtxBCh77X80oih0iB6XpeMJTr%2BV8AAAD%2F%2FxFj6VwAAAAGSURBVAMAAEO%2F%2BBSFkK4AAAAASUVORK5CYII%3D%22%20width%3D%2232%22%20height%3D%2232%22%20opacity%3D%220.3%22%20%2F%3E%3Cpath%20d%3D%22M3.04536%204.45259C2.7582%203.60299%203.60299%202.7582%204.45259%203.04536L14.1828%206.33403C15.1637%206.66558%2015.0872%208.08006%2014.0715%208.39045L10.2994%209.54319C9.93919%209.65327%209.65327%209.93919%209.54319%2010.2994L8.39046%2014.0715C8.08007%2015.0872%206.66558%2015.1637%206.33404%2014.1828L3.04536%204.45259Z%22%20fill%3D%22black%22%20stroke%3D%22white%22%20stroke-width%3D%221.5%22%20stroke-linejoin%3D%22round%22%20paint-order%3D%22stroke%20fill%22%20transform%3D%22translate(-2%20-2)%20scale(2.1)%22%20%2F%3E%3C%2Fsvg%3E" data-codex-favicon-badge="true" data-codex-favicon-badge-created="true"></head>
+  <body class="h-entry" role="document" id="respecDocument"><div class="head" role="contentinfo" id="respecHeader">
+  <p>
+    
+      <a href="https://www.w3.org/"><img width="72" height="48" alt="W3C" src="https://www.w3.org/Icons/w3c_home"></a>
+    
+  </p>
+  <h1 property="dcterms:title" id="title" class="title p-name">RDF 1.1 N-Triples</h1>
+  
+    <h2 id="subtitle" property="bibo:subtitle">A line-based syntax for an RDF graph</h2>
+  
+  <h2 content="2014-02-24T23:00:00.000Z" datatype="xsd:dateTime" property="dcterms:issued" id="w3c-recommendation-25-february-2014"><abbr title="World Wide Web Consortium">W3C</abbr> Recommendation <time datetime="2014-02-25" class="dt-published">25 February 2014</time></h2>
+  <dl>
+    
+      <dt>This version:</dt>
+      <dd><a href="https://www.w3.org/TR/2014/REC-n-triples-20140225/" class="u-url">http://www.w3.org/TR/2014/REC-n-triples-20140225/</a></dd>
+      <dt>Latest published version:</dt>
+      <dd><a href="https://www.w3.org/TR/n-triples/">http://www.w3.org/TR/n-triples/</a></dd>
+    
+    
+    
+      <dt>Test suite:</dt>
+      <dd><a href="https://www.w3.org/TR/2014/NOTE-rdf11-testcases-20140225/">http://www.w3.org/TR/2014/NOTE-rdf11-testcases-20140225/</a></dd>
+    
+    
+      <dt>Implementation report:</dt>
+      <dd><a href="https://www.w3.org/2013/N-TriplesReports/index.html">http://www.w3.org/2013/N-TriplesReports/index.html</a></dd>
+    
+    
+    
+    
+      <dt>Previous version:</dt>
+      <dd><a href="https://www.w3.org/TR/2014/PR-n-triples-20140109/" rel="dcterms:replaces">http://www.w3.org/TR/2014/PR-n-triples-20140109/</a></dd>
+    
+    
+    <dt>Editors:</dt>
+    <dd inlist="" rel="bibo:editor" class="p-author h-card vcard"><span typeof="foaf:Person"><span class="p-name fn" property="foaf:name">Gavin Carothers</span>, <a href="https://lexmachina.com/" class="p-org org h-org h-card" rel="foaf:workplaceHomepage">Lex Machina, Inc</a></span>
+</dd>
+<dd inlist="" rel="bibo:editor" class="p-author h-card vcard"><span typeof="foaf:Person"><span class="p-name fn" property="foaf:name">Andy Seaborne</span>, <a href="http://www.apache.org/" class="p-org org h-org h-card" rel="foaf:workplaceHomepage">The Apache Software Foundation</a></span>
+</dd>
+
+    
+      <dt>Author:</dt>
+      <dd rel="dcterms:contributor" class="p-author h-card vcard"><span typeof="foaf:Person"><a href="http://www.dajobe.org/" content="David Beckett" property="foaf:name" rel="foaf:homepage" class="u-url url p-name fn">David Beckett</a></span>
+</dd>
+
+    
+    
+  </dl>
+  
+    <p>
+      Please check the <a href="https://www.w3.org/2014/rdf1.1-errata"><strong>errata</strong></a> for any errors or issues
+      reported since publication.
+    </p>
+  
+  
+  
+    <p>
+      The English version of this specification is the only normative version. Non-normative
+      <a href="https://www.w3.org/Consortium/Translation/">translations</a> may also be available.
+    </p>
+  
+  
+    
+      <p class="copyright">
+        <a href="https://www.w3.org/Consortium/Legal/ipr-notice#Copyright">Copyright</a> ©
+        2001-2014
+        
+        <a href="https://www.w3.org/"><abbr title="World Wide Web Consortium">W3C</abbr></a><sup>®</sup>
+        (<a href="http://www.csail.mit.edu/"><abbr title="Massachusetts Institute of Technology">MIT</abbr></a>,
+        <a href="http://www.ercim.eu/"><abbr title="European Research Consortium for Informatics and Mathematics">ERCIM</abbr></a>,
+        <a href="http://www.keio.ac.jp/">Keio</a>, <a href="http://ev.buaa.edu.cn/">Beihang</a>), 
+        
+        All Rights Reserved.
+        
+        <abbr title="World Wide Web Consortium">W3C</abbr> <a href="https://www.w3.org/Consortium/Legal/ipr-notice#Legal_Disclaimer">liability</a>,
+        <a href="https://www.w3.org/Consortium/Legal/ipr-notice#W3C_Trademarks">trademark</a> and
+        
+          <a href="https://www.w3.org/Consortium/Legal/copyright-documents">document use</a>
+        
+        rules apply.
+      </p>
+    
+  
+  <hr>
+</div>
+    <section id="abstract" class="introductory" property="dcterms:abstract" datatype="" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter"><h2 aria-level="1" role="heading" id="h2_abstract">Abstract</h2><p>
+    N-Triples is a line-based, plain text format for encoding an RDF graph.
+</p></section><section class="introductory" id="sotd" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter"><h2 aria-level="1" role="heading" id="h2_sotd">Status of This Document</h2>
+  
+    
+      
+        <p>
+          <em>This section describes the status of this document at the time of its publication.
+          Other documents may supersede this document. A list of current <abbr title="World Wide Web Consortium">W3C</abbr> publications and the
+          latest revision of this technical report can be found in the <a href="https://www.w3.org/TR/"><abbr title="World Wide Web Consortium">W3C</abbr> technical reports index</a> at
+          http://www.w3.org/TR/.</em>
+        </p>
+        
+This document is part of the RDF 1.1 document suite.
+N-Triples was originally defined as a syntax for
+the RDF Test Cases [<cite><a class="bibref" href="#bib-RDF-TESTCASES">RDF-TESTCASES</a></cite>] document. Due to its popularity
+as an exchange format the <a href="https://www.w3.org/2011/rdf-wg/">RDF
+Working Group</a> decided to publish an updated
+version. 
+      
+        <p>
+          This document was published by the <a href="https://www.w3.org/2011/rdf-wg/">RDF Working Group</a> as a Recommendation.
+          
+          
+            If you wish to make comments regarding this document, please send them to 
+            <a href="mailto:public-rdf-comments@w3.org">public-rdf-comments@w3.org</a> 
+            (<a href="mailto:public-rdf-comments-request@w3.org?subject=subscribe">subscribe</a>,
+            <a href="http://lists.w3.org/Archives/Public/public-rdf-comments/">archives</a>).
+          
+          
+          
+          
+            All comments are welcome.
+          
+        </p>
+        
+          <p>
+            Please see the Working Group's  <a href="https://www.w3.org/2013/N-TriplesReports/index.html">implementation
+            report</a>.
+          </p>
+        
+        
+        
+          <p>
+            This document has been reviewed by <abbr title="World Wide Web Consortium">W3C</abbr> Members, by software developers, and by other <abbr title="World Wide Web Consortium">W3C</abbr>
+            groups and interested parties, and is endorsed by the Director as a <abbr title="World Wide Web Consortium">W3C</abbr> Recommendation.
+            It is a stable document and may be used as reference material or cited from another
+            document. <abbr title="World Wide Web Consortium">W3C</abbr>'s role in making the Recommendation is to draw attention to the
+            specification and to promote its widespread deployment. This enhances the functionality
+            and interoperability of the Web.
+          </p>
+        
+        
+        <p>
+          
+            This document was produced by a group operating under the 
+            <a href="https://www.w3.org/Consortium/Patent-Policy-20040205/" rel="w3p:patentRules" about="" id="sotd_patent">5 February 2004 <abbr title="World Wide Web Consortium">W3C</abbr> Patent
+            Policy</a>.
+          
+          
+          
+            
+              <abbr title="World Wide Web Consortium">W3C</abbr> maintains a <a rel="disclosure" href="https://www.w3.org/2004/01/pp-impl/46168/status">public list of any patent
+              disclosures</a> 
+            
+            made in connection with the deliverables of the group; that page also includes
+            instructions for disclosing a patent. An individual who has actual knowledge of a patent
+            which the individual believes contains
+            <a href="https://www.w3.org/Consortium/Patent-Policy-20040205/#def-essential">Essential
+            Claim(s)</a> must disclose the information in accordance with
+            <a href="https://www.w3.org/Consortium/Patent-Policy-20040205/#sec-Disclosure">section
+            6 of the <abbr title="World Wide Web Consortium">W3C</abbr> Patent Policy</a>.
+          
+          
+        </p>
+        
+      
+    
+  
+</section><section id="toc"><h2 class="introductory" aria-level="1" role="heading" id="h2_toc">Table of Contents</h2><ul class="toc" role="directory" id="respecContents"><li class="tocline"><a href="#sec-introduction" class="tocxref"><span class="secno">1. </span>Introduction</a></li><li class="tocline"><a href="#sec-n-triples-language" class="tocxref"><span class="secno">2. </span>N-Triples Language</a><ul class="toc"><li class="tocline"><a href="#simple-triples" class="tocxref"><span class="secno">2.1 </span>Simple Triples</a></li><li class="tocline"><a href="#sec-iri" class="tocxref"><span class="secno">2.2 </span>IRIs</a></li><li class="tocline"><a href="#sec-literals" class="tocxref"><span class="secno">2.3 </span>RDF Literals</a></li><li class="tocline"><a href="#BNodes" class="tocxref"><span class="secno">2.4 </span>RDF Blank Nodes</a></li></ul></li><li class="tocline"><a href="#n-triples-changes" class="tocxref"><span class="secno">3. </span>Changes from RDF Test Cases format</a></li><li class="tocline"><a href="#canonical-ntriples" class="tocxref"><span class="secno">4. </span>A Canonical form of N-Triples</a></li><li class="tocline"><a href="#conformance" class="tocxref"><span class="secno">5. </span>Conformance</a></li><li class="tocline"><a href="#n-triples-mediatype" class="tocxref"><span class="secno">6. </span>Media Type and Content Encoding</a><ul class="toc"><li class="tocline"><a href="#sec-other-media-types" class="tocxref"><span class="secno">6.1 </span>Other Media Types</a></li></ul></li><li class="tocline"><a href="#n-triples-grammar" class="tocxref"><span class="secno">7. </span>Grammar</a></li><li class="tocline"><a href="#sec-parsing" class="tocxref"><span class="secno">8. </span>Parsing</a><ul class="toc"><li class="tocline"><a href="#sec-parsing-terms" class="tocxref"><span class="secno">8.1 </span>RDF Term Constructors</a></li><li class="tocline"><a href="#rdf-triple-construction" class="tocxref"><span class="secno">8.2 </span>RDF Triple Construction</a></li></ul></li><li class="tocline"><a href="#section-ack" class="tocxref"><span class="secno">9. </span>Acknowledgements</a></li><li class="tocline"><a href="#sec-changes" class="tocxref"><span class="secno">A. </span>Change log</a><ul class="toc"><li class="tocline"><a href="#changes-between-proposed-recommendation-and-recommendation" class="tocxref"><span class="secno">A.1 </span>Changes between Proposed Recommendation and Recommendation</a></li><li class="tocline"><a href="#changes-between-candidate-recommendation-and-proposed-recommendation" class="tocxref"><span class="secno">A.2 </span>Changes between Candidate Recommendation and Proposed Recommendation</a></li><li class="tocline"><a href="#changes-between-last-call-working-draft-and-candidate-recommendation" class="tocxref"><span class="secno">A.3 </span>Changes between Last Call Working Draft and Candidate recommendation</a></li><li class="tocline"><a href="#changes-between-last-call-working-draft-and-publication-as-note" class="tocxref"><span class="secno">A.4 </span>Changes between Last Call Working Draft and publication as Note</a></li></ul></li><li class="tocline"><a href="#sec-mediaReg-n-triples" class="tocxref"><span class="secno">B. </span>N-Triples Internet Media Type, File Extension and Macintosh File Type </a></li><li class="tocline"><a href="#references" class="tocxref"><span class="secno">C. </span>References</a><ul class="toc"><li class="tocline"><a href="#normative-references" class="tocxref"><span class="secno">C.1 </span>Normative references</a></li><li class="tocline"><a href="#informative-references" class="tocxref"><span class="secno">C.2 </span>Informative references</a></li></ul></li></ul></section>
+        
+<!-- BEGIN N-TRIPLES SPEC -->
+
+
+      
+
+      <section id="sec-introduction" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+        
+<!--OddPage-->
+<h2 aria-level="1" role="heading" id="h2_sec-introduction"><span class="secno">1. </span>Introduction</h2>
+        <p>
+          This document defines N-Triples, a concrete syntax for 
+          RDF [<cite><a class="bibref" href="#bib-RDF11-CONCEPTS">RDF11-CONCEPTS</a></cite>].
+          N-Triples is an easy to parse line-based subset of
+          Turtle [<cite><a class="bibref" href="#bib-TURTLE">TURTLE</a></cite>].
+        </p>
+
+        <p>The syntax is a revised version of N-Triples as originally defined in the RDF Test Cases [<cite><a class="bibref" href="#bib-RDF-TESTCASES">RDF-TESTCASES</a></cite>] document. Its original intent was for writing test cases, but it has proven to be popular as an exchange format for RDF data.</p>
+      <p>An N-Triples document contains no parsing directives.
+    </p>
+    <p>N-Triples triples are a sequence of RDF terms representing the subject, predicate and object of an RDF Triple. These may be separated by white space (spaces <code>U+0020</code> or tabs <code>U+0009</code>). This sequence is terminated by a '<code>.</code>' and a new line (optional at the end of a document).
+    </p>
+
+      <div class="example"><div class="example-title"><span>Example 1</span></div><pre class="example"><script type="application/n-triples"><http://one.example/subject1> <http://one.example/predicate1> <http://one.example/object1> . # comments here
+# or on a line by themselves
+_:subject1 <http://an.example/predicate1> "object1" .
+_:subject2 <http://an.example/predicate2> "object2" .
+</script></pre></div>
+
+      <p>
+        N-Triples triples are also Turtle <a href="#simple-triples">simple triples</a>, but Turtle includes other representations of RDF terms and <a href="https://www.w3.org/TR/turtle/#predicate-lists">abbreviations of RDF Triples</a>. When parsed by a Turtle parser, data in the N-Triples format will produce exactly the same triples as a parser for the N-triples language.
+      </p>
+      <p>The RDF graph represented by an N-Triples document contains
+        exactly each triple matching the N-Triples 
+        <a href="#grammar-production-triple"><code>triple</code></a>
+        production.
+      </p></section>
+
+      <section id="sec-n-triples-language" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+        
+<!--OddPage-->
+<h2 aria-level="1" role="heading" id="h2_sec-n-triples-language"><span class="secno">2. </span>N-Triples Language</h2>
+        <section id="simple-triples" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+          <h3 aria-level="2" role="heading" id="h3_simple-triples"><span class="secno">2.1 </span>Simple Triples</h3>
+          <p>The simplest triple statement is a sequence of (subject, predicate, object) terms, separated by whitespace and terminated by '<code>.</code>' after each triple.</p>
+          <div class="example"><div class="example-title"><span>Example 2</span></div><pre class="example"><script type="application/n-triples"><http://example.org/#spiderman> <http://www.perceive.net/schemas/relationship/enemyOf> <http://example.org/#green-goblin> .</script></pre></div>
+        </section>
+              <section id="sec-iri" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+        <h3 aria-level="2" role="heading" id="h3_sec-iri"><span class="secno">2.2 </span>IRIs</h3>
+
+        <p>
+            <a href="https://www.w3.org/TR/rdf11-concepts/#dfn-iri">IRIs</a> may be written only as absolute IRIs.
+            IRIs are enclosed in '<code>&lt;</code>' and '<code>&gt;</code>' and may contain numeric escape sequences (described below). For example <code>&lt;http://example.org/#green-goblin&gt;</code>.
+        </p>
+      </section>
+        <section id="sec-literals" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+              <h3 aria-level="2" role="heading" id="h3_sec-literals"><span class="secno">2.3 </span>RDF Literals</h3>
+
+        <p><a href="https://www.w3.org/TR/rdf11-concepts/#dfn-literal">Literals</a>
+        are used to identify values such as strings, numbers,
+        dates.</p>
+
+        <p>
+          Literals (Grammar production <a href="#grammar-production-literal">Literal</a>) have a lexical form followed by a language tag, a datatype IRI, or neither.
+          The representation of the lexical form consists of an
+          initial delimiter <code>"</code> (<span class="codepoint">U+0022</span>), a sequence of permitted
+          characters or numeric escape sequence or string escape sequence, and a final delimiter. Literals may not contain the characters <code>"</code>, <code title="LINE FEED"><sub>LF</sub></code>, <code title="CARRIAGE RETURN"><sub>CR</sub></code> except in their escaped forms. In addition '<code>\</code>' (<span class="codepoint">U+005C</span>) may not appear in any quoted literal except as part of an escape sequence.
+          The corresponding <a href="https://www.w3.org/TR/rdf11-concepts/#dfn-lexical-form">RDF lexical form</a> is the characters between the delimiters, after processing any escape sequences.
+          If present, the <a href="https://www.w3.org/TR/rdf11-concepts/#dfn-language-tagged-string">language tag</a> is preceded by a '<code>@</code>' (<span class="codepoint">U+0040</span>).
+          If there is no language tag, there may be a <a href="https://www.w3.org/TR/rdf11-concepts/#dfn-datatype-iri">datatype IRI</a>, preceded by '<code>^^</code>' (<span class="codepoint">U+005E</span> <span class="codepoint">U+005E</span>). If there is no datatype IRI and no language tag it is a <a href="https://www.w3.org/TR/rdf11-concepts/#dfn-simple-literal">simple literal</a> and the datatype is <code>http://www.w3.org/2001/XMLSchema#string</code>.
+        </p>
+        <div class="example"><div class="example-title"><span>Example 3</span></div><pre class="example"><script type="application/n-triples"><http://example.org/show/218> <http://www.w3.org/2000/01/rdf-schema#label> "That Seventies Show"^^<http://www.w3.org/2001/XMLSchema#string> . # literal with XML Schema string datatype
+<http://example.org/show/218> <http://www.w3.org/2000/01/rdf-schema#label> "That Seventies Show" . # same as above
+<http://example.org/show/218> <http://example.org/show/localName> "That Seventies Show"@en . # literal with a language tag
+<http://example.org/show/218> <http://example.org/show/localName> "Cette Série des Années Septante"@fr-be .  # literal outside of ASCII range with a region subtag
+<http://example.org/#spiderman> <http://example.org/text> "This is a multi-line\nliteral with many quotes (\"\"\"\"\")\nand two apostrophes ('')." .
+<http://en.wikipedia.org/wiki/Helium> <http://example.org/elements/atomicNumber> "2"^^<http://www.w3.org/2001/XMLSchema#integer> . # xsd:integer
+<http://en.wikipedia.org/wiki/Helium> <http://example.org/elements/specificGravity> "1.663E-4"^^<http://www.w3.org/2001/XMLSchema#double> .     # xsd:double
+</script></pre></div>
+        </section>
+      <section id="BNodes" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+        <h3 aria-level="2" role="heading" id="h3_BNodes"><span class="secno">2.4 </span>RDF Blank Nodes</h3>
+        <p>
+          <a href="https://www.w3.org/TR/rdf11-concepts/#dfn-blank-node">RDF blank nodes</a> in N-Triples are expressed as <code>_:</code> followed by a blank node label which is a series of name characters.
+          The characters in the label are built upon <a href="#grammar-production-PN_CHARS_BASE">PN_CHARS_BASE</a>, liberalized as follows:
+        </p>
+        <ul>
+          <li>The characters <code>_</code> and <code>[0-9]</code> may appear anywhere in a blank node label.</li>
+          <li>The character <code>.</code> may appear anywhere except the first or last character.</li>
+          <li>The characters <code>-</code>, <code>U+00B7</code>, <code>U+0300</code> to <code>U+036F</code> and <code>U+203F</code> to <code>U+2040</code> are permitted anywhere except the first character.</li>
+        </ul>
+        <p>
+          A fresh RDF blank node is allocated for each unique blank node label in a document.
+          Repeated use of the same blank node label identifies the same RDF blank node.
+        </p>
+        <div class="example"><div class="example-title"><span>Example 4</span></div><pre class="example"><script type="application/n-triples">_:alice <http://xmlns.com/foaf/0.1/knows> _:bob .
+_:bob <http://xmlns.com/foaf/0.1/knows> _:alice .</script></pre></div>
+  </section>
+
+    </section>
+
+      <section class="informative" id="n-triples-changes" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+        
+<!--OddPage-->
+<h2 aria-level="1" role="heading" id="h2_n-triples-changes"><span class="secno">3. </span>Changes from RDF Test Cases format</h2><p><em>This section is non-normative.</em></p>
+        <ul>
+          <li>Encoding is UTF-8 rather than US-ASCII
+          </li><li>Uses IRIs rather than RDF URI References
+          </li><li>Defines a unique media type <code>application/n-triples</code>
+          </li><li>Subset of Turtle rather than Notation 3
+          </li><li>Comments may occur after a triple production
+          </li><li>Allows <code>\b</code> and <code>\f</code> for backspace and form feed
+          </li><li>More than one way to represent a single character
+          </li><li>Blank node labels may start with a digit
+        </li></ul>
+      </section>
+
+      <section id="canonical-ntriples" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+        
+<!--OddPage-->
+<h2 aria-level="1" role="heading" id="h2_canonical-ntriples"><span class="secno">4. </span>A Canonical form of N-Triples</h2>
+        <p>This section defined a canonical form of N-Triples which has
+          less variability in layout. The grammar for the language is the
+          same.  Implementers are encouraged to produce this form.</p>
+        <p>Canonical N-Triples has the following additional constraints on layout:</p>
+        <ul>
+          <li>The whitespace following <code>subject</code>,
+            <code>predicate</code>, 
+            and <code>object</code> <em class="rfc2119" title="MUST">MUST</em> be a single space, 
+            (<code>U+0020</code>).  All other locations that allow 
+            whitespace <em class="rfc2119" title="MUST">MUST</em> be empty.</li>
+          <li>There <em class="rfc2119" title="MUST">MUST</em> be no comments.</li>
+          <li><code>HEX</code> <em class="rfc2119" title="MUST">MUST</em> use only uppercase letters (<code>[A-F]</code>).</li>
+          <li>Characters <em class="rfc2119" title="MUST NOT">MUST NOT</em> be represented by <code>UCHAR</code>.</li>
+          <li>Within <a href="#grammar-production-STRING_LITERAL_QUOTE">STRING_LITERAL_QUOTE</a>,
+            only the characters 
+            <code>U+0022</code>, <code>U+005C</code>, <code>U+000A</code>, <code>U+000D</code>
+             are encoded using <code>ECHAR</code>.
+            <code>ECHAR</code> <em class="rfc2119" title="MUST NOT">MUST NOT</em> be used for characters that are
+            allowed directly in
+            <a href="#grammar-production-STRING_LITERAL_QUOTE">STRING_LITERAL_QUOTE</a>. </li>
+        </ul>
+      </section>
+
+      <section id="conformance" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+<!--OddPage-->
+<h2 aria-level="1" role="heading" id="h2_conformance"><span class="secno">5. </span>Conformance</h2>
+<p>
+  As well as sections marked as non-normative, all authoring guidelines, diagrams, examples,
+  and notes in this specification are non-normative. Everything else in this specification is
+  normative.
+</p>
+<p>
+  The key words <em class="rfc2119" title="MUST">MUST</em>, <em class="rfc2119" title="MUST NOT">MUST NOT</em>, <em class="rfc2119" title="REQUIRED">REQUIRED</em>, <em class="rfc2119" title="SHOULD">SHOULD</em>, <em class="rfc2119" title="SHOULD NOT">SHOULD NOT</em>, <em class="rfc2119" title="RECOMMENDED">RECOMMENDED</em>, <em class="rfc2119" title="MAY">MAY</em>,
+  and <em class="rfc2119" title="OPTIONAL">OPTIONAL</em> in this specification are to be interpreted as described in [<cite><a class="bibref" href="#bib-RFC2119">RFC2119</a></cite>].
+</p>
+
+        <p>This specification defines conformance criteria for:</p>
+        <ul>
+          <li>N-Triples documents
+          </li><li>Canonical N-Triples documents
+          </li><li>N-Triples parsers
+        </li></ul>
+
+        <p>A conforming <dfn id="dfn-n-triples-document">N-Triples document</dfn> is a Unicode string that conforms to the grammar and additional constraints defined in <a class="sectionRef sec-ref" href="#n-triples-grammar">section <span class="secno">7.</span> <span class="sec-title">Grammar</span></a>, starting with the <a href="#grammar-production-ntriplesDoc"><code>ntriplesDoc</code> production</a>. An N-Triples document serializes an RDF graph.</p>
+
+        <p>A conforming <dfn id="dfn-canonical-n-triples-document">Canonical N-Triples document</dfn> is an 
+        <strong>N-Triples document</strong> that follows the 
+        <a href="#canonical-ntriples">additional constraints</a> of Canonical N-Triples.</p>
+
+        <p>A conforming <dfn id="dfn-n-triples-parser">N-Triples parser</dfn> is a system capable of reading N-Triples documents on behalf of an application. It makes the serialized RDF graph, as defined in <a class="sectionRef sec-ref" href="#sec-parsing">section <span class="secno">8.</span> <span class="sec-title">Parsing</span></a>, available to the application, usually through some form of API.</p>
+
+      <p>The IRI that identifies the N-Triples language is:
+<code>http://www.w3.org/ns/formats/N-Triples</code></p>
+      </section>
+
+        <section id="n-triples-mediatype" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+      
+<!--OddPage-->
+<h2 aria-level="1" role="heading" id="h2_n-triples-mediatype"><span class="secno">6. </span>Media Type and Content Encoding</h2>
+
+      <p>The media type of N-Triples is <code>application/n-triples</code>.
+      The content encoding of N-Triples is always UTF-8.
+      See <a href="#sec-mediaReg-n-triples">N-Triples Media Type</a> for the media type
+      registration form.
+      </p>
+
+      <section id="sec-other-media-types" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+        <h3 aria-level="2" role="heading" id="h3_sec-other-media-types"><span class="secno">6.1 </span>Other Media Types</h3>
+        <p>N-Triples has been historically provided with other media types. N-Triples may also be provided as <code>text/plain</code>. When used in this way N-Triples <em class="rfc2119" title="MUST">MUST</em> use the escaped form of any character outside US-ASCII. As N-Triples is a subset of Turtle an N-Triples document <em class="rfc2119" title="MAY">MAY</em> also be provided as <code>text/turtle</code>. In both of these cases the document is not an N-Triples document as an N-Triples document is only provided as <code>application/n-triples</code>.</p>
+      </section>
+
+        </section>
+
+        <section id="n-triples-grammar" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+          
+<!--OddPage-->
+<h2 aria-level="1" role="heading" id="h2_n-triples-grammar"><span class="secno">7. </span>Grammar</h2>
+          <p>An N-Triples document is a Unicode [<cite><a class="bibref" href="#bib-UNICODE">UNICODE</a></cite>] character string encoded in UTF-8.
+          Unicode code points only in the range U+0 to U+10FFFF inclusive are allowed.</p>
+          <p>White space (tab <code>U+0009</code> or space <code>U+0020</code>) is used to separate two terminals which would otherwise be (mis-)recognized as one terminal. White space is significant in the production <a href="#grammar-production-STRING_LITERAL_QUOTE">STRING_LITERAL_QUOTE</a>.</p>
+          <p>Comments in N-Triples take the form of '<code>#</code>', 
+            outside an <code>IRIREF</code> or <code>STRING_LITERAL_QUOTE</code>, and continue
+            up-to, and excluding, the end of line (<code>EOL</code>), 
+            or end of file if there is no end of line after the comment
+            marker. Comments are treated as white space.</p>
+
+          <p>The <abbr title="Extended Backus–Naur Form">EBNF</abbr> used
+            here is defined in XML 1.0
+            [<cite><a class="bibref" href="#bib-EBNF-NOTATION">EBNF-NOTATION</a></cite>].</p>
+
+          <p>Escape sequence rules are the same as Turtle
+          [<cite><a class="bibref" href="#bib-TURTLE">TURTLE</a></cite>]. However, as only the <a href="#grammar-production-STRING_LITERAL_QUOTE"><code>STRING_LITERAL_QUOTE</code></a> production is allowed new lines in literals <em class="rfc2119" title="MUST">MUST</em> be escaped.</p>
+          <div><table class="grammar">
+    <tbody class="grammar-productions">
+            <tr data-grammar-expression="(',', [('?', ('id', 'triple')), ('*', (',', [('id', 'EOL'), ('id', 'triple')])), ('?', ('id', 'EOL'))])" data-grammar-original="[1]  ntriplesDoc        ::= triple? (EOL triple)* EOL?" id="grammar-production-ntriplesDoc">
+    <td>[1]</td>
+    <td><code>ntriplesDoc</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-triple">triple</a>? (<a href="#grammar-production-EOL">EOL</a> <a href="#grammar-production-triple">triple</a>)<code class="grammar-star">*</code> <a href="#grammar-production-EOL">EOL</a>?</td>
+</tr>
+            <tr data-grammar-expression="(',', [('id', 'subject'), ('id', 'predicate'), ('id', 'object'), (&quot;'&quot;, '.')])" data-grammar-original="[2]  triple             ::= subject predicate object '.'" id="grammar-production-triple">
+    <td>[2]</td>
+    <td><code>triple</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-subject">subject</a> <a href="#grammar-production-predicate">predicate</a> <a href="#grammar-production-object">object</a> '<code class="grammar-literal">.</code>'</td>
+</tr>
+            <tr data-grammar-expression="('|', [('id', 'IRIREF'), ('id', 'BLANK_NODE_LABEL')])" data-grammar-original="[3]  subject            ::= IRIREF | BLANK_NODE_LABEL" id="grammar-production-subject">
+    <td>[3]</td>
+    <td><code>subject</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-IRIREF">IRIREF</a> <code>| </code> <a href="#grammar-production-BLANK_NODE_LABEL">BLANK_NODE_LABEL</a></td>
+</tr>
+            <tr data-grammar-expression="('id', 'IRIREF')" data-grammar-original="[4]  predicate          ::= IRIREF" id="grammar-production-predicate">
+    <td>[4]</td>
+    <td><code>predicate</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-IRIREF">IRIREF</a></td>
+</tr>
+            <tr data-grammar-expression="('|', [('id', 'IRIREF'), ('id', 'BLANK_NODE_LABEL'), ('id', 'literal')])" data-grammar-original="[5]  object             ::= IRIREF | BLANK_NODE_LABEL | literal" id="grammar-production-object">
+    <td>[5]</td>
+    <td><code>object</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-IRIREF">IRIREF</a> <code>| </code> <a href="#grammar-production-BLANK_NODE_LABEL">BLANK_NODE_LABEL</a> <code>| </code> <a href="#grammar-production-literal">literal</a></td>
+</tr>
+            <tr data-grammar-expression="(',', [('id', 'STRING_LITERAL_QUOTE'), ('?', ('|', [(',', [(&quot;'&quot;, '^^'), ('id', 'IRIREF')]), (',', ['id', 'LANGTAG')])]))])" data-grammar-original="[6]  literal            ::= STRING_LITERAL_QUOTE ('^^' IRIREF | LANGTAG )?" id="grammar-production-literal">
+    <td>[6]</td>
+    <td><code>literal</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-STRING_LITERAL_QUOTE">STRING_LITERAL_QUOTE</a> ('<code class="grammar-literal">^^</code>' <a href="#grammar-production-IRIREF">IRIREF</a> <code>| </code> <a href="#grammar-production-LANGTAG">LANGTAG</a>)?</td>
+</tr>
+<tr><td colspan="4"><h2 id="terminals">Productions for terminals</h2></td></tr>
+            <tr class="grammar-token" data-grammar-expression="(',', [(&quot;'&quot;, '@'), ('+', ('[', 'a-zA-Z')), ('*', (',', [(&quot;'&quot;, '-'), ('+', ('[', 'a-zA-Z0-9'))]))])" data-grammar-original="[144s] LANGTAG          ::= &quot;@&quot; [a-zA-Z]+ ( &quot;-&quot; [a-zA-Z0-9]+ )*" id="grammar-production-LANGTAG">
+    <td>[144s]</td>
+    <td><code>LANGTAG</code></td>
+    <td>::=</td>
+    <td>'<code class="grammar-literal">@</code>' [<code class="grammar-chars">a-zA-Z</code>]<code class="grammar-plus">+</code> ('<code class="grammar-literal">-</code>' [<code class="grammar-chars">a-zA-Z0-9</code>]<code class="grammar-plus">+</code>)<code class="grammar-star">*</code></td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="('+', ('[', '#xD#xA'))" data-grammar-original="[7]  EOL                ::= [#xD#xA]+" id="grammar-production-EOL">
+    <td>[7]</td>
+    <td><code>EOL</code></td>
+    <td>::=</td>
+    <td>[<code class="grammar-chars">#xD#xA</code>]<code class="grammar-plus">+</code></td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="(',', [(&quot;'&quot;, '&lt;'), ('*', ('|', [('[', '^#x00-#x20&lt;&gt;&quot;{}|^`\\'), ('id', 'UCHAR')])), (&quot;'&quot;, '&gt;')])" data-grammar-original="[8] IRIREF ::=  '&lt;' ([^#x00-#x20&lt;&gt;&quot;{}|^`\] | UCHAR)* '&gt;'" id="grammar-production-IRIREF">
+    <td>[8]</td>
+    <td><code>IRIREF</code></td>
+    <td>::=</td>
+    <td>'<code class="grammar-literal">&lt;</code>' ([<code class="grammar-chars">^#x00-#x20&lt;&gt;"{}|^`\</code>] <code>| </code> <a href="#grammar-production-UCHAR">UCHAR</a>)<code class="grammar-star">*</code> '<code class="grammar-literal">&gt;</code>'</td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="(',', [(&quot;'&quot;, '&quot;'), ('*', ('|', [('[', '^#x22#x5C#xA#xD'), ('id', 'ECHAR'), ('id', 'UCHAR')])), (&quot;'&quot;, '&quot;')])" data-grammar-original="[9] STRING_LITERAL_QUOTE ::= '&quot;' ( [^#x22#x5C#xA#xD] | ECHAR | UCHAR )* '&quot;'" id="grammar-production-STRING_LITERAL_QUOTE">
+    <td>[9]</td>
+    <td><code>STRING_LITERAL_QUOTE</code></td>
+    <td>::=</td>
+    <td>'<code class="grammar-literal">"</code>' ([<code class="grammar-chars">^#x22#x5C#xA#xD</code>] <code>| </code> <a href="#grammar-production-ECHAR">ECHAR</a> <code>| </code> <a href="#grammar-production-UCHAR">UCHAR</a>)<code class="grammar-star">*</code> '<code class="grammar-literal">"</code>'</td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="(',', [(&quot;'&quot;, '_:'), ('|', [('id', 'PN_CHARS_U'), ('[', '0-9')]), ('?', (',', [('*', ('|', [('id', 'PN_CHARS'), (&quot;'&quot;, '.')])), ('id', 'PN_CHARS')]))])" data-grammar-original="[141s] BLANK_NODE_LABEL ::= '_:' ( PN_CHARS_U | [0-9] ) ((PN_CHARS|'.')* PN_CHARS)?" id="grammar-production-BLANK_NODE_LABEL">
+    <td>[141s]</td>
+    <td><code>BLANK_NODE_LABEL</code></td>
+    <td>::=</td>
+    <td>'<code class="grammar-literal">_:</code>' (<a href="#grammar-production-PN_CHARS_U">PN_CHARS_U</a> <code>| </code> [<code class="grammar-chars">0-9</code>]) ((<a href="#grammar-production-PN_CHARS">PN_CHARS</a> <code>| </code> '<code class="grammar-literal">.</code>')<code class="grammar-star">*</code> <a href="#grammar-production-PN_CHARS">PN_CHARS</a>)?</td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="('|', [(',', [(&quot;'&quot;, '\\u'), ('id', 'HEX'), ('id', 'HEX'), ('id', 'HEX'), ('id', 'HEX')]), (',', [(&quot;'&quot;, '\\U'), ('id', 'HEX'), ('id', 'HEX'), ('id', 'HEX'), ('id', 'HEX'), ('id', 'HEX'), ('id', 'HEX'), ('id', 'HEX'), ('id', 'HEX')])])" data-grammar-original="[10] UCHAR ::= ( &quot;\u&quot; HEX HEX HEX HEX )| ( &quot;\U&quot; HEX HEX HEX HEX HEX HEX HEX HEX )" id="grammar-production-UCHAR">
+    <td>[10]</td>
+    <td><code>UCHAR</code></td>
+    <td>::=</td>
+    <td>'<code class="grammar-literal">\u</code>' <a href="#grammar-production-HEX">HEX</a> <a href="#grammar-production-HEX">HEX</a> <a href="#grammar-production-HEX">HEX</a> <a href="#grammar-production-HEX">HEX</a> <code>| </code> '<code class="grammar-literal">\U</code>' <a href="#grammar-production-HEX">HEX</a> <a href="#grammar-production-HEX">HEX</a> <a href="#grammar-production-HEX">HEX</a> <a href="#grammar-production-HEX">HEX</a> <a href="#grammar-production-HEX">HEX</a> <a href="#grammar-production-HEX">HEX</a> <a href="#grammar-production-HEX">HEX</a> <a href="#grammar-production-HEX">HEX</a></td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="(',', [(&quot;'&quot;, '\\'), ('[', 'tbnrf&quot;\'')])" data-grammar-original="[153s] ECHAR ::= &quot;\&quot; [tbnrf&quot;\]" id="grammar-production-ECHAR">
+    <td>[153s]</td>
+    <td><code>ECHAR</code></td>
+    <td>::=</td>
+    <td>'<code class="grammar-literal">\</code>' [<code class="grammar-chars">tbnrf"'\</code>]</td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="('|', [('[', 'A-Z'), ('[', 'a-z'), ('[', '#x00C0-#x00D6'), ('[', '#x00D8-#x00F6'), ('[', '#x00F8-#x02FF'), ('[', '#x0370-#x037D'), ('[', '#x037F-#x1FFF'), ('[', '#x200C-#x200D'), ('[', '#x2070-#x218F'), ('[', '#x2C00-#x2FEF'), ('[', '#x3001-#xD7FF'), ('[', '#xF900-#xFDCF'), ('[', '#xFDF0-#xFFFD'), ('[', '#x10000-#xEFFFF')])" data-grammar-original="[157s] PN_CHARS_BASE    ::= [A-Z]| [a-z]| [#x00C0-#x00D6]| [#x00D8-#x00F6]| [#x00F8-#x02FF]| [#x0370-#x037D]| [#x037F-#x1FFF]| [#x200C-#x200D]| [#x2070-#x218F]| [#x2C00-#x2FEF]| [#x3001-#xD7FF]| [#xF900-#xFDCF]| [#xFDF0-#xFFFD]| [#x10000-#xEFFFF]" id="grammar-production-PN_CHARS_BASE">
+    <td>[157s]</td>
+    <td><code>PN_CHARS_BASE</code></td>
+    <td>::=</td>
+    <td>[<code class="grammar-chars">A-Z</code>] <code>| </code> [<code class="grammar-chars">a-z</code>] <code>| </code> [<code class="grammar-chars">#x00C0-#x00D6</code>] <code>| </code> [<code class="grammar-chars">#x00D8-#x00F6</code>] <code>| </code> [<code class="grammar-chars">#x00F8-#x02FF</code>] <code>| </code> [<code class="grammar-chars">#x0370-#x037D</code>] <code>| </code> [<code class="grammar-chars">#x037F-#x1FFF</code>] <code>| </code> [<code class="grammar-chars">#x200C-#x200D</code>] <code>| </code> [<code class="grammar-chars">#x2070-#x218F</code>] <code>| </code> [<code class="grammar-chars">#x2C00-#x2FEF</code>] <code>| </code> [<code class="grammar-chars">#x3001-#xD7FF</code>] <code>| </code> [<code class="grammar-chars">#xF900-#xFDCF</code>] <code>| </code> [<code class="grammar-chars">#xFDF0-#xFFFD</code>] <code>| </code> [<code class="grammar-chars">#x10000-#xEFFFF</code>]</td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="('|', [('id', 'PN_CHARS_BASE'), (&quot;'&quot;, '_'), (&quot;'&quot;, ':')])" data-grammar-original="[158s] PN_CHARS_U       ::=  PN_CHARS_BASE| '_'| ':'" id="grammar-production-PN_CHARS_U">
+    <td>[158s]</td>
+    <td><code>PN_CHARS_U</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-PN_CHARS_BASE">PN_CHARS_BASE</a> <code>| </code> '<code class="grammar-literal">_</code>' <code>| </code> '<code class="grammar-literal">:</code>'</td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="('|', [('id', 'PN_CHARS_U'), (&quot;'&quot;, '-'), ('[', '0-9'), ('#', '#x00B7'), ('[', '#x0300-#x036F'), ('[', '#x203F-#x2040')])" data-grammar-original="[160s] PN_CHARS         ::= PN_CHARS_U| &quot;-&quot;| [0-9]| #x00B7| [#x0300-#x036F]| [#x203F-#x2040]" id="grammar-production-PN_CHARS">
+    <td>[160s]</td>
+    <td><code>PN_CHARS</code></td>
+    <td>::=</td>
+    <td><a href="#grammar-production-PN_CHARS_U">PN_CHARS_U</a> <code>| </code> '<code class="grammar-literal">-</code>' <code>| </code> [<code class="grammar-chars">0-9</code>] <code>| </code> <code class="grammar-char-escape">#x00B7</code> <code>| </code> [<code class="grammar-chars">#x0300-#x036F</code>] <code>| </code> [<code class="grammar-chars">#x203F-#x2040</code>]</td>
+</tr>
+            <tr class="grammar-token" data-grammar-expression="('|', [('[', '0-9'), ('[', 'A-F'), ('[', 'a-f')])" data-grammar-original="[162s] HEX              ::= [0-9] | [A-F] | [a-f]" id="grammar-production-HEX">
+    <td>[162s]</td>
+    <td><code>HEX</code></td>
+    <td>::=</td>
+    <td>[<code class="grammar-chars">0-9</code>] <code>| </code> [<code class="grammar-chars">A-F</code>] <code>| </code> [<code class="grammar-chars">a-f</code>]</td>
+</tr>
+</tbody></table>
+</div>
+        </section>
+
+        <section id="sec-parsing" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+          
+<!--OddPage-->
+<h2 aria-level="1" role="heading" id="h2_sec-parsing"><span class="secno">8. </span>Parsing</h2>
+          <p>Parsing N-Triples requires a state of one item:</p>
+          <ul>
+            <li id="bnodeLabels">Map[string -&gt; <a href="https://www.w3.org/TR/rdf11-concepts/#dfn-blank-node">blank node</a>] <code class="dfn">bnodeLabels</code> — A mapping from string to blank node.</li>
+          </ul>
+
+          <section id="sec-parsing-terms" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+          <h3 aria-level="2" role="heading" id="h3_sec-parsing-terms"><span class="secno">8.1 </span>RDF Term Constructors</h3>
+              <p>This table maps productions and lexical tokens to <code>RDF terms</code> or components of <code>RDF terms</code> listed in <a class="sectionRef sec-ref" href="#sec-parsing">section <span class="secno">8.</span> <span class="sec-title">Parsing</span></a>:</p>
+              <table class="simple">
+                <thead>
+                  <tr><th>production</th><th>type</th><th>procedure</th></tr>
+                </thead>
+                <tbody>
+                  <tr id="handle-IRIREF"><td style="text-align:left;"><a href="#grammar-production-IRIREF" class="type IRI">IRIREF               </a></td><td><a href="https://www.w3.org/TR/rdf11-concepts/#dfn-iri">      IRI         </a></td><td>The characters between "&lt;" and "&gt;" are taken, with escape sequences unescaped, to form the unicode string of the IRI.</td></tr>
+                  <tr id="handle-STRING_LITERAL_QUOTE"><td style="text-align:left;"><a href="#grammar-production-STRING_LITERAL_QUOTE" class="type lexicalForm">STRING_LITERAL_QUOTE      </a></td><td><a href="https://www.w3.org/TR/rdf11-concepts/#dfn-lexical-form">                         lexical form</a></td><td>The characters between the outermost '"'s   are taken, with escape sequences unescaped, to form the unicode string of a lexical form.</td></tr>
+                  <tr id="handle-LANGTAG"><td style="text-align:left;"><a href="#grammar-production-LANGTAG" class="type langTag">LANGTAG              </a></td><td><a href="https://www.w3.org/TR/rdf11-concepts/#dfn-language-tag">language tag</a></td><td>The characters following the <code>@</code> form the unicode string of the language tag.</td></tr>
+                  <tr id="handle-literal"><td style="text-align:left;"><a href="#grammar-production-literal" class="type literal">literal           </a></td><td><a href="https://www.w3.org/TR/rdf11-concepts/#dfn-literal">            literal     </a></td><td>The literal has a lexical form of the first rule argument, <code>   STRING_LITERAL_QUOTE</code>, and either a language tag of <code>LANGTAG</code> or a datatype IRI of <code>iri</code>, depending on which rule matched the input.  If the <code>LANGTAG</code> rule matched, the datatype is <code>rdf:langString</code> and the language tag is <code>LANGTAG</code>. If neither a language tag nor a datatype IRI is provided, the literal has a datatype of <code>xsd:string</code>.</td></tr>
+                  <tr id="handle-BLANK_NODE_LABEL"><td style="text-align:left;"><a href="#grammar-production-BLANK_NODE_LABEL" class="type bNode">BLANK_NODE_LABEL     </a></td><td><a href="https://www.w3.org/TR/rdf11-concepts/#dfn-blank-node">         blank node  </a></td><td>The string after '<code>_:</code>', is a key in <a href="#bnodeLabels">bnodeLabels</a>. If there is no corresponding blank node in the map, one is allocated.</td></tr>
+                </tbody>
+              </table>
+          </section>
+          <section id="rdf-triple-construction">
+            <h3 aria-level="2" role="heading" id="h3_rdf-triple-construction"><span class="secno">8.2 </span>RDF Triple Construction</h3>
+            <p>An N-Triples document defines an RDF graphs composed of a set of RDF triples. The <code><a href="#grammar-production-triple">triple</a></code> production produces a triple defined by the terms constructed for <code><a href="#grammar-production-subject">subject</a></code>, <code><a href="#grammar-production-predicate">predicate</a></code> and <code><a href="#grammar-production-object">object</a></code>.
+          </p></section>
+
+
+        </section>
+
+      <section class="informative" id="section-ack" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+        
+<!--OddPage-->
+<h2 aria-level="1" role="heading" id="h2_section-ack"><span class="secno">9. </span>Acknowledgements</h2><p><em>This section is non-normative.</em></p>
+        <p>The editor of the RDF 1.1 edition acknowledges valuable contributions from Gregg Kellogg, Eric Prud'hommeaux, Dave Beckett, David Robillard, Gregory Williams, Pat Hayes, Richard Cyganiak, Henry S. Thompson,
+Peter Ansell, Evan Patton and David Booth.</p>
+        <p>This specification is a product of extended deliberations by the
+        members of the RDF Working Group.
+        It draws upon the earlier specification in <a href="https://www.w3.org/TR/2004/REC-rdf-testcases-20040210/#ntriples">RDF Test Cases</a>, edited by Dave Beckett.</p>
+      </section>
+
+      <section class="appendix" id="sec-changes" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+        
+<!--OddPage-->
+<h2 aria-level="1" role="heading" id="h2_sec-changes"><span class="secno">A. </span>Change log</h2>
+	<section id="changes-between-proposed-recommendation-and-recommendation">
+	<h3 aria-level="2" role="heading" id="h3_changes-between-proposed-recommendation-and-recommendation"><span class="secno">A.1 </span>Changes between Proposed Recommendation and Recommendation</h3>
+	<ul>
+	  <li><a href="http://lists.w3.org/Archives/Public/public-rdf-comments/2014Feb/0009.html">Bug in grammar rule [6]</a> concerning language-typed literals fixed.</li>
+	</ul>
+	</section>
+        <section id="changes-between-candidate-recommendation-and-proposed-recommendation">
+        <h3 aria-level="2" role="heading" id="h3_changes-between-candidate-recommendation-and-proposed-recommendation"><span class="secno">A.2 </span>Changes between Candidate Recommendation and Proposed Recommendation</h3>
+        <ul>
+          <li>A normative reference to RDF Concepts was added.</li>
+          <li>The text for "Canonical N-Triples" has been made into a separate section.</li> 
+        </ul>
+        </section>
+	<section id="changes-between-last-call-working-draft-and-candidate-recommendation">
+        <h3 aria-level="2" role="heading" id="h3_changes-between-last-call-working-draft-and-candidate-recommendation"><span class="secno">A.3 </span>Changes between Last Call Working Draft and Candidate recommendation</h3>
+          <p>No substantive changes.</p>
+	</section>
+	<section id="changes-between-last-call-working-draft-and-publication-as-note">
+        <h3 aria-level="2" role="heading" id="h3_changes-between-last-call-working-draft-and-publication-as-note"><span class="secno">A.4 </span>Changes between Last Call Working Draft and publication as Note</h3>
+        <ul>
+          <li>Section defines <a href="#dfn-canonical-n-triples-document">canonical
+	  N-Triples document</a>.
+          </li><li>White space rules defined outside of grammar, as in Turtle.
+          </li><li>Comment processing defined.
+          </li><li>Parsing is defined.
+          </li><li>Removed "Summary of differences in N-Triples and Turtle".
+          </li><li>Recommendation track, not a working group Note.
+        </li></ul>
+	</section>
+      </section>
+
+      <section class="appendix" id="sec-mediaReg-n-triples" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+        
+<!--OddPage-->
+<h2 aria-level="1" role="heading" id="h2_sec-mediaReg-n-triples"><span class="secno">B. </span>N-Triples Internet Media Type, File Extension and Macintosh File Type </h2>
+        <dl>
+          <dt>Contact:</dt>
+          <dd>Eric Prud'hommeaux</dd>
+          <dt>See also:</dt>
+
+          <dd><a href="https://www.w3.org/2002/06/registering-mediatype">How to Register a Media Type for a <abbr title="World Wide Web Consortium">W3C</abbr> Specification</a></dd>
+          <dd><a href="https://www.w3.org/2001/tag/2002/0129-mime">Internet Media Type registration, consistency of use</a><br>TAG Finding 3 June 2002 (Revised 4 September 2002)</dd>
+        </dl>
+        <p>The Internet Media Type / MIME Type for N-Triples is "application/n-triples".</p>
+        <p>It is recommended that N-Triples files have the extension ".nt" (all lowercase) on all platforms.</p>
+
+        <p>It is recommended that N-Triples files stored on Macintosh HFS file systems be given a file type of "TEXT".</p>
+        <p>This information that follows will be submitted to the IESG for review, approval, and registration with IANA.</p>
+        <dl>
+          <dt>Type name:</dt>
+          <dd>application</dd>
+
+          <dt>Subtype name:</dt>
+          <dd>n-triples</dd>
+          <dt>Required parameters:</dt>
+          <dd>None</dd>
+          <dt>Optional parameters:</dt>
+          <dd>None</dd>
+
+          <dt>Encoding considerations:</dt>
+          <dd>The syntax of N-Triples is expressed over code points in Unicode [<cite><a class="bibref" href="#bib-UNICODE">UNICODE</a></cite>]. The encoding is always UTF-8 [<cite><a class="bibref" href="#bib-UTF-8">UTF-8</a></cite>].</dd>
+          <dd>Unicode code points may also be expressed using an \uXXXX (U+0 to U+FFFF) or \UXXXXXXXX syntax (for U+10000 onwards) where X is a hexadecimal digit [0-9A-F]</dd>
+          <dt>Security considerations:</dt>
+          <dd>N-Triples is a general-purpose assertion language; applications may evaluate given data to infer more assertions or to dereference IRIs, invoking the security considerations of the scheme for that IRI. Note in particular, the privacy issues in [<cite><a class="bibref" href="#bib-RFC3023">RFC3023</a></cite>] section 10 for HTTP IRIs. Data obtained from an inaccurate or malicious data source may lead to inaccurate or misleading conclusions, as well as the dereferencing of unintended IRIs. Care must be taken to align the trust in consulted resources with the sensitivity of the intended use of the data; inferences of potential medical treatments would likely require different trust than inferences for trip planning.</dd>
+
+          <dd>N-Triples is used to express arbitrary application data; security considerations will vary by domain of use. Security tools and protocols applicable to text (e.g. PGP encryption, MD5 sum validation, password-protected compression) may also be used on N-Triples documents. Security/privacy protocols must be imposed which reflect the sensitivity of the embedded information.</dd>
+          <dd>N-Triples can express data which is presented to the user, for example, RDF Schema labels. Application rendering strings retrieved from untrusted N-Triples documents must ensure that malignant strings may not be used to mislead the reader. The security considerations in the media type registration for XML ([<cite><a class="bibref" href="#bib-RFC3023">RFC3023</a></cite>] section 10) provide additional guidance around the expression of arbitrary data and markup.</dd>
+          <dd>N-Triples uses IRIs as term identifiers. Applications interpreting data expressed in N-Triples should address the security issues of
+      <em>Internationalized Resource Identifiers (IRIs)</em> [<cite><a class="bibref" href="#bib-RFC3987">RFC3987</a></cite>] Section 8, as well as
+      <em>Uniform Resource Identifier (URI): Generic Syntax</em> [<cite><a class="bibref" href="#bib-RFC3986">RFC3986</a></cite>] Section 7.</dd>
+
+          <dd>Multiple IRIs may have the same appearance. Characters in different scripts may
+    look similar (a Cyrillic "о" may appear similar to a Latin "o"). A character followed
+    by combining characters may have the same visual representation as another character
+    (LATIN SMALL LETTER E followed by COMBINING ACUTE ACCENT has the same visual representation
+    as LATIN SMALL LETTER E WITH ACUTE).
+    
+<!-- (<code>foo:resum&#40751;code> and <code>f&#1086;&#1086;:resume&#769;</code>)-->
+
+    Any person or application that is writing or interpreting data in Turtle must take care to use the IRI that matches the intended semantics, and avoid IRIs that make look similar.
+    Further information about matching of similar characters can be found
+    in <em>Unicode Security Considerations</em> [<cite><a class="bibref" href="#bib-UNICODE-SECURITY">UNICODE-SECURITY</a></cite>] and
+    <em>Internationalized Resource Identifiers (IRIs)</em> [<cite><a class="bibref" href="#bib-RFC3987">RFC3987</a></cite>] Section 8.
+      </dd>
+
+          <dt>Interoperability considerations:</dt>
+          <dd>There are no known interoperability issues.</dd>
+          <dt>Published specification:</dt>
+          <dd>This specification.</dd>
+          <dt>Applications which use this media type:</dt>
+
+          <dd>No widely deployed applications are known to use this media type. It may be used by some web services and clients consuming their data.</dd>
+          <dt>Additional information:</dt>
+          <dt>Magic number(s):</dt>
+          <dd>None.</dd>
+          <dt>File extension(s):</dt>
+          <dd>".nt"</dd>
+
+          <dt>Macintosh file type code(s):</dt>
+          <dd>"TEXT"</dd>
+          <dt>Person &amp; email address to contact for further information:</dt>
+
+          <dd>Eric Prud'hommeaux &lt;eric@w3.org&gt;</dd>
+          <dt>Intended usage:</dt>
+          <dd>COMMON</dd>
+          <dt>Restrictions on usage:</dt>
+          <dd>None</dd>
+          <dt>Author/Change controller:</dt>
+
+          <dd>The N-Triples specification is the product of the RDF WG. The <abbr title="World Wide Web Consortium">W3C</abbr> reserves change control over this specifications.</dd>
+        </dl>
+      </section>
+  
+
+<section class="appendix" id="references" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter">
+<!--OddPage-->
+<h2 aria-level="1" role="heading" id="h2_references"><span class="secno">C. </span>References</h2><section id="normative-references" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter"><h3 aria-level="2" role="heading" id="h3_normative-references"><span class="secno">C.1 </span>Normative references</h3><dl class="bibliography" about=""><dt id="bib-EBNF-NOTATION">[EBNF-NOTATION]</dt><dd rel="dcterms:requires">Tim Bray; Jean Paoli; C. M. Sperberg-McQueen; Eve Maler; François Yergeau. <a href="https://www.w3.org/TR/REC-xml/#sec-notation"><cite>EBNF Notation</cite></a> 26 November 2008. W3C Recommendation. URL: <a href="https://www.w3.org/TR/REC-xml/#sec-notation">http://www.w3.org/TR/REC-xml/#sec-notation</a>
+</dd><dt id="bib-RDF-TESTCASES">[RDF-TESTCASES]</dt><dd rel="dcterms:requires">jan grant; Dave Beckett. <a href="https://www.w3.org/TR/rdf-testcases"><cite>RDF Test Cases</cite></a>. 10 February 2004. W3C Recommendation. URL: <a href="https://www.w3.org/TR/rdf-testcases">http://www.w3.org/TR/rdf-testcases</a>
+</dd><dt id="bib-RDF11-CONCEPTS">[RDF11-CONCEPTS]</dt><dd rel="dcterms:requires">Richard Cyganiak, David Wood, Markus Lanthaler. <cite><a href="https://www.w3.org/TR/2014/REC-rdf11-concepts-20140225/">RDF 1.1 Concepts and Abstract Syntax.</a></cite> W3C Recommendation, 25 February 2014. URL: <a href="https://www.w3.org/TR/2014/REC-rdf11-concepts-20140225/">http://www.w3.org/TR/2014/REC-rdf11-concepts-20140225/</a>. The latest edition is available at <a href="https://www.w3.org/TR/rdf11-concepts/">http://www.w3.org/TR/rdf11-concepts/</a>
+</dd><dt id="bib-RFC2119">[RFC2119]</dt><dd rel="dcterms:requires">S. Bradner. <a href="http://www.ietf.org/rfc/rfc2119.txt"><cite>Key words for use in RFCs to Indicate Requirement Levels.</cite></a> March 1997. Internet RFC 2119.  URL: <a href="http://www.ietf.org/rfc/rfc2119.txt">http://www.ietf.org/rfc/rfc2119.txt</a> 
+</dd><dt id="bib-RFC3023">[RFC3023]</dt><dd rel="dcterms:requires">M. Murata; S. St.Laurent; D. Kohn. <a href="http://www.ietf.org/rfc/rfc3023.txt"><cite>XML Media Types (RFC 3023)</cite></a>. January 2001. RFC. URL: <a href="http://www.ietf.org/rfc/rfc3023.txt">http://www.ietf.org/rfc/rfc3023.txt</a>
+</dd><dt id="bib-RFC3986">[RFC3986]</dt><dd rel="dcterms:requires">T. Berners-Lee; R. Fielding; L. Masinter. <a href="http://www.ietf.org/rfc/rfc3986.txt"><cite>Uniform Resource Identifier (URI): Generic Syntax (RFC 3986)</cite></a>. January 2005. RFC. URL: <a href="http://www.ietf.org/rfc/rfc3986.txt">http://www.ietf.org/rfc/rfc3986.txt</a>
+</dd><dt id="bib-RFC3987">[RFC3987]</dt><dd rel="dcterms:requires">M. Dürst; M. Suignard. <a href="http://www.ietf.org/rfc/rfc3987.txt"><cite>Internationalized Resource Identifiers (IRIs)</cite></a>. January 2005. RFC. URL: <a href="http://www.ietf.org/rfc/rfc3987.txt">http://www.ietf.org/rfc/rfc3987.txt</a>
+</dd><dt id="bib-TURTLE">[TURTLE]</dt><dd rel="dcterms:requires">Eric Prud'hommeaux, Gavin Carothers. <cite><a href="https://www.w3.org/TR/2014/REC-turtle-20140225/">RDF 1.1 Turtle: Terse RDF Triple Language.</a></cite> W3C Recommendation, 25 February 2014. URL: <a href="https://www.w3.org/TR/2014/REC-turtle-20140225/">http://www.w3.org/TR/2014/REC-turtle-20140225/</a>. The latest edition is available at <a href="https://www.w3.org/TR/turtle/">http://www.w3.org/TR/turtle/</a>
+</dd><dt id="bib-UNICODE">[UNICODE]</dt><dd rel="dcterms:requires"><a href="http://www.unicode.org/versions/latest/"><cite>The Unicode Standard</cite></a>. URL: <a href="http://www.unicode.org/versions/latest/">http://www.unicode.org/versions/latest/</a>
+</dd><dt id="bib-UTF-8">[UTF-8]</dt><dd rel="dcterms:requires">F. Yergeau. <a href="http://www.ietf.org/rfc/rfc3629.txt"><cite>UTF-8, a transformation format of ISO 10646</cite></a>. IETF RFC 3629. November 2003. URL: <a href="http://www.ietf.org/rfc/rfc3629.txt">http://www.ietf.org/rfc/rfc3629.txt</a>
+</dd></dl></section><section id="informative-references" typeof="bibo:Chapter" resource="#ref" rel="bibo:Chapter"><h3 aria-level="2" role="heading" id="h3_informative-references"><span class="secno">C.2 </span>Informative references</h3><dl class="bibliography" about=""><dt id="bib-UNICODE-SECURITY">[UNICODE-SECURITY]</dt><dd rel="dcterms:references">Mark Davis; Michel Suignard. <a href="http://www.unicode.org/reports/tr36/"><cite>Unicode Security Considerations</cite></a>. URL: <a href="http://www.unicode.org/reports/tr36/">http://www.unicode.org/reports/tr36/</a>
+</dd></dl></section></section><script src="https://www.w3.org/scripts/TR/fixup.js"></script></body><div id="codex-agent-overlay-root" data-codex-agent-overlay-root="true"></div></html>

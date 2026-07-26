@@ -1,0 +1,8 @@
+@prefix prov: <http://www.w3.org/ns/prov#> .
+
+prov:Entity a prov:Entity .
+prov:Activity a prov:Entity .
+prov:Agent a prov:Entity .
+prov:wasDerivedFrom a prov:Entity .
+prov:wasGeneratedBy a prov:Entity .
+prov:wasAttributedTo a prov:Entity .

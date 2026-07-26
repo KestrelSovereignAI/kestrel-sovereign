@@ -18,6 +18,12 @@ credentials/
 !package-lock.json
 !docs/generated/RENDER_MANIFEST.json
 !docs/audit/issues/*-prd.json
+# These are immutable, digest-pinned semantic package resources—not local
+# credentials—and must be versioned so installed wheels can resolve them.
+!kestrel_sovereign/data/semantic/profiles/
+!kestrel_sovereign/data/semantic/profiles/*.json
+!kestrel_sovereign/data/semantic/rules/
+!kestrel_sovereign/data/semantic/rules/*.json
 *.pem
 *.key
 

@@ -1,0 +1,7 @@
+@prefix time: <http://www.w3.org/2006/time#> .
+
+time:TemporalEntity a time:TemporalEntity .
+time:Interval a time:TemporalEntity .
+time:Instant a time:TemporalEntity .
+time:hasBeginning a time:TemporalEntity .
+time:hasEnd a time:TemporalEntity .
