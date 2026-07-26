@@ -39,11 +39,12 @@ schema interpretation. The Kestrel ontology contains assertion/revision/source
 and temporal/provenance schema only. It explicitly grants no permission, role,
 approval, visibility change, or tool access.
 
-The stable registry packages and pins the dated W3C source documents for RDF
-1.1 Concepts, Turtle, N-Triples, N-Quads, TriG, XML Schema 1.1 Datatypes, RDF
-Dataset Canonicalization, OWL 2 Profiles, SHACL Core, and SPARQL 1.1.  Its
-local Kestrel profiles import those sources explicitly.  It also records the
-selected RDFS, SKOS, PROV-O, and OWL-Time uses defined by the
+The stable registry packages and pins the dated RFC 3986 artifact used by
+the IRI profile, plus the dated W3C source documents for RDF 1.1 Concepts,
+Turtle, N-Triples, N-Quads, TriG, XML Schema 1.1 Datatypes, RDF Dataset
+Canonicalization, OWL 2 Profiles, SHACL Core, and SPARQL 1.1. Its local
+Kestrel profiles import those sources explicitly. It also records the selected
+RDFS, SKOS, PROV-O, and OWL-Time uses defined by the
 [semantic knowledge architecture](SEMANTIC_KNOWLEDGE_ARCHITECTURE.md#standards-and-compatibility-matrix).
 The RDF 1.2, SHACL 1.2, and SPARQL 1.2 dated snapshots are distinct
 `experimental` resources. They require `allow_experimental=True`; they do not

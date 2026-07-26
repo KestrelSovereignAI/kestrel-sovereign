@@ -87,6 +87,24 @@ def test_loading_and_resolution_are_offline(monkeypatch):
     assert capability.artifact_pins[-1].identifier == "kestrel-assertion-shapes"
 
 
+def test_iri_profile_closure_pins_the_normative_rfc3986_source():
+    registry = load_knowledge_registry()
+
+    capability = registry.select_capability(
+        "iri-profile:iri-normalization-v1-rfc3986-200501"
+    )
+
+    assert [resource.identifier for resource in capability.import_closure] == [
+        "rfc3986-200501",
+        "iri-normalization-v1-rfc3986-200501",
+    ]
+    rfc3986_pin = capability.artifact_pins[0]
+    assert rfc3986_pin.uri == "https://www.rfc-editor.org/rfc/rfc3986.txt"
+    assert rfc3986_pin.published_date == "2005-01-01"
+    assert rfc3986_pin.package_resource == "data/semantic/standards/rfc3986-200501.txt"
+    assert rfc3986_pin.sha256 == registry.resolve("rfc3986-200501", "1.0.0").sha256
+
+
 def test_import_cycle_is_rejected_with_the_cycle_path():
     first = _resource("first", imports=(ResourceRequirement.exact("second", "1.0.0"),))
     second = _resource("second", imports=(ResourceRequirement.exact("first", "1.0.0"),))

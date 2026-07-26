@@ -31,8 +31,22 @@ uri = "https://kestrel.ai/semantic/profiles/iri-normalization-v1-rfc3986-200501/
 published_date = "2026-07-26"
 description = "Closed RFC 3986 IRI normalization profile used before assertion identity hashing."
 selected_terms = ["RFC 3986 sections 3", "5.2.4", "6.2.2"]
-imports = []
+imports = ["rfc3986-200501@1.0.0"]
 capabilities = ["iri-profile:iri-normalization-v1-rfc3986-200501"]
+
+[resource.rfc3986-200501]
+version = "1.0.0"
+namespace = "https://www.rfc-editor.org/rfc/rfc3986"
+package_resource = "data/semantic/standards/rfc3986-200501.txt"
+sha256 = "fbc12a08fd679056dfedd436833397bf5f975283423e13bddd99fa07f009fc7f"
+maturity = "stable"
+kind = "standard-snapshot"
+uri = "https://www.rfc-editor.org/rfc/rfc3986.txt"
+published_date = "2005-01-01"
+description = "Dated RFC 3986 source pin for the closed IRI normalization profile; no URI dereference is permitted."
+selected_terms = ["RFC 3986 sections 3", "5.2.4", "6.2.2"]
+imports = []
+capabilities = ["standard:rfc3986-200501"]
 
 [resource.literal-v1-xsd11-20120405]
 version = "1.0.0"
