@@ -1135,8 +1135,16 @@ class Assertion:
         if isinstance(self.lineage, DirectLineage) and self.epistemic_state is EpistemicState.INFERRED:
             _fail("an inferred assertion requires DerivedLineage")
         if isinstance(self.lineage, DerivedLineage):
-            if self.epistemic_state is not EpistemicState.INFERRED:
-                _fail("DerivedLineage requires epistemic_state inferred")
+            # A derived assertion keeps its complete support lineage when a
+            # lifecycle transition retracts it. That historical revision is
+            # no longer an inference result, but deleting its lineage would
+            # make the invalidation unauditable and break transitive erasure.
+            is_retracted_history = (
+                self.status is AssertionStatus.RETRACTED
+                and self.epistemic_state is EpistemicState.RETRACTED
+            )
+            if self.epistemic_state is not EpistemicState.INFERRED and not is_retracted_history:
+                _fail("DerivedLineage requires epistemic_state inferred unless it is a retracted historical revision")
             if self.revision_id in self.lineage.input_revision_ids:
                 _fail("derived lineage cannot name its own revision as input")
         derived_id = derive_assertion_id(

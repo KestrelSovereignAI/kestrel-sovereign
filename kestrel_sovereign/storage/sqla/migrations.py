@@ -26,14 +26,284 @@ review — an in-place ``ALTER COLUMN TYPE`` would have broken
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import struct
 from typing import TYPE_CHECKING
+
+from ..async_assertion_store import _erasure_receipt_key
 
 if TYPE_CHECKING:
     from ..async_database import AsyncDatabase
 
 logger = logging.getLogger(__name__)
+
+
+_SEMANTIC_ASSERTION_SCHEMA_VERSION = "semantic_assertion_store_v2"
+_SEMANTIC_ASSERTION_LOCK_DOMAIN = b"kestrel:semantic-assertion-schema:v1\0"
+
+
+def _semantic_assertion_lock_id() -> int:
+    """Stable transaction-scoped PostgreSQL lock for semantic-schema DDL."""
+    return int.from_bytes(
+        hashlib.sha256(_SEMANTIC_ASSERTION_LOCK_DOMAIN).digest()[:8],
+        "big",
+        signed=True,
+    )
+
+
+async def _semantic_schema_marker_exists(db: "AsyncDatabase") -> bool:
+    row = await db.fetchone(
+        "SELECT 1 FROM semantic_schema_migrations WHERE version = ?",
+        (_SEMANTIC_ASSERTION_SCHEMA_VERSION,),
+    )
+    return row is not None
+
+
+async def _ensure_erasure_receipts_are_opaque(db: "AsyncDatabase") -> None:
+    """Upgrade prior JSON receipts without retaining erased identifiers.
+
+    The first implementation stored full erasure targets in ``receipt``.  A
+    pre-release database may still have that column, so move just its numeric
+    generation into a dedicated column and overwrite the JSON before marking
+    the migration complete.  New databases never create ``receipt`` at all.
+    """
+    if db.backend_type == "postgres":
+        columns = await db.fetchall(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'semantic_assertion_erasure_receipts'",
+            (),
+        )
+    else:
+        columns = await db.fetchall(
+            "SELECT name FROM pragma_table_info('semantic_assertion_erasure_receipts')",
+            (),
+        )
+    column_names = {str(row[0]) for row in columns}
+    if "generation" not in column_names:
+        if db.backend_type == "postgres":
+            await db.execute(
+                "ALTER TABLE semantic_assertion_erasure_receipts "
+                "ADD COLUMN IF NOT EXISTS generation INTEGER",
+                (),
+            )
+        else:
+            await db.execute(
+                "ALTER TABLE semantic_assertion_erasure_receipts "
+                "ADD COLUMN generation INTEGER",
+                (),
+            )
+        column_names.add("generation")
+    if "receipt" not in column_names:
+        return
+
+    rows = await db.fetchall(
+        "SELECT tenant_id, operation_id, receipt FROM semantic_assertion_erasure_receipts",
+        (),
+    )
+    for tenant_id, operation_id, receipt in rows:
+        try:
+            generation = int(json.loads(receipt).get("generation"))
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            # A malformed legacy retry record must not keep an opaque payload
+            # around.  Deleting it fails closed: retrying after restart reports
+            # that the target is absent rather than resurrecting an identifier.
+            await db.execute(
+                "DELETE FROM semantic_assertion_erasure_receipts "
+                "WHERE tenant_id = ? AND operation_id = ?",
+                (tenant_id, operation_id),
+            )
+            continue
+        if generation < 1:
+            await db.execute(
+                "DELETE FROM semantic_assertion_erasure_receipts "
+                "WHERE tenant_id = ? AND operation_id = ?",
+                (tenant_id, operation_id),
+            )
+            continue
+        await db.execute(
+            "UPDATE semantic_assertion_erasure_receipts "
+            "SET operation_id = ?, generation = ?, receipt = '{}' "
+            "WHERE tenant_id = ? AND operation_id = ?",
+            (
+                _erasure_receipt_key(str(operation_id)),
+                generation,
+                tenant_id,
+                operation_id,
+            ),
+        )
+
+
+async def migrate_semantic_assertion_store(db: "AsyncDatabase") -> None:
+    """Create the normalized canonical-assertion authority.
+
+    This is deliberately additive and backend-neutral.  Assertion records are
+    not graph rows or opaque properties: current pointers, immutable
+    revisions, provenance links, derivation supports, projection eligibility,
+    idempotency receipts, and change events have separate relational rows.
+    One transaction covers the complete DDL set so a failed migration neither
+    advertises a partial authority nor leaves a subset of its indexes behind.
+    """
+    statements = (
+        """CREATE TABLE IF NOT EXISTS semantic_assertion_tenants (
+            tenant_id TEXT PRIMARY KEY,
+            generation INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS semantic_assertions (
+            tenant_id TEXT NOT NULL,
+            assertion_id TEXT NOT NULL,
+            owning_agent_id TEXT NOT NULL,
+            current_revision_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, assertion_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS semantic_assertion_revisions (
+            revision_id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            assertion_id TEXT NOT NULL,
+            owning_agent_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            epistemic_state TEXT NOT NULL,
+            subject_value TEXT NOT NULL,
+            predicate_value TEXT NOT NULL,
+            object_kind TEXT NOT NULL,
+            object_value TEXT NOT NULL,
+            object_datatype TEXT,
+            object_language TEXT,
+            asserted_at TEXT NOT NULL,
+            observed_start TEXT,
+            observed_end TEXT,
+            valid_start TEXT,
+            valid_end TEXT,
+            supersedes_revision_id TEXT,
+            lineage_kind TEXT NOT NULL,
+            eligible INTEGER NOT NULL,
+            accepted_order INTEGER NOT NULL,
+            assertion_mapping TEXT NOT NULL,
+            CHECK (status IN ('active', 'superseded', 'retracted', 'quarantined', 'deleted')),
+            CHECK (epistemic_state IN ('asserted', 'observed', 'reported', 'inferred', 'hypothesis', 'disputed', 'retracted')),
+            CHECK (lineage_kind IN ('direct', 'derived')),
+            CHECK (eligible IN (0, 1)),
+            CHECK (accepted_order > 0),
+            CHECK ((status = 'retracted') = (epistemic_state = 'retracted')),
+            CHECK (status NOT IN ('retracted', 'quarantined', 'deleted') OR supersedes_revision_id IS NULL),
+            UNIQUE (tenant_id, assertion_id, revision_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS semantic_source_occurrences (
+            tenant_id TEXT NOT NULL,
+            source_occurrence_id TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            locator TEXT NOT NULL,
+            received_at TEXT NOT NULL,
+            content_digest TEXT,
+            actor TEXT,
+            selector TEXT,
+            source_mapping TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, source_occurrence_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS semantic_revision_sources (
+            tenant_id TEXT NOT NULL,
+            revision_id TEXT NOT NULL,
+            source_occurrence_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            CHECK (ordinal >= 0),
+            PRIMARY KEY (tenant_id, revision_id, source_occurrence_id),
+            UNIQUE (tenant_id, revision_id, ordinal)
+        )""",
+        """CREATE TABLE IF NOT EXISTS semantic_derivation_inputs (
+            tenant_id TEXT NOT NULL,
+            derived_revision_id TEXT NOT NULL,
+            input_revision_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            CHECK (ordinal >= 0),
+            PRIMARY KEY (tenant_id, derived_revision_id, input_revision_id),
+            UNIQUE (tenant_id, derived_revision_id, ordinal)
+        )""",
+        """CREATE TABLE IF NOT EXISTS semantic_projection_eligibility (
+            tenant_id TEXT NOT NULL,
+            revision_id TEXT NOT NULL,
+            eligible INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            CHECK (eligible IN (0, 1)),
+            PRIMARY KEY (tenant_id, revision_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS semantic_projection_outbox (
+            event_id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            assertion_id TEXT NOT NULL,
+            revision_id TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            eligible INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            CHECK (eligible IN (0, 1)),
+            CHECK (generation > 0)
+        )""",
+        """CREATE TABLE IF NOT EXISTS semantic_projection_erasure_outbox (
+            event_id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            CHECK (operation = 'erased'),
+            CHECK (generation > 0)
+        )""",
+        """CREATE TABLE IF NOT EXISTS semantic_assertion_operations (
+            tenant_id TEXT NOT NULL,
+            operation_id TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            request_digest TEXT NOT NULL,
+            receipt TEXT NOT NULL,
+            assertion_ids TEXT NOT NULL,
+            revision_ids TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, operation_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS semantic_assertion_erasure_receipts (
+            tenant_id TEXT NOT NULL,
+            operation_id TEXT NOT NULL,
+            request_digest TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, operation_id)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_semantic_assertion_current ON semantic_assertions(tenant_id, current_revision_id)",
+        "CREATE INDEX IF NOT EXISTS idx_semantic_revision_query ON semantic_assertion_revisions(tenant_id, status, subject_value, predicate_value, revision_id)",
+        "CREATE INDEX IF NOT EXISTS idx_semantic_revision_object ON semantic_assertion_revisions(tenant_id, predicate_value, object_kind, object_value)",
+        "CREATE INDEX IF NOT EXISTS idx_semantic_revision_valid_time ON semantic_assertion_revisions(tenant_id, valid_start, valid_end)",
+        "CREATE INDEX IF NOT EXISTS idx_semantic_revision_sources_source ON semantic_revision_sources(tenant_id, source_occurrence_id, revision_id)",
+        "CREATE INDEX IF NOT EXISTS idx_semantic_derivation_input ON semantic_derivation_inputs(tenant_id, input_revision_id, derived_revision_id)",
+        "CREATE INDEX IF NOT EXISTS idx_semantic_outbox_changes ON semantic_projection_outbox(tenant_id, generation, created_at, event_id)",
+        "CREATE INDEX IF NOT EXISTS idx_semantic_erasure_changes ON semantic_projection_erasure_outbox(tenant_id, generation, created_at, event_id)",
+    )
+    async with db.transaction():
+        # PostgreSQL's catalog DDL can race even with IF NOT EXISTS.  A
+        # transaction-scoped advisory lock keeps a concurrent multi-agent boot
+        # from attempting this complete DDL set simultaneously; the marker is
+        # committed atomically with the schema.  SQLite promotes to its single
+        # writer slot before the marker read for the corresponding behavior.
+        if db.backend_type == "postgres":
+            await db.execute(
+                "SELECT pg_advisory_xact_lock(?)",
+                (_semantic_assertion_lock_id(),),
+            )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS semantic_schema_migrations ("
+            "version TEXT PRIMARY KEY, completed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+            (),
+        )
+        if db.backend_type == "sqlite":
+            await db.execute("DELETE FROM semantic_schema_migrations WHERE 0", ())
+        if await _semantic_schema_marker_exists(db):
+            return
+        for statement in statements:
+            await db.execute(statement, ())
+        await _ensure_erasure_receipts_are_opaque(db)
+        await db.execute(
+            "INSERT INTO semantic_schema_migrations (version) VALUES (?)",
+            (_SEMANTIC_ASSERTION_SCHEMA_VERSION,),
+        )
 
 
 # Default embedding dimension if no embedded rows exist yet (fresh DB).

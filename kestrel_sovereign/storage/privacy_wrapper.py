@@ -65,6 +65,7 @@ logger = logging.getLogger(__name__)
 # explicit session_id, so list_conversation_sessions never returns a synthetic
 # index that delete_conversation_session can't resolve (#2019).
 _ISOLATED_UNLABELED_SESSION_ID = "session-local"
+_SEMANTIC_ASSERTION_SQL_RE = re.compile(r"\bsemantic_[a-z_]+\b", re.IGNORECASE)
 
 
 def _conv_session_id(conv: Dict[str, Any]) -> Optional[str]:
@@ -108,6 +109,70 @@ class OperationType(Enum):
     READ = "read"
     WRITE = "write"
     DELETE = "delete"
+
+
+class _PrivacyDatabaseView:
+    """Compatibility view for legacy database readers behind privacy storage.
+
+    The wrapper used to return its raw :class:`AsyncDatabase`; that object
+    exposed ``.backend``, allowing a caller to combine a shared backend with a
+    forged ``agent_id`` and obtain another tenant's assertion facade.  This
+    view preserves non-semantic legacy helpers while withholding the backend
+    and refusing direct semantic-table access.  Assertion operations must use
+    the explicit privacy-governed methods on :class:`PrivacyEnforcingStorage`.
+    """
+
+    __slots__ = ("__database",)
+
+    def __init__(self, database) -> None:
+        self.__database = database
+
+    @property
+    def backend(self):
+        raise PrivacyViolationError(
+            "The raw database backend is not exposed through privacy storage; "
+            "use the privacy-governed storage surface."
+        )
+
+    @property
+    def backend_type(self):
+        return self.__database.backend_type
+
+    @staticmethod
+    def _assert_no_semantic_sql(args, kwargs) -> None:
+        def visit(value) -> bool:
+            if isinstance(value, str):
+                return bool(_SEMANTIC_ASSERTION_SQL_RE.search(value))
+            if isinstance(value, dict):
+                return any(visit(item) for item in value.values())
+            if isinstance(value, (list, tuple, set, frozenset)):
+                return any(visit(item) for item in value)
+            return False
+
+        if visit(args) or visit(kwargs):
+            raise PrivacyViolationError(
+                "Direct semantic assertion database access is refused through "
+                "PrivacyEnforcingStorage; use its governed assertion methods."
+            )
+
+    @asynccontextmanager
+    async def transaction(self):
+        """Preserve transactions while keeping each proxied call governed."""
+        async with self.__database.transaction():
+            yield self
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        value = getattr(self.__database, name)
+        if not callable(value):
+            return value
+
+        async def governed(*args, **kwargs):
+            self._assert_no_semantic_sql(args, kwargs)
+            return await value(*args, **kwargs)
+
+        return governed
 
 
 # ── Cross-task reentry token for the privacy-transition lock (#2672 review P1) ──
@@ -2344,6 +2409,125 @@ class PrivacyEnforcingStorage:
         """Get incoming edges to a node."""
         return await self._storage.get_edges_to(node_id)
 
+    # === Canonical semantic assertions (explicit privacy-governed surface) ===
+    #
+    # Assertions are not graph nodes.  In particular, do not add an assertion
+    # method to ``_PrivacyGoverningGraphStore``: that proxy intentionally
+    # default-denies every unreviewed future graph writer.  These named facade
+    # methods are the only route from a privacy wrapper to the normalized
+    # assertion authority.
+
+    def _assert_semantic_assertion_write_allowed(self, operation: str) -> None:
+        if self._policy.use_session_storage:
+            raise PrivacyViolationError(
+                f"Canonical assertion operation '{operation}' blocked: ISOLATED "
+                "mode has no durable semantic assertion authority. Promotion is "
+                "a fresh governed write with fresh provenance."
+            )
+        if not self._policy.allow_persistent_write:
+            raise PrivacyViolationError(
+                f"Canonical assertion operation '{operation}' blocked: durable "
+                "semantic writes are default-denied in the current privacy config "
+                f"(storage={self._privacy_config.storage})."
+            )
+        if self._privacy_config.requires_anonymization():
+            # There is no generic, semantically safe way to redact an IRI or a
+            # typed literal while preserving a canonical claim identity.  A
+            # future approved redaction pipeline may submit an already-governed
+            # replacement; this boundary must not pretend string substitution is
+            # equivalent to semantic anonymization.
+            raise PrivacyViolationError(
+                f"Canonical assertion operation '{operation}' blocked: anonymous "
+                "semantic persistence requires an approved redacted assertion "
+                "pipeline; this wrapper will not silently rewrite canonical terms."
+            )
+
+    async def put_assertion(self, assertion, *, source_occurrences=(), operation_id=None):
+        self._assert_semantic_assertion_write_allowed("put_assertion")
+        return await self._storage.put_assertion(
+            assertion, source_occurrences=source_occurrences, operation_id=operation_id,
+        )
+
+    async def supersede_assertion(self, expected_predecessor_revision_id, replacement, *, source_occurrences=(), operation_id=None):
+        self._assert_semantic_assertion_write_allowed("supersede_assertion")
+        return await self._storage.supersede_assertion(
+            expected_predecessor_revision_id, replacement,
+            source_occurrences=source_occurrences, operation_id=operation_id,
+        )
+
+    async def retract_assertion(self, assertion_id, expected_revision_id, *, operation_id=None):
+        # Retraction removes eligibility and is allowed in every mode.
+        return await self._storage.retract_assertion(
+            assertion_id, expected_revision_id, operation_id=operation_id,
+        )
+
+    async def delete_assertion(self, assertion_id, expected_revision_id, *, operation_id=None):
+        # Lifecycle deletion removes eligibility and is likewise always allowed.
+        return await self._storage.delete_assertion(
+            assertion_id, expected_revision_id, operation_id=operation_id,
+        )
+
+    async def erase_assertion(self, assertion_id, *, operation_id=None):
+        # Physical erasure is never blocked by a privacy mode, a pin, or a
+        # derived reference.  The normalized store computes its full closure.
+        return await self._storage.erase_assertion(assertion_id, operation_id=operation_id)
+
+    async def get_assertion(self, assertion_id, *, include_inactive=False):
+        return await self._storage.get_assertion(assertion_id, include_inactive=include_inactive)
+
+    async def get_assertion_revision(self, revision_id):
+        return await self._storage.get_assertion_revision(revision_id)
+
+    async def query_assertions(self, query=None):
+        return await self._storage.query_assertions(query)
+
+    async def list_assertion_revisions(self, assertion_id):
+        return await self._storage.list_assertion_revisions(assertion_id)
+
+    async def list_assertion_sources(self, assertion_id):
+        return await self._storage.list_assertion_sources(assertion_id)
+
+    async def get_source_occurrence(self, source_occurrence_id):
+        return await self._storage.get_source_occurrence(source_occurrence_id)
+
+    async def get_derivation_inputs(self, revision_id):
+        return await self._storage.get_derivation_inputs(revision_id)
+
+    def _assert_semantic_assertion_incremental_read_allowed(self, operation: str) -> None:
+        """Prevent volatile modes from observing durable semantic progress."""
+        if (
+            not self._policy.allow_persistent_read
+            or self._privacy_config.is_ephemeral()
+            or self._policy.use_session_storage
+        ):
+            raise PrivacyViolationError(
+                f"Canonical assertion {operation} is disabled in volatile privacy modes"
+            )
+
+    async def assertion_checkpoint(self):
+        self._assert_semantic_assertion_incremental_read_allowed("checkpoint")
+        return await self._storage.assertion_checkpoint()
+
+    async def assertion_changes_since(self, generation, *, limit=100):
+        self._assert_semantic_assertion_incremental_read_allowed("change reads")
+        return await self._storage.assertion_changes_since(generation, limit=limit)
+
+    async def assertion_inference_inputs(self, query=None):
+        if self._privacy_config.is_ephemeral() or self._policy.use_session_storage:
+            raise PrivacyViolationError(
+                "Canonical assertion inference inputs are disabled in volatile privacy modes"
+            )
+        return await self._storage.assertion_inference_inputs(query)
+
+    async def export_assertion_snapshot(self, query=None):
+        if (
+            not self._policy.allow_persistent_read
+            or self._privacy_config.is_ephemeral()
+            or self._policy.use_session_storage
+        ):
+            raise PrivacyViolationError("Canonical assertion export is disabled in the current privacy config")
+        return await self._storage.export_assertion_snapshot(query)
+
     # === Private Agent Identity Resources (privacy-governed durable writes) ===
     #
     # A private identity resource (the SOUL body most notably) is user-derived
@@ -3380,30 +3564,30 @@ class PrivacyEnforcingStorage:
 
     # === Pass-through properties (with deprecation warnings) ===
     #
-    # These properties expose the underlying storage objects directly,
-    # which bypasses privacy mode enforcement. They are deprecated and
-    # callers should migrate to the privacy-aware methods above.
-    # They remain for backward compatibility with internal agent code.
+    # These properties retain selected compatibility surfaces for internal
+    # callers.  The database property is a governed view, not the underlying
+    # raw handle; callers should still prefer the explicit privacy-aware
+    # methods above.
 
     def _warn_direct_access(self, property_name: str) -> None:
         """Log a deprecation warning when a raw storage property is accessed."""
         warnings.warn(
-            f"Direct access to PrivacyEnforcingStorage.{property_name} bypasses "
-            f"privacy enforcement. Use privacy-aware methods instead "
+            f"Direct access to PrivacyEnforcingStorage.{property_name} is deprecated. "
+            f"Use privacy-aware methods instead "
             f"(e.g., query_conversations, get_conversation_history).",
             DeprecationWarning,
             stacklevel=3,
         )
         logger.warning(
-            f"Privacy bypass: direct access to .{property_name} property "
+            f"Deprecated direct access to .{property_name} property "
             f"(current mode: {self._privacy_mode.value})"
         )
 
     @property
     def db(self):
-        """Access to underlying database. DEPRECATED: bypasses privacy enforcement."""
+        """Return a guarded legacy database view, never its raw backend."""
         self._warn_direct_access("db")
-        return self._storage.db
+        return _PrivacyDatabaseView(self._storage.db)
 
     @property
     def db_path(self) -> str:

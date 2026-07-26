@@ -23,6 +23,12 @@ from .async_file_store import AsyncFileStore
 from .async_conversation_store import AsyncConversationStore
 from .destructive_audit import DestructiveAuditLog, audit_db_path_for
 from .async_graph_store import AsyncGraphStore, GraphNode, Edge, NodeSwapResult
+from .async_assertion_store import (
+    AsyncAssertionStore,
+    _AssertionTenantCapability,
+    _create_agent_bound_assertion_store,
+    _issue_assertion_tenant_capability,
+)
 from .async_rag_store import AsyncRAGStore
 from .agent_resource_store import (
     AgentResourceStore,
@@ -115,6 +121,7 @@ class AsyncStorage:
         config: Optional[Dict[str, Any]] = None,
         agent_id: str = "",
         llm_service: Optional[Any] = None,
+        _assertion_tenant_capability: Optional[_AssertionTenantCapability] = None,
     ):
         """
         Initialize AsyncStorage.
@@ -131,6 +138,12 @@ class AsyncStorage:
         self.db_path: Optional[str] = None
         self.agent_id = agent_id
         self.llm_service = llm_service
+        # A caller that supplies an already-reachable backend has not thereby
+        # established authority over an arbitrary assertion tenant.  Only
+        # storage that created/connected its own configured backend resolves a
+        # capability from its authenticated agent scope.  Shared-backend users
+        # must receive an opaque capability from their tenant resolver.
+        externally_supplied_backend = isinstance(backend, DatabaseBackend)
 
         # If backend is already a DatabaseBackend instance, use it directly
         if isinstance(backend, DatabaseBackend):
@@ -165,31 +178,68 @@ class AsyncStorage:
             self.db_path = db_path
             self._backend = SQLiteBackend(db_path)
 
+        if _assertion_tenant_capability is not None:
+            if type(_assertion_tenant_capability) is not _AssertionTenantCapability:
+                raise TypeError(
+                    "assertion tenant capability must be issued by the storage tenant resolver"
+                )
+            if _assertion_tenant_capability.tenant_id != agent_id:
+                raise ValueError("assertion tenant capability does not match AsyncStorage.agent_id")
+            self._assertion_tenant_capability = _assertion_tenant_capability
+        elif agent_id and not externally_supplied_backend:
+            self._assertion_tenant_capability = _issue_assertion_tenant_capability(agent_id)
+        else:
+            self._assertion_tenant_capability = None
+
         self.db: Optional[AsyncDatabase] = None
         self.files: Optional[AsyncFileStore] = None
         self.conversation: Optional[AsyncConversationStore] = None
         self.destructive_audit: Optional[DestructiveAuditLog] = None
         self.graph: Optional[AsyncGraphStore] = None
+        # Canonical semantic facts are intentionally separate from the property
+        # graph.  ``graph`` remains an application-resource/projection seam;
+        # ``assertions`` owns assertion lifecycle and provenance.
+        # Assertion scope is capability-bearing.  Keep it private so exposing
+        # this facade's database cannot be combined with a public constructor
+        # to forge another tenant's semantic authority.
+        self._assertions: Optional[AsyncAssertionStore] = None
         self.rag: Optional[AsyncRAGStore] = None
         self.agent_resources: Optional[AgentResourceStore] = None
         self._initialized = False
 
     @classmethod
-    def from_backend(cls, backend: DatabaseBackend) -> "AsyncStorage":
-        """Create AsyncStorage from an existing DatabaseBackend."""
-        return cls(backend=backend)
+    def from_backend(
+        cls,
+        backend: DatabaseBackend,
+        *,
+        agent_id: str = "",
+        _assertion_tenant_capability: Optional[_AssertionTenantCapability] = None,
+    ) -> "AsyncStorage":
+        """Create storage from a shared backend without minting tenant authority.
+
+        ``agent_id`` continues to scope the pre-existing file, graph, RAG, and
+        conversation stores.  Canonical assertions additionally require the
+        opaque capability issued by the host's authenticated tenant resolver;
+        a backend handle plus a caller-selected string is deliberately
+        insufficient.
+        """
+        return cls(
+            backend=backend,
+            agent_id=agent_id,
+            _assertion_tenant_capability=_assertion_tenant_capability,
+        )
 
     @classmethod
-    async def create_sqlite(cls, db_path: str) -> "AsyncStorage":
+    async def create_sqlite(cls, db_path: str, *, agent_id: str = "") -> "AsyncStorage":
         """Factory method to create and initialize SQLite-backed storage."""
-        storage = cls(db_path=db_path)
+        storage = cls(db_path=db_path, agent_id=agent_id)
         await storage.initialize()
         return storage
 
     @classmethod
-    async def create_postgres(cls, dsn: str) -> "AsyncStorage":
+    async def create_postgres(cls, dsn: str, *, agent_id: str = "") -> "AsyncStorage":
         """Factory method to create and initialize PostgreSQL-backed storage."""
-        storage = cls(backend="postgres", dsn=dsn)
+        storage = cls(backend="postgres", dsn=dsn, agent_id=agent_id)
         await storage.initialize()
         return storage
 
@@ -248,6 +298,11 @@ class AsyncStorage:
                 destructive_audit=self.destructive_audit,
             )
             self.graph = AsyncGraphStore(self.db, agent_id=self.agent_id)
+            if self._assertion_tenant_capability is not None:
+                self._assertions = _create_agent_bound_assertion_store(
+                    self.db,
+                    tenant_capability=self._assertion_tenant_capability,
+                )
             self.rag = AsyncRAGStore(
                 self.db,
                 llm_service=self.llm_service,
@@ -907,6 +962,104 @@ class AsyncStorage:
         if not self._initialized:
             await self.initialize()
         return await self.graph.get_edges(node_id, direction="in")
+
+    # --- Canonical Semantic Assertion Operations ---
+
+    def _assertion_store(self) -> AsyncAssertionStore:
+        if not self._initialized or self._assertions is None:
+            raise RuntimeError(
+                "Canonical assertion storage requires initialized, agent-bound AsyncStorage"
+            )
+        return self._assertions
+
+    async def put_assertion(self, assertion, *, source_occurrences=(), operation_id: Optional[str] = None):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().put_assertion(
+            assertion, source_occurrences=source_occurrences, operation_id=operation_id,
+        )
+
+    async def get_assertion(self, assertion_id: str, *, include_inactive: bool = False):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().get_assertion(assertion_id, include_inactive=include_inactive)
+
+    async def get_assertion_revision(self, revision_id: str):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().get_revision(revision_id)
+
+    async def query_assertions(self, query=None):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().query(query)
+
+    async def list_assertion_revisions(self, assertion_id: str):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().list_revisions(assertion_id)
+
+    async def list_assertion_sources(self, assertion_id: str):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().list_source_occurrences(assertion_id)
+
+    async def get_source_occurrence(self, source_occurrence_id: str):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().get_source_occurrence(source_occurrence_id)
+
+    async def get_derivation_inputs(self, revision_id: str):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().derivation_inputs(revision_id)
+
+    async def supersede_assertion(self, expected_predecessor_revision_id: str, replacement, *, source_occurrences=(), operation_id: Optional[str] = None):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().supersede(
+            expected_predecessor_revision_id, replacement,
+            source_occurrences=source_occurrences, operation_id=operation_id,
+        )
+
+    async def retract_assertion(self, assertion_id: str, expected_revision_id: str, *, operation_id: Optional[str] = None):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().retract(
+            assertion_id, expected_revision_id, operation_id=operation_id,
+        )
+
+    async def delete_assertion(self, assertion_id: str, expected_revision_id: str, *, operation_id: Optional[str] = None):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().delete(
+            assertion_id, expected_revision_id, operation_id=operation_id,
+        )
+
+    async def erase_assertion(self, assertion_id: str, *, operation_id: Optional[str] = None):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().erase(assertion_id, operation_id=operation_id)
+
+    async def assertion_checkpoint(self):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().checkpoint()
+
+    async def assertion_changes_since(self, generation: int, *, limit: int = 100):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().changes_since(generation, limit=limit)
+
+    async def assertion_inference_inputs(self, query=None):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().inference_inputs(query)
+
+    async def export_assertion_snapshot(self, query=None):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().export_snapshot(query)
 
     # --- RAG Operations ---
     

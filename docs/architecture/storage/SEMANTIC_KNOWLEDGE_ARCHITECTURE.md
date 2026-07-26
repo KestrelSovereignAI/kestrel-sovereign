@@ -19,9 +19,10 @@ privacy: public
 
 # Semantic Knowledge Architecture
 
-**Status:** Design of record — defines the implementation boundary before a
-semantic knowledge runtime is added. It does not claim that the tables,
-serializers, reasoner, or training exporter described below ship today.
+**Status:** Design of record. P1 ships the normalized, tenant-bound canonical
+assertion persistence authority and its lifecycle/provenance/checkpoint
+boundary; it does not claim an RDF serializer, reasoner, validator, vector
+projector, scheduler, or training exporter ships today.
 
 **Decision:** Kestrel has one canonical, tenant-scoped unit of knowledge: the
 **semantic assertion**. A fact, graph edge, RDF triple, embedding, validation
@@ -37,9 +38,9 @@ load-bearing contract for follow-on implementation tickets.
 
 ## Scope and non-goals
 
-This document specifies the future semantic knowledge layer and its migration
-boundary. It does not add an RDF library, an ontology, a reasoner, a database
-dependency, a tool, or a training pipeline. It also does not turn a
+This document specifies the semantic knowledge layer and its migration
+boundary. P1 adds no RDF library, ontology, reasoner, validator, vector
+generator, tool, or training pipeline. It also does not turn a
 conversation, an LLM completion, or a vector result into a fact merely by
 storing it.
 
@@ -1220,14 +1221,16 @@ parametric-self export boundary. The profile fixtures include one accepted RDF
 string: the latter two must produce `unsupported_rdf12_term`, no identity
 preimage, and no canonical/projection/training row.
 
-### Stage 1 — additive canonical store and dual-read shadow
+### Stage 1 — additive canonical store and dual-read shadow (P1 persistence shipped)
 
-Add versioned tables and typed writer/reader interfaces behind `AsyncDatabase`
-for SQLite and PostgreSQL. Backfill only a bounded copy of eligible
-`learned_fact` nodes as `reported` records with the legacy node as source
-occurrence. Preserve legacy rows untouched. Build projections in shadow and
-compare tenant/status/privacy-filtered results; do not route production
-retrieval through them yet.
+The P1 implementation adds versioned tables and tenant-bound typed storage
+interfaces behind `AsyncDatabase` for SQLite and PostgreSQL. It records
+immutable revisions, source occurrences, derivation supports, lifecycle and
+eligibility changes, idempotency receipts, and transaction checkpoints in one
+authority. The graph is explicitly an input/projection boundary and P1 adds no
+graph assertion writer. Bounded legacy `learned_fact` backfill and shadow
+projection comparison remain subsequent rollout work; legacy rows are
+preserved untouched and canonical reads are not routed through graph data.
 
 ### Stage 2 — dual write with outbox and verification
 
