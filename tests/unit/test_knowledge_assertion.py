@@ -182,6 +182,26 @@ def test_resource_and_literal_variants_have_lossless_versioned_mapping_round_tri
 
 
 @pytest.mark.parametrize(
+    ("lexical_form", "datatype_iri", "language"),
+    [
+        (" value ", XSD_STRING, None),
+        ("\tvalue", XSD_STRING, None),
+        ("value\u00a0", RDF_LANG_STRING, "en"),
+    ],
+)
+def test_literal_boundary_whitespace_is_rejected_in_identity_and_mapping_paths(
+    lexical_form: str, datatype_iri: str, language: str | None
+) -> None:
+    with pytest.raises(AssertionValidationError, match="leading or trailing whitespace"):
+        Literal(lexical_form, datatype_iri, language=language)
+
+    mapping = Literal("value", datatype_iri, language=language).to_mapping()
+    mapping["lexical_form"] = lexical_form
+    with pytest.raises(AssertionValidationError, match="leading or trailing whitespace"):
+        Literal.from_mapping(mapping)
+
+
+@pytest.mark.parametrize(
     ("status", "state", "supersedes"),
     [
         (AssertionStatus.ACTIVE, EpistemicState.REPORTED, None),
@@ -279,6 +299,20 @@ def test_direct_and_derived_provenance_round_trip_including_derivation_reference
 def test_fail_fast_validation_for_tenant_confidence_type_status_and_supersession(overrides: dict[str, object]) -> None:
     with pytest.raises(AssertionValidationError):
         direct_assertion(**overrides)
+
+
+def test_decimal_metadata_rejects_unbounded_fixed_point_mapping_before_rendering() -> None:
+    within_bound = direct_assertion(confidence="1e-1000").to_mapping()["confidence"]
+    assert isinstance(within_bound, str)
+    assert len(within_bound) == 1002
+    assert within_bound.endswith("1")
+
+    with pytest.raises(AssertionValidationError, match="confidence decimal exponent"):
+        direct_assertion(confidence="1e-100000000")
+    with pytest.raises(AssertionValidationError, match="score decimal exponent"):
+        AssertionResult(assertion=direct_assertion(), score="1e-100000000")
+    with pytest.raises(AssertionValidationError, match="fixed-point decimal serialization"):
+        AssertionResult(assertion=direct_assertion(), score="9" * 1025)
 
 
 def test_atomic_supersession_can_append_an_unlinked_old_state_revision() -> None:

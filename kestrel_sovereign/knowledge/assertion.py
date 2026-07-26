@@ -104,6 +104,12 @@ _GRANDFATHERED_LANGUAGE_TAGS = frozenset(
 _UNRESERVED = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
 _DEFAULT_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443, "ftp": 21}
 
+# Mappings preserve Decimal exactly as fixed-point text. Bound both the
+# exponent and the resulting text before formatting so untrusted metadata
+# cannot turn a compact exponential input into an unbounded allocation.
+_MAX_DECIMAL_ABS_EXPONENT = 1_000
+_MAX_DECIMAL_SERIALIZED_LENGTH = 1_024
+
 
 def _fail(message: str) -> None:
     raise AssertionValidationError(message)
@@ -413,8 +419,14 @@ def _instant_sort_key(value: str) -> tuple[int, int, int, int, int, int, int]:
     )
 
 
-def _normalize_literal(lexical_form: object, datatype_iri: object, language: object | None) -> tuple[str, str, str | None]:
-    lexical_form = unicodedata.normalize("NFC", _text(lexical_form, "literal lexical_form", nonempty=False))
+def _literal_lexical_form(value: object) -> str:
+    value = _text(value, "literal lexical_form", nonempty=False)
+    if value and (value[0].isspace() or value[-1].isspace()):
+        _fail("literal lexical_form must not have leading or trailing whitespace")
+    return unicodedata.normalize("NFC", value)
+
+
+def _normalize_literal(lexical_form: str, datatype_iri: object, language: object | None) -> tuple[str, str, str | None]:
     datatype_iri = normalize_iri(datatype_iri)
     normalized_language = _normalize_language(language) if language is not None else None
     if normalized_language is not None:
@@ -583,7 +595,7 @@ class Literal:
         direction = self.direction
         if direction is not None and direction not in {"ltr", "rtl"}:
             _fail("literal direction must be ltr or rtl")
-        lexical_form = unicodedata.normalize("NFC", _text(self.lexical_form, "literal lexical_form", nonempty=False))
+        lexical_form = _literal_lexical_form(self.lexical_form)
         datatype_iri = normalize_iri(self.datatype_iri)
         language = _normalize_language(self.language) if self.language is not None else None
         if direction is not None:
@@ -924,6 +936,7 @@ def _confidence(value: object) -> Decimal:
         _fail(f"confidence is invalid: {error}")
     if not confidence.is_finite() or not Decimal("0") <= confidence <= Decimal("1"):
         _fail("confidence must be within the inclusive range [0, 1]")
+    _validate_decimal_mapping_bounds(confidence, "confidence")
     return confidence
 
 
@@ -938,10 +951,46 @@ def _finite_decimal(value: object, field_name: str) -> Decimal:
         _fail(f"{field_name} is invalid: {error}")
     if not result.is_finite():
         _fail(f"{field_name} must be finite")
+    _validate_decimal_mapping_bounds(result, field_name)
     return result
 
 
+def _fixed_point_serialized_length(value: Decimal) -> int:
+    """Return ``format(value, 'f')``'s length without rendering it."""
+    decimal_tuple = value.as_tuple()
+    exponent = decimal_tuple.exponent
+    if not isinstance(exponent, int):  # finite values always have integer exponents
+        _fail("decimal must be finite")
+    sign_length = 1 if decimal_tuple.sign else 0
+    if value.is_zero():
+        return sign_length + (1 if exponent >= 0 else 2 - exponent)
+    digit_count = len(decimal_tuple.digits)
+    if exponent >= 0:
+        return sign_length + digit_count + exponent
+    fractional_digits = -exponent
+    if digit_count > fractional_digits:
+        return sign_length + digit_count + 1
+    return sign_length + 2 + fractional_digits
+
+
+def _validate_decimal_mapping_bounds(value: Decimal, field_name: str) -> None:
+    """Apply the v1 fixed-point mapping bounds before any rendering occurs."""
+    decimal_tuple = value.as_tuple()
+    exponent = decimal_tuple.exponent
+    if not isinstance(exponent, int):  # defensive: callers already require finite values
+        _fail(f"{field_name} must be finite")
+    if abs(exponent) > _MAX_DECIMAL_ABS_EXPONENT:
+        _fail(f"{field_name} decimal exponent must be within +/-{_MAX_DECIMAL_ABS_EXPONENT}")
+    serialized_length = _fixed_point_serialized_length(value)
+    if serialized_length > _MAX_DECIMAL_SERIALIZED_LENGTH:
+        _fail(
+            f"{field_name} fixed-point decimal serialization must be at most "
+            f"{_MAX_DECIMAL_SERIALIZED_LENGTH} characters"
+        )
+
+
 def _decimal_mapping(value: Decimal) -> str:
+    _validate_decimal_mapping_bounds(value, "decimal")
     return format(value, "f")
 
 
