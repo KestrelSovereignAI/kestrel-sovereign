@@ -49,8 +49,32 @@ from .assertion import (
     lineage_from_mapping,
     normalize_iri,
 )
-
 if TYPE_CHECKING:
+    from .rdf_codec import (
+        RdfAssertionCodec,
+        RdfAssertionReadAdapter,
+        RdfBlankNode,
+        RdfCapabilityReport,
+        RdfCodecConfiguration,
+        RdfCodecError,
+        RdfDataset,
+        RdfImportBudgetError,
+        RdfImportDocument,
+        RdfImportLimits,
+        RdfImportOwnership,
+        RdfImportSecurityError,
+        RdfIri,
+        RdfLiteral,
+        RdfOwnershipError,
+        RdfProjectionKind,
+        RdfTerm,
+        RdfTriple,
+        RdfTripleTerm,
+        RdfTypedQuery,
+        Sparql11AssertionReadAdapter,
+        Sparql12AssertionReadAdapter,
+        UnsupportedRdfCapabilityError,
+    )
     from .registry import (
         ArtifactPin,
         ExperimentalCapabilityError,
@@ -94,6 +118,26 @@ __all__ = [
     "MAPPING_SCHEMA_VERSION",
     "OntologyRef",
     "RDF_LANG_STRING",
+    "RdfAssertionCodec",
+    "RdfAssertionReadAdapter",
+    "RdfBlankNode",
+    "RdfCapabilityReport",
+    "RdfCodecConfiguration",
+    "RdfCodecError",
+    "RdfDataset",
+    "RdfImportBudgetError",
+    "RdfImportDocument",
+    "RdfImportLimits",
+    "RdfImportOwnership",
+    "RdfImportSecurityError",
+    "RdfIri",
+    "RdfLiteral",
+    "RdfOwnershipError",
+    "RdfProjectionKind",
+    "RdfTerm",
+    "RdfTriple",
+    "RdfTripleTerm",
+    "RdfTypedQuery",
     "ResolvedSemanticCapability",
     "Resource",
     "ResourceKind",
@@ -104,6 +148,8 @@ __all__ = [
     "SemanticVersion",
     "SourceOccurrence",
     "SourceProvenance",
+    "Sparql11AssertionReadAdapter",
+    "Sparql12AssertionReadAdapter",
     "StandardsMaturity",
     "TemporalInterval",
     "VersionConstraint",
@@ -116,6 +162,7 @@ __all__ = [
     "XSD_INTEGER",
     "XSD_STRING",
     "XSD_TIME",
+    "UnsupportedRdfCapabilityError",
     "derive_assertion_id",
     "get_knowledge_registry",
     "identity_preimage",
@@ -143,11 +190,43 @@ _REGISTRY_EXPORTS = frozenset(
     }
 )
 
+_RDF_CODEC_EXPORTS = frozenset(
+    {
+        "RdfAssertionCodec",
+        "RdfAssertionReadAdapter",
+        "RdfBlankNode",
+        "RdfCapabilityReport",
+        "RdfCodecConfiguration",
+        "RdfCodecError",
+        "RdfDataset",
+        "RdfImportBudgetError",
+        "RdfImportDocument",
+        "RdfImportLimits",
+        "RdfImportOwnership",
+        "RdfImportSecurityError",
+        "RdfIri",
+        "RdfLiteral",
+        "RdfOwnershipError",
+        "RdfProjectionKind",
+        "RdfTerm",
+        "RdfTriple",
+        "RdfTripleTerm",
+        "RdfTypedQuery",
+        "Sparql11AssertionReadAdapter",
+        "Sparql12AssertionReadAdapter",
+        "UnsupportedRdfCapabilityError",
+    }
+)
+
 
 def __getattr__(name: str):
-    """Lazily expose registry exports so its CLI can run as a module."""
-    if name not in _REGISTRY_EXPORTS:
-        raise AttributeError(name)
-    from . import registry
+    """Lazily expose optional boundaries so registry CLI execution stays clean."""
+    if name in _REGISTRY_EXPORTS:
+        from . import registry
 
-    return getattr(registry, name)
+        return getattr(registry, name)
+    if name in _RDF_CODEC_EXPORTS:
+        from . import rdf_codec
+
+        return getattr(rdf_codec, name)
+    raise AttributeError(name)

@@ -624,23 +624,30 @@ def _parse_resource(identifier: str, row: Mapping[str, object]) -> SemanticResou
         raise KnowledgeRegistryError(
             f"semantic resource {identifier!r} missing required fields: {', '.join(missing)}"
         )
+    # TOML table names must be unique, while a semantic resource identifier is
+    # intentionally stable across immutable releases.  A version-qualified
+    # table can therefore name its durable identifier explicitly; older rows
+    # retain the concise table-name form unchanged.
+    resource_identifier = (
+        _string_field(identifier, row, "identifier") if "identifier" in row else identifier
+    )
     return SemanticResource(
-        identifier=identifier,
-        version=SemanticVersion.parse(_string_field(identifier, row, "version")),
-        namespace=_string_field(identifier, row, "namespace"),
-        package_resource=_string_field(identifier, row, "package_resource"),
-        sha256=_string_field(identifier, row, "sha256"),
-        maturity=_enum_field(identifier, row, "maturity", StandardsMaturity),
-        kind=_enum_field(identifier, row, "kind", ResourceKind),
-        uri=_string_field(identifier, row, "uri"),
-        published_date=_string_field(identifier, row, "published_date"),
-        description=_string_field(identifier, row, "description"),
-        selected_terms=_string_tuple(identifier, row, "selected_terms"),
+        identifier=resource_identifier,
+        version=SemanticVersion.parse(_string_field(resource_identifier, row, "version")),
+        namespace=_string_field(resource_identifier, row, "namespace"),
+        package_resource=_string_field(resource_identifier, row, "package_resource"),
+        sha256=_string_field(resource_identifier, row, "sha256"),
+        maturity=_enum_field(resource_identifier, row, "maturity", StandardsMaturity),
+        kind=_enum_field(resource_identifier, row, "kind", ResourceKind),
+        uri=_string_field(resource_identifier, row, "uri"),
+        published_date=_string_field(resource_identifier, row, "published_date"),
+        description=_string_field(resource_identifier, row, "description"),
+        selected_terms=_string_tuple(resource_identifier, row, "selected_terms"),
         imports=tuple(
             ResourceRequirement.parse(value)
-            for value in _string_tuple(identifier, row, "imports")
+            for value in _string_tuple(resource_identifier, row, "imports")
         ),
-        capabilities=_string_tuple(identifier, row, "capabilities"),
+        capabilities=_string_tuple(resource_identifier, row, "capabilities"),
     )
 
 

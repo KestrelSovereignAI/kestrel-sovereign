@@ -382,7 +382,7 @@ term container.
 
 The snapshot-pinned `rdf12-cr-20260407` transport profile may recognize RDF
 1.2 source syntax, but it does **not** negotiate RDF 1.2 term support in this
-contract. In particular, an RDF 1.2 triple term (`<< s p o >>`) is not an
+contract. In particular, an RDF 1.2 triple term (`<<( s p o )>>`) is not an
 `AssertionTerm` in any position, and a directional language-tagged string is
 not a canonical literal because `AssertionTerm` has no direction member.
 The input adapter must never flatten either form into a string, substitute a
