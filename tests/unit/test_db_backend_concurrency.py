@@ -78,6 +78,61 @@ async def test_postgres_from_pool_derives_a_dedicated_advisory_pool_recipe():
 
 
 @pytest.mark.asyncio
+async def test_postgres_from_pool_preserves_list_connect_args_from_asyncpg_mutator():
+    """``Pool.set_connect_args()`` still supplies an advisory-pool recipe."""
+
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    class _Pool:
+        _connect = staticmethod(lambda *_args, **_kwargs: None)
+        _connection_class = object
+        _record_class = object
+
+        def get_max_size(self):
+            return 2
+
+        acquire = Mock(side_effect=AssertionError("shared pool must not be acquired"))
+
+    shared_pool = _Pool()
+    # asyncpg's public mutator deliberately stores the positional DSN in a
+    # list, unlike create_pool()'s initial tuple-shaped state.
+    postgres_module.asyncpg.Pool.set_connect_args(
+        shared_pool,
+        "postgresql://pool-reset/kestrel",
+        server_settings={"application_name": "host"},
+    )
+
+    backend = PostgresBackend.from_pool(shared_pool)
+    assert backend._advisory_connect_args == ("postgresql://pool-reset/kestrel",)
+    assert backend._advisory_connect_args is not shared_pool._connect_args
+    assert backend._advisory_recipe_available is True
+
+    # The backend keeps an immutable copy, not the mutable list that asyncpg
+    # changes when its public mutator is used again.
+    shared_pool._connect_args[0] = "postgresql://changed/kestrel"
+
+    advisory_pool = object()
+    with patch.object(
+        postgres_module.asyncpg,
+        "create_pool",
+        AsyncMock(return_value=advisory_pool),
+    ) as create_pool:
+        assert await backend._ensure_advisory_pool() is advisory_pool
+
+    create_pool.assert_awaited_once_with(
+        "postgresql://pool-reset/kestrel",
+        min_size=0,
+        max_size=2,
+        server_settings={"application_name": "host"},
+        connect=shared_pool._connect,
+        connection_class=object,
+        record_class=object,
+    )
+    shared_pool.acquire.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_postgres_from_pool_derives_keyword_only_advisory_pool_recipe():
     """asyncpg keyword-only pool settings are a valid dedicated recipe."""
 

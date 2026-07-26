@@ -25,6 +25,7 @@ ADVANCED MODE:
 import asyncio
 import contextvars
 import logging
+from collections.abc import Sequence as SequenceABC
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, AsyncIterator, List, Optional, Sequence, Tuple
@@ -251,8 +252,13 @@ class PostgresBackend(DatabaseBackend):
 
         raw_args = getattr(pool, "_connect_args", ())
         raw_kwargs = getattr(pool, "_connect_kwargs", {})
-        if not isinstance(raw_args, tuple) or not isinstance(raw_kwargs, dict):
+        if (
+            not isinstance(raw_args, SequenceABC)
+            or isinstance(raw_args, (str, bytes, bytearray))
+            or not isinstance(raw_kwargs, dict)
+        ):
             return (), {}
+        connect_args = tuple(raw_args)
         kwargs = dict(raw_kwargs)
         connect_factory = getattr(pool, "_connect", None)
         if callable(connect_factory):
@@ -263,7 +269,7 @@ class PostgresBackend(DatabaseBackend):
         record_class = getattr(pool, "_record_class", None)
         if record_class is not None:
             kwargs.setdefault("record_class", record_class)
-        return raw_args, kwargs
+        return connect_args, kwargs
 
     @staticmethod
     def _has_advisory_connection_recipe(
