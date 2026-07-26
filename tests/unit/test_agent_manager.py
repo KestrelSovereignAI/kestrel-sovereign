@@ -318,6 +318,114 @@ class TestAgentManagerBasics:
         agent.shutdown.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_pending_dynamic_registration_cannot_claim_before_onboarding_commit(
+        self, tmp_path
+    ):
+        """A host runner cannot adopt rollback-owned rows before onboarding."""
+
+        from kestrel_sovereign.features.scheduler.runner import (
+            SCHEDULER_PROTOCOL_VERSION,
+            SchedulerRunner,
+        )
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.storage.db import SQLiteBackend
+
+        backend = SQLiteBackend(str(tmp_path / "pending-registration.db"))
+        await backend.connect()
+        db = AsyncDatabase(backend)
+        manager = AgentManager()
+        manager.set_scheduler_polling_managed_by_host(True)
+        agent_id = "did:scheduler:pending-onboarding"
+        config = LocalAgentConfig(data_dir="dynamic", port=8801)
+        registration_runner = SchedulerRunner(
+            db,
+            None,
+            AsyncMock(),
+            authorized_agent_ids=(agent_id,),
+            owner_id="registration-owner",
+        )
+        pending = None
+        try:
+            async def register(_name, _agent_id, _config):
+                durable_registration = (
+                    await registration_runner.prepare_tenant_registration()
+                )
+
+                async def rollback() -> None:
+                    await registration_runner.rollback_tenant_registration(
+                        durable_registration
+                    )
+
+                rollback.scheduler_registration_nonce = (
+                    durable_registration.registration_nonce
+                )
+                return rollback
+
+            manager.set_scheduler_tenant_registration_hook(register)
+            pending = await manager._begin_dynamic_scheduler_tenant_registration(
+                "Dynamic", agent_id, config
+            )
+            assert pending is not None
+            assert manager.scheduler_authority_for(agent_id) == ("Dynamic", config)
+            assert not manager.is_scheduler_agent_authorized(agent_id)
+
+            now = datetime.now(timezone.utc).isoformat()
+            due = "2000-01-01T00:00:00+00:00"
+            await db.execute(
+                """
+                INSERT INTO scheduled_tasks
+                    (id, agent_id, task_name, cron_expression, args_json, enabled,
+                     next_run_at, created_at, scheduler_protocol_version,
+                     scheduler_registration_nonce)
+                VALUES (?, ?, 'backup_snapshot', '* * * * *', '{}', 1, ?, ?, ?, ?)
+                """,
+                (
+                    "pending-owned-schedule",
+                    agent_id,
+                    due,
+                    now,
+                    SCHEDULER_PROTOCOL_VERSION,
+                    pending.registration_nonce,
+                ),
+            )
+            host_runner = SchedulerRunner(
+                db,
+                None,
+                AsyncMock(return_value="executed"),
+                authorized_agent_ids=(agent_id,),
+                authorized_agent_ids_provider=manager.scheduler_authorized_agent_ids,
+                is_agent_authorized=manager.is_scheduler_agent_authorized,
+                owner_id="host-runner",
+            )
+
+            # This is the former race: a scope publication here let the host
+            # claim the row, clear its nonce, and make rollback retain it.
+            await host_runner._tick()
+            assert await db.fetchone(
+                "SELECT scheduler_registration_nonce FROM scheduled_tasks WHERE id = ?",
+                ("pending-owned-schedule",),
+            ) == (pending.registration_nonce,)
+            assert await db.fetchone(
+                "SELECT COUNT(*) FROM task_execution_log WHERE task_id = ?",
+                ("pending-owned-schedule",),
+            ) == (0,)
+
+            await pending.rollback()
+            pending = None
+            assert await db.fetchone(
+                "SELECT COUNT(*) FROM scheduled_tasks WHERE id = ?",
+                ("pending-owned-schedule",),
+            ) == (0,)
+            assert await db.fetchone(
+                "SELECT COUNT(*) FROM task_execution_log WHERE task_id = ?",
+                ("pending-owned-schedule",),
+            ) == (0,)
+        finally:
+            if pending is not None:
+                await pending.rollback()
+            await db.close()
+
+    @pytest.mark.asyncio
     async def test_hosted_cold_registration_validates_authority_without_releasing_owned_lock(
         self,
     ):
@@ -1744,7 +1852,7 @@ class TestSpawnAgent:
         )
 
         with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
-            child = await manager.spawn_agent("SpawnedBot", parent, mandate)
+            await manager.spawn_agent("SpawnedBot", parent, mandate)
 
         # Verify inception received parent_did
         call_kwargs = mock_inception.call_args[1]

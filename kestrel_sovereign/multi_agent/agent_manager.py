@@ -85,11 +85,18 @@ class _DynamicSchedulerTenantRegistration:
         self._finished = False
 
     def commit(self) -> None:
-        """Publish the registration by releasing its scheduler lifecycle lease."""
+        """Publish the registration by opening scheduler execution scope."""
 
         if self._finished:
             return
         self._finished = True
+        # Preparing the durable registration deliberately does not make the
+        # DID executable: post-load and host onboarding can still fail after
+        # that point, and a claim would adopt its private registration rows.
+        # This synchronous publication precedes releasing the lifecycle writer
+        # so a host scheduler can observe the DID only after onboarding has
+        # committed and no rollback can still own its durable state.
+        self._manager._scheduler_execution_scope.add(self._agent_id)
         self._lifecycle_lock.release()
 
     async def rollback(self) -> None:
@@ -795,7 +802,6 @@ class AgentManager:
                 lifecycle_lock,
                 rollback_protocol,
             )
-            self._scheduler_execution_scope.add(agent_id)
             if cancelled:
                 rollback_task = asyncio.create_task(
                     registration.rollback(),

@@ -1621,13 +1621,19 @@ class SchedulerRunner:
             await run_blocking_operation(lock.acquire)
             acquired = True
         except asyncio.CancelledError:
-            await run_blocking_operation(lock.release)
+            # ``flock(..., LOCK_UN)`` and ``UnlockFileEx`` are immediate
+            # unlock operations: neither waits for another reader or writer.
+            # Running them here, rather than queueing onto the default
+            # executor, guarantees an admitted effect can release its lock
+            # even when that executor is full of blocking acquisitions. It
+            # also adds no runner-owned executor that needs shutdown cleanup.
+            lock.release()
             raise
         try:
             yield
         finally:
             if acquired:
-                await run_blocking_operation(lock.release)
+                lock.release()
 
     @asynccontextmanager
     async def _bootstrap_serialization_boundary(self) -> AsyncIterator[None]:

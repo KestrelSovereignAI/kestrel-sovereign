@@ -1,6 +1,8 @@
 """Durability contracts for scheduler claims, leases, deadlines, and zones."""
 
 import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -1397,6 +1399,66 @@ async def test_sqlite_rollout_gate_allows_executor_write_and_delays_fence(tmp_pa
                 await asyncio.gather(task, return_exceptions=True)
         await db_a.close()
         await db_b.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_rollout_release_bypasses_saturated_default_executor(tmp_path):
+    """An unlock cannot wait behind blocking acquisitions in the default pool."""
+
+    database = SimpleNamespace(
+        backend_type="sqlite",
+        backend=SimpleNamespace(db_path=str(tmp_path / "rollout-lock.db")),
+    )
+    runner = SchedulerRunner(database, "agent-1", AsyncMock())
+    gate = runner._sqlite_rollout_gate("agent-1", shared=True)
+    loop = asyncio.get_running_loop()
+    prior_default_executor = getattr(loop, "_default_executor", None)
+    saturated_default_executor = ThreadPoolExecutor(max_workers=1)
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+    blocker = None
+    exit_task = None
+    gate_entered = False
+    loop.set_default_executor(saturated_default_executor)
+    try:
+        await gate.__aenter__()
+        gate_entered = True
+
+        # This models a blocking rollout reader/writer occupying the only
+        # default-executor worker. The old release path queued behind it;
+        # cleanup below releases the blocker before reporting that regression.
+        def block_default_executor() -> None:
+            blocker_started.set()
+            release_blocker.wait()
+
+        blocker = loop.run_in_executor(None, block_default_executor)
+        for _attempt in range(100):
+            if blocker_started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("default executor blocker did not start")
+
+        exit_task = asyncio.create_task(gate.__aexit__(None, None, None))
+        done, _ = await asyncio.wait({exit_task}, timeout=0.2)
+        assert exit_task in done, (
+            "SQLite rollout unlock queued behind a saturated default executor"
+        )
+        gate_entered = False
+        await exit_task
+    finally:
+        release_blocker.set()
+        if blocker is not None:
+            await asyncio.wait_for(blocker, timeout=1)
+        if exit_task is not None and not exit_task.done():
+            await asyncio.wait_for(exit_task, timeout=1)
+        elif gate_entered:
+            await gate.__aexit__(None, None, None)
+        if prior_default_executor is None:
+            loop._default_executor = None
+        else:
+            loop.set_default_executor(prior_default_executor)
+        saturated_default_executor.shutdown(wait=True)
 
 
 @pytest.mark.asyncio
