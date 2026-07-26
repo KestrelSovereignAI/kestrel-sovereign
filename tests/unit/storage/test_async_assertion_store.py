@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -235,6 +236,13 @@ def test_assertion_authority_requires_a_loader_verified_identity() -> None:
             OTHER_TENANT,
             _LOADER_VERIFIED_IDENTITY,
         )
+    copied_and_mutated = copy.copy(_LOADER_VERIFIED_IDENTITY)
+    object.__setattr__(copied_and_mutated, "legacy_did", OTHER_TENANT)
+    with pytest.raises(TypeError, match="loader-verified AgentIdentity"):
+        _resolve_authenticated_agent_assertion_capability(
+            OTHER_TENANT,
+            copied_and_mutated,
+        )
     capability = _assertion_capability(TENANT)
     assert capability is not None and capability.tenant_id == TENANT
 
@@ -409,6 +417,61 @@ async def test_lifecycle_closure_preserves_independent_current_replacements() ->
         assert derived_child.assertion_id in erased.erased_assertion_ids
         assert independent.assertion_id not in erased.erased_assertion_ids
         assert await storage.get_assertion(independent.assertion_id) == replacement.replacement
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_erasure_scrubs_historical_lineage_but_preserves_same_identity_direct_replacement() -> None:
+    storage = await _storage()
+    db = storage.db
+    try:
+        root = direct("same-identity-root", source_id="same-identity-root-source")
+        await storage.put_assertion(
+            root,
+            source_occurrences=(source("same-identity-root-source"),),
+        )
+        derived_child = derived("same-identity-derived", root.revision_id)
+        await storage.put_assertion(derived_child)
+
+        replacement_mapping = derived_child.to_mapping()
+        replacement_mapping["revision_id"] = "same-identity-direct"
+        replacement_mapping["lineage"] = DirectLineage(
+            ("same-identity-direct-source",)
+        ).to_mapping()
+        replacement_mapping["epistemic_state"] = EpistemicState.REPORTED.value
+        direct_replacement = Assertion.from_mapping(replacement_mapping)
+        assert direct_replacement.assertion_id == derived_child.assertion_id
+
+        supersession = await storage.supersede_assertion(
+            derived_child.revision_id,
+            direct_replacement,
+            source_occurrences=(source("same-identity-direct-source"),),
+        )
+
+        erased = await storage.erase_assertion(root.assertion_id)
+
+        assert root.assertion_id in erased.erased_assertion_ids
+        assert derived_child.assertion_id not in erased.erased_assertion_ids
+        assert derived_child.revision_id in erased.erased_revision_ids
+        assert supersession.predecessor.revision_id in erased.erased_revision_ids
+        assert supersession.replacement.revision_id not in erased.erased_revision_ids
+        assert await storage.get_assertion(derived_child.assertion_id) == supersession.replacement
+        assert await storage.get_assertion_revision(derived_child.revision_id) is None
+        assert await storage.get_assertion_revision(supersession.predecessor.revision_id) is None
+        assert await db.fetchall(
+            "SELECT revision_id FROM semantic_assertion_revisions "
+            "WHERE tenant_id = ? AND assertion_id = ?",
+            (TENANT, derived_child.assertion_id),
+        ) == [(supersession.replacement.revision_id,)]
+        assert await db.fetchval(
+            "SELECT COUNT(*) FROM semantic_derivation_inputs WHERE tenant_id = ?",
+            (TENANT,),
+        ) == 0
+        assert await db.fetchval(
+            "SELECT COUNT(*) FROM semantic_assertion_operations WHERE tenant_id = ?",
+            (TENANT,),
+        ) == 0
     finally:
         await storage.close()
 
@@ -766,5 +829,30 @@ async def test_volatile_privacy_modes_cannot_read_populated_assertion_authority(
         for read in reads:
             with pytest.raises(PrivacyViolationError, match="volatile privacy modes"):
                 await read
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [PrivacyMode.EPHEMERAL, PrivacyMode.ISOLATED])
+async def test_volatile_privacy_modes_block_lifecycle_results_with_durable_content(mode) -> None:
+    storage = await _storage()
+    try:
+        root = direct("volatile-lifecycle-root", source_id="volatile-lifecycle-source")
+        await storage.put_assertion(
+            root,
+            source_occurrences=(source("volatile-lifecycle-source"),),
+        )
+        dependent = derived("volatile-lifecycle-dependent", root.revision_id)
+        await storage.put_assertion(dependent)
+        wrapper = PrivacyEnforcingStorage(storage, mode)
+
+        with pytest.raises(PrivacyViolationError, match="volatile privacy modes"):
+            await wrapper.retract_assertion(root.assertion_id, root.revision_id)
+        with pytest.raises(PrivacyViolationError, match="volatile privacy modes"):
+            await wrapper.delete_assertion(root.assertion_id, root.revision_id)
+
+        assert await storage.get_assertion(root.assertion_id) == root
+        assert await storage.get_assertion(dependent.assertion_id) == dependent
     finally:
         await storage.close()

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from kestrel_sovereign.identity.runtime_identity import (
     AgentIdentity,
-    _is_loader_verified_agent_identity,
+    _loader_verified_identity_binding,
 )
 from kestrel_sovereign.storage.async_assertion_store import (
     _AssertionTenantCapability,
@@ -29,15 +29,11 @@ def _resolve_authenticated_agent_assertion_capability(
         raise ValueError("authenticated semantic assertion tenants require a DID")
     if agent_identity is None:
         return None
-    if not _is_loader_verified_agent_identity(agent_identity):
+    binding = _loader_verified_identity_binding(agent_identity)
+    if binding is None:
         raise TypeError(
             "semantic assertion authority requires a loader-verified AgentIdentity"
         )
-    bound_dids = {
-        candidate
-        for candidate in (agent_identity.legacy_did, agent_identity.new_did)
-        if isinstance(candidate, str) and candidate
-    }
-    if authenticated_agent_did not in bound_dids:
+    if authenticated_agent_did not in binding.dids:
         raise ValueError("agent identity is not bound to the semantic assertion tenant")
     return _issue_assertion_tenant_capability(authenticated_agent_did)

@@ -311,6 +311,64 @@ async def test_derived_assertion_lifecycle_parity(db_backend, tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_erasure_scrubs_historical_derived_lineage_on_both_backends(
+    db_backend,
+    tmp_path,
+):
+    """A same-identity direct replacement survives while stale lineage is erased."""
+    from kestrel_sovereign.knowledge import Assertion, DirectLineage, EpistemicState
+
+    tenant, identity = await _incepted_assertion_identity(tmp_path, "historical-lineage")
+    storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    try:
+        root = _semantic_assertion(tenant, "historical-root", value="historical-root")
+        await storage.put_assertion(
+            root,
+            source_occurrences=(_semantic_source("parity-source"),),
+        )
+        derived = _derived_semantic_assertion(
+            tenant,
+            "historical-derived",
+            root.revision_id,
+            "historical",
+        )
+        await storage.put_assertion(derived)
+
+        replacement_mapping = derived.to_mapping()
+        replacement_mapping["revision_id"] = "historical-direct-replacement"
+        replacement_mapping["lineage"] = DirectLineage(
+            ("historical-direct-source",)
+        ).to_mapping()
+        replacement_mapping["epistemic_state"] = EpistemicState.REPORTED.value
+        replacement = Assertion.from_mapping(replacement_mapping)
+        assert replacement.assertion_id == derived.assertion_id
+        supersession = await storage.supersede_assertion(
+            derived.revision_id,
+            replacement,
+            source_occurrences=(_semantic_source("historical-direct-source"),),
+        )
+
+        erased = await storage.erase_assertion(root.assertion_id)
+
+        assert derived.assertion_id not in erased.erased_assertion_ids
+        assert derived.revision_id in erased.erased_revision_ids
+        assert supersession.predecessor.revision_id in erased.erased_revision_ids
+        assert await storage.get_assertion(derived.assertion_id) == supersession.replacement
+        assert await storage.db.fetchall(
+            "SELECT revision_id FROM semantic_assertion_revisions "
+            "WHERE tenant_id = ? AND assertion_id = ?",
+            (tenant, derived.assertion_id),
+        ) == [(supersession.replacement.revision_id,)]
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM semantic_derivation_inputs WHERE tenant_id = ?",
+            (tenant,),
+        ) == 0
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_erasure_emits_an_opaque_retryable_change_on_both_backends(
     db_backend,
     tmp_path,

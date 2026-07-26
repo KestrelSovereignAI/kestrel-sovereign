@@ -670,6 +670,54 @@ class AsyncAssertionStore:
              _json(sorted(set(revision_ids))), _now()),
         )
 
+    async def _delete_operations_referencing(
+        self,
+        assertion_ids: set[str],
+        revision_ids: set[str],
+    ) -> None:
+        """Remove idempotency receipts that retain any physically erased ID.
+
+        The identifiers are stored as JSON arrays for backend-neutral audit
+        data. Parsing them avoids SQL ``LIKE`` semantics, which would treat
+        ``%`` and ``_`` in a caller-provided ID as wildcards and could leave a
+        recoverable receipt behind.
+        """
+        tenant_id, _ = self._require_scope()
+        rows = await self._database.fetchall(
+            "SELECT operation_id, assertion_ids, revision_ids "
+            "FROM semantic_assertion_operations WHERE tenant_id = ?",
+            (tenant_id,),
+        )
+        operation_ids: list[str] = []
+        for operation_id, encoded_assertion_ids, encoded_revision_ids in rows:
+            try:
+                recorded_assertion_ids = json.loads(encoded_assertion_ids)
+                recorded_revision_ids = json.loads(encoded_revision_ids)
+            except (TypeError, json.JSONDecodeError) as error:
+                raise AssertionStoreError(
+                    "semantic operation receipt contains malformed identifier data"
+                ) from error
+            if not (
+                isinstance(recorded_assertion_ids, list)
+                and all(isinstance(item, str) for item in recorded_assertion_ids)
+                and isinstance(recorded_revision_ids, list)
+                and all(isinstance(item, str) for item in recorded_revision_ids)
+            ):
+                raise AssertionStoreError(
+                    "semantic operation receipt contains malformed identifier data"
+                )
+            if (
+                assertion_ids.intersection(recorded_assertion_ids)
+                or revision_ids.intersection(recorded_revision_ids)
+            ):
+                operation_ids.append(operation_id)
+        if operation_ids:
+            await self._database.execute(
+                "DELETE FROM semantic_assertion_operations WHERE tenant_id = ? "
+                f"AND operation_id IN ({_placeholders(operation_ids)})",
+                (tenant_id,) + tuple(operation_ids),
+            )
+
     async def _erasure_operation(self, operation_id: str, request: object):
         """Resolve an idempotent physical-erasure receipt within this tenant.
 
@@ -1076,17 +1124,30 @@ class AsyncAssertionStore:
                 batch = tuple(sorted(pending))
                 pending.clear()
                 rows = await self._database.fetchall(
-                    "SELECT DISTINCT r.assertion_id FROM semantic_derivation_inputs d "
-                    "JOIN semantic_assertions a ON a.tenant_id = d.tenant_id "
-                    "  AND a.current_revision_id = d.derived_revision_id "
+                    "SELECT DISTINCT r.assertion_id, r.revision_id, a.current_revision_id "
+                    "FROM semantic_derivation_inputs d "
                     "JOIN semantic_assertion_revisions r ON r.tenant_id = d.tenant_id "
                     "  AND r.revision_id = d.derived_revision_id "
+                    "JOIN semantic_assertions a ON a.tenant_id = r.tenant_id "
+                    "  AND a.assertion_id = r.assertion_id "
                     f"WHERE d.tenant_id = ? AND d.input_revision_id IN ({_placeholders(batch)}) "
-                    "ORDER BY r.assertion_id ASC",
+                    "ORDER BY r.assertion_id ASC, r.revision_id ASC",
                     (tenant_id,) + batch,
                 )
-                for (derived_assertion_id,) in rows:
-                    if derived_assertion_id in assertion_ids:
+                for derived_assertion_id, derived_revision_id, current_revision_id in rows:
+                    # Derivation rows are historical evidence. Follow them
+                    # after a dependent is superseded, otherwise a root
+                    # erasure leaves recoverable lineage behind.
+                    if derived_revision_id not in revision_ids:
+                        revision_ids.add(derived_revision_id)
+                        pending.add(derived_revision_id)
+                    if (
+                        current_revision_id != derived_revision_id
+                        or derived_assertion_id in assertion_ids
+                    ):
+                        # A newer independent current revision owns this
+                        # deterministic assertion identity. Remove only its
+                        # reachable historical lineage, never that replacement.
                         continue
                     assertion_ids.add(derived_assertion_id)
                     all_revisions = await self._database.fetchall(
@@ -1120,12 +1181,7 @@ class AsyncAssertionStore:
                 f"DELETE FROM semantic_revision_sources WHERE tenant_id = ? AND revision_id IN ({_placeholders(revision_tuple)})",
                 (tenant_id,) + revision_tuple,
             )
-            operation_predicates = " OR ".join("assertion_ids LIKE ?" for _ in assertion_tuple)
-            await self._database.execute(
-                "DELETE FROM semantic_assertion_operations WHERE tenant_id = ? AND ("
-                + operation_predicates + ")",
-                (tenant_id,) + tuple(f'%"{item}"%' for item in assertion_tuple),
-            )
+            await self._delete_operations_referencing(assertion_ids, revision_ids)
             await self._database.execute(
                 f"DELETE FROM semantic_assertions WHERE tenant_id = ? AND assertion_id IN ({_placeholders(assertion_tuple)})",
                 (tenant_id,) + assertion_tuple,

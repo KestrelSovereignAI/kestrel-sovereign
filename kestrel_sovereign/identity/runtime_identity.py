@@ -32,13 +32,16 @@ Design notes
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+import weakref
 
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric import ec
 
@@ -67,7 +70,6 @@ logger = logging.getLogger(__name__)
 # separate from the public identity data: callers may construct an
 # ``AgentIdentity`` for signing tests or other local work, but that does not
 # establish authority over a persisted semantic tenant.
-_LOADER_VERIFIED_IDENTITY_WITNESS = object()
 _LOADER_VERIFIED_IDENTITY_FACTORY_TOKEN = object()
 
 
@@ -195,13 +197,6 @@ class AgentIdentity:
     succession_chain: Optional[SuccessionChain] = None
     archival_keypair: Optional[Keypair] = None
     succession_statement: Optional[SuccessionStatement] = None
-    _loader_verified_witness: object | None = field(
-        default=None,
-        init=False,
-        repr=False,
-        compare=False,
-    )
-
     def __post_init__(self) -> None:
         if self.hybrid_keypair is None and self.legacy_keypair is None:
             raise RuntimeIdentityError(
@@ -229,6 +224,109 @@ class AgentIdentity:
         return self.new_did if self.is_hybrid else self.legacy_did
 
 
+@dataclass(frozen=True)
+class _LoaderVerifiedIdentityBinding:
+    """Immutable loader evidence held outside a mutable identity instance."""
+
+    dids: frozenset[str]
+    public_material_digest: str
+
+
+_LOADER_VERIFIED_IDENTITIES: dict[
+    int,
+    tuple[weakref.ReferenceType[AgentIdentity], _LoaderVerifiedIdentityBinding],
+] = {}
+
+
+def _identity_dids(identity: AgentIdentity) -> frozenset[str]:
+    return frozenset(
+        candidate
+        for candidate in (identity.legacy_did, identity.new_did)
+        if isinstance(candidate, str) and candidate
+    )
+
+
+def _keypair_public_material(keypair: Keypair | None) -> bytes:
+    if keypair is None:
+        return b""
+    if not isinstance(keypair, Keypair):
+        raise TypeError("runtime identity key material has an invalid keypair type")
+    public_key = keypair.public_key
+    if isinstance(public_key, bytes):
+        return public_key
+    if not hasattr(public_key, "public_bytes"):
+        raise TypeError("runtime identity key material has no serializable public key")
+    try:
+        return public_key.public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    except (TypeError, ValueError):
+        # The classical keys loaded here support DER. Retain a raw fallback
+        # for providers whose public-key object supports only its native form.
+        return public_key.public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw,
+        )
+
+
+def _identity_public_material_digest(identity: AgentIdentity) -> str:
+    """Fingerprint loader-verified public key material, not object identities."""
+    hybrid = identity.hybrid_keypair
+    if hybrid is not None and not isinstance(hybrid, HybridKeypair):
+        raise TypeError("runtime identity hybrid key material has an invalid type")
+    parts = [
+        b"legacy\x00" + _keypair_public_material(identity.legacy_keypair),
+        b"hybrid-classical\x00" + _keypair_public_material(
+            hybrid.classical if hybrid is not None else None
+        ),
+        b"hybrid-pq\x00" + _keypair_public_material(
+            hybrid.pq if hybrid is not None else None
+        ),
+        b"archival\x00" + _keypair_public_material(identity.archival_keypair),
+    ]
+    return hashlib.sha256(b"\x1f".join(parts)).hexdigest()
+
+
+def _register_loader_verified_identity(identity: AgentIdentity) -> None:
+    """Record immutable DID/key evidence without trusting identity attributes."""
+    binding = _LoaderVerifiedIdentityBinding(
+        dids=_identity_dids(identity),
+        public_material_digest=_identity_public_material_digest(identity),
+    )
+    if not binding.dids:
+        raise RuntimeIdentityError("loader-verified identity has no DID binding")
+    identity_id = id(identity)
+
+    def _clear(reference: weakref.ReferenceType[AgentIdentity]) -> None:
+        current = _LOADER_VERIFIED_IDENTITIES.get(identity_id)
+        if current is not None and current[0] is reference:
+            del _LOADER_VERIFIED_IDENTITIES[identity_id]
+
+    _LOADER_VERIFIED_IDENTITIES[identity_id] = (weakref.ref(identity, _clear), binding)
+
+
+def _loader_verified_identity_binding(
+    identity: object,
+) -> _LoaderVerifiedIdentityBinding | None:
+    """Return independent loader evidence only while object and contents match."""
+    if type(identity) is not AgentIdentity:
+        return None
+    entry = _LOADER_VERIFIED_IDENTITIES.get(id(identity))
+    if entry is None or entry[0]() is not identity:
+        return None
+    binding = entry[1]
+    try:
+        matches = (
+            _identity_dids(identity) == binding.dids
+            and _identity_public_material_digest(identity)
+            == binding.public_material_digest
+        )
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return binding if matches else None
+
+
 def _loader_verified_agent_identity(
     token: object,
     **kwargs: object,
@@ -237,11 +335,7 @@ def _loader_verified_agent_identity(
     if token is not _LOADER_VERIFIED_IDENTITY_FACTORY_TOKEN:
         raise TypeError("loader verification witness is issued only by load_agent_identity")
     identity = AgentIdentity(**kwargs)
-    object.__setattr__(
-        identity,
-        "_loader_verified_witness",
-        _LOADER_VERIFIED_IDENTITY_WITNESS,
-    )
+    _register_loader_verified_identity(identity)
     return identity
 
 
@@ -252,10 +346,7 @@ def _is_loader_verified_agent_identity(identity: object) -> bool:
     identity predicate.  It prevents an attribute-compatible object—or a
     directly constructed runtime identity—from becoming storage authority.
     """
-    return (
-        type(identity) is AgentIdentity
-        and identity._loader_verified_witness is _LOADER_VERIFIED_IDENTITY_WITNESS
-    )
+    return _loader_verified_identity_binding(identity) is not None
 
 
 def _validate_hybrid_key_binding(

@@ -2456,13 +2456,17 @@ class PrivacyEnforcingStorage:
         )
 
     async def retract_assertion(self, assertion_id, expected_revision_id, *, operation_id=None):
-        # Retraction removes eligibility and is allowed in every mode.
+        # The result contains the retracted assertion and every dependent.
+        # Volatile sessions have no local semantic store, so returning that
+        # durable content would pierce their read boundary.
+        self._assert_semantic_assertion_read_allowed("retractions")
         return await self._storage.retract_assertion(
             assertion_id, expected_revision_id, operation_id=operation_id,
         )
 
     async def delete_assertion(self, assertion_id, expected_revision_id, *, operation_id=None):
-        # Lifecycle deletion removes eligibility and is likewise always allowed.
+        # A deletion result likewise includes durable dependent content.
+        self._assert_semantic_assertion_read_allowed("deletions")
         return await self._storage.delete_assertion(
             assertion_id, expected_revision_id, operation_id=operation_id,
         )
