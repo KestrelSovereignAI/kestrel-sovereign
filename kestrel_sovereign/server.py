@@ -780,6 +780,7 @@ def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
             # dispatching without a stale startup snapshot (#2089/#2522).
             if _is_webhook_receiver(getattr(feature, "receiver", None)):
                 continue
+            routes_before_include: Optional[int] = None
             try:
                 router = feature.get_router()
                 if router is None:
@@ -787,7 +788,7 @@ def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
                 router_key = _feature_router_signature(name, router)
                 if router_key in mounted_keys:
                     continue
-                before = len(app.routes)
+                routes_before_include = len(app.routes)
                 app.include_router(router)
                 # Gate exactly the routes this feature just contributed so a
                 # runtime disable/remove makes them 404 (never a core route).
@@ -800,7 +801,7 @@ def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
                 )
                 added = tuple(
                     candidate
-                    for candidate in app.routes[before:]
+                    for candidate in app.routes[routes_before_include:]
                     if hasattr(candidate, "app")
                 )
                 if len(added) != len(selectors):
@@ -814,6 +815,13 @@ def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
                 mounted_keys.add(router_key)
                 mounted.append(name)
             except Exception as exc:
+                if routes_before_include is not None:
+                    # ``include_router`` can copy ordinary routes before it
+                    # reaches a child it cannot preserve (for example a
+                    # mounted sub-application). Treat validation as an atomic
+                    # mount: never leave those partial, ungated routes in the
+                    # app or let a later retry add duplicates.
+                    del app.routes[routes_before_include:]
                 logger.warning("Failed to mount router from feature %s: %s", name, exc)
 
     if agents is None:

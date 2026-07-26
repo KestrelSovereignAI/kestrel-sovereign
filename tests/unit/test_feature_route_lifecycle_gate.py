@@ -109,6 +109,23 @@ class _InstanceBoundRouterFeature:
         return router
 
 
+class _PartiallyCopiedRouterFeature:
+    """A router whose mounted child FastAPI cannot be copied by include_router."""
+
+    def __init__(self):
+        self.enabled = True
+
+    def get_router(self):
+        router = APIRouter()
+
+        @router.get("/test-feature-lifecycle/partial-normal")
+        async def normal_route():
+            return {"partial": False}
+
+        router.mount("/test-feature-lifecycle/partial-child", FastAPI())
+        return router
+
+
 async def _overrideable_feature_route_dependency():
     """A stable dependency key used to exercise app-level overrides."""
 
@@ -316,6 +333,30 @@ def test_repeated_feature_mounts_are_deduplicated_and_unmounted():
         restore()
 
     assert _bridge_health_route_count(app) == 0
+
+
+def test_invalid_feature_router_rolls_back_partially_included_routes():
+    """A non-copyable child cannot leave an ungated route or retry duplicate."""
+
+    from kestrel_sovereign import server
+
+    feature = _PartiallyCopiedRouterFeature()
+    app = FastAPI()
+    app.state.agent = _make_agent({"PartialFeature": feature})
+    app.state.agent_manager = None
+    normal_path = "/test-feature-lifecycle/partial-normal"
+
+    server._mount_feature_routers(app)
+    assert not any(getattr(route, "path", None) == normal_path for route in app.routes)
+    assert getattr(app.state, "_feature_routes", []) == []
+    assert getattr(app.state, "_feature_router_keys", set()) == set()
+
+    # A retry sees the same invalid shape but cannot accumulate an earlier
+    # copied route; this guards both runtime reloads and repeated cold wakes.
+    server._mount_feature_routers(app)
+    assert not any(getattr(route, "path", None) == normal_path for route in app.routes)
+    assert getattr(app.state, "_feature_routes", []) == []
+    assert getattr(app.state, "_feature_router_keys", set()) == set()
 
 
 def test_dynamic_feature_routes_invalidate_openapi_schema_on_mount_and_unmount():
