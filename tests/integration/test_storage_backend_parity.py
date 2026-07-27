@@ -31,10 +31,14 @@ from kestrel_sovereign.storage.async_file_store import AsyncFileStore
 from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore, GraphNode
 from kestrel_sovereign.storage.async_rag_store import AsyncRAGStore
 from kestrel_sovereign.storage.async_storage import AsyncStorage
-from kestrel_sovereign.storage.db.interface import QueryError
+from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
 from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
 from kestrel_sovereign.storage.saved_items_store import SavedItemsStore
 from kestrel_sovereign.storage.schema_router import SchemaRouter
+from kestrel_sovereign.storage.sqla.migrations import (
+    _SEMANTIC_MAINTENANCE_LEASE_PRECISION_SCHEMA_VERSION,
+    migrate_semantic_maintenance,
+)
 from kestrel_sovereign.security.assertion_tenant_resolver import (
     _resolve_authenticated_agent_assertion_capability,
 )
@@ -210,6 +214,126 @@ async def _assertion_storage_for_backend(
     )
     await storage.initialize()
     return storage
+
+
+class _RollbackLeasePrecisionProbe(Exception):
+    """Sentinel used to leave the shared PostgreSQL fixture unchanged."""
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_semantic_maintenance_lease_precision_upgrade_is_backend_neutral(
+    db_backend,
+    tmp_path,
+):
+    """Legacy PostgreSQL leases upgrade to float8 without changing SQLite."""
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path,
+        "maintenance-lease-precision",
+    )
+    storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    probe_tenant = f"lease-precision:{uuid4()}"
+    # 1,774,000,000 is a multiple of 128. At this epoch, float4 rounds a
+    # 60.125-second lease back to the base while float8 preserves the duration.
+    epoch_base = 1_774_000_000.0
+    expected_expiry = epoch_base + 60.125
+    try:
+        try:
+            async with storage.db.transaction():
+                await storage.db.execute(
+                    "DELETE FROM semantic_schema_migrations WHERE version = ?",
+                    (_SEMANTIC_MAINTENANCE_LEASE_PRECISION_SCHEMA_VERSION,),
+                )
+                if storage.db.backend_type == "postgres":
+                    await storage.db.execute(
+                        "ALTER TABLE semantic_maintenance_leases "
+                        "ALTER COLUMN expires_at TYPE REAL "
+                        "USING expires_at::REAL",
+                        (),
+                    )
+                    assert await storage.db.fetchone(
+                        "SELECT udt_name FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() "
+                        "AND table_name = 'semantic_maintenance_leases' "
+                        "AND column_name = 'expires_at'",
+                        (),
+                    ) == ("float4",)
+                    await storage.db.execute(
+                        "INSERT INTO semantic_maintenance_leases "
+                        "(tenant_id, holder_id, fencing_token, expires_at, updated_at) "
+                        "VALUES (?, 'legacy-float4', 1, ?, '2026-07-27T00:00:00Z')",
+                        (probe_tenant, expected_expiry),
+                    )
+                    legacy_expiry = float(
+                        await storage.db.fetchval(
+                            "SELECT expires_at FROM semantic_maintenance_leases "
+                            "WHERE tenant_id = ?",
+                            (probe_tenant,),
+                        )
+                    )
+                    assert abs(legacy_expiry - expected_expiry) >= 1.0
+
+                await migrate_semantic_maintenance(storage.db)
+
+                marker_count = await storage.db.fetchval(
+                    "SELECT COUNT(*) FROM semantic_schema_migrations "
+                    "WHERE version = ?",
+                    (_SEMANTIC_MAINTENANCE_LEASE_PRECISION_SCHEMA_VERSION,),
+                )
+                assert marker_count == 1
+                if storage.db.backend_type == "postgres":
+                    assert await storage.db.fetchone(
+                        "SELECT udt_name FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() "
+                        "AND table_name = 'semantic_maintenance_leases' "
+                        "AND column_name = 'expires_at'",
+                        (),
+                    ) == ("float8",)
+                else:
+                    lease_columns = await storage.db.fetchall(
+                        "PRAGMA table_info(semantic_maintenance_leases)",
+                        (),
+                    )
+                    expires_at = next(
+                        row for row in lease_columns if row[1] == "expires_at"
+                    )
+                    assert str(expires_at[2]).upper() == "DOUBLE PRECISION"
+
+                await storage.db.execute(
+                    "INSERT INTO semantic_maintenance_leases "
+                    "(tenant_id, holder_id, fencing_token, expires_at, updated_at) "
+                    "VALUES (?, 'float8', 1, ?, '2026-07-27T00:00:00Z') "
+                    "ON CONFLICT(tenant_id) DO UPDATE SET "
+                    "holder_id = excluded.holder_id, "
+                    "fencing_token = excluded.fencing_token, "
+                    "expires_at = excluded.expires_at, "
+                    "updated_at = excluded.updated_at",
+                    (probe_tenant, expected_expiry),
+                )
+                stored_expiry = float(
+                    await storage.db.fetchval(
+                        "SELECT expires_at FROM semantic_maintenance_leases "
+                        "/* post-float8-upgrade */ "
+                        "WHERE tenant_id = ?",
+                        (probe_tenant,),
+                    )
+                )
+                assert stored_expiry == expected_expiry
+                assert stored_expiry - epoch_base == 60.125
+
+                # A second startup observes the marker and remains a no-op.
+                await migrate_semantic_maintenance(storage.db)
+                assert await storage.db.fetchval(
+                    "SELECT COUNT(*) FROM semantic_schema_migrations "
+                    "WHERE version = ?",
+                    (_SEMANTIC_MAINTENANCE_LEASE_PRECISION_SCHEMA_VERSION,),
+                ) == 1
+                raise _RollbackLeasePrecisionProbe
+        except TransactionError as exc:
+            if not isinstance(exc.__cause__, _RollbackLeasePrecisionProbe):
+                raise
+    finally:
+        await storage.close()
 
 
 @pytest.mark.asyncio
@@ -2136,6 +2260,152 @@ async def test_erasure_emits_an_opaque_retryable_change_on_both_backends(
             "SELECT operation, generation FROM semantic_projection_erasure_outbox WHERE tenant_id = ?",
             (tenant,),
         ) == [("erased", erased.generation)]
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_erasure_redacts_maintenance_artifacts_on_both_backends(
+    db_backend,
+    tmp_path,
+):
+    """JSON report evidence and every resumable cursor share erasure semantics."""
+    tenant, identity = await _incepted_assertion_identity(tmp_path, "maintenance-erasure")
+    storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    try:
+        root = _semantic_assertion(
+            tenant,
+            "maintenance-erasure-root",
+            value="maintenance-erasure-secret",
+        )
+        unrelated = _semantic_assertion(
+            tenant,
+            "maintenance-erasure-unrelated",
+            value="maintenance-unrelated",
+        )
+        written = await storage.put_assertion(
+            root,
+            source_occurrences=(_semantic_source("parity-source"),),
+        )
+        await storage.put_assertion(
+            unrelated,
+            source_occurrences=(_semantic_source("parity-source"),),
+        )
+        await storage.db.execute(
+            "INSERT INTO semantic_maintenance_state "
+            "(tenant_id, profile_key, checkpoint_generation, checkpoint_event_id, run_id, "
+            "status, capability_versions, repair_cursor_revision_id, repair_active, repair_mode, "
+            "repair_scan_complete, repair_checkpoint_generation, repair_checkpoint_event_id, "
+            "repair_reconcile_cursor_derivation_id, audit_assertion_id, audit_assertion_revision_id, "
+            "audit_competitor_cursor_revision_id, updated_at) "
+            "VALUES (?, 'maintenance-profile', ?, ?, 'maintenance-run', 'complete', '{}', "
+            "?, 1, 'current_scan', 1, ?, NULL, ?, ?, ?, ?, '2026-07-27T00:00:00Z')",
+            (
+                tenant,
+                written.generation,
+                written.event_id,
+                root.revision_id,
+                written.generation,
+                root.revision_id,
+                root.assertion_id,
+                root.revision_id,
+                root.revision_id,
+            ),
+        )
+
+        async def record_report(report_id: str, evidence: object) -> None:
+            await storage.db.execute(
+                "INSERT INTO semantic_maintenance_reports "
+                "(tenant_id, report_id, report_kind, evidence_digest, status, evidence_mapping, "
+                "created_at, updated_at) VALUES (?, ?, 'contradiction_candidate', ?, "
+                "'review_required', ?, '2026-07-27T00:00:00Z', '2026-07-27T00:00:00Z')",
+                (
+                    tenant,
+                    report_id,
+                    f"digest:{report_id}",
+                    json.dumps(evidence, sort_keys=True),
+                ),
+            )
+
+        await record_report(
+            "maintenance-erasure-flat",
+            {
+                "assertion_id": root.assertion_id,
+                "revision_id": root.revision_id,
+                "content": "maintenance-erasure-secret",
+            },
+        )
+        await record_report(
+            "maintenance-erasure-nested",
+            {
+                "nested": [
+                    {"assertion_ids": [root.assertion_id]},
+                    {"cursor": f"revision:{root.revision_id}"},
+                ]
+            },
+        )
+        await record_report(
+            "maintenance-erasure-unrelated",
+            {
+                "assertion_id": unrelated.assertion_id,
+                "revision_id": unrelated.revision_id,
+            },
+        )
+
+        erased = await storage.erase_assertion(
+            root.assertion_id,
+            operation_id="maintenance-erasure-parity",
+        )
+
+        assert await storage.db.fetchall(
+            "SELECT report_id FROM semantic_maintenance_reports "
+            "WHERE tenant_id = ? ORDER BY report_id",
+            (tenant,),
+        ) == [("maintenance-erasure-unrelated",)]
+        assert await storage.db.fetchone(
+            "SELECT checkpoint_generation, checkpoint_event_id, status, "
+            "repair_cursor_revision_id, repair_active, repair_mode, repair_scan_complete, "
+            "repair_checkpoint_generation, repair_checkpoint_event_id, "
+            "repair_reconcile_cursor_derivation_id, audit_assertion_id, "
+            "audit_assertion_revision_id, audit_competitor_cursor_revision_id "
+            "FROM semantic_maintenance_state WHERE tenant_id = ?",
+            (tenant,),
+        ) == (
+            erased.generation,
+            None,
+            "partial",
+            None,
+            0,
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        for table_name in (
+            "semantic_maintenance_state",
+            "semantic_maintenance_runs",
+            "semantic_maintenance_leases",
+            "semantic_maintenance_reports",
+        ):
+            rows = await storage.db.fetchall(
+                f"SELECT * FROM {table_name} WHERE tenant_id = ?",
+                (tenant,),
+            )
+            serialized = repr(rows)
+            assert root.assertion_id not in serialized
+            assert root.revision_id not in serialized
+            assert "maintenance-erasure-secret" not in serialized
+        changes = await storage.assertion_changes_since(written.generation)
+        erasure_changes = [change for change in changes if change.operation == "erased"]
+        assert len(erasure_changes) == 1
+        assert erasure_changes[0].assertion_id is None
+        assert erasure_changes[0].revision_id is None
+        assert erasure_changes[0].generation == erased.generation
     finally:
         await storage.close()
 

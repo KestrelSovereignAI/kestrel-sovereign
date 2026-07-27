@@ -19,6 +19,7 @@ from rdflib import Graph, Literal as RdfLiteral, RDF, URIRef
 
 from kestrel_sovereign.knowledge import (
     Assertion,
+    AssertionQuery,
     DerivedLineage,
     DirectLineage,
     GovernedShaclValidationService,
@@ -26,6 +27,7 @@ from kestrel_sovereign.knowledge import (
     ShaclValidationReport,
     ShapeSetReference,
     ValidationSource,
+    ValidationState,
     ValidationWriteAction,
 )
 
@@ -34,6 +36,7 @@ from .async_assertion_store import (
     AssertionStoreError,
     AssertionWriteResult,
     AsyncAssertionStore,
+    MaintenanceLeaseLostError,
     SupersessionResult,
     TenantIsolationError,
 )
@@ -157,6 +160,8 @@ class AsyncSemanticValidationReportStore:
             raise SemanticValidationStoreError("validation report tenant does not match the bound assertion tenant")
         try:
             return await self._assertions.persist_validation_report(report)
+        except MaintenanceLeaseLostError:
+            raise
         except AssertionStoreError as error:
             raise SemanticValidationStoreError(str(error)) from error
 
@@ -204,12 +209,11 @@ class AsyncSemanticValidationReportStore:
 class GovernedSemanticValidationService:
     """Validate canonical assertions, persist reports, and repair via the outbox.
 
-    A focused run supplies the supplied assertions' complete materialized
-    focus set while retaining the full tenant graph as the data graph.  The
-    validator uses that focus only for shape sets it can prove are local;
-    non-local paths and target declarations fail closed to a full audit.
-    ``full_audit_and_repair`` remains the explicit complete audit path;
-    neither method has a direct SQL eligibility update path.
+    Maintenance may opt into a bounded focused run that reads only its supplied
+    current assertions. The default focused contract retains the complete graph
+    for direct validation callers that need cross-assertion findings. The
+    validator still fails closed for non-local shape paths; neither method has
+    a direct SQL eligibility update path.
     """
 
     def __init__(
@@ -242,26 +246,49 @@ class GovernedSemanticValidationService:
         limits: ShaclValidationLimits = ShaclValidationLimits(),
         run_id: str | None = None,
         max_quarantine_retries: int = 2,
+        bounded_focus_only: bool = False,
     ) -> ShaclValidationReport:
         """Run a full-graph or affected-focus revalidation and persist its result."""
         if type(max_quarantine_retries) is not int or not 1 <= max_quarantine_retries <= 10:
             raise SemanticValidationStoreError("max_quarantine_retries must be an integer in [1, 10]")
+        if type(bounded_focus_only) is not bool:
+            raise SemanticValidationStoreError("bounded_focus_only must be a boolean")
         requested = _assertion_ids(assertion_ids)
         for attempt in range(max_quarantine_retries):
-            checkpoint, assertions = await self._assertions.export_snapshot()
-            active_by_id = {assertion.assertion_id: assertion for assertion in assertions}
-            if requested:
+            if requested and bounded_focus_only:
+                checkpoint = await self._assertions.checkpoint()
+                selected = await self._assertions.query(
+                    AssertionQuery(assertion_ids=requested, limit=len(requested))
+                )
+                active_by_id = {
+                    assertion.assertion_id: assertion for assertion in selected
+                }
                 missing = set(requested) - active_by_id.keys()
                 if missing:
                     raise SemanticValidationStoreError(
                         "validation target is absent from this tenant's active canonical graph"
-                    )
+                )
                 validation_assertion_ids = requested
                 selected = [active_by_id[item] for item in requested]
             else:
-                validation_assertion_ids = tuple(sorted(active_by_id))
-                selected = list(assertions)
-            data_graph, focus_map, affected_nodes = _canonical_validation_graph(assertions, selected)
+                checkpoint, assertions = await self._assertions.export_snapshot()
+                active_by_id = {
+                    assertion.assertion_id: assertion for assertion in assertions
+                }
+                if requested:
+                    missing = set(requested) - active_by_id.keys()
+                    if missing:
+                        raise SemanticValidationStoreError(
+                            "validation target is absent from this tenant's active canonical graph"
+                        )
+                    validation_assertion_ids = requested
+                    selected = [active_by_id[item] for item in requested]
+                else:
+                    validation_assertion_ids = tuple(sorted(active_by_id))
+                    selected = list(assertions)
+            data_graph, focus_map, affected_nodes = _canonical_validation_graph(
+                selected if bounded_focus_only else assertions, selected
+            )
             report = self._validator.validate(
                 data_graph,
                 tenant_id=self._assertions.tenant_id,
@@ -278,13 +305,21 @@ class GovernedSemanticValidationService:
                 run_id=run_id,
                 focus_nodes=(affected_nodes if requested else None),
                 focus_assertion_ids=focus_map,
+                require_complete_focus=bounded_focus_only,
                 limits=limits,
             )
+            # A bounded incremental caller has deliberately not materialized
+            # unbounded shape context. Non-local shapes therefore defer rather
+            # than quarantining an assertion from an incomplete graph.
+            if bounded_focus_only and report.state is ValidationState.INCOMPLETE:
+                await self._reports.persist(report)
+                return report
             if report.action is not ValidationWriteAction.QUARANTINE:
                 await self._reports.persist(report)
                 return report
             snapshot_revisions = {
-                assertion.assertion_id: assertion.revision_id for assertion in assertions
+                assertion.assertion_id: assertion.revision_id
+                for assertion in (selected if bounded_focus_only else assertions)
             }
             try:
                 await self._persist_and_quarantine_failed_current_assertions(

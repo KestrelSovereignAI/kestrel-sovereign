@@ -131,6 +131,7 @@ class ShaclValidationLimits:
 
     max_graph_triples: int = 100_000
     max_shape_triples: int = 20_000
+    max_shapes: int = 1_000
     max_shape_depth: int = 32
     max_results: int = 1_000
     max_path_nodes: int = 100_000
@@ -140,6 +141,7 @@ class ShaclValidationLimits:
         for field_name in (
             "max_graph_triples",
             "max_shape_triples",
+            "max_shapes",
             "max_shape_depth",
             "max_results",
             "max_path_nodes",
@@ -445,6 +447,7 @@ class GovernedShaclValidationService:
         run_id: str | None = None,
         focus_nodes: Iterable[URIRef | BNode] | None = None,
         focus_assertion_ids: Mapping[URIRef | BNode, str | Sequence[str]] | None = None,
+        require_complete_focus: bool = False,
         limits: ShaclValidationLimits = ShaclValidationLimits(),
     ) -> ShaclValidationReport:
         """Validate a fixed graph against one exact local profile and shape set.
@@ -465,6 +468,8 @@ class GovernedShaclValidationService:
             raise ShaclValidationError("source must be a ValidationSource")
         if not isinstance(limits, ShaclValidationLimits):
             raise ShaclValidationError("limits must be ShaclValidationLimits")
+        if type(require_complete_focus) is not bool:
+            raise ShaclValidationError("require_complete_focus must be a boolean")
         assertion_id_tuple = _safe_assertion_ids(assertion_ids)
         if checkpoint_generation is not None and (
             type(checkpoint_generation) is not int or checkpoint_generation < 0
@@ -501,6 +506,21 @@ class GovernedShaclValidationService:
                     checkpoint_generation, effective_run_id, ValidationState.INCOMPLETE, source, findings,
                 )
             if requested_focus is not None and not _focus_filter_is_complete(shapes):
+                if require_complete_focus:
+                    findings.append(_system_finding("incremental_context_unavailable"))
+                    return self._report(
+                        report_id,
+                        tenant_id,
+                        assertion_id_tuple,
+                        shape_set,
+                        profile,
+                        shapes_resource,
+                        checkpoint_generation,
+                        effective_run_id,
+                        ValidationState.INCOMPLETE,
+                        source,
+                        findings,
+                    )
                 # The caller's changed-node set is only complete for local
                 # shapes.  In particular, a target reached through an inverse
                 # or sequence path can depend on a changed assertion without
@@ -521,6 +541,8 @@ class GovernedShaclValidationService:
             property_shapes = tuple(sorted(
                 set(shapes.subjects(RDF.type, SH.PropertyShape)), key=_term_key
             ))
+            if len(set(node_shapes).union(property_shapes)) > limits.max_shapes:
+                raise _ValidationIncomplete("shape_limit_exhausted")
             for shape in node_shapes:
                 context.check_budget()
                 for focus in _targets_for_shape(shapes, data_graph, shape):

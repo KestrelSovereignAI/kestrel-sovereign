@@ -10,6 +10,7 @@ the tenant predicate is applied before every lookup or traversal.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -46,6 +47,23 @@ _EXPLICIT_FACT_FORGET_NOOP_OPERATION = "explicit_fact_forget_noop"
 _LEGACY_ERASED_EXPLICIT_FACT_OPERATION = "legacy_erased_explicit_fact"
 _EXPLICIT_FACT_SAVE_OPERATION_PREFIX = "memory-agency-save-fact-v1:save:"
 _EXPLICIT_FACT_FORGET_OPERATION_PREFIX = "memory-agency-save-fact-v1:forget:"
+_ERASURE_MAINTENANCE_LEASE_HOLDER = "physical-erasure"
+
+
+@dataclass(frozen=True, slots=True)
+class _MaintenanceFence:
+    """Lease identity carried only while semantic maintenance is committing."""
+
+    tenant_id: str
+    holder_id: str
+    fencing_token: int
+    lease_seconds: float
+
+
+_MAINTENANCE_FENCE: ContextVar[_MaintenanceFence | None] = ContextVar(
+    "semantic_maintenance_fence",
+    default=None,
+)
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -146,6 +164,10 @@ class _AssertionStoreScope:
 
 class AssertionStoreError(ValueError):
     """A canonical assertion mutation cannot be accepted."""
+
+
+class MaintenanceLeaseLostError(AssertionStoreError):
+    """A fenced maintenance mutation no longer owns its tenant lease."""
 
 
 class TenantIsolationError(AssertionStoreError):
@@ -767,7 +789,103 @@ class AsyncAssertionStore:
         return generation
 
     @asynccontextmanager
-    async def _mutation(self):
+    async def maintenance_fence(
+        self,
+        *,
+        holder_id: str,
+        fencing_token: int,
+        lease_seconds: float,
+    ):
+        """Fence canonical mutations to one active semantic-maintenance lease.
+
+        The context carries no write authority by itself.  It makes every
+        canonical mutation performed in its scope conditionally renew the
+        matching lease *inside that mutation's transaction*.  A stale worker
+        therefore cannot publish a validation quarantine, audit retraction,
+        or inference revision after another worker has acquired the lease.
+        """
+        if not isinstance(holder_id, str) or not holder_id:
+            raise AssertionStoreError("maintenance fence holder_id must be non-empty")
+        if type(fencing_token) is not int or fencing_token < 1:
+            raise AssertionStoreError("maintenance fence token must be a positive integer")
+        if (
+            not isinstance(lease_seconds, (int, float))
+            or isinstance(lease_seconds, bool)
+            or lease_seconds <= 0
+        ):
+            raise AssertionStoreError("maintenance fence lease_seconds must be positive")
+        fence = _MaintenanceFence(
+            self.tenant_id,
+            holder_id,
+            fencing_token,
+            float(lease_seconds),
+        )
+        current = _MAINTENANCE_FENCE.get()
+        if current is not None:
+            if current != fence:
+                raise AssertionStoreError("nested maintenance fence does not match active fence")
+            yield
+            return
+        token = _MAINTENANCE_FENCE.set(fence)
+        try:
+            yield
+        finally:
+            _MAINTENANCE_FENCE.reset(token)
+
+    async def _renew_maintenance_fence_in_mutation(self) -> None:
+        """Renew and lock the active maintenance lease in this transaction."""
+        fence = _MAINTENANCE_FENCE.get()
+        if fence is None:
+            return
+        tenant_id, _ = self._require_scope()
+        if fence.tenant_id != tenant_id:
+            raise MaintenanceLeaseLostError("semantic_maintenance_lease_lost")
+        if self._database.backend_type == "postgres":
+            database_now = "EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)"
+        else:
+            database_now = "CAST(strftime('%s', 'now') AS REAL)"
+        changed = await self._database.execute(
+            "UPDATE semantic_maintenance_leases "
+            f"SET expires_at = {database_now} + ?, updated_at = ? "
+            f"WHERE tenant_id = ? AND holder_id = ? AND fencing_token = ? "
+            f"AND expires_at > {database_now}",
+            (
+                fence.lease_seconds,
+                _now(),
+                tenant_id,
+                fence.holder_id,
+                fence.fencing_token,
+            ),
+        )
+        if changed != 1:
+            raise MaintenanceLeaseLostError("semantic_maintenance_lease_lost")
+
+    async def _revoke_maintenance_lease_for_erasure(self) -> None:
+        """Fence a maintenance worker before an erasure takes the tenant lock.
+
+        Maintenance renews its lease before it locks the canonical tenant row.
+        Physical erasure must take that same lock order: otherwise a worker
+        holding the lease can wait on the tenant row while erasure waits on
+        the lease, or can publish a report naming a revision after erasure has
+        scrubbed it.  The expired replacement lease makes every pre-erasure
+        worker fail its next fenced write, while a new worker can acquire a
+        fresh token after this transaction commits.
+        """
+        tenant_id, _ = self._require_scope()
+        await self._database.execute(
+            "INSERT INTO semantic_maintenance_leases "
+            "(tenant_id, holder_id, fencing_token, expires_at, updated_at) "
+            "VALUES (?, ?, 1, 0, ?) "
+            "ON CONFLICT(tenant_id) DO UPDATE SET "
+            "holder_id = excluded.holder_id, "
+            "fencing_token = semantic_maintenance_leases.fencing_token + 1, "
+            "expires_at = excluded.expires_at, "
+            "updated_at = excluded.updated_at",
+            (tenant_id, _ERASURE_MAINTENANCE_LEASE_HOLDER, _now()),
+        )
+
+    @asynccontextmanager
+    async def _mutation(self, *, revoke_maintenance_lease: bool = False):
         """Run one canonical mutation with a tenant serialization boundary.
 
         Database backends deliberately wrap any exception raised inside a
@@ -777,6 +895,13 @@ class AsyncAssertionStore:
         """
         try:
             async with self._database.transaction():
+                if revoke_maintenance_lease:
+                    if _MAINTENANCE_FENCE.get() is not None:
+                        raise AssertionStoreError(
+                            "physical erasure cannot run inside a maintenance lease"
+                        )
+                    await self._revoke_maintenance_lease_for_erasure()
+                await self._renew_maintenance_fence_in_mutation()
                 await self._lock_tenant()
                 yield
         except TransactionError as error:
@@ -2084,7 +2209,10 @@ class AsyncAssertionStore:
     async def persist_validation_report(self, report: ShaclValidationReport) -> ShaclValidationReport:
         """Persist a tenant-bound report when no canonical write is pending."""
         self._validate_validation_report(report)
-        async with self._database.transaction():
+        # Validation reports are durable semantic state.  Reuse the canonical
+        # mutation boundary so a maintenance-scoped revalidation verifies and
+        # renews its fence in the very transaction that writes the report.
+        async with self._mutation():
             await self._persist_validation_report_in_transaction(report)
         return report
 
@@ -4410,6 +4538,173 @@ class AsyncAssertionStore:
             (tenant_id,) + report_ids,
         )
 
+    @staticmethod
+    def _maintenance_evidence_references_erased_identifier(
+        evidence: object,
+        identifiers: frozenset[str],
+    ) -> bool:
+        """Return whether arbitrary JSON evidence retains an erased identifier.
+
+        Maintenance evidence is structured JSON today, but this redaction
+        boundary must also cover nested compatibility payloads and an ID
+        embedded in a diagnostic string.  Report evidence that references an
+        erased assertion cannot remain semantically honest after redaction, so
+        callers delete the whole report rather than trying to invent partial
+        evidence or a replacement digest.
+        """
+        if isinstance(evidence, str):
+            return any(identifier in evidence for identifier in identifiers)
+        if isinstance(evidence, Mapping):
+            return any(
+                AsyncAssertionStore._maintenance_evidence_references_erased_identifier(
+                    key, identifiers
+                )
+                or AsyncAssertionStore._maintenance_evidence_references_erased_identifier(
+                    value, identifiers
+                )
+                for key, value in evidence.items()
+            )
+        if isinstance(evidence, (list, tuple)):
+            return any(
+                AsyncAssertionStore._maintenance_evidence_references_erased_identifier(
+                    item, identifiers
+                )
+                for item in evidence
+            )
+        return False
+
+    async def _delete_maintenance_reports_referencing(
+        self,
+        assertion_ids: Sequence[str],
+        revision_ids: Sequence[str],
+    ) -> None:
+        """Delete current-tenant maintenance evidence made invalid by erasure.
+
+        SQLite and PostgreSQL expose incompatible JSON query operators.  Read
+        the tenant-bound evidence text and inspect its decoded JSON here so
+        the redaction contract is identical on both backends and does not put
+        an erased selector into a query, log, or durable audit field.
+        """
+        identifiers = frozenset(
+            identifier
+            for identifier in (*assertion_ids, *revision_ids)
+            if isinstance(identifier, str) and identifier
+        )
+        if not identifiers:
+            return
+        tenant_id, _ = self._require_scope()
+        rows = await self._database.fetchall(
+            "SELECT report_id, evidence_digest, evidence_mapping "
+            "FROM semantic_maintenance_reports WHERE tenant_id = ?",
+            (tenant_id,),
+        )
+        report_ids: list[str] = []
+        for report_id, evidence_digest, encoded_evidence in rows:
+            references_erased_identifier = (
+                str(report_id) in identifiers
+                or str(evidence_digest) in identifiers
+            )
+            if not references_erased_identifier:
+                try:
+                    evidence = json.loads(encoded_evidence)
+                except (TypeError, ValueError, RecursionError):
+                    # An unreadable report cannot prove it omits the erased
+                    # data.  It is not a valid maintenance artifact, and
+                    # retaining it would turn malformed JSON into a redaction
+                    # escape hatch.
+                    references_erased_identifier = True
+                else:
+                    references_erased_identifier = (
+                        self._maintenance_evidence_references_erased_identifier(
+                            evidence,
+                            identifiers,
+                        )
+                    )
+            if references_erased_identifier:
+                report_ids.append(str(report_id))
+        if not report_ids:
+            return
+        await self._database.execute(
+            "DELETE FROM semantic_maintenance_reports WHERE tenant_id = ? "
+            f"AND report_id IN ({_placeholders(report_ids)})",
+            (tenant_id, *report_ids),
+        )
+
+    async def _maintenance_state_columns(self) -> set[str]:
+        """Read the deployed maintenance-state shape for legacy databases."""
+        if self._database.backend_type == "postgres":
+            rows = await self._database.fetchall(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'semantic_maintenance_state'",
+                (),
+            )
+            return {str(row[0]) for row in rows}
+        rows = await self._database.fetchall(
+            "PRAGMA table_info(semantic_maintenance_state)",
+            (),
+        )
+        return {str(row[1]) for row in rows}
+
+    async def _rewind_maintenance_state_after_erasure(self, generation: int) -> None:
+        """Clear all maintenance cursors and replay the opaque erasure event.
+
+        A maintenance checkpoint with a null event ID deliberately takes the
+        legacy ``generation >=`` recovery branch in ``changes_after``.  By
+        writing the committed erasure generation before its opaque event is
+        inserted, the next bounded maintenance run must consume that event and
+        choose its existing full-audit/resynchronization path.  Clearing every
+        cursor also prevents a stale assertion, revision, or derivation cursor
+        from steering work back into the erased closure.
+        """
+        columns = await self._maintenance_state_columns()
+        if not columns:
+            return
+        assignments: list[str] = []
+        params: list[object] = []
+
+        def assign(column: str, value: object) -> None:
+            if column in columns:
+                assignments.append(f"{column} = ?")
+                params.append(value)
+
+        assign("checkpoint_generation", generation)
+        assign("checkpoint_event_id", None)
+        assign("status", "partial")
+        assign("repair_cursor_revision_id", None)
+        assign("repair_active", 0)
+        assign("repair_mode", None)
+        assign("repair_scan_complete", 0)
+        assign("repair_checkpoint_generation", None)
+        assign("repair_checkpoint_event_id", None)
+        assign("repair_reconcile_cursor_derivation_id", None)
+        assign("audit_assertion_id", None)
+        assign("audit_assertion_revision_id", None)
+        assign("audit_competitor_cursor_revision_id", None)
+        assign("updated_at", _now())
+        if not assignments:
+            return
+        tenant_id, _ = self._require_scope()
+        await self._database.execute(
+            "UPDATE semantic_maintenance_state SET "
+            + ", ".join(assignments)
+            + " WHERE tenant_id = ?",
+            (*params, tenant_id),
+        )
+
+    async def _sanitize_maintenance_after_erasure(
+        self,
+        assertion_ids: Sequence[str],
+        revision_ids: Sequence[str],
+        generation: int,
+    ) -> None:
+        """Remove erased maintenance evidence and reset its resumable state."""
+        await self._delete_maintenance_reports_referencing(
+            assertion_ids,
+            revision_ids,
+        )
+        await self._rewind_maintenance_state_after_erasure(generation)
+
     async def erase(self, assertion_id: str, *, operation_id: str | None = None) -> ErasureResult:
         """Physically erase an assertion and its transitive derived closure.
 
@@ -4423,7 +4718,7 @@ class AsyncAssertionStore:
         # the target assertion ID in the receipt key itself.
         operation_id = operation_id or f"erase:{_operation_digest({'assertion_id': assertion_id})}"
         request = {"assertion_id": assertion_id}
-        async with self._mutation():
+        async with self._mutation(revoke_maintenance_lease=True):
             digest, replay = await self._erasure_operation(operation_id, request)
             if replay is not None:
                 remembered = self._remembered_erasure_job(operation_id, digest)
@@ -4580,6 +4875,11 @@ class AsyncAssertionStore:
                 revision_ids,
                 generation,
             )
+            await self._sanitize_maintenance_after_erasure(
+                assertion_tuple,
+                revision_tuple,
+                generation,
+            )
             await self._database.execute(
                 f"DELETE FROM semantic_revision_sources WHERE tenant_id = ? AND revision_id IN ({_placeholders(revision_tuple)})",
                 (tenant_id,) + revision_tuple,
@@ -4672,6 +4972,11 @@ class AsyncAssertionStore:
         if query.assertion_ids:
             clauses.append(f"a.assertion_id IN ({_placeholders(query.assertion_ids)})")
             params.extend(query.assertion_ids)
+        if query.exclude_assertion_ids:
+            clauses.append(
+                f"a.assertion_id NOT IN ({_placeholders(query.exclude_assertion_ids)})"
+            )
+            params.extend(query.exclude_assertion_ids)
         statuses = query.statuses or (AssertionStatus.ACTIVE,)
         clauses.append(f"r.status IN ({_placeholders(statuses)})")
         params.extend(status.value for status in statuses)
@@ -4729,6 +5034,34 @@ class AsyncAssertionStore:
         return await self._query_current(
             AssertionQuery(limit=limit, cursor=cursor), eligible_only=True
         )
+
+    async def active_assertion_count(self, *, cursor: str | None = None) -> int:
+        """Count active current assertions after an optional revision cursor.
+
+        Semantic repair uses this aggregate for an exact backlog count without
+        materializing the rest of the tenant graph.
+        """
+        if cursor is not None and (not isinstance(cursor, str) or not cursor):
+            raise AssertionStoreError(
+                "active assertion cursor must be a non-empty string or null"
+            )
+        tenant_id, _ = self._require_scope()
+        clauses = [
+            "a.tenant_id = ?",
+            "a.current_revision_id = r.revision_id",
+            "r.status = ?",
+        ]
+        params: list[object] = [tenant_id, AssertionStatus.ACTIVE.value]
+        if cursor is not None:
+            clauses.append("r.revision_id > ?")
+            params.append(cursor)
+        value = await self._database.fetchval(
+            "SELECT COUNT(*) FROM semantic_assertions a "
+            "JOIN semantic_assertion_revisions r ON r.tenant_id = a.tenant_id "
+            "WHERE " + " AND ".join(clauses),
+            tuple(params),
+        )
+        return int(value or 0)
 
     async def _complete_active_assertions(self) -> tuple[Assertion, ...]:
         """Return every active current assertion in this store's bound tenant.
@@ -4796,6 +5129,100 @@ class AsyncAssertionStore:
             (tenant_id, generation, tenant_id, generation, limit),
         )
         return [AssertionChange(row[0], row[1], row[2], row[3], int(row[4]), bool(row[5])) for row in rows]
+
+    async def changes_after(
+        self,
+        checkpoint: AssertionCheckpoint,
+        *,
+        limit: int = 100,
+    ) -> list[AssertionChange]:
+        """Read the canonical stream strictly after an event-level cursor.
+
+        Generations are transaction boundaries, not event sequence numbers:
+        one lifecycle transition can emit several outbox events at the same
+        generation.  A maintenance cursor must therefore retain the event ID
+        and resume in the stream's canonical ``generation, created_at,
+        event_id`` order.  A legacy generation-only checkpoint is recovered
+        conservatively by replaying its whole final generation once.
+        """
+        if not isinstance(checkpoint, AssertionCheckpoint):
+            raise AssertionStoreError("changes_after requires an AssertionCheckpoint")
+        if checkpoint.tenant_id != self.tenant_id:
+            raise TenantIsolationError("change checkpoint tenant does not match bound store")
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise AssertionStoreError("limit must be an integer in [1, 1000]")
+        if checkpoint.latest_event_id is not None and (
+            not isinstance(checkpoint.latest_event_id, str)
+            or not checkpoint.latest_event_id
+        ):
+            raise AssertionStoreError("checkpoint latest_event_id must be non-empty or null")
+
+        tenant_id, _ = self._require_scope()
+        stream = (
+            "SELECT event_id, assertion_id, revision_id, operation, generation, eligible, created_at "
+            "FROM semantic_projection_outbox WHERE tenant_id = ? "
+            "UNION ALL "
+            "SELECT event_id, NULL AS assertion_id, NULL AS revision_id, operation, generation, "
+            "0 AS eligible, created_at FROM semantic_projection_erasure_outbox WHERE tenant_id = ?"
+        )
+        event_id = checkpoint.latest_event_id
+        if event_id is None:
+            # v1 maintenance state could only store a generation.  Replay the
+            # final generation rather than assuming it was fully consumed;
+            # report and canonical writes are idempotent, while skipping a
+            # same-generation event is not recoverable.
+            comparator = ">" if checkpoint.generation == 0 else ">="
+            rows = await self._database.fetchall(
+                "SELECT event_id, assertion_id, revision_id, operation, generation, eligible "
+                f"FROM ({stream}) AS assertion_changes WHERE generation {comparator} ? "
+                "ORDER BY generation ASC, created_at ASC, event_id ASC LIMIT ?",
+                (tenant_id, tenant_id, checkpoint.generation, limit),
+            )
+        else:
+            cursor = await self._database.fetchone(
+                "SELECT generation, created_at FROM ("
+                + stream
+                + ") AS assertion_changes WHERE event_id = ? LIMIT 1",
+                (tenant_id, tenant_id, event_id),
+            )
+            if cursor is None:
+                # Physical erasure removes ordinary outbox rows.  Its opaque
+                # resynchronization event is later than every removed row, so
+                # replaying this generation is the safe recovery if a durable
+                # cursor itself was erased.
+                rows = await self._database.fetchall(
+                    "SELECT event_id, assertion_id, revision_id, operation, generation, eligible "
+                    f"FROM ({stream}) AS assertion_changes WHERE generation >= ? "
+                    "ORDER BY generation ASC, created_at ASC, event_id ASC LIMIT ?",
+                    (tenant_id, tenant_id, checkpoint.generation, limit),
+                )
+            else:
+                cursor_generation, cursor_created_at = int(cursor[0]), str(cursor[1])
+                if cursor_generation != checkpoint.generation:
+                    raise AssertionStoreError(
+                        "checkpoint generation does not match its event cursor"
+                    )
+                rows = await self._database.fetchall(
+                    "SELECT event_id, assertion_id, revision_id, operation, generation, eligible "
+                    f"FROM ({stream}) AS assertion_changes "
+                    "WHERE generation > ? OR (generation = ? AND "
+                    "(created_at > ? OR (created_at = ? AND event_id > ?))) "
+                    "ORDER BY generation ASC, created_at ASC, event_id ASC LIMIT ?",
+                    (
+                        tenant_id,
+                        tenant_id,
+                        checkpoint.generation,
+                        checkpoint.generation,
+                        cursor_created_at,
+                        cursor_created_at,
+                        event_id,
+                        limit,
+                    ),
+                )
+        return [
+            AssertionChange(row[0], row[1], row[2], row[3], int(row[4]), bool(row[5]))
+            for row in rows
+        ]
 
 
 def _create_agent_bound_assertion_store(

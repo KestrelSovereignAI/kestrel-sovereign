@@ -815,6 +815,84 @@ class SchedulerFeature(Feature):
         # No hooks manager (bare test host) — execute directly.
         return await agent_tool.execute(**effective_args)
 
+    def _semantic_maintenance_required_for_training(self) -> bool:
+        """Whether this agent has an operator-selected semantic phase.
+
+        This mirrors the agent's sleep predicate without asking a scheduled
+        consumer to infer a profile.  A validation-only maintenance
+        configuration is still a governed semantic boundary and therefore
+        gates corpus/training consumers too.
+        """
+        if (
+            getattr(self.agent, "semantic_inference_configured", False) is True
+            or getattr(self.agent, "semantic_maintenance_configured", False) is True
+        ):
+            return True
+        from kestrel_sovereign.knowledge.inference import InferenceProfile
+
+        return isinstance(
+            getattr(self.agent, "semantic_inference_profile", None),
+            InferenceProfile,
+        )
+
+    async def _training_cycle_semantic_maintenance_gate(
+        self,
+    ) -> ScheduledTaskOutcome | None:
+        """Block scheduled training unless durable semantic input is current.
+
+        ``training_cycle`` is deliberately not part of the sleep cron: it can
+        be scheduled independently, including before sleep's next run.  Its
+        scheduler path must consequently enforce the same semantic data
+        boundary as phase-ordered post-consolidation hooks.  This is a
+        non-pausing block; a later maintenance completion should make the next
+        regular training tick eligible without manual schedule repair.
+        """
+        if not self._semantic_maintenance_required_for_training():
+            return None
+        storage = getattr(self.agent, "storage", None)
+        readiness = getattr(
+            storage, "semantic_maintenance_training_readiness", None
+        )
+        if not callable(readiness):
+            return ScheduledTaskOutcome(
+                status="blocked",
+                result_text=(
+                    "blocked: training_cycle requires durable semantic "
+                    "maintenance, but its governed status is unavailable"
+                ),
+            )
+        try:
+            state = await readiness(
+                getattr(self.agent, "semantic_inference_profile", None),
+                inference_limits=getattr(
+                    self.agent, "semantic_inference_limits", None
+                ),
+                maintenance_limits=getattr(
+                    self.agent, "semantic_maintenance_limits", None
+                ),
+            )
+        except Exception as error:  # noqa: BLE001 - fail closed at the data boundary
+            logger.warning(
+                "Scheduler: semantic maintenance readiness failed for training_cycle: %s",
+                type(error).__name__,
+            )
+            return ScheduledTaskOutcome(
+                status="blocked",
+                result_text=(
+                    "blocked: training_cycle requires durable semantic "
+                    "maintenance, but its status could not be verified"
+                ),
+            )
+        if state.ready:
+            return None
+        return ScheduledTaskOutcome(
+            status="blocked",
+            result_text=(
+                "blocked: training_cycle requires complete current semantic "
+                f"maintenance ({state.reason or 'semantic_maintenance_unverified'})"
+            ),
+        )
+
     @staticmethod
     def _feature_enabled(feature: Any) -> bool:
         """Whether ``feature`` is live-enabled and safe for the scheduler to run.
@@ -840,6 +918,10 @@ class SchedulerFeature(Feature):
         PRE_TOOL_USE/POST_TOOL_USE hooks and the SecurityHook DENY/ASK
         gate fire on each tick (F245). Disabled features are skipped so a
         persisted schedule cannot invoke a soft-disabled tool (#2522)."""
+        if task_name == "training_cycle":
+            blocked = await self._training_cycle_semantic_maintenance_gate()
+            if blocked is not None:
+                return blocked
         features = getattr(self.agent, "features", {})
         for feature in features.values():
             if not hasattr(feature, "get_tools"):

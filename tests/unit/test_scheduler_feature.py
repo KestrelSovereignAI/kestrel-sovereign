@@ -1691,6 +1691,52 @@ class TestTaskExecutor:
         mock_tool.execute.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_training_cycle_requires_current_durable_semantic_maintenance(
+        self, feature,
+    ):
+        """The generic scheduler path cannot bypass the sleep-hook boundary."""
+        mock_tool = MagicMock()
+        mock_tool.name = "training_cycle"
+        mock_tool.execute = AsyncMock(return_value={"success": True})
+        mock_feature = MagicMock()
+        mock_feature.get_tools = MagicMock(return_value=[mock_tool])
+
+        readiness = MagicMock(
+            ready=False,
+            reason="semantic_maintenance_partial",
+            using_prior_verified_snapshot=False,
+        )
+        storage = MagicMock()
+        storage.semantic_maintenance_training_readiness = AsyncMock(
+            return_value=readiness
+        )
+        feature.agent.features = {"ReflectionFeature": mock_feature}
+        feature.agent.storage = storage
+        feature.agent.semantic_inference_profile = None
+        feature.agent.semantic_inference_limits = None
+        feature.agent.semantic_maintenance_limits = None
+        feature.agent.semantic_inference_configured = False
+        feature.agent.semantic_maintenance_configured = True
+        feature.agent.semantic_maintenance_allow_prior_verified_snapshot = False
+
+        # Drive the scheduler callback rather than calling the lookup helper
+        # directly. The no-dispatcher branch preserves the direct callback
+        # path used by partially initialized scheduler hosts.
+        feature.agent.dispatcher = None
+        result = await feature._dispatch_scheduled_task("training_cycle", {})
+
+        assert isinstance(result, ScheduledTaskOutcome)
+        assert result.status == "blocked"
+        assert result.pause_schedule is False
+        assert "semantic_maintenance_partial" in result.result_text
+        mock_tool.execute.assert_not_awaited()
+        storage.semantic_maintenance_training_readiness.assert_awaited_once_with(
+            None,
+            inference_limits=None,
+            maintenance_limits=None,
+        )
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("decision", ["deny", "ask"])
     async def test_scheduled_permission_hook_returns_blocked_outcome(
         self, feature, decision,

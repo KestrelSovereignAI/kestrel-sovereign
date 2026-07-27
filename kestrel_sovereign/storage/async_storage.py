@@ -1325,6 +1325,78 @@ class AsyncStorage:
             ENGINE_VERSION
         )
 
+    async def run_semantic_maintenance(
+        self,
+        inference_profile,
+        *,
+        inference_limits=None,
+        maintenance_limits=None,
+        full_rebuild: bool = False,
+    ):
+        """Run the tenant's bounded incremental semantic-maintenance unit.
+
+        ``full_rebuild`` is deliberately an explicit repair knob.  Ordinary
+        sleep callers use the incremental path, which consumes the canonical
+        assertion change checkpoint before invoking validation or inference.
+        """
+        if not self._initialized:
+            await self.initialize()
+        from kestrel_sovereign.knowledge.maintenance import SemanticMaintenanceService
+
+        service = SemanticMaintenanceService(
+            self._assertion_store(),
+            inference_profile=inference_profile,
+            inference_limits=inference_limits,
+            limits=maintenance_limits,
+        )
+        if full_rebuild:
+            return await service.rebuild()
+        return await service.run()
+
+    async def semantic_maintenance_training_readiness(
+        self,
+        inference_profile,
+        *,
+        inference_limits=None,
+        maintenance_limits=None,
+        allow_prior_verified_snapshot: bool = False,
+    ):
+        """Return the durable semantic prerequisite for scheduled training.
+
+        Scheduler consumers must ask the same coordinator that owns the
+        maintenance checkpoint.  Reconstructing the capability identity here
+        keeps the gate in lockstep with sleep maintenance when limits, shape
+        pins, or inference profiles change.
+        """
+        if not self._initialized:
+            await self.initialize()
+        from kestrel_sovereign.knowledge.maintenance import SemanticMaintenanceService
+
+        service = SemanticMaintenanceService(
+            self._assertion_store(),
+            inference_profile=inference_profile,
+            inference_limits=inference_limits,
+            limits=maintenance_limits,
+        )
+        return await service.training_readiness(
+            allow_prior_verified_snapshot=allow_prior_verified_snapshot
+        )
+
+    async def repair_semantic_maintenance(
+        self,
+        inference_profile,
+        *,
+        inference_limits=None,
+        maintenance_limits=None,
+    ):
+        """Explicit full revalidation/rebuild using the normal maintenance service."""
+        return await self.run_semantic_maintenance(
+            inference_profile,
+            inference_limits=inference_limits,
+            maintenance_limits=maintenance_limits,
+            full_rebuild=True,
+        )
+
     async def export_assertion_snapshot(self, query=None):
         if not self._initialized:
             await self.initialize()

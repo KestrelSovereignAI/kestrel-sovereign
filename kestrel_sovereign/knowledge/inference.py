@@ -24,6 +24,7 @@ from uuid import uuid4
 
 from .assertion import (
     Assertion,
+    AssertionQuery,
     AssertionObject,
     AssertionStatus,
     DerivedLineage,
@@ -363,6 +364,21 @@ class MaterializationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class InferenceReconciliationResult:
+    """One bounded page retiring active proofs from an obsolete profile.
+
+    Maintenance owns the durable cursor; this result deliberately contains no
+    assertion values.  A page can retire proof-ledger entries without
+    retracting a conclusion when an independent active proof still grounds it.
+    """
+
+    retired_derivations: int
+    retracted_assertions: int
+    next_cursor: str | None
+    backlog: int
+
+
+@dataclass(frozen=True, slots=True)
 class DerivationExplanation:
     derivation_id: str
     rule_id: str
@@ -505,6 +521,131 @@ class BoundedInferenceService:
     async def rebuild(self) -> MaterializationResult:
         """Explicit repair path that recomputes the profile from current direct assertions."""
         return await self._materialize(full_rebuild=True)
+
+    async def materialize_targets(
+        self,
+        assertion_ids: Sequence[str],
+        *,
+        max_context_assertions: int = 0,
+    ) -> MaterializationResult:
+        """Materialize a bounded, caller-selected direct-fact work unit.
+
+        This is deliberately distinct from :meth:`materialize_incremental`.
+        The latter is a complete graph closure and therefore cannot be hidden
+        behind a sleep maintenance assertion budget.  A target unit reads only
+        the selected current sources, publishes only conclusions proven by
+        those sources, and never replaces the profile-wide proof ledger.
+        Lifecycle writes already deactivate proofs that name withdrawn input
+        revisions, so additive target publication remains safe across pages.
+        """
+        target_ids = tuple(sorted(set(assertion_ids)))
+        if type(max_context_assertions) is not int or max_context_assertions < 0:
+            raise InferenceError("max_context_assertions must be a non-negative integer")
+        if not target_ids:
+            checkpoint = await self._store.checkpoint()
+            return MaterializationResult(
+                "inference:targets:empty",
+                self.profile.key,
+                checkpoint.generation,
+                checkpoint.generation,
+                ClosureStatus.COMPLETE,
+                None,
+                0,
+                0,
+                0,
+                0,
+                True,
+            )
+        if len(target_ids) > self.limits.max_source_assertions:
+            raise InferenceError(
+                "targeted materialization exceeds max_source_assertions"
+            )
+
+        initial_checkpoint = await self._store.checkpoint()
+        run_id = "inference:targets:" + _sha256(
+            {
+                "profile_key": self.profile.key,
+                "generation": initial_checkpoint.generation,
+                "assertion_ids": target_ids,
+            }
+        )[:40]
+        started = monotonic()
+        try:
+            sources = await self._target_source_facts(
+                target_ids,
+                max_context_assertions=max_context_assertions,
+                started=started,
+            )
+            facts = self._close(sources, started)
+        except _BudgetExceeded as error:
+            return MaterializationResult(
+                run_id,
+                self.profile.key,
+                initial_checkpoint.generation,
+                initial_checkpoint.generation,
+                ClosureStatus.INCOMPLETE,
+                error.reason,
+                0,
+                0,
+                0,
+                0,
+                True,
+            )
+
+        try:
+            async with self._store.inference_publication():
+                locked_checkpoint = await self._store.checkpoint()
+                if locked_checkpoint.generation != initial_checkpoint.generation:
+                    return MaterializationResult(
+                        run_id,
+                        self.profile.key,
+                        initial_checkpoint.generation,
+                        locked_checkpoint.generation,
+                        ClosureStatus.INCOMPLETE,
+                        "source_changed_during_closure",
+                        len(sources),
+                        0,
+                        0,
+                        0,
+                        True,
+                    )
+                generated, derivations = await self._persist_facts(
+                    facts, run_id, started
+                )
+                await self._write_active_derivations(
+                    facts, run_id, started, replace=False
+                )
+                final_checkpoint = await self._store.checkpoint()
+        except Exception as error:
+            budget_error = _budget_exhaustion_from(error)
+            if budget_error is not None:
+                return MaterializationResult(
+                    run_id,
+                    self.profile.key,
+                    initial_checkpoint.generation,
+                    initial_checkpoint.generation,
+                    ClosureStatus.INCOMPLETE,
+                    budget_error.reason,
+                    len(sources),
+                    0,
+                    0,
+                    0,
+                    True,
+                )
+            raise
+        return MaterializationResult(
+            run_id,
+            self.profile.key,
+            initial_checkpoint.generation,
+            final_checkpoint.generation,
+            ClosureStatus.COMPLETE,
+            None,
+            len(sources),
+            generated,
+            derivations,
+            0,
+            True,
+        )
 
     async def _materialize(self, *, full_rebuild: bool) -> MaterializationResult:
         prior = await self.closure_state()
@@ -728,6 +869,395 @@ class BoundedInferenceService:
             if received_count < page_size:
                 return sources
             cursor = next_cursor
+
+    async def _target_source_facts(
+        self,
+        assertion_ids: Sequence[str],
+        *,
+        max_context_assertions: int,
+        started: float,
+    ) -> dict[str, _Fact]:
+        """Read only a target page's eligible direct inputs.
+
+        Targeted maintenance must not turn an assertion-ID filter into a
+        source-graph cursor walk.  The store applies tenant, lifecycle, and
+        eligibility filters before this bounded page reaches memory.
+        """
+        self._check_time(started)
+        selected = await self._store.inference_inputs(
+            AssertionQuery(assertion_ids=tuple(assertion_ids), limit=len(assertion_ids))
+        )
+        self._check_time(started)
+        facts: dict[str, _Fact] = {}
+
+        def add(assertion: Assertion) -> bool:
+            if (
+                assertion.epistemic_state is EpistemicState.INFERRED
+                or assertion.ontology_version != self.profile.ontology
+                or assertion.assertion_id in facts
+            ):
+                return False
+            if len(facts) >= self.limits.max_source_assertions:
+                raise _BudgetExceeded("source_assertions")
+            facts[assertion.assertion_id] = _Fact(
+                assertion.assertion_id,
+                assertion.subject,
+                assertion.predicate,
+                assertion.object,
+                0,
+                assertion,
+            )
+            self._check_memory(facts)
+            return True
+
+        for assertion in selected:
+            add(assertion)
+
+        # Targeted inference cannot infer a complete local unit by reading
+        # only the target's same-role neighbours.  For example, ``x type A``
+        # joins ``A subClassOf B`` through the target *object* and the schema
+        # assertion's *subject*.  Expand a bounded worklist of only the
+        # indexed joins admitted by this rule profile.  This is intentionally
+        # not a graph walk: every lookup is a specific rule premise and an
+        # overflow makes the unit incomplete rather than silently omitting a
+        # consequence.
+        remaining_context_reads = min(
+            max_context_assertions,
+            self.limits.max_source_assertions - len(facts),
+        )
+        pending_facts = deque(facts.values())
+        pending_terms: deque[dict[str, IRI]] = deque()
+        seen_terms: set[tuple[tuple[str, str], ...]] = set()
+
+        def schedule(term: dict[str, IRI]) -> None:
+            # ``AssertionQuery`` accepts only one value for each indexed role;
+            # the IRI's canonical value is sufficient to deduplicate a query.
+            key = tuple(sorted((name, value.value) for name, value in term.items()))
+            if key not in seen_terms:
+                seen_terms.add(key)
+                pending_terms.append(term)
+
+        # A changed property-chain member can require an unchanged chain axiom
+        # that names it inside a compact literal, so no subject/object index can
+        # identify that axiom.  The allowlisted profile is still bounded: scan
+        # only the chain-axiom predicate and defer if that indexed page exceeds
+        # the explicit context budget.
+        if self.profile.owl2rl_version is not None:
+            schedule({"predicate": IRI(OWL_PROPERTY_CHAIN_AXIOM)})
+
+        while pending_facts or pending_terms:
+            while pending_facts:
+                fact = pending_facts.popleft()
+                for term in self._target_context_terms(fact):
+                    schedule(term)
+
+            if not pending_terms:
+                break
+            term = pending_terms.popleft()
+            if remaining_context_reads <= 0:
+                # A zero context budget is a real boundary too.  Probe every
+                # required premise index so a caller cannot checkpoint a
+                # truncated closure merely because it admitted no context
+                # rows into memory.
+                if await self._has_context_row(
+                    term,
+                    cursor=None,
+                    excluded_assertion_ids=tuple(facts),
+                    started=started,
+                ):
+                    raise _BudgetExceeded("context_assertions")
+                continue
+
+            query = AssertionQuery(
+                **term,
+                limit=remaining_context_reads,
+                exclude_assertion_ids=tuple(facts),
+            )
+            self._check_time(started)
+            context_page = await self._store.inference_inputs(query)
+            # Count every newly materialized context fact. Known primary and
+            # previously admitted facts are excluded in SQL, so a repeated
+            # premise lookup cannot consume the budget needed for a distinct
+            # dependency. A distinct-fact cap alone would let a dense index
+            # consume arbitrary database work.
+            remaining_context_reads -= len(context_page)
+            for assertion in context_page:
+                if add(assertion):
+                    pending_facts.append(facts[assertion.assertion_id])
+            if len(context_page) == query.limit and await self._has_context_row(
+                term,
+                cursor=context_page[-1].revision_id,
+                excluded_assertion_ids=tuple(facts),
+                started=started,
+            ):
+                raise _BudgetExceeded("context_assertions")
+        return facts
+
+    def _target_context_terms(self, fact: _Fact) -> tuple[dict[str, IRI], ...]:
+        """Return the indexed direct-premise joins for one source fact.
+
+        The target path publishes only conclusions whose source premises fit in
+        the explicit context allowance.  Each entry therefore corresponds to
+        a role crossing used by :meth:`_apply_rules`; it is deliberately more
+        precise than a generic subject/predicate/object neighbourhood.
+        """
+        terms: list[dict[str, IRI]] = []
+
+        def by_subject(value: IRI) -> None:
+            terms.append({"subject": value})
+
+        def by_predicate(value: IRI) -> None:
+            terms.append({"predicate": value})
+
+        def by_object(value: IRI) -> None:
+            terms.append({"object": value})
+
+        def by_predicate_object(predicate: str, value: IRI) -> None:
+            """Schedule one bounded reverse schema lookup.
+
+            A bare object lookup would make a common class or property IRI a
+            graph-wide context scan.  These reverse joins are deliberately
+            constrained to the one OWL predicate that can supply the missing
+            rule premise, so they retain the ordinary target path's explicit
+            count, memory, and wall-time bounds.
+            """
+            terms.append({"predicate": IRI(predicate), "object": value})
+
+        predicate = fact.predicate.value
+        object_ = fact.object
+
+        if predicate == RDF_TYPE:
+            if not isinstance(object_, IRI):
+                return tuple(terms)
+            # ``x type A`` joins class hierarchy/equivalence at ``A``.
+            by_subject(object_)
+            if self.profile.owl2rl_version is not None:
+                # ``B owl:equivalentClass A`` is the reverse-oriented
+                # counterpart to ``A owl:equivalentClass B``.  It is not
+                # found by the subject lookup above, but it entails the same
+                # class bridge for ``x type A``.
+                by_predicate_object(OWL_EQUIVALENT_CLASS, object_)
+            if (
+                self.profile.owl2rl_version is not None
+                and object_.value
+                in (OWL_TRANSITIVE_PROPERTY, OWL_SYMMETRIC_PROPERTY)
+            ):
+                # ``P type owl:TransitiveProperty`` and its symmetric
+                # counterpart join all direct statements using ``P``.
+                by_predicate(fact.subject)
+                by_subject(fact.subject)
+            return tuple(terms)
+
+        if predicate == RDFS_SUBCLASS and isinstance(object_, IRI):
+            # ``A subClassOf B`` affects instances of A, predecessors of A,
+            # and the hierarchy/equivalence that continues from B.
+            by_subject(fact.subject)
+            by_object(fact.subject)
+            by_subject(object_)
+            return tuple(terms)
+
+        if (
+            self.profile.owl2rl_version is not None
+            and predicate == OWL_EQUIVALENT_CLASS
+            and isinstance(object_, IRI)
+        ):
+            # Equivalence is a bidirectional class bridge, so both class
+            # endpoints may have affected instances or hierarchy premises.
+            by_subject(fact.subject)
+            by_object(fact.subject)
+            by_subject(object_)
+            by_object(object_)
+            return tuple(terms)
+
+        if predicate == RDFS_SUBPROPERTY and isinstance(object_, IRI):
+            # ``P subPropertyOf Q`` joins P statements, P predecessors, and
+            # definitions continuing from Q.
+            by_subject(fact.subject)
+            by_object(fact.subject)
+            by_predicate(fact.subject)
+            by_subject(object_)
+            return tuple(terms)
+
+        if (
+            self.profile.owl2rl_version is not None
+            and predicate == OWL_EQUIVALENT_PROPERTY
+            and isinstance(object_, IRI)
+        ):
+            for endpoint in (fact.subject, object_):
+                by_subject(endpoint)
+                by_object(endpoint)
+                by_predicate(endpoint)
+            return tuple(terms)
+
+        if predicate in (RDFS_DOMAIN, RDFS_RANGE) and isinstance(object_, IRI):
+            # Domain/range declarations join every direct P statement, then
+            # continue through the declared class hierarchy.
+            by_subject(fact.subject)
+            by_predicate(fact.subject)
+            by_subject(object_)
+            return tuple(terms)
+
+        if (
+            self.profile.owl2rl_version is not None
+            and predicate == OWL_INVERSE_OF
+            and isinstance(object_, IRI)
+        ):
+            for endpoint in (fact.subject, object_):
+                by_subject(endpoint)
+                by_predicate(endpoint)
+            return tuple(terms)
+
+        if (
+            self.profile.owl2rl_version is not None
+            and predicate == OWL_PROPERTY_CHAIN_AXIOM
+        ):
+            by_subject(fact.subject)
+            chain = _property_chain(object_)
+            if chain is not None:
+                for chain_predicate in chain:
+                    by_predicate(chain_predicate)
+            return tuple(terms)
+
+        # An ordinary statement joins its predicate's schema declarations.
+        # Those declarations schedule their own statement/class neighbours,
+        # including inverse, symmetric, transitive, and domain/range paths.
+        by_subject(fact.predicate)
+        if self.profile.owl2rl_version is not None:
+            # These are the reverse-oriented forms of the two property
+            # schema joins above.  ``q equivalentProperty p`` and
+            # ``q inverseOf p`` must be visible when the changed statement
+            # uses ``p`` even though both schema assertions have ``q`` as
+            # their subject.  Predicate restriction preserves the bounded
+            # targeted path; a bare ``object=p`` lookup would not.
+            by_predicate_object(OWL_EQUIVALENT_PROPERTY, fact.predicate)
+            by_predicate_object(OWL_INVERSE_OF, fact.predicate)
+        return tuple(terms)
+
+    async def _has_context_row(
+        self,
+        term: Mapping[str, AssertionObject],
+        *,
+        cursor: str | None,
+        excluded_assertion_ids: Sequence[str],
+        started: float,
+    ) -> bool:
+        """Probe a term index without admitting another context fact.
+
+        The probe is the bounded overflow test paired with every context page.
+        Without it, a page that fills ``max_context_assertions`` is
+        indistinguishable from a complete neighbourhood and maintenance can
+        checkpoint a truncated inference closure.
+        """
+        self._check_time(started)
+        return bool(
+            await self._store.inference_inputs(
+                AssertionQuery(
+                    **term,
+                    limit=1,
+                    cursor=cursor,
+                    exclude_assertion_ids=tuple(excluded_assertion_ids),
+                )
+            )
+        )
+
+    @staticmethod
+    async def reconcile_obsolete_derivations_page(
+        store: "AsyncAssertionStore",
+        *,
+        active_profile_key: str | None,
+        cursor: str | None,
+        max_derivations: int,
+        run_id: str,
+    ) -> InferenceReconciliationResult:
+        """Retire one deterministic page of active proofs from prior profiles.
+
+        A new ontology/rule profile must not merely add its own proof rows:
+        conclusions justified only by an earlier profile remain active until
+        those rows are retired.  This operation pages the proof ledger by
+        derivation ID, deactivates obsolete rows, and retracts only conclusions
+        left with no independent active proof.  It is safe to retry because
+        inactive rows are excluded from each subsequent page.
+        """
+        if type(max_derivations) is not int or not 1 <= max_derivations <= 1_000:
+            raise InferenceError("max_derivations must be an integer in [1, 1000]")
+        if cursor is not None and (not isinstance(cursor, str) or not cursor):
+            raise InferenceError("derivation reconciliation cursor must be non-empty or null")
+        if active_profile_key is not None and (
+            not isinstance(active_profile_key, str) or not active_profile_key
+        ):
+            raise InferenceError("active_profile_key must be a non-empty string or null")
+        if not isinstance(run_id, str) or not run_id:
+            raise InferenceError("derivation reconciliation run_id must be non-empty")
+
+        database = store._database  # noqa: SLF001 - canonical inference ledger peer
+        clauses = ["tenant_id = ?", "active = 1"]
+        params: list[object] = [store.tenant_id]
+        if active_profile_key is not None:
+            clauses.append("profile_key <> ?")
+            params.append(active_profile_key)
+        if cursor is not None:
+            clauses.append("derivation_id > ?")
+            params.append(cursor)
+        rows = await database.fetchall(
+            "SELECT derivation_id, derived_assertion_id, derived_revision_id "
+            "FROM semantic_inference_derivations WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY derivation_id ASC LIMIT ?",
+            tuple(params + [max_derivations + 1]),
+        )
+        page = rows[:max_derivations]
+        backlog = max(0, len(rows) - len(page))
+        if not page:
+            return InferenceReconciliationResult(0, 0, None, 0)
+
+        retracted = 0
+        # The maintenance fence, when present, is renewed by every nested
+        # canonical mutation.  The peer publication transaction provides the
+        # same tenant serialization when this helper is used by another repair
+        # entry point.
+        async with store.inference_publication():
+            for derivation_id, _, _ in page:
+                await database.execute(
+                    "UPDATE semantic_inference_derivations SET active = 0 "
+                    "WHERE tenant_id = ? AND derivation_id = ? AND active = 1",
+                    (store.tenant_id, str(derivation_id)),
+                )
+            # Proof membership is lifecycle-relevant even when every affected
+            # conclusion has another live proof, so publish a fresh generation
+            # before checking conclusions for a necessary retraction.
+            await store._advance_generation()  # noqa: SLF001 - inference publication peer
+            for _, assertion_id, revision_id in page:
+                remaining = await database.fetchval(
+                    "SELECT COUNT(*) FROM semantic_inference_derivations "
+                    "WHERE tenant_id = ? AND derived_assertion_id = ? AND "
+                    "derived_revision_id = ? AND active = 1",
+                    (store.tenant_id, str(assertion_id), str(revision_id)),
+                )
+                if int(remaining or 0):
+                    continue
+                current = await store.get_assertion(str(assertion_id))
+                if (
+                    current is None
+                    or current.status is not AssertionStatus.ACTIVE
+                    or current.epistemic_state is not EpistemicState.INFERRED
+                    or current.revision_id != str(revision_id)
+                ):
+                    continue
+                receipt = await store.retract(
+                    current.assertion_id,
+                    current.revision_id,
+                    operation_id=(
+                        "inference-profile-reconcile:"
+                        f"{run_id}:{current.revision_id}"
+                    ),
+                )
+                retracted += len(receipt.retracted)
+        return InferenceReconciliationResult(
+            retired_derivations=len(page),
+            retracted_assertions=retracted,
+            next_cursor=(str(page[-1][0]) if backlog else None),
+            backlog=backlog,
+        )
 
     def _close(self, facts: dict[str, _Fact], started: float) -> dict[str, _Fact]:
         self._check_memory(facts)
@@ -1041,6 +1571,16 @@ class BoundedInferenceService:
         run_id: str,
         started: float,
     ) -> None:
+        await self._write_active_derivations(facts, run_id, started, replace=True)
+
+    async def _write_active_derivations(
+        self,
+        facts: dict[str, _Fact],
+        run_id: str,
+        started: float,
+        *,
+        replace: bool,
+    ) -> None:
         tenant_id = self._store.tenant_id
         database = self._store._database  # noqa: SLF001 - same internal persistence boundary
         # A materialization can change only the active proof set for an
@@ -1050,11 +1590,12 @@ class BoundedInferenceService:
         # before replacement so that a real proof/input change advances the
         # tenant generation in this same publication transaction.
         before_membership = await self._active_derivation_membership()
-        await database.execute(
-            "UPDATE semantic_inference_derivations SET active = 0 "
-            "WHERE tenant_id = ? AND profile_key = ?",
-            (tenant_id, self.profile.key),
-        )
+        if replace:
+            await database.execute(
+                "UPDATE semantic_inference_derivations SET active = 0 "
+                "WHERE tenant_id = ? AND profile_key = ?",
+                (tenant_id, self.profile.key),
+            )
         for fact in sorted((item for item in facts.values() if not item.is_source), key=lambda item: item.assertion_id):
             self._check_time(started)
             current = await self._store.get_assertion(fact.assertion_id)
@@ -1286,6 +1827,7 @@ __all__ = [
     "InferenceError",
     "InferenceLimits",
     "InferenceProfile",
+    "InferenceReconciliationResult",
     "inference_limits_from_config",
     "inference_profile_from_config",
     "validate_inference_profile",

@@ -144,6 +144,12 @@ __all__ = [
     "LocalIdentifier",
     "MAPPING_SCHEMA_VERSION",
     "MaterializationResult",
+    "SemanticMaintenanceError",
+    "SemanticMaintenanceLimits",
+    "SemanticMaintenanceResult",
+    "SemanticMaintenanceService",
+    "SemanticMaintenanceStatus",
+    "SemanticMaintenanceTrainingReadiness",
     "OntologyRef",
     "RDF_LANG_STRING",
     "RdfAssertionCodec",
@@ -212,6 +218,8 @@ __all__ = [
     "lineage_from_mapping",
     "load_knowledge_registry",
     "normalize_iri",
+    "maintenance_limits_from_config",
+    "maintenance_allows_prior_verified_snapshot",
 ]
 
 _REGISTRY_EXPORTS = frozenset(
@@ -298,6 +306,19 @@ _SHACL_VALIDATION_EXPORTS = frozenset(
     }
 )
 
+_MAINTENANCE_EXPORTS = frozenset(
+    {
+        "SemanticMaintenanceError",
+        "SemanticMaintenanceLimits",
+        "SemanticMaintenanceResult",
+        "SemanticMaintenanceService",
+        "SemanticMaintenanceStatus",
+        "SemanticMaintenanceTrainingReadiness",
+        "maintenance_allows_prior_verified_snapshot",
+        "maintenance_limits_from_config",
+    }
+)
+
 
 def __getattr__(name: str):
     """Lazily expose optional boundaries so registry CLI execution stays clean."""
@@ -309,6 +330,10 @@ def __getattr__(name: str):
         from . import rdf_codec
 
         return getattr(rdf_codec, name)
+    if name in _MAINTENANCE_EXPORTS:
+        from . import maintenance
+
+        return getattr(maintenance, name)
     if name in _INFERENCE_EXPORTS:
         from . import inference
 
