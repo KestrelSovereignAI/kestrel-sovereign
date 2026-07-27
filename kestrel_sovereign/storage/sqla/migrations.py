@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 
 _SEMANTIC_ASSERTION_SCHEMA_VERSION = "semantic_assertion_store_v2"
+_SEMANTIC_VALIDATION_SCHEMA_VERSION = "semantic_validation_reports_v1"
 _SEMANTIC_ASSERTION_LOCK_DOMAIN = b"kestrel:semantic-assertion-schema:v1\0"
 
 
@@ -303,6 +304,86 @@ async def migrate_semantic_assertion_store(db: "AsyncDatabase") -> None:
         await db.execute(
             "INSERT INTO semantic_schema_migrations (version) VALUES (?)",
             (_SEMANTIC_ASSERTION_SCHEMA_VERSION,),
+        )
+
+
+async def migrate_semantic_validation_reports(db: "AsyncDatabase") -> None:
+    """Create the tenant-bound SHACL report tables in the canonical database.
+
+    This is deliberately a companion migration rather than a second database:
+    validation reports are auditable projections of the same semantic tenant
+    and have no independent assertion or eligibility write path.
+    """
+    row = await db.fetchone(
+        "SELECT 1 FROM semantic_schema_migrations WHERE version = ?",
+        (_SEMANTIC_VALIDATION_SCHEMA_VERSION,),
+    )
+    if row is not None:
+        return
+    statements = (
+        """CREATE TABLE IF NOT EXISTS semantic_validation_reports (
+            report_id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            report_version INTEGER NOT NULL,
+            assertion_ids TEXT NOT NULL,
+            shape_set_id TEXT NOT NULL,
+            shape_set_version TEXT NOT NULL,
+            validation_profile_id TEXT NOT NULL,
+            validation_profile_version TEXT NOT NULL,
+            checkpoint_generation INTEGER,
+            run_id TEXT NOT NULL,
+            state TEXT NOT NULL,
+            action TEXT NOT NULL,
+            source TEXT NOT NULL,
+            evaluated_at TEXT NOT NULL,
+            report_mapping TEXT NOT NULL,
+            CHECK (report_version = 1),
+            CHECK (checkpoint_generation IS NULL OR checkpoint_generation >= 0),
+            CHECK (state IN ('conforms', 'nonconformant', 'incomplete')),
+            CHECK (action IN ('accept', 'accept-with-report', 'reject', 'quarantine')),
+            CHECK (source IN ('asserted', 'imported', 'inferred', 'revalidation'))
+        )""",
+        """CREATE TABLE IF NOT EXISTS semantic_validation_results (
+            tenant_id TEXT NOT NULL,
+            report_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            assertion_id TEXT,
+            shape_id TEXT,
+            constraint_code TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, report_id, ordinal),
+            CHECK (ordinal >= 0),
+            CHECK (severity IN ('info', 'warning', 'violation'))
+        )""",
+        """CREATE TABLE IF NOT EXISTS semantic_validation_report_assertions (
+            tenant_id TEXT NOT NULL,
+            report_id TEXT NOT NULL,
+            assertion_id TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, report_id, assertion_id)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_semantic_validation_report_tenant_time ON semantic_validation_reports(tenant_id, evaluated_at, report_id)",
+        "CREATE INDEX IF NOT EXISTS idx_semantic_validation_report_assertion ON semantic_validation_report_assertions(tenant_id, assertion_id, report_id)",
+        "CREATE INDEX IF NOT EXISTS idx_semantic_validation_result_tenant_assertion ON semantic_validation_results(tenant_id, assertion_id, report_id)",
+    )
+    async with db.transaction():
+        if db.backend_type == "postgres":
+            await db.execute("SELECT pg_advisory_xact_lock(?)", (_semantic_assertion_lock_id(),))
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS semantic_schema_migrations "
+            "(version TEXT PRIMARY KEY)",
+            (),
+        )
+        existing = await db.fetchone(
+            "SELECT 1 FROM semantic_schema_migrations WHERE version = ?",
+            (_SEMANTIC_VALIDATION_SCHEMA_VERSION,),
+        )
+        if existing is not None:
+            return
+        for statement in statements:
+            await db.execute(statement, ())
+        await db.execute(
+            "INSERT INTO semantic_schema_migrations (version) VALUES (?)",
+            (_SEMANTIC_VALIDATION_SCHEMA_VERSION,),
         )
 
 

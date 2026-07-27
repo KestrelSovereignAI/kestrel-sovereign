@@ -1,5 +1,6 @@
 @prefix kestrel: <https://kestrel.ai/vocab/> .
 @prefix kshape: <https://kestrel.ai/shapes/> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
 @prefix sh: <http://www.w3.org/ns/shacl#> .
 
 <https://kestrel.ai/shapes/> a sh:ShapesGraph ;
@@ -7,4 +8,19 @@
 
 kshape:AssertionRevisionShape a sh:NodeShape ;
     sh:targetClass kestrel:AssertionRevision ;
-    sh:property [ sh:path kestrel:hasSourceOccurrence ; sh:minCount 1 ] .
+    sh:or (
+        [
+            sh:property [
+                sh:path kestrel:hasSourceOccurrence ;
+                sh:minCount 1 ;
+                sh:nodeKind sh:IRI
+            ]
+        ]
+        [
+            sh:property [
+                sh:path prov:wasDerivedFrom ;
+                sh:minCount 1 ;
+                sh:nodeKind sh:IRI
+            ]
+        ]
+    ) .
