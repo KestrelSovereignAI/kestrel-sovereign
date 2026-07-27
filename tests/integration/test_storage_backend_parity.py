@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from uuid import uuid4
@@ -259,6 +260,39 @@ async def test_canonical_assertion_store_has_tenant_and_lifecycle_parity(
             )
     finally:
         await other_storage.close()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_canonical_assertion_iri_object_query_has_backend_parity(
+    db_backend,
+    tmp_path,
+):
+    """IRI-object lookups do not bind untyped NULLs on PostgreSQL."""
+    from kestrel_sovereign.knowledge import AssertionQuery, IRI
+
+    tenant, identity = await _incepted_assertion_identity(tmp_path, "iri-object-query")
+    storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    try:
+        object_ = IRI("https://example.test/object")
+        assertion = replace(
+            _semantic_assertion(tenant, "iri-object-query"),
+            object=object_,
+            assertion_id=None,
+        )
+        await storage.put_assertion(
+            assertion,
+            source_occurrences=(_semantic_source("parity-source"),),
+        )
+
+        assert await storage.query_assertions(
+            AssertionQuery(object=object_)
+        ) == [assertion]
+        assert await storage.query_assertions(
+            AssertionQuery(object=IRI("https://example.test/missing"))
+        ) == []
+    finally:
         await storage.close()
 
 

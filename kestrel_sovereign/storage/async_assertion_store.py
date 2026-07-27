@@ -2914,14 +2914,24 @@ class AsyncAssertionStore:
             params.append(query.predicate.value)
         if query.object is not None:
             mapping = query.object.identity_mapping()
-            clauses.extend([
-                "r.object_kind = ?", "r.object_value = ?",
-                "(r.object_datatype = ? OR (r.object_datatype IS NULL AND ? IS NULL))",
-                "(r.object_language = ? OR (r.object_language IS NULL AND ? IS NULL))",
-            ])
+            clauses.extend(("r.object_kind = ?", "r.object_value = ?"))
             datatype = mapping.get("datatype")
             language = mapping.get("language")
-            params.extend([mapping["kind"], mapping["value"], datatype, datatype, language, language])
+            params.extend((mapping["kind"], mapping["value"]))
+            # PostgreSQL cannot infer the type of a standalone NULL bind
+            # parameter.  IRI and blank-node terms have no datatype or
+            # language, so express their canonical identity with SQL NULL
+            # predicates rather than ``column = ? OR (? IS NULL ...)``.
+            if datatype is None:
+                clauses.append("r.object_datatype IS NULL")
+            else:
+                clauses.append("r.object_datatype = ?")
+                params.append(datatype)
+            if language is None:
+                clauses.append("r.object_language IS NULL")
+            else:
+                clauses.append("r.object_language = ?")
+                params.append(language)
         if query.assertion_ids:
             clauses.append(f"a.assertion_id IN ({_placeholders(query.assertion_ids)})")
             params.extend(query.assertion_ids)
