@@ -429,7 +429,7 @@ class SemanticMaintenanceService:
                     duration_ms=self._duration_ms(started),
                     capability_versions=capability_versions,
                 )
-                await self._record_state(
+                result = await self._record_state(
                     result,
                     profile_key,
                     lease,
@@ -457,7 +457,7 @@ class SemanticMaintenanceService:
                     duration_ms=self._duration_ms(started),
                     capability_versions=capability_versions,
                 )
-                await self._record_state(
+                result = await self._record_state(
                     result,
                     profile_key,
                     lease,
@@ -629,7 +629,7 @@ class SemanticMaintenanceService:
                         duration_ms=self._duration_ms(started),
                         capability_versions=capability_versions,
                     )
-                    await self._record_state(
+                    result = await self._record_state(
                         result,
                         profile_key,
                         lease,
@@ -718,7 +718,7 @@ class SemanticMaintenanceService:
                     duration_ms=self._duration_ms(started),
                     capability_versions=capability_versions,
                 )
-                await self._record_state(
+                result = await self._record_state(
                     result,
                     profile_key,
                     lease,
@@ -784,7 +784,7 @@ class SemanticMaintenanceService:
                     duration_ms=self._duration_ms(started),
                     capability_versions=capability_versions,
                 )
-                await self._record_state(
+                result = await self._record_state(
                     result,
                     profile_key,
                     lease,
@@ -882,7 +882,7 @@ class SemanticMaintenanceService:
                         duration_ms=self._duration_ms(started),
                         capability_versions=capability_versions,
                     )
-                    await self._record_state(
+                    result = await self._record_state(
                         result,
                         profile_key,
                         lease,
@@ -1069,7 +1069,7 @@ class SemanticMaintenanceService:
             # A partial batch has completed its bounded unit.  Its checkpoint
             # is therefore durable; the nonzero backlog says exactly why the
             # next sleep must take another unit rather than claiming closure.
-            await self._record_state(
+            result = await self._record_state(
                 result,
                 profile_key,
                 lease,
@@ -1100,7 +1100,7 @@ class SemanticMaintenanceService:
                 # page retryable.  Recording only the run result used to
                 # discard the newly introduced scan cursor and restart from
                 # the first lexical page forever.
-                await self._record_state(
+                result = await self._record_state(
                     result,
                     profile_key,
                     lease,
@@ -1903,65 +1903,92 @@ class SemanticMaintenanceService:
         audit_assertion_id: str | None = None,
         audit_assertion_revision_id: str | None = None,
         audit_competitor_cursor_revision_id: str | None = None,
-    ) -> None:
+    ) -> SemanticMaintenanceResult:
         try:
             async with self._database.transaction():
                 await self._renew_fenced_lease_in_transaction(lease)
-                # Keep terminal evidence and its authoritative state in one
-                # lease-fenced transaction.  A stale holder cannot overwrite
-                # a successor's terminal row, and a crash cannot commit one
-                # half of the terminal record without the other.
-                await self._write_terminal_run_in_transaction(result, profile_key)
-                changed = await self._database.execute(
-                    "INSERT INTO semantic_maintenance_state "
-                    "(tenant_id, profile_key, checkpoint_generation, checkpoint_event_id, run_id, status, capability_versions, repair_cursor_revision_id, repair_active, repair_mode, repair_scan_complete, repair_checkpoint_generation, repair_checkpoint_event_id, repair_reconcile_cursor_derivation_id, audit_assertion_id, audit_assertion_revision_id, audit_competitor_cursor_revision_id, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(tenant_id) DO UPDATE SET "
-                    "profile_key = excluded.profile_key, "
-                    "checkpoint_generation = excluded.checkpoint_generation, "
-                    "checkpoint_event_id = excluded.checkpoint_event_id, "
-                    "run_id = excluded.run_id, status = excluded.status, "
-                    "capability_versions = excluded.capability_versions, "
-                    "repair_cursor_revision_id = excluded.repair_cursor_revision_id, "
-                    "repair_active = excluded.repair_active, "
-                    "repair_mode = excluded.repair_mode, "
-                    "repair_scan_complete = excluded.repair_scan_complete, "
-                    "repair_checkpoint_generation = excluded.repair_checkpoint_generation, "
-                    "repair_checkpoint_event_id = excluded.repair_checkpoint_event_id, "
-                    "repair_reconcile_cursor_derivation_id = excluded.repair_reconcile_cursor_derivation_id, "
-                    "audit_assertion_id = excluded.audit_assertion_id, "
-                    "audit_assertion_revision_id = excluded.audit_assertion_revision_id, "
-                    "audit_competitor_cursor_revision_id = excluded.audit_competitor_cursor_revision_id, "
-                    "updated_at = excluded.updated_at",
-                    (
-                        self._assertions.tenant_id,
-                        profile_key,
-                        result.checkpoint_generation,
-                        checkpoint_event_id,
-                        result.run_id,
-                        result.status.value,
-                        _json(result.capability_versions),
-                        repair_cursor_revision_id,
-                        int(repair_active),
-                        repair_mode,
-                        int(repair_scan_complete),
+                # Terminal readiness is published under the same canonical
+                # tenant lock as assertion mutations.  The lock order is
+                # deliberately lease then tenant, matching erasure and
+                # maintenance-generated writes.  A source event arriving
+                # after the earlier replay probe therefore either commits
+                # before this lock and downgrades closure, or waits until the
+                # PARTIAL/COMPLETE state below is already durable.
+                async with self._assertions.inference_publication():
+                    if result.complete:
+                        current_source = await self._assertions.checkpoint()
+                        current_cursor = await self._event_checkpoint(current_source)
+                        proposed_cursor = AssertionCheckpoint(
+                            self._assertions.tenant_id,
+                            result.checkpoint_generation,
+                            checkpoint_event_id,
+                        )
+                        if not self._checkpoint_matches(
+                            proposed_cursor,
+                            current_cursor,
+                        ):
+                            result = replace(
+                                result,
+                                status=SemanticMaintenanceStatus.PARTIAL,
+                                reason="source_changed_during_closure",
+                                source_generation=current_source.generation,
+                                backlog_assertions=max(1, result.backlog_assertions),
+                            )
+                    # Keep terminal evidence and its authoritative state in one
+                    # lease-fenced, tenant-serialized transaction. A stale
+                    # holder cannot overwrite a successor's terminal row, and
+                    # a crash cannot commit one half without the other.
+                    await self._write_terminal_run_in_transaction(result, profile_key)
+                    changed = await self._database.execute(
+                        "INSERT INTO semantic_maintenance_state "
+                        "(tenant_id, profile_key, checkpoint_generation, checkpoint_event_id, run_id, status, capability_versions, repair_cursor_revision_id, repair_active, repair_mode, repair_scan_complete, repair_checkpoint_generation, repair_checkpoint_event_id, repair_reconcile_cursor_derivation_id, audit_assertion_id, audit_assertion_revision_id, audit_competitor_cursor_revision_id, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT(tenant_id) DO UPDATE SET "
+                        "profile_key = excluded.profile_key, "
+                        "checkpoint_generation = excluded.checkpoint_generation, "
+                        "checkpoint_event_id = excluded.checkpoint_event_id, "
+                        "run_id = excluded.run_id, status = excluded.status, "
+                        "capability_versions = excluded.capability_versions, "
+                        "repair_cursor_revision_id = excluded.repair_cursor_revision_id, "
+                        "repair_active = excluded.repair_active, "
+                        "repair_mode = excluded.repair_mode, "
+                        "repair_scan_complete = excluded.repair_scan_complete, "
+                        "repair_checkpoint_generation = excluded.repair_checkpoint_generation, "
+                        "repair_checkpoint_event_id = excluded.repair_checkpoint_event_id, "
+                        "repair_reconcile_cursor_derivation_id = excluded.repair_reconcile_cursor_derivation_id, "
+                        "audit_assertion_id = excluded.audit_assertion_id, "
+                        "audit_assertion_revision_id = excluded.audit_assertion_revision_id, "
+                        "audit_competitor_cursor_revision_id = excluded.audit_competitor_cursor_revision_id, "
+                        "updated_at = excluded.updated_at",
                         (
-                            repair_checkpoint.generation
-                            if repair_checkpoint is not None
-                            else None
+                            self._assertions.tenant_id,
+                            profile_key,
+                            result.checkpoint_generation,
+                            checkpoint_event_id,
+                            result.run_id,
+                            result.status.value,
+                            _json(result.capability_versions),
+                            repair_cursor_revision_id,
+                            int(repair_active),
+                            repair_mode,
+                            int(repair_scan_complete),
+                            (
+                                repair_checkpoint.generation
+                                if repair_checkpoint is not None
+                                else None
+                            ),
+                            (
+                                repair_checkpoint.latest_event_id
+                                if repair_checkpoint is not None
+                                else None
+                            ),
+                            repair_reconcile_cursor_derivation_id,
+                            audit_assertion_id,
+                            audit_assertion_revision_id,
+                            audit_competitor_cursor_revision_id,
+                            _now(),
                         ),
-                        (
-                            repair_checkpoint.latest_event_id
-                            if repair_checkpoint is not None
-                            else None
-                        ),
-                        repair_reconcile_cursor_derivation_id,
-                        audit_assertion_id,
-                        audit_assertion_revision_id,
-                        audit_competitor_cursor_revision_id,
-                        _now(),
-                    ),
-                )
+                    )
         except TransactionError as error:
             if isinstance(error.__cause__, MaintenanceLeaseLostError):
                 raise SemanticMaintenanceError("semantic_maintenance_lease_lost") from error
@@ -1969,6 +1996,7 @@ class SemanticMaintenanceService:
         if changed != 1:
             raise SemanticMaintenanceError("semantic_maintenance_lease_lost")
         self._log_result(result)
+        return result
 
     async def _database_time(self) -> float:
         if self._database.backend_type == "postgres":

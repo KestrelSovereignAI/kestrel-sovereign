@@ -899,6 +899,165 @@ async def test_semantic_maintenance_second_unchanged_run_is_a_true_noop(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("establish_nonempty_state", (False, True))
+async def test_noop_closure_downgrades_a_source_write_before_terminal_commit(
+    assertion_store,
+    monkeypatch,
+    establish_nonempty_state: bool,
+) -> None:
+    """Both fresh and unchanged NO_OP paths close under the canonical lock."""
+
+    service = SemanticMaintenanceService(assertion_store, inference_profile=None)
+    if establish_nonempty_state:
+        await _put(
+            assertion_store,
+            "noop-closure-existing",
+            IRI("https://example.test/noop-closure-existing-subject"),
+            IRI("https://example.test/noop-closure-predicate"),
+            Literal("existing", XSD_STRING),
+        )
+        assert (await service.run()).status is SemanticMaintenanceStatus.COMPLETE
+
+    original_record_state = service._record_state  # noqa: SLF001 - deterministic closure seam
+    injected = False
+
+    async def inject_governed_write(result, profile_key, lease, **kwargs):
+        nonlocal injected
+        if not injected:
+            injected = True
+            await _put(
+                assertion_store,
+                "noop-closure-concurrent",
+                IRI("https://example.test/noop-closure-concurrent-subject"),
+                IRI("https://example.test/noop-closure-predicate"),
+                Literal("concurrent", XSD_STRING),
+            )
+        return await original_record_state(result, profile_key, lease, **kwargs)
+
+    monkeypatch.setattr(service, "_record_state", inject_governed_write)
+
+    result = await service.run()
+
+    assert result.status is SemanticMaintenanceStatus.PARTIAL
+    assert result.reason == "source_changed_during_closure"
+    assert result.backlog_assertions == 1
+    assert await assertion_store._database.fetchone(  # noqa: SLF001 - closure atomicity
+        "SELECT status FROM semantic_maintenance_state WHERE tenant_id = ?",
+        (assertion_store.tenant_id,),
+    ) == ("partial",)
+    assert await assertion_store._database.fetchone(  # noqa: SLF001 - matching terminal evidence
+        "SELECT status, reason FROM semantic_maintenance_runs "
+        "WHERE tenant_id = ? AND run_id = ?",
+        (assertion_store.tenant_id, result.run_id),
+    ) == ("partial", "source_changed_during_closure")
+    readiness = await service.training_readiness()
+    assert not readiness.ready
+    assert readiness.reason == "semantic_maintenance_partial"
+
+
+@pytest.mark.asyncio
+async def test_complete_closure_race_blocks_sleep_training_hook(
+    assertion_store,
+    monkeypatch,
+) -> None:
+    """A post-probe governed write becomes durable PARTIAL before sleep resumes."""
+
+    service = SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=None,
+        limits=SemanticMaintenanceLimits(max_assertions=3),
+    )
+    assert (await service.run()).status is SemanticMaintenanceStatus.NO_OP
+    await _put(
+        assertion_store,
+        "complete-closure-selected",
+        IRI("https://example.test/complete-closure-selected-subject"),
+        IRI("https://example.test/complete-closure-predicate"),
+        Literal("selected", XSD_STRING),
+    )
+
+    original_record_state = service._record_state  # noqa: SLF001 - deterministic closure seam
+    injected = False
+
+    async def inject_governed_write(result, profile_key, lease, **kwargs):
+        nonlocal injected
+        if result.status is SemanticMaintenanceStatus.COMPLETE and not injected:
+            injected = True
+            await _put(
+                assertion_store,
+                "complete-closure-concurrent",
+                IRI("https://example.test/complete-closure-concurrent-subject"),
+                IRI("https://example.test/complete-closure-predicate"),
+                Literal("concurrent", XSD_STRING),
+            )
+        return await original_record_state(result, profile_key, lease, **kwargs)
+
+    monkeypatch.setattr(service, "_record_state", inject_governed_write)
+    calls: list[str] = []
+    selected_profile = _profile()
+
+    class Storage:
+        async def run_semantic_maintenance(self, profile, **kwargs):
+            assert profile == selected_profile
+            return await service.run()
+
+    class TrainingHook:
+        sleep_hook_contract = SleepHookContract(
+            hook_id="test.closure-training",
+            phase=SleepHookPhase.TRAINING,
+        )
+
+        async def on_post_consolidation(self, agent, result):
+            calls.append("training")
+            return {"success": True}
+
+    class Agent(SleepMixin):
+        def __init__(self) -> None:
+            self.semantic_inference_profile = selected_profile
+            self.semantic_inference_configured = True
+            self.semantic_inference_limits = InferenceLimits()
+            self.semantic_maintenance_configured = True
+            self.semantic_maintenance_limits = SemanticMaintenanceLimits(
+                max_assertions=3
+            )
+            self.storage = Storage()
+            self.sleep_hooks = [TrainingHook()]
+            self.on_sleep_complete = None
+
+        async def _consolidate_memories(self):
+            return {"episodes_created": 1}
+
+    report = await Agent().sleep(
+        skip_export=True,
+    )
+
+    assert calls == []
+    assert report.semantic_maintenance["status"] == "partial"
+    assert report.semantic_maintenance["reason"] == "source_changed_during_closure"
+    training = next(
+        item
+        for item in report.hook_results
+        if item.hook_id == "test.closure-training"
+    )
+    assert training.status.value == "blocked"
+    current = await assertion_store.checkpoint()
+    state = await assertion_store._database.fetchone(  # noqa: SLF001 - closure cursor
+        "SELECT status, checkpoint_event_id "
+        "FROM semantic_maintenance_state WHERE tenant_id = ?",
+        (assertion_store.tenant_id,),
+    )
+    assert state is not None
+    assert state[0] == "partial"
+    assert state[1] != current.latest_event_id
+    assert not (await service.training_readiness()).ready
+
+    resumed = await service.run()
+    assert resumed.status is SemanticMaintenanceStatus.COMPLETE
+    assert resumed.changes_consumed == 1
+    assert (await service.training_readiness()).ready
+
+
+@pytest.mark.asyncio
 async def test_save_fact_maintenance_reopen_is_a_true_noop(tmp_path, monkeypatch) -> None:
     """A governed fact write reaches maintenance once and remains drained after restart.
 
