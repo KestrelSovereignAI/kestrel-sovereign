@@ -84,6 +84,7 @@ class SemanticRecallConfig:
 
     enabled: bool = True
     candidate_limit: int = 32
+    candidate_scan_limit: int = 2_000
     work_limit: int = 24
     result_limit: int = 8
     max_tokens: int = 1_200
@@ -96,6 +97,7 @@ class SemanticRecallConfig:
             raise ValueError("semantic recall enabled must be a boolean")
         for name in (
             "candidate_limit",
+            "candidate_scan_limit",
             "work_limit",
             "result_limit",
             "max_tokens",
@@ -106,6 +108,8 @@ class SemanticRecallConfig:
                 raise ValueError(f"semantic recall {name} must be a positive integer")
         if self.work_limit > self.candidate_limit:
             raise ValueError("semantic recall work_limit cannot exceed candidate_limit")
+        if self.candidate_limit > self.candidate_scan_limit:
+            raise ValueError("semantic recall candidate_limit cannot exceed candidate_scan_limit")
         if (
             not isinstance(self.recency_half_life_days, (int, float))
             or isinstance(self.recency_half_life_days, bool)
@@ -180,6 +184,7 @@ def coerce_config(
     aliases = {
         "semantic_recall_enabled": "enabled",
         "semantic_recall_candidate_limit": "candidate_limit",
+        "semantic_recall_candidate_scan_limit": "candidate_scan_limit",
         "semantic_recall_work_limit": "work_limit",
         "semantic_recall_result_limit": "result_limit",
         "semantic_recall_max_tokens": "max_tokens",

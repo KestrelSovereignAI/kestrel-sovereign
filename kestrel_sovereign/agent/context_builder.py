@@ -149,6 +149,7 @@ class ContextBuilder:
         self._semantic_inference_profile = semantic_inference_profile
         self._semantic_inference_limits = semantic_inference_limits
         self._semantic_maintenance_limits = semantic_maintenance_limits
+        self.last_semantic_recall_metadata: Dict[str, Any] = {"status": "disabled"}
         self.agent_data_path = Path(agent_data_path) if agent_data_path else None
 
         # Load bootstrap config from kestrel.toml
@@ -311,7 +312,7 @@ class ContextBuilder:
         return True
 
     async def retrieve_context(
-        self, query: str, min_score: Optional[float] = None
+        self, query: str, min_score: Optional[float] = None, max_tokens: Optional[int] = None
     ) -> str:
         """
         Retrieves relevant documents and knowledge graph context for a query.
@@ -355,6 +356,7 @@ class ContextBuilder:
             logger.warning("Semantic recall configuration unavailable: %s", exc)
             recall_config = coerce_config({"semantic_recall_enabled": False})
         if recall_config.enabled:
+            self.last_semantic_recall_metadata = {"status": "enabled"}
             reader = getattr(self.storage, "semantic_recall_candidates", None)
             if reader is None:
                 logger.warning("Semantic recall capability unavailable: storage seam missing")
@@ -362,24 +364,46 @@ class ContextBuilder:
                 try:
                     recalled = await reader(
                         query=query,
-                        candidate_limit=recall_config.candidate_limit,
+                        candidate_scan_limit=recall_config.candidate_scan_limit,
                         inference_profile=self._semantic_inference_profile,
                         inference_limits=self._semantic_inference_limits,
                         maintenance_limits=self._semantic_maintenance_limits,
                     )
-                    candidates = tuple(recalled.candidates[:recall_config.work_limit])
-                    semantic_scores = await self._semantic_scores(query, candidates)
+                    semantic_scores = await self._semantic_scores(query, recalled.candidates)
+                    ordered = sorted(
+                        recalled.candidates,
+                        key=lambda item: (-semantic_scores[item.assertion.assertion_id], item.assertion.assertion_id),
+                    )
+                    selected = tuple(ordered[:recall_config.candidate_limit])
+                    hydrator = getattr(self.storage, "hydrate_semantic_recall_candidates", None)
+                    if hydrator is None:
+                        raise RuntimeError("semantic_recall_provenance_capability_unavailable")
+                    hydrated = await hydrator([item.assertion.assertion_id for item in selected])
+                    by_id = {item.assertion.assertion_id: item for item in hydrated}
+                    candidates = tuple(by_id[item.assertion.assertion_id] for item in selected if item.assertion.assertion_id in by_id)
                     hybrid = render_hybrid_context(
                         query=query, rag_results=rag_results,
                         assertion_candidates=candidates,
                         config=recall_config, count_tokens=self.counter.count,
-                        semantic_scores=semantic_scores,
+                        semantic_scores=semantic_scores, max_tokens=max_tokens,
                     )
+                    self.last_semantic_recall_metadata = {
+                        "status": "used" if hybrid.assertion_count else "empty",
+                        "checkpoint_generation": recalled.checkpoint_generation,
+                        "capability_versions": dict(recalled.capability_versions),
+                        "discovery_count": recalled.discovery_count,
+                        "assertions": hybrid.metadata,
+                    }
                     return hybrid.context
                 except Exception as exc:
                     # Capability failures are observable and never fabricate a
                     # graph result; retain the established RAG path.
                     logger.warning("Semantic recall unavailable: %s", exc)
+                    self.last_semantic_recall_metadata = {
+                        "status": "unavailable", "reason": str(exc)[:128],
+                    }
+        else:
+            self.last_semantic_recall_metadata = {"status": "disabled"}
         if not rag_results:
             return "No relevant documents or knowledge found in memory."
         return "\n\n".join(
@@ -400,8 +424,10 @@ class ContextBuilder:
         if not candidates:
             return {}
         from kestrel_sovereign.agent.semantic_recall import _claim_text
-        from kestrel_sovereign.llm.embedding_service import get_embedding_service, semantic_search
-        service = get_embedding_service()
+        from kestrel_sovereign.llm.embedding_service import get_provider_embedding_service, semantic_search
+        service = get_provider_embedding_service(self._llm_service)
+        if service is None:
+            raise RuntimeError("semantic_embedding_capability_unavailable")
         claims = [_claim_text(item.assertion, 1200) for item in candidates]
         hits = await semantic_search(query, claims, service, top_k=len(claims))
         if len(hits) != len(claims):

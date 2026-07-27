@@ -862,6 +862,7 @@ class ContextManager:
                     "chunks": rag_result.items,
                     "estimated": True,
                     "estimation_method": "production-retrieval-plan",
+                    **rag_result.metadata,
                 },
             )
         elif not include_rag or trivial_turn:
@@ -1513,7 +1514,7 @@ class ContextManager:
             return None
         try:
             rag_context = await self.context_builder.retrieve_context(
-                query, min_score=retrieval_cfg["rag_min_score"],
+                query, min_score=retrieval_cfg["rag_min_score"], max_tokens=budget.rag,
             )
         except Exception as e:
             logger.warning(f"RAG retrieval failed: {e}")
@@ -1525,7 +1526,13 @@ class ContextManager:
         if not rag_context:
             return None
         # Canonical typed result for RAG bytes/counting/provenance.
-        return build_rag_section(rag_context, self.counter.count)
+        result = build_rag_section(rag_context, self.counter.count)
+        # Content-free recall identifiers/scores belong in the typed section
+        # trace, never in prompt text or logs containing retrieved content.
+        metadata = getattr(self.context_builder, "last_semantic_recall_metadata", None)
+        if isinstance(metadata, dict):
+            result.metadata = {"semantic_recall": metadata}
+        return result
 
     def _commit_dynamic_section(
         self,

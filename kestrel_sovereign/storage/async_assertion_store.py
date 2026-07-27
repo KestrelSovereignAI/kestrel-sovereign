@@ -374,6 +374,7 @@ class AssertionRecallResult:
     candidates: tuple[AssertionRecallCandidate, ...]
     checkpoint_generation: int
     capability_versions: Mapping[str, str]
+    discovery_count: int
 
 
 _RECALL_WORD_RE = re.compile(r"[\w]+", re.UNICODE)
@@ -5045,7 +5046,7 @@ class AsyncAssertionStore:
         self,
         *,
         query: str,
-        candidate_limit: int,
+        candidate_scan_limit: int,
         inference_profile,
         inference_limits=None,
         maintenance_limits=None,
@@ -5057,8 +5058,8 @@ class AsyncAssertionStore:
         maintenance status.  The ledger query enforces current ACTIVE and
         projection eligibility before provenance is hydrated in one batch.
         """
-        if type(candidate_limit) is not int or not 1 <= candidate_limit <= 1000:
-            raise AssertionStoreError("semantic recall candidate_limit must be in [1, 1000]")
+        if type(candidate_scan_limit) is not int or not 1 <= candidate_scan_limit <= 10_000:
+            raise AssertionStoreError("semantic recall candidate_scan_limit must be in [1, 10000]")
         if not isinstance(query, str):
             raise AssertionStoreError("semantic recall query must be text")
         if inference_profile is None:
@@ -5072,31 +5073,60 @@ class AsyncAssertionStore:
         readiness = await service.training_readiness()
         if not readiness.ready:
             raise SemanticRecallUnavailableError(readiness.reason or "semantic_maintenance_unavailable")
-        # Candidate selection is deterministic relevance ranking over a fixed
-        # backend-neutral scan, never the lexical first public-query page.
-        # The prompt layer may apply richer semantic scoring, but it cannot
-        # widen this governed lifecycle/privacy result.
-        assertions = await self._query_current(AssertionQuery(limit=1000), eligible_only=True)
-        terms = set(_RECALL_WORD_RE.findall(query.casefold()))
-        def relevance(item: Assertion) -> tuple[float, str]:
-            text = " ".join((item.subject.value, item.predicate.value, getattr(item.object, "value", ""))).casefold()
-            claim_terms = set(_RECALL_WORD_RE.findall(text))
-            score = len(terms & claim_terms) / len(terms) if terms else 0.0
-            return (-score, item.assertion_id)
-        assertions = sorted(assertions, key=relevance)[:candidate_limit]
-        sources = await self._sources_for_assertions(assertions)
+        # Page the complete configured discovery window with a storage-owned
+        # clock.  If it overflows, fail visibly rather than calling an
+        # arbitrary revision-id prefix "semantic" recall.
+        now = datetime.now(timezone.utc)
+        assertions: list[Assertion] = []
+        cursor: str | None = None
+        while len(assertions) < candidate_scan_limit:
+            page = await self._query_current(
+                AssertionQuery(
+                    limit=min(1000, candidate_scan_limit - len(assertions)),
+                    cursor=cursor,
+                    valid_at=now,
+                ),
+                eligible_only=True,
+            )
+            assertions.extend(page)
+            if len(page) < min(1000, candidate_scan_limit - (len(assertions) - len(page))):
+                break
+            cursor = page[-1].revision_id
+        if len(assertions) == candidate_scan_limit:
+            overflow = await self._query_current(
+                AssertionQuery(limit=1, cursor=assertions[-1].revision_id, valid_at=now),
+                eligible_only=True,
+            )
+            if overflow:
+                raise SemanticRecallUnavailableError("semantic_recall_candidate_window_exceeded")
         return AssertionRecallResult(
             candidates=tuple(
                 AssertionRecallCandidate(
                     assertion=item,
-                    source_occurrences=sources.get(item.assertion_id, ()),
+                    source_occurrences=(),
                     inference_complete=True,
                 )
                 for item in assertions
             ),
             checkpoint_generation=(await self.checkpoint()).generation,
             capability_versions=service._capability_versions(),
+            discovery_count=len(assertions),
         )
+
+    async def hydrate_recall_candidates(
+        self, assertion_ids: Sequence[str],
+    ) -> tuple[AssertionRecallCandidate, ...]:
+        """Re-authorize selected IDs and hydrate their provenance in one batch."""
+        if not assertion_ids:
+            return ()
+        selected = await self._query_current(
+            AssertionQuery(
+                assertion_ids=tuple(assertion_ids), limit=len(assertion_ids),
+                valid_at=datetime.now(timezone.utc),
+            ), eligible_only=True,
+        )
+        sources = await self._sources_for_assertions(selected)
+        return tuple(AssertionRecallCandidate(item, sources.get(item.assertion_id, ()), True) for item in selected)
 
     async def _sources_for_assertions(
         self, assertions: Sequence[Assertion],
