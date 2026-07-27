@@ -76,6 +76,12 @@ from kestrel_sovereign.waits.engine import MAX_HANDLE_WAIT_SECONDS
 
 logger = logging.getLogger(__name__)
 
+# Job-log fallback for agents with no real data directory (test stubs,
+# ephemeral runs). Shared machine-wide by design — an agent without a data
+# directory has nowhere private to put it — so nothing durable should depend
+# on it surviving or being unique to one process.
+_EPHEMERAL_JOB_DIR = Path("/tmp/kestrel_talon_jobs")
+
 
 # Default sibling-checkout layout assumed throughout: kestrel-sovereign
 # and target repos live as siblings under a common project parent.
@@ -4287,17 +4293,34 @@ class TalonCoordinatorFeature(Feature):
     def _job_log_dir(self) -> Path:
         """Where job log files live.
 
-        Per-agent under the agent's data directory when available
-        (``<storage_path>/talon_jobs/``) so logs survive process
+        Per-agent BESIDE the agent's database file when available
+        (``<storage_path>/../talon_jobs/``) so logs survive process
         restarts and aren't shared across agents in the multi_agent.
         Falls back to ``/tmp`` when the agent has no storage_path
         (test stubs, ephemeral runs).
         """
         storage_path = getattr(self.agent, "storage_path", None) if self.agent else None
-        if storage_path:
+        # Truthiness is not enough to honour the documented fallback: a test
+        # stub's ``MagicMock`` attribute is truthy AND ``os.PathLike``, so it
+        # passed a bare ``if storage_path:`` and then resolved to the RELATIVE
+        # path ``MagicMock/mock.storage_path/talon_jobs``, which ``mkdir`` then
+        # created under the process working directory (i.e. the repo checkout).
+        # Only a real string/Path names a data directory. Note ``os.PathLike``
+        # would NOT be enough here — ``MagicMock`` satisfies it.
+        if isinstance(storage_path, (str, Path)) and str(storage_path).strip():
             base = Path(storage_path).parent / "talon_jobs"
         else:
-            base = Path("/tmp/kestrel_talon_jobs")
+            if storage_path is not None:
+                # Unreachable from any current caller (every production
+                # construction passes a str), but demoting a real agent to the
+                # shared /tmp registry would lose durable job state across
+                # restarts. Say so rather than losing it silently.
+                logger.warning(
+                    "talon: agent storage_path is %s, not a path; job logs "
+                    "and the durable job registry fall back to %s",
+                    type(storage_path).__name__, _EPHEMERAL_JOB_DIR,
+                )
+            base = _EPHEMERAL_JOB_DIR
         base.mkdir(parents=True, exist_ok=True)
         return base
 
@@ -4305,7 +4328,7 @@ class TalonCoordinatorFeature(Feature):
         """Durable registry of CLI-background job metadata.
 
         Lives next to the per-agent log files so it survives Kestrel
-        restarts (``<storage_path>/talon_jobs/jobs.json``).
+        restarts (``<storage_path>/../talon_jobs/jobs.json``).
         """
         return self._job_log_dir() / "jobs.json"
 
@@ -4538,11 +4561,11 @@ class TalonCoordinatorFeature(Feature):
         """
         try:
             path = self._jobs_registry_path()
-        except (TypeError, OSError) as e:
-            # Test stubs / discovery harness can construct the
-            # feature with a Mock agent whose ``storage_path`` is
-            # not a valid path. Skip reload silently in that case;
-            # real agents always have a real storage_path.
+        except OSError as e:
+            # The only remaining failure is the mkdir: an unwritable data dir
+            # or /tmp. ``TypeError`` used to be caught here because a Mock
+            # agent's storage_path reached ``Path(...)``; ``_job_log_dir`` now
+            # rejects a non-path before that point, so it can no longer occur.
             logger.debug("Talon job registry path unavailable: %s", e)
             return
         if not path.is_file():

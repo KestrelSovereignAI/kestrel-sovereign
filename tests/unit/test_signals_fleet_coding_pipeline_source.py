@@ -183,6 +183,10 @@ def test_register_support_sources_no_registry_is_noop():
 
 
 class _FakeAgent:
+    # SignalDispatcher scopes the durable consumer ledger to the owning agent
+    # DID, just like the production DispatcherAgent protocol.
+    did = "did:web:k.example"
+
     def __init__(self):
         self.background_tasks: list = []
 
@@ -726,6 +730,9 @@ async def test_observability_stamped_through_talon_run_stage(tmp_path, monkeypat
 
     agent = MagicMock()
     agent.agent_name = "kestrel"
+    # A bare MagicMock hands back a MagicMock for .did; the durable ledger
+    # requires a real non-empty DID string to scope the runtime owner.
+    agent.did = "did:web:k.example"
     agent._features = []
     agent.storage_path = str(tmp_path / "data" / "agent.db")
     tracked: list = []
