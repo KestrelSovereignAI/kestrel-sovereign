@@ -19,12 +19,14 @@ runtime layout.
 from __future__ import annotations
 
 import asyncio
+import glob
 import json
 import logging
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -281,6 +283,10 @@ class RestartCoordinatorFeature(Feature):
                     RegistrationPolicy.OPTIONAL,
                 )
             )
+
+        # A successful restart orphans its child's stderr file (this process
+        # dies before it can clean up), so boot is the only place that can.
+        self._sweep_orphaned_restart_stderr()
 
         # Recover any row left in ``updating`` by a host that went down
         # mid-update (operator restart, crash) BEFORE the executing
@@ -1628,9 +1634,14 @@ class RestartCoordinatorFeature(Feature):
         child that starts and immediately dies raises nothing, and discarding
         the handle made that outcome indistinguishable from success (#2667).
 
-        ``stderr`` is a pipe rather than ``DEVNULL`` for the same reason: when
-        the child does die, its message is the only evidence of why, and
-        throwing it away is what left the failure with no record at all.
+        ``stderr`` goes to a FILE, not ``DEVNULL`` and deliberately not a pipe.
+        DEVNULL threw away the only evidence of why a dispatch failed. A pipe
+        would be worse than either: this child must OUTLIVE us, and a pipe's
+        read end dies with us, so a successful restart would leave the child
+        taking EPIPE on its next stderr write — we would be breaking the very
+        restart we are trying to perform. A chatty child would also block on a
+        full pipe buffer that nobody is reading. A file has neither problem
+        and still survives for us to read.
         """
         cmd: List[str]
         kestrel_bin = shutil.which("kestrel")
@@ -1641,16 +1652,28 @@ class RestartCoordinatorFeature(Feature):
         logger.info(
             "restart_coordinator: spawning detached restart %s", cmd,
         )
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-            close_fds=True,
+        stderr_file = tempfile.NamedTemporaryFile(
+            prefix="kestrel-restart-", suffix=".err", delete=False,
         )
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_file,
+                start_new_session=True,
+                close_fds=True,
+            )
+        finally:
+            # Our copy of the descriptor is not needed once the child holds
+            # one; the path is what we read back.
+            stderr_file.close()
+        # Carried on the handle so the watchdog can find it without threading
+        # a second value through every call site.
+        proc._kestrel_stderr_path = stderr_file.name  # type: ignore[attr-defined]
         logger.info(
-            "restart_coordinator: restart subprocess pid=%s", proc.pid,
+            "restart_coordinator: restart subprocess pid=%s (stderr: %s)",
+            proc.pid, stderr_file.name,
         )
         return proc
 
@@ -1673,21 +1696,65 @@ class RestartCoordinatorFeature(Feature):
             return None
         if not isinstance(returncode, int):
             return None
-        # The child is gone and we are not. Read its complaint — it has
-        # already exited, so this cannot block.
-        detail = ""
-        try:
-            _out, err = proc.communicate(timeout=RESTART_DISPATCH_GRACE_SECONDS)
-            if err:
-                lines = err.decode("utf-8", "replace").strip().splitlines()
-                detail = lines[-1] if lines else ""
-        except Exception:  # pragma: no cover - defensive
-            detail = ""
+        # The child is gone and we are not. Read what it said on the way out.
+        detail = self._read_restart_stderr_tail(proc)
         reason = (
             f"restart subprocess (pid {proc.pid}) exited {returncode} "
             "without restarting the host"
         )
         return f"{reason}: {detail}" if detail else reason
+
+    @staticmethod
+    def _sweep_orphaned_restart_stderr(max_age_seconds: int = 86400) -> int:
+        """Delete restart stderr files left behind by SUCCESSFUL restarts.
+
+        The failure path cleans up its own file when it reads the tail. The
+        success path cannot: the restart kills this process mid-flight, so the
+        file is orphaned by definition. Without a sweep that is one small file
+        per restart, forever. Best-effort — a restart must never fail because
+        housekeeping did.
+        """
+        removed = 0
+        cutoff = time.time() - max_age_seconds
+        try:
+            candidates = glob.glob(
+                os.path.join(tempfile.gettempdir(), "kestrel-restart-*.err")
+            )
+        except OSError:  # pragma: no cover - defensive
+            return 0
+        for path in candidates:
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.unlink(path)
+                    removed += 1
+            except OSError:
+                continue
+        if removed:
+            logger.info(
+                "restart_coordinator: swept %d orphaned restart stderr "
+                "file(s)", removed,
+            )
+        return removed
+
+    @staticmethod
+    def _read_restart_stderr_tail(proc) -> str:
+        """Last stderr line of a dead restart child, and clean up its file."""
+        path = getattr(proc, "_kestrel_stderr_path", None)
+        if not path:
+            return ""
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                # Bounded: a failing child can be arbitrarily chatty and this
+                # string ends up in a status reason and a log line.
+                lines = fh.read(_OUTPUT_TAIL_CHARS).strip().splitlines()
+            return lines[-1] if lines else ""
+        except OSError:
+            return ""
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
     def _arm_restart_dispatch_watch(self, proc, request_id: str) -> bool:
         """Start the dispatch watchdog, if this host can carry one.

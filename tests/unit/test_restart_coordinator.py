@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import subprocess
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -2763,19 +2765,26 @@ async def test_delivered_ack_supervisor_self_removes_from_owned(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-class _DeadChild:
-    """A restart subprocess that exited instead of restarting the host."""
+def _dead_child(tmp_path, returncode=1, stderr="kestrel: no such command\n"):
+    """A restart subprocess that exited instead of restarting the host.
 
-    def __init__(self, returncode=1, stderr=b"kestrel: no such command\n"):
-        self.pid = 4242
-        self.returncode = returncode
-        self._stderr = stderr
+    Carries a real stderr FILE, matching production: the child must outlive
+    this process, so its stderr cannot be a pipe whose read end dies with us.
+    """
+    err_path = tmp_path / "restart.err"
+    err_path.write_text(stderr)
 
-    def poll(self):
-        return self.returncode
+    class _Dead:
+        pid = 4242
 
-    def communicate(self, timeout=None):
-        return (b"", self._stderr)
+        def __init__(self):
+            self.returncode = returncode
+            self._kestrel_stderr_path = str(err_path)
+
+        def poll(self):
+            return returncode
+
+    return _Dead()
 
 
 class _LiveChild:
@@ -2802,7 +2811,7 @@ async def test_dead_restart_child_returns_the_row_for_retry(tmp_path):
 
     with patch.object(
         RestartCoordinatorFeature, "_spawn_restart_subprocess",
-        return_value=_DeadChild(),
+        return_value=_dead_child(tmp_path),
     ):
         await feat.restart_coordinator()
     await agent.drain_background_tasks()
@@ -2918,3 +2927,80 @@ async def test_reconciler_leaves_an_in_flight_dispatch_alone(tmp_path):
 
     assert await feat._reconcile_stranded_executing_rows() == []
     assert (await get_request(backend, req.id)).status == "executing"
+
+
+@pytest.mark.asyncio
+async def test_restart_child_stderr_is_a_file_not_a_pipe(tmp_path):
+    """The restart child must OUTLIVE this process, so its stderr cannot be a
+    pipe: the read end dies with us, and the child would take EPIPE on its next
+    write — breaking the very restart we are performing. A chatty child would
+    also block forever on a full pipe buffer nobody is reading.
+
+    Exercises the real spawn path, not a double.
+    """
+    feat, _agent = await _make_feature(tmp_path)
+    with patch(
+        "kestrel_sovereign.features.restart_coordinator.feature.shutil.which",
+        return_value="/bin/echo",
+    ):
+        proc = feat._spawn_restart_subprocess()
+    try:
+        assert proc.stderr is None, (
+            "stderr must not be a pipe — it dies with this process"
+        )
+        path = proc._kestrel_stderr_path
+        assert os.path.exists(path)
+    finally:
+        proc.wait(timeout=10)
+        feat._read_restart_stderr_tail(proc)
+
+    # The tail read cleans the file up rather than leaking one per restart.
+    assert not os.path.exists(path)
+
+
+@pytest.mark.asyncio
+async def test_dead_child_stderr_tail_is_read_and_cleaned_up(tmp_path):
+    """The child's last line is the only evidence of why a dispatch failed,
+    and reading it must not leave a file behind on every failure."""
+    feat, _agent = await _make_feature(tmp_path)
+    err = tmp_path / "boom.err"
+    err.write_text("first line\nkestrel: boom\n")
+
+    class _Dead:
+        pid = 99
+        _kestrel_stderr_path = str(err)
+
+        def poll(self):
+            return 7
+
+    proc = _Dead()
+    reason = feat._restart_dispatch_failure(proc)
+    assert "exited 7" in reason
+    assert "kestrel: boom" in reason
+    assert not err.exists(), "the stderr file must not be left behind"
+
+
+@pytest.mark.asyncio
+async def test_boot_sweeps_stderr_files_orphaned_by_successful_restarts(
+    tmp_path, monkeypatch,
+):
+    """A SUCCESSFUL restart kills this process before it can clean up its
+    child's stderr file, so those are orphaned by definition. Boot is the only
+    place that can collect them; without this it is one file per restart,
+    forever. A recent file must survive — it may belong to a live dispatch.
+    """
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    old = tmp_path / "kestrel-restart-old.err"
+    new = tmp_path / "kestrel-restart-new.err"
+    unrelated = tmp_path / "something-else.err"
+    for p in (old, new, unrelated):
+        p.write_text("x")
+    os.utime(old, (0, 0))
+    os.utime(unrelated, (0, 0))
+
+    removed = RestartCoordinatorFeature._sweep_orphaned_restart_stderr()
+
+    assert removed == 1
+    assert not old.exists()
+    assert new.exists(), "a recent file may belong to a dispatch in flight"
+    assert unrelated.exists(), "the sweep must not touch unrelated files"
