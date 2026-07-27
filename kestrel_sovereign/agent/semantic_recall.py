@@ -569,13 +569,14 @@ def _provenance(item: RankedAssertion) -> str:
 
 
 def _claim_text(assertion: Assertion, max_characters: int) -> str:
-    return " | ".join(
+    # One total cap applies to the serialized claim, not each RDF term.
+    return _truncate(" | ".join(
         (
             _display_term(assertion.subject, max_characters),
             _display_term(assertion.predicate, max_characters),
             _display_term(assertion.object, max_characters),
         )
-    )
+    ), max_characters)
 
 
 def _display_term(value: object, max_characters: int) -> str:
