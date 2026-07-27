@@ -5,7 +5,7 @@ Each agent directory can have a kestrel.toml config file:
 
 ```toml
 [agent]
-name = "Claw"
+name = "My Agent"
 port = 8888
 
 [server]
@@ -163,18 +163,26 @@ def find_agent_dir(hint: Optional[str] = None) -> Optional[Path]:
         elif path.suffix == ".db" and path.exists():
             return path.parent
 
-    # 3. Common locations
-    for candidate in ["./agent_data/claw", "./my_agent", "."]:
+    # 3. Common locations. Deliberately generic: this list previously led with
+    #    a specific deployment's agent name, which silently resolved unrelated
+    #    hosts to that one agent's directory. Named agents are discovered by the
+    #    agent_data scan below, which does not privilege any single name.
+    for candidate in ["./my_agent", "."]:
         path = Path(candidate).resolve()
         if (path / "kestrel_prime.db").exists():
             return path
 
-    # 4. Search agent_data subdirectories
+    # 4. Search agent_data subdirectories. Sorted so a multi-agent tree
+    #    resolves the same way on every call and every platform; directory
+    #    iteration order is otherwise filesystem-dependent. Resolved so this
+    #    branch returns the same absolute-path contract as the branches above
+    #    (it previously leaked a CWD-relative path, which then moved with the
+    #    caller's working directory).
     agent_data = Path("./agent_data")
     if agent_data.is_dir():
-        for subdir in agent_data.iterdir():
+        for subdir in sorted(agent_data.iterdir()):
             if subdir.is_dir() and (subdir / "kestrel_prime.db").exists():
-                return subdir
+                return subdir.resolve()
 
     return None
 

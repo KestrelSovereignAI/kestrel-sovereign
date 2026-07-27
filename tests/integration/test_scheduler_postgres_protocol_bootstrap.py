@@ -1329,6 +1329,12 @@ async def test_live_postgres_runtime_create_spawn_execute_remove_and_failure_rol
                 return None
 
         class TestLLMService:
+            # Mirrors the real constructor envelope: each agent's service is
+            # bound to that agent's own data root, so per-agent usage rows
+            # cannot collapse into one shared database (#2769).
+            def __init__(self, database_url=None, agent_data_dir=None):
+                self.agent_data_dir = agent_data_dir
+
             async def close(self):
                 return None
 

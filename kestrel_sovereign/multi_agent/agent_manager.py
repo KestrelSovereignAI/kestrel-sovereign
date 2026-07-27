@@ -879,8 +879,11 @@ class AgentManager:
 
         db_path = str(resolved_dir / "kestrel_prime.db")
 
-        # Each agent gets its own LLMService (mutable model state)
-        llm_service = LLMService()
+        # Each agent gets its own LLMService (mutable model state). Bind it to
+        # THIS agent's data root: an in-process host shares one environment
+        # across every agent, so ``KESTREL_DB_PATH`` cannot name each agent's
+        # directory and usage rows would all land in one agent's DB (#2769).
+        llm_service = LLMService(agent_data_dir=resolved_dir)
 
         # Build allowed_features set from config (None = load all)
         allowed_features = set(config.features) if config.features is not None else None

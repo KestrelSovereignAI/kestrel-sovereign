@@ -56,7 +56,7 @@ from kestrel_sovereign.signals.durable import (
     DurableSignalStore,
 )
 from kestrel_sovereign.signals.handlers import template_artifact_handler
-from kestrel_sovereign.signals.lock_manager import OrderedLockManager
+from kestrel_sovereign.signals.lock_manager import LockHolder, OrderedLockManager
 from kestrel_sovereign.signals.prompt_overrides import (
     SignalWithPromptTemplateOverride,
     SourceRegistrationWithPromptOverride,
@@ -104,6 +104,7 @@ __all__ = [
     "FAILED",
     "INITIAL_RESERVED",
     "LEASED",
+    "LockHolder",
     "OrderedLockManager",
     "PENDING",
     "RegistrationError",

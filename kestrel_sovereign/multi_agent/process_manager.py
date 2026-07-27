@@ -5,7 +5,11 @@ The ProcessManager is used by both the CLI (`kestrel start/stop`) and the
 host (`host.py` lifespan + API endpoints) to manage agent processes.
 
 Each agent runs as a separate uvicorn process on its own port:
-    KESTREL_DB_PATH=agent_data/claw PORT=8801 uvicorn kestrel_sovereign.server:app
+    KESTREL_DB_PATH=agent_data/<agent> PORT=8801 uvicorn kestrel_sovereign.server:app
+
+Note that ``KESTREL_DB_PATH`` scopes an agent only in this separate-process
+mode. The in-process host runs every agent in ONE process, so per-agent state
+must be bound by parameter there rather than by environment (see #2769).
 
 Remote agents (url-only in config) are ignored — they're not managed by
 this host.
