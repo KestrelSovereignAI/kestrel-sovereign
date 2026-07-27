@@ -12,9 +12,10 @@ import asyncio
 import json
 import shutil
 import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -1303,6 +1304,9 @@ async def test_cron_does_not_complete_same_process_executing_row(tmp_path):
 
     feat, backend, agent = await _real_dispatch_feature(tmp_path)
     await feat.initialize()
+    # Don't make the drain below sit out the real dispatch-watch grace (#2667);
+    # this test is about the boot stamp, not the watchdog's timing.
+    feat._restart_dispatch_grace = 0
     created = await feat.request_restart(reason="ship")
     req_id = created.data["request"]["id"]
 
@@ -2752,3 +2756,165 @@ async def test_delivered_ack_supervisor_self_removes_from_owned(tmp_path):
     assert updated.wake_delivered is True
     # ...and self-removed from the owned list (no accumulation).
     assert ack_task not in feat._owned_background_tasks
+
+
+# ---------------------------------------------------------------------------
+# #2667 — a dispatched restart that never happens must not vanish silently
+# ---------------------------------------------------------------------------
+
+
+class _DeadChild:
+    """A restart subprocess that exited instead of restarting the host."""
+
+    def __init__(self, returncode=1, stderr=b"kestrel: no such command\n"):
+        self.pid = 4242
+        self.returncode = returncode
+        self._stderr = stderr
+
+    def poll(self):
+        return self.returncode
+
+    def communicate(self, timeout=None):
+        return (b"", self._stderr)
+
+
+class _LiveChild:
+    """A restart subprocess still running — the healthy case."""
+
+    pid = 4243
+    returncode = None
+
+    def poll(self):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_dead_restart_child_returns_the_row_for_retry(tmp_path):
+    """``Popen`` returning is not evidence the restart happened. A child that
+    exits without restarting the host left the row ``executing`` forever with
+    no error event and no notice to anyone (#2667).
+    """
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+    feat._restart_dispatch_grace = 0
+    created = await feat.request_restart(reason="ship")
+    req_id = created.data["request"]["id"]
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+        return_value=_DeadChild(),
+    ):
+        await feat.restart_coordinator()
+    await agent.drain_background_tasks()
+
+    row = await get_request(backend, req_id)
+    assert row.status == "pending", "a failed dispatch must not stay executing"
+    # The reason names the exit status AND the child's own complaint, which
+    # used to go to DEVNULL.
+    assert "exited 1" in row.status_reason
+    assert "no such command" in row.status_reason
+
+
+@pytest.mark.asyncio
+async def test_live_restart_child_leaves_the_row_executing(tmp_path):
+    """The watchdog must not bounce a restart that is genuinely in flight."""
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+    feat._restart_dispatch_grace = 0
+    created = await feat.request_restart(reason="ship")
+    req_id = created.data["request"]["id"]
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+        return_value=_LiveChild(),
+    ):
+        await feat.restart_coordinator()
+    await agent.drain_background_tasks()
+
+    row = await get_request(backend, req_id)
+    assert row.status == "executing"
+
+
+@pytest.mark.asyncio
+async def test_unverifiable_child_is_not_claimed_as_a_failure(tmp_path):
+    """A handle that cannot report an integer exit status is not evidence of
+    anything. Concluding failure from it would bounce live restarts."""
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+    assert feat._restart_dispatch_failure(MagicMock()) is None
+
+
+@pytest.mark.asyncio
+async def test_stranded_executing_row_is_recovered_by_the_sweep(tmp_path):
+    """The durable backstop. Before this, the coordinator scanned only
+    pending/approved and ``cancel_restart_request`` refused executing rows, so
+    a row whose restart never happened had NO path back — and the next
+    unrelated restart would terminalize it as 'completed', reporting success
+    for a restart that never ran (#2667).
+    """
+    from kestrel_sovereign.features.restart_coordinator.feature import (
+        _PROCESS_BOOT_ID,
+    )
+
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="stranded",
+    )
+    await update_status(
+        backend, req.id, status="executing",
+        expected_current_status="pending",
+        executing_boot_id=_PROCESS_BOOT_ID,
+    )
+    # Stamped by this process but with no dispatch in flight — nothing is
+    # waiting on it and nothing else will ever move it.
+    assert req.id not in feat._executing_since
+
+    reset = await feat._reconcile_stranded_executing_rows()
+    assert reset == [req.id]
+    row = await get_request(backend, req.id)
+    assert row.status == "pending"
+    assert "did not happen" in row.status_reason
+
+
+@pytest.mark.asyncio
+async def test_reconciler_leaves_a_prior_boot_row_for_the_wake_sweep(tmp_path):
+    """A row stamped by a PRIOR boot means the restart provably happened — it
+    belongs to the post-restart wake sweep, not to stranded-row recovery."""
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="prior boot",
+    )
+    await update_status(
+        backend, req.id, status="executing",
+        expected_current_status="pending",
+        executing_boot_id="a-different-boot",
+    )
+
+    assert await feat._reconcile_stranded_executing_rows() == []
+    row = await get_request(backend, req.id)
+    assert row.status == "executing"
+
+
+@pytest.mark.asyncio
+async def test_reconciler_leaves_an_in_flight_dispatch_alone(tmp_path):
+    """A dispatch this process started moments ago is in flight, not stuck."""
+    from kestrel_sovereign.features.restart_coordinator.feature import (
+        _PROCESS_BOOT_ID,
+    )
+
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="in flight",
+    )
+    await update_status(
+        backend, req.id, status="executing",
+        expected_current_status="pending",
+        executing_boot_id=_PROCESS_BOOT_ID,
+    )
+    feat._executing_since[req.id] = time.monotonic()
+
+    assert await feat._reconcile_stranded_executing_rows() == []
+    assert (await get_request(backend, req.id)).status == "executing"
