@@ -23,6 +23,10 @@ from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.restart_coordinator import (
     RestartCoordinatorFeature,
 )
+from kestrel_sovereign.features.restart_coordinator.feature import (
+    _MAX_NAMED_BUSY_KINDS,
+    _describe_background_tasks,
+)
 from kestrel_sovereign.features.restart_coordinator.store import (
     ensure_restart_requests_table,
     get_request,
@@ -2040,7 +2044,7 @@ async def test_idle_ignores_signal_log_infra_tasks(tmp_path):
     async def _never():
         await asyncio.Event().wait()
 
-    log_task = asyncio.create_task(_never(), name="signal_log:heartbeat:abc123")
+    log_task = asyncio.create_task(_never(), name="durable_signal_log:heartbeat:abc123")
     sweep_task = asyncio.create_task(_never(), name="a2a_question_expiry_sweep")
     work_task = asyncio.create_task(_never(), name="signal_dispatch:heartbeat:abc123")
     try:
@@ -2057,10 +2061,13 @@ async def test_idle_ignores_signal_log_infra_tasks(tmp_path):
         assert busy["idle"] is False
         # The reason names the ONE genuine blocker (#2665) and no infra task,
         # so an operator can tell what is actually holding the restart.
+        # Raw asyncio tasks carry no age stamp — only _track_background_task
+        # stamps them — so the age reads as unknown rather than fabricated.
         assert busy["reason"] == (
-            "1 background task(s) in flight: signal_dispatch:heartbeat:abc123"
+            "1 background task(s) in flight: "
+            "signal_dispatch:heartbeat:abc123 (age unknown)"
         )
-        assert "signal_log:" not in busy["reason"]
+        assert "durable_signal_log" not in busy["reason"]
         assert "a2a_question_expiry_sweep" not in busy["reason"]
     finally:
         log_task.cancel()
@@ -2108,8 +2115,11 @@ async def test_idle_ignores_a2a_question_supervisor_tasks(tmp_path):
         # Naming the blocker is what makes a phantom entry diagnosable: the
         # live report of "2 background tasks" against an empty task store was
         # unfalsifiable while the reason was a bare count (#2665).
+        # Raw asyncio tasks carry no age stamp — only _track_background_task
+        # stamps them — so the age reads as unknown rather than fabricated.
         assert busy["reason"] == (
-            "1 background task(s) in flight: signal_dispatch:heartbeat:abc123"
+            "1 background task(s) in flight: "
+            "signal_dispatch:heartbeat:abc123 (age unknown)"
         )
         assert "a2a_question_supervisor" not in busy["reason"]
     finally:
@@ -2771,66 +2781,132 @@ async def test_delivered_ack_supervisor_self_removes_from_owned(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+class _FakeTask:
+    """A background task with a name and a known age."""
+
+    def __init__(self, name, age_seconds=0.0, now=1000000.0):
+        self._name = name
+        self._kestrel_started_at = now - age_seconds
+
+    def get_name(self):
+        return self._name
+
+
 def test_busy_deferral_names_the_blocking_tasks():
     """A bare count is not reconcilable against the task store. The live report
     of "2 background tasks in flight" alongside `list_my_tasks` returning zero
     rows was undiagnosable precisely because the coordinator never said WHICH
     handles it meant (#2665).
     """
-    from kestrel_sovereign.features.restart_coordinator.feature import (
-        _describe_background_tasks,
-    )
-
-    class _T:
-        def __init__(self, name):
-            self._name = name
-
-        def get_name(self):
-            return self._name
-
     described = _describe_background_tasks(
-        [_T("signal_dispatch:talon:sig_1"), _T("a2a_send:claw")]
+        [
+            _FakeTask("signal_dispatch:talon:sig_1", age_seconds=5),
+            _FakeTask("a2a_send:claw", age_seconds=1),
+        ],
+        now=1000.0,
     )
     assert "signal_dispatch:talon:sig_1" in described
     assert "a2a_send:claw" in described
 
 
-def test_busy_deferral_bounds_the_named_task_list():
-    """Deferral reasons are persisted as status events and logged every tick,
-    so the enumeration must stay bounded rather than dumping an unbounded set.
+def test_busy_deferral_reports_age_not_just_identity():
+    """Age is what separates "busy" from "wedged", and #2665's symptom was a
+    duration symptom. The adjacent active-request path already reports age;
+    this one used to report none, so a task stuck for hours rendered
+    identically to one that appeared a moment ago.
     """
-    from kestrel_sovereign.features.restart_coordinator.feature import (
-        _MAX_NAMED_BUSY_TASKS,
-        _describe_background_tasks,
-    )
-
-    class _T:
-        def __init__(self, name):
-            self._name = name
-
-        def get_name(self):
-            return self._name
-
     described = _describe_background_tasks(
-        [_T(f"signal_dispatch:{i}") for i in range(_MAX_NAMED_BUSY_TASKS + 3)]
+        [_FakeTask("signal_dispatch:stuck", age_seconds=7200)],
+        now=1000000.0,
     )
-    assert "+3 more" in described
-    assert described.count(",") == _MAX_NAMED_BUSY_TASKS
+    assert "2h" in described
+
+
+def test_oldest_task_is_reported_first():
+    """Oldest first puts the likely culprit at the front of a truncated list."""
+    described = _describe_background_tasks(
+        [
+            _FakeTask("young:a", age_seconds=1),
+            _FakeTask("ancient:b", age_seconds=9999),
+            _FakeTask("middle:c", age_seconds=100),
+        ],
+        now=100000.0,
+    )
+    assert described.index("ancient") < described.index("middle")
+    assert described.index("middle") < described.index("young")
+
+
+def test_a_flood_of_one_kind_cannot_hide_the_wedged_task():
+    """The regression this ordering exists for. Sorted alphabetically and
+    truncated to five, six `a2a_*` tasks pushed a wedged `signal_dispatch:*`
+    out of the string entirely — the bound doing the OPPOSITE of its job at
+    exactly the moment it engaged. Grouping by kind means no kind can be
+    truncated away by the volume of another.
+    """
+    tasks = [
+        _FakeTask(f"a2a_complete:{i:08d}", age_seconds=1) for i in range(6)
+    ]
+    tasks.append(_FakeTask("signal_dispatch:channels:sig_WEDGED", age_seconds=900))
+
+    described = _describe_background_tasks(tasks, now=100000.0)
+
+    assert "sig_WEDGED" in described, (
+        f"the wedged task must not be truncated away; got: {described}"
+    )
+    # And the flood is summarised rather than spending the whole budget.
+    assert "x6" in described
+
+
+def test_duplicate_kinds_are_collapsed_with_a_count():
+    """Five identically-named tasks used to render five times, spending the
+    entire budget on one bit of information."""
+    described = _describe_background_tasks(
+        [_FakeTask("post_response_memory_enrichment", age_seconds=i)
+         for i in range(5)],
+        now=1000.0,
+    )
+    assert "x5" in described
+    assert described.count("post_response_memory_enrichment") == 1
+
+
+def test_busy_deferral_bounds_the_named_kinds():
+    """Deferral reasons are persisted as a status-event row on every cron tick
+    with no dedupe, so the string must stay bounded for a wedged restart."""
+    described = _describe_background_tasks(
+        [_FakeTask(f"kind{i}:x", age_seconds=i)
+         for i in range(_MAX_NAMED_BUSY_KINDS + 3)],
+        now=1000.0,
+    )
+    assert "+3 more kind(s)" in described
+
+
+def test_a_single_pathological_name_cannot_dominate():
+    described = _describe_background_tasks(
+        [_FakeTask("x" * 500, age_seconds=1)], now=1000.0,
+    )
+    assert len(described) < 200
 
 
 def test_busy_deferral_survives_a_task_without_a_readable_name():
     """An unnamed or introspection-hostile handle must not break the idle gate
     — reporting it as unnamed is still more useful than a bare count.
     """
-    from kestrel_sovereign.features.restart_coordinator.feature import (
-        _describe_background_tasks,
-    )
-
     class _Hostile:
         def get_name(self):
             raise RuntimeError("no name for you")
 
-    assert "<unnamed>" in _describe_background_tasks([_Hostile()])
+    assert "<unnamed>" in _describe_background_tasks([_Hostile()], now=1000.0)
+
+
+def test_unstamped_task_reports_unknown_age_rather_than_guessing():
+    """A task predating the age stamp must not be reported with a fabricated
+    age."""
+    class _Unstamped:
+        def get_name(self):
+            return "legacy:task"
+
+    described = _describe_background_tasks([_Unstamped()], now=1000.0)
+    assert "age unknown" in described
 
 
 @pytest.mark.asyncio
