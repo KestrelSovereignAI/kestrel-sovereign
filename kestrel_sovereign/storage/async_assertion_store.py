@@ -845,7 +845,8 @@ class AsyncAssertionStore:
     async def list_source_occurrences(self, assertion_id: str) -> list[SourceOccurrence]:
         tenant_id, _ = self._require_scope()
         rows = await self._database.fetchall(
-            "SELECT DISTINCT s.source_mapping FROM semantic_assertion_revisions r "
+            "SELECT DISTINCT s.source_mapping, s.received_at, s.source_occurrence_id "
+            "FROM semantic_assertion_revisions r "
             "JOIN semantic_revision_sources rs ON rs.tenant_id = r.tenant_id AND rs.revision_id = r.revision_id "
             "JOIN semantic_source_occurrences s ON s.tenant_id = rs.tenant_id "
             "  AND s.source_occurrence_id = rs.source_occurrence_id "

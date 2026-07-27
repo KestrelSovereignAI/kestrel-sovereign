@@ -191,6 +191,29 @@ async def test_assertion_crud_provenance_idempotency_and_checkpoint() -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_assertion_sources_selects_distinct_sort_keys_for_postgres() -> None:
+    """The portable DISTINCT query projects every PostgreSQL ORDER BY key."""
+    from unittest.mock import AsyncMock, patch
+
+    storage = await _storage()
+    try:
+        store = storage._assertion_store()
+        fetchall = AsyncMock(return_value=[])
+        with patch.object(store._database, "fetchall", fetchall):
+            assert await store.list_source_occurrences("postgres-distinct-order") == []
+
+        query, params = fetchall.await_args.args
+        assert params == (TENANT, "postgres-distinct-order")
+        assert (
+            "SELECT DISTINCT s.source_mapping, s.received_at, s.source_occurrence_id "
+            "FROM semantic_assertion_revisions r "
+        ) in query
+        assert "ORDER BY s.received_at, s.source_occurrence_id" in query
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_governed_source_append_creates_a_validated_provenance_revision() -> None:
     """A distinct evidence occurrence is a canonical revision, not a no-op."""
     storage = await _storage()
