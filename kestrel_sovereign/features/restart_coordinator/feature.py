@@ -85,6 +85,14 @@ STALE_ACTIVE_REQUEST_SECONDS = 900
 # still being alive with a dead child means it did not happen (#2667).
 RESTART_DISPATCH_GRACE_SECONDS = 10
 
+# How often to check the child within that window.
+_DISPATCH_POLL_SECONDS = 0.5
+
+# Failed dispatch attempts for one request in one boot before the coordinator
+# stops retrying and rejects it. A permanently broken ``kestrel restart`` would
+# otherwise spawn a doomed subprocess every cron tick indefinitely.
+MAX_RESTART_DISPATCH_ATTEMPTS = 3
+
 # An ``executing`` row stamped with THIS boot older than this never had its
 # restart happen — the process it was going to kill is still running it. The
 # in-dispatch check catches the common case; this is the backstop for a row
@@ -233,6 +241,13 @@ class RestartCoordinatorFeature(Feature):
         # silently failed, without a schema column: a row stamped with this
         # boot id but absent here has no dispatch behind it (#2667).
         self._executing_since: Dict[str, float] = {}
+        # Failed dispatch attempts per request in THIS boot, so a permanently
+        # broken restart stops being retried rather than flapping forever.
+        self._dispatch_failures: Dict[str, int] = {}
+        # When THIS feature instance came up. The boot id is module-scoped but
+        # this map is per-instance, so a reload must not treat the previous
+        # instance's in-flight dispatches as orphans the moment it starts.
+        self._instance_started_at = time.monotonic()
         # Instance-level so a host (or a test) can tune how long to wait
         # before concluding a dispatched restart never happened.
         self._restart_dispatch_grace = RESTART_DISPATCH_GRACE_SECONDS
@@ -1803,29 +1818,72 @@ class RestartCoordinatorFeature(Feature):
         kept running old code with the update's new dependencies already
         installed underneath it (#2667).
         """
-        await asyncio.sleep(
-            getattr(
-                self, "_restart_dispatch_grace", RESTART_DISPATCH_GRACE_SECONDS,
-            )
+        # POLL to the deadline rather than checking once at the end. The
+        # realistic failure — ``os.kill`` refused (EPERM: host under another
+        # uid, pid-file mismatch) — has ``cmd_stop`` burn ~5.5s on
+        # SIGTERM/poll/SIGKILL before ``cmd_start`` fails on the port, so the
+        # child dies around 7-10s. A single check at 10.0s is a coin flip
+        # against that, and losing it means the watchdog declares the dispatch
+        # healthy and recovery silently falls through to the 600s reconciler.
+        # We are alive for the whole window by definition, so polling is free.
+        grace = getattr(
+            self, "_restart_dispatch_grace", RESTART_DISPATCH_GRACE_SECONDS,
         )
-        reason = self._restart_dispatch_failure(proc)
+        deadline = time.monotonic() + grace
+        reason = None
+        while True:
+            reason = self._restart_dispatch_failure(proc)
+            if reason is not None:
+                break
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(min(_DISPATCH_POLL_SECONDS, grace))
         if reason is None:
             return
         logger.error("restart_coordinator: %s", reason)
         row = await get_request(self._db, request_id)
         if row is None or row.status != "executing":
             return
+
+        # Returning the row to ``pending`` means the next tick re-dispatches.
+        # For a permanently broken restart (missing binary, a uid that cannot
+        # signal the host) that turns "stuck forever" into "flaps forever":
+        # a doomed subprocess every minute, each with its own status event and
+        # error log. After a few identical failures in this boot, stop and say
+        # so terminally instead of retrying into the same wall.
+        attempts = self._dispatch_failures.get(request_id, 0) + 1
+        self._dispatch_failures[request_id] = attempts
+        give_up = attempts >= MAX_RESTART_DISPATCH_ATTEMPTS
+        next_status = "rejected" if give_up else "pending"
+        next_reason = (
+            f"{reason}; giving up after {attempts} dispatch attempts this boot"
+            if give_up else reason
+        )
+
         moved = await update_status(
             self._db, request_id,
-            status="pending",
-            status_reason=reason,
+            status=next_status,
+            status_reason=next_reason,
+            completed_at=(
+                datetime.now(timezone.utc).isoformat() if give_up else None
+            ),
             expected_current_status="executing",
         )
         if not moved:
             return
         self._executing_since.pop(request_id, None)
+        if give_up:
+            self._dispatch_failures.pop(request_id, None)
+            logger.error(
+                "restart_coordinator: rejecting restart %s after %d failed "
+                "dispatch attempts", request_id, attempts,
+            )
         await self._emit_status_event(
-            row, state="pending", deferral_reason=reason,
+            row, state=next_status,
+            **(
+                {"status_reason": next_reason} if give_up
+                else {"deferral_reason": next_reason}
+            ),
         )
 
     async def _reconcile_stranded_executing_rows(self) -> List[str]:
@@ -1863,8 +1921,18 @@ class RestartCoordinatorFeature(Feature):
             if started is None:
                 # Stamped by this process but absent from the in-flight map:
                 # the dispatch that owned it is gone (feature reload, cancelled
-                # task) and nothing is waiting on it. Nobody else will ever
-                # move it, so recover it now.
+                # task) and nothing is waiting on it.
+                #
+                # This branch must still wait. ``_PROCESS_BOOT_ID`` is
+                # module-scoped but the map is per-INSTANCE, so a feature
+                # reload inside the same process starts with an empty map and
+                # would otherwise take this branch — with no age check at all —
+                # and reset a dispatch the previous instance started moments
+                # ago. Requiring this instance to have been up for the same
+                # window closes that, since a genuinely stranded row is going
+                # nowhere and can wait.
+                if (now - self._instance_started_at) < STALE_EXECUTING_SECONDS:
+                    continue
                 reason = (
                     "restart row is executing under this process with no "
                     "dispatch in flight; the restart did not happen"
