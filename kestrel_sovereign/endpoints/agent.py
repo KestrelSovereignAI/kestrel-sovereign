@@ -1,7 +1,7 @@
 """Agent invoke and streaming endpoints."""
 from collections import defaultdict
 from dataclasses import dataclass
-from fastapi import APIRouter, Depends, HTTPException, Request, Query, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Request, Query, Response, UploadFile, File
 from fastapi.responses import StreamingResponse
 from typing import Any, Dict, List, Optional
 import asyncio
@@ -20,8 +20,16 @@ from kestrel_sovereign.kestrel_config.constants import (
 )
 from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.security.demo_isolation import enforce_destructive_op
-from kestrel_sovereign.endpoints.agent_helpers import get_agent
+from kestrel_sovereign.endpoints.agent_helpers import (
+    get_agent,
+    request_invocation_provenance,
+    resolve_request_invocation_id,
+)
 from kestrel_sovereign.api_errors import ApiHTTPException
+from kestrel_sovereign.agent.invocation import (
+    invocation_id_response_header,
+    new_stream_delivery_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +138,7 @@ async def _parse_optional_json_body(request: Request) -> dict:
 
 @router.post("/invoke")
 @limiter.limit("60/minute")
-async def invoke_agent(request: Request):
+async def invoke_agent(request: Request, http_response: Response):
     """
     Main endpoint to interact with the Kestrel Agent.
     It takes user input and returns the agent's response.
@@ -160,6 +168,20 @@ async def invoke_agent(request: Request):
         agent = get_agent(request)
         caller = getattr(request.state, "caller", None)
 
+        # A client may repeat the same opaque request id after a transport
+        # failure. Tool provenance derives its operation identity from this
+        # task-local id, so an exact retry reaches the canonical store's own
+        # idempotency ledger instead of being mistaken for a new invocation.
+        request_id = resolve_request_invocation_id(request, data)
+        invocation_provenance = request_invocation_provenance(
+            request,
+            source_locator="POST:/api/agent/invoke",
+        )
+        if hasattr(agent, "register_active_request"):
+            agent.register_active_request(request_id)
+        else:
+            agent._current_request_id = request_id
+
         # Pre-resolve the effective session_id so it can be returned to
         # the client. Without this, the frontend pane never learns the
         # implicit UUID derived inside add_conversation and stays
@@ -170,15 +192,21 @@ async def invoke_agent(request: Request):
         except Exception:
             effective_session_id = session_id  # fall back; never block the request
 
-        response = await agent.process_input(
-            user_input,
-            model_override=model_override,
-            session_id=effective_session_id,
-            caller=caller,
-            user_passphrase=user_passphrase,
-        )
+        try:
+            response = await agent.process_input(
+                user_input,
+                model_override=model_override,
+                session_id=effective_session_id,
+                caller=caller,
+                user_passphrase=user_passphrase,
+                invocation_id=request_id,
+                invocation_provenance=invocation_provenance,
+            )
+        finally:
+            agent._cleanup_cancelled_request(request_id)
         # Extract model/provider identity for frontend footer rendering (#1373)
         identity = agent._conversation_response_identity(use_last_identity=True)
+        http_response.headers["X-Request-ID"] = invocation_id_response_header(request_id)
         return {
             "response": response,
             "session_id": effective_session_id,
@@ -324,8 +352,20 @@ async def stream_agent_response(request: Request):
     Returns text chunks as they are generated.
     Optionally accepts 'session_id' to load context from a specific conversation.
     """
-    import uuid
-    
+    agent = None
+    request_id = None
+    stream_tap = None
+    stream_delivery_id = None
+    request_lifecycle_registered = False
+    stream_tap_registered = False
+
+    def cleanup_unstarted_stream() -> None:
+        """Undo setup if constructing the response fails before generation."""
+        if stream_tap_registered and stream_tap is not None and stream_delivery_id is not None:
+            stream_tap.unregister(stream_delivery_id)
+        if request_lifecycle_registered and agent is not None and request_id is not None:
+            agent._cleanup_cancelled_request(request_id)
+
     try:
         data = await _parse_json_body(request)
         user_input = data.get("input")
@@ -354,16 +394,28 @@ async def stream_agent_response(request: Request):
         if provider_override and model_override:
             model_override = f"{provider_override}/{model_override}"
 
-        # Generate unique request ID for cancellation tracking
-        request_id = str(uuid.uuid4())
+        # The client may supply the same opaque id for a transport retry. It
+        # is both the cancellation key and the task-local provenance identity.
+        request_id = resolve_request_invocation_id(request, data)
+        invocation_provenance = request_invocation_provenance(
+            request,
+            source_locator="POST:/api/agent/stream",
+        )
         if hasattr(agent, "register_active_request"):
             agent.register_active_request(request_id)
         else:
             agent._current_request_id = request_id
+        request_lifecycle_registered = True
 
         # Register the stream tap so TTS consumers can subscribe
         stream_tap = AgentStreamTap.get_instance()
-        stream_tap.register(request_id)
+        # A retry may deliberately reuse ``request_id`` to reach the canonical
+        # assertion idempotency ledger.  TTS delivery is independent: a fresh,
+        # server-owned id prevents concurrent response streams from publishing
+        # into or closing each other's tap queue.
+        stream_delivery_id = new_stream_delivery_id()
+        stream_tap.register(stream_delivery_id)
+        stream_tap_registered = True
 
         # Pre-resolve the effective session_id and surface it via a
         # response header. Resolved BEFORE StreamingResponse is created
@@ -405,6 +457,7 @@ async def stream_agent_response(request: Request):
                     audit_before_streaming=audit_before_streaming,
                     caller=caller,
                     request_id=request_id,
+                    invocation_provenance=invocation_provenance,
                     attachments=attachments,
                 ):
                     # Check if request was cancelled
@@ -420,7 +473,7 @@ async def stream_agent_response(request: Request):
                     # the yield below and strips it client-side.
                     tts_chunk = strip_revise_sentinels(chunk)
                     if tts_chunk:
-                        await stream_tap.publish(request_id, tts_chunk)
+                        await stream_tap.publish(stream_delivery_id, tts_chunk)
                     response_chunk_yielded = True
                     yield chunk
                 # #2674: a strict-audit turn cancelled before dispatch withholds
@@ -466,14 +519,15 @@ async def stream_agent_response(request: Request):
                 yield agent_stream_error_block(e)
             finally:
                 # Signal stream completion for TTS consumers
-                await stream_tap.finish(request_id)
+                await stream_tap.finish(stream_delivery_id)
                 # Cleanup request tracking
                 agent._cleanup_cancelled_request(request_id)
 
         headers = {
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
-            "X-Request-ID": request_id,
+            "X-Request-ID": invocation_id_response_header(request_id),
+            "X-Stream-Delivery-ID": stream_delivery_id,
         }
         if effective_session_id:
             headers["X-Session-Id"] = effective_session_id
@@ -483,8 +537,10 @@ async def stream_agent_response(request: Request):
             headers=headers,
         )
     except HTTPException:
+        cleanup_unstarted_stream()
         raise
     except Exception as e:
+        cleanup_unstarted_stream()
         logger.error(f"Error setting up stream: {e}", exc_info=True)
         raise ApiHTTPException(
             status_code=500,

@@ -72,6 +72,7 @@ from kestrel_sovereign.agent.model_preference import ModelPreferenceMixin
 from kestrel_sovereign.agent.event_manager import EventManagerMixin
 from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
+from kestrel_sovereign.agent.invocation import bind_async_invocation
 from kestrel_sovereign.signals import OrderedLockManager
 from kestrel_sovereign.storage.memory_system import MemorySystem
 from kestrel_sovereign.hooks import HooksManager, evaluate_blocking_decision
@@ -1043,6 +1044,10 @@ class KestrelAgent(
         # Cancellation tracking for stop button functionality
         self._current_request_id: Optional[str] = None
         self._active_request_ids: set[str] = set()
+        # A caller may retry the same id while its original delivery is still
+        # running. Keep lifecycle registration ownership per delivery so one
+        # completion cannot unregister the other.
+        self._active_request_counts: dict[str, int] = {}
         # Monotonic registration time per active request id so the
         # restart coordinator can age out stale markers (#1558).
         self._active_request_started_at: dict[str, float] = {}
@@ -4235,7 +4240,8 @@ Expected Duration: {expected_duration}
         # State is COMPLETE or unknown - proceed to normal processing
         return None
 
-    async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None, system_prompt_budget_bytes: int = None, anchored_doctrine=None, user_passphrase: str = None, signal_wake: Optional[dict] = None, invocation_context: Optional[LLMInvocationContext] = None) -> str:
+    @bind_async_invocation("invocation_id")
+    async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None, system_prompt_budget_bytes: int = None, anchored_doctrine=None, user_passphrase: str = None, signal_wake: Optional[dict] = None, invocation_context: Optional[LLMInvocationContext] = None, *, invocation_id: Optional[str] = None, invocation_provenance=None) -> str:
         """
         Processes user input by consulting the constitution, retrieving context,
         and generating a response using tool calling for features.
@@ -4269,6 +4275,11 @@ Expected Duration: {expected_duration}
                                     persisted user-turn content.
             user_passphrase: Optional per-request passphrase for USER_BYOK agents.
                              Required for PayerKind.USER_BYOK to decrypt provider keys.
+            invocation_id: Opaque top-level operation identity. When omitted,
+                an id is generated and task-locally bound for tool provenance.
+            invocation_provenance: Endpoint-owned authenticated actor and
+                transport metadata. This is task-local only; tools cannot
+                provide or override it through their arguments.
         """
         logging.info(f"[AGENTIC] process_input called ({len(user_input)} chars)")
 

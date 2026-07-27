@@ -28,9 +28,13 @@ class TestStreamingBasics:
             chunks.append(chunk)
 
         mock_agent._maybe_audit.assert_called_once()
-        mock_agent.process_input.assert_called_once_with(
-            "!help", None, session_id=None, caller=None, invocation_context=None,
-        )
+        mock_agent.process_input.assert_called_once()
+        args, kwargs = mock_agent.process_input.call_args
+        assert args == ("!help", None)
+        assert kwargs["session_id"] is None
+        assert kwargs["caller"] is None
+        assert kwargs["invocation_context"] is None
+        assert isinstance(kwargs["invocation_id"], str)
         assert "Command executed" in "".join(chunks)
 
     @pytest.mark.asyncio

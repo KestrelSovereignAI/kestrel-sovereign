@@ -340,6 +340,19 @@ class GovernedSemanticValidationService:
             return GovernedAssertionWriteResult(report, written)
         for attempt in range(max_commit_retries):
             checkpoint, current = await self._assertions.export_snapshot()
+            # The first replay lookup is the fast path.  A simultaneous
+            # delivery can commit after that lookup but before this snapshot;
+            # the canonical ledger must win over the lifecycle rejection in
+            # that narrow interval.  The store's mutation path checks the same
+            # ledger again while holding the tenant lock.
+            replay = await self._assertions.replay_governed_initial_write(
+                assertion,
+                source_occurrences=source_occurrences,
+                operation_id=operation_id,
+            )
+            if replay is not None:
+                report, written = replay
+                return GovernedAssertionWriteResult(report, written)
             if any(item.assertion_id == assertion.assertion_id for item in current):
                 raise SemanticValidationStoreError("governed initial write cannot replace an existing assertion")
             post_state = (*current, assertion)
@@ -437,12 +450,33 @@ class GovernedSemanticValidationService:
             return GovernedAssertionSupersessionResult(report, written)
         for attempt in range(max_commit_retries):
             checkpoint, _ = await self._assertions.export_snapshot()
+            # As with initial writes, a completed matching operation is
+            # authoritative before lifecycle planning rejects a predecessor
+            # that a concurrent delivery has already superseded.
+            replay = await self._assertions.replay_governed_supersession(
+                expected_predecessor_revision_id,
+                replacement,
+                source_occurrences=source_occurrences,
+                operation_id=operation_id,
+            )
+            if replay is not None:
+                report, written = replay
+                return GovernedAssertionSupersessionResult(report, written)
             try:
                 plan = await self._assertions.plan_supersession_lifecycle(
                     expected_predecessor_revision_id,
                     replacement,
                 )
             except AssertionConflictError as error:
+                replay = await self._assertions.replay_governed_supersession(
+                    expected_predecessor_revision_id,
+                    replacement,
+                    source_occurrences=source_occurrences,
+                    operation_id=operation_id,
+                )
+                if replay is not None:
+                    report, written = replay
+                    return GovernedAssertionSupersessionResult(report, written)
                 raise SemanticValidationStoreError(
                     "governed supersession requires an active predecessor in the bound tenant"
                 ) from error

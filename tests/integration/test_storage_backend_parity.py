@@ -265,6 +265,174 @@ async def test_canonical_assertion_store_has_tenant_and_lifecycle_parity(
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_save_fact_adapter_has_canonical_create_retry_supersede_delete_restart_parity(
+    db_backend,
+    tmp_path,
+):
+    """The explicit teaching tool never needs a learned_fact graph row as truth."""
+    from kestrel_sovereign.features.memory_agency.semantic_facts import GovernedFactAdapter
+
+    tenant, identity = await _incepted_assertion_identity(tmp_path, "save-fact-adapter")
+    raw_storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    try:
+        storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
+        adapter = GovernedFactAdapter(storage)
+        first = await adapter.save(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="us-central1",
+            confidence=0.9,
+            invocation_id="http-invoke-nonce",
+        )
+        replay = await adapter.save(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="us-central1",
+            confidence=0.9,
+            invocation_id="http-invoke-nonce",
+        )
+        replacement = await adapter.save(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="europe-west4",
+            confidence=0.9,
+            invocation_id="http-invoke-replacement",
+        )
+        replacement_replay = await adapter.save(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="europe-west4",
+            confidence=0.9,
+            invocation_id="http-invoke-replacement",
+        )
+
+        assert first.saved is True
+        assert replay.saved is True
+        assert replay.idempotent is True
+        assert replay.assertion_id == first.assertion_id
+        assert replacement.saved is True
+        assert replacement.superseded_assertion_id == first.assertion_id
+        assert replacement.assertion_id != first.assertion_id
+        assert replacement.provenance_reference is not None
+        assert replacement.provenance_digest is not None
+        assert replacement_replay.saved is True
+        assert replacement_replay.idempotent is True
+        assert replacement_replay.assertion_id == replacement.assertion_id
+        assert await raw_storage.get_nodes_by_type("learned_fact") == []
+
+        deleted = await adapter.forget(
+            subject="user",
+            predicate="preferred_deploy_region",
+            invocation_id="http-invoke-delete",
+        )
+        assert deleted.deleted is True
+        assert await storage.get_assertion(replacement.assertion_id) is None
+        deleted_replay = await adapter.forget(
+            subject="user",
+            predicate="preferred_deploy_region",
+            invocation_id="http-invoke-delete",
+        )
+        assert deleted_replay.deleted is True
+        assert deleted_replay.idempotent is True
+        assert deleted_replay.assertion_id == replacement.assertion_id
+
+        # Historical deleted shells must not make a later, distinct explicit
+        # fact ambiguous.  Its delete retry selects the original canonical
+        # operation by request identity and active predecessor revision.
+        after_delete = await adapter.save(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="asia-south1",
+            confidence=0.9,
+            invocation_id="http-invoke-after-delete",
+        )
+        after_delete_removed = await adapter.forget(
+            subject="user",
+            predicate="preferred_deploy_region",
+            invocation_id="http-invoke-after-delete-remove",
+        )
+        after_delete_replay = await adapter.forget(
+            subject="user",
+            predicate="preferred_deploy_region",
+            invocation_id="http-invoke-after-delete-remove",
+        )
+        assert after_delete.saved is True
+        assert after_delete_removed.deleted is True
+        assert after_delete_replay.deleted is True
+        assert after_delete_replay.idempotent is True
+        assert after_delete_replay.assertion_id == after_delete.assertion_id
+    finally:
+        await raw_storage.close()
+
+    restarted_raw = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    try:
+        restarted = PrivacyEnforcingStorage(restarted_raw, PrivacyMode.NORMAL)
+        assert await restarted.get_assertion(replacement.assertion_id) is None
+        assert await restarted_raw.get_nodes_by_type("learned_fact") == []
+    finally:
+        await restarted_raw.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_save_fact_concurrent_retry_replays_first_delivery_provenance(
+    db_backend,
+    tmp_path,
+):
+    """One retry ID has one canonical receipt despite distinct delivery clocks."""
+    from kestrel_sovereign.agent.invocation import invocation_scope, request_provenance
+    from kestrel_sovereign.features.memory_agency.semantic_facts import GovernedFactAdapter
+
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path,
+        "save-fact-concurrent-retry",
+    )
+    raw_storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    try:
+        storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
+        adapter = GovernedFactAdapter(storage)
+
+        async def deliver(received_at: str):
+            provenance = request_provenance(
+                actor="parity-user",
+                source_kind="http_request",
+                source_locator="POST:/api/agent/invoke",
+                received_at=received_at,
+            )
+            with invocation_scope("concurrent-retry-2765", provenance=provenance):
+                return await adapter.save(
+                    subject="user",
+                    predicate="preferred_deploy_region",
+                    value="us-central1",
+                    confidence=0.9,
+                    invocation_id="concurrent-retry-2765",
+                )
+
+        first, second = await asyncio.gather(
+            deliver("2026-07-26T14:02:11Z"),
+            deliver("2026-07-26T14:02:12Z"),
+        )
+
+        assert first.saved is True
+        assert second.saved is True
+        assert first.assertion_id == second.assertion_id
+        assert first.revision_id == second.revision_id
+        assert first.provenance_reference == second.provenance_reference
+        assert {first.idempotent, second.idempotent} == {False, True}
+
+        sources = await raw_storage.list_assertion_sources(first.assertion_id)
+        assert len(sources) == 1
+        assert sources[0].source_occurrence_id == first.provenance_reference
+        assert sources[0].received_at.value in {
+            "2026-07-26T14:02:11Z",
+            "2026-07-26T14:02:12Z",
+        }
+    finally:
+        await raw_storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_canonical_assertion_iri_object_query_has_backend_parity(
     db_backend,
     tmp_path,

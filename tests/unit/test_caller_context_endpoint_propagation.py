@@ -197,3 +197,78 @@ def test_bridge_stream_propagates_sovereign_caller_from_api_key():
         assert caller.is_sovereign
     finally:
         _restore_app(app, original)
+
+
+def test_bridge_invoke_forwards_header_retry_id_and_trusted_provenance():
+    """Bridge redeliveries must not mint a new canonical tool operation."""
+    agent = MagicMock()
+    agent.process_input = AsyncMock(return_value="ok")
+    _wire_bridge_feature(agent)
+
+    app, original = _prepare_app(agent)
+    try:
+        from kestrel_sovereign.features.bridge.router import get_router
+        app.include_router(get_router())
+
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/bridge/invoke",
+                    headers={
+                        "X-API-Key": "test-key",
+                        "X-Request-ID": "bridge-retry-2765",
+                    },
+                    json={"message": "teach this", "channel_type": "api"},
+                )
+
+        assert response.status_code == 200, response.text
+        assert response.headers["X-Request-ID"] == "bridge-retry-2765"
+        _, kwargs = agent.process_input.await_args
+        assert kwargs["invocation_id"] == "bridge-retry-2765"
+        provenance = kwargs["invocation_provenance"]
+        assert provenance.actor == "api_key"
+        assert provenance.source_locator == "POST:/api/bridge/invoke"
+    finally:
+        _restore_app(app, original)
+
+
+def test_bridge_stream_forwards_body_retry_id_and_trusted_provenance():
+    """The bridge SSE route shares the same invocation identity contract."""
+    captured = {}
+
+    async def _stream(_input, **kwargs):
+        captured.update(kwargs)
+        yield "ok"
+
+    agent = MagicMock()
+    agent.process_input_streaming = _stream
+    _wire_bridge_feature(agent)
+
+    app, original = _prepare_app(agent)
+    try:
+        from kestrel_sovereign.features.bridge.router import get_router
+        app.include_router(get_router())
+
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                with client.stream(
+                    "POST",
+                    "/api/bridge/stream",
+                    headers={"X-API-Key": "test-key"},
+                    json={
+                        "message": "teach this",
+                        "channel_type": "api",
+                        "request_id": "bridge-stream-retry-2765",
+                    },
+                ) as response:
+                    assert response.status_code == 200, response.read()
+                    assert response.headers["X-Request-ID"] == "bridge-stream-retry-2765"
+                    for _chunk in response.iter_text():
+                        pass
+
+        assert captured["request_id"] == "bridge-stream-retry-2765"
+        provenance = captured["invocation_provenance"]
+        assert provenance.actor == "api_key"
+        assert provenance.source_locator == "POST:/api/bridge/stream"
+    finally:
+        _restore_app(app, original)

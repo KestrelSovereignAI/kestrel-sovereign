@@ -6,7 +6,7 @@ Allows the agent to actively participate in its own memory by:
 - Releasing memories it wants to let go of
 - Listing currently pinned memories
 - Viewing pin statistics
-- Saving learned facts to the Knowledge Graph
+- Teaching explicitly approved facts through canonical assertions
 - Administrative bulk-unpin for sovereign/admin control
 
 Pinned memories get ``decay_protected = True`` in their metadata,
@@ -22,6 +22,7 @@ kestrel-sovereign #1042 narration-honesty contract (see #1061).
 
 import json
 import logging
+import math
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -29,7 +30,6 @@ from typing import Any, Dict, List, Optional
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import (
     hides_persisted_user_content,
-    resolve_agent_privacy_config,
     resolve_feature_database,
 )
 from kestrel_sdk.tools.base import ToolCategory
@@ -183,20 +183,6 @@ class MemoryAgencyFeature(Feature):
 
     def _persistent_memory_hidden(self) -> bool:
         return hides_persisted_user_content(self.agent)
-
-    def _requires_anonymization(self) -> bool:
-        """True when the active privacy config mandates PII redaction before persistence."""
-        config = resolve_agent_privacy_config(self.agent)
-        if config is None:
-            return False
-        requires = getattr(config, "requires_anonymization", None)
-        return bool(callable(requires) and requires())
-
-    def _anonymize_fact_field(self, value: str) -> str:
-        """Anonymize a fact field using the same path the storage wrapper uses."""
-        from kestrel_sovereign.features.privacy.pii_detector import anonymize_text
-
-        return anonymize_text(value)
 
     def _privacy_unavailable_result(self) -> ToolResult:
         return ToolResult.failed(
@@ -754,18 +740,15 @@ class MemoryAgencyFeature(Feature):
         return ToolResult.ok(confirmation=confirmation, data=data)
 
     # ------------------------------------------------------------------
-    # Knowledge Graph -- learned facts
+    # Canonical semantic assertions -- explicit facts
     # ------------------------------------------------------------------
 
     @tool(
         name="save_fact",
         description=(
-            "Save a learned fact to the Knowledge Graph. Use this when the "
-            "user tells you something worth remembering permanently, like "
-            "preferences, personal details, or important information. "
-            "The fact appears immediately in the Knowledge Graph panel. "
-            "Use 'user' as the subject for facts about the user. "
-            "Call once per distinct fact — do not save the same fact with different subject names."
+            "Save an explicitly approved canonical fact. The current mapping "
+            "supports subject 'user' and predicate 'preferred_deploy_region'. "
+            "Unsupported local terms are rejected rather than guessed."
         ),
         category=ToolCategory.MEMORY,
         command_prefix="!memory-save-fact",
@@ -778,20 +761,14 @@ class MemoryAgencyFeature(Feature):
         confidence: float = 1.0,
     ) -> ToolResult:
         """
-        Save a learned fact as a Knowledge Graph node.
+        Save one explicit fact through the governed canonical assertion writer.
 
         Args:
-            subject: Who or what the fact is about (e.g. "user", "project")
-            predicate: The relationship or attribute (e.g. "favorite_color", "lives_in")
-            value: The fact value (e.g. "blue", "Portland")
+            subject: The supported local subject (currently ``user``)
+            predicate: The supported local predicate (currently ``preferred_deploy_region``)
+            value: The explicitly taught string value
             confidence: Confidence level 0.0-1.0 (default 1.0)
         """
-        from kestrel_sovereign.storage.async_graph_store import GraphNode
-
-        # Privacy gate: the knowledge graph is an ungated passthrough to the
-        # persistent on-disk store, so save_fact must re-check privacy per call
-        # exactly like the pin tools. In ISOLATED/EPHEMERAL nothing purges a
-        # persisted fact, so refuse before writing.
         if self._persistent_memory_hidden():
             return self._privacy_unavailable_result()
 
@@ -801,18 +778,8 @@ class MemoryAgencyFeature(Feature):
             return ToolResult.failed(
                 f"confidence must be a number, got {confidence!r}"
             )
-
-        graph = getattr(self.storage, "graph", None)
-        if graph is None:
-            return ToolResult.failed("Knowledge graph not available")
-
-        # Under ANONYMOUS (storage="pii_redacted") the wrapper redacts PII from
-        # conversation content before persistence; the graph store bypasses that
-        # wrapper, so anonymize the fact fields here on the same path.
-        if self._requires_anonymization():
-            subject = self._anonymize_fact_field(subject)
-            predicate = self._anonymize_fact_field(predicate)
-            value = self._anonymize_fact_field(value)
+        if not math.isfinite(confidence_val):
+            return ToolResult.failed("confidence must be a finite number")
 
         # Honesty: confidence is silently clamped to [0, 1]. Pre-fix
         # this was hidden — the agent could pass 1.5 and the saved
@@ -820,50 +787,75 @@ class MemoryAgencyFeature(Feature):
         # the input was actually clamped.
         clamped_confidence = max(0.0, min(1.0, confidence_val))
         was_clamped = clamped_confidence != confidence_val
-
-        fact_id = f"fact:{self.agent_id}:{subject}:{predicate}"
-        node = GraphNode(
-            node_id=fact_id,
-            node_type="learned_fact",
-            label=f"{predicate.replace('_', ' ').title()}: {value}",
-            properties={
-                "subject": subject,
-                "predicate": predicate,
-                "value": value,
-                "confidence": clamped_confidence,
-                "source": "agent_tool",
-                "saved_at": datetime.now(timezone.utc).isoformat(),
-            },
-        )
-
         try:
-            await graph.add_node(node)
-            await graph.add_edge(self.agent_id, fact_id, "knows")
-        except Exception as e:
-            logger.error(f"save_fact write failed: {e}", exc_info=True)
+            from kestrel_sovereign.agent.invocation import (
+                current_invocation_id,
+                ensure_invocation_id,
+            )
+            from kestrel_sovereign.features.memory_agency.semantic_facts import (
+                FactLifecycleError,
+                FactMappingError,
+                GovernedFactAdapter,
+            )
+            from kestrel_sovereign.storage.privacy_wrapper import PrivacyViolationError
+
+            receipt = await GovernedFactAdapter(self.storage).save(
+                subject=subject,
+                predicate=predicate,
+                value=value,
+                confidence=clamped_confidence,
+                confidence_requested=confidence_val,
+                invocation_id=ensure_invocation_id(current_invocation_id()),
+            )
+        except (
+            FactLifecycleError,
+            FactMappingError,
+            PrivacyViolationError,
+            RuntimeError,
+            ValueError,
+        ) as e:
+            logger.info("save_fact canonical write refused: %s", e)
             return ToolResult.failed(str(e))
 
         logger.info(
-            "Saved fact to KG: %s.%s = %s (confidence=%.2f)",
-            subject, predicate, value, clamped_confidence,
+            "save_fact canonical result: %s.%s=%s (assertion=%s, saved=%s)",
+            subject, predicate, value,
+            receipt.assertion_id, receipt.saved,
         )
 
         data = {
-            "saved": True,
-            "node_id": fact_id,
+            "saved": receipt.saved,
             "subject": subject,
             "predicate": predicate,
             "value": value,
             "confidence": clamped_confidence,
             "confidence_requested": confidence_val,
             "confidence_clamped": was_clamped,
+            "assertion_id": receipt.assertion_id,
+            "revision_id": receipt.revision_id,
+            "validation_disposition": receipt.validation_disposition,
+            "validation_report_id": receipt.validation_report_id,
+            "provenance_reference": receipt.provenance_reference,
+            "provenance_digest": receipt.provenance_digest,
+            "operation_id": receipt.operation_id,
+            "idempotent": receipt.idempotent,
+            "superseded_assertion_id": receipt.superseded_assertion_id,
         }
+
+        if not receipt.saved:
+            return ToolResult.failed(
+                receipt.error or "canonical validation did not accept the fact",
+                data=data,
+            )
 
         if was_clamped:
             return ToolResult.partial(
                 confirmation=(
-                    f"Saved fact {subject}.{predicate}={value} "
-                    f"(confidence={clamped_confidence:.2f})"
+                    f"Saved canonical fact {subject}.{predicate}={value} "
+                    f"(confidence={clamped_confidence:.2f}; "
+                    f"assertion_id={receipt.assertion_id}; "
+                    f"revision_id={receipt.revision_id}; "
+                    f"provenance_reference={receipt.provenance_reference})"
                 ),
                 error=(
                     f"requested confidence={confidence_val} was outside "
@@ -874,8 +866,69 @@ class MemoryAgencyFeature(Feature):
 
         return ToolResult.ok(
             confirmation=(
-                f"Saved fact {subject}.{predicate}={value} "
-                f"(confidence={clamped_confidence:.2f})"
+                f"Saved canonical fact {subject}.{predicate}={value} "
+                f"(confidence={clamped_confidence:.2f}; "
+                f"assertion_id={receipt.assertion_id}; "
+                f"revision_id={receipt.revision_id}; "
+                f"provenance_reference={receipt.provenance_reference})"
+            ),
+            data=data,
+        )
+
+    @tool(
+        name="forget_fact",
+        description=(
+            "Delete a current canonical fact previously created by save_fact. "
+            "Uses the same supported local subject/predicate mapping."
+        ),
+        category=ToolCategory.MEMORY,
+        command_prefix="!memory-forget-fact",
+    )
+    async def forget_fact(self, subject: str, predicate: str) -> ToolResult:
+        """Delete one tenant-owned save_fact assertion through canonical lifecycle."""
+        try:
+            from kestrel_sovereign.agent.invocation import (
+                current_invocation_id,
+                ensure_invocation_id,
+            )
+            from kestrel_sovereign.features.memory_agency.semantic_facts import (
+                FactLifecycleError,
+                FactMappingError,
+                GovernedFactAdapter,
+            )
+            from kestrel_sovereign.storage.privacy_wrapper import PrivacyViolationError
+
+            receipt = await GovernedFactAdapter(self.storage).forget(
+                subject=subject,
+                predicate=predicate,
+                invocation_id=ensure_invocation_id(current_invocation_id()),
+            )
+        except (
+            FactLifecycleError,
+            FactMappingError,
+            PrivacyViolationError,
+            RuntimeError,
+            ValueError,
+        ) as e:
+            logger.info("forget_fact canonical lifecycle refused: %s", e)
+            return ToolResult.failed(str(e))
+
+        data = {
+            "deleted": receipt.deleted,
+            "assertion_id": receipt.assertion_id,
+            "revision_id": receipt.revision_id,
+            "provenance_reference": receipt.provenance_reference,
+            "operation_id": receipt.operation_id,
+            "idempotent": receipt.idempotent,
+        }
+        if not receipt.deleted:
+            return ToolResult.failed(receipt.error or "no matching current fact", data=data)
+        return ToolResult.ok(
+            confirmation=(
+                f"Deleted canonical fact {subject}.{predicate} "
+                f"(assertion_id={receipt.assertion_id}; "
+                f"revision_id={receipt.revision_id}; "
+                f"provenance_reference={receipt.provenance_reference})"
             ),
             data=data,
         )

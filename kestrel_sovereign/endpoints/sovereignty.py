@@ -1,6 +1,6 @@
 """Sovereignty export/import and file browser endpoints."""
 import asyncio
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
 from pathlib import Path
 import json
@@ -13,8 +13,12 @@ from typing import Any, Dict
 from kestrel_sovereign.kestrel_config.constants import MAX_SOVEREIGNTY_PREVIEW_SIZE
 from kestrel_sovereign.endpoints.agent_helpers import (
     get_agent,
+    get_caller,
     privacy_hides_persisted,
+    request_invocation_provenance,
+    resolve_request_invocation_id,
 )
+from kestrel_sovereign.agent.invocation import invocation_id_response_header
 
 logger = logging.getLogger(__name__)
 
@@ -250,7 +254,7 @@ async def trigger_sovereignty_export(request: Request):
 
 
 @router.post("/sovereignty/import")
-async def trigger_sovereignty_import(request: Request):
+async def trigger_sovereignty_import(request: Request, http_response: Response):
     """Trigger a sovereignty import via the agent's !import-sovereignty command."""
     try:
         data = await request.json()
@@ -265,8 +269,18 @@ async def trigger_sovereignty_import(request: Request):
 
         agent = get_agent(request)
         cmd = f"!import-sovereignty {cid}"
-        result = await agent.process_input(cmd)
+        request_id = resolve_request_invocation_id(request, data)
+        result = await agent.process_input(
+            cmd,
+            caller=get_caller(request),
+            invocation_id=request_id,
+            invocation_provenance=request_invocation_provenance(
+                request,
+                source_locator="POST:/api/sovereignty/import",
+            ),
+        )
 
+        http_response.headers["X-Request-ID"] = invocation_id_response_header(request_id)
         return {"success": True, "message": result}
     except HTTPException:
         raise

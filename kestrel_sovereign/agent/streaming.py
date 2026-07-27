@@ -20,6 +20,10 @@ from kestrel_sovereign.agent.parts import (
     part_collector,
 )
 from kestrel_sovereign.agent.operator_signals import inject_operator_turn
+from kestrel_sovereign.agent.invocation import (
+    bind_async_generator_invocation,
+    current_invocation_id,
+)
 from kestrel_sovereign.agent.context_manager import CONTEXT_HISTORY_LIMIT
 from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
 from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
@@ -890,6 +894,7 @@ class StreamingMixin:
             images.append(data)
         return images
 
+    @bind_async_generator_invocation("request_id")
     async def process_input_streaming(
         self,
         user_input: str,
@@ -900,6 +905,7 @@ class StreamingMixin:
         request_id: Optional[str] = None,
         attachments: Optional[list] = None,
         invocation_context: Optional[LLMInvocationContext] = None,
+        invocation_provenance=None,
     ):
         """
         Streaming version of process_input. Yields text chunks as generated.
@@ -951,6 +957,8 @@ class StreamingMixin:
                 explicit values — the global is overwritten by the next
                 ``register_active_request`` call and races between
                 overlapping streams can otherwise misroute events.
+            invocation_provenance: Endpoint-owned authenticated actor and
+                transport metadata bound task-locally for governed tools.
         """
         # Match process_input's retryable pre-initialization behavior. Without
         # storage there is no durable genesis receipt to inspect yet.
@@ -1045,6 +1053,7 @@ class StreamingMixin:
                     session_id=session_id,
                     caller=caller,
                     invocation_context=invocation_context,
+                    invocation_id=current_invocation_id(),
                 )
                 yield result
                 release_parts = not getattr(result, "denied", False) and not (

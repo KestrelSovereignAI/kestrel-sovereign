@@ -269,7 +269,28 @@ def _now() -> str:
 
 
 def _operation_digest(value: object) -> str:
-    return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
+    """Hash semantic operation intent, excluding transport delivery clocks.
+
+    A retry preserves the invocation and its semantic proposal, but it is a
+    distinct HTTP delivery and therefore has a new honest ``received_at``
+    timestamp.  The assertion mirrors that source timestamp in
+    ``asserted_at``.  Neither volatile clock may prevent the operation ledger
+    from returning the original canonical receipt; the committed assertion
+    and source still retain the first delivery's actual timestamps.
+    """
+    def without_delivery_timestamps(item: object) -> object:
+        if isinstance(item, dict):
+            return {
+                key: without_delivery_timestamps(nested)
+                for key, nested in item.items()
+                if key not in {"asserted_at", "received_at"}
+            }
+        if isinstance(item, (list, tuple)):
+            return [without_delivery_timestamps(nested) for nested in item]
+        return item
+
+    normalized = without_delivery_timestamps(value)
+    return hashlib.sha256(_json(normalized).encode("utf-8")).hexdigest()
 
 
 def _erasure_receipt_key(operation_id: str) -> str:

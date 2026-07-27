@@ -44,6 +44,8 @@ from kestrel_sovereign.storage.async_graph_store import NodeSwapResult
 from kestrel_sovereign.storage.agent_resource_store import (
     SOUL_MARKDOWN_RESOURCE_TYPE,
 )
+from kestrel_sovereign.storage.semantic_binding import SemanticAssertionBinding
+from kestrel_sovereign.knowledge import Visibility
 
 # Lazy import to avoid circular dependency with features.privacy
 # Note: This global cache is shared across all instances and async contexts.
@@ -2441,6 +2443,29 @@ class PrivacyEnforcingStorage:
                 "semantic persistence requires an approved redacted assertion "
                 "pipeline; this wrapper will not silently rewrite canonical terms."
             )
+
+    def semantic_assertion_binding(self) -> SemanticAssertionBinding:
+        """Return tenant/owner/privacy metadata from the governed storage path.
+
+        This is intentionally the only metadata surface an explicit assertion
+        adapter needs before building its value object.  Volatile and anonymous
+        modes fail before exposing a binding because no canonical write may be
+        attempted there.
+        """
+        self._assert_semantic_assertion_write_allowed("semantic_assertion_binding")
+        binding = self._storage.semantic_assertion_binding()
+        is_public = self._privacy_config.sharing == "public"
+        return SemanticAssertionBinding(
+            tenant_id=binding.tenant_id,
+            owning_agent_id=binding.owning_agent_id,
+            privacy_classification="public" if is_public else "normal",
+            release_policy_reference=(
+                "policy:privacy:public-v1"
+                if is_public
+                else "policy:privacy:normal-v1"
+            ),
+            visibility=Visibility.PUBLIC if is_public else Visibility.PRIVATE,
+        )
 
     async def put_assertion(self, assertion, *, source_occurrences=(), operation_id=None):
         """Govern normal assertion ingestion through the SHACL write boundary.

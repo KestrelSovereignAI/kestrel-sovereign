@@ -34,6 +34,8 @@ from .agent_resource_store import (
     AgentResourceVersion,
     SOUL_MARKDOWN_RESOURCE_TYPE,
 )
+from .semantic_binding import SemanticAssertionBinding
+from kestrel_sovereign.knowledge import Visibility
 from .db import DatabaseBackend, SQLiteBackend, create_backend
 
 logger = logging.getLogger(__name__)
@@ -965,6 +967,23 @@ class AsyncStorage:
                 "Canonical assertion storage requires initialized, agent-bound AsyncStorage"
             )
         return self._assertions
+
+    def semantic_assertion_binding(self) -> SemanticAssertionBinding:
+        """Return storage-owned assertion metadata for a foreground adapter.
+
+        The tenant and owner come from the private, agent-bound assertion
+        store—not a caller-selected ``agent_id`` or tool payload.  Privacy
+        wrappers refine the default NORMAL/private policy before exposing this
+        binding to application features.
+        """
+        store = self._assertion_store()
+        return SemanticAssertionBinding(
+            tenant_id=store.tenant_id,
+            owning_agent_id=store.owning_agent_id,
+            privacy_classification="normal",
+            release_policy_reference="policy:privacy:normal-v1",
+            visibility=Visibility.PRIVATE,
+        )
 
     async def put_assertion(self, assertion, *, source_occurrences=(), operation_id: Optional[str] = None):
         """Govern canonical ingestion and return its required SHACL report.

@@ -366,7 +366,7 @@ kind = "ontology"
 uri = "https://kestrel.ai/vocab/1.0.0"
 published_date = "2026-07-26"
 description = "Versioned Kestrel ontology for assertions, revisions, source occurrences, confidence, and temporal projection; it grants no authority."
-selected_terms = ["kestrel:SemanticAssertion", "kestrel:AssertionRevision", "kestrel:SourceOccurrence", "kestrel:hasRevision", "kestrel:hasSourceOccurrence", "kestrel:validTime", "kestrel:observedTime", "kestrel:confidence"]
+selected_terms = ["kestrel:SemanticAssertion", "kestrel:AssertionRevision", "kestrel:SourceOccurrence", "kestrel:hasRevision", "kestrel:hasSourceOccurrence", "kestrel:validTime", "kestrel:observedTime", "kestrel:confidence", "kestrel:preferredDeployRegion"]
 imports = ["rdfs-20140225@1.0.0", "skos-20090818@1.0.0", "prov-o-20130430@1.0.0", "owl-time-20171019@1.0.0"]
 capabilities = ["ontology:kestrel-vocab"]
 

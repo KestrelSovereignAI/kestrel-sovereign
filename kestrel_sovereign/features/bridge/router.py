@@ -25,14 +25,17 @@ Usage:
 import json
 import logging
 import time
-import uuid
-from typing import Optional
-
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
 from kestrel_sovereign.rate_limit import limiter
-from kestrel_sovereign.endpoints.agent_helpers import get_agent, get_caller
+from kestrel_sovereign.endpoints.agent_helpers import (
+    get_agent,
+    get_caller,
+    request_invocation_provenance,
+    resolve_request_invocation_id,
+)
+from kestrel_sovereign.agent.invocation import invocation_id_response_header
 
 from .protocol import (
     BridgeCapabilitiesResponse,
@@ -79,7 +82,11 @@ def get_router() -> APIRouter:
 
     @router.post("/invoke", response_model=BridgeResponse)
     @limiter.limit("120/minute")
-    async def bridge_invoke(request: Request, body: BridgeRequest):
+    async def bridge_invoke(
+        request: Request,
+        body: BridgeRequest,
+        http_response: Response,
+    ):
         """
         Synchronous bridge invocation.
 
@@ -106,6 +113,11 @@ def get_router() -> APIRouter:
 
         # Build context note from gateway context
         context_note = _build_context_note(body)
+        request_id = resolve_request_invocation_id(request, body)
+        invocation_provenance = request_invocation_provenance(
+            request,
+            source_locator="POST:/api/bridge/invoke",
+        )
 
         # Route through the agent's process_input
         try:
@@ -118,6 +130,8 @@ def get_router() -> APIRouter:
                 model_override=body.model_override,
                 session_id=session.id,
                 caller=get_caller(request),
+                invocation_id=request_id,
+                invocation_provenance=invocation_provenance,
             )
         except Exception as e:
             logger.error(f"Bridge invoke error: {e}", exc_info=True)
@@ -133,6 +147,7 @@ def get_router() -> APIRouter:
             duration_ms=elapsed_ms,
         )
 
+        http_response.headers["X-Request-ID"] = invocation_id_response_header(request_id)
         return BridgeResponse(
             message=response_text,
             session_id=session.id,
@@ -140,6 +155,7 @@ def get_router() -> APIRouter:
                 "channel_type": body.channel_type.value,
                 "duration_ms": elapsed_ms,
                 "gateway_session_id": body.session_id,
+                "request_id": request_id,
             },
         )
 
@@ -185,6 +201,11 @@ def get_router() -> APIRouter:
         user_input = body.message
         if context_note:
             user_input = f"{user_input}\n\n[Bridge context: {context_note}]"
+        request_id = resolve_request_invocation_id(request, body)
+        invocation_provenance = request_invocation_provenance(
+            request,
+            source_locator="POST:/api/bridge/stream",
+        )
 
         async def event_generator():
             full_response = []
@@ -199,6 +220,8 @@ def get_router() -> APIRouter:
                     model_override=body.model_override,
                     session_id=session.id,
                     caller=get_caller(request),
+                    request_id=request_id,
+                    invocation_provenance=invocation_provenance,
                 ):
                     chunk = strip_revise_sentinels(chunk)
                     if not chunk:
@@ -214,6 +237,7 @@ def get_router() -> APIRouter:
                     "session_id": session.id,
                     "duration_ms": elapsed_ms,
                     "channel_type": body.channel_type.value,
+                    "request_id": request_id,
                 })
                 yield f"data: {complete_data}\n\n"
 
@@ -247,6 +271,7 @@ def get_router() -> APIRouter:
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
+                "X-Request-ID": invocation_id_response_header(request_id),
             },
         )
 

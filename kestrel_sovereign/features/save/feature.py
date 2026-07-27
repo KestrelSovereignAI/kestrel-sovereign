@@ -505,9 +505,9 @@ class SaveFeature(Feature):
     @tool(
         name="recall",
         description=(
-            "Search saved items and learned facts. Find previously saved "
-            "stashes, excerpts, files, and items by meaning, plus facts saved "
-            "via save_fact (matched by keyword). Optional item_type filter "
+            "Search saved items. Find previously saved stashes, excerpts, "
+            "files, and items by meaning; legacy learned-fact graph rows may "
+            "also appear by keyword during the compatibility window. Optional item_type filter "
             "must be one of: stash, file, excerpt, structured; passing one "
             "scopes the search to saved items only."
         ),
@@ -569,14 +569,11 @@ class SaveFeature(Feature):
                 "created_at": item.get("created_at")
             })
 
-        # #2020: ``save_fact`` persists learned facts as ``learned_fact``
-        # Knowledge Graph nodes, which live in a different store than
-        # saved items and so are never surfaced by the vector/text search
-        # above. Without an embedding provider those facts were
-        # completely unrecoverable through recall. Extend the keyword
-        # fallback to cover them so saved facts are findable. The fact
-        # store is only queried when the caller isn't filtering to a
-        # saved-item type (stash/file/excerpt/structured).
+        # #2020 compatibility: historical ``learned_fact`` graph nodes live
+        # outside saved items, so retain this read-only fallback until their
+        # migration is complete. New ``save_fact`` writes are canonical
+        # assertions, not graph rows; canonical recall is owned by the later
+        # semantic read cutover rather than this legacy compatibility path.
         fact_matches: List[Dict[str, Any]] = []
         if not filter_type:
             fact_matches = await self._recall_learned_facts(query, limit)
@@ -617,10 +614,9 @@ class SaveFeature(Feature):
     ) -> List[Dict[str, Any]]:
         """Keyword search over ``learned_fact`` Knowledge Graph nodes.
 
-        Facts saved via ``save_fact`` are stored as graph nodes, not
-        saved items, so the saved-item vector/text search never returns
-        them. This keyword fallback makes them recoverable through
-        ``recall`` even when no embedding provider is available (#2020).
+        This reads only historical ``learned_fact`` graph rows.  New explicit
+        facts are canonical assertions and deliberately do not write this
+        compatibility projection.
         """
         # Production wraps storage in ``PrivacyEnforcingStorage``, whose
         # canonical surface is the facade method ``get_nodes_by_type``

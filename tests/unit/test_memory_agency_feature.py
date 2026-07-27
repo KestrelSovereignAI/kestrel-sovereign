@@ -10,10 +10,14 @@ Verifies:
 - Pinning a nonexistent message returns an error
 """
 
-import json
-import pytest
+import asyncio
+from dataclasses import replace
 from datetime import datetime, timezone
+import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 
 class FakeDB:
@@ -339,11 +343,117 @@ class FakeGraphStore:
         self.edges.append((source_id, target_id, label))
 
 
-def _make_feature(fake_db, agent_id="test-agent", graph_store=None):
+class FakeCanonicalFactStorage:
+    """Narrow governed-storage double for MemoryAgencyFeature receipts."""
+
+    def __init__(self, tenant_id="did:example:memory-agency"):
+        from kestrel_sovereign.knowledge import Visibility
+        from kestrel_sovereign.storage.semantic_binding import SemanticAssertionBinding
+
+        self.binding = SemanticAssertionBinding(
+            tenant_id=tenant_id,
+            owning_agent_id=tenant_id,
+            privacy_classification="normal",
+            release_policy_reference="policy:privacy:normal-v1",
+            visibility=Visibility.PRIVATE,
+        )
+        self.current = []
+        self.sources = {}
+        self.operations = {}
+        self.put_calls = []
+        self.supersede_calls = []
+        self.delete_calls = []
+
+    def semantic_assertion_binding(self):
+        return self.binding
+
+    async def query_assertions(self, query):
+        return [
+            assertion for assertion in self.current
+            if assertion.subject == query.subject and assertion.predicate == query.predicate
+        ]
+
+    async def list_assertion_sources(self, assertion_id):
+        return list(self.sources.get(assertion_id, ()))
+
+    @staticmethod
+    def _report():
+        return SimpleNamespace(
+            state=SimpleNamespace(value="conforms"),
+            action=SimpleNamespace(value="accept"),
+            report_id="validation-report",
+        )
+
+    async def put_assertion(self, assertion, *, source_occurrences, operation_id):
+        self.put_calls.append((assertion, source_occurrences, operation_id))
+        if operation_id in self.operations:
+            return SimpleNamespace(
+                accepted=True,
+                assertion=self.operations[operation_id],
+                report=self._report(),
+                idempotent=True,
+            )
+        self.operations[operation_id] = assertion
+        self.current = [assertion]
+        self.sources[assertion.assertion_id] = list(source_occurrences)
+        return SimpleNamespace(
+            accepted=True,
+            assertion=assertion,
+            report=self._report(),
+            idempotent=False,
+        )
+
+    async def supersede_assertion(self, revision_id, assertion, *, source_occurrences, operation_id):
+        self.supersede_calls.append((revision_id, assertion, source_occurrences, operation_id))
+        predecessor = self.current[0]
+        self.current = [assertion]
+        self.sources[assertion.assertion_id] = list(source_occurrences)
+        return SimpleNamespace(
+            accepted=True,
+            predecessor=predecessor,
+            replacement=assertion,
+            report=self._report(),
+            idempotent=False,
+        )
+
+    async def delete_assertion(self, assertion_id, revision_id, *, operation_id):
+        self.delete_calls.append((assertion_id, revision_id, operation_id))
+        target = self.current.pop()
+        return SimpleNamespace(deleted=target, idempotent=False)
+
+
+class PrivacyBlockedCanonicalFactStorage(FakeCanonicalFactStorage):
+    """Models the wrapper's fail-closed anonymous semantic policy."""
+
+    def semantic_assertion_binding(self):
+        from kestrel_sovereign.storage.privacy_wrapper import PrivacyViolationError
+
+        raise PrivacyViolationError("canonical assertion operation blocked by privacy policy")
+
+
+class ValidationRejectedCanonicalFactStorage(FakeCanonicalFactStorage):
+    async def put_assertion(self, assertion, *, source_occurrences, operation_id):
+        self.put_calls.append((assertion, source_occurrences, operation_id))
+        report = SimpleNamespace(
+            state=SimpleNamespace(value="nonconformant"),
+            action=SimpleNamespace(value="reject"),
+            report_id="rejected-report",
+        )
+        return SimpleNamespace(accepted=False, report=report, idempotent=False)
+
+
+class ValidationUnavailableCanonicalFactStorage(FakeCanonicalFactStorage):
+    async def put_assertion(self, assertion, *, source_occurrences, operation_id):
+        from kestrel_sovereign.knowledge.shacl_validation import ShaclCapabilityUnavailable
+
+        raise ShaclCapabilityUnavailable("the pinned SHACL profile is unavailable")
+
+
+def _make_feature(fake_db, agent_id="test-agent", graph_store=None, semantic_storage=None):
     """Create a MemoryAgencyFeature with a mocked agent and fake database."""
     from kestrel_sovereign.features.memory_agency.feature import MemoryAgencyFeature, PIN_QUOTA_DEFAULT
 
-    storage = MagicMock()
+    storage = semantic_storage or MagicMock()
     storage.db = fake_db
     storage.agent_id = agent_id
     storage.graph = graph_store
@@ -700,62 +810,199 @@ async def test_pin_preserves_existing_metadata():
 
 
 # --------------------------------------------------------------------------
-# save_fact tests
+# save_fact canonical assertion tests
 # --------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_save_fact_creates_kg_node():
-    """save_fact should create a learned_fact node in the knowledge graph."""
+async def test_save_fact_creates_canonical_receipt_without_graph_write():
+    """The explicit tool has one mutation route: the governed assertion facade."""
     from kestrel_sdk.tools.result import ToolResultStatus
     db = FakeDB()
     graph = FakeGraphStore()
-    feature = _make_feature(db, graph_store=graph)
+    canonical = FakeCanonicalFactStorage()
+    feature = _make_feature(db, graph_store=graph, semantic_storage=canonical)
 
     result = await feature.save_fact(
-        subject="user", predicate="favorite_number", value="445"
+        subject="user", predicate="preferred_deploy_region", value="us-central1"
     )
 
     assert result.status is ToolResultStatus.OK
     assert result.data["saved"] is True
     assert result.data["subject"] == "user"
-    assert result.data["predicate"] == "favorite_number"
-    assert result.data["value"] == "445"
+    assert result.data["predicate"] == "preferred_deploy_region"
+    assert result.data["value"] == "us-central1"
+    assert result.data["assertion_id"].startswith("urn:kestrel:assertion:sha256:")
+    assert result.data["revision_id"]
+    assert result.data["validation_disposition"] == "conforms:accept"
+    assert result.data["provenance_reference"].startswith("source:memory-agency-save-fact-v1:")
+    assert result.data["provenance_digest"].startswith("sha256:")
 
-    # Verify KG node was created
-    fact_id = result.data["node_id"]
-    assert fact_id in graph.nodes
-    node = graph.nodes[fact_id]
-    assert node.node_type == "learned_fact"
-    assert node.label == "Favorite Number: 445"
-    assert node.properties["subject"] == "user"
-    assert node.properties["predicate"] == "favorite_number"
-    assert node.properties["value"] == "445"
-    assert node.properties["confidence"] == 1.0
-    assert node.properties["source"] == "agent_tool"
-
-    # Verify edge was created
-    assert ("test-agent", fact_id, "knows") in graph.edges
+    assertion, sources, operation_id = canonical.put_calls[0]
+    assert assertion.tenant_id == canonical.binding.tenant_id
+    assert assertion.owning_agent_id == canonical.binding.owning_agent_id
+    assert assertion.subject.value.endswith(":principal:user")
+    assert assertion.predicate.value == "https://kestrel.ai/vocab/preferredDeployRegion"
+    assert assertion.object.datatype_iri == "http://www.w3.org/2001/XMLSchema#string"
+    assert assertion.ontology_version.namespace == "https://kestrel.ai/vocab/"
+    assert assertion.ontology_version.version == "1.0.0"
+    assert assertion.ontology_version.content_digest == "db708b6790e5212bcbfd5040a1d7883da1161b05e73c809ee8d924c31b2a8044"
+    assert sources[0].locator == f"tool:memory_agency.save_fact#{operation_id}"
+    assert sources[0].actor == canonical.binding.owning_agent_id
+    assert "us-central1" not in sources[0].locator
+    assert "us-central1" not in sources[0].content_digest
+    assert graph.nodes == {}
+    assert graph.edges == []
 
 
 @pytest.mark.asyncio
-async def test_save_fact_upserts_same_subject_predicate():
-    """Saving the same subject+predicate should update the existing node."""
+async def test_save_fact_retries_idempotently_and_supersedes_changed_value():
+    """Retries retain provenance; changed values use the canonical lifecycle."""
+    from kestrel_sovereign.agent.invocation import invocation_scope
     from kestrel_sdk.tools.result import ToolResultStatus
     db = FakeDB()
-    graph = FakeGraphStore()
-    feature = _make_feature(db, graph_store=graph)
+    canonical = FakeCanonicalFactStorage()
+    feature = _make_feature(db, semantic_storage=canonical)
 
-    await feature.save_fact(subject="user", predicate="favorite_color", value="blue")
-    result = await feature.save_fact(subject="user", predicate="favorite_color", value="green")
+    with invocation_scope("request-1"):
+        first = await feature.save_fact(
+            subject="user", predicate="preferred_deploy_region", value="us-central1"
+        )
+        replay = await feature.save_fact(
+            subject="user", predicate="preferred_deploy_region", value="us-central1"
+        )
+    with invocation_scope("request-2"):
+        replacement = await feature.save_fact(
+            subject="user", predicate="preferred_deploy_region", value="europe-west4"
+        )
 
-    assert result.status is ToolResultStatus.OK
+    assert first.status is ToolResultStatus.OK
+    assert replay.status is ToolResultStatus.OK
+    assert replay.data["idempotent"] is True
+    assert replay.data["assertion_id"] == first.data["assertion_id"]
+    assert replacement.status is ToolResultStatus.OK
+    assert replacement.data["superseded_assertion_id"] == first.data["assertion_id"]
+    assert replacement.data["assertion_id"] != first.data["assertion_id"]
+    assert len(canonical.supersede_calls) == 1
+    assert canonical.current[0].object.value == "europe-west4"
+
+
+@pytest.mark.asyncio
+async def test_save_fact_uses_task_local_invocation_not_agent_global_request_id():
+    """Concurrent turns retain their own canonical operation provenance."""
+    from kestrel_sovereign.agent.invocation import invocation_scope
+    from kestrel_sovereign.features.memory_agency.semantic_facts import (
+        _operation_material,
+    )
+
+    async def teach(invocation_id, value):
+        canonical = FakeCanonicalFactStorage()
+        feature = _make_feature(FakeDB(), semantic_storage=canonical)
+        # This is deliberately wrong for both turns. Provenance must never use
+        # the shared lifecycle fallback.
+        feature.agent._current_request_id = "wrong-shared-request-id"
+        with invocation_scope(invocation_id):
+            await asyncio.sleep(0)
+            result = await feature.save_fact(
+                subject="user",
+                predicate="preferred_deploy_region",
+                value=value,
+            )
+        return result, _operation_material(
+            action="save",
+            subject="user",
+            predicate="preferred_deploy_region",
+            value=value,
+            confidence_requested=1.0,
+            invocation_id=invocation_id,
+        )[0]
+
+    first, second = await asyncio.gather(
+        teach("turn-a", "us-central1"),
+        teach("turn-b", "europe-west4"),
+    )
+
+    assert first[0].data["operation_id"] == first[1]
+    assert second[0].data["operation_id"] == second[1]
+    assert first[0].data["operation_id"] != second[0].data["operation_id"]
+
+
+@pytest.mark.asyncio
+async def test_save_fact_uses_authenticated_task_local_provenance_not_agent_owner():
+    """The tool cannot choose actor/source fields; the trusted turn can."""
+    from kestrel_sovereign.agent.invocation import (
+        invocation_scope,
+        request_provenance,
+    )
+
+    canonical = FakeCanonicalFactStorage()
+    feature = _make_feature(FakeDB(), semantic_storage=canonical)
+    provenance = request_provenance(
+        actor="owner@example.test",
+        source_kind="http_request",
+        source_locator="POST:/v1/chat/completions",
+        received_at="2026-07-26T12:00:00+00:00",
+    )
+
+    with invocation_scope("openai-retry-2765", provenance=provenance):
+        result = await feature.save_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="us-central1",
+        )
+
     assert result.data["saved"] is True
-    assert result.data["value"] == "green"
+    _, sources, _ = canonical.put_calls[0]
+    source = sources[0]
+    assert source.actor == "owner@example.test"
+    assert source.source_kind == "http_request"
+    assert source.locator.startswith(
+        "POST:/v1/chat/completions#tool:memory_agency.save_fact#"
+    )
+    assert source.received_at.value == "2026-07-26T12:00:00Z"
+    assert source.actor != canonical.binding.owning_agent_id
 
-    # Should still be one node (upserted)
-    fact_id = "fact:test-agent:user:favorite_color"
-    assert graph.nodes[fact_id].label == "Favorite Color: green"
-    assert graph.nodes[fact_id].properties["value"] == "green"
+
+def test_nested_invocation_keeps_trusted_request_provenance_for_command_delegation():
+    """Streaming command delegation must not clear the outer HTTP context."""
+    from kestrel_sovereign.agent.invocation import (
+        current_invocation_provenance,
+        invocation_scope,
+        request_provenance,
+    )
+
+    provenance = request_provenance(
+        actor="owner@example.test",
+        source_kind="http_request",
+        source_locator="POST:/api/agent/stream",
+        received_at="2026-07-26T12:00:00Z",
+    )
+    with invocation_scope("outer-retry-2765", provenance=provenance):
+        with invocation_scope("nested-command"):
+            assert current_invocation_provenance() is provenance
+
+
+@pytest.mark.asyncio
+async def test_save_fact_without_a_turn_generates_fresh_direct_invocation_ids():
+    """Non-HTTP producers no longer share the permanent ``direct`` identity."""
+    canonical = FakeCanonicalFactStorage()
+    feature = _make_feature(FakeDB(), semantic_storage=canonical)
+
+    first = await feature.save_fact(
+        subject="user", predicate="preferred_deploy_region", value="us-central1"
+    )
+    second = await feature.save_fact(
+        subject="user", predicate="preferred_deploy_region", value="europe-west4"
+    )
+    third = await feature.save_fact(
+        subject="user", predicate="preferred_deploy_region", value="us-central1"
+    )
+
+    assert first.data["saved"] is True
+    assert second.data["saved"] is True
+    assert third.data["saved"] is True
+    assert first.data["operation_id"] != second.data["operation_id"]
+    assert second.data["operation_id"] != third.data["operation_id"]
+    assert len(canonical.supersede_calls) == 2
 
 
 @pytest.mark.asyncio
@@ -763,20 +1010,22 @@ async def test_save_fact_clamps_confidence():
     """Out-of-range confidence is clamped and surfaced as PARTIAL."""
     from kestrel_sdk.tools.result import ToolResultStatus
     db = FakeDB()
-    graph = FakeGraphStore()
-    feature = _make_feature(db, graph_store=graph)
+    canonical = FakeCanonicalFactStorage()
+    feature = _make_feature(db, semantic_storage=canonical)
 
     result = await feature.save_fact(
-        subject="user", predicate="test", value="x", confidence=2.5
+        subject="user", predicate="preferred_deploy_region", value="x", confidence=2.5
     )
     assert result.status is ToolResultStatus.PARTIAL
     assert result.data["confidence"] == 1.0
     assert result.data["confidence_requested"] == 2.5
     assert result.data["confidence_clamped"] is True
     assert "clamped" in result.error
+    assert "assertion_id=" in result.confirmation
+    assert "provenance_reference=" in result.confirmation
 
     result = await feature.save_fact(
-        subject="user", predicate="test2", value="y", confidence=-0.5
+        subject="user", predicate="preferred_deploy_region", value="y", confidence=-0.5
     )
     assert result.status is ToolResultStatus.PARTIAL
     assert result.data["confidence"] == 0.0
@@ -784,16 +1033,120 @@ async def test_save_fact_clamps_confidence():
 
 
 @pytest.mark.asyncio
-async def test_save_fact_without_graph_returns_error():
-    """save_fact should return error if graph store is not available."""
+async def test_save_fact_rejects_unsupported_or_ambiguous_legacy_terms():
+    """The adapter never turns free-form local strings into new ontology terms."""
     from kestrel_sdk.tools.result import ToolResultStatus
     db = FakeDB()
-    feature = _make_feature(db, graph_store=None)
+    feature = _make_feature(db, semantic_storage=FakeCanonicalFactStorage())
 
-    result = await feature.save_fact(subject="user", predicate="name", value="Alice")
+    result = await feature.save_fact(
+        subject="us\u00e9r", predicate="preferred_deploy_region", value="Berlin"
+    )
+    assert result.status is ToolResultStatus.ERROR
+    assert "unsupported subject" in result.error
+
+    result = await feature.save_fact(
+        subject="urn:kestrel:agent:forged-tenant:principal:user",
+        predicate="preferred_deploy_region",
+        value="Berlin",
+    )
+    assert result.status is ToolResultStatus.ERROR
+    assert "unsupported subject" in result.error
+
+    result = await feature.save_fact(
+        subject="user", predicate="https://example.test/adversarial", value="Berlin"
+    )
+    assert result.status is ToolResultStatus.ERROR
+    assert "unsupported predicate" in result.error
+
+
+@pytest.mark.asyncio
+async def test_save_fact_keeps_unicode_as_a_typed_literal_not_an_iri():
+    """Unicode values are explicit literal data, never inferred semantic terms."""
+    from kestrel_sdk.tools.result import ToolResultStatus
+
+    db = FakeDB()
+    canonical = FakeCanonicalFactStorage()
+    feature = _make_feature(db, semantic_storage=canonical)
+
+    result = await feature.save_fact(
+        subject="user",
+        predicate="preferred_deploy_region",
+        value="東京-中央",
+    )
+
+    assert result.status is ToolResultStatus.OK
+    assertion = canonical.put_calls[0][0]
+    assert assertion.object.lexical_form == "東京-中央"
+    assert assertion.object.datatype_iri == "http://www.w3.org/2001/XMLSchema#string"
+
+
+@pytest.mark.asyncio
+async def test_save_fact_surfaces_validation_rejection_and_unavailability_honestly():
+    from kestrel_sdk.tools.result import ToolResultStatus
+
+    db = FakeDB()
+    rejected = _make_feature(
+        db,
+        semantic_storage=ValidationRejectedCanonicalFactStorage(),
+    )
+    result = await rejected.save_fact(
+        subject="user", predicate="preferred_deploy_region", value="us-central1"
+    )
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["assertion_id"] is None
+    assert result.data["validation_disposition"] == "nonconformant:reject"
+
+    unavailable = _make_feature(
+        db,
+        semantic_storage=ValidationUnavailableCanonicalFactStorage(),
+    )
+    result = await unavailable.save_fact(
+        subject="user", predicate="preferred_deploy_region", value="us-central1"
+    )
+    assert result.status is ToolResultStatus.ERROR
+    assert "SHACL profile is unavailable" in result.error
+
+
+@pytest.mark.asyncio
+async def test_forget_fact_uses_canonical_delete_for_the_current_adapter_fact():
+    from kestrel_sdk.tools.result import ToolResultStatus
+
+    db = FakeDB()
+    canonical = FakeCanonicalFactStorage()
+    feature = _make_feature(db, semantic_storage=canonical)
+    await feature.save_fact(
+        subject="user", predicate="preferred_deploy_region", value="us-central1"
+    )
+
+    result = await feature.forget_fact("user", "preferred_deploy_region")
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["deleted"] is True
+    assert len(canonical.delete_calls) == 1
+    assert canonical.current == []
+
+
+@pytest.mark.asyncio
+async def test_forget_fact_refuses_a_current_foreign_lifecycle_target():
+    """Matching local terms never let this adapter delete another producer's fact."""
+    from kestrel_sdk.tools.result import ToolResultStatus
+
+    db = FakeDB()
+    canonical = FakeCanonicalFactStorage()
+    feature = _make_feature(db, semantic_storage=canonical)
+    await feature.save_fact(
+        subject="user", predicate="preferred_deploy_region", value="us-central1"
+    )
+    canonical.current = [
+        replace(canonical.current[0], confidence_method="other-producer-v1")
+    ]
+
+    result = await feature.forget_fact("user", "preferred_deploy_region")
 
     assert result.status is ToolResultStatus.ERROR
-    assert "not available" in result.error
+    assert "outside save_fact" in result.error
+    assert canonical.delete_calls == []
 
 
 # --------------------------------------------------------------------------
@@ -854,50 +1207,43 @@ async def test_memory_pinned_excludes_trashed_pin():
 
 
 @pytest.mark.asyncio
-async def test_save_fact_blocked_in_isolated_privacy_mode():
-    """save_fact must not persist to the KG when persistent memory is hidden (F213)."""
+@pytest.mark.parametrize("storage_mode", ["none", "temp", "deidentified"])
+async def test_save_fact_blocked_in_volatile_privacy_modes(storage_mode):
+    """EPHEMERAL, ISOLATED, and DEIDENTIFIED never reach semantic storage."""
     from kestrel_sdk.tools.result import ToolResultStatus
     from kestrel_sovereign.privacy import PrivacyConfig
 
     db = FakeDB()
-    graph = FakeGraphStore()
-    feature = _make_feature(db, graph_store=graph)
-    # ISOLATED uses temporary session storage (storage="temp").
-    feature.agent.privacy_config = PrivacyConfig(storage="temp", llm_location="local")
+    canonical = FakeCanonicalFactStorage()
+    feature = _make_feature(db, semantic_storage=canonical)
+    feature.agent.privacy_config = PrivacyConfig(storage=storage_mode, llm_location="local")
 
     result = await feature.save_fact(
-        subject="user", predicate="secret", value="do-not-persist"
+        subject="user", predicate="preferred_deploy_region", value="do-not-persist"
     )
 
     assert result.status is ToolResultStatus.ERROR
     assert "privacy mode" in result.error
-    # Nothing was written to the persistent graph store.
-    assert graph.nodes == {}
-    assert graph.edges == []
+    assert canonical.put_calls == []
 
 
 @pytest.mark.asyncio
-async def test_save_fact_anonymized_under_anonymous_mode():
-    """Under ANONYMOUS, save_fact anonymizes fields before persisting (F213)."""
+async def test_save_fact_anonymous_mode_fails_closed_without_a_redacted_assertion_pipeline():
+    """String redaction is not a semantics-preserving canonical transformation."""
     from kestrel_sdk.tools.result import ToolResultStatus
     from kestrel_sovereign.privacy import PrivacyConfig
 
     db = FakeDB()
-    graph = FakeGraphStore()
-    feature = _make_feature(db, graph_store=graph)
-    # ANONYMOUS redacts PII before persistence (storage="pii_redacted").
+    canonical = PrivacyBlockedCanonicalFactStorage()
+    feature = _make_feature(db, semantic_storage=canonical)
     feature.agent.privacy_config = PrivacyConfig(
         storage="pii_redacted", llm_location="local"
     )
 
     result = await feature.save_fact(
-        subject="user", predicate="email", value="jane@example.com"
+        subject="user", predicate="preferred_deploy_region", value="jane@example.com"
     )
 
-    assert result.status is ToolResultStatus.OK
-    fact_id = result.data["node_id"]
-    node = graph.nodes[fact_id]
-    # The raw email must not have been persisted.
-    assert "jane@example.com" not in node.properties["value"]
-    assert "[EMAIL_REDACTED]" in node.properties["value"]
-    assert "jane@example.com" not in result.data["value"]
+    assert result.status is ToolResultStatus.ERROR
+    assert "privacy" in result.error
+    assert canonical.put_calls == []
