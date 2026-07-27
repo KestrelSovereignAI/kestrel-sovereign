@@ -2613,6 +2613,9 @@ class KestrelAgent(
             agent_data_path=agent_data_dir,
             db=self._raw_storage.db,
             agent_id=self.agent_id,
+            semantic_inference_profile=self.semantic_inference_profile,
+            semantic_inference_limits=self.semantic_inference_limits,
+            semantic_maintenance_limits=self.semantic_maintenance_limits,
         )
         # Merge DB-backed bootstrap config (bootstrap_add / bootstrap_remove
         # persistence) into the loader before the first system-prompt

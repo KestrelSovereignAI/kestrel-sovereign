@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import time
+import re
 from typing import Iterable, Mapping, Sequence
 from uuid import uuid4
 
@@ -164,6 +165,10 @@ class _AssertionStoreScope:
 
 class AssertionStoreError(ValueError):
     """A canonical assertion mutation cannot be accepted."""
+
+
+class SemanticRecallUnavailableError(AssertionStoreError):
+    """Semantic recall cannot safely observe a current maintenance snapshot."""
 
 
 class MaintenanceLeaseLostError(AssertionStoreError):
@@ -351,6 +356,27 @@ class AssertionCheckpoint:
     tenant_id: str
     generation: int
     latest_event_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class AssertionRecallCandidate:
+    """One privacy-governed, current assertion with authoritative provenance."""
+
+    assertion: Assertion
+    source_occurrences: tuple[SourceOccurrence, ...]
+    inference_complete: bool
+
+
+@dataclass(frozen=True, slots=True)
+class AssertionRecallResult:
+    """Bounded tenant-local recall candidates and content-free checkpoint metadata."""
+
+    candidates: tuple[AssertionRecallCandidate, ...]
+    checkpoint_generation: int
+    capability_versions: Mapping[str, str]
+
+
+_RECALL_WORD_RE = re.compile(r"[\w]+", re.UNICODE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -5014,6 +5040,89 @@ class AsyncAssertionStore:
         if not isinstance(query, AssertionQuery):
             raise AssertionStoreError("inference_inputs requires AssertionQuery")
         return await self._query_current(query, eligible_only=True)
+
+    async def recall_candidates(
+        self,
+        *,
+        query: str,
+        candidate_limit: int,
+        inference_profile,
+        inference_limits=None,
+        maintenance_limits=None,
+    ) -> AssertionRecallResult:
+        """Return recallable assertions only from a complete current checkpoint.
+
+        This is intentionally the host-owned semantic/privacy seam: callers
+        cannot supply a tenant, lifecycle flags, source IDs, or a claimed
+        maintenance status.  The ledger query enforces current ACTIVE and
+        projection eligibility before provenance is hydrated in one batch.
+        """
+        if type(candidate_limit) is not int or not 1 <= candidate_limit <= 1000:
+            raise AssertionStoreError("semantic recall candidate_limit must be in [1, 1000]")
+        if not isinstance(query, str):
+            raise AssertionStoreError("semantic recall query must be text")
+        if inference_profile is None:
+            raise SemanticRecallUnavailableError("semantic_maintenance_capability_unavailable")
+        from kestrel_sovereign.knowledge.maintenance import SemanticMaintenanceService
+
+        service = SemanticMaintenanceService(
+            self, inference_profile=inference_profile,
+            inference_limits=inference_limits, limits=maintenance_limits,
+        )
+        readiness = await service.training_readiness()
+        if not readiness.ready:
+            raise SemanticRecallUnavailableError(readiness.reason or "semantic_maintenance_unavailable")
+        # Candidate selection is deterministic relevance ranking over a fixed
+        # backend-neutral scan, never the lexical first public-query page.
+        # The prompt layer may apply richer semantic scoring, but it cannot
+        # widen this governed lifecycle/privacy result.
+        assertions = await self._query_current(AssertionQuery(limit=1000), eligible_only=True)
+        terms = set(_RECALL_WORD_RE.findall(query.casefold()))
+        def relevance(item: Assertion) -> tuple[float, str]:
+            text = " ".join((item.subject.value, item.predicate.value, getattr(item.object, "value", ""))).casefold()
+            claim_terms = set(_RECALL_WORD_RE.findall(text))
+            score = len(terms & claim_terms) / len(terms) if terms else 0.0
+            return (-score, item.assertion_id)
+        assertions = sorted(assertions, key=relevance)[:candidate_limit]
+        sources = await self._sources_for_assertions(assertions)
+        return AssertionRecallResult(
+            candidates=tuple(
+                AssertionRecallCandidate(
+                    assertion=item,
+                    source_occurrences=sources.get(item.assertion_id, ()),
+                    inference_complete=True,
+                )
+                for item in assertions
+            ),
+            checkpoint_generation=(await self.checkpoint()).generation,
+            capability_versions=service._capability_versions(),
+        )
+
+    async def _sources_for_assertions(
+        self, assertions: Sequence[Assertion],
+    ) -> dict[str, tuple[SourceOccurrence, ...]]:
+        """Hydrate all selected provenance in one tenant-bound query (no N+1)."""
+        if not assertions:
+            return {}
+        tenant_id, _ = self._require_scope()
+        revision_ids = tuple(item.revision_id for item in assertions)
+        rows = await self._database.fetchall(
+            "SELECT rs.revision_id, s.source_mapping FROM semantic_revision_sources rs "
+            "JOIN semantic_source_occurrences s ON s.tenant_id = rs.tenant_id "
+            "AND s.source_occurrence_id = rs.source_occurrence_id "
+            f"WHERE rs.tenant_id = ? AND rs.revision_id IN ({_placeholders(revision_ids)}) "
+            "ORDER BY rs.revision_id, rs.ordinal, s.source_occurrence_id",
+            (tenant_id,) + revision_ids,
+        )
+        by_revision: dict[str, list[SourceOccurrence]] = {}
+        for revision_id, mapping in rows:
+            by_revision.setdefault(str(revision_id), []).append(
+                SourceOccurrence.from_mapping(json.loads(mapping))
+            )
+        return {
+            item.assertion_id: tuple(by_revision.get(item.revision_id, ()))
+            for item in assertions
+        }
 
     async def inference_inputs_page(
         self,

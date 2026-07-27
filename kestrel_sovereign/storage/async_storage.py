@@ -1288,6 +1288,19 @@ class AsyncStorage:
             await self.initialize()
         return await self._assertion_store().inference_inputs(query)
 
+    async def semantic_recall_candidates(
+        self, *, query, candidate_limit, inference_profile, inference_limits=None, maintenance_limits=None,
+    ):
+        """Read bounded recall candidates through the canonical ledger seam."""
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().recall_candidates(
+            query=query, candidate_limit=candidate_limit,
+            inference_profile=inference_profile,
+            inference_limits=inference_limits,
+            maintenance_limits=maintenance_limits,
+        )
+
     async def semantic_inference_state(self, profile):
         """Read the durable complete/incomplete status for one exact profile."""
         if not self._initialized:

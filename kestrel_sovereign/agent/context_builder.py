@@ -120,6 +120,9 @@ class ContextBuilder:
         llm_service=None,
         db=None,
         agent_id: Optional[str] = None,
+        semantic_inference_profile=None,
+        semantic_inference_limits=None,
+        semantic_maintenance_limits=None,
     ):
         """
         Initialize the context builder.
@@ -143,6 +146,9 @@ class ContextBuilder:
         self._counter = None
         self._counter_model = None
         self.consolidator = consolidator
+        self._semantic_inference_profile = semantic_inference_profile
+        self._semantic_inference_limits = semantic_inference_limits
+        self._semantic_maintenance_limits = semantic_maintenance_limits
         self.agent_data_path = Path(agent_data_path) if agent_data_path else None
 
         # Load bootstrap config from kestrel.toml
@@ -332,30 +338,78 @@ class ContextBuilder:
             if min_score is not None:
                 search_kwargs["min_score"] = min_score
             rag_results = await self.storage.search_chunks(query, **search_kwargs)
-            context_parts = []
-            for res in rag_results:
-                doc_name = res.get('document_name') or res.get('file_hash', 'unknown')
-                content = res.get('content', '')
-                # Include timestamp if available for temporal awareness
-                created_at = res.get('created_at', '')
-                timestamp_note = f" (indexed: {created_at})" if created_at else ""
-                context_parts.append(
-                    f"Source: {doc_name}{timestamp_note}\nContent: {content}"
-                )
         except Exception as e:
             logger.error(f"Error during RAG search: {e}")
-            context_parts = ["Error retrieving document context."]
+            return "Error retrieving document context."
 
-        # 2. Search knowledge graph (Conceptual)
-        # In a real implementation, we would parse the query for entities
-        # and query the graph for related nodes.
-        # kg_results = self.storage.query_graph(...)
-        # context_parts.append(f"Knowledge Graph Context: {kg_results}")
-
-        if not context_parts:
+        # The semantic boundary is opt-in. Disabled and empty results preserve
+        # the legacy RAG bytes exactly, including ordering and cache behavior.
+        from kestrel_sovereign.agent.semantic_recall import coerce_config, render_hybrid_context
+        try:
+            from kestrel_sovereign.config import load_section
+            recall_values = load_section("retrieval") or {}
+            if "semantic_recall_enabled" not in recall_values:
+                recall_values = {**recall_values, "semantic_recall_enabled": False}
+            recall_config = coerce_config(recall_values)
+        except Exception as exc:
+            logger.warning("Semantic recall configuration unavailable: %s", exc)
+            recall_config = coerce_config({"semantic_recall_enabled": False})
+        if recall_config.enabled:
+            reader = getattr(self.storage, "semantic_recall_candidates", None)
+            if reader is None:
+                logger.warning("Semantic recall capability unavailable: storage seam missing")
+            else:
+                try:
+                    recalled = await reader(
+                        query=query,
+                        candidate_limit=recall_config.candidate_limit,
+                        inference_profile=self._semantic_inference_profile,
+                        inference_limits=self._semantic_inference_limits,
+                        maintenance_limits=self._semantic_maintenance_limits,
+                    )
+                    candidates = tuple(recalled.candidates[:recall_config.work_limit])
+                    semantic_scores = await self._semantic_scores(query, candidates)
+                    hybrid = render_hybrid_context(
+                        query=query, rag_results=rag_results,
+                        assertion_candidates=candidates,
+                        config=recall_config, count_tokens=self.counter.count,
+                        semantic_scores=semantic_scores,
+                    )
+                    return hybrid.context
+                except Exception as exc:
+                    # Capability failures are observable and never fabricate a
+                    # graph result; retain the established RAG path.
+                    logger.warning("Semantic recall unavailable: %s", exc)
+        if not rag_results:
             return "No relevant documents or knowledge found in memory."
+        return "\n\n".join(
+            f"Source: {res.get('document_name') or res.get('file_hash', 'unknown')}"
+            f"{' (indexed: ' + str(res.get('created_at')) + ')' if res.get('created_at') else ''}\n"
+            f"Content: {res.get('content', '')}"
+            for res in rag_results
+        )
 
-        return "\n\n".join(context_parts)
+    async def _semantic_scores(self, query: str, candidates) -> Dict[str, float]:
+        """Score already-authorized candidates in one embedding batch.
+
+        Assertions never get a second persisted vector index. The existing
+        embedding service is only a candidate ranker; a capability failure
+        aborts semantic recall rather than silently pretending lexical recall
+        was semantic.
+        """
+        if not candidates:
+            return {}
+        from kestrel_sovereign.agent.semantic_recall import _claim_text
+        from kestrel_sovereign.llm.embedding_service import get_embedding_service, semantic_search
+        service = get_embedding_service()
+        claims = [_claim_text(item.assertion, 1200) for item in candidates]
+        hits = await semantic_search(query, claims, service, top_k=len(claims))
+        if len(hits) != len(claims):
+            raise RuntimeError("semantic embedding capability returned incomplete candidate scores")
+        return {
+            candidates[int(hit["index"])].assertion.assertion_id: float(hit["score"])
+            for hit in hits
+        }
 
     def get_session_briefing(self) -> str:
         """
