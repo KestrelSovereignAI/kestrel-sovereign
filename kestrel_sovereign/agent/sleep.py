@@ -13,6 +13,9 @@ This is inspired by how human memory consolidation occurs during sleep:
 - A "checkpoint" is created for disaster recovery
 """
 
+from collections.abc import Mapping
+import hashlib
+import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -21,6 +24,181 @@ import heapq
 from typing import Optional, Dict, Any, Callable, List, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+# ``!sleep`` is an authenticated operational surface, but its response still
+# travels through the normal chat/invoke formatter.  Keep semantic-maintenance
+# observability deliberately aggregate-only so a run report can never turn that
+# surface into an assertion, provenance, or raw-error disclosure.
+_SEMANTIC_MAINTENANCE_SUMMARY_MAX_CHARS = 1_024
+_SEMANTIC_MAINTENANCE_MAX_RENDERED_NUMBER = 1_000_000_000
+_SEMANTIC_MAINTENANCE_CAPABILITY_VALUE_MAX_CHARS = 256
+_SEMANTIC_MAINTENANCE_CAPABILITY_KEYS = (
+    "semantic_maintenance",
+    "maintenance_budget",
+    "shape_set",
+    "validation_capability",
+    "validation_profile_version",
+    "validation_artifact_pins",
+    "inference_profile",
+    "rule_profile",
+    "ontology",
+)
+_SEMANTIC_MAINTENANCE_STATUSES = frozenset(
+    {"complete", "partial", "failed", "no_op", "disabled"}
+)
+_SEMANTIC_MAINTENANCE_REASONS = frozenset(
+    {
+        "assertion_budget",
+        "consolidation_failed",
+        "consolidation_skipped",
+        "context_assertions",
+        "contradiction_context_budget",
+        "derivation_budget",
+        "generated_assertions",
+        "inference_incomplete",
+        "iterations",
+        "memory",
+        "repair_change_replay",
+        "report_budget",
+        "semantic_inference_revocation_failed",
+        "semantic_maintenance_busy",
+        "semantic_maintenance_capability_unavailable",
+        "semantic_maintenance_capability_mismatch",
+        "semantic_maintenance_checkpoint_behind",
+        "semantic_maintenance_failed",
+        "semantic_maintenance_lease_lost",
+        "semantic_maintenance_state_missing",
+        "semantic_storage_unavailable",
+        "semantic_maintenance_validation_capability_unavailable",
+        "source_assertions",
+        "source_changed_during_closure",
+        "validation_incomplete",
+        "wall_time",
+    }
+)
+_SLEEP_FAILURE_REASONS = frozenset(
+    {
+        "consolidation_failed",
+        "consolidation_skipped",
+        "semantic_inference_revocation_failed",
+        "semantic_maintenance_failed",
+        "semantic_storage_unavailable",
+    }
+)
+
+
+def _bounded_summary_number(value: Any) -> str:
+    """Render a finite aggregate count without trusting a report payload."""
+    if type(value) is not int or value < 0:
+        return "0"
+    if value > _SEMANTIC_MAINTENANCE_MAX_RENDERED_NUMBER:
+        return f">={_SEMANTIC_MAINTENANCE_MAX_RENDERED_NUMBER}"
+    return str(value)
+
+
+def _semantic_maintenance_status(value: Any) -> str:
+    """Return one of the public status tokens, never report-controlled text."""
+    if isinstance(value, str) and value in _SEMANTIC_MAINTENANCE_STATUSES:
+        return value
+    return "unknown"
+
+
+def _semantic_maintenance_reason(value: Any) -> str:
+    """Return a known content-free reason code, redacting all other values."""
+    if value is None:
+        return "none"
+    if isinstance(value, str) and value in _SEMANTIC_MAINTENANCE_REASONS:
+        return value
+    return "unavailable"
+
+
+def _sleep_failure_reason(value: Any) -> Optional[str]:
+    """Return an established content-free sleep failure code, if available."""
+    if not isinstance(value, str):
+        return None
+    # Existing sleep stages may append a later failure to an earlier safe code.
+    # Preserve the useful known code without echoing the appended exception.
+    for candidate in value.split(";"):
+        code = candidate.strip()
+        if code in _SLEEP_FAILURE_REASONS:
+            return code
+    return None
+
+
+def _semantic_maintenance_capability_summary(value: Any) -> Tuple[int, str]:
+    """Return a bounded capability-version count and deterministic digest.
+
+    The maintenance service owns the raw capability map.  Its values can
+    contain deployment-specific identifiers, so this renderer considers only
+    the fixed contract keys and publishes a digest rather than the map itself.
+    """
+    if not isinstance(value, Mapping):
+        return 0, "none"
+
+    canonical: List[Tuple[str, str]] = []
+    for key in _SEMANTIC_MAINTENANCE_CAPABILITY_KEYS:
+        if key not in value:
+            continue
+        raw = value[key]
+        if not isinstance(raw, str):
+            canonical.append((key, "invalid"))
+        elif len(raw) > _SEMANTIC_MAINTENANCE_CAPABILITY_VALUE_MAX_CHARS:
+            canonical.append((key, "oversize"))
+        else:
+            canonical.append((key, raw))
+
+    if not canonical:
+        return 0, "none"
+    encoded = json.dumps(
+        canonical,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return len(canonical), hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def _render_semantic_maintenance_summary(value: Any) -> Optional[str]:
+    """Render the fixed, content-free semantic-maintenance text block.
+
+    This is intentionally the only human renderer for the maintenance map.
+    It is used by :class:`SleepReport` and therefore reaches authenticated
+    ``!sleep --consolidate-only`` calls through both the command and HTTP
+    invoke paths.  The field allowlist and fixed output shape keep it
+    deterministic, bounded, and safe to show to an operator.
+    """
+    if not isinstance(value, Mapping):
+        return None
+
+    status = _semantic_maintenance_status(value.get("status"))
+    reason = _semantic_maintenance_reason(value.get("reason"))
+    capability_count, capability_digest = _semantic_maintenance_capability_summary(
+        value.get("capability_versions")
+    )
+    lines = [
+        "  Semantic maintenance:",
+        f"    status: {status}",
+        f"    reason: {reason}",
+        "    generations: "
+        f"source={_bounded_summary_number(value.get('source_generation'))} "
+        f"checkpoint={_bounded_summary_number(value.get('checkpoint_generation'))}",
+        "    changes: "
+        f"consumed={_bounded_summary_number(value.get('changes_consumed'))} "
+        f"validated={_bounded_summary_number(value.get('assertions_validated'))} "
+        f"inferred={_bounded_summary_number(value.get('assertions_inferred'))} "
+        f"retracted={_bounded_summary_number(value.get('assertions_retracted'))}",
+        f"    contradictions: {_bounded_summary_number(value.get('contradictions'))}",
+        f"    reports: created={_bounded_summary_number(value.get('reports_created'))}",
+        "    backlog: "
+        f"assertions={_bounded_summary_number(value.get('backlog_assertions'))} "
+        f"reports={_bounded_summary_number(value.get('backlog_reports'))}",
+        f"    duration: {_bounded_summary_number(value.get('duration_ms'))}ms",
+        "    capabilities: "
+        f"versions={capability_count} digest={capability_digest}",
+    ]
+    # Every interpolated value above is independently bounded.  Retain this
+    # final cap as a defense-in-depth contract for future edits.
+    return "\n".join(lines)[:_SEMANTIC_MAINTENANCE_SUMMARY_MAX_CHARS]
 
 
 class SleepHookPhase(str, Enum):
@@ -298,10 +476,42 @@ class SleepReport:
             "error": self.error,
         }
 
+    def semantic_maintenance_summary(self) -> Optional[str]:
+        """Return the bounded aggregate block for authenticated sleep output.
+
+        The raw ``semantic_maintenance`` map remains available through
+        :meth:`to_dict` for governed programmatic consumers.  Human-facing
+        command and HTTP-invoke output must use this method instead: it emits
+        only fixed aggregate fields and a capability digest, never assertion
+        content, identifiers, tenant/provenance details, raw errors, or the
+        capability map itself.
+        """
+        return _render_semantic_maintenance_summary(self.semantic_maintenance)
+
     def __str__(self) -> str:
-        """Human-readable summary."""
+        """Human-readable sleep summary with safe maintenance observability."""
+        maintenance_summary = self.semantic_maintenance_summary()
         if not self.success:
-            return f"Sleep failed: {self.error}"
+            failure_reason = _sleep_failure_reason(self.error)
+            maintenance_status = _semantic_maintenance_status(
+                self.semantic_maintenance.get("status")
+                if isinstance(self.semantic_maintenance, Mapping)
+                else None
+            )
+            if failure_reason is not None:
+                lines = [f"Sleep failed: {failure_reason}"]
+            elif maintenance_status == "partial":
+                # A bounded maintenance unit can be intentionally incomplete.
+                # Its report often has no separate legacy ``error`` field, so
+                # do not degrade this operator-visible state to ``None``.
+                lines = ["Sleep incomplete: semantic maintenance is partial."]
+            elif maintenance_status == "failed":
+                lines = ["Sleep failed: semantic_maintenance_failed"]
+            else:
+                lines = ["Sleep failed: unavailable"]
+            if maintenance_summary:
+                lines.append(maintenance_summary)
+            return "\n".join(lines)
 
         lines = [
             "Sleep cycle complete:",
@@ -314,6 +524,8 @@ class SleepReport:
         ]
         if self.cid:
             lines.append(f"  CID: {self.cid}")
+        if maintenance_summary:
+            lines.append(maintenance_summary)
         return "\n".join(lines)
 
 
@@ -1285,6 +1497,11 @@ class SleepMixin:
             !sleep --tier filecoin    - Export to Filecoin for permanent storage
             !sleep --consolidate-only - Only run memory consolidation
             !sleep --export-only      - Only run sovereignty export
+
+        When semantic maintenance is configured, the response includes a
+        bounded, content-free aggregate summary (status, generations, counters,
+        backlog, duration, and a capability digest).  It intentionally omits
+        assertion content, identifiers, provenance, tenant data, and raw errors.
         """
         parts = user_input.split()
 
