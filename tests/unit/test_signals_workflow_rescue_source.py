@@ -582,7 +582,11 @@ async def _make_runner(tmp_path, registry):
     store = WorkflowStore(backend)
     await store.initialize()
     dispatcher = SignalDispatcher(
-        agent=None,
+        # Not None: ``agent`` is annotated ``DispatcherAgent`` and the durable
+        # path reads ``.did``. A None agent only survives here because this
+        # runner never drives a durable dispatch — the moment one does, ``_run``
+        # swallows the AttributeError and downgrades the result to FAILED.
+        agent=_FakeAgent(),
         registry=registry,
         lock_manager=OrderedLockManager(),
         store=signal_store,

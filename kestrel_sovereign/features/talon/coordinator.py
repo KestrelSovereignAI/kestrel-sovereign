@@ -4294,7 +4294,13 @@ class TalonCoordinatorFeature(Feature):
         (test stubs, ephemeral runs).
         """
         storage_path = getattr(self.agent, "storage_path", None) if self.agent else None
-        if storage_path:
+        # Truthiness is not enough to honour the documented fallback: a test
+        # stub's ``MagicMock`` attribute is truthy AND ``os.PathLike``, so it
+        # passed a bare ``if storage_path:`` and then resolved to the RELATIVE
+        # path ``MagicMock/mock.storage_path/talon_jobs``, which ``mkdir`` then
+        # created under the process working directory (i.e. the repo checkout).
+        # Only a real string/Path names a data directory.
+        if isinstance(storage_path, (str, Path)) and str(storage_path).strip():
             base = Path(storage_path).parent / "talon_jobs"
         else:
             base = Path("/tmp/kestrel_talon_jobs")

@@ -3,6 +3,7 @@
 import json
 import urllib.error
 import urllib.request
+from pathlib import Path
 from types import SimpleNamespace
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -37,6 +38,33 @@ class TestTalonCoordinatorInit:
     async def test_initialize(self):
         feature = TalonCoordinatorFeature(_make_agent())
         await feature.initialize()  # should not raise
+
+
+class TestJobLogDir:
+    """``_job_log_dir`` must honour its documented ``/tmp`` fallback for stub
+    agents instead of resolving a mock attribute into a relative path."""
+
+    def test_real_storage_path_lands_under_the_agent_data_dir(self, tmp_path):
+        agent = _make_agent()
+        agent.storage_path = str(tmp_path / "agent_data" / "kestrel_prime.db")
+        feature = TalonCoordinatorFeature(agent)
+        assert feature._job_log_dir() == tmp_path / "agent_data" / "talon_jobs"
+
+    def test_stub_agent_falls_back_to_tmp_and_does_not_write_to_cwd(
+        self, tmp_path, monkeypatch,
+    ):
+        """A bare ``MagicMock`` storage_path is truthy AND ``os.PathLike``, so a
+        truthiness check resolved it to the RELATIVE path
+        ``MagicMock/mock.storage_path/talon_jobs`` and ``mkdir(parents=True)``
+        created it under the process working directory — i.e. the repo checkout.
+        The tests still passed, so the pollution went unnoticed.
+        """
+        monkeypatch.chdir(tmp_path)
+        feature = TalonCoordinatorFeature(_make_agent())
+
+        assert feature._job_log_dir() == Path("/tmp/kestrel_talon_jobs")
+        assert not (tmp_path / "MagicMock").exists()
+        assert list(tmp_path.iterdir()) == []
 
 
 class TestTalonClaim:
