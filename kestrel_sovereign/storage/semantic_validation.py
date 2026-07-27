@@ -436,17 +436,31 @@ class GovernedSemanticValidationService:
             report, written = replay
             return GovernedAssertionSupersessionResult(report, written)
         for attempt in range(max_commit_retries):
-            checkpoint, current = await self._assertions.export_snapshot()
-            predecessor = next(
-                (item for item in current if item.revision_id == expected_predecessor_revision_id),
-                None,
-            )
-            if predecessor is None:
+            checkpoint, _ = await self._assertions.export_snapshot()
+            try:
+                plan = await self._assertions.plan_supersession_lifecycle(
+                    expected_predecessor_revision_id,
+                    replacement,
+                )
+            except AssertionConflictError as error:
                 raise SemanticValidationStoreError(
                     "governed supersession requires an active predecessor in the bound tenant"
-                )
-            post_state = _supersession_post_state(current, predecessor, replacement)
-            data_graph, focus_map, _ = _canonical_validation_graph(post_state, post_state)
+                ) from error
+            # ``plan_supersession_lifecycle`` reads the alternate-proof ledger
+            # as well as canonical lineage.  Reject a plan assembled across a
+            # changed generation before validating it; the next bounded retry
+            # derives both the report graph and eventual mutation from one
+            # current lifecycle decision.
+            if (await self._assertions.checkpoint()).generation != checkpoint.generation:
+                if attempt + 1 == max_commit_retries:
+                    raise SemanticValidationStoreError(
+                        "validation conflict: canonical generation changed before the bounded supersession retry"
+                    )
+                continue
+            data_graph, focus_map, _ = _canonical_validation_graph(
+                plan.post_state,
+                plan.post_state,
+            )
             report = self._validator.validate(
                 data_graph,
                 tenant_id=self._assertions.tenant_id,
@@ -594,36 +608,6 @@ def _canonical_validation_graph(
             if isinstance(object_, URIRef):
                 affected_nodes.add(object_)
     return graph, {node: tuple(sorted(assertion_ids)) for node, assertion_ids in focus_map.items()}, affected_nodes
-
-
-def _supersession_post_state(
-    current: Sequence[Assertion],
-    predecessor: Assertion,
-    replacement: Assertion,
-) -> tuple[Assertion, ...]:
-    """Model the same active graph that the canonical supersession will commit.
-
-    Replacing a revision retracts every active derived assertion that depends
-    on it, including transitive descendants.  They must be absent from SHACL
-    evaluation just as they are absent from the committed active graph.
-    """
-    invalidated_revision_ids = {predecessor.revision_id}
-    while True:
-        newly_invalidated = {
-            assertion.revision_id
-            for assertion in current
-            if isinstance(assertion.lineage, DerivedLineage)
-            and assertion.revision_id not in invalidated_revision_ids
-            and set(assertion.lineage.input_revision_ids).intersection(invalidated_revision_ids)
-        }
-        if not newly_invalidated:
-            break
-        invalidated_revision_ids.update(newly_invalidated)
-    return tuple(
-        assertion
-        for assertion in current
-        if assertion.revision_id not in invalidated_revision_ids
-    ) + (replacement,)
 
 
 def _revision_node(assertion: Assertion) -> URIRef:

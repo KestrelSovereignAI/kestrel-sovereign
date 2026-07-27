@@ -29,6 +29,7 @@ import json
 import hashlib
 import logging
 import struct
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
 from ..async_assertion_store import _erasure_receipt_key
@@ -39,7 +40,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-_SEMANTIC_ASSERTION_SCHEMA_VERSION = "semantic_assertion_store_v2"
+_SEMANTIC_ASSERTION_SCHEMA_VERSION = "semantic_assertion_store_v3"
 _SEMANTIC_VALIDATION_SCHEMA_VERSION = "semantic_validation_reports_v1"
 _SEMANTIC_ASSERTION_LOCK_DOMAIN = b"kestrel:semantic-assertion-schema:v1\0"
 
@@ -59,6 +60,21 @@ async def _semantic_schema_marker_exists(db: "AsyncDatabase") -> bool:
         (_SEMANTIC_ASSERTION_SCHEMA_VERSION,),
     )
     return row is not None
+
+
+@asynccontextmanager
+async def _semantic_validation_migration_transaction(db: "AsyncDatabase"):
+    """Serialize a validation-schema marker read with SQLite's writer slot."""
+    if db.backend_type == "sqlite":
+        # The normal SQLite transaction begins deferred.  Once it has read a
+        # schema marker, attempting to promote it to a writer races another
+        # initializer and fails immediately instead of observing busy_timeout.
+        # Begin as the writer so every marker read below is serialized.
+        async with db.backend.transaction(immediate=True):  # type: ignore[call-arg]
+            yield
+        return
+    async with db.transaction():
+        yield
 
 
 async def _ensure_erasure_receipts_are_opaque(db: "AsyncDatabase") -> None:
@@ -221,6 +237,61 @@ async def migrate_semantic_assertion_store(db: "AsyncDatabase") -> None:
             PRIMARY KEY (tenant_id, derived_revision_id, input_revision_id),
             UNIQUE (tenant_id, derived_revision_id, ordinal)
         )""",
+        """CREATE TABLE IF NOT EXISTS semantic_inference_runs (
+            tenant_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            profile_key TEXT NOT NULL,
+            ontology_namespace TEXT NOT NULL,
+            ontology_version TEXT NOT NULL,
+            ontology_digest TEXT NOT NULL,
+            source_generation INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            incomplete_reason TEXT,
+            result_mapping TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            PRIMARY KEY (tenant_id, run_id),
+            CHECK (source_generation >= 0),
+            CHECK (status IN ('running', 'complete', 'incomplete', 'failed'))
+        )""",
+        """CREATE TABLE IF NOT EXISTS semantic_inference_state (
+            tenant_id TEXT NOT NULL,
+            profile_key TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            source_generation INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            incomplete_reason TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, profile_key),
+            CHECK (source_generation >= 0),
+            CHECK (status IN ('running', 'complete', 'incomplete', 'failed'))
+        )""",
+        """CREATE TABLE IF NOT EXISTS semantic_inference_derivations (
+            tenant_id TEXT NOT NULL,
+            derivation_id TEXT NOT NULL,
+            derived_assertion_id TEXT NOT NULL,
+            derived_revision_id TEXT NOT NULL,
+            rule_id TEXT NOT NULL,
+            profile_key TEXT NOT NULL,
+            rule_profile_version TEXT NOT NULL,
+            ontology_namespace TEXT NOT NULL,
+            ontology_version TEXT NOT NULL,
+            ontology_digest TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            generated_at TEXT NOT NULL,
+            active INTEGER NOT NULL,
+            PRIMARY KEY (tenant_id, derivation_id),
+            CHECK (active IN (0, 1))
+        )""",
+        """CREATE TABLE IF NOT EXISTS semantic_inference_derivation_inputs (
+            tenant_id TEXT NOT NULL,
+            derivation_id TEXT NOT NULL,
+            input_revision_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            PRIMARY KEY (tenant_id, derivation_id, input_revision_id),
+            UNIQUE (tenant_id, derivation_id, ordinal),
+            CHECK (ordinal >= 0)
+        )""",
         """CREATE TABLE IF NOT EXISTS semantic_projection_eligibility (
             tenant_id TEXT NOT NULL,
             revision_id TEXT NOT NULL,
@@ -275,6 +346,9 @@ async def migrate_semantic_assertion_store(db: "AsyncDatabase") -> None:
         "CREATE INDEX IF NOT EXISTS idx_semantic_revision_valid_time ON semantic_assertion_revisions(tenant_id, valid_start, valid_end)",
         "CREATE INDEX IF NOT EXISTS idx_semantic_revision_sources_source ON semantic_revision_sources(tenant_id, source_occurrence_id, revision_id)",
         "CREATE INDEX IF NOT EXISTS idx_semantic_derivation_input ON semantic_derivation_inputs(tenant_id, input_revision_id, derived_revision_id)",
+        "CREATE INDEX IF NOT EXISTS idx_semantic_inference_runs_profile ON semantic_inference_runs(tenant_id, profile_key, source_generation)",
+        "CREATE INDEX IF NOT EXISTS idx_semantic_inference_derivation_revision ON semantic_inference_derivations(tenant_id, derived_revision_id, active)",
+        "CREATE INDEX IF NOT EXISTS idx_semantic_inference_derivation_input ON semantic_inference_derivation_inputs(tenant_id, input_revision_id, derivation_id)",
         "CREATE INDEX IF NOT EXISTS idx_semantic_outbox_changes ON semantic_projection_outbox(tenant_id, generation, created_at, event_id)",
         "CREATE INDEX IF NOT EXISTS idx_semantic_erasure_changes ON semantic_projection_erasure_outbox(tenant_id, generation, created_at, event_id)",
     )
@@ -314,12 +388,6 @@ async def migrate_semantic_validation_reports(db: "AsyncDatabase") -> None:
     validation reports are auditable projections of the same semantic tenant
     and have no independent assertion or eligibility write path.
     """
-    row = await db.fetchone(
-        "SELECT 1 FROM semantic_schema_migrations WHERE version = ?",
-        (_SEMANTIC_VALIDATION_SCHEMA_VERSION,),
-    )
-    if row is not None:
-        return
     statements = (
         """CREATE TABLE IF NOT EXISTS semantic_validation_reports (
             report_id TEXT PRIMARY KEY,
@@ -365,7 +433,7 @@ async def migrate_semantic_validation_reports(db: "AsyncDatabase") -> None:
         "CREATE INDEX IF NOT EXISTS idx_semantic_validation_report_assertion ON semantic_validation_report_assertions(tenant_id, assertion_id, report_id)",
         "CREATE INDEX IF NOT EXISTS idx_semantic_validation_result_tenant_assertion ON semantic_validation_results(tenant_id, assertion_id, report_id)",
     )
-    async with db.transaction():
+    async with _semantic_validation_migration_transaction(db):
         if db.backend_type == "postgres":
             await db.execute("SELECT pg_advisory_xact_lock(?)", (_semantic_assertion_lock_id(),))
         await db.execute(

@@ -22,9 +22,12 @@ from kestrel_sovereign.security.assertion_tenant_resolver import (
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.llm.adapter import LLMResponse
 from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
-from kestrel_sovereign.config import TRUSTED_AGENTS_DIR
+from kestrel_sovereign.config import (
+    SEMANTIC_INFERENCE_CONFIG_ENV,
+    TRUSTED_AGENTS_DIR,
+)
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
-from typing import Optional, Dict, List, Any, TYPE_CHECKING, Union
+from typing import Optional, Dict, List, Any, TYPE_CHECKING, Union, Mapping
 import re
 from pathlib import Path
 from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
@@ -92,6 +95,7 @@ if TYPE_CHECKING:
         PeerDirectoryRouter,
         PeerRequester,
     )
+    from kestrel_sovereign.knowledge.inference import InferenceProfile
 
 # Optional ollama import (not available in remote-only containers)
 try:
@@ -524,6 +528,9 @@ class KestrelAgent(
         peer_requester: Optional["PeerRequester"] = None,
         sovereign_trust_root_path: Optional[str] = None,
         identity_export_dir: Optional[Path] = None,
+        semantic_inference_profile: Optional["InferenceProfile"] = None,
+        semantic_inference_limits: Optional["InferenceLimits"] = None,
+        semantic_inference_configured: bool = False,
     ):
         """
         Initializes the agent with memory and reasoning capabilities.
@@ -573,6 +580,15 @@ class KestrelAgent(
             identity_export_dir: Optional per-agent local identity export
                        directory. Multi-agent hosts resolve this before agent
                        construction so it never depends on process CWD.
+            semantic_inference_profile: Parsed, exact semantic materialization
+                       profile injected by a managed agent configuration.
+            semantic_inference_limits: Parsed, bounded materialization limits
+                       injected with the selected profile.  The limits remain
+                       operator configuration rather than service constants.
+            semantic_inference_configured: Whether the managed configuration
+                       explicitly supplied the profile, including an explicit
+                       disabled profile. When true it takes precedence over a
+                       legacy per-agent kestrel.toml block.
         """
         self.did = did
         self._privacy_mode = privacy_mode
@@ -655,6 +671,62 @@ class KestrelAgent(
         # ``kestrel.toml`` and apply it to the privacy_agent's PrivacyConfig
         # when it gets constructed in ``initialize()``. Default stays False.
         self._privacy_computer_access: bool = False
+        # Inference remains opt-in per tenant. An enabled profile carries exact
+        # ontology and rule versions; SleepMixin consumes this value on every
+        # incremental maintenance pass and never selects a profile itself.
+        # Managed agents receive this from their LocalAgentConfig; direct
+        # agents retain the existing per-agent TOML control surface below.
+        from kestrel_sovereign.knowledge.inference import (
+            InferenceError,
+            InferenceLimits,
+        )
+
+        if semantic_inference_limits is not None and not isinstance(
+            semantic_inference_limits, InferenceLimits
+        ):
+            raise RuntimeError("Invalid semantic inference limits")
+        self.semantic_inference_profile = semantic_inference_profile
+        self.semantic_inference_limits = semantic_inference_limits or InferenceLimits()
+        self.semantic_inference_configured = semantic_inference_configured
+        if semantic_inference_profile is not None:
+            from kestrel_sovereign.knowledge.inference import (
+                validate_inference_profile,
+            )
+
+            try:
+                validate_inference_profile(semantic_inference_profile)
+            except InferenceError as exc:
+                raise RuntimeError("Invalid semantic inference profile") from exc
+        if not semantic_inference_configured:
+            serialized_profile = os.environ.get(SEMANTIC_INFERENCE_CONFIG_ENV)
+            if serialized_profile is not None:
+                try:
+                    environment_profile = json.loads(serialized_profile)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"Invalid {SEMANTIC_INFERENCE_CONFIG_ENV} configuration"
+                    ) from exc
+                from kestrel_sovereign.knowledge.inference import (
+                    inference_limits_from_config,
+                    inference_profile_from_config,
+                    validate_inference_profile,
+                )
+
+                try:
+                    self.semantic_inference_profile = inference_profile_from_config(
+                        environment_profile
+                    )
+                    self.semantic_inference_limits = inference_limits_from_config(
+                        environment_profile
+                    )
+                    if self.semantic_inference_profile is not None:
+                        validate_inference_profile(self.semantic_inference_profile)
+                except InferenceError as exc:
+                    raise RuntimeError(
+                        f"Invalid {SEMANTIC_INFERENCE_CONFIG_ENV} configuration"
+                    ) from exc
+                semantic_inference_configured = True
+                self.semantic_inference_configured = True
         if storage_path:
             agent_toml = Path(storage_path).parent / "kestrel.toml"
             if agent_toml.exists():
@@ -665,14 +737,61 @@ class KestrelAgent(
                         import tomli as tomllib  # type: ignore[import-not-found]
                     with open(agent_toml, "rb") as f:
                         toml_data = tomllib.load(f)
-                    self._privacy_computer_access = bool(
-                        toml_data.get("privacy", {}).get("computer_access", False)
-                    )
-                except Exception as exc:
+                except (OSError, ValueError) as exc:
                     logging.warning(
-                        "Failed to read [privacy] from %s: %s",
+                        "Failed to read [privacy] or [semantic_inference] from %s: %s",
                         agent_toml, exc,
                     )
+                else:
+                    # Semantic inference is an explicit approval boundary, so
+                    # parse it independently from optional privacy settings.
+                    # A malformed [privacy] section cannot disable a valid
+                    # materialization profile, and an invalid explicit profile
+                    # always blocks startup.
+                    if (
+                        not semantic_inference_configured
+                        and "semantic_inference" in toml_data
+                    ):
+                        from kestrel_sovereign.knowledge.inference import (
+                            inference_limits_from_config,
+                            inference_profile_from_config,
+                            validate_inference_profile,
+                        )
+
+                        try:
+                            self.semantic_inference_profile = (
+                                inference_profile_from_config(
+                                    toml_data["semantic_inference"]
+                                )
+                            )
+                            self.semantic_inference_limits = (
+                                inference_limits_from_config(
+                                    toml_data["semantic_inference"]
+                                )
+                            )
+                            if self.semantic_inference_profile is not None:
+                                validate_inference_profile(
+                                    self.semantic_inference_profile
+                                )
+                        except InferenceError as exc:
+                            # Do not quietly disable a profile an operator
+                            # explicitly placed in the agent configuration.
+                            raise RuntimeError(
+                                f"Invalid [semantic_inference] configuration in {agent_toml}"
+                            ) from exc
+                        semantic_inference_configured = True
+                        self.semantic_inference_configured = True
+
+                    privacy = toml_data.get("privacy", {})
+                    if not isinstance(privacy, Mapping):
+                        logging.warning(
+                            "Ignoring malformed [privacy] configuration in %s: expected a table",
+                            agent_toml,
+                        )
+                    else:
+                        self._privacy_computer_access = bool(
+                            privacy.get("computer_access", False)
+                        )
 
         # Hybrid-aware identity load (Quantum Hardening epic, Wave 3 follow-up).
         # Reads the legacy ECDSA key, the new hybrid keys (Ed25519 + ML-DSA-65),

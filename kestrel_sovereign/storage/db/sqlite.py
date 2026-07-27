@@ -379,8 +379,14 @@ class SQLiteBackend(DatabaseBackend):
                 raise
 
     @asynccontextmanager
-    async def transaction(self) -> AsyncIterator[None]:
-        """Transaction context manager."""
+    async def transaction(self, *, immediate: bool = False) -> AsyncIterator[None]:
+        """Transaction context manager.
+
+        ``BEGIN IMMEDIATE`` is reserved for one-time schema migrations that
+        must acquire SQLite's writer slot before inspecting a migration marker.
+        Normal data mutations retain deferred ``BEGIN`` so read-first flows do
+        not unnecessarily block one another.
+        """
         conn = self._ensure_connected()
 
         if self._in_transaction and self._txn_owner is asyncio.current_task():
@@ -397,7 +403,7 @@ class SQLiteBackend(DatabaseBackend):
             self._in_transaction = True
             self._txn_owner = asyncio.current_task()
             try:
-                await conn.execute("BEGIN")
+                await conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
                 yield
                 await conn.commit()
             except Exception as e:

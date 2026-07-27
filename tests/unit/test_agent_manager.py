@@ -20,6 +20,7 @@ from kestrel_sovereign.features.scheduler.runner import (
 )
 from kestrel_sovereign.identity.runtime_identity import IdentityReadinessError
 from kestrel_sovereign.kestrel_agent import KestrelAgent
+from kestrel_sovereign.knowledge import InferenceError, InferenceProfile, OntologyRef
 from kestrel_sovereign.multi_agent.agent_manager import (
     AgentManager,
     _AgentDIDLookupMode,
@@ -1531,6 +1532,96 @@ class TestLoadFromConfig:
         assert mock_agent_cls.call_args.kwargs["identity_export_dir"] == (
             tmp_path / "agent_data" / "claw" / "continuity"
         ).resolve()
+
+    @pytest.mark.asyncio
+    @patch(
+        "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+        new_callable=AsyncMock,
+    )
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
+    async def test_in_process_agent_receives_semantic_inference_profile(
+        self,
+        mock_llm_cls,
+        mock_agent_cls,
+        mock_get_did,
+        tmp_path,
+    ):
+        """The managed config, not a sidecar TOML, controls nightly closure."""
+        mock_get_did.return_value = "did:claw"
+        mock_agent_cls.return_value = _make_mock_agent("did:claw")
+        manager = AgentManager(base_data_dir=tmp_path)
+        config = LocalAgentConfig(
+            data_dir=Path("agent_data/claw"),
+            port=8801,
+            semantic_inference={
+                "enabled": True,
+                "rdfs_version": "1.0.0",
+                "ontology": {
+                    "namespace": "http://www.w3.org/2000/01/rdf-schema#",
+                    "version": "1.0.0",
+                    "content_digest": "e362812917fddab7cfab3dc35553ad292725e8f264e05f376077340e91034db5",
+                    "compatibility_profile": "semantic-kb-v1",
+                },
+                "limits": {"max_source_assertions": 17},
+            },
+        )
+
+        with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
+            await manager._initialize_agent("claw", config)
+
+        profile = mock_agent_cls.call_args.kwargs["semantic_inference_profile"]
+        assert profile == InferenceProfile(
+            OntologyRef(
+                "http://www.w3.org/2000/01/rdf-schema#",
+                "1.0.0",
+                "e362812917fddab7cfab3dc35553ad292725e8f264e05f376077340e91034db5",
+                "semantic-kb-v1",
+            ),
+            "1.0.0",
+        )
+        assert mock_agent_cls.call_args.kwargs[
+            "semantic_inference_limits"
+        ].max_source_assertions == 17
+        assert mock_agent_cls.call_args.kwargs["semantic_inference_configured"] is True
+
+    @pytest.mark.asyncio
+    @patch(
+        "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+        new_callable=AsyncMock,
+    )
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
+    async def test_in_process_agent_rejects_unavailable_pinned_inference_profile(
+        self,
+        mock_llm_cls,
+        mock_agent_cls,
+        mock_get_did,
+        tmp_path,
+    ):
+        """Rule resources are validated before the agent can publish ready."""
+        mock_get_did.return_value = "did:claw"
+        manager = AgentManager(base_data_dir=tmp_path)
+        config = LocalAgentConfig(
+            data_dir=Path("agent_data/claw"),
+            port=8801,
+            semantic_inference={
+                "enabled": True,
+                "rdfs_version": "9.9.9",
+                "ontology": {
+                    "namespace": "http://www.w3.org/2000/01/rdf-schema#",
+                    "version": "1.0.0",
+                    "content_digest": "e362812917fddab7cfab3dc35553ad292725e8f264e05f376077340e91034db5",
+                    "compatibility_profile": "semantic-kb-v1",
+                },
+            },
+        )
+
+        with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
+            with pytest.raises(InferenceError, match="RDFS"):
+                await manager._initialize_agent("claw", config)
+
+        mock_agent_cls.assert_not_called()
 
     @pytest.mark.asyncio
     @patch(

@@ -38,7 +38,10 @@ from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage, PrivacyViolationError
 from kestrel_sovereign.privacy import PrivacyMode
-from kestrel_sovereign.storage.sqla.migrations import migrate_semantic_assertion_store
+from kestrel_sovereign.storage.sqla.migrations import (
+    migrate_semantic_assertion_store,
+    migrate_semantic_validation_reports,
+)
 from kestrel_sovereign.security.assertion_tenant_resolver import (
     _resolve_authenticated_agent_assertion_capability,
 )
@@ -793,6 +796,32 @@ async def test_migration_is_idempotent_and_failed_write_rolls_back() -> None:
         assert await db.fetchval("SELECT COUNT(*) FROM semantic_assertion_operations") == 0
     finally:
         await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_inference_and_validation_schema_migrations_coexist_idempotently() -> None:
+    """Independent schema markers preserve both durable semantic ledgers."""
+    db = await AsyncDatabase.sqlite(":memory:")
+    try:
+        await migrate_semantic_assertion_store(db)
+        await migrate_semantic_validation_reports(db)
+        await migrate_semantic_assertion_store(db)
+        await migrate_semantic_validation_reports(db)
+
+        assert await db.table_exists("semantic_inference_derivations")
+        assert await db.table_exists("semantic_inference_derivation_inputs")
+        assert await db.table_exists("semantic_validation_reports")
+        assert await db.table_exists("semantic_validation_results")
+        assert await db.fetchall(
+            "SELECT version FROM semantic_schema_migrations "
+            "WHERE version IN (?, ?) ORDER BY version",
+            ("semantic_assertion_store_v3", "semantic_validation_reports_v1"),
+        ) == [
+            ("semantic_assertion_store_v3",),
+            ("semantic_validation_reports_v1",),
+        ]
+    finally:
+        await db.close()
 
 
 @pytest.mark.asyncio

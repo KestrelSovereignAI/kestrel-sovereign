@@ -12,7 +12,7 @@ The multi_agent.toml file defines which agents exist and how to reach them.
 
 import logging
 from pathlib import Path
-from typing import List, Optional, Union, Literal
+from typing import Any, List, Optional, Union, Literal
 
 import toml
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -88,6 +88,14 @@ class LocalAgentConfig(BaseModel):
             "If None, all discovered features are loaded (backward compatible). "
             "Mandatory features (Identity, Security, Peers, Constitution, Wait) "
             "are always loaded regardless of this list."
+        ),
+    )
+    semantic_inference: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Optional exact RDFS/OWL 2 RL materialization profile for this "
+            "agent. The profile is parsed at agent initialization, where "
+            "invalid operator approval fails startup."
         ),
     )
 
@@ -393,6 +401,11 @@ class MultiAgentConfig(BaseModel):
                     entry["features"] = list(agent.features)
                 if agent.identity_export_dir is not None:
                     entry["identity_export_dir"] = str(agent.identity_export_dir)
+                # Preserve an explicit disabled profile too: its presence is
+                # an operator decision and must not fall back to a legacy
+                # per-agent TOML profile after this config is rewritten.
+                if agent.semantic_inference is not None:
+                    entry["semantic_inference"] = agent.semantic_inference
                 data["agents"][name] = entry
             elif isinstance(agent, RemoteAgentConfig):
                 data["agents"][name] = {

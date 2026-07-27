@@ -1016,6 +1016,13 @@ class AsyncStorage:
             await self.initialize()
         return await self._assertion_store().derivation_inputs(revision_id)
 
+    async def reactivate_inferred_assertion(self, assertion, *, operation_id: Optional[str] = None):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().reactivate_inferred(
+            assertion, operation_id=operation_id,
+        )
+
     async def supersede_assertion(self, expected_predecessor_revision_id: str, replacement, *, source_occurrences=(), operation_id: Optional[str] = None):
         """Govern canonical supersession and return its required SHACL report."""
         if not self._initialized:
@@ -1038,6 +1045,14 @@ class AsyncStorage:
         if not self._initialized:
             await self.initialize()
         return await self._assertion_store().delete(
+            assertion_id, expected_revision_id, operation_id=operation_id,
+        )
+
+    async def invalidate_assertion_eligibility(self, assertion_id: str, expected_revision_id: str, *, operation_id: Optional[str] = None):
+        """Withdraw a source's validation eligibility and cascade unsupported inference."""
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().invalidate_assertion_eligibility(
             assertion_id, expected_revision_id, operation_id=operation_id,
         )
 
@@ -1123,6 +1138,43 @@ class AsyncStorage:
         if not self._initialized:
             await self.initialize()
         return await self._assertion_store().inference_inputs(query)
+
+    async def semantic_inference_state(self, profile):
+        """Read the durable complete/incomplete status for one exact profile."""
+        if not self._initialized:
+            await self.initialize()
+        from kestrel_sovereign.knowledge.inference import BoundedInferenceService
+
+        return await BoundedInferenceService(self._assertion_store(), profile).closure_state()
+
+    async def explain_semantic_inference(self, assertion_id: str, profile):
+        """Read rule and premise-ID lineage for one tenant-local inferred claim."""
+        if not self._initialized:
+            await self.initialize()
+        from kestrel_sovereign.knowledge.inference import BoundedInferenceService
+
+        return await BoundedInferenceService(self._assertion_store(), profile).explain(assertion_id)
+
+    async def materialize_semantic_inference(self, profile, *, limits=None, full_rebuild: bool = False):
+        """Advance an incremental semantic closure, or run explicit repair mode."""
+        if not self._initialized:
+            await self.initialize()
+        from kestrel_sovereign.knowledge.inference import BoundedInferenceService
+
+        service = BoundedInferenceService(self._assertion_store(), profile, limits=limits)
+        if full_rebuild:
+            return await service.rebuild()
+        return await service.materialize_incremental()
+
+    async def revoke_semantic_inference(self):
+        """Revoke this tenant's materializations after explicit disablement."""
+        if not self._initialized:
+            await self.initialize()
+        from kestrel_sovereign.knowledge.inference import ENGINE_VERSION
+
+        return await self._assertion_store().revoke_semantic_inference(
+            ENGINE_VERSION
+        )
 
     async def export_assertion_snapshot(self, query=None):
         if not self._initialized:

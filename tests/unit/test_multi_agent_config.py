@@ -572,6 +572,37 @@ class TestMultiAgentConfigSave:
 
         assert loaded.agents["test"].identity_export_dir == Path("continuity")
 
+    def test_save_preserves_per_agent_semantic_inference_profile(
+        self,
+        tmp_path,
+        temp_agent_dir,
+    ):
+        profile = {
+            "enabled": True,
+            "rdfs_version": "1.0.0",
+            "ontology": {
+                "namespace": "kestrel-test",
+                "version": "1",
+                "content_digest": "sha256:test",
+                "compatibility_profile": "semantic-kb-v1",
+            },
+        }
+        config = MultiAgentConfig(
+            agents={
+                "test": LocalAgentConfig(
+                    data_dir=temp_agent_dir,
+                    port=8801,
+                    semantic_inference=profile,
+                )
+            }
+        )
+
+        config_path = tmp_path / "multi_agent.toml"
+        config.save(config_path)
+        loaded = MultiAgentConfig.from_file(config_path)
+
+        assert loaded.agents["test"].semantic_inference == profile
+
     def test_save_with_remote_agents(self, tmp_path):
         """Test saving config with remote agents."""
         config = MultiAgentConfig(
