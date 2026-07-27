@@ -1546,6 +1546,48 @@ class TestLoadFromConfig:
     )
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
     @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
+    async def test_each_agent_llm_service_is_bound_to_its_own_data_dir(
+        self,
+        mock_llm_cls,
+        mock_agent_cls,
+        mock_get_did,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Per-agent usage rows must follow the agent, not the process env.
+
+        Asserts the resolved directory itself, not merely that the keyword was
+        passed: ``LLMService(agent_data_dir=None)`` would keep the keyword while
+        silently falling back to ``KESTREL_DB_PATH`` and reinstating #2769.
+        """
+        monkeypatch.setenv("KESTREL_DB_PATH", str(tmp_path / "agent_data" / "claw"))
+        mock_agent_cls.side_effect = lambda **kw: _make_mock_agent(kw["did"])
+
+        manager = AgentManager(base_data_dir=tmp_path)
+        seen = {}
+        with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
+            for name in ("claw", "meridian"):
+                mock_get_did.return_value = f"did:{name}"
+                await manager._initialize_agent(
+                    name,
+                    LocalAgentConfig(data_dir=Path("agent_data") / name, port=8801),
+                )
+                seen[name] = mock_llm_cls.call_args.kwargs["agent_data_dir"]
+
+        for name, passed in seen.items():
+            assert passed == (tmp_path / "agent_data" / name).resolve()
+
+        # Two agents in one process must not collapse onto one usage DB — the
+        # exact condition that produced the live misattribution.
+        assert seen["claw"] != seen["meridian"]
+
+    @pytest.mark.asyncio
+    @patch(
+        "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+        new_callable=AsyncMock,
+    )
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
     async def test_in_process_agent_receives_semantic_inference_profile(
         self,
         mock_llm_cls,

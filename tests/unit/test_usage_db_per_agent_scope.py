@@ -156,3 +156,10 @@ def test_agent_manager_binds_each_agent_to_its_own_data_dir():
             "AgentManager must bind each agent's LLMService to that agent's own "
             f"data dir; found bare construction: LLMService({args})"
         )
+        # A literal None keeps the keyword while restoring the env-var fallback,
+        # so the keyword's presence alone is not enough. The value itself is
+        # asserted behaviorally in
+        # test_agent_manager.test_each_agent_llm_service_is_bound_to_its_own_data_dir.
+        assert "agent_data_dir=None" not in args.replace(" ", ""), (
+            f"binding must be a real per-agent dir; found: LLMService({args})"
+        )
