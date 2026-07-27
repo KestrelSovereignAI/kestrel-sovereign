@@ -47,6 +47,7 @@ from kestrel_sovereign.identity.runtime_identity import (
     load_agent_identity,
 )
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
+from kestrel_sovereign.knowledge import InferenceProfile, OntologyRef
 
 
 def _semantic_source(source_id: str):
@@ -63,7 +64,9 @@ def _semantic_source(source_id: str):
     )
 
 
-def _semantic_assertion(tenant_id: str, revision_id: str, *, value: str = "value"):
+def _semantic_assertion(
+    tenant_id: str, revision_id: str, *, value: str = "value", source_id: str = "parity-source",
+):
     from kestrel_sovereign.knowledge import (
         Assertion,
         DirectLineage,
@@ -73,7 +76,6 @@ def _semantic_assertion(tenant_id: str, revision_id: str, *, value: str = "value
         OntologyRef,
         XSD_STRING,
     )
-
     return Assertion(
         tenant_id=tenant_id,
         owning_agent_id=tenant_id,
@@ -87,10 +89,29 @@ def _semantic_assertion(tenant_id: str, revision_id: str, *, value: str = "value
         epistemic_state=EpistemicState.REPORTED,
         asserted_at="2026-07-26T14:02:11Z",
         ontology_version=OntologyRef("parity", "1", "sha256:parity", "semantic-kb-v1"),
-        lineage=DirectLineage(("parity-source",)),
+        lineage=DirectLineage((source_id,)),
         privacy_classification="normal",
         release_policy_reference="policy:private-v1",
     )
+
+
+_RECALL_PROFILE = InferenceProfile(
+    OntologyRef(
+        "http://www.w3.org/2000/01/rdf-schema#", "1.0.0",
+        "e362812917fddab7cfab3dc35553ad292725e8f264e05f376077340e91034db5",
+        "semantic-kb-v1",
+    ),
+    "1.0.0",
+)
+
+
+async def _reach_current_semantic_maintenance(storage: AsyncStorage) -> None:
+    """Drive the real bounded maintenance cursor to a durable checkpoint."""
+    for _ in range(4):
+        result = await storage.run_semantic_maintenance(_RECALL_PROFILE)
+        if result.status.value in {"complete", "no_op"}:
+            return
+    raise AssertionError(f"maintenance did not converge: {result}")
 
 
 def _explicit_fact_proposal(
@@ -427,6 +448,54 @@ async def test_canonical_assertion_store_has_tenant_and_lifecycle_parity(
             )
     finally:
         await other_storage.close()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_governed_semantic_recall_storage_seam_has_backend_parity(db_backend, tmp_path):
+    """Discovery and final provenance hydration use the same SQL contract."""
+    from kestrel_sovereign.storage.async_assertion_store import SemanticRecallUnavailableError
+
+    tenant, identity = await _incepted_assertion_identity(tmp_path, "recall-parity")
+    storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    try:
+        fact = _semantic_assertion(tenant, "recall-current", value="current", source_id="recall-current")
+        expired = _semantic_assertion(tenant, "recall-expired", value="expired", source_id="recall-expired")
+        ineligible = _semantic_assertion(tenant, "recall-ineligible", value="ineligible", source_id="recall-ineligible")
+        await storage.put_assertion(fact, source_occurrences=(_semantic_source("recall-current"),))
+        await storage.put_assertion(expired, source_occurrences=(_semantic_source("recall-expired"),))
+        await storage.put_assertion(ineligible, source_occurrences=(_semantic_source("recall-ineligible"),))
+        await storage.db.execute(
+            "UPDATE semantic_assertion_revisions SET valid_end = ? "
+            "WHERE tenant_id = ? AND revision_id = ?",
+            ("2020-01-01T00:00:00Z", tenant, expired.revision_id),
+        )
+        await storage.db.execute(
+            "UPDATE semantic_projection_eligibility SET eligible = 0 "
+            "WHERE tenant_id = ? AND revision_id = ?",
+            (tenant, ineligible.revision_id),
+        )
+        await _reach_current_semantic_maintenance(storage)
+
+        discovered = await storage.semantic_recall_candidates(
+            query="current", candidate_scan_limit=10, inference_profile=_RECALL_PROFILE,
+        )
+        assert [candidate.assertion.assertion_id for candidate in discovered.candidates] == [fact.assertion_id]
+        hydrated = await storage.hydrate_semantic_recall_candidates(
+            [fact.assertion_id], expected_checkpoint_generation=discovered.checkpoint_generation,
+            inference_profile=_RECALL_PROFILE,
+        )
+        assert hydrated[0].source_occurrences == (_semantic_source("recall-current"),)
+
+        overflow = _semantic_assertion(tenant, "recall-overflow", value="overflow", source_id="recall-overflow")
+        await storage.put_assertion(overflow, source_occurrences=(_semantic_source("recall-overflow"),))
+        await _reach_current_semantic_maintenance(storage)
+        with pytest.raises(SemanticRecallUnavailableError, match="semantic_recall_candidate_window_exceeded"):
+            await storage.semantic_recall_candidates(
+                query="", candidate_scan_limit=1, inference_profile=_RECALL_PROFILE,
+            )
+    finally:
         await storage.close()
 
 
