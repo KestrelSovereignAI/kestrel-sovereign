@@ -24,7 +24,9 @@ class UsageTrackingMixin:
     1. Explicit database_url parameter (PostgreSQL)
     2. KESTREL_DATABASE_URL env var (PostgreSQL)
     3. DATABASE_URL env var (PostgreSQL) 
-    4. Default to SQLite at KESTREL_DB_PATH/agent_data/llm_usage.db
+    4. Default to SQLite at ``<agent data root>/llm_usage.db``, where the agent
+       data root follows the precedence documented on
+       :meth:`_init_usage_tracking`.
     """
 
     # Instance attributes to be initialized
@@ -32,12 +34,19 @@ class UsageTrackingMixin:
     _db_backend: str
     _db_initialized: bool
 
-    def _init_usage_tracking(self, database_url: Optional[str] = None):
+    def _init_usage_tracking(
+        self,
+        database_url: Optional[str] = None,
+        agent_data_dir: Optional[Any] = None,
+    ):
         """Initialize usage tracking state (async initialization done in _ensure_db_initialized).
-        
+
         Args:
             database_url: Optional PostgreSQL connection URL. If provided, uses PostgreSQL.
                          If None, checks env vars, then falls back to SQLite.
+            agent_data_dir: The owning agent's data root. This is the strongest
+                         signal for where SQLite usage rows belong — see the
+                         precedence note in the body.
         """
         self._usage_db = None
         self._db_initialized = False
@@ -61,7 +70,22 @@ class UsageTrackingMixin:
             # DB-selection guard could turn it into a clean refusal (#2362). The
             # directory is created lazily in ``_ensure_db_initialized`` right
             # before the connection is actually opened.
-            db_path = os.environ.get("KESTREL_DB_PATH", "./agent_data")
+            #
+            # The owning agent's data root outranks the process environment. An
+            # in-process multi-agent host runs EVERY agent in one process, so a
+            # single ``KESTREL_DB_PATH`` cannot name more than one agent's data
+            # root; without this precedence every agent on such a host writes
+            # its usage rows into whichever lone agent the host env points at,
+            # silently corrupting per-agent cost attribution (#2769).
+            # ``KESTREL_DB_PATH`` stays authoritative for the single-agent and
+            # container deployments that set it, and for callers holding no
+            # agent binding at all. Mirrors the precedence established for
+            # identity exports in #2604.
+            db_path = (
+                os.fspath(agent_data_dir)
+                if agent_data_dir
+                else os.environ.get("KESTREL_DB_PATH", "./agent_data")
+            )
             self._usage_db_dir = db_path
             self._usage_db_path = os.path.join(db_path, "llm_usage.db")
             logger.info(f"Model usage tracking configured: SQLite at {self._usage_db_path}")

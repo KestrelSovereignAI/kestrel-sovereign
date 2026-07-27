@@ -356,7 +356,11 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
     # through :meth:`set_force_local_only_provider` (#1492).
     _force_local_only_provider: Optional[Callable[[], bool]] = None
 
-    def __init__(self, database_url: Optional[str] = None):
+    def __init__(
+        self,
+        database_url: Optional[str] = None,
+        agent_data_dir: Optional[Any] = None,
+    ):
         """Initialize LLM service.
 
         Reads LLM configuration from the ``[llm]`` section of ``kestrel.toml``
@@ -368,6 +372,11 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             database_url: Optional PostgreSQL connection URL for usage tracking.
                          If provided, uses PostgreSQL. Otherwise checks env vars,
                          then falls back to SQLite.
+            agent_data_dir: The owning agent's data root. Multi-agent callers
+                         MUST pass this: one process hosts several agents, so
+                         the process environment cannot name each agent's data
+                         root and SQLite usage rows would otherwise all land in
+                         one agent's database (#2769).
         """
         load_dotenv()
 
@@ -418,7 +427,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         self.disabled: bool = False
 
         # Database for model usage tracking (uses abstract data layer)
-        self._init_usage_tracking(database_url)
+        self._init_usage_tracking(database_url, agent_data_dir=agent_data_dir)
 
         # Constitutional profile service
         self._init_constitutional_profiles()
