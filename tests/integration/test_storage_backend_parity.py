@@ -31,10 +31,14 @@ from kestrel_sovereign.storage.async_file_store import AsyncFileStore
 from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore, GraphNode
 from kestrel_sovereign.storage.async_rag_store import AsyncRAGStore
 from kestrel_sovereign.storage.async_storage import AsyncStorage
-from kestrel_sovereign.storage.db.interface import QueryError
+from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
 from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
 from kestrel_sovereign.storage.saved_items_store import SavedItemsStore
 from kestrel_sovereign.storage.schema_router import SchemaRouter
+from kestrel_sovereign.storage.sqla.migrations import (
+    _SEMANTIC_MAINTENANCE_LEASE_PRECISION_SCHEMA_VERSION,
+    migrate_semantic_maintenance,
+)
 from kestrel_sovereign.security.assertion_tenant_resolver import (
     _resolve_authenticated_agent_assertion_capability,
 )
@@ -210,6 +214,126 @@ async def _assertion_storage_for_backend(
     )
     await storage.initialize()
     return storage
+
+
+class _RollbackLeasePrecisionProbe(Exception):
+    """Sentinel used to leave the shared PostgreSQL fixture unchanged."""
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_semantic_maintenance_lease_precision_upgrade_is_backend_neutral(
+    db_backend,
+    tmp_path,
+):
+    """Legacy PostgreSQL leases upgrade to float8 without changing SQLite."""
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path,
+        "maintenance-lease-precision",
+    )
+    storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    probe_tenant = f"lease-precision:{uuid4()}"
+    # 1,774,000,000 is a multiple of 128. At this epoch, float4 rounds a
+    # 60.125-second lease back to the base while float8 preserves the duration.
+    epoch_base = 1_774_000_000.0
+    expected_expiry = epoch_base + 60.125
+    try:
+        try:
+            async with storage.db.transaction():
+                await storage.db.execute(
+                    "DELETE FROM semantic_schema_migrations WHERE version = ?",
+                    (_SEMANTIC_MAINTENANCE_LEASE_PRECISION_SCHEMA_VERSION,),
+                )
+                if storage.db.backend_type == "postgres":
+                    await storage.db.execute(
+                        "ALTER TABLE semantic_maintenance_leases "
+                        "ALTER COLUMN expires_at TYPE REAL "
+                        "USING expires_at::REAL",
+                        (),
+                    )
+                    assert await storage.db.fetchone(
+                        "SELECT udt_name FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() "
+                        "AND table_name = 'semantic_maintenance_leases' "
+                        "AND column_name = 'expires_at'",
+                        (),
+                    ) == ("float4",)
+                    await storage.db.execute(
+                        "INSERT INTO semantic_maintenance_leases "
+                        "(tenant_id, holder_id, fencing_token, expires_at, updated_at) "
+                        "VALUES (?, 'legacy-float4', 1, ?, '2026-07-27T00:00:00Z')",
+                        (probe_tenant, expected_expiry),
+                    )
+                    legacy_expiry = float(
+                        await storage.db.fetchval(
+                            "SELECT expires_at FROM semantic_maintenance_leases "
+                            "WHERE tenant_id = ?",
+                            (probe_tenant,),
+                        )
+                    )
+                    assert abs(legacy_expiry - expected_expiry) >= 1.0
+
+                await migrate_semantic_maintenance(storage.db)
+
+                marker_count = await storage.db.fetchval(
+                    "SELECT COUNT(*) FROM semantic_schema_migrations "
+                    "WHERE version = ?",
+                    (_SEMANTIC_MAINTENANCE_LEASE_PRECISION_SCHEMA_VERSION,),
+                )
+                assert marker_count == 1
+                if storage.db.backend_type == "postgres":
+                    assert await storage.db.fetchone(
+                        "SELECT udt_name FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() "
+                        "AND table_name = 'semantic_maintenance_leases' "
+                        "AND column_name = 'expires_at'",
+                        (),
+                    ) == ("float8",)
+                else:
+                    lease_columns = await storage.db.fetchall(
+                        "PRAGMA table_info(semantic_maintenance_leases)",
+                        (),
+                    )
+                    expires_at = next(
+                        row for row in lease_columns if row[1] == "expires_at"
+                    )
+                    assert str(expires_at[2]).upper() == "DOUBLE PRECISION"
+
+                await storage.db.execute(
+                    "INSERT INTO semantic_maintenance_leases "
+                    "(tenant_id, holder_id, fencing_token, expires_at, updated_at) "
+                    "VALUES (?, 'float8', 1, ?, '2026-07-27T00:00:00Z') "
+                    "ON CONFLICT(tenant_id) DO UPDATE SET "
+                    "holder_id = excluded.holder_id, "
+                    "fencing_token = excluded.fencing_token, "
+                    "expires_at = excluded.expires_at, "
+                    "updated_at = excluded.updated_at",
+                    (probe_tenant, expected_expiry),
+                )
+                stored_expiry = float(
+                    await storage.db.fetchval(
+                        "SELECT expires_at FROM semantic_maintenance_leases "
+                        "/* post-float8-upgrade */ "
+                        "WHERE tenant_id = ?",
+                        (probe_tenant,),
+                    )
+                )
+                assert stored_expiry == expected_expiry
+                assert stored_expiry - epoch_base == 60.125
+
+                # A second startup observes the marker and remains a no-op.
+                await migrate_semantic_maintenance(storage.db)
+                assert await storage.db.fetchval(
+                    "SELECT COUNT(*) FROM semantic_schema_migrations "
+                    "WHERE version = ?",
+                    (_SEMANTIC_MAINTENANCE_LEASE_PRECISION_SCHEMA_VERSION,),
+                ) == 1
+                raise _RollbackLeasePrecisionProbe
+        except TransactionError as exc:
+            if not isinstance(exc.__cause__, _RollbackLeasePrecisionProbe):
+                raise
+    finally:
+        await storage.close()
 
 
 @pytest.mark.asyncio

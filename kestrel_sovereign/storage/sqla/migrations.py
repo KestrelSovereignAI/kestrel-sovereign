@@ -55,6 +55,9 @@ _SEMANTIC_MAINTENANCE_REPAIR_MODE_SCHEMA_VERSION = "semantic_maintenance_v6_repa
 _SEMANTIC_MAINTENANCE_ERASURE_REDACTION_SCHEMA_VERSION = (
     "semantic_maintenance_v7_erasure_redaction"
 )
+_SEMANTIC_MAINTENANCE_LEASE_PRECISION_SCHEMA_VERSION = (
+    "semantic_maintenance_v8_lease_precision"
+)
 _SEMANTIC_ASSERTION_LOCK_DOMAIN = b"kestrel:semantic-assertion-schema:v1\0"
 
 
@@ -600,7 +603,7 @@ async def migrate_semantic_maintenance(db: "AsyncDatabase") -> None:
             tenant_id TEXT PRIMARY KEY,
             holder_id TEXT NOT NULL,
             fencing_token INTEGER NOT NULL,
-            expires_at REAL NOT NULL,
+            expires_at DOUBLE PRECISION NOT NULL,
             updated_at TEXT NOT NULL,
             CHECK (fencing_token > 0)
         )""",
@@ -882,6 +885,43 @@ async def migrate_semantic_maintenance(db: "AsyncDatabase") -> None:
             await db.execute(
                 "INSERT INTO semantic_schema_migrations (version) VALUES (?)",
                 (_SEMANTIC_MAINTENANCE_ERASURE_REDACTION_SCHEMA_VERSION,),
+            )
+
+        lease_precision_migration = await db.fetchone(
+            "SELECT 1 FROM semantic_schema_migrations WHERE version = ?",
+            (_SEMANTIC_MAINTENANCE_LEASE_PRECISION_SCHEMA_VERSION,),
+        )
+        if lease_precision_migration is None:
+            if db.backend_type == "postgres":
+                lease_expiry_type = await db.fetchone(
+                    "SELECT udt_name FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() "
+                    "AND table_name = 'semantic_maintenance_leases' "
+                    "AND column_name = 'expires_at'",
+                    (),
+                )
+                if lease_expiry_type is None:
+                    raise RuntimeError(
+                        "semantic_maintenance_leases.expires_at is missing"
+                    )
+                # These migration statements are executed directly rather
+                # than through normalize_schema(). V1 therefore created
+                # PostgreSQL REAL/float4, whose 2026 epoch-second resolution
+                # is 128 seconds -- longer than the 60-second lease. Upgrade
+                # legacy installs in-place before advertising the marker.
+                if str(lease_expiry_type[0]) != "float8":
+                    await db.execute(
+                        "ALTER TABLE semantic_maintenance_leases "
+                        "ALTER COLUMN expires_at TYPE DOUBLE PRECISION "
+                        "USING expires_at::DOUBLE PRECISION",
+                        (),
+                    )
+            # SQLite's REAL storage class is already an IEEE-754 binary64.
+            # It accepts the explicit DOUBLE PRECISION declaration used for
+            # fresh databases, while legacy REAL declarations need no rewrite.
+            await db.execute(
+                "INSERT INTO semantic_schema_migrations (version) VALUES (?)",
+                (_SEMANTIC_MAINTENANCE_LEASE_PRECISION_SCHEMA_VERSION,),
             )
 
 
