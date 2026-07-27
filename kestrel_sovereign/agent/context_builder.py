@@ -375,7 +375,7 @@ class ContextBuilder:
                         batch_size=recall_config.embedding_batch_size,
                     )
                     ordered = sorted(
-                        recalled.candidates,
+                        (item for item in recalled.candidates if item.assertion.assertion_id in semantic_scores),
                         key=lambda item: (-semantic_scores[item.assertion.assertion_id], item.assertion.assertion_id),
                     )
                     selected = tuple(ordered[:recall_config.candidate_limit])
@@ -442,6 +442,13 @@ class ContextBuilder:
         service = get_provider_embedding_service(self._llm_service)
         if service is None:
             raise RuntimeError("semantic_embedding_capability_unavailable")
+        requires_gate = getattr(service, "requires_answerability_gate", None)
+        if callable(requires_gate) and requires_gate():
+            # Assertion recall has no governed cross-encoder/evidence gate yet;
+            # never silently bypass a provider-required safety contract.
+            raise RuntimeError("semantic_answerability_gate_unavailable")
+        floor_getter = getattr(service, "retrieval_similarity_floor", None)
+        floor = float(floor_getter()) if callable(floor_getter) else 0.0
         query_embedding = await aembed_retrieval_query(service, query)
         if query_embedding is None:
             raise RuntimeError("semantic_embedding_capability_unavailable")
@@ -454,8 +461,9 @@ class ContextBuilder:
             if len(embeddings) != len(batch) or any(value is None for value in embeddings):
                 raise RuntimeError("semantic_embedding_capability_unavailable")
             scores.update({
-                item.assertion.assertion_id: cosine_similarity(query_embedding, embedding)
+                item.assertion.assertion_id: score
                 for item, embedding in zip(batch, embeddings)
+                if (score := cosine_similarity(query_embedding, embedding)) >= floor
             })
         return scores
 
@@ -470,6 +478,7 @@ class ContextBuilder:
             "semantic_maintenance_state_missing",
             "semantic_maintenance_partial",
             "semantic_recall_checkpoint_changed",
+            "semantic_answerability_gate_unavailable",
         }
         value = str(error)
         return value if value in known else "semantic_recall_capability_unavailable"
