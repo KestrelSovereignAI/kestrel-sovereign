@@ -752,6 +752,15 @@ class RestartCoordinatorFeature(Feature):
                 "updating" if req.operation == "update_then_restart"
                 else "executing"
             )
+            if initial_state == "executing":
+                # Record BEFORE the transition commits. ``update_status``
+                # awaits, so recording after it leaves a window where the row
+                # is durably ``executing`` under this boot id with no entry
+                # here — and ``_reconcile_stranded_executing_rows`` treats
+                # exactly that as an orphan and resets a dispatch that is
+                # very much alive. Popped again below if the transition loses
+                # its race.
+                self._executing_since[req.id] = time.monotonic()
             moved = await update_status(
                 self._db, req.id,
                 status=initial_state,
@@ -769,13 +778,13 @@ class RestartCoordinatorFeature(Feature):
                 ),
             )
             if not moved:
+                if initial_state == "executing":
+                    self._executing_since.pop(req.id, None)
                 deferred.append({
                     "request_id": req.id,
                     "reason": "lost race against another transition",
                 })
                 continue
-            if initial_state == "executing":
-                self._executing_since[req.id] = time.monotonic()
 
             # Surface the transition out of pending — ``updating`` (update
             # profile running) or ``executing`` (restart dispatched) (#1551).
@@ -838,6 +847,9 @@ class RestartCoordinatorFeature(Feature):
                 # Update done and still safe — NOW cross into ``executing``
                 # right before the spawn so the post-restart sweep
                 # recognizes the restart we are about to perform.
+                # Recorded before the write for the same reason as the
+                # straight-to-executing path above.
+                self._executing_since[req.id] = time.monotonic()
                 moved = await update_status(
                     self._db, req.id,
                     status="executing",
@@ -846,12 +858,12 @@ class RestartCoordinatorFeature(Feature):
                     executing_boot_id=_PROCESS_BOOT_ID,
                 )
                 if not moved:
+                    self._executing_since.pop(req.id, None)
                     deferred.append({
                         "request_id": req.id,
                         "reason": "lost race after update before restart",
                     })
                     continue
-                self._executing_since[req.id] = time.monotonic()
                 await self._emit_status_event(req, state="executing")
 
             try:

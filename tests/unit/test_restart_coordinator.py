@@ -3004,3 +3004,54 @@ async def test_boot_sweeps_stderr_files_orphaned_by_successful_restarts(
     assert not old.exists()
     assert new.exists(), "a recent file may belong to a dispatch in flight"
     assert unrelated.exists(), "the sweep must not touch unrelated files"
+
+
+@pytest.mark.asyncio
+async def test_reconciler_cannot_reset_a_dispatch_mid_transition(tmp_path):
+    """TOCTOU guard, probing the actual window.
+
+    ``update_status`` awaits. If the in-flight record is written AFTER it
+    returns, there is a window where the row is durably ``executing`` under
+    this boot id with NO entry in ``_executing_since`` — and the reconciler
+    treats exactly that as an orphan. A cron tick landing there resets a
+    dispatch that is very much alive.
+
+    This runs the reconciler INSIDE that window (from within update_status,
+    immediately after the executing row commits) rather than after the fact,
+    which is the only placement that can tell the two orderings apart.
+    """
+    from kestrel_sovereign.features.restart_coordinator import feature as fm
+
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+    feat._restart_dispatch_grace = 0
+    created = await feat.request_restart(reason="ship")
+    req_id = created.data["request"]["id"]
+
+    real_update_status = fm.update_status
+    fired = {"count": 0}
+
+    async def _reconcile_inside_the_window(db, request_id, **kwargs):
+        landed = await real_update_status(db, request_id, **kwargs)
+        if kwargs.get("status") == "executing" and landed:
+            # A concurrent cron tick, arriving at the worst possible moment.
+            fired["count"] += 1
+            await feat._reconcile_stranded_executing_rows()
+        return landed
+
+    fm.update_status = _reconcile_inside_the_window
+    try:
+        with patch.object(
+            RestartCoordinatorFeature, "_spawn_restart_subprocess",
+            return_value=_LiveChild(),
+        ):
+            await feat.restart_coordinator()
+        await agent.drain_background_tasks()
+    finally:
+        fm.update_status = real_update_status
+
+    assert fired["count"] == 1, "the window was never exercised"
+    row = await get_request(backend, req_id)
+    assert row.status == "executing", (
+        "a concurrent reconciler reset a dispatch that was still in flight"
+    )
