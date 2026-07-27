@@ -192,6 +192,35 @@ def _is_infra_background_task(task) -> bool:
     return name.startswith(_INFRA_TASK_PREFIXES)
 
 
+# How many blocking task names to name individually in a deferral reason
+# before summarising the rest. Deferral reasons are persisted as status
+# events and logged every tick, so the string stays bounded.
+_MAX_NAMED_BUSY_TASKS = 5
+
+
+def _describe_background_tasks(tasks) -> str:
+    """Name the tasks blocking an idle restart, not just how many (#2665).
+
+    A bare count ("2 background tasks in flight") cannot be reconciled against
+    anything: the live report of two in-flight tasks alongside a task store
+    returning zero rows was undiagnosable precisely because the coordinator
+    never said WHICH handles it meant. Emitting the names makes a phantom
+    entry identifiable from the deferral reason alone.
+    """
+    names = []
+    for task in tasks:
+        try:
+            names.append(task.get_name() or "<unnamed>")
+        except Exception:
+            names.append("<unnamed>")
+    names.sort()
+    shown = names[:_MAX_NAMED_BUSY_TASKS]
+    remaining = len(names) - len(shown)
+    if remaining > 0:
+        shown.append(f"+{remaining} more")
+    return ", ".join(shown)
+
+
 class RestartCoordinatorFeature(Feature):
     """Durable restart-request surface for agents (#1512)."""
 
@@ -1212,7 +1241,10 @@ class RestartCoordinatorFeature(Feature):
             if alive:
                 return {
                     "idle": False,
-                    "reason": f"{len(alive)} background task(s) in flight",
+                    "reason": (
+                        f"{len(alive)} background task(s) in flight: "
+                        f"{_describe_background_tasks(alive)}"
+                    ),
                 }
 
         if not any_surface_seen:

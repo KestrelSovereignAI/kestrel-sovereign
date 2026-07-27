@@ -2055,7 +2055,13 @@ async def test_idle_ignores_signal_log_infra_tasks(tmp_path):
         feat.agent._background_tasks = {log_task, sweep_task, work_task}
         busy = feat._agent_appears_idle()
         assert busy["idle"] is False
-        assert busy["reason"] == "1 background task(s) in flight"
+        # The reason names the ONE genuine blocker (#2665) and no infra task,
+        # so an operator can tell what is actually holding the restart.
+        assert busy["reason"] == (
+            "1 background task(s) in flight: signal_dispatch:heartbeat:abc123"
+        )
+        assert "signal_log:" not in busy["reason"]
+        assert "a2a_question_expiry_sweep" not in busy["reason"]
     finally:
         log_task.cancel()
         sweep_task.cancel()
@@ -2099,7 +2105,13 @@ async def test_idle_ignores_a2a_question_supervisor_tasks(tmp_path):
         feat.agent._background_tasks = {sup_task, replay_task, work_task}
         busy = feat._agent_appears_idle()
         assert busy["idle"] is False
-        assert busy["reason"] == "1 background task(s) in flight"
+        # Naming the blocker is what makes a phantom entry diagnosable: the
+        # live report of "2 background tasks" against an empty task store was
+        # unfalsifiable while the reason was a bare count (#2665).
+        assert busy["reason"] == (
+            "1 background task(s) in flight: signal_dispatch:heartbeat:abc123"
+        )
+        assert "a2a_question_supervisor" not in busy["reason"]
     finally:
         sup_task.cancel()
         replay_task.cancel()
@@ -2752,3 +2764,92 @@ async def test_delivered_ack_supervisor_self_removes_from_owned(tmp_path):
     assert updated.wake_delivered is True
     # ...and self-removed from the owned list (no accumulation).
     assert ack_task not in feat._owned_background_tasks
+
+
+# ---------------------------------------------------------------------------
+# #2665 — deferral reasons must name the blocking handles, not just count them
+# ---------------------------------------------------------------------------
+
+
+def test_busy_deferral_names_the_blocking_tasks():
+    """A bare count is not reconcilable against the task store. The live report
+    of "2 background tasks in flight" alongside `list_my_tasks` returning zero
+    rows was undiagnosable precisely because the coordinator never said WHICH
+    handles it meant (#2665).
+    """
+    from kestrel_sovereign.features.restart_coordinator.feature import (
+        _describe_background_tasks,
+    )
+
+    class _T:
+        def __init__(self, name):
+            self._name = name
+
+        def get_name(self):
+            return self._name
+
+    described = _describe_background_tasks(
+        [_T("signal_dispatch:talon:sig_1"), _T("a2a_send:claw")]
+    )
+    assert "signal_dispatch:talon:sig_1" in described
+    assert "a2a_send:claw" in described
+
+
+def test_busy_deferral_bounds_the_named_task_list():
+    """Deferral reasons are persisted as status events and logged every tick,
+    so the enumeration must stay bounded rather than dumping an unbounded set.
+    """
+    from kestrel_sovereign.features.restart_coordinator.feature import (
+        _MAX_NAMED_BUSY_TASKS,
+        _describe_background_tasks,
+    )
+
+    class _T:
+        def __init__(self, name):
+            self._name = name
+
+        def get_name(self):
+            return self._name
+
+    described = _describe_background_tasks(
+        [_T(f"signal_dispatch:{i}") for i in range(_MAX_NAMED_BUSY_TASKS + 3)]
+    )
+    assert "+3 more" in described
+    assert described.count(",") == _MAX_NAMED_BUSY_TASKS
+
+
+def test_busy_deferral_survives_a_task_without_a_readable_name():
+    """An unnamed or introspection-hostile handle must not break the idle gate
+    — reporting it as unnamed is still more useful than a bare count.
+    """
+    from kestrel_sovereign.features.restart_coordinator.feature import (
+        _describe_background_tasks,
+    )
+
+    class _Hostile:
+        def get_name(self):
+            raise RuntimeError("no name for you")
+
+    assert "<unnamed>" in _describe_background_tasks([_Hostile()])
+
+
+@pytest.mark.asyncio
+async def test_idle_gate_reason_carries_task_names_end_to_end(tmp_path):
+    """The names must reach the reason string the coordinator actually emits,
+    not just the helper.
+    """
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+
+    async def _never():
+        await asyncio.sleep(3600)
+
+    blocker = asyncio.create_task(_never(), name="signal_dispatch:blocking")
+    agent._background_tasks = {blocker}
+    try:
+        state = feat._agent_appears_idle()
+        assert state["idle"] is False
+        assert "signal_dispatch:blocking" in state["reason"]
+    finally:
+        blocker.cancel()
+        await asyncio.gather(blocker, return_exceptions=True)
