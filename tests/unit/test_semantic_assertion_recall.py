@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -13,6 +14,8 @@ from kestrel_sovereign.agent.semantic_recall import (
     coerce_config,
     render_hybrid_context,
 )
+from kestrel_sovereign.agent.context_builder import ContextBuilder
+from kestrel_sovereign.storage.memory_answerability import AnswerabilityDecision
 from kestrel_sovereign.knowledge import (
     Assertion,
     DerivedLineage,
@@ -137,7 +140,13 @@ def test_exact_rag_claim_duplicate_merges_document_into_assertion_provenance():
     assert "matching indexed documents=same-claim.txt" in result.context
     assert assertion.assertion_id in result.context
     assert result.metadata[0]["assertion_id"] == assertion.assertion_id
+    assert result.metadata[0]["provenance"] == {
+        "kind": "source_occurrences",
+        "provenance_references": (SOURCE.source_occurrence_id,),
+        "provenance_count": 1,
+    }
     assert "content" not in result.metadata[0]
+    assert not ({"locator", "actor", "selector", "content_digest"} & result.metadata[0]["provenance"].keys())
 
 
 def test_untrusted_assertion_values_cannot_close_context_tags_or_become_instructions():
@@ -239,3 +248,119 @@ def test_retrieval_config_exposes_assertion_candidate_work_and_budget_limits():
     assert config.work_limit == 8
     assert config.result_limit == 4
     assert config.max_tokens == 256
+
+
+class _EmbeddingService:
+    def __init__(self, *, floor=0.0, requires_gate=False):
+        self.floor = floor
+        self._requires_gate = requires_gate
+        self.batches = []
+
+    def requires_answerability_gate(self):
+        return self._requires_gate
+
+    def retrieval_similarity_floor(self):
+        return self.floor
+
+    async def aembed_batch(self, values):
+        self.batches.append(values)
+        # The first term makes the test's cosine shim deterministic.
+        return [[float(value.endswith("tea")), 1.0] for value in values]
+
+
+@pytest.mark.asyncio
+async def test_semantic_scoring_embeds_query_once_enforces_batches_and_floor(monkeypatch):
+    """All discovered claims are ranked globally, not by an arbitrary prefix."""
+    service = _EmbeddingService(floor=0.5)
+    query_embedding = AsyncMock(return_value=[1.0, 1.0])
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.embedding_service.get_provider_embedding_service",
+        lambda _: service,
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.embedding_service.aembed_retrieval_query",
+        query_embedding,
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.embedding_service.cosine_similarity",
+        lambda _query, embedding: embedding[0],
+    )
+    builder = ContextBuilder(SimpleNamespace(), llm_service=object())
+    candidates = [_candidate(_assertion("coffee", revision_id="a")), _candidate(_assertion("tea", revision_id="b")), _candidate(_assertion("tea", revision_id="c"))]
+
+    scores = await builder._semantic_scores("what is preferred", candidates, max_claim_characters=1200, batch_size=2)
+
+    query_embedding.assert_awaited_once()
+    assert [len(batch) for batch in service.batches] == [2, 1]
+    assert scores == {candidates[1].assertion.assertion_id: 1.0, candidates[2].assertion.assertion_id: 1.0}
+
+
+@pytest.mark.asyncio
+async def test_semantic_scoring_uses_existing_answerability_gate_before_publication(monkeypatch):
+    service = _EmbeddingService(requires_gate=True)
+    monkeypatch.setattr("kestrel_sovereign.llm.embedding_service.get_provider_embedding_service", lambda _: service)
+    monkeypatch.setattr("kestrel_sovereign.llm.embedding_service.aembed_retrieval_query", AsyncMock(return_value=[1.0]))
+    monkeypatch.setattr("kestrel_sovereign.llm.embedding_service.cosine_similarity", lambda *_: 1.0)
+    tea, coffee = _candidate(_assertion("tea", revision_id="tea")), _candidate(_assertion("coffee", revision_id="coffee"))
+    gate = SimpleNamespace(filter=AsyncMock(return_value=AnswerabilityDecision(frozenset({tea.assertion.assertion_id}), True, 1.0)))
+    builder = ContextBuilder(SimpleNamespace(), llm_service=object(), semantic_answerability_gate=gate)
+
+    scores = await builder._semantic_scores("what is preferred", [tea, coffee], max_claim_characters=20, batch_size=8)
+
+    assert scores == {tea.assertion.assertion_id: 1.0}
+    candidates = gate.filter.await_args.args[1]
+    assert {candidate.memory_id for candidate in candidates} == {tea.assertion.assertion_id, coffee.assertion.assertion_id}
+    assert all(len(candidate.content) <= 20 for candidate in candidates)
+
+
+@pytest.mark.asyncio
+async def test_semantic_scoring_fails_closed_when_required_gate_missing_or_incomplete(monkeypatch):
+    service = _EmbeddingService(requires_gate=True)
+    monkeypatch.setattr("kestrel_sovereign.llm.embedding_service.get_provider_embedding_service", lambda _: service)
+    monkeypatch.setattr("kestrel_sovereign.llm.embedding_service.aembed_retrieval_query", AsyncMock(return_value=[1.0]))
+    monkeypatch.setattr("kestrel_sovereign.llm.embedding_service.cosine_similarity", lambda *_: 1.0)
+    candidate = _candidate(_assertion())
+
+    missing = ContextBuilder(SimpleNamespace(), llm_service=object())
+    with pytest.raises(RuntimeError, match="semantic_answerability_gate_unavailable"):
+        await missing._semantic_scores("question", [candidate], max_claim_characters=20, batch_size=8)
+
+    incomplete_gate = SimpleNamespace(filter=AsyncMock(return_value=AnswerabilityDecision(frozenset(), False, 1.0, "timeout")))
+    incomplete = ContextBuilder(SimpleNamespace(), llm_service=object(), semantic_answerability_gate=incomplete_gate)
+    with pytest.raises(RuntimeError, match="semantic_answerability_gate_unavailable"):
+        await incomplete._semantic_scores("question", [candidate], max_claim_characters=20, batch_size=8)
+
+
+@pytest.mark.asyncio
+async def test_semantic_scoring_drops_rejected_answerability_candidates(monkeypatch):
+    service = _EmbeddingService(requires_gate=True)
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.embedding_service.get_provider_embedding_service",
+        lambda _: service,
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.embedding_service.aembed_retrieval_query",
+        AsyncMock(return_value=[1.0]),
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.embedding_service.cosine_similarity", lambda *_: 1.0
+    )
+    gate = SimpleNamespace(
+        filter=AsyncMock(
+            return_value=AnswerabilityDecision(frozenset(), True, 1.0)
+        )
+    )
+    builder = ContextBuilder(
+        SimpleNamespace(), llm_service=object(), semantic_answerability_gate=gate
+    )
+
+    assert await builder._semantic_scores(
+        "question", [_candidate(_assertion())], max_claim_characters=20, batch_size=8
+    ) == {}
+
+
+def test_claim_character_limit_caps_the_whole_serialized_claim():
+    assertion = _assertion("x" * 200)
+    # Subject + predicate alone consume the cap: it is not a per-term cap.
+    from kestrel_sovereign.agent.semantic_recall import _claim_text
+    assert len(_claim_text(assertion, 30)) == 30

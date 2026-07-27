@@ -654,6 +654,26 @@ def _stable_identifier(value: object) -> str:
 def _metadata(item: RankedAssertion) -> Mapping[str, Any]:
     assertion = item.candidate.assertion
     lineage = assertion.lineage
+    # This is deliberately a receipt projection, not source metadata.  It
+    # lets the live path correlate a save receipt with a selected assertion
+    # without disclosing locators, actors, selectors, digests, or source body.
+    provenance = (
+        {
+            "kind": "inference",
+            "rule_id": lineage.rule_id,
+            "profile_version": lineage.profile_version,
+            "input_count": len(lineage.input_revision_ids),
+        }
+        if isinstance(lineage, DerivedLineage)
+        else {
+            "kind": "source_occurrences",
+            "provenance_references": tuple(
+                source.source_occurrence_id
+                for source in item.candidate.source_occurrences[:3]
+            ),
+            "provenance_count": len(item.candidate.source_occurrences),
+        }
+    )
     return {
         "assertion_id": assertion.assertion_id,
         "revision_id": assertion.revision_id,
@@ -672,6 +692,7 @@ def _metadata(item: RankedAssertion) -> Mapping[str, Any]:
             if isinstance(lineage, DerivedLineage)
             else None
         ),
+        "provenance": provenance,
     }
 
 

@@ -123,6 +123,7 @@ class ContextBuilder:
         semantic_inference_profile=None,
         semantic_inference_limits=None,
         semantic_maintenance_limits=None,
+        semantic_answerability_gate=None,
     ):
         """
         Initialize the context builder.
@@ -149,6 +150,9 @@ class ContextBuilder:
         self._semantic_inference_profile = semantic_inference_profile
         self._semantic_inference_limits = semantic_inference_limits
         self._semantic_maintenance_limits = semantic_maintenance_limits
+        # Reuse the agent-owned, privacy-aware memory judge.  Assertion
+        # recall must never create a second LLM client or bypass that lane.
+        self._semantic_answerability_gate = semantic_answerability_gate
         self.last_semantic_recall_metadata: Dict[str, Any] = {"status": "disabled"}
         self.agent_data_path = Path(agent_data_path) if agent_data_path else None
 
@@ -443,10 +447,7 @@ class ContextBuilder:
         if service is None:
             raise RuntimeError("semantic_embedding_capability_unavailable")
         requires_gate = getattr(service, "requires_answerability_gate", None)
-        if callable(requires_gate) and requires_gate():
-            # Assertion recall has no governed cross-encoder/evidence gate yet;
-            # never silently bypass a provider-required safety contract.
-            raise RuntimeError("semantic_answerability_gate_unavailable")
+        gate_required = callable(requires_gate) and requires_gate()
         floor_getter = getattr(service, "retrieval_similarity_floor", None)
         floor = float(floor_getter()) if callable(floor_getter) else 0.0
         query_embedding = await aembed_retrieval_query(service, query)
@@ -465,6 +466,36 @@ class ContextBuilder:
                 for item, embedding in zip(batch, embeddings)
                 if (score := cosine_similarity(query_embedding, embedding)) >= floor
             })
+        if gate_required:
+            gate = self._semantic_answerability_gate
+            if gate is None or not callable(getattr(gate, "filter", None)):
+                raise RuntimeError("semantic_answerability_gate_unavailable")
+            # The judge sees only the bounded, already-ranked top-K projection.
+            # It runs before provenance hydration, so rejected or failed claims
+            # cannot be published through a later storage read.
+            from kestrel_sovereign.storage.memory_answerability import AnswerabilityCandidate
+            ranked = sorted(
+                (item for item in candidates if item.assertion.assertion_id in scores),
+                key=lambda item: (-scores[item.assertion.assertion_id], item.assertion.assertion_id),
+            )[:8]
+            decision = await gate.filter(
+                query,
+                [
+                    AnswerabilityCandidate(
+                        memory_id=item.assertion.assertion_id,
+                        content=_claim_text(item.assertion, max_claim_characters),
+                    )
+                    for item in ranked
+                ],
+            )
+            if not getattr(decision, "completed", False):
+                raise RuntimeError("semantic_answerability_gate_unavailable")
+            allowed = frozenset(getattr(decision, "answerable_ids", ()))
+            scores = {
+                assertion_id: score
+                for assertion_id, score in scores.items()
+                if assertion_id in allowed
+            }
         return scores
 
     @staticmethod

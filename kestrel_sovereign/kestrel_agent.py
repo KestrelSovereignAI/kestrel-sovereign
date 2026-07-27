@@ -2616,6 +2616,7 @@ class KestrelAgent(
             semantic_inference_profile=self.semantic_inference_profile,
             semantic_inference_limits=self.semantic_inference_limits,
             semantic_maintenance_limits=self.semantic_maintenance_limits,
+            semantic_answerability_gate=self.memory_system.retriever.answerability_gate,
         )
         # Merge DB-backed bootstrap config (bootstrap_add / bootstrap_remove
         # persistence) into the loader before the first system-prompt
