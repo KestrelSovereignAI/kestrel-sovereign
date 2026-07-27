@@ -52,6 +52,7 @@ from kestrel_sovereign.storage.async_assertion_store import (
 from kestrel_sovereign.storage.semantic_validation import GovernedSemanticValidationService
 from kestrel_sovereign.storage.db import TransactionError
 from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.security.assertion_tenant_resolver import (
     _resolve_authenticated_agent_assertion_capability,
 )
@@ -895,6 +896,138 @@ async def test_semantic_maintenance_second_unchanged_run_is_a_true_noop(
     assert second.changes_consumed == 0
     assert second.assertions_validated == 0
     assert second.assertions_inferred == 0
+
+
+@pytest.mark.asyncio
+async def test_save_fact_maintenance_reopen_is_a_true_noop(tmp_path, monkeypatch) -> None:
+    """A governed fact write reaches maintenance once and remains drained after restart.
+
+    This crosses the #2765 explicit-fact adapter and its privacy wrapper into
+    #2750's durable maintenance cursor.  The restarted facade must observe the
+    same canonical checkpoint and return before constructing either validator
+    or reasoner work.
+    """
+    identity_dir = tmp_path / "identity"
+    credentials = await create_kestrel_identity_async(
+        str(identity_dir),
+        identity_method="did:pkh",
+        agent_name="Semantic maintenance save_fact seam",
+    )
+    key_id = f"kestrel_{credentials.agent_did.rsplit(':', 1)[-1]}"
+    identity = load_agent_identity(key_id, identity_dir)
+    capability = _resolve_authenticated_agent_assertion_capability(
+        credentials.agent_did,
+        identity,
+    )
+    database_path = str(tmp_path / "semantic-maintenance-seam.db")
+    limits = SemanticMaintenanceLimits(max_assertions=3, max_derivations=3)
+
+    first_storage = AsyncStorage(
+        database_path,
+        agent_id=credentials.agent_did,
+        _assertion_tenant_capability=capability,
+    )
+    await first_storage.initialize()
+    try:
+        from kestrel_sovereign.agent.invocation import invocation_scope
+        from kestrel_sovereign.features.memory_agency.feature import (
+            MemoryAgencyFeature,
+        )
+
+        governed = PrivacyEnforcingStorage(first_storage, PrivacyMode.NORMAL)
+        producer = MemoryAgencyFeature(
+            SimpleNamespace(storage=governed, did=credentials.agent_did)
+        )
+        producer.storage = governed
+        producer.agent_id = credentials.agent_did
+        with invocation_scope("maintenance-save-fact-request"):
+            saved = await producer.save_fact(
+                subject="user",
+                predicate="preferred_deploy_region",
+                value="us-central1",
+                confidence=1.0,
+            )
+        assert saved.data["saved"] is True
+        assert saved.data["assertion_id"] is not None
+        assert saved.data["revision_id"] is not None
+
+        canonical_checkpoint = await governed.assertion_checkpoint()
+        changes = await governed.assertion_changes_since(0)
+        assert [change.assertion_id for change in changes] == [saved.data["assertion_id"]]
+        assert [change.revision_id for change in changes] == [saved.data["revision_id"]]
+
+        first = await governed.run_semantic_maintenance(
+            _profile(),
+            maintenance_limits=limits,
+        )
+        assert first.status is SemanticMaintenanceStatus.COMPLETE
+        assert first.changes_consumed == 1
+        assert first.assertions_validated == 1
+        assert first.checkpoint_generation == canonical_checkpoint.generation
+        assert await governed.assertion_checkpoint() == canonical_checkpoint
+    finally:
+        await first_storage.close()
+
+    restarted_storage = AsyncStorage(
+        database_path,
+        agent_id=credentials.agent_did,
+        _assertion_tenant_capability=capability,
+    )
+    await restarted_storage.initialize()
+    try:
+        restarted = PrivacyEnforcingStorage(restarted_storage, PrivacyMode.NORMAL)
+        checkpoint_before_noop = await restarted.assertion_checkpoint()
+        assert checkpoint_before_noop == canonical_checkpoint
+        cursor_before_noop = await restarted_storage.db.fetchone(
+            "SELECT checkpoint_generation, checkpoint_event_id "
+            "FROM semantic_maintenance_state WHERE tenant_id = ?",
+            (credentials.agent_did,),
+        )
+        assert cursor_before_noop == (
+            canonical_checkpoint.generation,
+            canonical_checkpoint.latest_event_id,
+        )
+
+        calls: list[str] = []
+
+        async def should_not_validate(*args, **kwargs):
+            calls.append("validator")
+            raise AssertionError("reopened no-change maintenance called validation")
+
+        async def should_not_reason(*args, **kwargs):
+            calls.append("reasoner")
+            raise AssertionError("reopened no-change maintenance called inference")
+
+        monkeypatch.setattr(
+            GovernedSemanticValidationService,
+            "validate_current",
+            should_not_validate,
+        )
+        monkeypatch.setattr(
+            BoundedInferenceService,
+            "materialize_targets",
+            should_not_reason,
+        )
+
+        second = await restarted.run_semantic_maintenance(
+            _profile(),
+            maintenance_limits=limits,
+        )
+
+        assert second.status is SemanticMaintenanceStatus.NO_OP
+        assert second.changes_consumed == 0
+        assert second.assertions_validated == 0
+        assert second.assertions_inferred == 0
+        assert second.checkpoint_generation == canonical_checkpoint.generation
+        assert calls == []
+        assert await restarted.assertion_checkpoint() == checkpoint_before_noop
+        assert await restarted_storage.db.fetchone(
+            "SELECT checkpoint_generation, checkpoint_event_id "
+            "FROM semantic_maintenance_state WHERE tenant_id = ?",
+            (credentials.agent_did,),
+        ) == cursor_before_noop
+    finally:
+        await restarted_storage.close()
 
 
 @pytest.mark.asyncio
