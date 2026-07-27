@@ -11,7 +11,11 @@ import pytest
 
 from kestrel_sovereign.identity.runtime_identity import load_agent_identity
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
-from kestrel_sovereign.agent.sleep import SleepMixin
+from kestrel_sovereign.agent.sleep import (
+    SleepHookContract,
+    SleepHookPhase,
+    SleepMixin,
+)
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.knowledge import (
     Assertion,
@@ -27,13 +31,25 @@ from kestrel_sovereign.knowledge import (
     InferenceProfile,
     Literal,
     OntologyRef,
+    SemanticMaintenanceLimits,
+    SemanticMaintenanceError,
+    SemanticMaintenanceService,
+    SemanticMaintenanceStatus,
     SourceOccurrence,
+    ValidationState,
+    ValidationWriteAction,
     XSD_STRING,
     inference_limits_from_config,
     inference_profile_from_config,
+    maintenance_allows_prior_verified_snapshot,
+    maintenance_limits_from_config,
 )
 from kestrel_sovereign.knowledge.inference import ENGINE_VERSION, validate_inference_profile
-from kestrel_sovereign.storage.async_assertion_store import AssertionConflictError
+from kestrel_sovereign.storage.async_assertion_store import (
+    AssertionConflictError,
+    MaintenanceLeaseLostError,
+)
+from kestrel_sovereign.storage.semantic_validation import GovernedSemanticValidationService
 from kestrel_sovereign.storage.db import TransactionError
 from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
 from kestrel_sovereign.security.assertion_tenant_resolver import (
@@ -204,6 +220,35 @@ def test_semantic_inference_limits_are_strictly_operator_configured() -> None:
         )
 
 
+def test_semantic_maintenance_limits_are_strictly_operator_configured() -> None:
+    assert maintenance_limits_from_config(
+        {
+            "max_wall_time_seconds": 2.5,
+            "max_assertions": 7,
+            "max_derivations": 11,
+            "max_shapes": 1,
+            "max_reports": 5,
+        }
+    ) == SemanticMaintenanceLimits(
+        max_wall_time_seconds=2.5,
+        max_assertions=7,
+        max_derivations=11,
+        max_shapes=1,
+        max_reports=5,
+    )
+    with pytest.raises(ValueError, match="unsupported fields"):
+        maintenance_limits_from_config({"unbounded": 1})
+
+
+def test_semantic_maintenance_prior_snapshot_exception_is_explicit() -> None:
+    assert maintenance_allows_prior_verified_snapshot(
+        {"allow_prior_verified_snapshot": True}
+    )
+    assert not maintenance_allows_prior_verified_snapshot({})
+    with pytest.raises(ValueError, match="must be a boolean"):
+        maintenance_limits_from_config({"allow_prior_verified_snapshot": 1})
+
+
 @pytest.mark.parametrize("wall_time_literal", ("nan", "+inf"))
 def test_toml_semantic_inference_limits_reject_non_finite_wall_time(
     tmp_path, wall_time_literal: str
@@ -294,6 +339,43 @@ def test_explicitly_disabled_semantic_profile_remains_an_operator_state(tmp_path
 
     assert agent.semantic_inference_profile is None
     assert agent.semantic_inference_configured is True
+
+
+def test_validation_only_semantic_maintenance_is_an_operator_state(tmp_path) -> None:
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    (agent_dir / "kestrel.toml").write_text(
+        "[semantic_maintenance]\nmax_assertions = 7\n"
+        "allow_prior_verified_snapshot = true\n"
+    )
+
+    agent = KestrelAgent(
+        did="did:test:semantic-maintenance-config",
+        storage_path=str(agent_dir / "kestrel_prime.db"),
+    )
+
+    assert agent.semantic_inference_profile is None
+    assert agent.semantic_maintenance_configured is True
+    assert agent.semantic_maintenance_limits.max_assertions == 7
+    assert agent.semantic_maintenance_allow_prior_verified_snapshot is True
+
+
+def test_managed_maintenance_limits_override_stale_agent_toml(tmp_path) -> None:
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    (agent_dir / "kestrel.toml").write_text(
+        "[semantic_maintenance]\nmax_assertions = 1\n"
+    )
+
+    agent = KestrelAgent(
+        did="did:test:managed-semantic-maintenance-config",
+        storage_path=str(agent_dir / "kestrel_prime.db"),
+        semantic_maintenance_limits=SemanticMaintenanceLimits(max_assertions=7),
+        semantic_maintenance_configured=True,
+    )
+
+    assert agent.semantic_maintenance_configured is True
+    assert agent.semantic_maintenance_limits.max_assertions == 7
 
 
 @pytest.mark.asyncio
@@ -684,16 +766,31 @@ async def test_sleep_runs_incremental_inference_for_approved_profile() -> None:
         def __init__(self) -> None:
             self.profiles = []
 
-        async def materialize_semantic_inference(self, selected_profile, *, limits=None):
+        async def run_semantic_maintenance(
+            self,
+            selected_profile,
+            *,
+            inference_limits=None,
+            maintenance_limits=None,
+        ):
             self.profiles.append(selected_profile)
-            self.limits = limits
+            self.limits = inference_limits
             return SimpleNamespace(
-                status=ClosureStatus.COMPLETE,
-                incomplete_reason=None,
+                status=SemanticMaintenanceStatus.COMPLETE,
+                reason=None,
                 source_generation=3,
                 checkpoint_generation=3,
-                generated_assertions=0,
-                retracted_assertions=0,
+                assertions_inferred=0,
+                assertions_retracted=0,
+                to_mapping=lambda: {
+                    "status": "complete",
+                    "source_generation": 3,
+                    "checkpoint_generation": 3,
+                    "changes_consumed": 0,
+                    "assertions_validated": 0,
+                    "assertions_inferred": 0,
+                    "assertions_retracted": 0,
+                },
             )
 
     class Agent(SleepMixin):
@@ -721,11 +818,557 @@ async def test_sleep_runs_incremental_inference_for_approved_profile() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sleep_runs_validation_only_maintenance_without_an_inference_profile() -> None:
+    class Storage:
+        def __init__(self) -> None:
+            self.profiles: list[object] = []
+
+        async def run_semantic_maintenance(self, selected_profile, **kwargs):
+            self.profiles.append(selected_profile)
+            assert kwargs["maintenance_limits"].max_assertions == 3
+            return SimpleNamespace(
+                status=SemanticMaintenanceStatus.COMPLETE,
+                reason=None,
+                source_generation=3,
+                checkpoint_generation=3,
+                assertions_inferred=0,
+                assertions_retracted=0,
+                to_mapping=lambda: {"status": "complete"},
+            )
+
+    class Agent(SleepMixin):
+        def __init__(self) -> None:
+            self.semantic_inference_profile = None
+            self.semantic_inference_configured = False
+            self.semantic_maintenance_configured = True
+            self.semantic_maintenance_limits = SemanticMaintenanceLimits(max_assertions=3)
+            self.storage = Storage()
+
+    agent = Agent()
+    report = await agent.sleep(
+        skip_consolidation=True,
+        skip_export=True,
+        skip_reflection=True,
+    )
+
+    assert agent.storage.profiles == [None]
+    assert report.semantic_maintenance == {"status": "complete"}
+
+
+@pytest.mark.asyncio
+async def test_semantic_maintenance_second_unchanged_run_is_a_true_noop(
+    assertion_store, monkeypatch
+) -> None:
+    """No-change sleep must not wake either validator or reasoner again."""
+    service = SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=_profile(),
+        limits=SemanticMaintenanceLimits(max_assertions=3, max_derivations=3),
+    )
+    async def should_not_validate(*args, **kwargs):
+        raise AssertionError("no-change maintenance called validation")
+
+    async def should_not_reason(*args, **kwargs):
+        raise AssertionError("no-change maintenance called inference")
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.storage.semantic_validation.GovernedSemanticValidationService.validate_current",
+        should_not_validate,
+    )
+    monkeypatch.setattr(
+        BoundedInferenceService,
+        "materialize_incremental",
+        should_not_reason,
+    )
+
+    first = await service.run()
+    assert first.status is SemanticMaintenanceStatus.NO_OP
+    second = await service.run()
+    assert second.status is SemanticMaintenanceStatus.NO_OP
+    assert second.changes_consumed == 0
+    assert second.assertions_validated == 0
+    assert second.assertions_inferred == 0
+
+
+@pytest.mark.asyncio
+async def test_semantic_maintenance_replays_its_generated_derivation_before_checkpointing(
+    assertion_store,
+) -> None:
+    """A derived assertion is a fresh input for the next bounded unit."""
+    class_a = IRI("https://example.test/ClassA")
+    class_b = IRI("https://example.test/ClassB")
+    subject = IRI("https://example.test/subject")
+    await _put(assertion_store, "a-sub-b", class_a, RDFS_SUBCLASS, class_b)
+    await _put(assertion_store, "subject-a", subject, RDF_TYPE, class_a)
+
+    service = SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=_profile(),
+        limits=SemanticMaintenanceLimits(max_assertions=3, max_derivations=3),
+    )
+    first = await service.run()
+    assert first.status is SemanticMaintenanceStatus.COMPLETE
+    assert first.assertions_inferred == 1
+
+    state_row = await assertion_store._database.fetchone(  # noqa: SLF001 - durable cursor contract
+        "SELECT checkpoint_event_id FROM semantic_maintenance_state WHERE tenant_id = ?",
+        (assertion_store.tenant_id,),
+    )
+    assert state_row is not None
+    assert state_row[0] != (await assertion_store.checkpoint()).latest_event_id
+
+    second = await service.run()
+    assert second.status is SemanticMaintenanceStatus.COMPLETE
+    assert second.changes_consumed == 1
+    assert second.assertions_validated == 1
+    # A subsequent unchanged unit must leave the durable training prerequisite
+    # ready; it cannot skip the derived assertion by checkpointing it early.
+    third = await service.run()
+    assert third.status is SemanticMaintenanceStatus.NO_OP
+    assert third.changes_consumed == 0
+    readiness = await service.training_readiness()
+    assert readiness.ready
+
+
+@pytest.mark.asyncio
+async def test_training_readiness_allows_only_an_explicit_prior_verified_snapshot(
+    assertion_store,
+) -> None:
+    """A stale semantic cursor is safe only under the operator exception."""
+    await _put(
+        assertion_store,
+        "verified-first",
+        IRI("https://example.test/subject"),
+        IRI("https://example.test/predicate"),
+        Literal("first", XSD_STRING),
+    )
+    service = SemanticMaintenanceService(assertion_store, inference_profile=None)
+    assert (await service.run()).status is SemanticMaintenanceStatus.COMPLETE
+    assert (await service.training_readiness()).ready
+
+    await _put(
+        assertion_store,
+        "unmaintained-second",
+        IRI("https://example.test/subject"),
+        IRI("https://example.test/predicate"),
+        Literal("second", XSD_STRING),
+    )
+    current = await service.training_readiness()
+    assert not current.ready
+    assert current.reason == "semantic_maintenance_checkpoint_behind"
+
+    prior = await service.training_readiness(
+        allow_prior_verified_snapshot=True
+    )
+    assert prior.ready
+    assert prior.using_prior_verified_snapshot
+    assert prior.reason == "prior_verified_snapshot_policy_allowed"
+
+
+@pytest.mark.asyncio
+async def test_incomplete_validation_is_not_reused_when_maintenance_budget_changes(
+    assertion_store, monkeypatch
+) -> None:
+    """A larger budget gets a new validation run rather than stale partial work."""
+    await _put(
+        assertion_store,
+        "budget-subject",
+        IRI("https://example.test/subject"),
+        IRI("https://example.test/predicate"),
+        Literal("object", XSD_STRING),
+    )
+    calls: list[str] = []
+    original = GovernedSemanticValidationService.validate_current
+
+    async def incomplete_once(self, *args, **kwargs):
+        calls.append(kwargs["run_id"])
+        report = await original(self, *args, **kwargs)
+        return replace(
+            report,
+            state=ValidationState.INCOMPLETE,
+            action=ValidationWriteAction.REJECT,
+        )
+
+    monkeypatch.setattr(
+        GovernedSemanticValidationService,
+        "validate_current",
+        incomplete_once,
+    )
+    tight = SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=None,
+        limits=SemanticMaintenanceLimits(max_shapes=1),
+    )
+    first = await tight.run()
+    assert first.status is SemanticMaintenanceStatus.PARTIAL
+    assert first.reason == "validation_incomplete"
+
+    expanded = SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=None,
+        limits=SemanticMaintenanceLimits(max_shapes=2),
+    )
+    second = await expanded.run()
+    assert second.status is SemanticMaintenanceStatus.PARTIAL
+    assert second.reason == "validation_incomplete"
+    assert len(calls) == 2
+    assert calls[0] != calls[1]
+
+
+@pytest.mark.asyncio
+async def test_semantic_maintenance_records_review_only_contradiction_candidate(
+    assertion_store,
+) -> None:
+    """Different current values become review evidence, never LLM arbitration."""
+    subject = IRI("https://example.test/user")
+    predicate = IRI("https://example.test/preferred-region")
+    await _put(
+        assertion_store,
+        "region-a",
+        subject,
+        predicate,
+        Literal("us-central1", XSD_STRING),
+    )
+    await _put(
+        assertion_store,
+        "region-b",
+        subject,
+        predicate,
+        Literal("europe-west4", XSD_STRING),
+    )
+
+    result = await SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=None,
+        limits=SemanticMaintenanceLimits(max_assertions=2, max_reports=2),
+    ).run()
+
+    assert result.status is SemanticMaintenanceStatus.COMPLETE
+    assert result.contradictions == 1
+    assert result.supersession_candidates == 1
+    report = await assertion_store._database.fetchone(  # noqa: SLF001 - durable audit assertion
+        "SELECT report_kind, status FROM semantic_maintenance_reports "
+        "WHERE tenant_id = ?",
+        (assertion_store.tenant_id,),
+    )
+    assert report == ("contradiction_candidate", "review_required")
+
+
+@pytest.mark.asyncio
+async def test_semantic_maintenance_report_budget_limits_candidate_writes(
+    assertion_store,
+) -> None:
+    subject = IRI("https://example.test/user")
+    predicate = IRI("https://example.test/preferred-region")
+    for revision, region in (
+        ("region-a", "us-central1"),
+        ("region-b", "europe-west4"),
+        ("region-c", "asia-south1"),
+    ):
+        await _put(
+            assertion_store,
+            revision,
+            subject,
+            predicate,
+            Literal(region, XSD_STRING),
+        )
+
+    result = await SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=None,
+        limits=SemanticMaintenanceLimits(max_assertions=3, max_reports=2),
+    ).run()
+
+    assert result.status is SemanticMaintenanceStatus.PARTIAL
+    assert result.reason == "report_budget"
+    # One report slot is the bounded validation report; one remains for a
+    # contradiction candidate.  The next candidate stays behind the checkpoint.
+    assert result.reports_created == 2
+    assert result.backlog_assertions >= 1
+    candidate_count = await assertion_store._database.fetchval(  # noqa: SLF001
+        "SELECT COUNT(*) FROM semantic_maintenance_reports WHERE tenant_id = ?",
+        (assertion_store.tenant_id,),
+    )
+    assert candidate_count == 1
+
+
+@pytest.mark.asyncio
+async def test_semantic_maintenance_lease_is_atomic_and_fences_state_writes(
+    assertion_store,
+) -> None:
+    first_service = SemanticMaintenanceService(assertion_store, inference_profile=None)
+    second_service = SemanticMaintenanceService(assertion_store, inference_profile=None)
+
+    first, second = await asyncio.gather(
+        first_service._acquire_lease("first"),  # noqa: SLF001 - lease contract
+        second_service._acquire_lease("second"),  # noqa: SLF001 - lease contract
+    )
+    winner = first or second
+    assert winner is not None
+    assert (first is None) != (second is None)
+    try:
+        await assertion_store._database.execute(  # noqa: SLF001 - force expiry
+            "UPDATE semantic_maintenance_leases SET expires_at = 0 WHERE tenant_id = ?",
+            (assertion_store.tenant_id,),
+        )
+        successor = await second_service._acquire_lease("successor")  # noqa: SLF001
+        assert successor is not None
+        try:
+            result = first_service._result(  # noqa: SLF001 - fixed state fixture
+                run_id="fenced-state",
+                status=SemanticMaintenanceStatus.COMPLETE,
+                reason=None,
+                source_generation=0,
+                checkpoint_generation=0,
+                capability_versions={},
+            )
+            with pytest.raises(
+                SemanticMaintenanceError, match="semantic_maintenance_lease_lost"
+            ):
+                await first_service._record_state(  # noqa: SLF001 - fencing contract
+                    result,
+                    "profile",
+                    winner,
+                )
+        finally:
+            await second_service._release_lease(successor)  # noqa: SLF001
+    finally:
+        await first_service._release_lease(winner)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_semantic_maintenance_resumes_same_generation_supersession_events(
+    assertion_store,
+) -> None:
+    """A partial batch advances by event, never by generation alone."""
+    subject = IRI("https://example.test/subject")
+    predicate = IRI("https://example.test/current-value")
+    predecessor = await _put(
+        assertion_store,
+        "value-before",
+        subject,
+        predicate,
+        Literal("before", XSD_STRING),
+    )
+    service = SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=None,
+        limits=SemanticMaintenanceLimits(max_assertions=1),
+    )
+    assert (await service.run()).status is SemanticMaintenanceStatus.COMPLETE
+
+    replacement = _assertion(
+        assertion_store,
+        "value-after",
+        subject,
+        predicate,
+        Literal("after", XSD_STRING),
+    )
+    supersession = await _GOVERNED_STORAGES[id(assertion_store)].supersede_assertion(
+        predecessor.revision_id,
+        replacement,
+        source_occurrences=(_source("source:value-after"),),
+    )
+    assert supersession.accepted
+    assert len(supersession.event_ids) == 2
+
+    first = await service.run()
+    assert first.status is SemanticMaintenanceStatus.PARTIAL
+    assert first.reason == "assertion_budget"
+    assert first.checkpoint_generation == supersession.generation
+
+    cursor = await assertion_store._database.fetchone(  # noqa: SLF001 - durable cursor contract
+        "SELECT checkpoint_event_id FROM semantic_maintenance_state WHERE tenant_id = ?",
+        (assertion_store.tenant_id,),
+    )
+    assert cursor is not None
+    assert cursor[0] in supersession.event_ids
+
+    second = await service.run()
+    assert second.status is SemanticMaintenanceStatus.COMPLETE
+    assert second.status is not SemanticMaintenanceStatus.NO_OP
+    assert second.changes_consumed == 1
+
+
+@pytest.mark.asyncio
+async def test_semantic_maintenance_revalidates_active_neighbours_after_delete(
+    assertion_store,
+    monkeypatch,
+) -> None:
+    """A hidden deleted revision still schedules its active shape neighbours."""
+    subject = IRI("https://example.test/account")
+    predicate = IRI("https://example.test/has-status")
+    deleted = await _put(
+        assertion_store,
+        "status-old",
+        subject,
+        predicate,
+        Literal("pending", XSD_STRING),
+    )
+    surviving = await _put(
+        assertion_store,
+        "status-current",
+        subject,
+        predicate,
+        Literal("active", XSD_STRING),
+    )
+    service = SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=None,
+        limits=SemanticMaintenanceLimits(max_assertions=2),
+    )
+    assert (await service.run()).status is SemanticMaintenanceStatus.COMPLETE
+
+    await assertion_store.delete(deleted.assertion_id, deleted.revision_id)
+    observed_focus: list[tuple[str, ...] | None] = []
+    original = GovernedSemanticValidationService.validate_current
+
+    async def capture_focus(self, *args, **kwargs):
+        observed_focus.append(kwargs.get("assertion_ids"))
+        return await original(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        GovernedSemanticValidationService,
+        "validate_current",
+        capture_focus,
+    )
+    result = await service.run()
+
+    assert result.status is SemanticMaintenanceStatus.COMPLETE
+    assert observed_focus
+    assert surviving.assertion_id in set(observed_focus[0] or ())
+    assert await assertion_store.get_assertion(surviving.assertion_id) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ("validation", "audit", "inference"))
+async def test_semantic_maintenance_fence_blocks_expired_phase_writes(
+    assertion_store,
+    phase: str,
+) -> None:
+    """Expiry blocks validation, audit, and inference publication at commit time."""
+    subject = IRI("https://example.test/fenced-subject")
+    predicate = IRI("https://example.test/fenced-predicate")
+    assertion = await _put(
+        assertion_store,
+        f"fenced-{phase}",
+        subject,
+        predicate,
+        Literal("value", XSD_STRING),
+    )
+    maintenance = SemanticMaintenanceService(assertion_store, inference_profile=None)
+    lease = await maintenance._acquire_lease(f"{phase}-holder")  # noqa: SLF001 - fence contract
+    assert lease is not None
+    try:
+        async with assertion_store.maintenance_fence(
+            holder_id=lease.holder_id,
+            fencing_token=lease.fencing_token,
+            lease_seconds=maintenance._LEASE_SECONDS,  # noqa: SLF001 - matching contract lifetime
+        ):
+            await assertion_store._database.execute(  # noqa: SLF001 - force stale worker
+                "UPDATE semantic_maintenance_leases SET expires_at = 0 WHERE tenant_id = ?",
+                (assertion_store.tenant_id,),
+            )
+            with pytest.raises(MaintenanceLeaseLostError):
+                if phase == "validation":
+                    await GovernedSemanticValidationService(
+                        assertion_store
+                    ).validate_current(
+                        assertion_ids=(assertion.assertion_id,),
+                        run_id=f"fenced-{phase}",
+                    )
+                elif phase == "audit":
+                    await assertion_store.retract(
+                        assertion.assertion_id,
+                        assertion.revision_id,
+                        operation_id=f"fenced-{phase}",
+                    )
+                else:
+                    service = BoundedInferenceService(assertion_store, _profile())
+                    await service.materialize_incremental()
+        assert await assertion_store.get_assertion(assertion.assertion_id) is not None
+    finally:
+        await maintenance._release_lease(lease)  # noqa: SLF001 - fence cleanup
+
+
+@pytest.mark.asyncio
+async def test_sleep_blocks_training_hook_after_partial_core_semantic_maintenance() -> None:
+    """The core phase is a real #2749 dependency, not a late side effect."""
+    profile = _profile()
+    calls: list[str] = []
+
+    class Storage:
+        async def run_semantic_maintenance(self, *args, **kwargs):
+            return SimpleNamespace(
+                to_mapping=lambda: {
+                    "status": "partial",
+                    "reason": "assertion_budget",
+                    "source_generation": 3,
+                    "checkpoint_generation": 2,
+                    "changes_consumed": 1,
+                    "assertions_validated": 1,
+                    "assertions_inferred": 0,
+                    "assertions_retracted": 0,
+                },
+                status=SimpleNamespace(value="partial"),
+                reason="assertion_budget",
+                source_generation=3,
+                checkpoint_generation=2,
+                assertions_inferred=0,
+                assertions_retracted=0,
+            )
+
+    class TrainingHook:
+        sleep_hook_contract = SleepHookContract(
+            hook_id="test.training",
+            phase=SleepHookPhase.TRAINING,
+        )
+
+        async def on_post_consolidation(self, agent, result):
+            calls.append("training")
+            return {"success": True}
+
+    class Agent(SleepMixin):
+        def __init__(self) -> None:
+            self.semantic_inference_profile = profile
+            self.semantic_inference_limits = InferenceLimits()
+            self.semantic_maintenance_limits = SemanticMaintenanceLimits()
+            self.storage = Storage()
+            self.sleep_hooks = [TrainingHook()]
+            self.on_sleep_complete = None
+
+        async def _consolidate_memories(self):
+            return {"episodes_created": 1}
+
+    report = await Agent().sleep(skip_export=True)
+
+    assert calls == []
+    core = next(
+        item
+        for item in report.hook_results
+        if item.hook_id == "kestrel_sovereign.semantic_maintenance"
+    )
+    training = next(item for item in report.hook_results if item.hook_id == "test.training")
+    assert core.status.value == "failed"
+    assert training.status.value == "blocked"
+    assert report.semantic_maintenance == {
+        "status": "partial",
+        "reason": "assertion_budget",
+        "source_generation": 3,
+        "checkpoint_generation": 2,
+        "changes_consumed": 1,
+        "assertions_validated": 1,
+        "assertions_inferred": 0,
+        "assertions_retracted": 0,
+    }
+
+
+@pytest.mark.asyncio
 async def test_sleep_marks_success_false_when_enabled_inference_fails() -> None:
     profile = _profile()
 
     class Storage:
-        async def materialize_semantic_inference(self, selected_profile, *, limits=None):
+        async def run_semantic_maintenance(self, selected_profile, **kwargs):
             assert selected_profile == profile
             raise RuntimeError("publication failed")
 
@@ -742,11 +1385,12 @@ async def test_sleep_marks_success_false_when_enabled_inference_fails() -> None:
     report = await Agent().sleep(skip_export=True, skip_reflection=True)
 
     assert report.success is False
-    assert report.error == "semantic_inference_failed"
+    assert report.error == "semantic_maintenance_failed"
     assert report.semantic_inference == {
         "status": "failed",
-        "reason": "semantic_inference_failed",
+        "reason": "semantic_maintenance_failed",
     }
+    assert report.semantic_maintenance == report.semantic_inference
 
 
 @pytest.mark.asyncio
@@ -777,6 +1421,32 @@ async def test_sleep_explicit_disabled_inference_revokes_prior_materialization()
         "deactivated_derivations": 7,
         "generation": 12,
     }
+
+
+@pytest.mark.asyncio
+async def test_sleep_reports_revocation_failure_as_failed_maintenance() -> None:
+    class Storage:
+        async def revoke_semantic_inference(self):
+            raise RuntimeError("storage failure")
+
+    class Agent(SleepMixin):
+        def __init__(self) -> None:
+            self.semantic_inference_profile = None
+            self.semantic_inference_configured = True
+            self.storage = Storage()
+
+    report = await Agent().sleep(
+        skip_consolidation=True,
+        skip_export=True,
+        skip_reflection=True,
+    )
+
+    assert report.success is False
+    assert report.semantic_inference == {
+        "status": "failed",
+        "reason": "semantic_inference_revocation_failed",
+    }
+    assert report.semantic_maintenance == report.semantic_inference
 
 
 @pytest.mark.asyncio

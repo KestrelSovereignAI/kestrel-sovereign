@@ -131,6 +131,7 @@ class ShaclValidationLimits:
 
     max_graph_triples: int = 100_000
     max_shape_triples: int = 20_000
+    max_shapes: int = 1_000
     max_shape_depth: int = 32
     max_results: int = 1_000
     max_path_nodes: int = 100_000
@@ -140,6 +141,7 @@ class ShaclValidationLimits:
         for field_name in (
             "max_graph_triples",
             "max_shape_triples",
+            "max_shapes",
             "max_shape_depth",
             "max_results",
             "max_path_nodes",
@@ -521,6 +523,8 @@ class GovernedShaclValidationService:
             property_shapes = tuple(sorted(
                 set(shapes.subjects(RDF.type, SH.PropertyShape)), key=_term_key
             ))
+            if len(set(node_shapes).union(property_shapes)) > limits.max_shapes:
+                raise _ValidationIncomplete("shape_limit_exhausted")
             for shape in node_shapes:
                 context.check_budget()
                 for focus in _targets_for_shape(shapes, data_graph, shape):

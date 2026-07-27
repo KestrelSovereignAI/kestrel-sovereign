@@ -2610,6 +2610,56 @@ class PrivacyEnforcingStorage:
         """
         return await self._storage.revoke_semantic_inference()
 
+    async def run_semantic_maintenance(
+        self,
+        inference_profile,
+        *,
+        inference_limits=None,
+        maintenance_limits=None,
+        full_rebuild: bool = False,
+    ):
+        """Keep sleep maintenance behind the same durable privacy boundary."""
+        self._assert_semantic_assertion_read_allowed("semantic maintenance")
+        self._assert_semantic_assertion_write_allowed("semantic maintenance")
+        return await self._storage.run_semantic_maintenance(
+            inference_profile,
+            inference_limits=inference_limits,
+            maintenance_limits=maintenance_limits,
+            full_rebuild=full_rebuild,
+        )
+
+    async def semantic_maintenance_training_readiness(
+        self,
+        inference_profile,
+        *,
+        inference_limits=None,
+        maintenance_limits=None,
+        allow_prior_verified_snapshot: bool = False,
+    ):
+        """Read the training prerequisite without bypassing privacy policy."""
+        self._assert_semantic_assertion_read_allowed("semantic maintenance status")
+        return await self._storage.semantic_maintenance_training_readiness(
+            inference_profile,
+            inference_limits=inference_limits,
+            maintenance_limits=maintenance_limits,
+            allow_prior_verified_snapshot=allow_prior_verified_snapshot,
+        )
+
+    async def repair_semantic_maintenance(
+        self,
+        inference_profile,
+        *,
+        inference_limits=None,
+        maintenance_limits=None,
+    ):
+        self._assert_semantic_assertion_read_allowed("semantic maintenance repair")
+        self._assert_semantic_assertion_write_allowed("semantic maintenance repair")
+        return await self._storage.repair_semantic_maintenance(
+            inference_profile,
+            inference_limits=inference_limits,
+            maintenance_limits=maintenance_limits,
+        )
+
     async def export_assertion_snapshot(self, query=None):
         self._assert_semantic_assertion_read_allowed("export")
         return await self._storage.export_assertion_snapshot(query)

@@ -24,6 +24,8 @@ from kestrel_sovereign.llm.adapter import LLMResponse
 from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
 from kestrel_sovereign.config import (
     SEMANTIC_INFERENCE_CONFIG_ENV,
+    SEMANTIC_MAINTENANCE_CONFIG_ENV,
+    SEMANTIC_MAINTENANCE_CONFIGURED_ENV,
     TRUSTED_AGENTS_DIR,
 )
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
@@ -530,7 +532,10 @@ class KestrelAgent(
         identity_export_dir: Optional[Path] = None,
         semantic_inference_profile: Optional["InferenceProfile"] = None,
         semantic_inference_limits: Optional["InferenceLimits"] = None,
+        semantic_maintenance_limits: Optional["SemanticMaintenanceLimits"] = None,
         semantic_inference_configured: bool = False,
+        semantic_maintenance_configured: bool = False,
+        semantic_maintenance_allow_prior_verified_snapshot: bool = False,
     ):
         """
         Initializes the agent with memory and reasoning capabilities.
@@ -585,10 +590,19 @@ class KestrelAgent(
             semantic_inference_limits: Parsed, bounded materialization limits
                        injected with the selected profile.  The limits remain
                        operator configuration rather than service constants.
+            semantic_maintenance_limits: Parsed bounded validation, audit,
+                       and report budget for post-consolidation maintenance.
             semantic_inference_configured: Whether the managed configuration
                        explicitly supplied the profile, including an explicit
                        disabled profile. When true it takes precedence over a
                        legacy per-agent kestrel.toml block.
+            semantic_maintenance_configured: Whether the managed
+                configuration explicitly supplied maintenance limits.
+                When true it takes precedence over a legacy per-agent
+                kestrel.toml block, even when inference is disabled.
+            semantic_maintenance_allow_prior_verified_snapshot: Explicit
+                operator policy allowing scheduled training to use a prior
+                complete maintenance snapshot for the active capability.
         """
         self.did = did
         self._privacy_mode = privacy_mode
@@ -680,6 +694,12 @@ class KestrelAgent(
             InferenceError,
             InferenceLimits,
         )
+        from kestrel_sovereign.knowledge.maintenance import (
+            SemanticMaintenanceError,
+            SemanticMaintenanceLimits,
+            maintenance_allows_prior_verified_snapshot,
+            maintenance_limits_from_config,
+        )
 
         if semantic_inference_limits is not None and not isinstance(
             semantic_inference_limits, InferenceLimits
@@ -687,7 +707,22 @@ class KestrelAgent(
             raise RuntimeError("Invalid semantic inference limits")
         self.semantic_inference_profile = semantic_inference_profile
         self.semantic_inference_limits = semantic_inference_limits or InferenceLimits()
+        if semantic_maintenance_limits is not None and not isinstance(
+            semantic_maintenance_limits, SemanticMaintenanceLimits
+        ):
+            raise RuntimeError("Invalid semantic maintenance limits")
+        self.semantic_maintenance_limits = (
+            semantic_maintenance_limits or SemanticMaintenanceLimits()
+        )
         self.semantic_inference_configured = semantic_inference_configured
+        self.semantic_maintenance_configured = semantic_maintenance_configured
+        if type(semantic_maintenance_allow_prior_verified_snapshot) is not bool:
+            raise RuntimeError(
+                "Invalid semantic maintenance prior verified snapshot policy"
+            )
+        self.semantic_maintenance_allow_prior_verified_snapshot = (
+            semantic_maintenance_allow_prior_verified_snapshot
+        )
         if semantic_inference_profile is not None:
             from kestrel_sovereign.knowledge.inference import (
                 validate_inference_profile,
@@ -727,6 +762,40 @@ class KestrelAgent(
                     ) from exc
                 semantic_inference_configured = True
                 self.semantic_inference_configured = True
+        serialized_maintenance = os.environ.get(SEMANTIC_MAINTENANCE_CONFIG_ENV)
+        environment_maintenance_configured = os.environ.get(
+            SEMANTIC_MAINTENANCE_CONFIGURED_ENV
+        )
+        if not semantic_maintenance_configured:
+            if environment_maintenance_configured not in (None, "1"):
+                raise RuntimeError(
+                    f"Invalid {SEMANTIC_MAINTENANCE_CONFIGURED_ENV} configuration"
+                )
+            if (
+                environment_maintenance_configured == "1"
+                and serialized_maintenance is None
+            ):
+                raise RuntimeError(
+                    f"{SEMANTIC_MAINTENANCE_CONFIGURED_ENV} requires "
+                    f"{SEMANTIC_MAINTENANCE_CONFIG_ENV}"
+                )
+        if not semantic_maintenance_configured and serialized_maintenance is not None:
+            try:
+                maintenance_config = json.loads(serialized_maintenance)
+                self.semantic_maintenance_limits = maintenance_limits_from_config(
+                    maintenance_config
+                )
+                self.semantic_maintenance_allow_prior_verified_snapshot = (
+                    maintenance_allows_prior_verified_snapshot(
+                        maintenance_config
+                    )
+                )
+            except (json.JSONDecodeError, SemanticMaintenanceError) as exc:
+                raise RuntimeError(
+                    f"Invalid {SEMANTIC_MAINTENANCE_CONFIG_ENV} configuration"
+                ) from exc
+            semantic_maintenance_configured = True
+            self.semantic_maintenance_configured = True
         if storage_path:
             agent_toml = Path(storage_path).parent / "kestrel.toml"
             if agent_toml.exists():
@@ -781,6 +850,28 @@ class KestrelAgent(
                             ) from exc
                         semantic_inference_configured = True
                         self.semantic_inference_configured = True
+
+                    if (
+                        not semantic_maintenance_configured
+                        and "semantic_maintenance" in toml_data
+                    ):
+                        try:
+                            self.semantic_maintenance_limits = (
+                                maintenance_limits_from_config(
+                                    toml_data["semantic_maintenance"]
+                                )
+                            )
+                            self.semantic_maintenance_allow_prior_verified_snapshot = (
+                                maintenance_allows_prior_verified_snapshot(
+                                    toml_data["semantic_maintenance"]
+                                )
+                            )
+                        except SemanticMaintenanceError as exc:
+                            raise RuntimeError(
+                                f"Invalid [semantic_maintenance] configuration in {agent_toml}"
+                            ) from exc
+                        semantic_maintenance_configured = True
+                        self.semantic_maintenance_configured = True
 
                     privacy = toml_data.get("privacy", {})
                     if not isinstance(privacy, Mapping):

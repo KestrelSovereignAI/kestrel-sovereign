@@ -98,6 +98,13 @@ class LocalAgentConfig(BaseModel):
             "invalid operator approval fails startup."
         ),
     )
+    semantic_maintenance: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Optional bounded validation/audit budget for this agent's "
+            "post-consolidation semantic maintenance."
+        ),
+    )
 
     @field_validator("data_dir", mode="before")
     @classmethod
@@ -406,6 +413,8 @@ class MultiAgentConfig(BaseModel):
                 # per-agent TOML profile after this config is rewritten.
                 if agent.semantic_inference is not None:
                     entry["semantic_inference"] = agent.semantic_inference
+                if agent.semantic_maintenance is not None:
+                    entry["semantic_maintenance"] = agent.semantic_maintenance
                 data["agents"][name] = entry
             elif isinstance(agent, RemoteAgentConfig):
                 data["agents"][name] = {

@@ -890,7 +890,10 @@ class AgentManager:
         # disabling its approved closure.
         semantic_inference_profile = None
         semantic_inference_limits = None
+        semantic_maintenance_limits = None
+        semantic_maintenance_allow_prior_verified_snapshot = False
         semantic_inference_configured = config.semantic_inference is not None
+        semantic_maintenance_configured = config.semantic_maintenance is not None
         if semantic_inference_configured:
             from kestrel_sovereign.knowledge.inference import (
                 inference_limits_from_config,
@@ -906,6 +909,20 @@ class AgentManager:
             )
             if semantic_inference_profile is not None:
                 validate_inference_profile(semantic_inference_profile)
+        if config.semantic_maintenance is not None:
+            from kestrel_sovereign.knowledge.maintenance import (
+                maintenance_allows_prior_verified_snapshot,
+                maintenance_limits_from_config,
+            )
+
+            semantic_maintenance_limits = maintenance_limits_from_config(
+                config.semantic_maintenance
+            )
+            semantic_maintenance_allow_prior_verified_snapshot = (
+                maintenance_allows_prior_verified_snapshot(
+                    config.semantic_maintenance
+                )
+            )
 
         agent: Optional[KestrelAgent] = None
         scheduler_registration: Optional[
@@ -933,7 +950,12 @@ class AgentManager:
                     identity_export_dir=identity_export_dir,
                     semantic_inference_profile=semantic_inference_profile,
                     semantic_inference_limits=semantic_inference_limits,
+                    semantic_maintenance_limits=semantic_maintenance_limits,
                     semantic_inference_configured=semantic_inference_configured,
+                    semantic_maintenance_configured=semantic_maintenance_configured,
+                    semantic_maintenance_allow_prior_verified_snapshot=(
+                        semantic_maintenance_allow_prior_verified_snapshot
+                    ),
                 )
             else:
                 agent = KestrelAgent(
@@ -944,7 +966,12 @@ class AgentManager:
                     identity_export_dir=identity_export_dir,
                     semantic_inference_profile=semantic_inference_profile,
                     semantic_inference_limits=semantic_inference_limits,
+                    semantic_maintenance_limits=semantic_maintenance_limits,
                     semantic_inference_configured=semantic_inference_configured,
+                    semantic_maintenance_configured=semantic_maintenance_configured,
+                    semantic_maintenance_allow_prior_verified_snapshot=(
+                        semantic_maintenance_allow_prior_verified_snapshot
+                    ),
                 )
 
             # Publish this before feature initialization. A shared PostgreSQL

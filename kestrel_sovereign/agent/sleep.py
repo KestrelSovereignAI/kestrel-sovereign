@@ -188,6 +188,25 @@ class _PostConsolidationPlan:
     blocked_reasons: Dict[str, str]
 
 
+class _CoreSemanticMaintenanceHook:
+    """Expose core semantic work through the same dependency graph as features."""
+
+    sleep_hook_contract = SleepHookContract(
+        hook_id="kestrel_sovereign.semantic_maintenance",
+        phase=SleepHookPhase.SEMANTIC_MAINTENANCE,
+    )
+
+    def __init__(self, report: "SleepReport") -> None:
+        self._report = report
+
+    async def on_post_consolidation(
+        self, agent: Any, consolidation_result: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        del consolidation_result
+        success = await agent._run_semantic_maintenance(self._report)
+        return {"success": success}
+
+
 @dataclass
 class SleepReport:
     """Result of a sleep cycle."""
@@ -225,6 +244,11 @@ class SleepReport:
     # assertion term or source text.
     semantic_inference: Optional[Dict[str, Any]] = None
 
+    # Incremental validation, audit, and inference is reported separately from
+    # the legacy inference-only field.  Both mappings contain only aggregate
+    # counts, status, and capability versions.
+    semantic_maintenance: Optional[Dict[str, Any]] = None
+
     # Timing
     consolidation_ms: int = 0
     export_ms: int = 0
@@ -259,6 +283,7 @@ class SleepReport:
             },
             "hook_results": [result.to_dict() for result in self.hook_results],
             "semantic_inference": self.semantic_inference,
+            "semantic_maintenance": self.semantic_maintenance,
             "export": {
                 "shards_exported": self.shards_exported,
                 "total_size_bytes": self.total_size_bytes,
@@ -409,7 +434,10 @@ class SleepMixin:
             # 1.5 Post-consolidation hooks use the new episodes. Annotated hooks
             # are phase- and dependency-ordered; legacy hooks retain their
             # registration-order, continue-on-error behavior.
-            if not skip_reflection and self.sleep_hooks:
+            if (
+                (not skip_reflection and self.sleep_hooks)
+                or self._semantic_maintenance_required()
+            ):
                 unavailability_reason = self._post_consolidation_unavailability_reason(
                     consolidation_result
                 )
@@ -417,19 +445,26 @@ class SleepMixin:
                     self._record_unavailable_post_consolidation_hooks(
                         report,
                         reason=unavailability_reason,
+                        include_semantic_maintenance=self._semantic_maintenance_required(),
                     )
                 else:
                     await self._run_post_consolidation_hooks(
-                        consolidation_result, report
+                        consolidation_result,
+                        report,
+                        include_feature_hooks=not skip_reflection,
                     )
 
-        # Semantic closure is driven by the tenant's explicitly approved,
-        # exact profile.  It deliberately is not a reflection hook: scheduler
-        # sleep skips reflection on idle agents, but an assertion change still
-        # needs its incremental materialization pass.
-        inference_maintenance_succeeded = (
-            await self._run_semantic_inference_maintenance(report)
-        )
+        # The core semantic service is a declared post-consolidation hook, so
+        # phase-ordered training consumers see a failed/incomplete maintenance
+        # prerequisite before they can consume a corpus.  An explicitly
+        # requested skip still runs the service for compatibility with manual
+        # repair callers, but has no post-consolidation feature consumers.
+        if skip_consolidation and self._semantic_maintenance_required():
+            semantic_maintenance_succeeded = await self._run_semantic_maintenance(report)
+        elif self._semantic_maintenance_required():
+            semantic_maintenance_succeeded = self._semantic_maintenance_successful(report)
+        else:
+            semantic_maintenance_succeeded = True
 
         # Record total reflection time
         report.reflection_ms = int((time.time() - reflection_start) * 1000) - report.consolidation_ms
@@ -458,7 +493,7 @@ class SleepMixin:
         # and the scheduler normally skips export.
         report.success = (
             consolidation_succeeded or export_succeeded
-        ) and inference_maintenance_succeeded
+        ) and semantic_maintenance_succeeded
 
         # Invoke callback if set (allows platform to update latest_cid)
         if report.success and report.cid and self.on_sleep_complete:
@@ -470,30 +505,46 @@ class SleepMixin:
 
         return report
 
-    async def _run_semantic_inference_maintenance(
+    def _semantic_maintenance_required(self) -> bool:
+        return bool(
+            getattr(self, "semantic_inference_configured", False)
+            or getattr(self, "semantic_maintenance_configured", False)
+            or getattr(self, "semantic_inference_profile", None) is not None
+        )
+
+    @staticmethod
+    def _semantic_maintenance_successful(report: SleepReport) -> bool:
+        """Return the core hook's declared outcome, never infer one from a map."""
+        core_results = [
+            item
+            for item in report.hook_results
+            if item.hook_id == "kestrel_sovereign.semantic_maintenance"
+        ]
+        return bool(core_results) and core_results[-1].status is SleepHookStatus.SUCCESS
+
+    async def _run_semantic_maintenance(
         self,
         report: SleepReport,
     ) -> bool:
-        """Advance the approved profile's incremental closure, if configured.
-
-        ``materialize_semantic_inference`` performs its own changed-generation
-        no-op check.  Calling it from every sleep cycle therefore covers
-        assertion writes from all production paths without turning the nightly
-        job into a full rebuild.  Full rebuild remains an explicit storage
-        repair operation.
-        """
+        """Run one governed semantic-maintenance unit, if configured."""
         profile = getattr(self, "semantic_inference_profile", None)
-        configured = bool(getattr(self, "semantic_inference_configured", False))
-        if profile is None and not configured:
+        inference_configured = bool(
+            getattr(self, "semantic_inference_configured", False)
+        )
+        maintenance_configured = bool(
+            getattr(self, "semantic_maintenance_configured", False)
+        )
+        if profile is None and not inference_configured and not maintenance_configured:
             return True
         storage = getattr(self, "storage", None)
-        if profile is None:
+        if profile is None and inference_configured:
             revoke = getattr(storage, "revoke_semantic_inference", None)
             if not callable(revoke):
                 report.semantic_inference = {
                     "status": "failed",
                     "reason": "semantic_storage_unavailable",
                 }
+                report.semantic_maintenance = dict(report.semantic_inference)
                 logger.warning(
                     "Semantic inference revocation skipped: governed storage is unavailable"
                 )
@@ -505,6 +556,7 @@ class SleepMixin:
                     "status": "failed",
                     "reason": "semantic_inference_revocation_failed",
                 }
+                report.semantic_maintenance = dict(report.semantic_inference)
                 report.error = (
                     f"{report.error}; semantic_inference_revocation_failed"
                     if report.error
@@ -518,43 +570,65 @@ class SleepMixin:
                 "deactivated_derivations": result.deactivated_derivations,
                 "generation": result.generation,
             }
-            return True
-        materialize = getattr(storage, "materialize_semantic_inference", None)
-        if not callable(materialize):
-            report.semantic_inference = {
-                "status": "skipped",
-                "reason": "semantic_storage_unavailable",
-            }
-            logger.warning(
-                "Semantic inference skipped: governed storage is unavailable"
-            )
-            return False
-        try:
-            result = await materialize(
-                profile,
-                limits=getattr(self, "semantic_inference_limits", None),
-            )
-        except Exception:  # Inference maintenance cannot leave sleep half-run.
-            report.semantic_inference = {
-                "status": "failed",
-                "reason": "semantic_inference_failed",
-            }
-            report.error = (
-                f"{report.error}; semantic_inference_failed"
-                if report.error
-                else "semantic_inference_failed"
-            )
-            logger.warning("Semantic inference maintenance failed")
-            return False
-        report.semantic_inference = {
-            "status": result.status.value,
-            "incomplete_reason": result.incomplete_reason,
-            "source_generation": result.source_generation,
-            "checkpoint_generation": result.checkpoint_generation,
-            "generated_assertions": result.generated_assertions,
-            "retracted_assertions": result.retracted_assertions,
+            if not maintenance_configured:
+                report.semantic_maintenance = dict(report.semantic_inference)
+                return True
+        maintain = getattr(storage, "run_semantic_maintenance", None)
+        if callable(maintain):
+            try:
+                result = await maintain(
+                    profile,
+                    inference_limits=getattr(self, "semantic_inference_limits", None),
+                    maintenance_limits=getattr(self, "semantic_maintenance_limits", None),
+                )
+            except Exception:
+                report.semantic_maintenance = {
+                    "status": "failed",
+                    "reason": "semantic_maintenance_failed",
+                }
+                report.semantic_inference = dict(report.semantic_maintenance)
+                report.error = (
+                    f"{report.error}; semantic_maintenance_failed"
+                    if report.error
+                    else "semantic_maintenance_failed"
+                )
+                logger.warning("Semantic maintenance failed")
+                return False
+            report.semantic_maintenance = result.to_mapping()
+            # Keep the established field available to API clients while the
+            # richer maintenance report is adopted.  A validation-only run
+            # must not masquerade as inference, and a preceding explicit
+            # revocation remains observable as ``disabled``.
+            if profile is not None:
+                report.semantic_inference = {
+                    "status": result.status.value,
+                    "incomplete_reason": result.reason,
+                    "source_generation": result.source_generation,
+                    "checkpoint_generation": result.checkpoint_generation,
+                    "generated_assertions": result.assertions_inferred,
+                    "retracted_assertions": result.assertions_retracted,
+                }
+            return result.status.value in {"complete", "no_op"}
+
+        report.semantic_maintenance = {
+            "status": "failed",
+            "reason": "semantic_storage_unavailable",
         }
-        return result.status.value != "failed"
+        report.semantic_inference = dict(report.semantic_maintenance)
+        report.error = (
+            f"{report.error}; semantic_storage_unavailable"
+            if report.error
+            else "semantic_storage_unavailable"
+        )
+        logger.warning("Semantic maintenance skipped: governed storage is unavailable")
+        return False
+
+    async def _run_semantic_inference_maintenance(
+        self,
+        report: SleepReport,
+    ) -> bool:
+        """Compatibility alias for callers of the prior private method name."""
+        return await self._run_semantic_maintenance(report)
 
     @staticmethod
     def _sleep_hook_contract(hook: Any) -> Optional[SleepHookContract]:
@@ -721,6 +795,7 @@ class SleepMixin:
         report: SleepReport,
         *,
         reason: str,
+        include_semantic_maintenance: bool = False,
     ) -> None:
         """Report hooks skipped because consolidation produced no safe input.
 
@@ -728,7 +803,15 @@ class SleepMixin:
         hook call, so every post hook was effectively skipped.  Preserve that
         safety boundary while making it observable in the structured report.
         """
-        for registration_index, hook in enumerate(self.sleep_hooks or []):
+        if include_semantic_maintenance:
+            report.semantic_maintenance = {
+                "status": "partial",
+                "reason": reason,
+            }
+        hooks = list(self.sleep_hooks or [])
+        if include_semantic_maintenance:
+            hooks.append(_CoreSemanticMaintenanceHook(report))
+        for registration_index, hook in enumerate(hooks):
             if not callable(getattr(hook, "on_post_consolidation", None)):
                 continue
             contract = self._sleep_hook_contract(hook)
@@ -946,12 +1029,18 @@ class SleepMixin:
         )
 
     async def _run_post_consolidation_hooks(
-        self, consolidation_result: Dict[str, Any], report: SleepReport
+        self,
+        consolidation_result: Dict[str, Any],
+        report: SleepReport,
+        *,
+        include_feature_hooks: bool = True,
     ) -> None:
         """Run dependency-aware hooks while preserving legacy-group order."""
         import time
 
-        registered_hooks = list(self.sleep_hooks or [])
+        registered_hooks = list(self.sleep_hooks or []) if include_feature_hooks else []
+        if self._semantic_maintenance_required():
+            registered_hooks.append(_CoreSemanticMaintenanceHook(report))
         post_consolidation_hooks: List[_PostConsolidationHook] = []
         for registration_index, hook in enumerate(registered_hooks):
             contract = self._sleep_hook_contract(hook)

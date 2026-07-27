@@ -15,6 +15,10 @@ logger = logging.getLogger(__name__)
 # The value is a JSON-encoded LocalAgentConfig.semantic_inference mapping, not
 # assertion content or a profile selected by the child process.
 SEMANTIC_INFERENCE_CONFIG_ENV = "KESTREL_SEMANTIC_INFERENCE_CONFIG"
+SEMANTIC_MAINTENANCE_CONFIG_ENV = "KESTREL_SEMANTIC_MAINTENANCE_CONFIG"
+# Carries the managed-config precedence boundary separately from the JSON
+# payload so a child process never falls back to a stale local TOML table.
+SEMANTIC_MAINTENANCE_CONFIGURED_ENV = "KESTREL_SEMANTIC_MAINTENANCE_CONFIGURED"
 
 
 # Default CORS origins for the console/API. Override via the comma-separated

@@ -28,7 +28,11 @@ from kestrel_sovereign.multi_agent.config import (
     LocalAgentConfig,
     MultiAgentConfig,
 )
-from kestrel_sovereign.config import SEMANTIC_INFERENCE_CONFIG_ENV
+from kestrel_sovereign.config import (
+    SEMANTIC_INFERENCE_CONFIG_ENV,
+    SEMANTIC_MAINTENANCE_CONFIG_ENV,
+    SEMANTIC_MAINTENANCE_CONFIGURED_ENV,
+)
 
 # NOTE: ``IDENTITY_EXPORT_DIR_ENV`` is imported lazily inside ``start_agent``
 # (its only use). Pulling it in at module scope would force ``identity``'s
@@ -520,6 +524,20 @@ class ProcessManager:
                 raise RuntimeError(
                     f"Agent '{name}' has a non-serializable semantic inference profile"
                 ) from exc
+        if config.semantic_maintenance is None:
+            env.pop(SEMANTIC_MAINTENANCE_CONFIG_ENV, None)
+            env.pop(SEMANTIC_MAINTENANCE_CONFIGURED_ENV, None)
+        else:
+            try:
+                env[SEMANTIC_MAINTENANCE_CONFIG_ENV] = json.dumps(
+                    config.semantic_maintenance,
+                    sort_keys=True,
+                )
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Agent '{name}' has a non-serializable semantic maintenance budget"
+                ) from exc
+            env[SEMANTIC_MAINTENANCE_CONFIGURED_ENV] = "1"
 
         # Force child agents into single-agent mode. Without this,
         # server.py detects multi_agent.toml in the CWD and enters multi-

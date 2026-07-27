@@ -34,6 +34,7 @@ from .async_assertion_store import (
     AssertionStoreError,
     AssertionWriteResult,
     AsyncAssertionStore,
+    MaintenanceLeaseLostError,
     SupersessionResult,
     TenantIsolationError,
 )
@@ -157,6 +158,8 @@ class AsyncSemanticValidationReportStore:
             raise SemanticValidationStoreError("validation report tenant does not match the bound assertion tenant")
         try:
             return await self._assertions.persist_validation_report(report)
+        except MaintenanceLeaseLostError:
+            raise
         except AssertionStoreError as error:
             raise SemanticValidationStoreError(str(error)) from error
 
