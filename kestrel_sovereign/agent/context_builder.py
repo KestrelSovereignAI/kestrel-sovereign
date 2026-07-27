@@ -383,6 +383,28 @@ class ContextBuilder:
                         key=lambda item: (-semantic_scores[item.assertion.assertion_id], item.assertion.assertion_id),
                     )
                     selected = tuple(ordered[:recall_config.candidate_limit])
+                    # Empty discovery/ranking is a normal governed result.
+                    # Do not ask the provenance capability to hydrate an empty
+                    # set: that would convert byte-identical legacy RAG into a
+                    # spurious unavailable state.
+                    if not selected:
+                        hybrid = render_hybrid_context(
+                            query=query,
+                            rag_results=rag_results,
+                            assertion_candidates=(),
+                            config=recall_config,
+                            count_tokens=self.counter.count,
+                            semantic_scores=semantic_scores,
+                            max_tokens=max_tokens,
+                        )
+                        self.last_semantic_recall_metadata = {
+                            "status": "empty",
+                            "checkpoint_generation": recalled.checkpoint_generation,
+                            "capability_versions": dict(recalled.capability_versions),
+                            "discovery_count": recalled.discovery_count,
+                            "assertions": hybrid.metadata,
+                        }
+                        return hybrid.context
                     hydrator = getattr(self.storage, "hydrate_semantic_recall_candidates", None)
                     if hydrator is None:
                         raise RuntimeError("semantic_recall_provenance_capability_unavailable")

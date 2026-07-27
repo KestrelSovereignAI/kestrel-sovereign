@@ -5,6 +5,7 @@ Tests for the ContextBuilder module.
 import pytest
 from unittest.mock import Mock, AsyncMock, patch
 from kestrel_sovereign.agent.context_builder import ContextBuilder
+from kestrel_sovereign.agent.context_manager import ContextManager
 
 
 class TestContextBuilder:
@@ -62,6 +63,87 @@ class TestContextBuilder:
         assert "First document content" in result
         assert "Source: doc2.txt" in result
         assert "Second document content" in result
+
+    @pytest.mark.asyncio
+    async def test_disabled_semantic_recall_preserves_legacy_rag_bytes_without_touching_seams(
+        self, monkeypatch
+    ):
+        """Disabled recall is observationally indistinguishable from legacy RAG."""
+        rag = [{"document_name": "note.txt", "created_at": "now", "content": "private legacy text"}]
+        storage = Mock(search_chunks=AsyncMock(return_value=rag))
+        # A real callable here would be an accidental governed-surface call.
+        storage.semantic_recall_candidates = AsyncMock(side_effect=AssertionError("must not read"))
+        builder = ContextBuilder(storage)
+        monkeypatch.setattr("kestrel_sovereign.config.load_section", lambda _: {"semantic_recall_enabled": False})
+
+        result = await builder.retrieve_context("question")
+
+        assert result == "Source: note.txt (indexed: now)\nContent: private legacy text"
+        storage.semantic_recall_candidates.assert_not_awaited()
+        assert builder.last_semantic_recall_metadata == {"status": "disabled"}
+
+    @pytest.mark.asyncio
+    async def test_empty_governed_semantic_recall_preserves_legacy_rag_bytes_but_is_observable(
+        self, monkeypatch
+    ):
+        rag = [{"document_name": "note.txt", "content": "private legacy text"}]
+        storage = Mock(search_chunks=AsyncMock(return_value=rag))
+        storage.semantic_recall_candidates = AsyncMock(
+            return_value=Mock(candidates=(), checkpoint_generation=7, capability_versions={}, discovery_count=0)
+        )
+        storage.hydrate_semantic_recall_candidates = AsyncMock(side_effect=AssertionError("no hydrate"))
+        builder = ContextBuilder(storage)
+        monkeypatch.setattr("kestrel_sovereign.config.load_section", lambda _: {"semantic_recall_enabled": True})
+
+        result = await builder.retrieve_context("question")
+
+        assert result == "Source: note.txt\nContent: private legacy text"
+        storage.semantic_recall_candidates.assert_awaited_once()
+        storage.hydrate_semantic_recall_candidates.assert_not_awaited()
+        assert builder.last_semantic_recall_metadata == {
+            "status": "empty",
+            "checkpoint_generation": 7,
+            "capability_versions": {},
+            "discovery_count": 0,
+            "assertions": (),
+        }
+
+    @pytest.mark.asyncio
+    async def test_unavailable_semantic_capability_keeps_legacy_bytes_and_hides_exception_text(
+        self, monkeypatch
+    ):
+        storage = Mock(search_chunks=AsyncMock(return_value=[{"document_name": "note", "content": "legacy"}]))
+        storage.semantic_recall_candidates = AsyncMock(side_effect=RuntimeError("provider key: secret value"))
+        builder = ContextBuilder(storage)
+        monkeypatch.setattr("kestrel_sovereign.config.load_section", lambda _: {"semantic_recall_enabled": True})
+
+        assert await builder.retrieve_context("question") == "Source: note\nContent: legacy"
+        assert builder.last_semantic_recall_metadata == {
+            "status": "unavailable", "reason": "semantic_recall_capability_unavailable"
+        }
+
+
+@pytest.mark.asyncio
+async def test_context_manager_passes_live_rag_budget_and_keeps_semantic_metadata_content_free():
+    """The plan receives typed trace metadata, never retrieved claim/source bytes."""
+    builder = Mock()
+    builder.retrieve_context = AsyncMock(return_value="Source: note\nContent: fitting legacy RAG")
+    builder.last_semantic_recall_metadata = {
+        "status": "used",
+        "assertions": ({"assertion_id": "opaque-id", "score": 0.9},),
+    }
+    manager = ContextManager(Mock(), context_builder=builder)
+    manager.counter = Mock(count=lambda value: len(value))
+
+    result = await manager._produce_rag(
+        Mock(rag=37), "question", {"rag_min_score": 0.2}, include_rag=True, trivial_turn=False
+    )
+
+    builder.retrieve_context.assert_awaited_once_with("question", min_score=0.2, max_tokens=37)
+    assert result is not None
+    assert "Source: note\nContent: fitting legacy RAG" in result.dynamic_block
+    assert result.metadata == {"semantic_recall": builder.last_semantic_recall_metadata}
+    assert "fitting legacy RAG" not in repr(result.metadata)
 
     @pytest.mark.asyncio
     async def test_retrieve_context_handles_error(self, async_context_builder, async_mock_storage):
