@@ -3252,9 +3252,9 @@ class PrivacyEnforcingStorage:
             maintenance_limits=maintenance_limits,
         )
 
-    async def hydrate_semantic_recall_candidates(self, assertion_ids):
+    async def hydrate_semantic_recall_candidates(self, assertion_ids, **kwargs):
         self._assert_semantic_assertion_read_allowed("semantic recall provenance")
-        return await self._storage.hydrate_semantic_recall_candidates(assertion_ids)
+        return await self._storage.hydrate_semantic_recall_candidates(assertion_ids, **kwargs)
 
     async def semantic_inference_state(self, profile):
         self._assert_semantic_assertion_read_allowed("inference status")

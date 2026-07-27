@@ -1301,10 +1301,10 @@ class AsyncStorage:
             maintenance_limits=maintenance_limits,
         )
 
-    async def hydrate_semantic_recall_candidates(self, assertion_ids):
+    async def hydrate_semantic_recall_candidates(self, assertion_ids, **kwargs):
         if not self._initialized:
             await self.initialize()
-        return await self._assertion_store().hydrate_recall_candidates(assertion_ids)
+        return await self._assertion_store().hydrate_recall_candidates(assertion_ids, **kwargs)
 
     async def semantic_inference_state(self, profile):
         """Read the durable complete/incomplete status for one exact profile."""

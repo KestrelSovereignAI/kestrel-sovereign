@@ -382,7 +382,13 @@ class ContextBuilder:
                     hydrator = getattr(self.storage, "hydrate_semantic_recall_candidates", None)
                     if hydrator is None:
                         raise RuntimeError("semantic_recall_provenance_capability_unavailable")
-                    hydrated = await hydrator([item.assertion.assertion_id for item in selected])
+                    hydrated = await hydrator(
+                        [item.assertion.assertion_id for item in selected],
+                        expected_checkpoint_generation=recalled.checkpoint_generation,
+                        inference_profile=self._semantic_inference_profile,
+                        inference_limits=self._semantic_inference_limits,
+                        maintenance_limits=self._semantic_maintenance_limits,
+                    )
                     by_id = {item.assertion.assertion_id: item for item in hydrated}
                     candidates = tuple(by_id[item.assertion.assertion_id] for item in selected if item.assertion.assertion_id in by_id)
                     hybrid = render_hybrid_context(
@@ -402,7 +408,11 @@ class ContextBuilder:
                 except Exception as exc:
                     # Capability failures are observable and never fabricate a
                     # graph result; retain the established RAG path.
-                    logger.warning("Semantic recall unavailable: %s", exc)
+                    reason = self._semantic_failure_reason(exc)
+                    logger.warning(
+                        "Semantic recall unavailable reason=%s error_class=%s",
+                        reason, type(exc).__name__,
+                    )
                     self.last_semantic_recall_metadata = {
                         "status": "unavailable", "reason": self._semantic_failure_reason(exc),
                     }
@@ -459,6 +469,7 @@ class ContextBuilder:
             "semantic_maintenance_checkpoint_behind",
             "semantic_maintenance_state_missing",
             "semantic_maintenance_partial",
+            "semantic_recall_checkpoint_changed",
         }
         value = str(error)
         return value if value in known else "semantic_recall_capability_unavailable"

@@ -5114,11 +5114,24 @@ class AsyncAssertionStore:
         )
 
     async def hydrate_recall_candidates(
-        self, assertion_ids: Sequence[str],
+        self, assertion_ids: Sequence[str], *, expected_checkpoint_generation: int,
+        inference_profile, inference_limits=None, maintenance_limits=None,
     ) -> tuple[AssertionRecallCandidate, ...]:
-        """Re-authorize selected IDs and hydrate their provenance in one batch."""
+        """Fence final publication after async scoring, then hydrate in one batch."""
         if not assertion_ids:
             return ()
+        if inference_profile is None:
+            raise SemanticRecallUnavailableError("semantic_maintenance_capability_unavailable")
+        from kestrel_sovereign.knowledge.maintenance import SemanticMaintenanceService
+        readiness = await SemanticMaintenanceService(
+            self, inference_profile=inference_profile,
+            inference_limits=inference_limits, limits=maintenance_limits,
+        ).training_readiness()
+        if not readiness.ready:
+            raise SemanticRecallUnavailableError(readiness.reason or "semantic_maintenance_unavailable")
+        checkpoint = await self.checkpoint()
+        if checkpoint.generation != expected_checkpoint_generation:
+            raise SemanticRecallUnavailableError("semantic_recall_checkpoint_changed")
         selected = await self._query_current(
             AssertionQuery(
                 assertion_ids=tuple(assertion_ids), limit=len(assertion_ids),
@@ -5126,6 +5139,10 @@ class AsyncAssertionStore:
             ), eligible_only=True,
         )
         sources = await self._sources_for_assertions(selected)
+        # Repeat the generation fence after provenance I/O; callers must retry
+        # rather than publishing a half-old semantic snapshot.
+        if (await self.checkpoint()).generation != expected_checkpoint_generation:
+            raise SemanticRecallUnavailableError("semantic_recall_checkpoint_changed")
         return tuple(AssertionRecallCandidate(item, sources.get(item.assertion_id, ()), True) for item in selected)
 
     async def _sources_for_assertions(
