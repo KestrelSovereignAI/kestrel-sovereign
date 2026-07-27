@@ -14,6 +14,8 @@ from kestrel_sovereign.storage.privacy_wrapper import (
     EphemeralPurgeReport,
     StorePurgeResult,
     PurgeOutcome,
+    PRIVACY_TRANSITION_RETRY_MESSAGE,
+    PrivacyViolationError,
 )
 from kestrel_sovereign.security.encryption import DecryptionError
 from kestrel_sovereign.security.assertion_tenant_resolver import (
@@ -140,6 +142,10 @@ class PrivacyTransitionResult:
     # reported as successful. Distinct from ``requires_confirmation`` (a staged
     # data-destructive downgrade the user can still confirm).
     purge_failed: bool = False
+    # True when an already-running durable explicit-fact operation won the
+    # privacy linearization race. No privacy state changed; callers should
+    # surface a retryable conflict rather than success or an internal error.
+    retryable_conflict: bool = False
 
 
 async def _add_sovereign_ipfs_target_if_active(
@@ -2984,7 +2990,13 @@ class KestrelAgent(
                     allows_cloud_llm=privacy_mode_to_config(self._privacy_mode).allows_cloud_llm(),
                 )
             self._pending_privacy_transition = None
-            return await self._apply_privacy_mode_locked(mode)
+            result = await self._apply_privacy_mode_locked(mode)
+            if result.retryable_conflict:
+                # Keep the consented target staged. Retrying confirmation after
+                # the active fact finishes must apply that same target, not
+                # silently become a "nothing pending" no-op.
+                self._pending_privacy_transition = mode
+            return result
 
     async def cancel_privacy_transition(self) -> PrivacyTransitionResult:
         """Discard a privacy transition previously staged as pending confirmation.
@@ -3089,8 +3101,22 @@ class KestrelAgent(
                     purge_failed=True,
                 )
 
+        # The storage wrapper owns the linearization guard against durable
+        # explicit-fact operations.  Ask it first: if a fact operation is in
+        # flight, the transition is refused without leaving the agent and its
+        # privacy policy in a split state.
+        try:
+            self.storage.set_privacy_mode(mode)
+        except PrivacyViolationError:
+            return PrivacyTransitionResult(
+                message=PRIVACY_TRANSITION_RETRY_MESSAGE,
+                allows_cloud_llm=privacy_mode_to_config(
+                    self._privacy_mode
+                ).allows_cloud_llm(),
+                applied=False,
+                retryable_conflict=True,
+            )
         self._privacy_mode = mode
-        self.storage.set_privacy_mode(mode)
         status_message = self.privacy_agent.set_mode(mode)
 
         config = privacy_mode_to_config(mode)

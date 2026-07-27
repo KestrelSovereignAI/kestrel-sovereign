@@ -3,6 +3,11 @@ import asyncio
 import logging
 from decimal import Decimal
 
+from kestrel_sovereign.storage.privacy_wrapper import (
+    PRIVACY_TRANSITION_RETRY_MESSAGE,
+    PrivacyViolationError,
+)
+
 
 class BackupMixin:
     """Mixin class providing backup methods."""
@@ -106,7 +111,20 @@ class BackupMixin:
                 return save_msg
             # Switch to normal mode so the backup can proceed through the privacy wrapper
             from kestrel_sovereign.privacy import PrivacyMode
-            await self.set_privacy_mode(PrivacyMode.NORMAL)
+            try:
+                transition_method = getattr(
+                    self,
+                    "set_privacy_mode_with_effects",
+                    None,
+                )
+                if transition_method is not None:
+                    transition = await transition_method(PrivacyMode.NORMAL)
+                    if not getattr(transition, "applied", False):
+                        return transition.message
+                else:
+                    await self.set_privacy_mode(PrivacyMode.NORMAL)
+            except PrivacyViolationError:
+                return PRIVACY_TRANSITION_RETRY_MESSAGE
         return await self._command_backup(user_input.replace("!promote-backup", "!backup", 1))
 
     async def anchor_memory_state(self):

@@ -9,6 +9,10 @@ from kestrel_sovereign.command_handler import CommandHandler
 from kestrel_sovereign.features.privacy import PrivacyAgent
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.privacy import PrivacyMode
+from kestrel_sovereign.storage.privacy_wrapper import (
+    PRIVACY_TRANSITION_RETRY_MESSAGE,
+    PrivacyEnforcingStorage,
+)
 
 
 import pytest
@@ -116,6 +120,128 @@ def _make_agent_with_privacy_transition(llm_service):
         side_effect=lambda m: PrivacyTransitionDecision(target=m, requires_confirmation=False)
     )
     return agent
+
+
+def _make_lease_guarded_agent(initial_mode=PrivacyMode.NORMAL):
+    """Build a real wrapper/agent pair without starting the full runtime."""
+    from kestrel_sovereign.features.privacy.feature import (
+        PrivacyTransitionDecision,
+    )
+
+    wrapper = PrivacyEnforcingStorage(MagicMock(), initial_mode)
+    agent = KestrelAgent.__new__(KestrelAgent)
+    agent._privacy_mode = initial_mode
+    agent.storage = wrapper
+    agent.features = {}
+    agent.llm_service = None
+    agent.privacy_agent = MagicMock()
+    agent.privacy_agent.evaluate_transition = MagicMock(
+        side_effect=lambda mode: PrivacyTransitionDecision(
+            target=mode,
+            requires_confirmation=False,
+        )
+    )
+    agent.privacy_agent.set_mode = MagicMock(
+        side_effect=lambda mode: f"Privacy mode changed to {mode.value}."
+    )
+    return agent, wrapper
+
+
+def test_privacy_mode_endpoint_returns_retryable_conflict_during_fact_lease():
+    """POST never turns a linearization refusal into a 500 or false success."""
+    agent, wrapper = _make_lease_guarded_agent()
+    app, original = _prepare_app(agent)
+    wrapper._acquire_explicit_fact_lease()
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                refused = client.post(
+                    "/api/agent/privacy-mode",
+                    headers={
+                        "X-API-Key": "test-key",
+                        "X-Kestrel-Allow-Destructive": "test-rail-bypass",
+                    },
+                    json={"mode": "isolated"},
+                )
+                assert refused.status_code == 409
+                payload = refused.json()
+                assert payload["detail"] == PRIVACY_TRANSITION_RETRY_MESSAGE
+                assert payload["error"]["code"] == "http_409"
+                assert (
+                    payload["error"]["message"]
+                    == PRIVACY_TRANSITION_RETRY_MESSAGE
+                )
+                assert refused.headers["retry-after"] == "1"
+                assert agent.privacy_mode is PrivacyMode.NORMAL
+                assert wrapper.privacy_mode is PrivacyMode.NORMAL
+
+                wrapper._release_explicit_fact_lease()
+                applied = client.post(
+                    "/api/agent/privacy-mode",
+                    headers={
+                        "X-API-Key": "test-key",
+                        "X-Kestrel-Allow-Destructive": "test-rail-bypass",
+                    },
+                    json={"mode": "isolated"},
+                )
+                assert applied.status_code == 200
+                assert applied.json()["success"] is True
+                assert agent.privacy_mode is PrivacyMode.ISOLATED
+                assert wrapper.privacy_mode is PrivacyMode.ISOLATED
+    finally:
+        if wrapper._active_explicit_fact_leases:
+            wrapper._release_explicit_fact_lease()
+        _restore_app(app, original)
+
+
+def test_privacy_confirm_endpoint_preserves_pending_target_during_fact_lease():
+    """A 409 confirmation remains retryable after the fact operation exits."""
+    agent, wrapper = _make_lease_guarded_agent(PrivacyMode.PUBLIC)
+    agent._pending_privacy_transition = PrivacyMode.EPHEMERAL
+    app, original = _prepare_app(agent)
+    wrapper._acquire_explicit_fact_lease()
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                refused = client.post(
+                    "/api/agent/privacy-mode/confirm",
+                    headers={
+                        "X-API-Key": "test-key",
+                        "X-Kestrel-Allow-Destructive": "test-rail-bypass",
+                    },
+                )
+                assert refused.status_code == 409
+                payload = refused.json()
+                assert payload["detail"] == PRIVACY_TRANSITION_RETRY_MESSAGE
+                assert payload["error"]["code"] == "http_409"
+                assert (
+                    payload["error"]["message"]
+                    == PRIVACY_TRANSITION_RETRY_MESSAGE
+                )
+                assert agent.privacy_mode is PrivacyMode.PUBLIC
+                assert wrapper.privacy_mode is PrivacyMode.PUBLIC
+                assert (
+                    agent._pending_privacy_transition
+                    is PrivacyMode.EPHEMERAL
+                )
+
+                wrapper._release_explicit_fact_lease()
+                applied = client.post(
+                    "/api/agent/privacy-mode/confirm",
+                    headers={
+                        "X-API-Key": "test-key",
+                        "X-Kestrel-Allow-Destructive": "test-rail-bypass",
+                    },
+                )
+                assert applied.status_code == 200
+                assert applied.json()["applied"] is True
+                assert agent.privacy_mode is PrivacyMode.EPHEMERAL
+                assert wrapper.privacy_mode is PrivacyMode.EPHEMERAL
+                assert agent._pending_privacy_transition is None
+    finally:
+        if wrapper._active_explicit_fact_leases:
+            wrapper._release_explicit_fact_lease()
+        _restore_app(app, original)
 
 
 def test_privacy_mode_restores_default_cloud_model_after_local_only_transition():

@@ -133,8 +133,11 @@ def get_router() -> APIRouter:
                 invocation_id=request_id,
                 invocation_provenance=invocation_provenance,
             )
-        except Exception as e:
-            logger.error(f"Bridge invoke error: {e}", exc_info=True)
+        except Exception:
+            # Exception text and tracebacks can contain bridge message/context
+            # content.  The client receives only the fixed HTTP detail below;
+            # logs retain the event category and no request-derived material.
+            logger.error("Bridge invoke failed")
             raise HTTPException(status_code=500, detail="Agent processing error.")
 
         elapsed_ms = int((time.monotonic() - start_ms) * 1000)
@@ -209,7 +212,13 @@ def get_router() -> APIRouter:
 
         async def event_generator():
             full_response = []
+            request_lifecycle_registered = False
             try:
+                if hasattr(agent, "register_active_request"):
+                    agent.register_active_request(request_id)
+                else:
+                    agent._current_request_id = request_id
+                request_lifecycle_registered = True
                 # Wave 5E: bridge consumers (Slack/Discord/email/etc.)
                 # don't speak the chat-protocol revise sentinel —
                 # strip it before serializing each chunk into the
@@ -250,19 +259,26 @@ def get_router() -> APIRouter:
                     duration_ms=elapsed_ms,
                 )
             except Exception as e:
-                # #2674 finding 3: the FULL error goes to the operator log (a
-                # separate trust boundary); the SSE client gets ONLY a stable safe
-                # payload built by the SAME shared boundary /api/agent/stream uses.
+                # The SSE client gets only the stable safe payload built by
+                # the same shared boundary /api/agent/stream uses.  Logging
+                # also remains content-safe for gateway-provided input.
                 # Reflecting ``str(e)`` verbatim leaked a
                 # BRIDGE_STRICT_WITHHELD_PROSE_MARKER (Terra): an adapter that
                 # raises after yielding partial prose wraps that late exception,
                 # so its text can carry withheld response content under a strict
                 # buffered audit. Never emit the underlying/message/provider text.
-                logger.error(f"Bridge stream error: {e}", exc_info=True)
+                logger.error("Bridge stream failed")
                 from kestrel_sovereign.llm.streaming_errors import (
                     bridge_sse_error_event,
                 )
                 yield bridge_sse_error_event(e)
+            finally:
+                # Bridge streams use the same counted lifecycle contract as
+                # /api/agent/stream.  Duplicate retry ids deliberately share
+                # a cancellation key; each generator releases only its own
+                # registration in this finally block.
+                if request_lifecycle_registered:
+                    agent._cleanup_cancelled_request(request_id)
 
         return StreamingResponse(
             event_generator(),

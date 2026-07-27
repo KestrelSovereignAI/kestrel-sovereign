@@ -969,12 +969,13 @@ class AsyncStorage:
         return self._assertions
 
     def semantic_assertion_binding(self) -> SemanticAssertionBinding:
-        """Return storage-owned assertion metadata for a foreground adapter.
+        """Return non-authorizing storage metadata for internal consumers.
 
         The tenant and owner come from the private, agent-bound assertion
-        store—not a caller-selected ``agent_id`` or tool payload.  Privacy
-        wrappers refine the default NORMAL/private policy before exposing this
-        binding to application features.
+        store—not a caller-selected ``agent_id`` or tool payload.  Foreground
+        producers must obtain the wrapper-issued governed binding from
+        ``PrivacyEnforcingStorage``; this raw metadata never authorizes a
+        feature to skip the current privacy policy.
         """
         store = self._assertion_store()
         return SemanticAssertionBinding(
@@ -1053,6 +1054,73 @@ class AsyncStorage:
             operation_id=operation_id,
         )
 
+    async def append_assertion_source(
+        self,
+        expected_predecessor_revision_id: str,
+        replacement,
+        *,
+        source_occurrences=(),
+        operation_id: Optional[str] = None,
+    ):
+        """Append one direct source through the governed revision lifecycle."""
+        if not self._initialized:
+            await self.initialize()
+        return await self.semantic_validation_service().append_assertion_source(
+            expected_predecessor_revision_id,
+            replacement,
+            source_occurrences=source_occurrences,
+            operation_id=operation_id,
+        )
+
+    async def _restore_explicit_fact_assertion(
+        self,
+        expected_terminal_revision_id: str,
+        replacement,
+        *,
+        source_occurrences=(),
+        operation_id: Optional[str] = None,
+    ):
+        """Restore a terminal direct shell through governed SHACL validation."""
+        if not self._initialized:
+            await self.initialize()
+        return await self.semantic_validation_service()._restore_explicit_fact_assertion(
+            expected_terminal_revision_id,
+            replacement,
+            source_occurrences=source_occurrences,
+            operation_id=operation_id,
+        )
+
+    async def _replay_governed_assertion_operation(
+        self,
+        operation_id: str,
+        binding,
+    ):
+        """Read one exact accepted governed assertion-write receipt.
+
+        This is a ledger lookup, not a current-state reconstruction.  It is
+        used by the privacy-owned explicit-fact path to make delayed retries
+        stable after subsequent revisions have been committed.
+        """
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().replay_governed_assertion_operation(
+            operation_id,
+            binding,
+        )
+
+    async def _terminalize_legacy_erased_explicit_fact_operation(
+        self,
+        operation_id: str,
+        binding,
+    ):
+        """Fail closed on an exact semantic identity erased by a v3 store."""
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().terminalize_legacy_erased_explicit_fact_operation(
+            operation_id,
+            binding,
+        )
+
     async def retract_assertion(self, assertion_id: str, expected_revision_id: str, *, operation_id: Optional[str] = None):
         if not self._initialized:
             await self.initialize()
@@ -1060,11 +1128,73 @@ class AsyncStorage:
             assertion_id, expected_revision_id, operation_id=operation_id,
         )
 
-    async def delete_assertion(self, assertion_id: str, expected_revision_id: str, *, operation_id: Optional[str] = None):
+    async def delete_assertion(
+        self,
+        assertion_id: str,
+        expected_revision_id: str,
+        *,
+        operation_id: Optional[str] = None,
+    ):
         if not self._initialized:
             await self.initialize()
         return await self._assertion_store().delete(
-            assertion_id, expected_revision_id, operation_id=operation_id,
+            assertion_id,
+            expected_revision_id,
+            operation_id=operation_id,
+        )
+
+    async def _delete_explicit_fact_assertion(
+        self,
+        assertion_id: str,
+        expected_revision_id: str,
+        *,
+        operation_id: str,
+        explicit_fact_selector,
+    ):
+        """Delete one adapter fact while binding its immutable selector."""
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().delete(
+            assertion_id,
+            expected_revision_id,
+            operation_id=operation_id,
+            explicit_fact_selector=explicit_fact_selector,
+        )
+
+    async def _replay_delete_assertion_operation(self, operation_id: str):
+        """Read one exact canonical deletion receipt without mutating state."""
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().replay_delete_operation(operation_id)
+
+    async def _replay_explicit_fact_forget_operation(
+        self,
+        operation_id: str,
+        subject,
+        predicate,
+    ):
+        """Read an exact explicit-fact delete or absent-result receipt."""
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().replay_explicit_fact_forget(
+            operation_id,
+            subject,
+            predicate,
+        )
+
+    async def _record_explicit_fact_forget_noop(
+        self,
+        operation_id: str,
+        subject,
+        predicate,
+    ):
+        """Atomically persist a tenant-bound absent-result fact tombstone."""
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().record_explicit_fact_forget_noop(
+            operation_id,
+            subject,
+            predicate,
         )
 
     async def invalidate_assertion_eligibility(self, assertion_id: str, expected_revision_id: str, *, operation_id: Optional[str] = None):

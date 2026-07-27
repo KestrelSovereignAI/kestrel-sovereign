@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -185,6 +186,133 @@ async def test_assertion_crud_provenance_idempotency_and_checkpoint() -> None:
         assert checkpoint.generation == 1
         assert checkpoint.latest_event_id == written.event_id
         assert [change.revision_id for change in await store.assertion_changes_since(0)] == [assertion.revision_id]
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_governed_source_append_creates_a_validated_provenance_revision() -> None:
+    """A distinct evidence occurrence is a canonical revision, not a no-op."""
+    storage = await _storage()
+    try:
+        governed = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+        first = direct("append-first", source_id="append-source-a")
+        await governed.put_assertion(
+            first,
+            source_occurrences=(source("append-source-a"),),
+            operation_id="append-first-operation",
+        )
+        replacement = replace(
+            first,
+            revision_id="append-second",
+            lineage=DirectLineage(("append-source-a", "append-source-b")),
+        )
+
+        appended = await governed.append_assertion_source(
+            first.revision_id,
+            replacement,
+            source_occurrences=(source("append-source-b"),),
+            operation_id="append-second-operation",
+        )
+        replay = await governed.append_assertion_source(
+            first.revision_id,
+            replacement,
+            source_occurrences=(source("append-source-b"),),
+            operation_id="append-second-operation",
+        )
+
+        assert appended.accepted is True
+        assert appended.idempotent is False
+        assert replay.accepted is True
+        assert replay.idempotent is True
+        assert appended.report.report_id == replay.report.report_id
+        current = await governed.get_assertion(first.assertion_id)
+        assert current is not None
+        assert current.revision_id == replacement.revision_id
+        assert current.lineage == replacement.lineage
+        assert [
+            item.source_occurrence_id
+            for item in await governed.list_assertion_sources(first.assertion_id)
+        ] == ["append-source-a", "append-source-b"]
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_raw_storage_binding_cannot_authorize_the_explicit_fact_adapter() -> None:
+    """Raw storage, module helpers, and method aliasing cannot mint authority."""
+
+    storage = await _storage()
+    try:
+        assert not hasattr(storage, "save_explicit_fact")
+        assert not hasattr(storage, "forget_explicit_fact")
+
+        class ForwardingShim:
+            def __init__(self, wrapped) -> None:
+                self._wrapped = wrapped
+
+            def __getattr__(self, name):
+                return getattr(self._wrapped, name)
+
+        forged = ForwardingShim(storage)
+        assert not hasattr(forged, "save_explicit_fact")
+        assert not hasattr(forged, "forget_explicit_fact")
+        adapter_ledger_helpers = (
+            "replay_governed_assertion_operation",
+            "terminalize_legacy_erased_explicit_fact_operation",
+            "replay_delete_assertion_operation",
+            "replay_explicit_fact_forget_operation",
+            "record_explicit_fact_forget_noop",
+        )
+        for helper_name in adapter_ledger_helpers:
+            assert not hasattr(storage, helper_name)
+            assert not hasattr(forged, helper_name)
+        from kestrel_sovereign.storage.semantic_binding import SemanticAssertionBinding
+        import kestrel_sovereign.storage as storage_module
+        import kestrel_sovereign.storage.semantic_binding as binding_module
+        import kestrel_sovereign.features.memory_agency.semantic_facts as fact_module
+
+        raw_binding = storage.semantic_assertion_binding()
+        assert isinstance(raw_binding, SemanticAssertionBinding)
+        assert not hasattr(storage_module, "GovernedAssertionReplayBinding")
+        assert not hasattr(storage_module, "governed_assertion_replay_binding")
+        assert not hasattr(raw_binding, "_governed_marker")
+        assert not hasattr(binding_module, "_issue_governed_semantic_assertion_binding")
+        assert not hasattr(binding_module, "is_governed_semantic_assertion_binding")
+        assert not hasattr(fact_module, "GovernedFactAdapter")
+        assert not hasattr(fact_module, "_save_explicit_fact")
+        assert not hasattr(fact_module, "_forget_explicit_fact")
+
+        ephemeral = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+        with pytest.raises(PrivacyViolationError):
+            await ephemeral.save_explicit_fact(
+                subject="user",
+                predicate="preferred_deploy_region",
+                value="us-central1",
+                confidence=0.9,
+                invocation_id="ephemeral-direct-call",
+            )
+
+        # Copying the public descriptor does not copy a wrapper's captured
+        # executor.  The shim therefore cannot turn raw storage into the
+        # explicit-fact authority that PrivacyEnforcingStorage owns.
+        forged.save_explicit_fact = (
+            PrivacyEnforcingStorage.save_explicit_fact.__get__(
+                forged,
+                ForwardingShim,
+            )
+        )
+        with pytest.raises(AttributeError, match="__save_explicit_fact"):
+            await forged.save_explicit_fact(
+                subject="user",
+                predicate="preferred_deploy_region",
+                value="us-central1",
+                confidence=0.9,
+                invocation_id="shim-method-alias",
+            )
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM semantic_assertion_revisions"
+        ) == 0
     finally:
         await storage.close()
 
@@ -739,6 +867,222 @@ async def test_erasure_replay_survives_restart_without_retaining_semantic_ids(tm
 
 
 @pytest.mark.asyncio
+async def test_legacy_request_key_tombstone_with_matching_fence_fails_closed() -> None:
+    """An unreleased v4 tombstone remains terminal without being trusted."""
+    from kestrel_sovereign.storage.async_assertion_store import (
+        _erased_operation_key,
+        _erased_operation_request_key,
+        _legacy_erasure_assertion_key,
+    )
+
+    storage = await _storage()
+    try:
+        governed = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+        saved = await governed.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="legacy-request-key-region",
+            confidence=0.9,
+            invocation_id="legacy-request-key-save",
+        )
+        operation_row = await storage.db.fetchone(
+            "SELECT operation, request_digest "
+            "FROM semantic_assertion_operations "
+            "WHERE tenant_id = ? AND operation_id = ?",
+            (TENANT, saved.operation_id),
+        )
+        await governed.erase_assertion(
+            saved.assertion_id,
+            operation_id="legacy-request-key-erasure",
+        )
+        erasure_row = await storage.db.fetchone(
+            "SELECT request_digest, generation "
+            "FROM semantic_assertion_erasure_receipts "
+            "WHERE tenant_id = ?",
+            (TENANT,),
+        )
+        legacy_request_key = _erased_operation_request_key(
+            saved.operation_id,
+            str(operation_row[0]),
+            str(operation_row[1]),
+        )
+        await storage.db.execute(
+            "UPDATE semantic_assertion_erased_operation_tombstones "
+            "SET request_key = ? "
+            "WHERE tenant_id = ? AND operation_key = ?",
+            (
+                legacy_request_key,
+                TENANT,
+                _erased_operation_key(saved.operation_id),
+            ),
+        )
+        await storage.db.execute(
+            "INSERT INTO semantic_assertion_legacy_erasure_fences "
+            "(tenant_id, assertion_key, generation, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                TENANT,
+                _legacy_erasure_assertion_key(str(erasure_row[0])),
+                int(erasure_row[1]),
+                "2026-07-27T00:00:00Z",
+            ),
+        )
+
+        replay = await governed.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="legacy-request-key-region",
+            confidence=0.9,
+            invocation_id="legacy-request-key-save",
+        )
+        assert replay.saved is False
+        assert replay.idempotent is True
+        assert replay.validation_disposition == "erased:terminal"
+        assert replay.assertion_id is None
+        assert replay.revision_id is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_v3_post_erasure_upgrade_blocks_lost_save_and_append_replays(
+    tmp_path,
+) -> None:
+    """Opaque v3 erasure residue fences only the erased semantic identity."""
+    db_path = tmp_path / "v3-post-erasure-upgrade.db"
+    raw = AsyncStorage(
+        str(db_path),
+        agent_id=TENANT,
+        _assertion_tenant_capability=_assertion_capability(TENANT),
+    )
+    await raw.initialize()
+    try:
+        governed = PrivacyEnforcingStorage(raw, PrivacyMode.NORMAL)
+        original = await governed.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="legacy-erased-region",
+            confidence=0.9,
+            invocation_id="legacy-erased-original",
+        )
+        appended = await governed.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="legacy-erased-region",
+            confidence=0.9,
+            invocation_id="legacy-erased-append",
+        )
+        await governed.erase_assertion(
+            original.assertion_id,
+            operation_id="legacy-v3-erasure",
+        )
+
+        # Reproduce a durable v3 post-erasure database: the opaque erasure
+        # receipt survived, while every source operation receipt disappeared
+        # before per-operation tombstones or per-identity fences existed.
+        await raw.db.execute(
+            "DROP TABLE semantic_assertion_erased_operation_tombstones",
+        )
+        await raw.db.execute(
+            "DROP TABLE semantic_assertion_legacy_erasure_fences",
+        )
+        await raw.db.execute(
+            "DELETE FROM semantic_schema_migrations WHERE version = ?",
+            ("semantic_assertion_store_v5",),
+        )
+        await raw.db.execute(
+            "INSERT INTO semantic_schema_migrations (version) VALUES (?)",
+            ("semantic_assertion_store_v3",),
+        )
+    finally:
+        await raw.close()
+
+    restarted_raw = AsyncStorage(
+        str(db_path),
+        agent_id=TENANT,
+        _assertion_tenant_capability=_assertion_capability(TENANT),
+    )
+    await restarted_raw.initialize()
+    try:
+        restarted = PrivacyEnforcingStorage(
+            restarted_raw,
+            PrivacyMode.NORMAL,
+        )
+        old_save = await restarted.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="legacy-erased-region",
+            confidence=0.9,
+            invocation_id="legacy-erased-original",
+        )
+        old_append = await restarted.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="legacy-erased-region",
+            confidence=0.9,
+            invocation_id="legacy-erased-append",
+        )
+        for replay in (old_save, old_append):
+            assert replay.saved is False
+            assert replay.idempotent is True
+            assert replay.validation_disposition == "erased:terminal"
+            assert replay.assertion_id is None
+            assert replay.revision_id is None
+            assert replay.provenance_reference is None
+        assert await restarted.query_assertions() == []
+        assert await restarted_raw.db.fetchval(
+            "SELECT COUNT(*) "
+            "FROM semantic_assertion_erased_operation_tombstones "
+            "WHERE tenant_id = ?",
+            (TENANT,),
+        ) == 2
+
+        fence_rows = await restarted_raw.db.fetchall(
+            "SELECT assertion_key, generation "
+            "FROM semantic_assertion_legacy_erasure_fences "
+            "WHERE tenant_id = ?",
+            (TENANT,),
+        )
+        assert len(fence_rows) == 1
+        encoded_fences = repr(fence_rows)
+        for erased_value in (
+            "legacy-erased-region",
+            original.assertion_id,
+            original.revision_id,
+            appended.revision_id,
+            original.operation_id,
+            appended.operation_id,
+        ):
+            assert erased_value not in encoded_fences
+
+        ambiguous_same_content = await restarted.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="legacy-erased-region",
+            confidence=0.9,
+            invocation_id="intentional-but-ambiguous-reteach",
+        )
+        assert ambiguous_same_content.saved is False
+        assert (
+            ambiguous_same_content.validation_disposition
+            == "erased:terminal"
+        )
+
+        unrelated = await restarted.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="legitimate-post-upgrade-region",
+            confidence=0.9,
+            invocation_id="legitimate-post-upgrade",
+        )
+        assert unrelated.saved is True
+        assert unrelated.idempotent is False
+        assert await restarted.get_assertion(unrelated.assertion_id) is not None
+    finally:
+        await restarted_raw.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status", [
     AssertionStatus.SUPERSEDED,
     AssertionStatus.RETRACTED,
@@ -815,11 +1159,98 @@ async def test_inference_and_validation_schema_migrations_coexist_idempotently()
         assert await db.fetchall(
             "SELECT version FROM semantic_schema_migrations "
             "WHERE version IN (?, ?) ORDER BY version",
-            ("semantic_assertion_store_v3", "semantic_validation_reports_v1"),
+            ("semantic_assertion_store_v5", "semantic_validation_reports_v1"),
         ) == [
-            ("semantic_assertion_store_v3",),
+            ("semantic_assertion_store_v5",),
             ("semantic_validation_reports_v1",),
         ]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_v3_semantic_store_upgrades_with_erased_operation_tombstones() -> None:
+    """Existing semantic databases receive the v5 blinded replay ledgers."""
+    backend = SQLiteBackend(":memory:")
+    await backend.connect()
+    db = AsyncDatabase(backend)
+    try:
+        await db.execute(
+            "CREATE TABLE semantic_schema_migrations ("
+            "version TEXT PRIMARY KEY, completed_at TEXT NOT NULL "
+            "DEFAULT CURRENT_TIMESTAMP)",
+        )
+        await db.execute(
+            "INSERT INTO semantic_schema_migrations (version) VALUES (?)",
+            ("semantic_assertion_store_v3",),
+        )
+
+        await migrate_semantic_assertion_store(db)
+
+        assert await db.table_exists(
+            "semantic_assertion_erased_operation_tombstones"
+        )
+        assert await db.table_exists(
+            "semantic_assertion_legacy_erasure_fences"
+        )
+        assert await db.fetchall(
+            "SELECT version FROM semantic_schema_migrations ORDER BY version",
+        ) == [
+            ("semantic_assertion_store_v3",),
+            ("semantic_assertion_store_v5",),
+        ]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_v3_migration_rejects_non_integral_legacy_generation() -> None:
+    """A decimal ledger ordinal must not be truncated into an authenticated fence."""
+    backend = SQLiteBackend(":memory:")
+    await backend.connect()
+    db = AsyncDatabase(backend)
+    try:
+        await db.execute(
+            "CREATE TABLE semantic_schema_migrations ("
+            "version TEXT PRIMARY KEY, completed_at TEXT NOT NULL "
+            "DEFAULT CURRENT_TIMESTAMP)",
+        )
+        await db.execute(
+            "INSERT INTO semantic_schema_migrations (version) VALUES (?)",
+            ("semantic_assertion_store_v3",),
+        )
+        # REAL is deliberate: malformed pre-release schemas can contain a
+        # numeric value that SQLite would otherwise let int() silently truncate.
+        await db.execute(
+            "CREATE TABLE semantic_assertion_erasure_receipts ("
+            "tenant_id TEXT NOT NULL, operation_id TEXT NOT NULL, "
+            "request_digest TEXT NOT NULL, generation REAL NOT NULL, "
+            "created_at TEXT NOT NULL, PRIMARY KEY (tenant_id, operation_id))"
+        )
+        await db.execute(
+            "INSERT INTO semantic_assertion_erasure_receipts "
+            "(tenant_id, operation_id, request_digest, generation, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                TENANT,
+                "malformed-generation",
+                "a" * 64,
+                1.5,
+                "2026-07-26T14:02:11Z",
+            ),
+        )
+
+        with pytest.raises(
+            TransactionError,
+            match="malformed opaque state",
+        ) as error:
+            await migrate_semantic_assertion_store(db)
+
+        assert isinstance(error.value.__cause__, ValueError)
+        assert await db.fetchone(
+            "SELECT 1 FROM semantic_schema_migrations WHERE version = ?",
+            ("semantic_assertion_store_v5",),
+        ) is None
     finally:
         await db.close()
 
@@ -911,6 +1342,23 @@ async def test_privacy_wrapper_governs_assertions_and_graph_proxy_denies_new_sur
             await ephemeral.put_assertion(assertion, source_occurrences=(source("privacy-source"),))
         with pytest.raises(PrivacyViolationError):
             await isolated.put_assertion(assertion, source_occurrences=(source("privacy-source"),))
+        appended = replace(
+            assertion,
+            revision_id="privacy-append-revision",
+            lineage=DirectLineage(("privacy-source", "privacy-append-source")),
+        )
+        with pytest.raises(PrivacyViolationError):
+            await ephemeral.append_assertion_source(
+                assertion.revision_id,
+                appended,
+                source_occurrences=(source("privacy-append-source"),),
+            )
+        with pytest.raises(PrivacyViolationError):
+            await isolated.append_assertion_source(
+                assertion.revision_id,
+                appended,
+                source_occurrences=(source("privacy-append-source"),),
+            )
         with pytest.raises(PrivacyViolationError, match="checkpoint"):
             await ephemeral.assertion_checkpoint()
         with pytest.raises(PrivacyViolationError, match="checkpoint"):

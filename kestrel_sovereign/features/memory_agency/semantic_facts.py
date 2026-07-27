@@ -1,4 +1,4 @@
-"""Governed adapter for the explicit ``save_fact`` teaching tool.
+"""Governed lifecycle for the explicit ``save_fact`` teaching tool.
 
 The legacy tool accepts compact local strings.  They are not semantic terms on
 their own, so this module owns the deliberately small, versioned mapping from
@@ -17,8 +17,6 @@ from typing import Any
 
 from kestrel_sovereign.knowledge import (
     Assertion,
-    AssertionQuery,
-    AssertionStatus,
     DirectLineage,
     EpistemicState,
     IRI,
@@ -186,7 +184,6 @@ def _operation_material(
     value: str | None,
     confidence_requested: float | None,
     invocation_id: object,
-    lifecycle_target: str | None = None,
 ) -> tuple[str, str]:
     material: dict[str, object] = {
         "adapter_version": FACT_ADAPTER_VERSION,
@@ -199,8 +196,6 @@ def _operation_material(
         material["value"] = value
     if confidence_requested is not None:
         material["confidence_requested"] = repr(confidence_requested)
-    if lifecycle_target is not None:
-        material["lifecycle_target"] = lifecycle_target
     digest = _canonical_digest(material)
     return f"{FACT_ADAPTER_VERSION}:{action}:{digest}", digest
 
@@ -267,431 +262,73 @@ def _is_adapter_source(source: SourceOccurrence) -> bool:
     )
 
 
-async def _has_adapter_provenance(storage, assertion: Assertion) -> bool:
-    sources = await storage.list_assertion_sources(assertion.assertion_id)
-    return any(
-        _is_adapter_source(source) for source in sources
+def _assertion(
+    *,
+    binding: SemanticAssertionBinding,
+    mapping: FactMapping,
+    source: SourceOccurrence,
+    confidence: float,
+) -> Assertion:
+    """Build one proposal after the privacy wrapper has bound its metadata."""
+    return Assertion(
+        tenant_id=binding.tenant_id,
+        owning_agent_id=binding.owning_agent_id,
+        subject=mapping.subject,
+        predicate=mapping.predicate,
+        object=mapping.object,
+        revision_id=source.source_occurrence_id,
+        confidence=Decimal(str(confidence)),
+        confidence_method=_CONFIDENCE_METHOD,
+        confidence_basis=_CONFIDENCE_BASIS,
+        epistemic_state=EpistemicState.REPORTED,
+        asserted_at=source.received_at,
+        ontology_version=mapping.ontology,
+        lineage=DirectLineage((source.source_occurrence_id,)),
+        privacy_classification=binding.privacy_classification,
+        release_policy_reference=binding.release_policy_reference,
+        visibility=binding.visibility,
     )
 
 
-async def _current_for_mapping(storage, mapping: FactMapping) -> list[Assertion]:
-    assertions = await storage.query_assertions(
-        AssertionQuery(subject=mapping.subject, predicate=mapping.predicate)
-    )
-    foreign = [
-        item
-        for item in assertions
-        if not _adapter_owned(item, mapping)
-        or not await _has_adapter_provenance(storage, item)
-    ]
-    if foreign:
-        raise FactLifecycleError(
-            "the mapped subject/predicate already has a canonical assertion "
-            "outside save_fact; refusing to create a competing preference"
-        )
-    if len(assertions) > 1:
-        raise FactLifecycleError(
-            "multiple current save_fact assertions exist for the mapped "
-            "subject/predicate; repair canonical state before changing it"
-        )
-    return assertions
+def _disposition(report) -> str:
+    return f"{report.state.value}:{report.action.value}"
 
 
-async def _deleted_for_mapping(storage, mapping: FactMapping) -> list[Assertion]:
-    """Find a deleted adapter assertion only for a same-request replay.
-
-    A normal forget operation resolves an active current assertion.  The
-    deletion receipt leaves that assertion current-but-deleted, so a delivery
-    retry can recover the original active revision and ask the canonical store
-    to replay its own operation receipt.  The caller's request identity and
-    that predecessor revision select the matching deletion operation when
-    several historical shells exist.
-    """
-    assertions = await storage.query_assertions(
-        AssertionQuery(
-            subject=mapping.subject,
-            predicate=mapping.predicate,
-            statuses=(AssertionStatus.DELETED,),
-        )
-    )
-    return [
-        item
-        for item in assertions
-        if _adapter_owned(item, mapping)
-        and await _has_adapter_provenance(storage, item)
-    ]
-
-
-async def _deleted_predecessor_revision(storage, deleted: Assertion) -> str:
-    """Recover the active revision named by a canonical delete receipt."""
-    revisions = await storage.list_assertion_revisions(deleted.assertion_id)
-    active = [
-        revision.revision_id
-        for revision in revisions
-        if revision.status is AssertionStatus.ACTIVE
-    ]
-    if len(active) != 1:
-        raise FactLifecycleError(
-            "deleted save_fact assertion has no unique active predecessor for retry"
-        )
-    return active[0]
-
-
-async def _matching_source(storage, assertion: Assertion, source_id: str):
-    for occurrence in await storage.list_assertion_sources(assertion.assertion_id):
-        if occurrence.source_occurrence_id == source_id:
-            return occurrence
-    return None
-
-
-class GovernedFactAdapter:
-    """The sole explicit-fact producer over privacy-governed canonical storage."""
-
-    def __init__(self, storage) -> None:
-        self._storage = storage
-
-    def _binding(self) -> SemanticAssertionBinding:
-        binding = self._storage.semantic_assertion_binding()
-        if not isinstance(binding, SemanticAssertionBinding):
-            raise FactLifecycleError(
-                "save_fact requires an agent-bound PrivacyEnforcingStorage binding"
-            )
-        return binding
-
-    @staticmethod
-    def _assertion(
-        *,
-        binding: SemanticAssertionBinding,
-        mapping: FactMapping,
-        source: SourceOccurrence,
-        confidence: float,
-    ) -> Assertion:
-        return Assertion(
-            tenant_id=binding.tenant_id,
-            owning_agent_id=binding.owning_agent_id,
-            subject=mapping.subject,
-            predicate=mapping.predicate,
-            object=mapping.object,
-            revision_id=source.source_occurrence_id,
-            confidence=Decimal(str(confidence)),
-            confidence_method=_CONFIDENCE_METHOD,
-            confidence_basis=_CONFIDENCE_BASIS,
-            epistemic_state=EpistemicState.REPORTED,
-            # The source occurrence owns the invocation timestamp.  Reusing it
-            # for a delivery retry keeps the governed request byte-identical;
-            # the canonical store still records the actual commit boundary.
-            asserted_at=source.received_at,
-            ontology_version=mapping.ontology,
-            lineage=DirectLineage((source.source_occurrence_id,)),
-            privacy_classification=binding.privacy_classification,
-            release_policy_reference=binding.release_policy_reference,
-            visibility=binding.visibility,
-        )
-
-    async def save(
-        self,
-        *,
-        subject: str,
-        predicate: str,
-        value: str,
-        confidence: float,
-        confidence_requested: float | None = None,
-        invocation_id: object = None,
-    ) -> FactWriteReceipt:
-        invocation_id = ensure_invocation_id(invocation_id)
-        binding = self._binding()
-        mapping = map_legacy_fact(
-            subject,
-            predicate,
-            value,
-            tenant_id=binding.tenant_id,
-        )
-        operation_id, digest = _operation_material(
-            action="save",
-            subject=subject,
-            predicate=predicate,
-            value=value,
-            confidence_requested=(
-                confidence if confidence_requested is None else confidence_requested
-            ),
-            invocation_id=invocation_id,
-        )
-        provisional_source = _source_for_operation(
-            operation_id,
-            digest,
-            binding.owning_agent_id,
-        )
-        current = (await _current_for_mapping(self._storage, mapping))
-        prior = current[0] if current else None
-        source = provisional_source
-        if prior is not None and prior.object == mapping.object:
-            prior_source = await _matching_source(
-                self._storage,
-                prior,
-                provisional_source.source_occurrence_id,
-            )
-            if prior_source is None:
-                return FactWriteReceipt(
-                    saved=True,
-                    assertion_id=prior.assertion_id,
-                    revision_id=prior.revision_id,
-                    validation_disposition="existing_current",
-                    validation_report_id=None,
-                    provenance_reference=None,
-                    provenance_digest=None,
-                    operation_id=operation_id,
-                    idempotent=True,
-                )
-            source = prior_source
-        assertion = self._assertion(
-            binding=binding,
-            mapping=mapping,
-            source=source,
-            confidence=confidence,
-        )
-        if (
-            prior is not None
-            and prior.object == mapping.object
-            and source is not provisional_source
-            and prior.supersedes_revision_id is not None
-        ):
-            # A replayed replacement is no longer adjacent to its original
-            # active predecessor: the current replacement points at the
-            # superseded-history revision, which in turn records that original
-            # revision.  Recover that stored request field solely to let the
-            # canonical store match its idempotency receipt before lifecycle
-            # validation; do not use it to drive a new mutation.
-            predecessor_state = await self._storage.get_assertion_revision(
-                prior.supersedes_revision_id
-            )
-            expected_predecessor = (
-                predecessor_state.supersedes_revision_id
-                if predecessor_state is not None
-                else None
-            )
-            if expected_predecessor is None:
-                raise FactLifecycleError(
-                    "save_fact supersession retry cannot recover its canonical predecessor"
-                )
-            result = await self._storage.supersede_assertion(
-                expected_predecessor,
-                assertion,
-                source_occurrences=(source,),
-                operation_id=operation_id,
-            )
-            if not result.accepted:
-                return FactWriteReceipt(
-                    saved=False,
-                    assertion_id=None,
-                    revision_id=None,
-                    validation_disposition=f"{result.report.state.value}:{result.report.action.value}",
-                    validation_report_id=result.report.report_id,
-                    provenance_reference=source.source_occurrence_id,
-                    provenance_digest=source.content_digest,
-                    operation_id=operation_id,
-                    idempotent=False,
-                    superseded_assertion_id=prior.assertion_id,
-                    error="canonical validation did not accept the replacement fact",
-                )
-            return FactWriteReceipt(
-                saved=True,
-                assertion_id=result.replacement.assertion_id,
-                revision_id=result.replacement.revision_id,
-                validation_disposition=f"{result.report.state.value}:{result.report.action.value}",
-                validation_report_id=result.report.report_id,
-                provenance_reference=source.source_occurrence_id,
-                provenance_digest=source.content_digest,
-                operation_id=operation_id,
-                idempotent=result.idempotent,
-                superseded_assertion_id=result.predecessor.assertion_id,
-            )
-        if prior is None or prior.object == mapping.object:
-            result = await self._storage.put_assertion(
-                assertion,
-                source_occurrences=(source,),
-                operation_id=operation_id,
-            )
-            if not result.accepted:
-                return FactWriteReceipt(
-                    saved=False,
-                    assertion_id=None,
-                    revision_id=None,
-                    validation_disposition=f"{result.report.state.value}:{result.report.action.value}",
-                    validation_report_id=result.report.report_id,
-                    provenance_reference=source.source_occurrence_id,
-                    provenance_digest=source.content_digest,
-                    operation_id=operation_id,
-                    idempotent=False,
-                    error="canonical validation did not accept the fact",
-                )
-            return FactWriteReceipt(
-                saved=True,
-                assertion_id=result.assertion.assertion_id,
-                revision_id=result.assertion.revision_id,
-                validation_disposition=f"{result.report.state.value}:{result.report.action.value}",
-                validation_report_id=result.report.report_id,
-                provenance_reference=source.source_occurrence_id,
-                provenance_digest=source.content_digest,
-                operation_id=operation_id,
-                idempotent=result.idempotent,
-            )
-
-        result = await self._storage.supersede_assertion(
-            prior.revision_id,
-            assertion,
-            source_occurrences=(source,),
-            operation_id=operation_id,
-        )
-        if not result.accepted:
-            return FactWriteReceipt(
-                saved=False,
-                assertion_id=None,
-                revision_id=None,
-                validation_disposition=f"{result.report.state.value}:{result.report.action.value}",
-                validation_report_id=result.report.report_id,
-                provenance_reference=source.source_occurrence_id,
-                provenance_digest=source.content_digest,
-                operation_id=operation_id,
-                idempotent=False,
-                superseded_assertion_id=prior.assertion_id,
-                error="canonical validation did not accept the replacement fact",
-            )
+def _write_receipt_from_replay(
+    replay,
+    *,
+    source: SourceOccurrence,
+    operation_id: str,
+) -> FactWriteReceipt:
+    if getattr(replay, "terminal_erased", False):
         return FactWriteReceipt(
-            saved=True,
-            assertion_id=result.replacement.assertion_id,
-            revision_id=result.replacement.revision_id,
-            validation_disposition=f"{result.report.state.value}:{result.report.action.value}",
-            validation_report_id=result.report.report_id,
-            provenance_reference=source.source_occurrence_id,
-            provenance_digest=source.content_digest,
+            saved=False,
+            assertion_id=None,
+            revision_id=None,
+            validation_disposition="erased:terminal",
+            validation_report_id=None,
+            provenance_reference=None,
+            provenance_digest=None,
             operation_id=operation_id,
-            idempotent=result.idempotent,
-            superseded_assertion_id=result.predecessor.assertion_id,
+            idempotent=True,
+            error=(
+                "the original semantic write was physically erased and "
+                "cannot be replayed"
+            ),
         )
-
-    async def forget(
-        self,
-        *,
-        subject: str,
-        predicate: str,
-        invocation_id: object = None,
-    ) -> FactDeleteReceipt:
-        invocation_id = ensure_invocation_id(invocation_id)
-        binding = self._binding()
-        mapping = map_legacy_fact(
-            subject,
-            predicate,
-            "forgetting-target",
-            tenant_id=binding.tenant_id,
-        )
-        current = await _current_for_mapping(self._storage, mapping)
-        if not current:
-            deleted = await _deleted_for_mapping(self._storage, mapping)
-            # A subject/predicate may have more than one historical deletion.
-            # The request-bound operation id includes the active predecessor,
-            # so ask the canonical lifecycle to replay only the one whose
-            # ledger receipt matches this invocation.  A non-matching deleted
-            # shell cannot mutate: ``delete_assertion`` requires an ACTIVE
-            # expected revision before it can create any new state.
-            for target in deleted:
-                sources = await self._storage.list_assertion_sources(
-                    target.assertion_id
-                )
-                source = next(
-                    (
-                        item
-                        for item in sources
-                        if _is_adapter_source(item)
-                    ),
-                    None,
-                )
-                if source is None:
-                    raise FactLifecycleError(
-                        "deleted assertion lacks save_fact provenance and cannot be replayed"
-                    )
-                predecessor_revision = await _deleted_predecessor_revision(
-                    self._storage, target
-                )
-                operation_id, _ = _operation_material(
-                    action="forget",
-                    subject=subject,
-                    predicate=predicate,
-                    value=None,
-                    confidence_requested=None,
-                    invocation_id=invocation_id,
-                    lifecycle_target=predecessor_revision,
-                )
-                try:
-                    result = await self._storage.delete_assertion(
-                        target.assertion_id,
-                        predecessor_revision,
-                        operation_id=operation_id,
-                    )
-                except ValueError:
-                    # The canonical lifecycle rejects a deleted shell whose
-                    # operation receipt does not match this retry.  It cannot
-                    # mutate because the supplied predecessor is no longer
-                    # ACTIVE; continue only to another deleted shell.
-                    continue
-                if not result.idempotent:
-                    raise FactLifecycleError(
-                        "a deleted save_fact assertion unexpectedly accepted a new deletion"
-                    )
-                return FactDeleteReceipt(
-                    deleted=True,
-                    assertion_id=result.deleted.assertion_id,
-                    revision_id=result.deleted.revision_id,
-                    provenance_reference=source.source_occurrence_id,
-                    operation_id=operation_id,
-                    idempotent=result.idempotent,
-                )
-            operation_id, _ = _operation_material(
-                action="forget",
-                subject=subject,
-                predicate=predicate,
-                value=None,
-                confidence_requested=None,
-                invocation_id=invocation_id,
-            )
-            return FactDeleteReceipt(
-                deleted=False,
-                assertion_id=None,
-                revision_id=None,
-                provenance_reference=None,
-                operation_id=operation_id,
-                idempotent=True,
-                error="no current save_fact assertion exists for the mapped subject/predicate",
-            )
-        target = current[0]
-        operation_id, _ = _operation_material(
-            action="forget",
-            subject=subject,
-            predicate=predicate,
-            value=None,
-            confidence_requested=None,
-            invocation_id=invocation_id,
-            lifecycle_target=target.revision_id,
-        )
-        sources = await self._storage.list_assertion_sources(target.assertion_id)
-        adapter_sources = [
-            source
-            for source in sources
-            if _is_adapter_source(source)
-        ]
-        if not adapter_sources:
-            raise FactLifecycleError(
-                "current assertion lacks save_fact provenance and cannot be deleted by this tool"
-            )
-        result = await self._storage.delete_assertion(
-            target.assertion_id,
-            target.revision_id,
-            operation_id=operation_id,
-        )
-        return FactDeleteReceipt(
-            deleted=True,
-            assertion_id=result.deleted.assertion_id,
-            revision_id=result.deleted.revision_id,
-            provenance_reference=adapter_sources[0].source_occurrence_id,
-            operation_id=operation_id,
-            idempotent=result.idempotent,
-        )
+    return FactWriteReceipt(
+        saved=True,
+        assertion_id=replay.assertion.assertion_id,
+        revision_id=replay.assertion.revision_id,
+        validation_disposition=_disposition(replay.report),
+        validation_report_id=replay.report.report_id,
+        provenance_reference=source.source_occurrence_id,
+        provenance_digest=source.content_digest,
+        operation_id=operation_id,
+        idempotent=True,
+        superseded_assertion_id=(
+            replay.predecessor.assertion_id
+            if replay.predecessor is not None
+            else None
+        ),
+    )

@@ -795,11 +795,10 @@ class MemoryAgencyFeature(Feature):
             from kestrel_sovereign.features.memory_agency.semantic_facts import (
                 FactLifecycleError,
                 FactMappingError,
-                GovernedFactAdapter,
             )
             from kestrel_sovereign.storage.privacy_wrapper import PrivacyViolationError
 
-            receipt = await GovernedFactAdapter(self.storage).save(
+            receipt = await self.storage.save_explicit_fact(
                 subject=subject,
                 predicate=predicate,
                 value=value,
@@ -814,33 +813,54 @@ class MemoryAgencyFeature(Feature):
             RuntimeError,
             ValueError,
         ) as e:
-            logger.info("save_fact canonical write refused: %s", e)
+            # Refusal text can include rejected legacy terms.  The tool result
+            # returns the actionable error to its caller, but logs retain only
+            # fixed event metadata so explicit fact content never escapes.
+            logger.info("save_fact canonical write refused")
             return ToolResult.failed(str(e))
 
         logger.info(
-            "save_fact canonical result: %s.%s=%s (assertion=%s, saved=%s)",
-            subject, predicate, value,
-            receipt.assertion_id, receipt.saved,
+            "save_fact canonical write completed saved=%s idempotent=%s",
+            receipt.saved,
+            receipt.idempotent,
         )
 
-        data = {
-            "saved": receipt.saved,
-            "subject": subject,
-            "predicate": predicate,
-            "value": value,
-            "confidence": clamped_confidence,
-            "confidence_requested": confidence_val,
-            "confidence_clamped": was_clamped,
-            "assertion_id": receipt.assertion_id,
-            "revision_id": receipt.revision_id,
-            "validation_disposition": receipt.validation_disposition,
-            "validation_report_id": receipt.validation_report_id,
-            "provenance_reference": receipt.provenance_reference,
-            "provenance_digest": receipt.provenance_digest,
-            "operation_id": receipt.operation_id,
-            "idempotent": receipt.idempotent,
-            "superseded_assertion_id": receipt.superseded_assertion_id,
-        }
+        if receipt.validation_disposition == "erased:terminal":
+            # The caller already supplied the retry arguments, but reflecting
+            # them would make a terminal replay look like retained semantic
+            # content.  Return only the blinded operation disposition and
+            # explicit absence of every erased identity/provenance field.
+            data = {
+                "saved": False,
+                "assertion_id": None,
+                "revision_id": None,
+                "validation_disposition": receipt.validation_disposition,
+                "validation_report_id": None,
+                "provenance_reference": None,
+                "provenance_digest": None,
+                "operation_id": receipt.operation_id,
+                "idempotent": True,
+                "superseded_assertion_id": None,
+            }
+        else:
+            data = {
+                "saved": receipt.saved,
+                "subject": subject,
+                "predicate": predicate,
+                "value": value,
+                "confidence": clamped_confidence,
+                "confidence_requested": confidence_val,
+                "confidence_clamped": was_clamped,
+                "assertion_id": receipt.assertion_id,
+                "revision_id": receipt.revision_id,
+                "validation_disposition": receipt.validation_disposition,
+                "validation_report_id": receipt.validation_report_id,
+                "provenance_reference": receipt.provenance_reference,
+                "provenance_digest": receipt.provenance_digest,
+                "operation_id": receipt.operation_id,
+                "idempotent": receipt.idempotent,
+                "superseded_assertion_id": receipt.superseded_assertion_id,
+            }
 
         if not receipt.saved:
             return ToolResult.failed(
@@ -894,11 +914,10 @@ class MemoryAgencyFeature(Feature):
             from kestrel_sovereign.features.memory_agency.semantic_facts import (
                 FactLifecycleError,
                 FactMappingError,
-                GovernedFactAdapter,
             )
             from kestrel_sovereign.storage.privacy_wrapper import PrivacyViolationError
 
-            receipt = await GovernedFactAdapter(self.storage).forget(
+            receipt = await self.storage.forget_explicit_fact(
                 subject=subject,
                 predicate=predicate,
                 invocation_id=ensure_invocation_id(current_invocation_id()),
@@ -910,7 +929,7 @@ class MemoryAgencyFeature(Feature):
             RuntimeError,
             ValueError,
         ) as e:
-            logger.info("forget_fact canonical lifecycle refused: %s", e)
+            logger.info("forget_fact canonical lifecycle refused")
             return ToolResult.failed(str(e))
 
         data = {

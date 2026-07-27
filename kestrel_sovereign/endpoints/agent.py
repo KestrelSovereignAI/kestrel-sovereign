@@ -30,6 +30,10 @@ from kestrel_sovereign.agent.invocation import (
     invocation_id_response_header,
     new_stream_delivery_id,
 )
+from kestrel_sovereign.storage.privacy_wrapper import (
+    PRIVACY_TRANSITION_RETRY_MESSAGE,
+    PrivacyViolationError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +51,15 @@ router = APIRouter(prefix="/api/agent", tags=["agent"])
 _INVALID_JSON_ESCAPE = re.compile(rb'\\([^"\\/bfnrtu])')
 
 LEGACY_CONTEXT_MODEL = "legacy/unknown"
+
+
+def _privacy_transition_conflict() -> HTTPException:
+    """Return the content-safe retry contract for an active fact lease."""
+    return HTTPException(
+        status_code=409,
+        detail=PRIVACY_TRANSITION_RETRY_MESSAGE,
+        headers={"Retry-After": "1"},
+    )
 
 
 def _invalid_json_message(error: ValueError) -> str:
@@ -215,8 +228,11 @@ async def invoke_agent(request: Request, http_response: Response):
         }
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error invoking agent: {e}", exc_info=True)
+    except Exception:
+        # Invocation failures can wrap caller content, provider errors, or a
+        # client-controlled retry id.  Keep the operator event useful without
+        # recording any of those values outside the governed request path.
+        logger.error("Agent invocation failed")
         raise ApiHTTPException(
             status_code=500,
             code="invoke_failed",
@@ -495,12 +511,16 @@ async def stream_agent_response(request: Request):
                     yield stop_notice
                     stop_notice_emitted = True
             except Exception as e:
-                # #2674 findings 4 & 6: log the FULL error (class + message +
-                # trace) to the operator log with the request id for triage — a
-                # separate trust boundary from the user stream.
+                # A request id and exception text can be client-controlled or
+                # contain withheld content.  Keep only a one-way correlation
+                # in the operator log; the client receives the shared safe
+                # error boundary below.
+                from kestrel_sovereign.agent.invocation import (
+                    invocation_log_correlation,
+                )
                 logger.error(
-                    "Streaming error (request %s): %s",
-                    request_id, e, exc_info=True,
+                    "Streaming request failed (correlation=%s)",
+                    invocation_log_correlation(request_id),
                 )
                 # #2674 findings 3 & 4: emit the user-visible error through the
                 # ONE shared safe boundary used by /api/bridge/stream too, so the
@@ -512,7 +532,7 @@ async def stream_agent_response(request: Request):
                 # ROUTE_FIELD_UNBOUNDED_MARKER__WITHHELD_TEXT). A route failure
                 # still gets the no-blind-fallback / recovery guidance via a
                 # CONSTANT "your selected model route" label; the failing route
-                # and full error stay operator-log only.
+                # and full error remain unavailable to this transport.
                 from kestrel_sovereign.llm.streaming_errors import (
                     agent_stream_error_block,
                 )
@@ -539,9 +559,9 @@ async def stream_agent_response(request: Request):
     except HTTPException:
         cleanup_unstarted_stream()
         raise
-    except Exception as e:
+    except Exception:
         cleanup_unstarted_stream()
-        logger.error(f"Error setting up stream: {e}", exc_info=True)
+        logger.error("Error setting up stream")
         raise ApiHTTPException(
             status_code=500,
             code="stream_setup_failed",
@@ -557,7 +577,24 @@ async def stop_agent_request(request: Request):
     """
     try:
         data = await _parse_optional_json_body(request)
-        request_id = data.get("request_id") or request.query_params.get("request_id")
+        # The body and query forms predate the shared retry-header contract and
+        # remain literal values.  Only X-Request-ID is a percent-encoded wire
+        # form, so a client can copy an invoke/stream response header here
+        # verbatim without forking the cancellation key.
+        explicit_request_id = (
+            data.get("request_id") or request.query_params.get("request_id")
+        )
+        request_id = (
+            resolve_request_invocation_id(
+                request,
+                {"request_id": explicit_request_id}
+                if explicit_request_id is not None
+                else {},
+            )
+            if explicit_request_id is not None
+            or request.headers.get("X-Request-ID") is not None
+            else None
+        )
         agent = get_agent(request)
         cancelled = agent.cancel_current_request(request_id=request_id)
         return {
@@ -680,6 +717,9 @@ async def set_privacy_mode(request: Request):
                 "message": transition.message,
             }
 
+        if getattr(transition, "retryable_conflict", False):
+            raise _privacy_transition_conflict()
+
         # An EPHEMERAL exit was REFUSED because a required no-trace purge sweep
         # failed (#2673). Nothing flipped — the agent stayed in EPHEMERAL — so we
         # must report the ACTUAL (unchanged) mode and failure, never success.
@@ -776,6 +816,11 @@ async def set_privacy_mode(request: Request):
         }
     except HTTPException:
         raise
+    except PrivacyViolationError:
+        # Never interpolate the exception: storage/provider details are not
+        # part of the public response or operator log contract.
+        logger.info("Privacy mode change deferred by an active fact operation")
+        raise _privacy_transition_conflict()
     except Exception as e:
         logger.error(f"Error setting privacy mode: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error setting privacy mode.")
@@ -798,6 +843,8 @@ async def confirm_privacy_mode(request: Request):
         if not getattr(type(agent), "confirm_privacy_transition", None):
             raise HTTPException(status_code=400, detail="Agent does not support staged privacy transitions.")
         result = await agent.confirm_privacy_transition()
+        if getattr(result, "retryable_conflict", False):
+            raise _privacy_transition_conflict()
         # applied is False for a no-op confirm (nothing was pending) as well as
         # for a staged result — so a stale/double-click confirm reports success
         # False instead of masquerading as an applied transition.
@@ -814,6 +861,11 @@ async def confirm_privacy_mode(request: Request):
         }
     except HTTPException:
         raise
+    except PrivacyViolationError:
+        logger.info(
+            "Privacy mode confirmation deferred by an active fact operation"
+        )
+        raise _privacy_transition_conflict()
     except Exception as e:
         logger.error(f"Error confirming privacy mode: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error confirming privacy mode.")

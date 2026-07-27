@@ -13,8 +13,8 @@ class SemanticAssertionBinding:
 
     This is deliberately not an authorization capability.  The canonical
     assertion store still checks its private tenant capability on every write;
-    this value only keeps adapters from accepting tenant, owner, or privacy
-    fields as untrusted tool arguments.
+    it only keeps adapters from accepting tenant, owner, or privacy fields as
+    untrusted tool arguments.
     """
 
     tenant_id: str

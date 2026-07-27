@@ -89,6 +89,49 @@ def _semantic_assertion(tenant_id: str, revision_id: str, *, value: str = "value
     )
 
 
+def _explicit_fact_proposal(
+    storage: AsyncStorage,
+    *,
+    value: str,
+    confidence: float,
+    invocation_id: str,
+):
+    """Build the deterministic adapter proposal without crossing its writer."""
+    from kestrel_sovereign.features.memory_agency.semantic_facts import (
+        _assertion,
+        _operation_material,
+        _source_for_operation,
+        map_legacy_fact,
+    )
+
+    binding = storage.semantic_assertion_binding()
+    operation_id, digest = _operation_material(
+        action="save",
+        subject="user",
+        predicate="preferred_deploy_region",
+        value=value,
+        confidence_requested=confidence,
+        invocation_id=invocation_id,
+    )
+    source = _source_for_operation(
+        operation_id,
+        digest,
+        binding.owning_agent_id,
+    )
+    proposal = _assertion(
+        binding=binding,
+        mapping=map_legacy_fact(
+            "user",
+            "preferred_deploy_region",
+            value,
+            tenant_id=binding.tenant_id,
+        ),
+        source=source,
+        confidence=confidence,
+    )
+    return operation_id, source, proposal
+
+
 def _derived_semantic_assertion(tenant_id: str, revision_id: str, input_revision_id: str, marker: str):
     from kestrel_sovereign.knowledge import (
         Assertion,
@@ -270,46 +313,63 @@ async def test_save_fact_adapter_has_canonical_create_retry_supersede_delete_res
     tmp_path,
 ):
     """The explicit teaching tool never needs a learned_fact graph row as truth."""
-    from kestrel_sovereign.features.memory_agency.semantic_facts import GovernedFactAdapter
-
     tenant, identity = await _incepted_assertion_identity(tmp_path, "save-fact-adapter")
     raw_storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
     try:
         storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
-        adapter = GovernedFactAdapter(storage)
-        first = await adapter.save(
+        first = await storage.save_explicit_fact(
             subject="user",
             predicate="preferred_deploy_region",
             value="us-central1",
             confidence=0.9,
             invocation_id="http-invoke-nonce",
         )
-        replay = await adapter.save(
+        replay = await storage.save_explicit_fact(
             subject="user",
             predicate="preferred_deploy_region",
             value="us-central1",
             confidence=0.9,
             invocation_id="http-invoke-nonce",
         )
-        replacement = await adapter.save(
-            subject="user",
-            predicate="preferred_deploy_region",
-            value="europe-west4",
-            confidence=0.9,
-            invocation_id="http-invoke-replacement",
-        )
-        replacement_replay = await adapter.save(
-            subject="user",
-            predicate="preferred_deploy_region",
-            value="europe-west4",
-            confidence=0.9,
-            invocation_id="http-invoke-replacement",
-        )
-
         assert first.saved is True
         assert replay.saved is True
         assert replay.idempotent is True
         assert replay.assertion_id == first.assertion_id
+        same_value_new_invocation = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="us-central1",
+            confidence=0.9,
+            invocation_id="http-invoke-second-source",
+        )
+        same_value_replay = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="us-central1",
+            confidence=0.9,
+            invocation_id="http-invoke-second-source",
+        )
+        assert same_value_new_invocation.saved is True
+        assert same_value_new_invocation.idempotent is False
+        assert same_value_new_invocation.assertion_id == first.assertion_id
+        assert same_value_new_invocation.provenance_reference != first.provenance_reference
+        assert same_value_replay.idempotent is True
+        assert same_value_replay.provenance_reference == same_value_new_invocation.provenance_reference
+        assert len(await storage.list_assertion_sources(first.assertion_id)) == 2
+        replacement = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="europe-west4",
+            confidence=0.9,
+            invocation_id="http-invoke-replacement",
+        )
+        replacement_replay = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="europe-west4",
+            confidence=0.9,
+            invocation_id="http-invoke-replacement",
+        )
         assert replacement.saved is True
         assert replacement.superseded_assertion_id == first.assertion_id
         assert replacement.assertion_id != first.assertion_id
@@ -320,14 +380,14 @@ async def test_save_fact_adapter_has_canonical_create_retry_supersede_delete_res
         assert replacement_replay.assertion_id == replacement.assertion_id
         assert await raw_storage.get_nodes_by_type("learned_fact") == []
 
-        deleted = await adapter.forget(
+        deleted = await storage.forget_explicit_fact(
             subject="user",
             predicate="preferred_deploy_region",
             invocation_id="http-invoke-delete",
         )
         assert deleted.deleted is True
         assert await storage.get_assertion(replacement.assertion_id) is None
-        deleted_replay = await adapter.forget(
+        deleted_replay = await storage.forget_explicit_fact(
             subject="user",
             predicate="preferred_deploy_region",
             invocation_id="http-invoke-delete",
@@ -337,21 +397,21 @@ async def test_save_fact_adapter_has_canonical_create_retry_supersede_delete_res
         assert deleted_replay.assertion_id == replacement.assertion_id
 
         # Historical deleted shells must not make a later, distinct explicit
-        # fact ambiguous.  Its delete retry selects the original canonical
-        # operation by request identity and active predecessor revision.
-        after_delete = await adapter.save(
+        # fact ambiguous.  Its delete retry replays the original canonical
+        # ledger receipt rather than scanning historical active revisions.
+        after_delete = await storage.save_explicit_fact(
             subject="user",
             predicate="preferred_deploy_region",
             value="asia-south1",
             confidence=0.9,
             invocation_id="http-invoke-after-delete",
         )
-        after_delete_removed = await adapter.forget(
+        after_delete_removed = await storage.forget_explicit_fact(
             subject="user",
             predicate="preferred_deploy_region",
             invocation_id="http-invoke-after-delete-remove",
         )
-        after_delete_replay = await adapter.forget(
+        after_delete_replay = await storage.forget_explicit_fact(
             subject="user",
             predicate="preferred_deploy_region",
             invocation_id="http-invoke-after-delete-remove",
@@ -375,14 +435,699 @@ async def test_save_fact_adapter_has_canonical_create_retry_supersede_delete_res
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_deleted_fact_same_value_reteach_restores_fresh_validated_revision(
+    db_backend,
+    tmp_path,
+):
+    """A distinct exact re-teach restores a deleted shell and replays exactly."""
+    from kestrel_sovereign.knowledge import AssertionStatus
+
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path,
+        "save-fact-same-value-restoration",
+    )
+    raw_storage = await _assertion_storage_for_backend(
+        db_backend,
+        tenant,
+        identity,
+    )
+    try:
+        storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
+        first = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="same-after-delete",
+            confidence=0.9,
+            invocation_id="same-after-delete-first",
+        )
+        deleted = await storage.forget_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            invocation_id="same-after-delete-forget",
+        )
+        deleted_shell = await storage.get_assertion(
+            first.assertion_id,
+            include_inactive=True,
+        )
+        assert deleted.deleted is True
+        assert deleted_shell.status is AssertionStatus.DELETED
+
+        restored = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="same-after-delete",
+            confidence=0.9,
+            invocation_id="same-after-delete-restored",
+        )
+        retry = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="same-after-delete",
+            confidence=0.9,
+            invocation_id="same-after-delete-restored",
+        )
+
+        assert restored.saved is True
+        assert restored.idempotent is False
+        assert restored.assertion_id == first.assertion_id
+        assert restored.revision_id != first.revision_id
+        assert restored.provenance_reference != first.provenance_reference
+        assert retry.saved is True
+        assert retry.idempotent is True
+        assert retry.revision_id == restored.revision_id
+        assert retry.provenance_reference == restored.provenance_reference
+
+        current = await storage.get_assertion(first.assertion_id)
+        restored_source = await storage.get_source_occurrence(
+            restored.provenance_reference
+        )
+        assert current.status is AssertionStatus.ACTIVE
+        assert current.supersedes_revision_id == deleted_shell.revision_id
+        assert current.asserted_at == restored_source.received_at
+        revisions = await storage.list_assertion_revisions(
+            first.assertion_id
+        )
+        assert [item.status for item in revisions] == [
+            AssertionStatus.ACTIVE,
+            AssertionStatus.DELETED,
+            AssertionStatus.ACTIVE,
+        ]
+        assert len(await storage.list_assertion_sources(first.assertion_id)) == 2
+    finally:
+        await raw_storage.close()
+
+    restarted_raw = await _assertion_storage_for_backend(
+        db_backend,
+        tenant,
+        identity,
+    )
+    try:
+        restarted = PrivacyEnforcingStorage(
+            restarted_raw,
+            PrivacyMode.NORMAL,
+        )
+        restarted_retry = await restarted.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="same-after-delete",
+            confidence=0.9,
+            invocation_id="same-after-delete-restored",
+        )
+        assert restarted_retry.saved is True
+        assert restarted_retry.idempotent is True
+        assert restarted_retry.revision_id == restored.revision_id
+        assert (
+            restarted_retry.provenance_reference
+            == restored.provenance_reference
+        )
+    finally:
+        await restarted_raw.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_concurrent_same_value_reteaches_after_delete_preserve_both_sources(
+    db_backend,
+    tmp_path,
+):
+    """One restoration and one bounded redecision retain both encounters."""
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path,
+        "save-fact-concurrent-restoration",
+    )
+    raw_storage = await _assertion_storage_for_backend(
+        db_backend,
+        tenant,
+        identity,
+    )
+    try:
+        storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
+        first = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="concurrent-restore-region",
+            confidence=0.9,
+            invocation_id="concurrent-restore-first",
+        )
+        await storage.forget_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            invocation_id="concurrent-restore-forget",
+        )
+
+        original_restore = raw_storage._restore_explicit_fact_assertion
+        both_arrived = asyncio.Event()
+        release = asyncio.Event()
+        arrivals = 0
+
+        async def synchronized_restore(*args, **kwargs):
+            nonlocal arrivals
+            arrivals += 1
+            if arrivals == 2:
+                both_arrived.set()
+            await release.wait()
+            return await original_restore(*args, **kwargs)
+
+        raw_storage._restore_explicit_fact_assertion = synchronized_restore
+
+        async def reteach(invocation_id):
+            return await storage.save_explicit_fact(
+                subject="user",
+                predicate="preferred_deploy_region",
+                value="concurrent-restore-region",
+                confidence=0.9,
+                invocation_id=invocation_id,
+            )
+
+        tasks = (
+            asyncio.create_task(reteach("concurrent-restore-a")),
+            asyncio.create_task(reteach("concurrent-restore-b")),
+        )
+        await asyncio.wait_for(both_arrived.wait(), timeout=5)
+        release.set()
+        results = await asyncio.gather(*tasks)
+
+        assert all(result.saved for result in results)
+        assert all(not result.idempotent for result in results)
+        assert {result.assertion_id for result in results} == {
+            first.assertion_id
+        }
+        assert len(
+            {
+                result.provenance_reference
+                for result in results
+            }
+        ) == 2
+        sources = await storage.list_assertion_sources(first.assertion_id)
+        assert len(sources) == 3
+        current = await storage.get_assertion(first.assertion_id)
+        assert set(current.lineage.source_occurrence_ids) == {
+            result.provenance_reference for result in results
+        }
+    finally:
+        await raw_storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_save_fact_live_replay_rejects_forged_matching_result_ids(
+    db_backend,
+    tmp_path,
+):
+    """Exact IDs cannot hide forged immutable assertion metadata."""
+    from decimal import Decimal
+
+    from kestrel_sovereign.storage.async_assertion_store import (
+        AssertionConflictError,
+    )
+
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path,
+        "save-fact-live-result-binding",
+    )
+    raw_storage = await _assertion_storage_for_backend(
+        db_backend,
+        tenant,
+        identity,
+    )
+    try:
+        operation_id, source, proposal = _explicit_fact_proposal(
+            raw_storage,
+            value="binding-live",
+            confidence=0.9,
+            invocation_id="binding-live-invocation",
+        )
+        forged = replace(
+            proposal,
+            confidence=Decimal("0.1"),
+            confidence_method="forged-confidence",
+            confidence_basis="untrusted-preseed",
+        )
+        await raw_storage.put_assertion(
+            forged,
+            source_occurrences=(source,),
+            operation_id=operation_id,
+        )
+
+        storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
+        with pytest.raises(
+            AssertionConflictError,
+            match="different governed assertion metadata",
+        ):
+            await storage.save_explicit_fact(
+                subject="user",
+                predicate="preferred_deploy_region",
+                value="binding-live",
+                confidence=0.9,
+                invocation_id="binding-live-invocation",
+            )
+        current = await storage.get_assertion(proposal.assertion_id)
+        assert current.confidence == Decimal("0.1")
+        assert current.confidence_method == "forged-confidence"
+    finally:
+        await raw_storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_save_fact_erased_replay_rejects_forged_matching_result_ids(
+    db_backend,
+    tmp_path,
+):
+    """The blinded erased result key enforces the same proposal binding."""
+    from decimal import Decimal
+
+    from kestrel_sovereign.storage.async_assertion_store import (
+        AssertionConflictError,
+    )
+
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path,
+        "save-fact-erased-result-binding",
+    )
+    raw_storage = await _assertion_storage_for_backend(
+        db_backend,
+        tenant,
+        identity,
+    )
+    try:
+        operation_id, source, proposal = _explicit_fact_proposal(
+            raw_storage,
+            value="binding-erased",
+            confidence=0.9,
+            invocation_id="binding-erased-invocation",
+        )
+        forged = replace(
+            proposal,
+            confidence=Decimal("0.1"),
+            privacy_classification="forged-private",
+            release_policy_reference="policy:forged-v1",
+        )
+        await raw_storage.put_assertion(
+            forged,
+            source_occurrences=(source,),
+            operation_id=operation_id,
+        )
+        await raw_storage.erase_assertion(
+            proposal.assertion_id,
+            operation_id="binding-erased-physical-erasure",
+        )
+    finally:
+        await raw_storage.close()
+
+    restarted_raw = await _assertion_storage_for_backend(
+        db_backend,
+        tenant,
+        identity,
+    )
+    try:
+        restarted = PrivacyEnforcingStorage(
+            restarted_raw,
+            PrivacyMode.NORMAL,
+        )
+        with pytest.raises(
+            AssertionConflictError,
+            match="different erased governed assertion result",
+        ):
+            await restarted.save_explicit_fact(
+                subject="user",
+                predicate="preferred_deploy_region",
+                value="binding-erased",
+                confidence=0.9,
+                invocation_id="binding-erased-invocation",
+            )
+        assert await restarted.query_assertions() == []
+    finally:
+        await restarted_raw.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_save_fact_replay_rejects_reordered_append_lineage(
+    db_backend,
+    tmp_path,
+):
+    """A colliding append must be predecessor lineage plus one new source."""
+    from kestrel_sovereign.knowledge import DirectLineage
+    from kestrel_sovereign.storage.async_assertion_store import (
+        AssertionConflictError,
+    )
+
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path,
+        "save-fact-reordered-append-binding",
+    )
+    raw_storage = await _assertion_storage_for_backend(
+        db_backend,
+        tenant,
+        identity,
+    )
+    try:
+        storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
+        first = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="lineage-region",
+            confidence=0.9,
+            invocation_id="lineage-first",
+        )
+        operation_id, new_source, _ = _explicit_fact_proposal(
+            raw_storage,
+            value="lineage-region",
+            confidence=0.9,
+            invocation_id="lineage-reordered",
+        )
+        current = await storage.get_assertion(first.assertion_id)
+        reordered = replace(
+            current,
+            revision_id=new_source.source_occurrence_id,
+            asserted_at=new_source.received_at,
+            supersedes_revision_id=None,
+            lineage=DirectLineage(
+                (
+                    new_source.source_occurrence_id,
+                    *current.lineage.source_occurrence_ids,
+                )
+            ),
+        )
+        await raw_storage.supersede_assertion(
+            current.revision_id,
+            reordered,
+            source_occurrences=(new_source,),
+            operation_id=operation_id,
+        )
+
+        with pytest.raises(
+            AssertionConflictError,
+            match="different governed assertion result",
+        ):
+            await storage.save_explicit_fact(
+                subject="user",
+                predicate="preferred_deploy_region",
+                value="lineage-region",
+                confidence=0.9,
+                invocation_id="lineage-reordered",
+            )
+    finally:
+        await raw_storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_save_fact_erased_replay_rejects_extra_direct_source(
+    db_backend,
+    tmp_path,
+):
+    """Erasure authenticates only the adapter's exact one-source put shape."""
+    from kestrel_sovereign.knowledge import DirectLineage, SourceOccurrence
+    from kestrel_sovereign.storage.async_assertion_store import (
+        AssertionConflictError,
+    )
+
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path,
+        "save-fact-erased-extra-source-binding",
+    )
+    raw_storage = await _assertion_storage_for_backend(
+        db_backend,
+        tenant,
+        identity,
+    )
+    try:
+        operation_id, source, proposal = _explicit_fact_proposal(
+            raw_storage,
+            value="extra-source-region",
+            confidence=0.9,
+            invocation_id="extra-source-invocation",
+        )
+        extra_source = SourceOccurrence(
+            source_occurrence_id=f"{source.source_occurrence_id}:extra",
+            source_kind=source.source_kind,
+            locator=f"{source.locator}:extra",
+            received_at=source.received_at,
+            content_digest="sha256:extra-source",
+            actor=source.actor,
+            selector=source.selector,
+        )
+        forged = replace(
+            proposal,
+            lineage=DirectLineage(
+                (
+                    source.source_occurrence_id,
+                    extra_source.source_occurrence_id,
+                )
+            ),
+        )
+        await raw_storage.put_assertion(
+            forged,
+            source_occurrences=(source, extra_source),
+            operation_id=operation_id,
+        )
+        await raw_storage.erase_assertion(
+            proposal.assertion_id,
+            operation_id="extra-source-physical-erasure",
+        )
+    finally:
+        await raw_storage.close()
+
+    restarted_raw = await _assertion_storage_for_backend(
+        db_backend,
+        tenant,
+        identity,
+    )
+    try:
+        restarted = PrivacyEnforcingStorage(
+            restarted_raw,
+            PrivacyMode.NORMAL,
+        )
+        with pytest.raises(
+            AssertionConflictError,
+            match="different erased governed assertion result",
+        ):
+            await restarted.save_explicit_fact(
+                subject="user",
+                predicate="preferred_deploy_region",
+                value="extra-source-region",
+                confidence=0.9,
+                invocation_id="extra-source-invocation",
+            )
+    finally:
+        await restarted_raw.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_forget_replay_rejects_unrelated_raw_delete_preseed(
+    db_backend,
+    tmp_path,
+):
+    """A future forget operation ID cannot bind an unrelated deletion."""
+    from kestrel_sovereign.features.memory_agency.semantic_facts import (
+        _operation_material,
+    )
+    from kestrel_sovereign.storage.async_assertion_store import (
+        AssertionConflictError,
+    )
+
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path,
+        "forget-live-selector-binding",
+    )
+    raw_storage = await _assertion_storage_for_backend(
+        db_backend,
+        tenant,
+        identity,
+    )
+    try:
+        storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
+        desired = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="forget-live-desired",
+            confidence=0.9,
+            invocation_id="forget-live-save",
+        )
+        unrelated = _semantic_assertion(
+            tenant,
+            "forget-live-unrelated-revision",
+            value="forget-live-unrelated",
+        )
+        await raw_storage.put_assertion(
+            unrelated,
+            source_occurrences=(_semantic_source("parity-source"),),
+            operation_id="forget-live-unrelated-put",
+        )
+        forget_operation_id, _ = _operation_material(
+            action="forget",
+            subject="user",
+            predicate="preferred_deploy_region",
+            value=None,
+            confidence_requested=None,
+            invocation_id="forget-live-collision",
+        )
+        await raw_storage.delete_assertion(
+            unrelated.assertion_id,
+            unrelated.revision_id,
+            operation_id=forget_operation_id,
+        )
+
+        with pytest.raises(
+            AssertionConflictError,
+            match="different explicit fact deletion",
+        ):
+            await storage.forget_explicit_fact(
+                subject="user",
+                predicate="preferred_deploy_region",
+                invocation_id="forget-live-collision",
+            )
+        assert await storage.get_assertion(desired.assertion_id) is not None
+    finally:
+        await raw_storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_forget_erased_replay_rejects_unrelated_raw_delete_preseed(
+    db_backend,
+    tmp_path,
+):
+    """A blinded unrelated delete cannot terminate the intended selector."""
+    from kestrel_sovereign.features.memory_agency.semantic_facts import (
+        _operation_material,
+    )
+    from kestrel_sovereign.storage.async_assertion_store import (
+        AssertionConflictError,
+    )
+
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path,
+        "forget-erased-selector-binding",
+    )
+    raw_storage = await _assertion_storage_for_backend(
+        db_backend,
+        tenant,
+        identity,
+    )
+    try:
+        storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
+        desired = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="forget-erased-desired",
+            confidence=0.9,
+            invocation_id="forget-erased-save",
+        )
+        unrelated = _semantic_assertion(
+            tenant,
+            "forget-erased-unrelated-revision",
+            value="forget-erased-unrelated",
+        )
+        await raw_storage.put_assertion(
+            unrelated,
+            source_occurrences=(_semantic_source("parity-source"),),
+            operation_id="forget-erased-unrelated-put",
+        )
+        forget_operation_id, _ = _operation_material(
+            action="forget",
+            subject="user",
+            predicate="preferred_deploy_region",
+            value=None,
+            confidence_requested=None,
+            invocation_id="forget-erased-collision",
+        )
+        deleted = await raw_storage.delete_assertion(
+            unrelated.assertion_id,
+            unrelated.revision_id,
+            operation_id=forget_operation_id,
+        )
+        await raw_storage.erase_assertion(
+            deleted.deleted.assertion_id,
+            operation_id="forget-erased-unrelated-erasure",
+        )
+
+        with pytest.raises(
+            AssertionConflictError,
+            match="different erased explicit fact deletion",
+        ):
+            await storage.forget_explicit_fact(
+                subject="user",
+                predicate="preferred_deploy_region",
+                invocation_id="forget-erased-collision",
+            )
+        assert await storage.get_assertion(desired.assertion_id) is not None
+    finally:
+        await raw_storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_forget_noop_replay_rejects_different_selector_preseed(
+    db_backend,
+    tmp_path,
+):
+    """An absent receipt for selector A cannot suppress selector B."""
+    from kestrel_sovereign.features.memory_agency.semantic_facts import (
+        _operation_material,
+    )
+    from kestrel_sovereign.knowledge import IRI
+    from kestrel_sovereign.storage.async_assertion_store import (
+        AssertionConflictError,
+    )
+
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path,
+        "forget-noop-selector-binding",
+    )
+    raw_storage = await _assertion_storage_for_backend(
+        db_backend,
+        tenant,
+        identity,
+    )
+    try:
+        forget_operation_id, _ = _operation_material(
+            action="forget",
+            subject="user",
+            predicate="preferred_deploy_region",
+            value=None,
+            confidence_requested=None,
+            invocation_id="forget-noop-collision",
+        )
+        await raw_storage._record_explicit_fact_forget_noop(
+            forget_operation_id,
+            IRI(f"urn:kestrel:agent:{tenant}:principal:other"),
+            IRI("https://kestrel.ai/vocab/unrelatedSelector"),
+        )
+        storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
+        desired = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="forget-noop-desired",
+            confidence=0.9,
+            invocation_id="forget-noop-save",
+        )
+
+        with pytest.raises(
+            AssertionConflictError,
+            match="different semantic mutation",
+        ):
+            await storage.forget_explicit_fact(
+                subject="user",
+                predicate="preferred_deploy_region",
+                invocation_id="forget-noop-collision",
+            )
+        assert await storage.get_assertion(desired.assertion_id) is not None
+    finally:
+        await raw_storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_save_fact_concurrent_retry_replays_first_delivery_provenance(
     db_backend,
     tmp_path,
 ):
     """One retry ID has one canonical receipt despite distinct delivery clocks."""
     from kestrel_sovereign.agent.invocation import invocation_scope, request_provenance
-    from kestrel_sovereign.features.memory_agency.semantic_facts import GovernedFactAdapter
-
     tenant, identity = await _incepted_assertion_identity(
         tmp_path,
         "save-fact-concurrent-retry",
@@ -390,8 +1135,6 @@ async def test_save_fact_concurrent_retry_replays_first_delivery_provenance(
     raw_storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
     try:
         storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
-        adapter = GovernedFactAdapter(storage)
-
         async def deliver(received_at: str):
             provenance = request_provenance(
                 actor="parity-user",
@@ -400,7 +1143,7 @@ async def test_save_fact_concurrent_retry_replays_first_delivery_provenance(
                 received_at=received_at,
             )
             with invocation_scope("concurrent-retry-2765", provenance=provenance):
-                return await adapter.save(
+                return await storage.save_explicit_fact(
                     subject="user",
                     predicate="preferred_deploy_region",
                     value="us-central1",
@@ -428,6 +1171,664 @@ async def test_save_fact_concurrent_retry_replays_first_delivery_provenance(
             "2026-07-26T14:02:12Z",
         }
     finally:
+        await raw_storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_concurrent_distinct_same_value_teachings_preserve_both_sources(
+    db_backend,
+    tmp_path,
+):
+    """A stale initial-write decision is retried as a provenance append."""
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path,
+        "save-fact-concurrent-distinct",
+    )
+    raw_storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    try:
+        storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
+        original_put = storage.put_assertion
+        both_initial_writes_ready = asyncio.Event()
+        arrival_lock = asyncio.Lock()
+        arrivals = 0
+
+        async def synchronized_initial_put(assertion, **kwargs):
+            nonlocal arrivals
+            async with arrival_lock:
+                arrivals += 1
+                if arrivals == 2:
+                    both_initial_writes_ready.set()
+            await both_initial_writes_ready.wait()
+            return await original_put(assertion, **kwargs)
+
+        # Both invocations observe no current fact before either initial write
+        # reaches storage.  One must re-decide after its stale put conflicts.
+        storage.put_assertion = synchronized_initial_put
+
+        async def teach(invocation_id: str):
+            return await storage.save_explicit_fact(
+                subject="user",
+                predicate="preferred_deploy_region",
+                value="us-central1",
+                confidence=0.9,
+                invocation_id=invocation_id,
+            )
+
+        first, second = await asyncio.gather(
+            teach("concurrent-distinct-a"),
+            teach("concurrent-distinct-b"),
+        )
+
+        assert first.saved is True
+        assert second.saved is True
+        assert first.idempotent is False
+        assert second.idempotent is False
+        assert first.assertion_id == second.assertion_id
+        assert first.provenance_reference != second.provenance_reference
+
+        sources = await storage.list_assertion_sources(first.assertion_id)
+        assert {source.source_occurrence_id for source in sources} == {
+            first.provenance_reference,
+            second.provenance_reference,
+        }
+
+        first_retry, second_retry = await asyncio.gather(
+            teach("concurrent-distinct-a"),
+            teach("concurrent-distinct-b"),
+        )
+        assert first_retry.idempotent is True
+        assert second_retry.idempotent is True
+        assert first_retry.revision_id == first.revision_id
+        assert second_retry.revision_id == second.revision_id
+        assert len(await storage.list_assertion_sources(first.assertion_id)) == 2
+    finally:
+        await raw_storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_noop_forget_replay_never_deletes_a_later_teaching(
+    db_backend,
+    tmp_path,
+):
+    """An absent-result forget is a durable tombstone, including after restart."""
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path,
+        "save-fact-noop-forget",
+    )
+    raw_storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    try:
+        storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
+        absent = await storage.forget_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            invocation_id="noop-before-teach",
+        )
+        taught = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="europe-west4",
+            confidence=0.9,
+            invocation_id="teach-after-noop",
+        )
+        stale_retry = await storage.forget_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            invocation_id="noop-before-teach",
+        )
+
+        assert absent.deleted is False
+        assert absent.idempotent is False
+        assert stale_retry.deleted is False
+        assert stale_retry.idempotent is True
+        assert await storage.get_assertion(taught.assertion_id) is not None
+    finally:
+        await raw_storage.close()
+
+    restarted_raw = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    try:
+        restarted = PrivacyEnforcingStorage(restarted_raw, PrivacyMode.NORMAL)
+        restarted_retry = await restarted.forget_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            invocation_id="noop-before-teach",
+        )
+        assert restarted_retry.deleted is False
+        assert restarted_retry.idempotent is True
+        assert await restarted.get_assertion(taught.assertion_id) is not None
+    finally:
+        await restarted_raw.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_explicit_fact_replays_append_and_delete_from_the_operation_ledger(
+    db_backend,
+    tmp_path,
+):
+    """Later source appends cannot rewrite an older retry's receipt.
+
+    This is the adversarial lifecycle that exposed #2765's reconstruction
+    bug: A → B → C all carry the same claim but distinct provenance.  Retrying
+    B must return B's original validated revision, and deleting C then
+    retrying that delete must use its persisted receipt rather than counting
+    historical ``ACTIVE`` revisions.
+    """
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path,
+        "save-fact-ledger-replay",
+    )
+    raw_storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    try:
+        storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
+        first = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="us-central1",
+            confidence=0.9,
+            invocation_id="ledger-a",
+        )
+        second = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="us-central1",
+            confidence=0.9,
+            invocation_id="ledger-b",
+        )
+        third = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="us-central1",
+            confidence=0.9,
+            invocation_id="ledger-c",
+        )
+
+        assert first.idempotent is False
+        assert second.idempotent is False
+        assert third.idempotent is False
+        assert len(await storage.list_assertion_sources(first.assertion_id)) == 3
+
+        retry_second = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="us-central1",
+            confidence=0.9,
+            invocation_id="ledger-b",
+        )
+        assert retry_second.idempotent is True
+        assert retry_second.revision_id == second.revision_id
+        assert retry_second.provenance_reference == second.provenance_reference
+        current = await storage.get_assertion(first.assertion_id)
+        assert current is not None
+        assert current.revision_id == third.revision_id
+
+        deleted = await storage.forget_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            invocation_id="ledger-delete",
+        )
+        deleted_retry = await storage.forget_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            invocation_id="ledger-delete",
+        )
+        assert deleted.deleted is True
+        assert deleted_retry.deleted is True
+        assert deleted_retry.idempotent is True
+        assert deleted_retry.revision_id == deleted.revision_id
+        assert await storage.get_assertion(first.assertion_id) is None
+    finally:
+        await raw_storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_erased_explicit_fact_operations_are_terminal_across_restart(
+    db_backend,
+    tmp_path,
+):
+    """Erasure blinds both the original save and later source-append receipts."""
+    from kestrel_sovereign.storage.async_assertion_store import (
+        AssertionConflictError,
+    )
+
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path,
+        "save-fact-erased-operation-tombstones",
+    )
+    raw_storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    try:
+        storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
+        original = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="secret-region",
+            confidence=0.9,
+            invocation_id="erased-original-save",
+        )
+        appended = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="secret-region",
+            confidence=0.9,
+            invocation_id="erased-source-append",
+        )
+        assert original.saved is True
+        assert appended.saved is True
+        assert original.revision_id != appended.revision_id
+
+        await storage.erase_assertion(
+            original.assertion_id,
+            operation_id="erase-explicit-fact-history",
+        )
+
+        assert await raw_storage.db.fetchval(
+            "SELECT COUNT(*) FROM semantic_assertion_operations "
+            "WHERE tenant_id = ?",
+            (tenant,),
+        ) == 0
+        tombstones = await raw_storage.db.fetchall(
+            "SELECT purpose, operation_key, request_key, generation "
+            "FROM semantic_assertion_erased_operation_tombstones "
+            "WHERE tenant_id = ? ORDER BY purpose",
+            (tenant,),
+        )
+        assert [row[0] for row in tombstones] == ["put", "supersede"]
+        encoded_tombstones = repr(tombstones)
+        for erased_value in (
+            "secret-region",
+            original.operation_id,
+            appended.operation_id,
+            original.assertion_id,
+            original.revision_id,
+            appended.revision_id,
+            original.provenance_reference,
+            appended.provenance_reference,
+        ):
+            assert erased_value not in encoded_tombstones
+    finally:
+        await raw_storage.close()
+
+    restarted_raw = await _assertion_storage_for_backend(
+        db_backend,
+        tenant,
+        identity,
+    )
+    try:
+        restarted = PrivacyEnforcingStorage(
+            restarted_raw,
+            PrivacyMode.NORMAL,
+        )
+        original_replay = await restarted.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="secret-region",
+            confidence=0.9,
+            invocation_id="erased-original-save",
+        )
+        append_replay = await restarted.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="secret-region",
+            confidence=0.9,
+            invocation_id="erased-source-append",
+        )
+        for replay in (original_replay, append_replay):
+            assert replay.saved is False
+            assert replay.idempotent is True
+            assert replay.validation_disposition == "erased:terminal"
+            assert replay.assertion_id is None
+            assert replay.revision_id is None
+            assert replay.validation_report_id is None
+            assert replay.provenance_reference is None
+            assert replay.provenance_digest is None
+        assert await restarted.query_assertions() == []
+
+        conflicting = _semantic_assertion(
+            tenant,
+            "different-content-revision",
+            value="different-content",
+        )
+        with pytest.raises(
+            AssertionConflictError,
+            match="different semantic mutation",
+        ):
+            await restarted_raw.put_assertion(
+                conflicting,
+                source_occurrences=(_semantic_source("parity-source"),),
+                operation_id=original.operation_id,
+            )
+        assert await restarted.query_assertions() == []
+    finally:
+        await restarted_raw.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_erased_changed_value_supersession_replays_terminally(
+    db_backend,
+    tmp_path,
+):
+    """A changed-claim supersession gets the same blinded result binding."""
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path,
+        "save-fact-erased-changed-supersession",
+    )
+    raw_storage = await _assertion_storage_for_backend(
+        db_backend,
+        tenant,
+        identity,
+    )
+    try:
+        storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
+        await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="changed-erasure-old",
+            confidence=0.9,
+            invocation_id="changed-erasure-old-save",
+        )
+        changed = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="changed-erasure-new",
+            confidence=0.9,
+            invocation_id="changed-erasure-new-save",
+        )
+        await storage.erase_assertion(
+            changed.assertion_id,
+            operation_id="changed-erasure-physical",
+        )
+    finally:
+        await raw_storage.close()
+
+    restarted_raw = await _assertion_storage_for_backend(
+        db_backend,
+        tenant,
+        identity,
+    )
+    try:
+        restarted = PrivacyEnforcingStorage(
+            restarted_raw,
+            PrivacyMode.NORMAL,
+        )
+        replay = await restarted.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="changed-erasure-new",
+            confidence=0.9,
+            invocation_id="changed-erasure-new-save",
+        )
+        assert replay.saved is False
+        assert replay.idempotent is True
+        assert replay.validation_disposition == "erased:terminal"
+        assert replay.assertion_id is None
+        assert replay.revision_id is None
+        assert replay.provenance_reference is None
+    finally:
+        await restarted_raw.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_legacy_erasure_fence_blocks_only_matching_semantic_identity(
+    db_backend,
+    tmp_path,
+):
+    """The v3 migration's opaque output is backend-neutral and narrowly scoped."""
+    from kestrel_sovereign.storage.async_assertion_store import (
+        _legacy_erasure_assertion_key,
+    )
+
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path,
+        "legacy-erasure-fence-parity",
+    )
+    raw_storage = await _assertion_storage_for_backend(
+        db_backend,
+        tenant,
+        identity,
+    )
+    try:
+        storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
+        saved = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="legacy-fenced-region",
+            confidence=0.9,
+            invocation_id="legacy-fenced-save",
+        )
+        await storage.erase_assertion(
+            saved.assertion_id,
+            operation_id="legacy-fenced-erasure",
+        )
+        erasure_row = await raw_storage.db.fetchone(
+            "SELECT request_digest, generation "
+            "FROM semantic_assertion_erasure_receipts "
+            "WHERE tenant_id = ?",
+            (tenant,),
+        )
+        assert erasure_row is not None
+        await raw_storage.db.execute(
+            "DELETE FROM semantic_assertion_erased_operation_tombstones "
+            "WHERE tenant_id = ?",
+            (tenant,),
+        )
+        await raw_storage.db.execute(
+            "INSERT INTO semantic_assertion_legacy_erasure_fences "
+            "(tenant_id, assertion_key, generation, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                tenant,
+                _legacy_erasure_assertion_key(str(erasure_row[0])),
+                int(erasure_row[1]),
+                "2026-07-27T00:00:00Z",
+            ),
+        )
+    finally:
+        await raw_storage.close()
+
+    restarted_raw = await _assertion_storage_for_backend(
+        db_backend,
+        tenant,
+        identity,
+    )
+    try:
+        restarted = PrivacyEnforcingStorage(
+            restarted_raw,
+            PrivacyMode.NORMAL,
+        )
+        stale = await restarted.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="legacy-fenced-region",
+            confidence=0.9,
+            invocation_id="legacy-fenced-save",
+        )
+        assert stale.saved is False
+        assert stale.idempotent is True
+        assert stale.validation_disposition == "erased:terminal"
+        assert await restarted.query_assertions() == []
+
+        unrelated = await restarted.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="new-unrelated-region",
+            confidence=0.9,
+            invocation_id="new-unrelated-save",
+        )
+        assert unrelated.saved is True
+        assert unrelated.idempotent is False
+    finally:
+        await restarted_raw.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_governed_replay_racing_physical_erasure_is_terminal(
+    db_backend,
+    tmp_path,
+    monkeypatch,
+):
+    """A replay split across erasure observes its new blinded tombstone."""
+    from kestrel_sovereign.storage.async_assertion_store import (
+        AsyncAssertionStore,
+    )
+
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path,
+        "governed-replay-erasure-race",
+    )
+    raw_storage = await _assertion_storage_for_backend(
+        db_backend,
+        tenant,
+        identity,
+    )
+    release_replay = asyncio.Event()
+    operation_observed = asyncio.Event()
+    try:
+        storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
+        saved = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="race-erased-region",
+            confidence=0.9,
+            invocation_id="race-erased-save",
+        )
+        target_store = raw_storage._assertion_store()
+        original_recorded = AsyncAssertionStore._recorded_operation
+        blocked = False
+
+        async def recorded_with_barrier(store, operation_id):
+            nonlocal blocked
+            recorded = await original_recorded(store, operation_id)
+            if (
+                store is target_store
+                and operation_id == saved.operation_id
+                and recorded is not None
+                and not blocked
+            ):
+                blocked = True
+                operation_observed.set()
+                await release_replay.wait()
+            return recorded
+
+        monkeypatch.setattr(
+            AsyncAssertionStore,
+            "_recorded_operation",
+            recorded_with_barrier,
+        )
+        replay_task = asyncio.create_task(
+            storage.save_explicit_fact(
+                subject="user",
+                predicate="preferred_deploy_region",
+                value="race-erased-region",
+                confidence=0.9,
+                invocation_id="race-erased-save",
+            )
+        )
+        await asyncio.wait_for(operation_observed.wait(), timeout=5)
+        await storage.erase_assertion(
+            saved.assertion_id,
+            operation_id="race-erasure",
+        )
+        release_replay.set()
+        replay = await replay_task
+
+        assert replay.saved is False
+        assert replay.idempotent is True
+        assert replay.validation_disposition == "erased:terminal"
+        assert replay.assertion_id is None
+        assert replay.revision_id is None
+        assert replay.provenance_reference is None
+    finally:
+        release_replay.set()
+        await raw_storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_delete_replay_racing_physical_erasure_is_terminal(
+    db_backend,
+    tmp_path,
+    monkeypatch,
+):
+    """The analogous delete replay never leaks a transient missing revision."""
+    from kestrel_sovereign.storage.async_assertion_store import (
+        AsyncAssertionStore,
+    )
+
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path,
+        "delete-replay-erasure-race",
+    )
+    raw_storage = await _assertion_storage_for_backend(
+        db_backend,
+        tenant,
+        identity,
+    )
+    release_replay = asyncio.Event()
+    operation_observed = asyncio.Event()
+    try:
+        storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
+        saved = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="delete-race-region",
+            confidence=0.9,
+            invocation_id="delete-race-save",
+        )
+        deleted = await storage.forget_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            invocation_id="delete-race-forget",
+        )
+        target_store = raw_storage._assertion_store()
+        original_recorded = AsyncAssertionStore._recorded_operation
+        blocked = False
+
+        async def recorded_with_barrier(store, operation_id):
+            nonlocal blocked
+            recorded = await original_recorded(store, operation_id)
+            if (
+                store is target_store
+                and operation_id == deleted.operation_id
+                and recorded is not None
+                and not blocked
+            ):
+                blocked = True
+                operation_observed.set()
+                await release_replay.wait()
+            return recorded
+
+        monkeypatch.setattr(
+            AsyncAssertionStore,
+            "_recorded_operation",
+            recorded_with_barrier,
+        )
+        replay_task = asyncio.create_task(
+            storage.forget_explicit_fact(
+                subject="user",
+                predicate="preferred_deploy_region",
+                invocation_id="delete-race-forget",
+            )
+        )
+        await asyncio.wait_for(operation_observed.wait(), timeout=5)
+        await storage.erase_assertion(
+            saved.assertion_id,
+            operation_id="delete-race-erasure",
+        )
+        release_replay.set()
+        replay = await replay_task
+
+        assert replay.deleted is False
+        assert replay.idempotent is True
+        assert replay.assertion_id is None
+        assert replay.revision_id is None
+        assert replay.provenance_reference is None
+    finally:
+        release_replay.set()
         await raw_storage.close()
 
 
@@ -795,9 +2196,9 @@ async def test_concurrent_postgres_initializers_serialize_semantic_migration(db_
         marker_rows = await db_backend.fetch_all(
             "SELECT version FROM semantic_schema_migrations "
             "WHERE version = ?",
-            ("semantic_assertion_store_v3",),
+            ("semantic_assertion_store_v5",),
         )
-        assert marker_rows == [("semantic_assertion_store_v3",)]
+        assert marker_rows == [("semantic_assertion_store_v5",)]
     finally:
         await asyncio.gather(*(storage.close() for storage in storages))
 

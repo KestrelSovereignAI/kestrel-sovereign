@@ -13,13 +13,17 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from contextvars import ContextVar
 from functools import wraps
+import hashlib
 import inspect
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterator, Mapping, TypeVar
-from urllib.parse import quote
+from urllib.parse import quote, unquote_to_bytes
 import uuid
 
 
 MAX_INVOCATION_ID_LENGTH = 256
+_HEADER_UNRESERVED = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+)
 
 _current_invocation_id: ContextVar[str | None] = ContextVar(
     "kestrel_current_invocation_id",
@@ -77,6 +81,64 @@ def invocation_id_response_header(value: object) -> str:
     return quote(validate_invocation_id(value), safe="-._~")
 
 
+def invocation_id_from_request_header(value: object) -> str:
+    """Decode the one-pass wire form used by ``X-Request-ID``.
+
+    Request IDs are opaque Unicode *values*, while HTTP headers are an ASCII
+    transport.  ``X-Request-ID`` therefore always uses RFC 3986 percent
+    encoding: a client retries with the response value verbatim, and the
+    server decodes it exactly once.  Body ``request_id`` / ``invocation_id`` /
+    ``id`` values remain literal Unicode and retain their existing precedence.
+
+    This is deliberately not a best-effort decoder.  A literal percent in a
+    header value must be sent as ``%25``; otherwise a value such as ``%E2`` is
+    ambiguous between an identifier and a wire escape.  Rejecting malformed
+    wire forms prevents a double-decoding or a silently forked retry key.
+    """
+    if not isinstance(value, str):
+        raise ValueError("request-id header must be text")
+    try:
+        value.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise ValueError(
+            "request-id header must use ASCII percent-encoding for Unicode text"
+        ) from error
+
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character in _HEADER_UNRESERVED:
+            index += 1
+            continue
+        if character != "%" or (
+            index + 2 >= len(value)
+            or value[index + 1] not in "0123456789abcdefABCDEF"
+            or value[index + 2] not in "0123456789abcdefABCDEF"
+        ):
+            raise ValueError(
+                "request-id header must percent-encode reserved characters"
+            )
+        index += 3
+    try:
+        decoded = unquote_to_bytes(value).decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError(
+            "request-id header percent escapes must decode to valid UTF-8"
+        ) from error
+    return validate_invocation_id(decoded)
+
+
+def invocation_log_correlation(value: object) -> str:
+    """Return a non-reversible operator-log correlation for an invocation.
+
+    Transport retry identifiers are client-controlled and can contain private
+    content.  They remain opaque to application logs; this short digest lets
+    operators correlate related events without persisting the identifier.
+    """
+    invocation_id = validate_invocation_id(value)
+    return hashlib.sha256(invocation_id.encode("utf-8")).hexdigest()[:16]
+
+
 def new_invocation_id() -> str:
     """Create an opaque identity for a producer without a transport id."""
     return str(uuid.uuid4())
@@ -105,7 +167,9 @@ def resolve_transport_invocation_id(
             value = getattr(body, field, None) if body is not None else None
         if value is not None:
             return ensure_invocation_id(value)
-    return ensure_invocation_id(header_request_id)
+    if header_request_id is None:
+        return ensure_invocation_id()
+    return invocation_id_from_request_header(header_request_id)
 
 
 def request_provenance(
