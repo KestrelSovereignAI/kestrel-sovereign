@@ -884,6 +884,23 @@ class AgentManager:
 
         # Build allowed_features set from config (None = load all)
         allowed_features = set(config.features) if config.features is not None else None
+        # Materialization is an exact, tenant-local operator approval.  Parse
+        # the per-agent multi_agent.toml block before construction so an
+        # invalid profile fails this agent's startup rather than silently
+        # disabling its approved closure.
+        semantic_inference_profile = None
+        semantic_inference_configured = config.semantic_inference is not None
+        if semantic_inference_configured:
+            from kestrel_sovereign.knowledge.inference import (
+                inference_profile_from_config,
+                validate_inference_profile,
+            )
+
+            semantic_inference_profile = inference_profile_from_config(
+                config.semantic_inference
+            )
+            if semantic_inference_profile is not None:
+                validate_inference_profile(semantic_inference_profile)
 
         agent: Optional[KestrelAgent] = None
         scheduler_registration: Optional[
@@ -909,6 +926,8 @@ class AgentManager:
                     db_backend="postgres",
                     allowed_features=allowed_features,
                     identity_export_dir=identity_export_dir,
+                    semantic_inference_profile=semantic_inference_profile,
+                    semantic_inference_configured=semantic_inference_configured,
                 )
             else:
                 agent = KestrelAgent(
@@ -917,6 +936,8 @@ class AgentManager:
                     llm_service=llm_service,
                     allowed_features=allowed_features,
                     identity_export_dir=identity_export_dir,
+                    semantic_inference_profile=semantic_inference_profile,
+                    semantic_inference_configured=semantic_inference_configured,
                 )
 
             # Publish this before feature initialization. A shared PostgreSQL

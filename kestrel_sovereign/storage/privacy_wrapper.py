@@ -2521,6 +2521,12 @@ class PrivacyEnforcingStorage:
         self._assert_semantic_assertion_read_allowed("derivation traversal")
         return await self._storage.get_derivation_inputs(revision_id)
 
+    async def reactivate_inferred_assertion(self, assertion, *, operation_id=None):
+        self._assert_semantic_assertion_write_allowed("reactivate_inferred_assertion")
+        return await self._storage.reactivate_inferred_assertion(
+            assertion, operation_id=operation_id,
+        )
+
     def _assert_semantic_assertion_incremental_read_allowed(self, operation: str) -> None:
         """Prevent volatile modes from observing durable semantic progress."""
         self._assert_semantic_assertion_read_allowed(operation)
@@ -2536,6 +2542,20 @@ class PrivacyEnforcingStorage:
     async def assertion_inference_inputs(self, query=None):
         self._assert_semantic_assertion_read_allowed("inference inputs")
         return await self._storage.assertion_inference_inputs(query)
+
+    async def semantic_inference_state(self, profile):
+        self._assert_semantic_assertion_read_allowed("inference status")
+        return await self._storage.semantic_inference_state(profile)
+
+    async def explain_semantic_inference(self, assertion_id, profile):
+        self._assert_semantic_assertion_read_allowed("inference lineage")
+        return await self._storage.explain_semantic_inference(assertion_id, profile)
+
+    async def materialize_semantic_inference(self, profile, *, limits=None, full_rebuild: bool = False):
+        self._assert_semantic_assertion_write_allowed("semantic inference")
+        return await self._storage.materialize_semantic_inference(
+            profile, limits=limits, full_rebuild=full_rebuild,
+        )
 
     async def export_assertion_snapshot(self, query=None):
         self._assert_semantic_assertion_read_allowed("export")

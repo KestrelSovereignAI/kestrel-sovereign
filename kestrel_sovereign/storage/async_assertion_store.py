@@ -165,6 +165,15 @@ class ErasureResult:
 
 
 @dataclass(frozen=True, slots=True)
+class InferenceRevocationResult:
+    """Tenant-local outcome of disabling one materialization engine."""
+
+    retracted_assertions: int
+    deactivated_derivations: int
+    generation: int
+
+
+@dataclass(frozen=True, slots=True)
 class AssertionCheckpoint:
     tenant_id: str
     generation: int
@@ -342,6 +351,25 @@ class AsyncAssertionStore:
             if isinstance(error.__cause__, AssertionStoreError):
                 raise error.__cause__ from error
             raise
+
+    @asynccontextmanager
+    async def inference_publication(self):
+        """Serialize one inference publication with canonical assertions.
+
+        Materialization calculates a closure outside a transaction so it does
+        not hold a tenant lock while applying bounded rules.  Publishing that
+        closure is different: inferred revisions, their derivation ledger,
+        and the durable completion checkpoint must observe one serialized
+        tenant generation.  Reuse the canonical mutation boundary so SQLite
+        and PostgreSQL get the same guarantee, and so inference writes cannot
+        race a direct assertion lifecycle mutation.
+
+        This is intentionally a narrow peer-service primitive rather than a
+        general transaction API.  Callers still use the canonical assertion
+        mutation methods inside the scope.
+        """
+        async with self._mutation():
+            yield
 
     async def _current(self, assertion_id: str) -> Assertion | None:
         tenant_id, _ = self._require_scope()
@@ -952,6 +980,7 @@ class AsyncAssertionStore:
         tenant_id, _ = self._require_scope()
         pending = set(input_revision_ids)
         discovered: dict[str, Assertion] = {}
+        invalidated = set(pending)
         while pending:
             batch = tuple(sorted(pending))
             pending.clear()
@@ -967,10 +996,238 @@ class AsyncAssertionStore:
             )
             for row in rows:
                 assertion = Assertion.from_mapping(json.loads(row[2]))
+                if assertion.revision_id in discovered:
+                    continue
+                if await self._has_surviving_inference_derivation(
+                    assertion.revision_id, invalidated
+                ):
+                    # The canonical revision has an independently supported
+                    # materialization derivation.  Its primary lineage may be
+                    # losing a premise, but retracting the assertion would
+                    # incorrectly remove the surviving conclusion.
+                    continue
                 if assertion.revision_id not in discovered:
                     discovered[assertion.revision_id] = assertion
+                    invalidated.add(assertion.revision_id)
                     pending.add(assertion.revision_id)
         return list(discovered.values())
+
+    async def _has_surviving_inference_derivation(
+        self,
+        derived_revision_id: str,
+        invalidated_revision_ids: set[str],
+    ) -> bool:
+        """Whether an inference-ledger derivation still independently supports a fact.
+
+        ``semantic_derivation_inputs`` records the canonical primary lineage
+        for compatibility and transitive erasure.  The materializer ledger can
+        hold additional premise sets for the same conclusion.  Lifecycle
+        mutations consult that ledger before cascading a retraction so one
+        withdrawn path cannot retract a conclusion that another active path
+        still proves.
+        """
+        tenant_id, _ = self._require_scope()
+        rows = await self._database.fetchall(
+            "SELECT derivation_id FROM semantic_inference_derivations "
+            "WHERE tenant_id = ? AND derived_revision_id = ? AND active = 1 "
+            "ORDER BY derivation_id ASC",
+            (tenant_id, derived_revision_id),
+        )
+        for (derivation_id,) in rows:
+            inputs = await self._database.fetchall(
+                "SELECT input_revision_id FROM semantic_inference_derivation_inputs "
+                "WHERE tenant_id = ? AND derivation_id = ? ORDER BY ordinal ASC",
+                (tenant_id, derivation_id),
+            )
+            if not inputs:
+                continue
+            premise_ids = [str(row[0]) for row in inputs]
+            if any(revision_id in invalidated_revision_ids for revision_id in premise_ids):
+                continue
+            premises_are_eligible = True
+            for revision_id in premise_ids:
+                if not await self._is_current_active_eligible_revision(revision_id):
+                    premises_are_eligible = False
+                    break
+            if premises_are_eligible:
+                return True
+        return False
+
+    async def revoke_semantic_inference(
+        self,
+        engine_version: str,
+    ) -> InferenceRevocationResult:
+        """Retract this tenant's current materializations for a disabled engine.
+
+        A configured ``enabled = false`` is an operator decision, not an
+        instruction to merely skip the next maintenance pass.  The canonical
+        inferred revisions and every active ledger entry that supported them
+        must stop participating in reads before sleep reports the profile as
+        disabled.  Derived dependents outside the selected engine still use
+        normal alternate-proof handling, while the disabled engine itself is
+        always revoked even when it has another valid semantic proof.
+        """
+        if not isinstance(engine_version, str) or not engine_version:
+            raise AssertionStoreError("inference engine_version must be non-empty")
+        async with self._mutation():
+            tenant_id, _ = self._require_scope()
+            rows = await self._database.fetchall(
+                "SELECT r.assertion_mapping FROM semantic_assertions a "
+                "JOIN semantic_assertion_revisions r ON r.tenant_id = a.tenant_id "
+                "  AND r.revision_id = a.current_revision_id "
+                "WHERE a.tenant_id = ? AND r.status = ? AND r.epistemic_state = ? "
+                "ORDER BY r.assertion_id ASC",
+                (
+                    tenant_id,
+                    AssertionStatus.ACTIVE.value,
+                    EpistemicState.INFERRED.value,
+                ),
+            )
+            selected = [
+                Assertion.from_mapping(json.loads(encoded))
+                for (encoded,) in rows
+            ]
+            selected = [
+                assertion for assertion in selected
+                if isinstance(assertion.lineage, DerivedLineage)
+                and assertion.lineage.engine_version == engine_version
+            ]
+            if not selected:
+                return InferenceRevocationResult(0, 0, await self._generation())
+
+            selected_revision_ids = [item.revision_id for item in selected]
+            ledger_rows = await self._database.fetchall(
+                "SELECT derivation_id FROM semantic_inference_derivations "
+                "WHERE tenant_id = ? AND active = 1 "
+                f"AND derived_revision_id IN ({_placeholders(selected_revision_ids)})",
+                (tenant_id,) + tuple(selected_revision_ids),
+            )
+            disabled_derivation_ids = tuple(str(row[0]) for row in ledger_rows)
+            if disabled_derivation_ids:
+                await self._database.execute(
+                    "UPDATE semantic_inference_derivations SET active = 0 "
+                    "WHERE tenant_id = ? "
+                    f"AND derivation_id IN ({_placeholders(disabled_derivation_ids)})",
+                    (tenant_id,) + disabled_derivation_ids,
+                )
+
+            # Once the selected engine's ledgers are inactive, non-selected
+            # derived assertions can still retain an independent proof but
+            # cannot keep a conclusion alive solely through disabled rules.
+            dependents = await self._dependent_current_revisions(
+                selected_revision_ids
+            )
+            by_revision = {item.revision_id: item for item in selected}
+            for dependent in dependents:
+                by_revision.setdefault(dependent.revision_id, dependent)
+            to_retract = [
+                by_revision[revision_id]
+                for revision_id in sorted(by_revision)
+                if by_revision[revision_id].status is AssertionStatus.ACTIVE
+            ]
+            old_revision_ids = [item.revision_id for item in to_retract]
+            all_ledger_rows = await self._database.fetchall(
+                "SELECT derivation_id FROM semantic_inference_derivations "
+                "WHERE tenant_id = ? AND active = 1 "
+                f"AND derived_revision_id IN ({_placeholders(old_revision_ids)})",
+                (tenant_id,) + tuple(old_revision_ids),
+            )
+            all_deactivated_ids = tuple(
+                sorted(
+                    set(disabled_derivation_ids).union(
+                        str(row[0]) for row in all_ledger_rows
+                    )
+                )
+            )
+            if all_deactivated_ids:
+                await self._database.execute(
+                    "UPDATE semantic_inference_derivations SET active = 0 "
+                    "WHERE tenant_id = ? "
+                    f"AND derivation_id IN ({_placeholders(all_deactivated_ids)})",
+                    (tenant_id,) + all_deactivated_ids,
+                )
+
+            retracted: list[Assertion] = []
+            for assertion in to_retract:
+                await self._invalidate_eligibility(assertion.revision_id)
+                state = _assertion_with(
+                    assertion,
+                    revision_id=uuid4().hex,
+                    status=AssertionStatus.RETRACTED,
+                    supersedes_revision_id=None,
+                    epistemic_state=EpistemicState.RETRACTED,
+                )
+                await self._write_revision(state, ())
+                await self._set_current(state)
+                retracted.append(state)
+            generation = await self._advance_generation()
+            for assertion in retracted:
+                await self._event(assertion, "retracted", generation)
+            return InferenceRevocationResult(
+                len(retracted), len(all_deactivated_ids), generation
+            )
+
+    async def reactivate_inferred(
+        self,
+        assertion: Assertion,
+        *,
+        operation_id: str | None = None,
+    ) -> AssertionWriteResult:
+        """Make a previously inactive inferred identity current again.
+
+        A canonical assertion ID describes the claim, not a particular
+        derivation.  Re-materialization after a premise or profile change must
+        therefore create a fresh immutable inferred revision instead of trying
+        to mutate an old retracted revision or creating a second fact store.
+        Direct facts are never replaced by this inference-only operation.
+        """
+        if not isinstance(assertion, Assertion):
+            raise AssertionStoreError("reactivate_inferred requires a canonical Assertion")
+        self._check_assertion_scope(assertion)
+        if (
+            assertion.status is not AssertionStatus.ACTIVE
+            or assertion.epistemic_state is not EpistemicState.INFERRED
+            or not isinstance(assertion.lineage, DerivedLineage)
+        ):
+            raise AssertionStoreError("reactivate_inferred requires an active inferred derived assertion")
+        operation_id = operation_id or f"reactivate-inferred:{assertion.revision_id}"
+        request = {"assertion": assertion.to_mapping()}
+        async with self._mutation():
+            digest, replay = await self._operation(operation_id, "reactivate_inferred", request)
+            if replay is not None:
+                restored = await self._revision(str(replay["revision_id"]))
+                if restored is None:
+                    raise AssertionConflictError("idempotent reactivation receipt no longer has a revision")
+                return AssertionWriteResult(
+                    restored, int(replay["generation"]), str(replay["event_id"]), True
+                )
+            current = await self._current(assertion.assertion_id)
+            if current is None:
+                raise AssertionConflictError("reactivation requires an existing inferred assertion identity")
+            if current.status is AssertionStatus.ACTIVE:
+                if current.epistemic_state is EpistemicState.INFERRED:
+                    return AssertionWriteResult(current, await self._generation(), "", True)
+                raise AssertionConflictError("inference cannot replace an active direct assertion")
+            if (
+                current.status is not AssertionStatus.RETRACTED
+                or current.epistemic_state is not EpistemicState.RETRACTED
+                or not isinstance(current.lineage, DerivedLineage)
+            ):
+                raise AssertionConflictError("inference cannot reactivate a non-derived assertion identity")
+            await self._validate_lineage(assertion, ())
+            await self._write_revision(assertion, ())
+            await self._set_current(assertion)
+            generation = await self._advance_generation()
+            event_id = await self._event(assertion, "inferred", generation)
+            await self._record_operation(
+                operation_id,
+                "reactivate_inferred",
+                digest,
+                {"revision_id": assertion.revision_id, "generation": generation, "event_id": event_id},
+                [assertion.assertion_id],
+                [assertion.revision_id],
+            )
+            return AssertionWriteResult(assertion, generation, event_id)
 
     async def retract(
         self,
@@ -1138,6 +1395,210 @@ class AsyncAssertionStore:
                 (_json(sanitized.to_mapping()), tenant_id, revision_id),
             )
 
+    async def _erasure_replacement_lineage(
+        self,
+        assertion: Assertion,
+        erased_revision_ids: set[str],
+        refreshed_revision_ids: dict[str, str],
+        run_id: str,
+    ) -> DerivedLineage | None:
+        """Choose one valid proof for a current conclusion being re-lined.
+
+        The canonical ``semantic_derivation_inputs`` row names one primary
+        proof, while the inference ledger holds every independent proof.  An
+        erasure may remove the primary proof without removing the conclusion.
+        In that case the conclusion receives a fresh canonical revision whose
+        lineage names a surviving complete premise set; the old revision is
+        still physically erased.
+        """
+        if not isinstance(assertion.lineage, DerivedLineage):
+            return None
+
+        async def resolved_inputs(
+            input_revision_ids: Sequence[str],
+        ) -> tuple[str, ...] | None:
+            resolved = tuple(
+                refreshed_revision_ids.get(revision_id, revision_id)
+                for revision_id in input_revision_ids
+            )
+            if len(set(resolved)) != len(resolved):
+                return None
+            for original_revision_id, resolved_revision_id in zip(
+                input_revision_ids, resolved
+            ):
+                if (
+                    original_revision_id in erased_revision_ids
+                    and original_revision_id not in refreshed_revision_ids
+                ):
+                    return None
+                if resolved_revision_id in erased_revision_ids:
+                    return None
+                if not await self._is_current_active_eligible_revision(
+                    resolved_revision_id
+                ):
+                    return None
+            return resolved
+
+        primary_inputs = await resolved_inputs(
+            assertion.lineage.input_revision_ids
+        )
+        generated_at = _now()
+        if primary_inputs is not None:
+            return DerivedLineage(
+                rule_id=assertion.lineage.rule_id,
+                engine_version=assertion.lineage.engine_version,
+                profile_version=assertion.lineage.profile_version,
+                input_revision_ids=primary_inputs,
+                input_digest=_operation_digest({"premises": primary_inputs}),
+                run_id=run_id,
+                generated_at=generated_at,
+                derivation_reference=assertion.lineage.derivation_reference,
+            )
+
+        tenant_id, _ = self._require_scope()
+        derivations = await self._database.fetchall(
+            "SELECT derivation_id, rule_id, rule_profile_version "
+            "FROM semantic_inference_derivations "
+            "WHERE tenant_id = ? AND derived_revision_id = ? AND active = 1 "
+            "ORDER BY derivation_id ASC",
+            (tenant_id, assertion.revision_id),
+        )
+        for derivation_id, rule_id, profile_version in derivations:
+            rows = await self._database.fetchall(
+                "SELECT input_revision_id FROM semantic_inference_derivation_inputs "
+                "WHERE tenant_id = ? AND derivation_id = ? ORDER BY ordinal ASC",
+                (tenant_id, derivation_id),
+            )
+            inputs = await resolved_inputs(tuple(str(row[0]) for row in rows))
+            if inputs is None:
+                continue
+            return DerivedLineage(
+                rule_id=str(rule_id),
+                engine_version=assertion.lineage.engine_version,
+                profile_version=str(profile_version),
+                input_revision_ids=inputs,
+                input_digest=_operation_digest({"premises": inputs}),
+                run_id=run_id,
+                generated_at=generated_at,
+                derivation_reference=f"urn:kestrel:inference:{derivation_id}",
+            )
+        return None
+
+    async def _freshen_inferred_for_erasure(
+        self,
+        assertion: Assertion,
+        lineage: DerivedLineage,
+    ) -> Assertion:
+        """Publish a fresh current inferred revision without retaining old lineage."""
+        if (
+            assertion.status is not AssertionStatus.ACTIVE
+            or assertion.epistemic_state is not EpistemicState.INFERRED
+            or not isinstance(assertion.lineage, DerivedLineage)
+        ):
+            raise AssertionStoreError(
+                "only an active inferred assertion can be re-lined for erasure"
+            )
+        mapping = assertion.to_mapping()
+        mapping["revision_id"] = uuid4().hex
+        mapping["status"] = AssertionStatus.ACTIVE.value
+        mapping["epistemic_state"] = EpistemicState.INFERRED.value
+        mapping["supersedes_revision_id"] = None
+        mapping["asserted_at"] = {"schema_version": 1, "value": _now()}
+        mapping["lineage"] = lineage.to_mapping()
+        replacement = Assertion.from_mapping(mapping)
+        await self._validate_lineage(replacement, ())
+        await self._invalidate_eligibility(assertion.revision_id)
+        await self._write_revision(replacement, ())
+        await self._set_current(replacement)
+        return replacement
+
+    async def _reconcile_inference_derivations_after_erasure(
+        self,
+        erased_revision_ids: set[str],
+        refreshed_revision_ids: dict[str, str],
+    ) -> None:
+        """Delete erased proofs and retarget independently surviving proofs.
+
+        A refreshed conclusion has a different revision ID.  Every surviving
+        ledger proof that names the old revision must point to the fresh one;
+        every proof with an actually erased input must disappear so an erased
+        revision is never recoverable through the explanation ledger.
+        """
+        if not erased_revision_ids:
+            return
+        tenant_id, _ = self._require_scope()
+        affected = tuple(sorted(erased_revision_ids))
+        rows = await self._database.fetchall(
+            "SELECT DISTINCT d.derivation_id, d.derived_revision_id "
+            "FROM semantic_inference_derivations d "
+            "LEFT JOIN semantic_inference_derivation_inputs i "
+            "  ON i.tenant_id = d.tenant_id AND i.derivation_id = d.derivation_id "
+            "WHERE d.tenant_id = ? "
+            f"AND (d.derived_revision_id IN ({_placeholders(affected)}) "
+            f"OR i.input_revision_id IN ({_placeholders(affected)}))",
+            (tenant_id,) + affected + affected,
+        )
+        for derivation_id, derived_revision_id in rows:
+            input_rows = await self._database.fetchall(
+                "SELECT input_revision_id FROM semantic_inference_derivation_inputs "
+                "WHERE tenant_id = ? AND derivation_id = ? ORDER BY ordinal ASC",
+                (tenant_id, derivation_id),
+            )
+            original_inputs = tuple(str(row[0]) for row in input_rows)
+            original_derived = str(derived_revision_id)
+            if (
+                original_derived in erased_revision_ids
+                and original_derived not in refreshed_revision_ids
+            ) or any(
+                revision_id in erased_revision_ids
+                and revision_id not in refreshed_revision_ids
+                for revision_id in original_inputs
+            ):
+                await self._database.execute(
+                    "DELETE FROM semantic_inference_derivation_inputs "
+                    "WHERE tenant_id = ? AND derivation_id = ?",
+                    (tenant_id, derivation_id),
+                )
+                await self._database.execute(
+                    "DELETE FROM semantic_inference_derivations "
+                    "WHERE tenant_id = ? AND derivation_id = ?",
+                    (tenant_id, derivation_id),
+                )
+                continue
+            replacement_derived = refreshed_revision_ids.get(
+                original_derived, original_derived
+            )
+            replacement_inputs = tuple(
+                refreshed_revision_ids.get(revision_id, revision_id)
+                for revision_id in original_inputs
+            )
+            if (
+                replacement_derived == original_derived
+                and replacement_inputs == original_inputs
+            ):
+                continue
+            if len(set(replacement_inputs)) != len(replacement_inputs):
+                raise AssertionStoreError(
+                    "erasure rematerialization produced duplicate derivation inputs"
+                )
+            await self._database.execute(
+                "UPDATE semantic_inference_derivations SET derived_revision_id = ? "
+                "WHERE tenant_id = ? AND derivation_id = ?",
+                (replacement_derived, tenant_id, derivation_id),
+            )
+            await self._database.execute(
+                "DELETE FROM semantic_inference_derivation_inputs "
+                "WHERE tenant_id = ? AND derivation_id = ?",
+                (tenant_id, derivation_id),
+            )
+            for ordinal, revision_id in enumerate(replacement_inputs):
+                await self._database.execute(
+                    "INSERT INTO semantic_inference_derivation_inputs "
+                    "(tenant_id, derivation_id, input_revision_id, ordinal) "
+                    "VALUES (?, ?, ?, ?)",
+                    (tenant_id, derivation_id, revision_id, ordinal),
+                )
+
     async def erase(self, assertion_id: str, *, operation_id: str | None = None) -> ErasureResult:
         """Physically erase an assertion and its transitive derived closure.
 
@@ -1171,6 +1632,8 @@ class AsyncAssertionStore:
             revision_ids = {row[0] for row in seed_rows}
             assertion_ids = {assertion_id}
             pending = set(revision_ids)
+            refreshed_revision_ids: dict[str, str] = {}
+            erasure_run_id = f"inference:erasure-rematerialization:{uuid4().hex}"
             while pending:
                 batch = tuple(sorted(pending))
                 pending.clear()
@@ -1192,23 +1655,66 @@ class AsyncAssertionStore:
                     if derived_revision_id not in revision_ids:
                         revision_ids.add(derived_revision_id)
                         pending.add(derived_revision_id)
-                    if (
-                        current_revision_id != derived_revision_id
-                        or derived_assertion_id in assertion_ids
-                    ):
+                    if current_revision_id != derived_revision_id:
                         # A newer independent current revision owns this
                         # deterministic assertion identity. Remove only its
                         # reachable historical lineage, never that replacement.
                         continue
-                    assertion_ids.add(derived_assertion_id)
+                    if derived_assertion_id in assertion_ids:
+                        # This assertion has no valid alternate proof and is
+                        # part of the physical-erasure closure.
+                        all_revisions = await self._database.fetchall(
+                            "SELECT revision_id FROM semantic_assertion_revisions "
+                            "WHERE tenant_id = ? AND assertion_id = ? ORDER BY revision_id ASC",
+                            (tenant_id, derived_assertion_id),
+                        )
+                        for (revision_id,) in all_revisions:
+                            if revision_id not in revision_ids:
+                                revision_ids.add(revision_id)
+                                pending.add(revision_id)
+                        continue
+                    current = await self._current(str(derived_assertion_id))
+                    if current is None or current.revision_id != derived_revision_id:
+                        raise AssertionStoreError(
+                            "current assertion changed during serialized erasure"
+                        )
                     all_revisions = await self._database.fetchall(
-                        "SELECT revision_id FROM semantic_assertion_revisions WHERE tenant_id = ? AND assertion_id = ? ORDER BY revision_id ASC",
+                        "SELECT revision_id FROM semantic_assertion_revisions "
+                        "WHERE tenant_id = ? AND assertion_id = ? ORDER BY revision_id ASC",
                         (tenant_id, derived_assertion_id),
                     )
+                    replacement_lineage = await self._erasure_replacement_lineage(
+                        current,
+                        revision_ids,
+                        refreshed_revision_ids,
+                        erasure_run_id,
+                    )
+                    if replacement_lineage is not None:
+                        # Capture every pre-existing revision before writing
+                        # the replacement: the fresh revision is the retained
+                        # conclusion, while historical proof rows remain
+                        # reachable erasure data.
+                        for (revision_id,) in all_revisions:
+                            if revision_id not in revision_ids:
+                                revision_ids.add(revision_id)
+                                pending.add(revision_id)
+                        replacement = await self._freshen_inferred_for_erasure(
+                            current, replacement_lineage
+                        )
+                        refreshed_revision_ids[current.revision_id] = (
+                            replacement.revision_id
+                        )
+                        continue
+
+                    assertion_ids.add(str(derived_assertion_id))
                     for (revision_id,) in all_revisions:
                         if revision_id not in revision_ids:
                             revision_ids.add(revision_id)
                             pending.add(revision_id)
+            await self._reconcile_inference_derivations_after_erasure(
+                revision_ids,
+                refreshed_revision_ids,
+            )
             revision_tuple = tuple(sorted(revision_ids))
             assertion_tuple = tuple(sorted(assertion_ids))
             await self._sanitize_surviving_references_after_erasure(
@@ -1227,6 +1733,26 @@ class AsyncAssertionStore:
                 f"DELETE FROM semantic_projection_eligibility WHERE tenant_id = ? AND revision_id IN ({_placeholders(revision_tuple)})",
                 (tenant_id,) + revision_tuple,
             )
+            inference_rows = await self._database.fetchall(
+                "SELECT derivation_id FROM semantic_inference_derivations "
+                f"WHERE tenant_id = ? AND derived_revision_id IN ({_placeholders(revision_tuple)}) "
+                "UNION "
+                "SELECT derivation_id FROM semantic_inference_derivation_inputs "
+                f"WHERE tenant_id = ? AND input_revision_id IN ({_placeholders(revision_tuple)})",
+                (tenant_id,) + revision_tuple + (tenant_id,) + revision_tuple,
+            )
+            inference_derivation_ids = tuple(sorted({str(row[0]) for row in inference_rows}))
+            if inference_derivation_ids:
+                await self._database.execute(
+                    "DELETE FROM semantic_inference_derivation_inputs WHERE tenant_id = ? "
+                    f"AND derivation_id IN ({_placeholders(inference_derivation_ids)})",
+                    (tenant_id,) + inference_derivation_ids,
+                )
+                await self._database.execute(
+                    "DELETE FROM semantic_inference_derivations WHERE tenant_id = ? "
+                    f"AND derivation_id IN ({_placeholders(inference_derivation_ids)})",
+                    (tenant_id,) + inference_derivation_ids,
+                )
             await self._database.execute(
                 f"DELETE FROM semantic_derivation_inputs WHERE tenant_id = ? AND (derived_revision_id IN ({_placeholders(revision_tuple)}) OR input_revision_id IN ({_placeholders(revision_tuple)}))",
                 (tenant_id,) + revision_tuple + revision_tuple,
@@ -1321,7 +1847,11 @@ class AsyncAssertionStore:
     async def inference_inputs(self, query: AssertionQuery | None = None) -> list[Assertion]:
         """Return only current, active, projection-eligible tenant assertions."""
         values = await self.query(query)
-        return [value for value in values if value.status is AssertionStatus.ACTIVE]
+        return [
+            value for value in values
+            if value.status is AssertionStatus.ACTIVE
+            and await self._is_current_active_eligible_revision(value.revision_id)
+        ]
 
     async def export_snapshot(self, query: AssertionQuery | None = None) -> tuple[AssertionCheckpoint, tuple[Assertion, ...]]:
         """Return a tenant-bound active snapshot for a caller already scoped here.

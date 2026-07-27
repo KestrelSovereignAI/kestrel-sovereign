@@ -106,16 +106,27 @@ __all__ = [
     "DirectLineage",
     "EpistemicState",
     "ExperimentalCapabilityError",
+    "BoundedInferenceService",
+    "ClosureState",
+    "ClosureStatus",
+    "DerivationExplanation",
     "IDENTITY_VERSION",
     "IRI",
     "IRI_PROFILE",
     "Instant",
+    "InferenceError",
+    "InferenceLimits",
+    "InferenceProfile",
+    "inference_profile_from_config",
+    "validate_inference_profile",
+    "InferenceService",
     "KnowledgeRegistryError",
     "LITERAL_PROFILE",
     "Lineage",
     "Literal",
     "LocalIdentifier",
     "MAPPING_SCHEMA_VERSION",
+    "MaterializationResult",
     "OntologyRef",
     "RDF_LANG_STRING",
     "RdfAssertionCodec",
@@ -143,6 +154,7 @@ __all__ = [
     "ResourceKind",
     "ResourceRequirement",
     "SemanticCapabilityContract",
+    "SemanticInferenceService",
     "SemanticKnowledgeRegistry",
     "SemanticResource",
     "SemanticVersion",
@@ -218,6 +230,23 @@ _RDF_CODEC_EXPORTS = frozenset(
     }
 )
 
+_INFERENCE_EXPORTS = frozenset(
+    {
+        "BoundedInferenceService",
+        "ClosureState",
+        "ClosureStatus",
+        "DerivationExplanation",
+        "InferenceError",
+        "InferenceLimits",
+        "InferenceProfile",
+        "inference_profile_from_config",
+        "validate_inference_profile",
+        "InferenceService",
+        "MaterializationResult",
+        "SemanticInferenceService",
+    }
+)
+
 
 def __getattr__(name: str):
     """Lazily expose optional boundaries so registry CLI execution stays clean."""
@@ -229,4 +258,8 @@ def __getattr__(name: str):
         from . import rdf_codec
 
         return getattr(rdf_codec, name)
+    if name in _INFERENCE_EXPORTS:
+        from . import inference
+
+        return getattr(inference, name)
     raise AttributeError(name)

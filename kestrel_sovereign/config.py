@@ -11,6 +11,11 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Internal handoff from ProcessManager to a separately launched managed agent.
+# The value is a JSON-encoded LocalAgentConfig.semantic_inference mapping, not
+# assertion content or a profile selected by the child process.
+SEMANTIC_INFERENCE_CONFIG_ENV = "KESTREL_SEMANTIC_INFERENCE_CONFIG"
+
 
 # Default CORS origins for the console/API. Override via the comma-separated
 # KESTREL_CORS_ORIGINS env var. Shared by server.py and host.py so the

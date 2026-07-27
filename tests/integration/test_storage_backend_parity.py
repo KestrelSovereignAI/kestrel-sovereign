@@ -452,9 +452,9 @@ async def test_concurrent_postgres_initializers_serialize_semantic_migration(db_
         marker_rows = await db_backend.fetch_all(
             "SELECT version FROM semantic_schema_migrations "
             "WHERE version = ?",
-            ("semantic_assertion_store_v2",),
+            ("semantic_assertion_store_v3",),
         )
-        assert marker_rows == [("semantic_assertion_store_v2",)]
+        assert marker_rows == [("semantic_assertion_store_v3",)]
     finally:
         await asyncio.gather(*(storage.close() for storage in storages))
 

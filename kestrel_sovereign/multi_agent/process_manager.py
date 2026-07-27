@@ -11,6 +11,7 @@ Remote agents (url-only in config) are ignored — they're not managed by
 this host.
 """
 
+import json
 import logging
 import os
 import signal
@@ -27,6 +28,7 @@ from kestrel_sovereign.multi_agent.config import (
     LocalAgentConfig,
     MultiAgentConfig,
 )
+from kestrel_sovereign.config import SEMANTIC_INFERENCE_CONFIG_ENV
 
 # NOTE: ``IDENTITY_EXPORT_DIR_ENV`` is imported lazily inside ``start_agent``
 # (its only use). Pulling it in at module scope would force ``identity``'s
@@ -501,6 +503,23 @@ class ProcessManager:
         env["PORT"] = str(config.port)
         env["KESTREL_SERVE_UI"] = "true" if standalone else "false"
         env["KESTREL_HOST_URL"] = f"http://localhost:{host_port}"
+        # Unlike an in-process AgentManager, this process handoff cannot pass
+        # constructor arguments. Carry the exact per-agent config rather than
+        # asking the child to discover a project-global profile. Remove an
+        # inherited value when this agent has no configured profile so one
+        # sibling's approval cannot cross a process/tenant boundary.
+        if config.semantic_inference is None:
+            env.pop(SEMANTIC_INFERENCE_CONFIG_ENV, None)
+        else:
+            try:
+                env[SEMANTIC_INFERENCE_CONFIG_ENV] = json.dumps(
+                    config.semantic_inference,
+                    sort_keys=True,
+                )
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Agent '{name}' has a non-serializable semantic inference profile"
+                ) from exc
 
         # Force child agents into single-agent mode. Without this,
         # server.py detects multi_agent.toml in the CWD and enters multi-

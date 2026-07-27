@@ -51,6 +51,21 @@ autostart = true
 # If omitted, ALL discovered features are loaded (sovereign/full agent).
 # features = ["BootstrapFeature", "MemoryFeature", "GitHubFeature"]
 
+# Optional: exact semantic materialization profile. This is configured per
+# managed agent (not in the project-root kestrel.toml), so one tenant's
+# approved ontology/rule pins cannot enable inference for another.
+#
+# [agents.claw.semantic_inference]
+# enabled = true
+# rdfs_version = "1.0.0"
+# # owl2rl_version = "1.0.0"  # enable only the reviewed allowlist
+#
+# [agents.claw.semantic_inference.ontology]
+# namespace = "kestrel-vocab"
+# version = "1.0.0"
+# content_digest = "sha256:<operator-verified-ontology-digest>"
+# compatibility_profile = "semantic-kb-v1"
+
 [agents.testbot]
 data_dir = "agent_data/testbot"
 port = 8802

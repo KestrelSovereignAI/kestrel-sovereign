@@ -5,6 +5,7 @@ Tests process lifecycle, agent registration, status tracking,
 and log reading — all without spawning real subprocesses.
 """
 
+import json
 import os
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -17,6 +18,7 @@ from kestrel_sovereign.multi_agent.config import (
     RemoteAgentConfig,
 )
 from kestrel_sovereign.multi_agent.process_manager import ProcessManager, AgentProcess
+from kestrel_sovereign.config import SEMANTIC_INFERENCE_CONFIG_ENV
 
 
 # -----------------------------------------------------------------------
@@ -236,6 +238,33 @@ class TestStartAgent:
         assert "KESTREL_DATA_DIR" not in env
         assert env["PORT"] == "8801"
         assert env["KESTREL_SERVE_UI"] == "false"
+
+    def test_start_agent_passes_per_agent_semantic_inference_profile(
+        self,
+        pm,
+        project_dir,
+    ):
+        cfg = LocalAgentConfig(
+            data_dir=Path("agent_data/claw"),
+            port=8801,
+            semantic_inference={
+                "enabled": True,
+                "rdfs_version": "1.0.0",
+                "ontology": {
+                    "namespace": "kestrel-test",
+                    "version": "1",
+                    "content_digest": "sha256:test",
+                    "compatibility_profile": "semantic-kb-v1",
+                },
+            },
+        )
+        mock_process = MagicMock(pid=12345)
+
+        with patch("subprocess.Popen", return_value=mock_process) as mock_popen:
+            pm.start_agent("claw", cfg)
+
+        env = mock_popen.call_args.kwargs["env"]
+        assert json.loads(env[SEMANTIC_INFERENCE_CONFIG_ENV]) == cfg.semantic_inference
 
     def test_start_agent_resolves_explicit_export_override_below_data_dir(
         self,

@@ -714,6 +714,20 @@ role = "technical_reviewer"
 
 
 # ---------------------------------------------------------------------------
+# Semantic inference — bounded RDFS / approved OWL 2 RL maintenance (#2746)
+# ---------------------------------------------------------------------------
+# A managed agent's approved profile belongs in that agent's
+# [agents.<name>.semantic_inference] block in multi_agent.toml; see
+# multi_agent.toml.example. The nightly sleep cycle runs incremental
+# materialization only; a full rebuild is an operator repair action. Every pin
+# is exact so a package upgrade cannot widen a tenant's inference rules or
+# ontology interpretation.
+#
+# A standalone agent may place the same [semantic_inference] block in its own
+# agent-data-directory/kestrel.toml.
+
+
+# ---------------------------------------------------------------------------
 # [forgetting] — memory-episode deletion tier (#1674)
 # ---------------------------------------------------------------------------
 # The deletion tier of the importance-decay forgetting curve. It runs INSIDE
