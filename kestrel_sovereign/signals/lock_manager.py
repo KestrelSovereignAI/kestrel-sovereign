@@ -141,8 +141,20 @@ class OrderedLockManager:
                 )
             yield
         finally:
-            # Cancel diagnostics before releasing so a watchdog cannot report a
-            # hold that has already ended.
+            # Release FIRST, and synchronously. Nothing may await before this
+            # loop: a release placed after a suspension point is not
+            # cancellation-safe, and a second cancellation arriving during that
+            # await (aggressive shutdown, or a wait_for timeout composed with an
+            # outer cancel) would skip the release entirely — stranding
+            # CONVERSATION and wedging every later turn for the agent. That is
+            # precisely the incident this instrumentation exists to diagnose, so
+            # the diagnostics must not be able to cause it.
+            for name, lock in reversed(acquired):
+                self._holders.pop(name, None)
+                lock.release()
+            # Then retire the diagnostics. Cancelling after release is safe for
+            # log correctness because a watchdog that fires in the gap reads an
+            # already-popped holder and returns without logging.
             for watchdog in reversed(watchdogs):
                 watchdog.cancel()
             if watchdogs:
@@ -150,9 +162,6 @@ class OrderedLockManager:
                 # an interpreter/loop teardown mid-hold cannot surface "Task was
                 # destroyed but it is pending!" noise from these diagnostics.
                 await asyncio.gather(*watchdogs, return_exceptions=True)
-            for name, lock in reversed(acquired):
-                self._holders.pop(name, None)
-                lock.release()
 
     async def _acquire_one(
         self,

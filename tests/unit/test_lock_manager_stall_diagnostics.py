@@ -213,6 +213,66 @@ async def test_watchdogs_do_not_outlive_the_hold(fast_thresholds, caplog):
     assert "short-turn" not in caplog.text
 
 
+async def test_lock_is_released_when_the_holder_is_cancelled(fast_thresholds):
+    """Release must survive cancellation of the holding task.
+
+    The diagnostics must never be able to cause the failure they exist to
+    report: if release were sequenced after an await in the cleanup path, a
+    cancellation landing there would strand the lock and wedge every later turn
+    for that agent — the exact shape of #2770.
+    """
+    mgr = OrderedLockManager()
+    entered = asyncio.Event()
+
+    async def holder():
+        async with mgr.acquire({ResourceLock.CONVERSATION}, label="doomed-holder"):
+            entered.set()
+            await asyncio.sleep(3600)
+
+    task = asyncio.ensure_future(holder())
+    await entered.wait()
+    assert mgr.is_held(ResourceLock.CONVERSATION)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert not mgr.is_held(ResourceLock.CONVERSATION)
+    assert mgr.holder(ResourceLock.CONVERSATION) is None
+
+    # And the lock is genuinely reusable, not merely reported free.
+    async with mgr.acquire({ResourceLock.CONVERSATION}, label="after-cancel"):
+        assert mgr.holder(ResourceLock.CONVERSATION).label == "after-cancel"
+
+
+async def test_release_precedes_any_await_in_cleanup():
+    """Pin the ordering structurally, not just behaviorally.
+
+    A future refactor could reintroduce an await before the release loop and
+    still pass the cancellation test above under single-cancel timing, because
+    the hazard needs a second cancellation to bite. Assert on the source that
+    release comes first.
+    """
+    import inspect
+
+    from kestrel_sovereign.signals import lock_manager
+
+    source = inspect.getsource(lock_manager.OrderedLockManager.acquire.__wrapped__)
+    cleanup = source.split("finally:", 1)[1]
+    # Strip comments: the surrounding prose legitimately discusses awaiting, and
+    # matching that would assert on documentation rather than on control flow.
+    code = "\n".join(
+        line for line in cleanup.splitlines() if not line.strip().startswith("#")
+    )
+    release_at = code.index("lock.release()")
+    first_await = code.index("await ")
+
+    assert release_at < first_await, (
+        "locks must be released before any suspension point in cleanup; an "
+        "await placed first makes release non-cancellation-safe"
+    )
+
+
 async def test_lock_is_released_when_the_body_raises(fast_thresholds):
     mgr = OrderedLockManager()
 
