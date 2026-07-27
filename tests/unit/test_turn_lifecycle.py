@@ -297,3 +297,89 @@ async def test_clear_without_token_falls_back_safely():
     agent._set_current_chain([_frame("a", "x", 1)])
     agent._clear_current_chain(None)
     assert agent._get_current_chain() is None
+
+
+# ---------------------------------------------------------------------------
+# Stall observability (#2770)
+# ---------------------------------------------------------------------------
+
+
+class _NamedAgent(_StubAgent):
+    """Carries ``agent_name`` like a real KestrelAgent, so the lock label is
+    attributable to a specific agent rather than to "some turn"."""
+
+    def __init__(self, agent_name: str) -> None:
+        super().__init__()
+        self.agent_name = agent_name
+
+
+@pytest.mark.asyncio
+async def test_turn_boundaries_log_at_info(caplog):
+    """#2770: a turn that stalled inside this region left ``process_input
+    called`` as the agent's last record — begin/end were DEBUG and therefore
+    invisible in production. Both boundaries must be visible at INFO."""
+    import logging
+
+    agent = _NamedAgent("Nellie")
+    with caplog.at_level(logging.INFO):
+        async with agent._turn_lifecycle():
+            pass
+
+    assert "turn_lifecycle: Nellie turn_" in caplog.text
+    assert "begin" in caplog.text
+    assert "end after" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_exit_line_carries_the_turn_duration(caplog):
+    """Duration on the exit line so a slow turn is measurable from the log
+    alone, instead of correlating two timestamps by hand."""
+    import logging
+    import re
+
+    agent = _NamedAgent("Nellie")
+    with caplog.at_level(logging.INFO):
+        async with agent._turn_lifecycle():
+            await asyncio.sleep(0.05)
+
+    assert re.search(r"end after \d+\.\ds", caplog.text)
+
+
+@pytest.mark.asyncio
+async def test_lock_holder_is_labelled_with_agent_and_turn():
+    """The holder label is what a blocked waiter reports, so it must identify
+    the agent AND the specific turn."""
+    agent = _NamedAgent("Nellie")
+
+    async with agent._turn_lifecycle() as turn_id:
+        holder = agent._lock_manager.holder(ResourceLock.CONVERSATION)
+        assert holder is not None
+        assert holder.label == f"Nellie {turn_id}"
+
+
+@pytest.mark.asyncio
+async def test_label_degrades_gracefully_without_an_agent_name():
+    """Callers that bypass ``__init__`` (tests using ``__new__``) still get a
+    usable label rather than an AttributeError inside the lock path."""
+    agent = _StubAgent()
+
+    async with agent._turn_lifecycle() as turn_id:
+        holder = agent._lock_manager.holder(ResourceLock.CONVERSATION)
+        assert holder.label == f"agent {turn_id}"
+
+
+@pytest.mark.asyncio
+async def test_boundaries_still_log_when_the_turn_raises(caplog):
+    """A turn that dies must still close its region in the log, otherwise an
+    exception looks identical to a stall."""
+    import logging
+
+    agent = _NamedAgent("Nellie")
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(RuntimeError):
+            async with agent._turn_lifecycle():
+                raise RuntimeError("boom")
+
+    assert "begin" in caplog.text
+    assert "end after" in caplog.text
+    assert not agent._lock_manager.is_held(ResourceLock.CONVERSATION)
