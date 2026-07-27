@@ -1991,6 +1991,17 @@ def build_parser() -> argparse.ArgumentParser:
     from kestrel_sovereign.cli_extensions import register_cli_extensions
     register_cli_extensions(subparsers)
 
+    # kestrel help [command] — a real command, not just a flag, so users
+    # aren't required to already know `-h`/`--help` syntax to ask for help.
+    help_p = subparsers.add_parser("help", help="Show help for kestrel or a specific command")
+    help_p.add_argument(
+        "topic", nargs="?", help="Command to show help for (e.g. `kestrel help feature`)",
+    )
+
+    # Stashed so `kestrel help <topic>` can look up the topic's own parser
+    # without re-walking the registration above.
+    parser._kestrel_subparsers = subparsers  # type: ignore[attr-defined]
+
     return parser
 
 
@@ -2019,6 +2030,17 @@ def main() -> int:
     if not args.command:
         parser.print_help()
         return 1
+
+    if args.command == "help":
+        topic = getattr(args, "topic", None)
+        subparsers = getattr(parser, "_kestrel_subparsers", None)
+        topic_parser = subparsers.choices.get(topic) if subparsers and topic else None
+        if topic and topic_parser is None:
+            print(f"kestrel help: no such command '{topic}'\n")
+            parser.print_help()
+            return 1
+        (topic_parser or parser).print_help()
+        return 0
 
     from kestrel_sovereign.cli_release import cmd_release
     from kestrel_sovereign.cli_deploy import cmd_deploy

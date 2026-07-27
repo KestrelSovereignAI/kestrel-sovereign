@@ -85,6 +85,26 @@ class TestArgumentParsing:
         with patch("sys.argv", ["kestrel"]):
             assert main() == 1
 
+    def test_help_no_topic_prints_top_level_help(self, capsys):
+        """'help' with no topic should print the top-level help and return 0."""
+        with patch("sys.argv", ["kestrel", "help"]):
+            assert main() == 0
+        assert "Kestrel Sovereign Agent Manager" in capsys.readouterr().out
+
+    def test_help_with_topic_prints_subcommand_help(self, capsys):
+        """'help <command>' should print that subcommand's own help."""
+        with patch("sys.argv", ["kestrel", "help", "feature"]):
+            assert main() == 0
+        assert "usage: kestrel feature" in capsys.readouterr().out
+
+    def test_help_with_unknown_topic_returns_1(self, capsys):
+        """'help <bogus>' should say so and fall back to top-level help."""
+        with patch("sys.argv", ["kestrel", "help", "not-a-real-command"]):
+            assert main() == 1
+        out = capsys.readouterr().out
+        assert "no such command 'not-a-real-command'" in out
+        assert "Kestrel Sovereign Agent Manager" in out
+
     def test_version(self, capsys):
         """--version should print version and exit."""
         parser = build_parser()
