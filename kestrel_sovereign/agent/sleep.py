@@ -50,6 +50,7 @@ _SEMANTIC_MAINTENANCE_STATUSES = frozenset(
 _SEMANTIC_MAINTENANCE_REASONS = frozenset(
     {
         "assertion_budget",
+        "change_replay",
         "consolidation_failed",
         "consolidation_skipped",
         "context_assertions",

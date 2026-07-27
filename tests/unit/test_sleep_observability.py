@@ -214,14 +214,19 @@ async def test_consolidate_only_command_includes_safe_maintenance_summary() -> N
 
 def test_authenticated_invoke_preserves_consolidate_only_maintenance_summary() -> None:
     """The actual HTTP invoke envelope must not drop the command's summary."""
+    replay_assertion_id = "replay-assertion-id-DO-NOT-RENDER"
     command_agent = _CommandSleepAgent(
         SleepReport(
             success=False,
-            semantic_maintenance=_maintenance(
-                status="partial",
-                reason="assertion_budget",
-                backlog_assertions=1,
-            ),
+            semantic_maintenance={
+                **_maintenance(
+                    status="partial",
+                    reason="change_replay",
+                    backlog_assertions=1,
+                ),
+                "run_id": replay_assertion_id,
+                "assertion_id": replay_assertion_id,
+            },
         )
     )
 
@@ -253,8 +258,10 @@ def test_authenticated_invoke_preserves_consolidate_only_maintenance_summary() -
             "Sleep incomplete: semantic maintenance is partial."
         )
         assert "status: partial" in body["response"]
+        assert "reason: change_replay" in body["response"]
         assert "backlog: assertions=1 reports=0" in body["response"]
         assert "capabilities: versions=9 digest=" in body["response"]
+        assert replay_assertion_id not in body["response"]
         agent.process_input.assert_awaited_once()
         assert command_agent.sleep_calls == [
             {
