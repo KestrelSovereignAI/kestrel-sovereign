@@ -1889,11 +1889,17 @@ class AsyncAssertionStore:
                     grounded.add(revision_id)
                     changed = True
 
-        dependent_assertions = [
-            inferred[revision_id]
-            for revision_id in sorted(inferred)
-            if revision_id not in withdrawn and revision_id not in grounded
-        ]
+        # Lifecycle receipts and outbox events expose this sequence, so use the
+        # immutable assertion identity rather than an incidental revision or
+        # derivation traversal order.
+        dependent_assertions = sorted(
+            (
+                assertion
+                for revision_id, assertion in inferred.items()
+                if revision_id not in withdrawn and revision_id not in grounded
+            ),
+            key=lambda assertion: assertion.assertion_id,
+        )
         return (
             dependent_assertions,
             tuple(sorted(set(active_derivations).difference(grounded_derivations))),
