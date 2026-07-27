@@ -2,21 +2,23 @@
 Agent stream tap — shared infrastructure for tapping into active agent streams.
 
 When the agent streams a response via ``/agent/stream``, text chunks are
-published to an :class:`asyncio.Queue` keyed by *request_id*.  A TTS consumer
-can subscribe to the same request_id and receive text as it arrives, enabling
+published to an :class:`asyncio.Queue` keyed by a server-generated
+*delivery_id*. A TTS consumer can subscribe to the delivery ID advertised in
+the ``X-Stream-Delivery-ID`` response header and receive text as it arrives,
+enabling
 incremental speech synthesis before the full response is complete.
 
 Usage::
 
     # Producer side (agent stream endpoint):
     tap = AgentStreamTap.get_instance()
-    tap.register(request_id)
+    tap.register(delivery_id)
     for chunk in agent_chunks:
-        await tap.publish(request_id, chunk)
-    await tap.finish(request_id)
+        await tap.publish(delivery_id, chunk)
+    await tap.finish(delivery_id)
 
     # Consumer side (TTS streaming endpoint):
-    async for text_chunk in tap.subscribe(request_id):
+    async for text_chunk in tap.subscribe(delivery_id):
         ...  # synthesize speech
 """
 
@@ -31,7 +33,7 @@ _STREAM_DONE = object()
 
 
 class AgentStreamTap:
-    """Registry of per-request async queues for agent text streaming.
+    """Registry of per-delivery async queues for agent text streaming.
 
     Singleton — use :meth:`get_instance` to obtain the shared instance.
     """
@@ -54,48 +56,48 @@ class AgentStreamTap:
 
     # ---- Producer API ----
 
-    def register(self, request_id: str) -> None:
-        """Create a queue for *request_id*. Idempotent."""
-        if request_id not in self._queues:
-            self._queues[request_id] = asyncio.Queue()
+    def register(self, delivery_id: str) -> None:
+        """Create a queue for one server-owned stream delivery."""
+        if delivery_id not in self._queues:
+            self._queues[delivery_id] = asyncio.Queue()
 
-    async def publish(self, request_id: str, text_chunk: str) -> None:
-        """Push a text chunk to all subscribers of *request_id*."""
-        queue = self._queues.get(request_id)
+    async def publish(self, delivery_id: str, text_chunk: str) -> None:
+        """Push a text chunk to subscribers of one stream delivery."""
+        queue = self._queues.get(delivery_id)
         if queue is not None:
             await queue.put(text_chunk)
 
-    async def finish(self, request_id: str) -> None:
-        """Signal that the agent stream for *request_id* is complete."""
-        queue = self._queues.get(request_id)
+    async def finish(self, delivery_id: str) -> None:
+        """Signal that one stream delivery is complete."""
+        queue = self._queues.get(delivery_id)
         if queue is not None:
             await queue.put(_STREAM_DONE)
 
-    def unregister(self, request_id: str) -> None:
-        """Remove the queue for *request_id* (cleanup)."""
-        self._queues.pop(request_id, None)
+    def unregister(self, delivery_id: str) -> None:
+        """Remove the queue for one completed stream delivery."""
+        self._queues.pop(delivery_id, None)
 
-    def has_stream(self, request_id: str) -> bool:
-        """Check whether a stream exists for *request_id*."""
-        return request_id in self._queues
+    def has_stream(self, delivery_id: str) -> bool:
+        """Check whether a stream delivery has an active tap."""
+        return delivery_id in self._queues
 
     # ---- Consumer API ----
 
     async def subscribe(
-        self, request_id: str, timeout: float = 30.0
+        self, delivery_id: str, timeout: float = 30.0
     ) -> AsyncIterator[str]:
         """Yield text chunks as they arrive for *request_id*.
 
         Args:
-            request_id: The agent request to follow.
+            delivery_id: The server-generated stream delivery to follow.
             timeout: Max seconds to wait for a chunk before giving up.
 
         Yields:
             Text chunks from the agent stream.
         """
-        queue = self._queues.get(request_id)
+        queue = self._queues.get(delivery_id)
         if queue is None:
-            logger.warning("No active stream for request_id=%s", request_id)
+            logger.warning("No active stream for delivery_id=%s", delivery_id)
             return
 
         try:
@@ -104,7 +106,7 @@ class AgentStreamTap:
                     item = await asyncio.wait_for(queue.get(), timeout=timeout)
                 except asyncio.TimeoutError:
                     logger.warning(
-                        "Timeout waiting for stream chunk (request_id=%s)", request_id
+                        "Timeout waiting for stream chunk (delivery_id=%s)", delivery_id
                     )
                     break
                 if item is _STREAM_DONE:
@@ -112,4 +114,4 @@ class AgentStreamTap:
                 yield item
         finally:
             # Consumer done — clean up only if no other subscribers
-            self.unregister(request_id)
+            self.unregister(delivery_id)

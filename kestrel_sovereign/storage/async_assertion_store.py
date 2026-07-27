@@ -23,7 +23,9 @@ from kestrel_sovereign.knowledge import (
     AssertionQuery,
     AssertionStatus,
     DerivedLineage,
+    DirectLineage,
     EpistemicState,
+    IRI,
     SourceOccurrence,
 )
 from kestrel_sovereign.knowledge.shacl_validation import (
@@ -40,6 +42,10 @@ _ASSERTION_TENANT_CAPABILITY_TOKEN = object()
 _RAW_ASSERTION_MUTATION_CAPABILITY_TOKEN = object()
 _ERASURE_JOB_TTL_SECONDS = 300.0
 _MAX_ERASURE_JOBS = 256
+_EXPLICIT_FACT_FORGET_NOOP_OPERATION = "explicit_fact_forget_noop"
+_LEGACY_ERASED_EXPLICIT_FACT_OPERATION = "legacy_erased_explicit_fact"
+_EXPLICIT_FACT_SAVE_OPERATION_PREFIX = "memory-agency-save-fact-v1:save:"
+_EXPLICIT_FACT_FORGET_OPERATION_PREFIX = "memory-agency-save-fact-v1:forget:"
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -150,6 +156,10 @@ class AssertionConflictError(AssertionStoreError):
     """A lifecycle compare-and-swap or idempotency check did not match."""
 
 
+class AssertionOperationErasedError(AssertionConflictError):
+    """A matching operation completed earlier but its semantic data was erased."""
+
+
 @dataclass(frozen=True, slots=True)
 class AssertionWriteResult:
     assertion: Assertion
@@ -166,6 +176,48 @@ class SupersessionResult:
     event_ids: tuple[str, ...]
     invalidated_revision_ids: tuple[str, ...]
     idempotent: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class GovernedAssertionOperationReplay:
+    """The exact accepted receipt for one governed assertion write.
+
+    This is intentionally ledger-derived: callers use it for a delivery retry
+    before inspecting the mutable current revision.  A subsequent append or
+    supersession therefore cannot make an older operation look like a new,
+    conflicting proposal.
+    """
+
+    operation: str
+    report: ShaclValidationReport
+    assertion: Assertion
+    predecessor: Assertion | None
+    generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class _GovernedAssertionReplayBinding:
+    """Immutable explicit-fact result identity required for narrow replay.
+
+    The adapter can rebuild these fields from its invocation after canonical
+    state has moved on.  Delivery timestamps and predecessor/current state are
+    deliberately absent: neither is stable across retries.
+    """
+
+    assertion_id: str
+    revision_id: str
+    source_occurrence_id: str
+    adapter_request_digest: str
+    proposal_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class ErasedGovernedAssertionOperationReplay:
+    """Identity-free terminal replay after physical semantic erasure."""
+
+    operation: str
+    generation: int
+    terminal_erased: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +240,14 @@ class SupersessionLifecyclePlan:
 
 
 @dataclass(frozen=True, slots=True)
+class RestorationLifecyclePlan:
+    """The terminal direct shell and validated graph for one re-teaching."""
+
+    predecessor: Assertion
+    post_state: tuple[Assertion, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class RetractionResult:
     retracted: tuple[Assertion, ...]
     invalidated_revision_ids: tuple[str, ...]
@@ -202,6 +262,27 @@ class DeletionResult:
     invalidated_revision_ids: tuple[str, ...]
     generation: int
     idempotent: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ErasedDeletionOperationReplay:
+    """Identity-free terminal replay for a physically erased deletion."""
+
+    generation: int
+    idempotent: bool = True
+    terminal_erased: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class ExplicitFactForgetReplay:
+    """Exact ledger outcome for one explicit-fact forget invocation."""
+
+    deletion: DeletionResult | None
+    idempotent: bool
+
+    @property
+    def deleted(self) -> bool:
+        return self.deletion is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,12 +350,266 @@ def _now() -> str:
 
 
 def _operation_digest(value: object) -> str:
-    return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
+    """Hash semantic operation intent, excluding transport delivery clocks.
+
+    A retry preserves the invocation and its semantic proposal, but it is a
+    distinct HTTP delivery and therefore has a new honest ``received_at``
+    timestamp.  The assertion mirrors that source timestamp in
+    ``asserted_at``.  Neither volatile clock may prevent the operation ledger
+    from returning the original canonical receipt; the committed assertion
+    and source still retain the first delivery's actual timestamps.
+    """
+    def without_delivery_timestamps(item: object) -> object:
+        if isinstance(item, dict):
+            return {
+                key: without_delivery_timestamps(nested)
+                for key, nested in item.items()
+                if key not in {"asserted_at", "received_at"}
+            }
+        if isinstance(item, (list, tuple)):
+            return [without_delivery_timestamps(nested) for nested in item]
+        return item
+
+    normalized = without_delivery_timestamps(value)
+    return hashlib.sha256(_json(normalized).encode("utf-8")).hexdigest()
 
 
 def _erasure_receipt_key(operation_id: str) -> str:
     """Derive the durable, opaque lookup key for an erasure retry."""
     return _operation_digest({"erasure_operation_id": operation_id})
+
+
+def _erased_operation_key(operation_id: str) -> str:
+    """Blind one ordinary semantic operation ID retained after erasure."""
+    return _operation_digest(
+        {
+            "namespace": "semantic-assertion-erased-operation-v1",
+            "operation_id": operation_id,
+        }
+    )
+
+
+def _erased_operation_request_key(
+    operation_id: str,
+    purpose: str,
+    request_digest: str,
+) -> str:
+    """Bind a blinded tombstone to its exact prior purpose and request.
+
+    The stored value is not the ordinary request digest.  Keying this second
+    hash with the opaque operation ID prevents the tombstone from becoming a
+    content-confirmation oracle while still rejecting reuse with a different
+    request.
+    """
+    return _operation_digest(
+        {
+            "namespace": "semantic-assertion-erased-operation-request-v1",
+            "operation_id": operation_id,
+            "purpose": purpose,
+            "request_digest": request_digest,
+        }
+    )
+
+
+def _validate_governed_replay_binding(
+    binding: _GovernedAssertionReplayBinding,
+) -> None:
+    if not isinstance(binding, _GovernedAssertionReplayBinding):
+        raise AssertionStoreError(
+            "governed assertion replay requires an immutable result binding"
+        )
+    values = (
+        binding.assertion_id,
+        binding.revision_id,
+        binding.source_occurrence_id,
+        binding.adapter_request_digest,
+        binding.proposal_fingerprint,
+    )
+    if any(not isinstance(value, str) or not value for value in values):
+        raise AssertionStoreError(
+            "governed assertion replay binding fields must be non-empty strings"
+        )
+    if (
+        len(binding.adapter_request_digest) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in binding.adapter_request_digest
+        )
+    ):
+        raise AssertionStoreError(
+            "governed assertion replay adapter digest must be lowercase sha256"
+        )
+    if (
+        len(binding.proposal_fingerprint) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in binding.proposal_fingerprint
+        )
+    ):
+        raise AssertionStoreError(
+            "governed assertion replay proposal fingerprint must be lowercase sha256"
+        )
+
+
+def _governed_assertion_replay_binding(
+    assertion: Assertion,
+    source: SourceOccurrence,
+    adapter_request_digest: str,
+) -> _GovernedAssertionReplayBinding:
+    """Bind every immutable proposal field while ignoring delivery clocks."""
+    if not isinstance(assertion, Assertion) or not isinstance(
+        source,
+        SourceOccurrence,
+    ):
+        raise AssertionStoreError(
+            "governed assertion replay binding requires canonical proposal data"
+        )
+    assertion_mapping = assertion.to_mapping()
+    for field in (
+        "revision_id",
+        "status",
+        "supersedes_revision_id",
+        "asserted_at",
+        "lineage",
+    ):
+        assertion_mapping.pop(field, None)
+    source_mapping = source.to_mapping()
+    source_mapping.pop("received_at", None)
+    fingerprint = _operation_digest(
+        {
+            "namespace": "semantic-explicit-fact-proposal-v1",
+            "assertion": assertion_mapping,
+            "direct_source": source_mapping,
+        }
+    )
+    binding = _GovernedAssertionReplayBinding(
+        assertion_id=assertion.assertion_id,
+        revision_id=assertion.revision_id,
+        source_occurrence_id=source.source_occurrence_id,
+        adapter_request_digest=adapter_request_digest,
+        proposal_fingerprint=fingerprint,
+    )
+    _validate_governed_replay_binding(binding)
+    return binding
+
+
+def _erased_explicit_fact_result_key(
+    operation_id: str,
+    purpose: str,
+    binding: _GovernedAssertionReplayBinding,
+) -> str:
+    """Blind the immutable accepted result needed to authenticate a retry."""
+    _validate_governed_replay_binding(binding)
+    return _operation_digest(
+        {
+            "namespace": "semantic-explicit-fact-erased-result-v1",
+            "operation_id": operation_id,
+            "purpose": purpose,
+            "assertion_id": binding.assertion_id,
+            "revision_id": binding.revision_id,
+            "source_occurrence_id": binding.source_occurrence_id,
+            "adapter_request_digest": binding.adapter_request_digest,
+            "proposal_fingerprint": binding.proposal_fingerprint,
+        }
+    )
+
+
+def _erased_explicit_fact_forget_selector_key(
+    operation_id: str,
+    subject: IRI,
+    predicate: IRI,
+) -> str:
+    """Blind an authenticated adapter deletion selector after erasure."""
+    if (
+        not operation_id.startswith(_EXPLICIT_FACT_FORGET_OPERATION_PREFIX)
+        or not isinstance(subject, IRI)
+        or not isinstance(predicate, IRI)
+    ):
+        raise AssertionStoreError(
+            "explicit fact forget binding requires its deterministic selector"
+        )
+    return _operation_digest(
+        {
+            "namespace": "semantic-explicit-fact-erased-forget-v1",
+            "operation_id": operation_id,
+            "purpose": "delete",
+            "subject": subject.value,
+            "predicate": predicate.value,
+        }
+    )
+
+
+def _explicit_fact_binding_from_request(
+    operation_id: str,
+    purpose: str,
+    request: object,
+) -> _GovernedAssertionReplayBinding | None:
+    """Extract only immutable result fields from a governed write request."""
+    if (
+        not operation_id.startswith(_EXPLICIT_FACT_SAVE_OPERATION_PREFIX)
+        or purpose not in {"put", "supersede", "restore"}
+        or not isinstance(request, Mapping)
+    ):
+        return None
+    assertion_mapping = request.get(
+        "assertion" if purpose == "put" else "replacement"
+    )
+    source_mappings = request.get("sources")
+    if not isinstance(assertion_mapping, Mapping) or not isinstance(
+        source_mappings, list
+    ):
+        return None
+    try:
+        assertion = Assertion.from_mapping(assertion_mapping)
+        sources = tuple(
+            SourceOccurrence.from_mapping(item)
+            for item in source_mappings
+            if isinstance(item, Mapping)
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (
+        len(sources) != len(source_mappings)
+        or not isinstance(assertion.lineage, DirectLineage)
+        or assertion.revision_id not in assertion.lineage.source_occurrence_ids
+    ):
+        return None
+    source = next(
+        (
+            item
+            for item in sources
+            if item.source_occurrence_id == assertion.revision_id
+        ),
+        None,
+    )
+    digest_prefix = "sha256:"
+    if (
+        source is None
+        or not isinstance(source.content_digest, str)
+        or not source.content_digest.startswith(digest_prefix)
+    ):
+        return None
+    digest = source.content_digest[len(digest_prefix) :]
+    try:
+        binding = _governed_assertion_replay_binding(
+            assertion,
+            source,
+            digest,
+        )
+        _validate_governed_replay_binding(binding)
+    except AssertionStoreError:
+        return None
+    return binding
+
+
+def _legacy_erasure_assertion_key(erasure_request_digest: str) -> str:
+    """Blind a legacy erasure's already-opaque assertion request digest."""
+    return _operation_digest(
+        {
+            "namespace": "semantic-assertion-legacy-erasure-fence-v1",
+            "erasure_request_digest": erasure_request_digest,
+        }
+    )
 
 
 def _placeholders(values: Sequence[object]) -> str:
@@ -510,7 +845,8 @@ class AsyncAssertionStore:
     async def list_source_occurrences(self, assertion_id: str) -> list[SourceOccurrence]:
         tenant_id, _ = self._require_scope()
         rows = await self._database.fetchall(
-            "SELECT DISTINCT s.source_mapping FROM semantic_assertion_revisions r "
+            "SELECT DISTINCT s.source_mapping, s.received_at, s.source_occurrence_id "
+            "FROM semantic_assertion_revisions r "
             "JOIN semantic_revision_sources rs ON rs.tenant_id = r.tenant_id AND rs.revision_id = r.revision_id "
             "JOIN semantic_source_occurrences s ON s.tenant_id = rs.tenant_id "
             "  AND s.source_occurrence_id = rs.source_occurrence_id "
@@ -792,10 +1128,281 @@ class AsyncAssertionStore:
                 raise AssertionConflictError(
                     "operation_id was already used for an erasure mutation"
                 )
+            erased = await self._erased_operation_tombstone(operation_id)
+            if erased is not None:
+                prior_purpose, prior_request_key, _ = erased
+                explicit_fact_binding = _explicit_fact_binding_from_request(
+                    operation_id,
+                    operation,
+                    request,
+                )
+                explicit_fact_selector = (
+                    request.get("explicit_fact_selector")
+                    if isinstance(request, Mapping)
+                    else None
+                )
+                if (
+                    operation == "delete"
+                    and operation_id.startswith(
+                        _EXPLICIT_FACT_FORGET_OPERATION_PREFIX
+                    )
+                    and isinstance(explicit_fact_selector, Mapping)
+                    and isinstance(
+                        explicit_fact_selector.get("subject"),
+                        str,
+                    )
+                    and isinstance(
+                        explicit_fact_selector.get("predicate"),
+                        str,
+                    )
+                ):
+                    expected_request_key = (
+                        _erased_explicit_fact_forget_selector_key(
+                            operation_id,
+                            IRI(explicit_fact_selector["subject"]),
+                            IRI(explicit_fact_selector["predicate"]),
+                        )
+                    )
+                elif explicit_fact_binding is not None:
+                    expected_request_key = _erased_explicit_fact_result_key(
+                        operation_id,
+                        operation,
+                        explicit_fact_binding,
+                    )
+                else:
+                    expected_request_key = _erased_operation_request_key(
+                        operation_id,
+                        operation,
+                        digest,
+                    )
+                if (
+                    prior_purpose != operation
+                    or prior_request_key != expected_request_key
+                ):
+                    raise AssertionConflictError(
+                        "operation_id was already used for a different semantic mutation"
+                    )
+                raise AssertionOperationErasedError(
+                    "semantic operation completed previously but was physically erased"
+                )
             return digest, None
         if row[0] != operation or row[1] != digest:
             raise AssertionConflictError("operation_id was already used for a different semantic mutation")
         return digest, json.loads(row[2])
+
+    async def _erased_operation_tombstone(
+        self,
+        operation_id: str,
+    ) -> tuple[str, str, int] | None:
+        """Resolve one exact blinded tombstone without offering enumeration."""
+        tenant_id, _ = self._require_scope()
+        if not isinstance(operation_id, str) or not operation_id:
+            raise AssertionStoreError("operation_id must be a non-empty string")
+        row = await self._database.fetchone(
+            "SELECT purpose, request_key, generation "
+            "FROM semantic_assertion_erased_operation_tombstones "
+            "WHERE tenant_id = ? AND operation_key = ?",
+            (tenant_id, _erased_operation_key(operation_id)),
+        )
+        if row is None:
+            return None
+        return str(row[0]), str(row[1]), int(row[2])
+
+    async def _erased_governed_operation_replay(
+        self,
+        operation_id: str,
+        binding: _GovernedAssertionReplayBinding,
+    ) -> ErasedGovernedAssertionOperationReplay | None:
+        """Resolve only exact governed/legacy tombstones after a replay race."""
+        _validate_governed_replay_binding(binding)
+        erased = await self._erased_operation_tombstone(operation_id)
+        if erased is None:
+            return None
+        purpose, request_key, generation = erased
+        if purpose in {"put", "supersede", "restore"}:
+            expected_request_key = _erased_explicit_fact_result_key(
+                operation_id,
+                purpose,
+                binding,
+            )
+        elif purpose == _LEGACY_ERASED_EXPLICIT_FACT_OPERATION:
+            expected_request_key = _erased_operation_request_key(
+                operation_id,
+                purpose,
+                binding.adapter_request_digest,
+            )
+        else:
+            raise AssertionConflictError(
+                "operation_id resolves to a non-governed erased semantic mutation"
+            )
+        if request_key != expected_request_key:
+            # Unreleased v4 branch databases wrote ordinary canonical-request
+            # keys into these tombstones.  Their migration also creates the
+            # same per-assertion opaque fence used for released v3 data.  A
+            # matching fence is enough only to fail closed as terminal: it is
+            # not enough to rewrite/authenticate the old tombstone, because a
+            # cross-producer operation-key collision is indistinguishable
+            # after erasure.  Fresh stores have no such fence and conflict.
+            candidate_erasure_digest = _operation_digest(
+                {"assertion_id": binding.assertion_id}
+            )
+            legacy_fence = await self._database.fetchone(
+                "SELECT 1 FROM semantic_assertion_legacy_erasure_fences "
+                "WHERE tenant_id = ? AND assertion_key = ?",
+                (
+                    self.tenant_id,
+                    _legacy_erasure_assertion_key(
+                        candidate_erasure_digest
+                    ),
+                ),
+            )
+            if legacy_fence is not None:
+                return ErasedGovernedAssertionOperationReplay(
+                    operation=_LEGACY_ERASED_EXPLICIT_FACT_OPERATION,
+                    generation=generation,
+                )
+            raise AssertionConflictError(
+                "operation_id resolves to a different erased governed assertion result"
+            )
+        return ErasedGovernedAssertionOperationReplay(
+            operation=purpose,
+            generation=generation,
+        )
+
+    async def terminalize_legacy_erased_explicit_fact_operation(
+        self,
+        operation_id: str,
+        binding: _GovernedAssertionReplayBinding,
+    ) -> ErasedGovernedAssertionOperationReplay | None:
+        """Lazily tombstone an exact v3-erased explicit-fact identity.
+
+        v3 retained only ``H({assertion_id})`` in the opaque erasure receipt
+        after deleting ordinary operation receipts.  The v5 migration blinds
+        those digests again into per-tenant assertion fences.  Because
+        explicit-fact assertion identities are deterministic, a retry can
+        compare its in-memory proposal without recovering or storing the
+        erased identifier or content.  A match is information-theoretically
+        ambiguous with an intentional same-content re-teach, so this path
+        fails closed; unrelated post-upgrade facts remain writable.  Restoring
+        the exact erased identity would require a future explicit
+        consent/epoch override contract, not this ordinary retry surface.
+        """
+        if not isinstance(operation_id, str) or not operation_id:
+            raise AssertionStoreError(
+                "legacy erased explicit-fact replay requires non-empty opaque identifiers"
+            )
+        _validate_governed_replay_binding(binding)
+        adapter_request_digest = binding.adapter_request_digest
+        assertion_id = binding.assertion_id
+        candidate_erasure_digest = _operation_digest(
+            {"assertion_id": assertion_id}
+        )
+        row = await self._database.fetchone(
+            "SELECT generation "
+            "FROM semantic_assertion_legacy_erasure_fences "
+            "WHERE tenant_id = ? AND assertion_key = ?",
+            (
+                self.tenant_id,
+                _legacy_erasure_assertion_key(candidate_erasure_digest),
+            ),
+        )
+        if row is None:
+            # Fresh v5 stores and unrelated post-upgrade facts stay on the
+            # ordinary path without acquiring the tenant writer slot.
+            return None
+        fence_generation = int(row[0])
+        async with self._mutation():
+            if await self._recorded_operation(operation_id) is not None:
+                # A concurrent normal commit won.  The caller will re-enter
+                # its bounded loop and replay that complete receipt.
+                return None
+            erased = await self._erased_operation_tombstone(operation_id)
+            if erased is not None:
+                purpose, request_key, generation = erased
+                if purpose in {"put", "supersede", "restore"}:
+                    if request_key != _erased_explicit_fact_result_key(
+                        operation_id,
+                        purpose,
+                        binding,
+                    ):
+                        raise AssertionConflictError(
+                            "operation_id resolves to a different erased governed assertion result"
+                        )
+                    return ErasedGovernedAssertionOperationReplay(
+                        operation=purpose,
+                        generation=generation,
+                    )
+                expected_request_key = _erased_operation_request_key(
+                    operation_id,
+                    _LEGACY_ERASED_EXPLICIT_FACT_OPERATION,
+                    adapter_request_digest,
+                )
+                if (
+                    purpose != _LEGACY_ERASED_EXPLICIT_FACT_OPERATION
+                    or request_key != expected_request_key
+                ):
+                    raise AssertionConflictError(
+                        "operation_id was already used for a different semantic mutation"
+                    )
+                return ErasedGovernedAssertionOperationReplay(
+                    operation=purpose,
+                    generation=generation,
+                )
+
+            purpose = _LEGACY_ERASED_EXPLICIT_FACT_OPERATION
+            await self._database.execute(
+                "INSERT INTO semantic_assertion_erased_operation_tombstones "
+                "(tenant_id, purpose, operation_key, request_key, generation, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    self.tenant_id,
+                    purpose,
+                    _erased_operation_key(operation_id),
+                    _erased_operation_request_key(
+                        operation_id,
+                        purpose,
+                        adapter_request_digest,
+                    ),
+                    fence_generation,
+                    _now(),
+                ),
+            )
+            return ErasedGovernedAssertionOperationReplay(
+                operation=purpose,
+                generation=fence_generation,
+            )
+
+    async def _recorded_operation(
+        self,
+        operation_id: str,
+    ) -> tuple[str, dict[str, object]] | None:
+        """Load one tenant-local operation receipt without reconstructing intent.
+
+        A replay caller already possesses the stable, adapter-derived
+        operation ID.  It must not derive a request from the current canonical
+        state just to rediscover an older receipt: later revisions are allowed
+        to change that state.  Mutations still use :meth:`_operation`, which
+        verifies both the operation ID and complete request digest.
+        """
+        tenant_id, _ = self._require_scope()
+        if not isinstance(operation_id, str) or not operation_id:
+            raise AssertionStoreError("operation_id must be a non-empty string")
+        row = await self._database.fetchone(
+            "SELECT operation, receipt FROM semantic_assertion_operations "
+            "WHERE tenant_id = ? AND operation_id = ?",
+            (tenant_id, operation_id),
+        )
+        if row is None:
+            return None
+        try:
+            receipt = json.loads(row[1])
+        except (TypeError, json.JSONDecodeError) as error:
+            raise AssertionConflictError(
+                "semantic operation receipt is malformed"
+            ) from error
+        if not isinstance(receipt, dict):
+            raise AssertionConflictError("semantic operation receipt is malformed")
+        return str(row[0]), receipt
 
     async def _record_operation(
         self, operation_id: str, operation: str, digest: str, receipt: dict[str, object], assertion_ids: Iterable[str], revision_ids: Iterable[str],
@@ -809,27 +1416,200 @@ class AsyncAssertionStore:
              _json(sorted(set(revision_ids))), _now()),
         )
 
-    async def _delete_operations_referencing(
+    async def _explicit_fact_binding_from_recorded_result(
+        self,
+        operation_id: str,
+        purpose: str,
+        receipt: Mapping[str, object],
+    ) -> _GovernedAssertionReplayBinding | None:
+        """Derive a fact result binding before its revisions are erased."""
+        if (
+            not operation_id.startswith(_EXPLICIT_FACT_SAVE_OPERATION_PREFIX)
+            or purpose not in {"put", "supersede", "restore"}
+        ):
+            return None
+        result_field = (
+            "revision_id" if purpose == "put" else "replacement_revision_id"
+        )
+        revision_id = receipt.get(result_field)
+        if not isinstance(revision_id, str) or not revision_id:
+            return None
+        assertion = await self._revision(revision_id)
+        if (
+            assertion is None
+            or not isinstance(assertion.lineage, DirectLineage)
+        ):
+            return None
+        predecessor: Assertion | None = None
+        if purpose in {"supersede", "restore"}:
+            predecessor_id = receipt.get("predecessor_revision_id")
+            if not isinstance(predecessor_id, str) or not predecessor_id:
+                return None
+            predecessor = await self._revision(predecessor_id)
+            if predecessor is None:
+                return None
+        if not self._governed_replay_result_structure_matches(
+            purpose,
+            assertion,
+            predecessor,
+            revision_id,
+        ):
+            return None
+        row = await self._database.fetchone(
+            "SELECT s.source_mapping "
+            "FROM semantic_revision_sources rs "
+            "JOIN semantic_source_occurrences s "
+            "  ON s.tenant_id = rs.tenant_id "
+            " AND s.source_occurrence_id = rs.source_occurrence_id "
+            "WHERE rs.tenant_id = ? AND rs.revision_id = ? "
+            "AND rs.source_occurrence_id = ?",
+            (self.tenant_id, revision_id, revision_id),
+        )
+        if row is None:
+            return None
+        try:
+            source = SourceOccurrence.from_mapping(json.loads(row[0]))
+        except (KeyError, TypeError, json.JSONDecodeError, ValueError):
+            return None
+        digest_prefix = "sha256:"
+        if (
+            not isinstance(source.content_digest, str)
+            or not source.content_digest.startswith(digest_prefix)
+            or assertion.asserted_at != source.received_at
+        ):
+            return None
+        try:
+            binding = _governed_assertion_replay_binding(
+                assertion,
+                source,
+                source.content_digest[len(digest_prefix) :],
+            )
+            _validate_governed_replay_binding(binding)
+        except AssertionStoreError:
+            return None
+        return binding
+
+    async def _explicit_fact_forget_selector_from_recorded_result(
+        self,
+        operation_id: str,
+        purpose: str,
+        receipt: Mapping[str, object],
+    ) -> tuple[IRI, IRI] | None:
+        """Authenticate an adapter deletion before its result is erased."""
+        if (
+            purpose != "delete"
+            or not operation_id.startswith(
+                _EXPLICIT_FACT_FORGET_OPERATION_PREFIX
+            )
+        ):
+            return None
+        selector = receipt.get("explicit_fact_selector")
+        deleted_revision_id = receipt.get("deleted_revision_id")
+        if (
+            not isinstance(selector, Mapping)
+            or not isinstance(selector.get("subject"), str)
+            or not isinstance(selector.get("predicate"), str)
+            or not isinstance(deleted_revision_id, str)
+            or not deleted_revision_id
+        ):
+            return None
+        try:
+            subject = IRI(selector["subject"])
+            predicate = IRI(selector["predicate"])
+        except (TypeError, ValueError):
+            return None
+        deleted = await self._revision(deleted_revision_id)
+        if (
+            deleted is None
+            or deleted.status is not AssertionStatus.DELETED
+            or deleted.subject != subject
+            or deleted.predicate != predicate
+            or deleted.confidence_method != "memory-agency-save-fact-v1"
+            or deleted.confidence_basis != "explicit-tool-invocation"
+            or not isinstance(deleted.lineage, DirectLineage)
+        ):
+            return None
+        rows = await self._database.fetchall(
+            "SELECT s.source_mapping "
+            "FROM semantic_revision_sources rs "
+            "JOIN semantic_source_occurrences s "
+            "  ON s.tenant_id = rs.tenant_id "
+            " AND s.source_occurrence_id = rs.source_occurrence_id "
+            "WHERE rs.tenant_id = ? AND rs.revision_id = ?",
+            (self.tenant_id, deleted_revision_id),
+        )
+        try:
+            sources = [
+                SourceOccurrence.from_mapping(json.loads(row[0]))
+                for row in rows
+            ]
+        except (KeyError, TypeError, json.JSONDecodeError, ValueError):
+            return None
+        if not any(
+            source.source_occurrence_id.startswith(
+                "source:memory-agency-save-fact-v1:"
+            )
+            and source.selector == "tool-arguments"
+            and (
+                (
+                    source.source_kind == "agent_tool_invocation"
+                    and source.locator.startswith(
+                        "tool:memory_agency.save_fact#"
+                    )
+                )
+                or (
+                    source.source_kind == "http_request"
+                    and "#tool:memory_agency.save_fact#"
+                    in source.locator
+                )
+            )
+            for source in sources
+        ):
+            return None
+        return subject, predicate
+
+    async def _tombstone_and_delete_operations_referencing(
         self,
         assertion_ids: set[str],
         revision_ids: set[str],
+        generation: int,
     ) -> None:
-        """Remove idempotency receipts that retain any physically erased ID.
+        """Blind then remove receipts that retain any physically erased ID.
 
         The identifiers are stored as JSON arrays for backend-neutral audit
         data. Parsing them avoids SQL ``LIKE`` semantics, which would treat
         ``%`` and ``_`` in a caller-provided ID as wildcards and could leave a
-        recoverable receipt behind.
+        recoverable receipt behind.  Every selected operation first receives
+        an identity-free tombstone inside the erasure transaction.  A delayed
+        retry therefore terminates without resurrecting data after the
+        content-bearing receipt is deleted.
         """
         tenant_id, _ = self._require_scope()
         rows = await self._database.fetchall(
-            "SELECT operation_id, assertion_ids, revision_ids "
+            "SELECT operation_id, operation, request_digest, receipt, "
+            "assertion_ids, revision_ids "
             "FROM semantic_assertion_operations WHERE tenant_id = ?",
             (tenant_id,),
         )
-        operation_ids: list[str] = []
-        for operation_id, encoded_assertion_ids, encoded_revision_ids in rows:
+        operations: list[
+            tuple[
+                str,
+                str,
+                str,
+                _GovernedAssertionReplayBinding | None,
+                tuple[IRI, IRI] | None,
+            ]
+        ] = []
+        for (
+            operation_id,
+            purpose,
+            request_digest,
+            encoded_receipt,
+            encoded_assertion_ids,
+            encoded_revision_ids,
+        ) in rows:
             try:
+                receipt = json.loads(encoded_receipt)
                 recorded_assertion_ids = json.loads(encoded_assertion_ids)
                 recorded_revision_ids = json.loads(encoded_revision_ids)
             except (TypeError, json.JSONDecodeError) as error:
@@ -837,7 +1617,8 @@ class AsyncAssertionStore:
                     "semantic operation receipt contains malformed identifier data"
                 ) from error
             if not (
-                isinstance(recorded_assertion_ids, list)
+                isinstance(receipt, dict)
+                and isinstance(recorded_assertion_ids, list)
                 and all(isinstance(item, str) for item in recorded_assertion_ids)
                 and isinstance(recorded_revision_ids, list)
                 and all(isinstance(item, str) for item in recorded_revision_ids)
@@ -849,8 +1630,86 @@ class AsyncAssertionStore:
                 assertion_ids.intersection(recorded_assertion_ids)
                 or revision_ids.intersection(recorded_revision_ids)
             ):
-                operation_ids.append(operation_id)
-        if operation_ids:
+                binding = await self._explicit_fact_binding_from_recorded_result(
+                    str(operation_id),
+                    str(purpose),
+                    receipt,
+                )
+                forget_selector = (
+                    await self._explicit_fact_forget_selector_from_recorded_result(
+                        str(operation_id),
+                        str(purpose),
+                        receipt,
+                    )
+                )
+                operations.append(
+                    (
+                        str(operation_id),
+                        str(purpose),
+                        str(request_digest),
+                        binding,
+                        forget_selector,
+                    )
+                )
+        if operations:
+            for (
+                operation_id,
+                purpose,
+                request_digest,
+                binding,
+                forget_selector,
+            ) in operations:
+                operation_key = _erased_operation_key(operation_id)
+                request_key = (
+                    _erased_explicit_fact_forget_selector_key(
+                        operation_id,
+                        forget_selector[0],
+                        forget_selector[1],
+                    )
+                    if forget_selector is not None
+                    else _erased_explicit_fact_result_key(
+                        operation_id,
+                        purpose,
+                        binding,
+                    )
+                    if binding is not None
+                    else _erased_operation_request_key(
+                        operation_id,
+                        purpose,
+                        request_digest,
+                    )
+                )
+                existing = await self._database.fetchone(
+                    "SELECT purpose, request_key, generation "
+                    "FROM semantic_assertion_erased_operation_tombstones "
+                    "WHERE tenant_id = ? AND operation_key = ?",
+                    (tenant_id, operation_key),
+                )
+                if existing is None:
+                    await self._database.execute(
+                        "INSERT INTO semantic_assertion_erased_operation_tombstones "
+                        "(tenant_id, purpose, operation_key, request_key, generation, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            tenant_id,
+                            purpose,
+                            operation_key,
+                            request_key,
+                            generation,
+                            _now(),
+                        ),
+                    )
+                elif (
+                    str(existing[0]) != purpose
+                    or str(existing[1]) != request_key
+                    or int(existing[2]) != generation
+                ):
+                    raise AssertionConflictError(
+                        "erased semantic operation tombstone conflicts with its prior request"
+                    )
+            operation_ids = [
+                operation_id for operation_id, _, _, _, _ in operations
+            ]
             await self._database.execute(
                 "DELETE FROM semantic_assertion_operations WHERE tenant_id = ? "
                 f"AND operation_id IN ({_placeholders(operation_ids)})",
@@ -875,6 +1734,11 @@ class AsyncAssertionStore:
         )
         if normal is not None:
             raise AssertionConflictError("operation_id was already used for a different semantic mutation")
+        erased = await self._erased_operation_tombstone(operation_id)
+        if erased is not None:
+            raise AssertionConflictError(
+                "operation_id was already used for a physically erased semantic mutation"
+            )
         row = await self._database.fetchone(
             "SELECT request_digest, generation FROM semantic_assertion_erasure_receipts "
             "WHERE tenant_id = ? AND operation_id = ?",
@@ -1520,6 +2384,41 @@ class AsyncAssertionStore:
                 await self._validation_report_from_receipt(replay)
             return result
 
+    async def restore_with_validation_report(
+        self,
+        expected_terminal_revision_id: str,
+        replacement: Assertion,
+        report: ShaclValidationReport,
+        *,
+        source_occurrences: Sequence[SourceOccurrence] = (),
+        operation_id: str | None = None,
+        expected_generation: int | None = None,
+    ) -> SupersessionResult:
+        """Atomically restore a terminal direct shell with fresh evidence."""
+        operation_id, request = self._validate_restoration(
+            expected_terminal_revision_id,
+            replacement,
+            source_occurrences=source_occurrences,
+            operation_id=operation_id,
+            expected_generation=expected_generation,
+        )
+        self._validate_accepted_validation_report(replacement, report)
+        async with self._mutation():
+            result, replay = await self._restore_in_mutation(
+                expected_terminal_revision_id,
+                replacement,
+                source_occurrences=source_occurrences,
+                operation_id=operation_id,
+                request=request,
+                expected_generation=expected_generation,
+                validation_report_id=report.report_id,
+            )
+            if replay is None:
+                await self._persist_validation_report_in_transaction(report)
+            else:
+                await self._validation_report_from_receipt(replay)
+            return result
+
     def _validate_supersession(
         self,
         expected_predecessor_revision_id: str,
@@ -1545,6 +2444,116 @@ class AsyncAssertionStore:
             "sources": [s.to_mapping() for s in source_occurrences],
         }
         return resolved_operation_id, request
+
+    def _validate_restoration(
+        self,
+        expected_terminal_revision_id: str,
+        replacement: Assertion,
+        *,
+        source_occurrences: Sequence[SourceOccurrence],
+        operation_id: str | None,
+        expected_generation: int | None,
+    ) -> tuple[str, dict[str, object]]:
+        if not isinstance(replacement, Assertion):
+            raise AssertionStoreError(
+                "restore requires a canonical Assertion replacement"
+            )
+        self._check_assertion_scope(replacement)
+        if (
+            replacement.status is not AssertionStatus.ACTIVE
+            or replacement.supersedes_revision_id is not None
+            or not isinstance(replacement.lineage, DirectLineage)
+        ):
+            raise AssertionStoreError(
+                "restoration requires an initial-form active direct replacement"
+            )
+        if (
+            len(source_occurrences) != 1
+            or not isinstance(source_occurrences[0], SourceOccurrence)
+            or replacement.lineage.source_occurrence_ids
+            != (source_occurrences[0].source_occurrence_id,)
+            or replacement.revision_id
+            != source_occurrences[0].source_occurrence_id
+        ):
+            raise AssertionStoreError(
+                "restoration requires exactly one fresh attached source revision"
+            )
+        if expected_generation is not None and (
+            type(expected_generation) is not int or expected_generation < 0
+        ):
+            raise AssertionStoreError(
+                "expected_generation must be a non-negative integer"
+            )
+        resolved_operation_id = operation_id or (
+            f"restore:{expected_terminal_revision_id}:"
+            f"{replacement.revision_id}"
+        )
+        source = source_occurrences[0]
+        adapter_digest = resolved_operation_id.removeprefix(
+            _EXPLICIT_FACT_SAVE_OPERATION_PREFIX
+        )
+        if (
+            not resolved_operation_id.startswith(
+                _EXPLICIT_FACT_SAVE_OPERATION_PREFIX
+            )
+            or replacement.confidence_method
+            != "memory-agency-save-fact-v1"
+            or replacement.confidence_basis != "explicit-tool-invocation"
+            or source.source_occurrence_id
+            != f"source:memory-agency-save-fact-v1:{adapter_digest}"
+            or source.content_digest != f"sha256:{adapter_digest}"
+        ):
+            raise AssertionStoreError(
+                "restoration is restricted to an exact save_fact proposal"
+            )
+        request = {
+            "expected": expected_terminal_revision_id,
+            "replacement": replacement.to_mapping(),
+            "sources": [s.to_mapping() for s in source_occurrences],
+        }
+        return resolved_operation_id, request
+
+    async def replay_governed_restoration(
+        self,
+        expected_terminal_revision_id: str,
+        replacement: Assertion,
+        *,
+        source_occurrences: Sequence[SourceOccurrence] = (),
+        operation_id: str | None = None,
+    ) -> tuple[ShaclValidationReport, SupersessionResult] | None:
+        """Return the exact accepted report and restoration receipt."""
+        resolved_operation_id, request = self._validate_restoration(
+            expected_terminal_revision_id,
+            replacement,
+            source_occurrences=source_occurrences,
+            operation_id=operation_id,
+            expected_generation=None,
+        )
+        _, replay = await self._operation(
+            resolved_operation_id,
+            "restore",
+            request,
+        )
+        if replay is None:
+            return None
+        report = await self._validation_report_from_receipt(replay)
+        predecessor = await self._revision(
+            str(replay["predecessor_revision_id"])
+        )
+        applied = await self._revision(str(replay["replacement_revision_id"]))
+        if predecessor is None or applied is None:
+            raise AssertionConflictError(
+                "idempotent restoration receipt no longer has its revisions"
+            )
+        self._validate_accepted_validation_report(applied, report)
+        return report, SupersessionResult(
+            predecessor,
+            applied,
+            int(replay["generation"]),
+            tuple(replay["event_ids"]),
+            (),
+            True,
+        )
 
     async def replay_governed_supersession(
         self,
@@ -1579,6 +2588,307 @@ class AsyncAssertionStore:
             tuple(replay["invalidated_revision_ids"]),
             True,
         )
+
+    async def _assert_governed_replay_binding(
+        self,
+        operation: str,
+        assertion: Assertion,
+        predecessor: Assertion | None,
+        binding: _GovernedAssertionReplayBinding,
+    ) -> None:
+        """Authenticate a live governed receipt against its adapter proposal."""
+        _validate_governed_replay_binding(binding)
+        if (
+            assertion.assertion_id != binding.assertion_id
+            or assertion.revision_id != binding.revision_id
+            or not self._governed_replay_result_structure_matches(
+                operation,
+                assertion,
+                predecessor,
+                binding.source_occurrence_id,
+            )
+        ):
+            raise AssertionConflictError(
+                "operation_id resolves to a different governed assertion result"
+            )
+        row = await self._database.fetchone(
+            "SELECT s.source_mapping "
+            "FROM semantic_revision_sources rs "
+            "JOIN semantic_source_occurrences s "
+            "  ON s.tenant_id = rs.tenant_id "
+            " AND s.source_occurrence_id = rs.source_occurrence_id "
+            "WHERE rs.tenant_id = ? AND rs.revision_id = ? "
+            "AND rs.source_occurrence_id = ?",
+            (
+                self.tenant_id,
+                binding.revision_id,
+                binding.source_occurrence_id,
+            ),
+        )
+        if row is None:
+            raise AssertionConflictError(
+                "governed assertion receipt lacks its expected attached source"
+            )
+        try:
+            source = SourceOccurrence.from_mapping(json.loads(row[0]))
+        except (KeyError, TypeError, json.JSONDecodeError, ValueError) as error:
+            raise AssertionConflictError(
+                "governed assertion receipt has malformed attached provenance"
+            ) from error
+        if (
+            source.source_occurrence_id != binding.source_occurrence_id
+            or source.content_digest
+            != f"sha256:{binding.adapter_request_digest}"
+            or assertion.asserted_at != source.received_at
+        ):
+            raise AssertionConflictError(
+                "operation_id resolves to different governed assertion provenance"
+            )
+        actual_binding = _governed_assertion_replay_binding(
+            assertion,
+            source,
+            binding.adapter_request_digest,
+        )
+        if (
+            actual_binding.proposal_fingerprint
+            != binding.proposal_fingerprint
+        ):
+            raise AssertionConflictError(
+                "operation_id resolves to different governed assertion metadata"
+            )
+
+    @staticmethod
+    def _governed_replay_result_structure_matches(
+        operation: str,
+        assertion: Assertion,
+        predecessor: Assertion | None,
+        expected_source_occurrence_id: str,
+    ) -> bool:
+        """Check the exact direct-lineage lifecycle shape selected by a receipt."""
+        if (
+            assertion.status is not AssertionStatus.ACTIVE
+            or not isinstance(assertion.lineage, DirectLineage)
+        ):
+            return False
+        source_ids = assertion.lineage.source_occurrence_ids
+        if operation == "put":
+            return (
+                predecessor is None
+                and assertion.supersedes_revision_id is None
+                and source_ids == (expected_source_occurrence_id,)
+            )
+        if (
+            operation == "restore"
+            and predecessor is not None
+            and predecessor.status is AssertionStatus.DELETED
+            and predecessor.assertion_id == assertion.assertion_id
+        ):
+            return (
+                assertion.supersedes_revision_id == predecessor.revision_id
+                and source_ids == (expected_source_occurrence_id,)
+            )
+        if (
+            operation != "supersede"
+            or predecessor is None
+            or predecessor.status is not AssertionStatus.SUPERSEDED
+            or not isinstance(predecessor.lineage, DirectLineage)
+            or assertion.supersedes_revision_id != predecessor.revision_id
+        ):
+            return False
+        if predecessor.assertion_id == assertion.assertion_id:
+            return source_ids == (
+                *predecessor.lineage.source_occurrence_ids,
+                expected_source_occurrence_id,
+            )
+        return source_ids == (expected_source_occurrence_id,)
+
+    async def replay_governed_assertion_operation(
+        self,
+        operation_id: str,
+        binding: _GovernedAssertionReplayBinding,
+    ) -> (
+        GovernedAssertionOperationReplay
+        | ErasedGovernedAssertionOperationReplay
+        | None
+    ):
+        """Return one exact governed-write receipt or erased disposition.
+
+        The normal retry APIs accept a full request and verify its digest.  An
+        explicit-fact adapter cannot safely rebuild that request after later
+        canonical transitions, however: the later state may contain extra
+        source occurrences or a newer replacement.  This narrow read surface
+        resolves only a previously committed, report-backed governed write by
+        its stable operation ID.  After physical erasure it resolves the
+        blinded tombstone instead, returning no assertion, revision, source,
+        report, or content.  It cannot enumerate, publish, or mutate anything.
+        """
+        _validate_governed_replay_binding(binding)
+        recorded = await self._recorded_operation(operation_id)
+        if recorded is None:
+            return await self._erased_governed_operation_replay(
+                operation_id,
+                binding,
+            )
+        operation, receipt = recorded
+        try:
+            if operation == "put":
+                revision_id = receipt.get("revision_id")
+                if not isinstance(revision_id, str) or not revision_id:
+                    raise AssertionConflictError("governed put receipt is malformed")
+                assertion = await self._revision(revision_id)
+                if assertion is None:
+                    raise AssertionConflictError(
+                        "idempotent assertion receipt no longer has a revision"
+                    )
+                report = await self._validation_report_from_receipt(receipt)
+                self._validate_accepted_validation_report(assertion, report)
+                await self._assert_governed_replay_binding(
+                    operation,
+                    assertion,
+                    None,
+                    binding,
+                )
+                generation = receipt.get("generation")
+                if type(generation) is not int:
+                    raise AssertionConflictError("governed put receipt is malformed")
+                return GovernedAssertionOperationReplay(
+                    operation=operation,
+                    report=report,
+                    assertion=assertion,
+                    predecessor=None,
+                    generation=generation,
+                )
+            if operation in {"supersede", "restore"}:
+                predecessor_id = receipt.get("predecessor_revision_id")
+                replacement_id = receipt.get("replacement_revision_id")
+                if not (
+                    isinstance(predecessor_id, str)
+                    and predecessor_id
+                    and isinstance(replacement_id, str)
+                    and replacement_id
+                ):
+                    raise AssertionConflictError(
+                        "governed supersession receipt is malformed"
+                    )
+                predecessor = await self._revision(predecessor_id)
+                assertion = await self._revision(replacement_id)
+                if predecessor is None or assertion is None:
+                    raise AssertionConflictError(
+                        "idempotent supersession receipt no longer has its revisions"
+                    )
+                report = await self._validation_report_from_receipt(receipt)
+                self._validate_accepted_validation_report(assertion, report)
+                await self._assert_governed_replay_binding(
+                    operation,
+                    assertion,
+                    predecessor,
+                    binding,
+                )
+                generation = receipt.get("generation")
+                if type(generation) is not int:
+                    raise AssertionConflictError(
+                        "governed supersession receipt is malformed"
+                    )
+                return GovernedAssertionOperationReplay(
+                    operation=operation,
+                    report=report,
+                    assertion=assertion,
+                    predecessor=predecessor,
+                    generation=generation,
+                )
+            raise AssertionConflictError(
+                "operation_id resolves to a non-governed assertion write"
+            )
+        except AssertionConflictError:
+            # Physical erasure can commit between the operation-row read and
+            # its revision/report reads.  Prefer the now-durable terminal
+            # tombstone over leaking that implementation race as a transient
+            # conflict.  Without a matching tombstone, preserve the original
+            # corruption/conflict signal.
+            erased = await self._erased_governed_operation_replay(
+                operation_id,
+                binding,
+            )
+            if erased is not None:
+                return erased
+            raise
+
+    async def validate_source_append(
+        self,
+        expected_predecessor_revision_id: str,
+        replacement: Assertion,
+        *,
+        source_occurrences: Sequence[SourceOccurrence],
+    ) -> None:
+        """Prove that a replacement is only a direct-provenance append.
+
+        A provenance encounter is itself a canonical revision, but it must not
+        become a back door for changing claim terms or confidence.  The
+        governed validation service calls this before it routes the append
+        through the normal validated supersession lifecycle.  Replays bypass
+        this preflight only after the operation ledger has supplied the exact
+        original receipt.
+        """
+        if not isinstance(replacement, Assertion):
+            raise AssertionStoreError(
+                "source append requires a canonical Assertion replacement"
+            )
+        self._check_assertion_scope(replacement)
+        if len(source_occurrences) != 1 or not isinstance(
+            source_occurrences[0], SourceOccurrence
+        ):
+            raise AssertionStoreError(
+                "source append requires exactly one SourceOccurrence"
+            )
+        predecessor = await self._revision(expected_predecessor_revision_id)
+        if predecessor is None or predecessor.status is not AssertionStatus.ACTIVE:
+            raise AssertionConflictError(
+                "source append requires an active predecessor in the bound tenant"
+            )
+        current = await self._current(predecessor.assertion_id)
+        if current is None or current.revision_id != expected_predecessor_revision_id:
+            raise AssertionConflictError(
+                "source append predecessor is no longer the current tenant revision"
+            )
+        if not isinstance(predecessor.lineage, DirectLineage) or not isinstance(
+            replacement.lineage, DirectLineage
+        ):
+            raise AssertionStoreError(
+                "source append is available only for direct assertions"
+            )
+        source = source_occurrences[0]
+        previous_source_ids = predecessor.lineage.source_occurrence_ids
+        if source.source_occurrence_id in previous_source_ids:
+            raise AssertionStoreError(
+                "source append requires a new source occurrence"
+            )
+        if replacement.lineage.source_occurrence_ids != (
+            *previous_source_ids,
+            source.source_occurrence_id,
+        ):
+            raise AssertionStoreError(
+                "source append replacement must preserve prior direct provenance "
+                "and append exactly the supplied source occurrence"
+            )
+        if replacement.asserted_at != source.received_at:
+            raise AssertionStoreError(
+                "source append assertion time must match the new source encounter"
+            )
+        predecessor_mapping = predecessor.to_mapping()
+        replacement_mapping = replacement.to_mapping()
+        for field in (
+            "revision_id",
+            "status",
+            "supersedes_revision_id",
+            "lineage",
+            "asserted_at",
+        ):
+            predecessor_mapping.pop(field, None)
+            replacement_mapping.pop(field, None)
+        if predecessor_mapping != replacement_mapping:
+            raise AssertionStoreError(
+                "source append cannot alter canonical claim or epistemic metadata"
+            )
 
     async def plan_supersession_lifecycle(
         self,
@@ -1631,6 +2941,162 @@ class AsyncAssertionStore:
             post_state=post_state,
         )
 
+    async def plan_restoration_lifecycle(
+        self,
+        expected_terminal_revision_id: str,
+        replacement: Assertion,
+    ) -> RestorationLifecyclePlan:
+        """Plan a fresh direct revision over an immutable terminal shell."""
+        self._check_assertion_scope(replacement)
+        predecessor = await self._revision(expected_terminal_revision_id)
+        if (
+            predecessor is None
+            or predecessor.status is not AssertionStatus.DELETED
+            or not isinstance(predecessor.lineage, DirectLineage)
+            or not isinstance(replacement.lineage, DirectLineage)
+            or predecessor.assertion_id != replacement.assertion_id
+        ):
+            raise AssertionConflictError(
+                "expected predecessor is not a restorable deleted direct revision"
+            )
+        current = await self._current(predecessor.assertion_id)
+        if (
+            current is None
+            or current.revision_id != expected_terminal_revision_id
+        ):
+            raise AssertionConflictError(
+                "expected terminal predecessor is no longer current"
+            )
+        if replacement.supersedes_revision_id not in (
+            None,
+            expected_terminal_revision_id,
+        ):
+            raise AssertionStoreError(
+                "restoration cannot name an unrelated superseded revision"
+            )
+        predecessor_mapping = predecessor.to_mapping()
+        replacement_mapping = replacement.to_mapping()
+        for field in (
+            "revision_id",
+            "status",
+            "supersedes_revision_id",
+            "lineage",
+            "asserted_at",
+            "epistemic_state",
+        ):
+            predecessor_mapping.pop(field, None)
+            replacement_mapping.pop(field, None)
+        if predecessor_mapping != replacement_mapping:
+            raise AssertionStoreError(
+                "restoration cannot alter canonical claim or policy metadata"
+            )
+        current_assertions = await self._complete_active_assertions()
+        return RestorationLifecyclePlan(
+            predecessor=predecessor,
+            post_state=(*current_assertions, replacement),
+        )
+
+    async def _restore_in_mutation(
+        self,
+        expected_terminal_revision_id: str,
+        replacement: Assertion,
+        *,
+        source_occurrences: Sequence[SourceOccurrence],
+        operation_id: str,
+        request: dict[str, object],
+        expected_generation: int | None,
+        validation_report_id: str | None = None,
+    ) -> tuple[SupersessionResult, dict[str, object] | None]:
+        """Apply one pre-validated terminal-shell restoration."""
+        digest, replay = await self._operation(
+            operation_id,
+            "restore",
+            request,
+        )
+        if replay is not None:
+            predecessor = await self._revision(
+                str(replay["predecessor_revision_id"])
+            )
+            applied = await self._revision(
+                str(replay["replacement_revision_id"])
+            )
+            if predecessor is None or applied is None:
+                raise AssertionConflictError(
+                    "idempotent restoration receipt no longer has its revisions"
+                )
+            return (
+                SupersessionResult(
+                    predecessor,
+                    applied,
+                    int(replay["generation"]),
+                    tuple(replay["event_ids"]),
+                    (),
+                    True,
+                ),
+                replay,
+            )
+        if (
+            expected_generation is not None
+            and await self._generation() != expected_generation
+        ):
+            raise AssertionConflictError(
+                "validation generation is no longer current; "
+                "revalidate before restoring"
+            )
+        plan = await self.plan_restoration_lifecycle(
+            expected_terminal_revision_id,
+            replacement,
+        )
+        prior_source = await self.get_source_occurrence(
+            source_occurrences[0].source_occurrence_id
+        )
+        if prior_source is not None:
+            raise AssertionConflictError(
+                "restoration source occurrence was already accepted"
+            )
+        await self._store_sources(source_occurrences)
+        await self._validate_lineage(replacement, source_occurrences)
+        replacement_mapping = replacement.to_mapping()
+        replacement_mapping["supersedes_revision_id"] = (
+            expected_terminal_revision_id
+        )
+        replacement_state = Assertion.from_mapping(replacement_mapping)
+        await self._write_revision(replacement_state, source_occurrences)
+        await self._set_current(replacement_state)
+        generation = await self._advance_generation()
+        event_id = await self._event(
+            replacement_state,
+            "accepted",
+            generation,
+        )
+        receipt = {
+            "predecessor_revision_id": plan.predecessor.revision_id,
+            "replacement_revision_id": replacement_state.revision_id,
+            "generation": generation,
+            "event_ids": [event_id],
+            "invalidated_revision_ids": [],
+        }
+        if validation_report_id is not None:
+            receipt["validation_report_id"] = validation_report_id
+        await self._record_operation(
+            operation_id,
+            "restore",
+            digest,
+            receipt,
+            [replacement_state.assertion_id],
+            [plan.predecessor.revision_id, replacement_state.revision_id],
+        )
+        return (
+            SupersessionResult(
+                plan.predecessor,
+                replacement_state,
+                generation,
+                (event_id,),
+                (),
+            ),
+            None,
+        )
+
     async def _supersede_in_mutation(
         self,
         expected_predecessor_revision_id: str,
@@ -1669,10 +3135,11 @@ class AsyncAssertionStore:
             predecessor, revision_id=uuid4().hex, status=AssertionStatus.SUPERSEDED,
             supersedes_revision_id=expected_predecessor_revision_id,
         )
-        replacement_state = _assertion_with(
-            replacement, revision_id=replacement.revision_id, status=AssertionStatus.ACTIVE,
-            supersedes_revision_id=predecessor_state.revision_id,
+        replacement_mapping = replacement.to_mapping()
+        replacement_mapping["supersedes_revision_id"] = (
+            predecessor_state.revision_id
         )
+        replacement_state = Assertion.from_mapping(replacement_mapping)
         # Apply the same plan used to construct the governed tentative graph.
         # In particular, only ledger proofs selected by the planner deactivate;
         # an alternate proof keeps its conclusion in the active state.
@@ -2238,6 +3705,7 @@ class AsyncAssertionStore:
         expected_revision_id: str,
         *,
         operation_id: str | None = None,
+        explicit_fact_selector: tuple[IRI, IRI] | None = None,
     ) -> DeletionResult:
         """Apply a non-erasure lifecycle deletion and invalidate dependents.
 
@@ -2246,7 +3714,27 @@ class AsyncAssertionStore:
         training consumption; physical erasure removes that shell entirely.
         """
         operation_id = operation_id or f"delete:{assertion_id}:{expected_revision_id}"
-        request = {"assertion_id": assertion_id, "expected_revision_id": expected_revision_id}
+        request: dict[str, object] = {
+            "assertion_id": assertion_id,
+            "expected_revision_id": expected_revision_id,
+        }
+        if explicit_fact_selector is not None:
+            if (
+                not isinstance(explicit_fact_selector, tuple)
+                or len(explicit_fact_selector) != 2
+                or not isinstance(explicit_fact_selector[0], IRI)
+                or not isinstance(explicit_fact_selector[1], IRI)
+                or not operation_id.startswith(
+                    _EXPLICIT_FACT_FORGET_OPERATION_PREFIX
+                )
+            ):
+                raise AssertionStoreError(
+                    "explicit fact deletion requires a deterministic mapped selector"
+                )
+            request["explicit_fact_selector"] = {
+                "subject": explicit_fact_selector[0].value,
+                "predicate": explicit_fact_selector[1].value,
+            }
         async with self._mutation():
             digest, replay = await self._operation(operation_id, "delete", request)
             if replay is not None:
@@ -2293,15 +3781,248 @@ class AsyncAssertionStore:
             await self._record_operation(
                 operation_id, "delete", digest,
                 {
+                    "expected_predecessor_revision_id": expected_revision_id,
                     "deleted_revision_id": deleted.revision_id,
                     "invalidated_revision_ids": invalidated_revision_ids,
                     "invalidation_state_revision_ids": [item.revision_id for item in invalidated],
                     "generation": generation,
+                    **(
+                        {
+                            "explicit_fact_selector": request[
+                                "explicit_fact_selector"
+                            ]
+                        }
+                        if "explicit_fact_selector" in request
+                        else {}
+                    ),
                 },
                 [deleted.assertion_id, *[item.assertion_id for item in invalidated]],
                 [deleted.revision_id, *[item.revision_id for item in invalidated]],
             )
             return DeletionResult(deleted, tuple(invalidated), tuple(invalidated_revision_ids), generation)
+
+    async def replay_delete_operation(
+        self,
+        operation_id: str,
+    ) -> DeletionResult | ErasedDeletionOperationReplay | None:
+        """Return the exact deletion receipt selected by an earlier operation.
+
+        Deletion revisions intentionally leave their historical active
+        predecessors in the append-only ledger.  A retry must therefore not
+        search for an ``ACTIVE`` historical row: source-appends can produce
+        several of them.  The delete receipt is the authoritative binding from
+        the invocation's operation ID to its predecessor and deletion state.
+        """
+        recorded = await self._recorded_operation(operation_id)
+        if recorded is None:
+            erased = await self._erased_operation_tombstone(operation_id)
+            if erased is None:
+                return None
+            purpose, _, generation = erased
+            if purpose != "delete":
+                raise AssertionConflictError(
+                    "operation_id resolves to a non-deletion erased semantic mutation"
+                )
+            return ErasedDeletionOperationReplay(generation)
+        operation, receipt = recorded
+        if operation != "delete":
+            raise AssertionConflictError(
+                "operation_id resolves to a non-deletion semantic mutation"
+            )
+        predecessor_id = receipt.get("expected_predecessor_revision_id")
+        deleted_id = receipt.get("deleted_revision_id")
+        invalidated_ids = receipt.get("invalidated_revision_ids")
+        state_ids = receipt.get("invalidation_state_revision_ids")
+        generation = receipt.get("generation")
+        if not (
+            isinstance(predecessor_id, str)
+            and predecessor_id
+            and isinstance(deleted_id, str)
+            and deleted_id
+            and isinstance(invalidated_ids, list)
+            and all(isinstance(item, str) for item in invalidated_ids)
+            and isinstance(state_ids, list)
+            and all(isinstance(item, str) for item in state_ids)
+            and type(generation) is int
+        ):
+            raise AssertionConflictError("deletion operation receipt is malformed")
+        # The predecessor is deliberately resolved from the receipt, not the
+        # current graph.  Retain the check so a malformed/future receipt cannot
+        # claim a deletion unrelated to this tenant's immutable history.
+        try:
+            if await self._revision(predecessor_id) is None:
+                raise AssertionConflictError(
+                    "deletion operation receipt no longer has its predecessor revision"
+                )
+            deleted = await self._revision(deleted_id)
+            invalidated = [await self._revision(item) for item in state_ids]
+            if deleted is None or any(item is None for item in invalidated):
+                raise AssertionConflictError(
+                    "idempotent deletion receipt no longer has its revisions"
+                )
+            return DeletionResult(
+                deleted,
+                tuple(item for item in invalidated if item is not None),
+                tuple(invalidated_ids),
+                generation,
+                True,
+            )
+        except AssertionConflictError:
+            erased = await self._erased_operation_tombstone(operation_id)
+            if erased is not None:
+                purpose, _, erased_generation = erased
+                if purpose != "delete":
+                    raise AssertionConflictError(
+                        "operation_id resolves to a non-deletion erased semantic mutation"
+                    )
+                return ErasedDeletionOperationReplay(erased_generation)
+            raise
+
+    async def replay_explicit_fact_forget(
+        self,
+        operation_id: str,
+        subject: IRI,
+        predicate: IRI,
+    ) -> ExplicitFactForgetReplay | None:
+        """Replay either the exact delete or exact absent-result tombstone."""
+        if (
+            not operation_id.startswith(
+                _EXPLICIT_FACT_FORGET_OPERATION_PREFIX
+            )
+            or not isinstance(subject, IRI)
+            or not isinstance(predicate, IRI)
+        ):
+            raise AssertionStoreError(
+                "explicit fact forget replay requires its mapped selector"
+            )
+        recorded = await self._recorded_operation(operation_id)
+        if recorded is None:
+            erased = await self._erased_operation_tombstone(operation_id)
+            if erased is None:
+                return None
+            purpose, request_key, _ = erased
+            if purpose == "delete":
+                if request_key != _erased_explicit_fact_forget_selector_key(
+                    operation_id,
+                    subject,
+                    predicate,
+                ):
+                    raise AssertionConflictError(
+                        "operation_id resolves to a different erased explicit fact deletion"
+                    )
+                # Physical erasure removed both the deleted shell and its
+                # content-bearing receipt.  The exact forget invocation is
+                # still terminal, but no erased identity is reconstructed.
+                return ExplicitFactForgetReplay(None, True)
+            raise AssertionConflictError(
+                "operation_id resolves to an unrelated erased semantic mutation"
+            )
+        operation, receipt = recorded
+        if operation == "delete":
+            selector = await self._explicit_fact_forget_selector_from_recorded_result(
+                operation_id,
+                operation,
+                receipt,
+            )
+            if selector != (subject, predicate):
+                erased = await self._erased_operation_tombstone(operation_id)
+                if (
+                    erased is not None
+                    and erased[0] == "delete"
+                    and erased[1]
+                    == _erased_explicit_fact_forget_selector_key(
+                        operation_id,
+                        subject,
+                        predicate,
+                    )
+                ):
+                    return ExplicitFactForgetReplay(None, True)
+                raise AssertionConflictError(
+                    "operation_id resolves to a different explicit fact deletion"
+                )
+            deletion = await self.replay_delete_operation(operation_id)
+            if deletion is None:  # pragma: no cover - row was just observed
+                raise AssertionConflictError(
+                    "explicit fact deletion receipt disappeared during replay"
+                )
+            if isinstance(deletion, ErasedDeletionOperationReplay):
+                return ExplicitFactForgetReplay(None, True)
+            return ExplicitFactForgetReplay(deletion, True)
+        if operation == _EXPLICIT_FACT_FORGET_NOOP_OPERATION:
+            request = {
+                "subject": subject.value,
+                "predicate": predicate.value,
+                "outcome": "absent",
+            }
+            _, exact_receipt = await self._operation(
+                operation_id,
+                _EXPLICIT_FACT_FORGET_NOOP_OPERATION,
+                request,
+            )
+            if exact_receipt != {"outcome": "absent"}:
+                raise AssertionConflictError(
+                    "explicit fact no-op forget receipt is malformed"
+                )
+            return ExplicitFactForgetReplay(None, True)
+        raise AssertionConflictError(
+            "operation_id resolves to an unrelated semantic mutation"
+        )
+
+    async def record_explicit_fact_forget_noop(
+        self,
+        operation_id: str,
+        subject: IRI,
+        predicate: IRI,
+    ) -> ExplicitFactForgetReplay:
+        """Linearizably record that a fact selector had no active assertion.
+
+        The operation ledger is part of the durable lifecycle contract even
+        when no assertion is deleted.  The absence check and receipt insert
+        share the tenant mutation transaction, so a concurrent teaching either
+        commits before this check (and forces a caller re-decision) or after the
+        no-op tombstone.  Retrying the same invocation can never affect that
+        later fact.
+        """
+        if not isinstance(subject, IRI) or not isinstance(predicate, IRI):
+            raise AssertionStoreError(
+                "explicit fact no-op requires canonical subject and predicate IRIs"
+            )
+        request = {
+            "subject": subject.value,
+            "predicate": predicate.value,
+            "outcome": "absent",
+        }
+        async with self._mutation():
+            digest, replay = await self._operation(
+                operation_id,
+                _EXPLICIT_FACT_FORGET_NOOP_OPERATION,
+                request,
+            )
+            if replay is not None:
+                if replay != {"outcome": "absent"}:
+                    raise AssertionConflictError(
+                        "explicit fact no-op forget receipt is malformed"
+                    )
+                return ExplicitFactForgetReplay(None, True)
+            current = [
+                assertion
+                for assertion in await self._complete_active_assertions()
+                if assertion.subject == subject and assertion.predicate == predicate
+            ]
+            if current:
+                raise AssertionConflictError(
+                    "explicit fact selector gained a current assertion before no-op commit"
+                )
+            receipt = {"outcome": "absent"}
+            await self._record_operation(
+                operation_id,
+                _EXPLICIT_FACT_FORGET_NOOP_OPERATION,
+                digest,
+                receipt,
+                (),
+                (),
+            )
+            return ExplicitFactForgetReplay(None, False)
 
     async def invalidate_assertion_eligibility(
         self,
@@ -2847,11 +4568,22 @@ class AsyncAssertionStore:
                 f"DELETE FROM semantic_derivation_inputs WHERE tenant_id = ? AND (derived_revision_id IN ({_placeholders(revision_tuple)}) OR input_revision_id IN ({_placeholders(revision_tuple)}))",
                 (tenant_id,) + revision_tuple + revision_tuple,
             )
+            # Reserve the committed erasure checkpoint while revisions and
+            # their attached source rows are still present.  Fact operation
+            # tombstones bind a blinded immutable accepted-result fingerprint,
+            # so that binding must be derived before provenance is removed.
+            # The surrounding mutation keeps the generation, tombstones,
+            # physical deletes, and opaque erasure event atomic.
+            generation = await self._advance_generation()
+            await self._tombstone_and_delete_operations_referencing(
+                assertion_ids,
+                revision_ids,
+                generation,
+            )
             await self._database.execute(
                 f"DELETE FROM semantic_revision_sources WHERE tenant_id = ? AND revision_id IN ({_placeholders(revision_tuple)})",
                 (tenant_id,) + revision_tuple,
             )
-            await self._delete_operations_referencing(assertion_ids, revision_ids)
             await self._delete_validation_reports_referencing(assertion_tuple)
             await self._database.execute(
                 f"DELETE FROM semantic_assertions WHERE tenant_id = ? AND assertion_id IN ({_placeholders(assertion_tuple)})",
@@ -2871,7 +4603,6 @@ class AsyncAssertionStore:
                         "DELETE FROM semantic_source_occurrences WHERE tenant_id = ? AND source_occurrence_id = ?",
                         (tenant_id, source_id),
                     )
-            generation = await self._advance_generation()
             await self._erasure_event(generation)
             result = ErasureResult(assertion_tuple, revision_tuple, generation)
             await self._record_erasure_operation(

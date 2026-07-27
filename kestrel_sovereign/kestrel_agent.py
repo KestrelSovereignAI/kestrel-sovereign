@@ -14,6 +14,8 @@ from kestrel_sovereign.storage.privacy_wrapper import (
     EphemeralPurgeReport,
     StorePurgeResult,
     PurgeOutcome,
+    PRIVACY_TRANSITION_RETRY_MESSAGE,
+    PrivacyViolationError,
 )
 from kestrel_sovereign.security.encryption import DecryptionError
 from kestrel_sovereign.security.assertion_tenant_resolver import (
@@ -72,6 +74,7 @@ from kestrel_sovereign.agent.model_preference import ModelPreferenceMixin
 from kestrel_sovereign.agent.event_manager import EventManagerMixin
 from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
+from kestrel_sovereign.agent.invocation import bind_async_invocation
 from kestrel_sovereign.signals import OrderedLockManager
 from kestrel_sovereign.storage.memory_system import MemorySystem
 from kestrel_sovereign.hooks import HooksManager, evaluate_blocking_decision
@@ -139,6 +142,10 @@ class PrivacyTransitionResult:
     # reported as successful. Distinct from ``requires_confirmation`` (a staged
     # data-destructive downgrade the user can still confirm).
     purge_failed: bool = False
+    # True when an already-running durable explicit-fact operation won the
+    # privacy linearization race. No privacy state changed; callers should
+    # surface a retryable conflict rather than success or an internal error.
+    retryable_conflict: bool = False
 
 
 async def _add_sovereign_ipfs_target_if_active(
@@ -1043,6 +1050,10 @@ class KestrelAgent(
         # Cancellation tracking for stop button functionality
         self._current_request_id: Optional[str] = None
         self._active_request_ids: set[str] = set()
+        # A caller may retry the same id while its original delivery is still
+        # running. Keep lifecycle registration ownership per delivery so one
+        # completion cannot unregister the other.
+        self._active_request_counts: dict[str, int] = {}
         # Monotonic registration time per active request id so the
         # restart coordinator can age out stale markers (#1558).
         self._active_request_started_at: dict[str, float] = {}
@@ -2979,7 +2990,13 @@ class KestrelAgent(
                     allows_cloud_llm=privacy_mode_to_config(self._privacy_mode).allows_cloud_llm(),
                 )
             self._pending_privacy_transition = None
-            return await self._apply_privacy_mode_locked(mode)
+            result = await self._apply_privacy_mode_locked(mode)
+            if result.retryable_conflict:
+                # Keep the consented target staged. Retrying confirmation after
+                # the active fact finishes must apply that same target, not
+                # silently become a "nothing pending" no-op.
+                self._pending_privacy_transition = mode
+            return result
 
     async def cancel_privacy_transition(self) -> PrivacyTransitionResult:
         """Discard a privacy transition previously staged as pending confirmation.
@@ -3084,8 +3101,22 @@ class KestrelAgent(
                     purge_failed=True,
                 )
 
+        # The storage wrapper owns the linearization guard against durable
+        # explicit-fact operations.  Ask it first: if a fact operation is in
+        # flight, the transition is refused without leaving the agent and its
+        # privacy policy in a split state.
+        try:
+            self.storage.set_privacy_mode(mode)
+        except PrivacyViolationError:
+            return PrivacyTransitionResult(
+                message=PRIVACY_TRANSITION_RETRY_MESSAGE,
+                allows_cloud_llm=privacy_mode_to_config(
+                    self._privacy_mode
+                ).allows_cloud_llm(),
+                applied=False,
+                retryable_conflict=True,
+            )
         self._privacy_mode = mode
-        self.storage.set_privacy_mode(mode)
         status_message = self.privacy_agent.set_mode(mode)
 
         config = privacy_mode_to_config(mode)
@@ -4235,7 +4266,8 @@ Expected Duration: {expected_duration}
         # State is COMPLETE or unknown - proceed to normal processing
         return None
 
-    async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None, system_prompt_budget_bytes: int = None, anchored_doctrine=None, user_passphrase: str = None, signal_wake: Optional[dict] = None, invocation_context: Optional[LLMInvocationContext] = None) -> str:
+    @bind_async_invocation("invocation_id")
+    async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None, system_prompt_budget_bytes: int = None, anchored_doctrine=None, user_passphrase: str = None, signal_wake: Optional[dict] = None, invocation_context: Optional[LLMInvocationContext] = None, *, invocation_id: Optional[str] = None, invocation_provenance=None) -> str:
         """
         Processes user input by consulting the constitution, retrieving context,
         and generating a response using tool calling for features.
@@ -4269,6 +4301,11 @@ Expected Duration: {expected_duration}
                                     persisted user-turn content.
             user_passphrase: Optional per-request passphrase for USER_BYOK agents.
                              Required for PayerKind.USER_BYOK to decrypt provider keys.
+            invocation_id: Opaque top-level operation identity. When omitted,
+                an id is generated and task-locally bound for tool provenance.
+            invocation_provenance: Endpoint-owned authenticated actor and
+                transport metadata. This is task-local only; tools cannot
+                provide or override it through their arguments.
         """
         logging.info(f"[AGENTIC] process_input called ({len(user_input)} chars)")
 

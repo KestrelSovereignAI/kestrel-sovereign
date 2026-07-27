@@ -340,6 +340,19 @@ class GovernedSemanticValidationService:
             return GovernedAssertionWriteResult(report, written)
         for attempt in range(max_commit_retries):
             checkpoint, current = await self._assertions.export_snapshot()
+            # The first replay lookup is the fast path.  A simultaneous
+            # delivery can commit after that lookup but before this snapshot;
+            # the canonical ledger must win over the lifecycle rejection in
+            # that narrow interval.  The store's mutation path checks the same
+            # ledger again while holding the tenant lock.
+            replay = await self._assertions.replay_governed_initial_write(
+                assertion,
+                source_occurrences=source_occurrences,
+                operation_id=operation_id,
+            )
+            if replay is not None:
+                report, written = replay
+                return GovernedAssertionWriteResult(report, written)
             if any(item.assertion_id == assertion.assertion_id for item in current):
                 raise SemanticValidationStoreError("governed initial write cannot replace an existing assertion")
             post_state = (*current, assertion)
@@ -437,12 +450,33 @@ class GovernedSemanticValidationService:
             return GovernedAssertionSupersessionResult(report, written)
         for attempt in range(max_commit_retries):
             checkpoint, _ = await self._assertions.export_snapshot()
+            # As with initial writes, a completed matching operation is
+            # authoritative before lifecycle planning rejects a predecessor
+            # that a concurrent delivery has already superseded.
+            replay = await self._assertions.replay_governed_supersession(
+                expected_predecessor_revision_id,
+                replacement,
+                source_occurrences=source_occurrences,
+                operation_id=operation_id,
+            )
+            if replay is not None:
+                report, written = replay
+                return GovernedAssertionSupersessionResult(report, written)
             try:
                 plan = await self._assertions.plan_supersession_lifecycle(
                     expected_predecessor_revision_id,
                     replacement,
                 )
             except AssertionConflictError as error:
+                replay = await self._assertions.replay_governed_supersession(
+                    expected_predecessor_revision_id,
+                    replacement,
+                    source_occurrences=source_occurrences,
+                    operation_id=operation_id,
+                )
+                if replay is not None:
+                    report, written = replay
+                    return GovernedAssertionSupersessionResult(report, written)
                 raise SemanticValidationStoreError(
                     "governed supersession requires an active predecessor in the bound tenant"
                 ) from error
@@ -510,6 +544,189 @@ class GovernedSemanticValidationService:
                 report, written = replay
             return GovernedAssertionSupersessionResult(report, written)
         raise AssertionError("bounded validation supersession retry loop exhausted without returning")
+
+    async def append_assertion_source(
+        self,
+        expected_predecessor_revision_id: str,
+        replacement: Assertion,
+        *,
+        source_occurrences=(),
+        **validation_options,
+    ) -> GovernedAssertionSupersessionResult:
+        """Append one direct source through a validated canonical revision.
+
+        Source provenance is immutable evidence, not an auxiliary side table.
+        A distinct explicit invocation therefore creates a new revision with
+        the old occurrence set plus one new occurrence.  The normal governed
+        supersession path supplies its atomic lifecycle, validation report,
+        operation-ledger replay, change event, and dependent invalidation.
+        """
+        operation_id = validation_options.get("operation_id")
+        replay = await self._assertions.replay_governed_supersession(
+            expected_predecessor_revision_id,
+            replacement,
+            source_occurrences=source_occurrences,
+            operation_id=operation_id,
+        )
+        if replay is not None:
+            report, written = replay
+            return GovernedAssertionSupersessionResult(report, written)
+        await self._assertions.validate_source_append(
+            expected_predecessor_revision_id,
+            replacement,
+            source_occurrences=source_occurrences,
+        )
+        return await self.supersede_assertion(
+            expected_predecessor_revision_id,
+            replacement,
+            source_occurrences=source_occurrences,
+            **validation_options,
+        )
+
+    async def _restore_explicit_fact_assertion(
+        self,
+        expected_terminal_revision_id: str,
+        replacement: Assertion,
+        *,
+        source_occurrences=(),
+        source: ValidationSource = ValidationSource.ASSERTED,
+        shape_set: ShapeSetReference = ShapeSetReference(
+            "kestrel-assertion-shapes",
+            "1.0.0",
+        ),
+        validation_capability: str = (
+            "validation-profile:shacl-core-20170720"
+        ),
+        profile_version: str | None = None,
+        allow_experimental: bool = False,
+        limits: ShaclValidationLimits = ShaclValidationLimits(),
+        operation_id: str | None = None,
+        run_id: str | None = None,
+        max_commit_retries: int = 2,
+    ) -> GovernedAssertionSupersessionResult:
+        """Validate fresh direct evidence over an immutable terminal shell."""
+        if not isinstance(replacement, Assertion):
+            raise SemanticValidationStoreError(
+                "governed restoration requires a canonical Assertion replacement"
+            )
+        if replacement.tenant_id != self._assertions.tenant_id:
+            raise TenantIsolationError(
+                "restoration assertion tenant does not match the bound tenant"
+            )
+        if type(max_commit_retries) is not int or not (
+            1 <= max_commit_retries <= 10
+        ):
+            raise SemanticValidationStoreError(
+                "max_commit_retries must be an integer in [1, 10]"
+            )
+        replay = await self._assertions.replay_governed_restoration(
+            expected_terminal_revision_id,
+            replacement,
+            source_occurrences=source_occurrences,
+            operation_id=operation_id,
+        )
+        if replay is not None:
+            report, written = replay
+            return GovernedAssertionSupersessionResult(report, written)
+        for attempt in range(max_commit_retries):
+            checkpoint, _ = await self._assertions.export_snapshot()
+            replay = await self._assertions.replay_governed_restoration(
+                expected_terminal_revision_id,
+                replacement,
+                source_occurrences=source_occurrences,
+                operation_id=operation_id,
+            )
+            if replay is not None:
+                report, written = replay
+                return GovernedAssertionSupersessionResult(report, written)
+            try:
+                plan = await self._assertions.plan_restoration_lifecycle(
+                    expected_terminal_revision_id,
+                    replacement,
+                )
+            except AssertionConflictError as error:
+                replay = await self._assertions.replay_governed_restoration(
+                    expected_terminal_revision_id,
+                    replacement,
+                    source_occurrences=source_occurrences,
+                    operation_id=operation_id,
+                )
+                if replay is not None:
+                    report, written = replay
+                    return GovernedAssertionSupersessionResult(report, written)
+                raise SemanticValidationStoreError(
+                    "governed restoration requires a current terminal "
+                    "direct predecessor"
+                ) from error
+            if (
+                await self._assertions.checkpoint()
+            ).generation != checkpoint.generation:
+                if attempt + 1 == max_commit_retries:
+                    raise SemanticValidationStoreError(
+                        "validation conflict: canonical generation changed "
+                        "before the bounded restoration retry"
+                    )
+                continue
+            data_graph, focus_map, _ = _canonical_validation_graph(
+                plan.post_state,
+                plan.post_state,
+            )
+            report = self._validator.validate(
+                data_graph,
+                tenant_id=self._assertions.tenant_id,
+                assertion_ids=(replacement.assertion_id,),
+                shape_set=shape_set,
+                validation_capability=validation_capability,
+                profile_version=profile_version,
+                allow_experimental=allow_experimental,
+                source=source,
+                checkpoint_generation=checkpoint.generation,
+                run_id=run_id,
+                focus_assertion_ids=focus_map,
+                limits=limits,
+            )
+            if report.action not in (
+                ValidationWriteAction.ACCEPT,
+                ValidationWriteAction.ACCEPT_WITH_REPORT,
+            ):
+                sanitized = report.without_assertion_identity()
+                await self._reports.persist(sanitized)
+                return GovernedAssertionSupersessionResult(sanitized, None)
+            try:
+                written = (
+                    await self._assertions.restore_with_validation_report(
+                        expected_terminal_revision_id,
+                        replacement,
+                        report,
+                        source_occurrences=source_occurrences,
+                        operation_id=operation_id,
+                        expected_generation=checkpoint.generation,
+                    )
+                )
+            except AssertionConflictError:
+                if attempt + 1 == max_commit_retries:
+                    raise SemanticValidationStoreError(
+                        "validation conflict: canonical generation changed "
+                        "before the bounded restoration retry"
+                    ) from None
+                continue
+            if written.idempotent:
+                replay = await self._assertions.replay_governed_restoration(
+                    expected_terminal_revision_id,
+                    replacement,
+                    source_occurrences=source_occurrences,
+                    operation_id=operation_id,
+                )
+                if replay is None:
+                    raise SemanticValidationStoreError(
+                        "idempotent governed restoration receipt is missing "
+                        "its validation report"
+                    )
+                report, written = replay
+            return GovernedAssertionSupersessionResult(report, written)
+        raise AssertionError(
+            "bounded validation restoration retry loop exhausted"
+        )
 
     async def full_audit_and_repair(
         self,

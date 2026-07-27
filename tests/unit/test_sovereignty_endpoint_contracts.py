@@ -217,6 +217,34 @@ def test_sovereignty_import_rejects_invalid_cid():
         _restore_app(app, original)
 
 
+def test_sovereignty_import_uses_shared_request_identity_for_agent_command():
+    """Every HTTP route that invokes the agent uses the retry/provenance seam."""
+    agent = MagicMock(storage=MagicMock())
+    agent.process_input = AsyncMock(return_value="imported")
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/sovereignty/import",
+                    headers={
+                        "X-API-Key": "test-key",
+                        "X-Request-ID": "sovereignty-retry-2765",
+                    },
+                    json={"cid": "bafyvalidcid2765"},
+                )
+        assert response.status_code == 200
+        assert response.headers["X-Request-ID"] == "sovereignty-retry-2765"
+        _, kwargs = agent.process_input.await_args
+        assert kwargs["invocation_id"] == "sovereignty-retry-2765"
+        assert (
+            kwargs["invocation_provenance"].source_locator
+            == "POST:/api/sovereignty/import"
+        )
+    finally:
+        _restore_app(app, original)
+
+
 def test_sovereignty_files_listing_and_preview_contract(tmp_path):
     from kestrel_sovereign.endpoints import sovereignty as sovereignty_endpoints
 

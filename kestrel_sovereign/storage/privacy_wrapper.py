@@ -20,6 +20,7 @@ import json
 import logging
 import re
 import sys
+import threading
 import warnings
 from contextlib import asynccontextmanager, contextmanager
 
@@ -44,6 +45,8 @@ from kestrel_sovereign.storage.async_graph_store import NodeSwapResult
 from kestrel_sovereign.storage.agent_resource_store import (
     SOUL_MARKDOWN_RESOURCE_TYPE,
 )
+from kestrel_sovereign.storage.semantic_binding import SemanticAssertionBinding
+from kestrel_sovereign.knowledge import Visibility
 
 # Lazy import to avoid circular dependency with features.privacy
 # Note: This global cache is shared across all instances and async contexts.
@@ -102,6 +105,12 @@ def _in_session(conv: Dict[str, Any], session_id: Optional[str]) -> bool:
 class PrivacyViolationError(Exception):
     """Raised when a storage operation violates the current privacy mode."""
     pass
+
+
+PRIVACY_TRANSITION_RETRY_MESSAGE = (
+    "Privacy mode change not applied because an explicit fact operation is "
+    "still finishing. Retry shortly."
+)
 
 
 class OperationType(Enum):
@@ -1422,6 +1431,533 @@ class PrivacyEnforcingStorage:
         # watermark and returns ``{table: rows_deleted}`` which is merged into
         # the purge breakdown. ``None`` = not wired (no observability sweep).
         self._observability_purge = None
+        # ``set_privacy_mode`` is synchronous, while explicit fact operations
+        # span async storage awaits.  A short synchronous lease supplies the
+        # linearization point those two surfaces otherwise lack: once a fact
+        # operation begins, a concurrent config transition is refused instead
+        # of taking effect between a durable commit/replay and its return.
+        self._explicit_fact_lease_lock = threading.RLock()
+        self._active_explicit_fact_leases = 0
+
+        # Explicit semantic teaching is intentionally captured per wrapper.
+        # There is no module-level adapter that accepts caller-supplied storage
+        # or binding objects: a feature can call the public methods below only
+        # on the actual privacy wrapper it was given.  Aliasing those methods
+        # onto raw storage or a forwarding shim does not copy these closures,
+        # and the closures always re-check this wrapper's live privacy policy.
+        from dataclasses import replace as replace_fact_assertion
+        from decimal import Decimal
+
+        from kestrel_sovereign.features.memory_agency.semantic_facts import (
+            FactDeleteReceipt,
+            FactLifecycleError,
+            FactWriteReceipt,
+            _adapter_owned,
+            _assertion,
+            _disposition,
+            _is_adapter_source,
+            _operation_material,
+            _source_for_operation,
+            _write_receipt_from_replay,
+            map_legacy_fact,
+        )
+        from kestrel_sovereign.knowledge import (
+            AssertionQuery,
+            AssertionStatus,
+            DirectLineage,
+        )
+        from kestrel_sovereign.storage.async_assertion_store import (
+            AssertionConflictError,
+            _governed_assertion_replay_binding,
+        )
+        from kestrel_sovereign.storage.semantic_validation import (
+            SemanticValidationStoreError,
+        )
+
+        max_fact_state_retries = 4
+
+        def fact_binding() -> SemanticAssertionBinding:
+            self._assert_semantic_assertion_write_allowed("explicit_fact")
+            raw_binding = self._storage.semantic_assertion_binding()
+            is_public = self._privacy_config.sharing == "public"
+            return SemanticAssertionBinding(
+                tenant_id=raw_binding.tenant_id,
+                owning_agent_id=raw_binding.owning_agent_id,
+                privacy_classification="public" if is_public else "normal",
+                release_policy_reference=(
+                    "policy:privacy:public-v1"
+                    if is_public
+                    else "policy:privacy:normal-v1"
+                ),
+                visibility=Visibility.PUBLIC if is_public else Visibility.PRIVATE,
+            )
+
+        async def has_adapter_provenance(assertion) -> bool:
+            sources = await self.list_assertion_sources(assertion.assertion_id)
+            return any(_is_adapter_source(source) for source in sources)
+
+        async def current_for_mapping(mapping):
+            assertions = await self.query_assertions(
+                AssertionQuery(
+                    subject=mapping.subject,
+                    predicate=mapping.predicate,
+                )
+            )
+            foreign = [
+                item
+                for item in assertions
+                if not _adapter_owned(item, mapping)
+                or not await has_adapter_provenance(item)
+            ]
+            if foreign:
+                raise FactLifecycleError(
+                    "the mapped subject/predicate already has a canonical assertion "
+                    "outside save_fact; refusing to create a competing preference"
+                )
+            if len(assertions) > 1:
+                raise FactLifecycleError(
+                    "multiple current save_fact assertions exist for the mapped "
+                    "subject/predicate; repair canonical state before changing it"
+                )
+            return assertions
+
+        async def adapter_source_reference(assertion) -> str:
+            sources = await self.list_assertion_sources(assertion.assertion_id)
+            source = next(
+                (item for item in sources if _is_adapter_source(item)),
+                None,
+            )
+            if source is None:
+                raise FactLifecycleError(
+                    "save_fact assertion lacks adapter provenance for lifecycle receipt"
+                )
+            return source.source_occurrence_id
+
+        async def terminal_for_assertion(candidate, mapping):
+            terminal = await self.get_assertion(
+                candidate.assertion_id,
+                include_inactive=True,
+            )
+            if terminal is None or terminal.status is AssertionStatus.ACTIVE:
+                return None
+            if (
+                not _adapter_owned(terminal, mapping)
+                or not await has_adapter_provenance(terminal)
+            ):
+                raise FactLifecycleError(
+                    "the matching terminal assertion is outside save_fact; "
+                    "refusing to restore it"
+                )
+            if terminal.status is not AssertionStatus.DELETED:
+                raise FactLifecycleError(
+                    "save_fact cannot revive a retracted, quarantined, or "
+                    "superseded assertion"
+                )
+            return terminal
+
+        def is_retryable_state_conflict(error: Exception) -> bool:
+            if isinstance(error, AssertionConflictError):
+                return True
+            if not isinstance(error, SemanticValidationStoreError):
+                return False
+            message = str(error)
+            return message.startswith(
+                (
+                    "validation conflict:",
+                    "governed initial write cannot replace an existing assertion",
+                    "governed supersession requires an active predecessor",
+                    "governed restoration requires a current terminal",
+                )
+            )
+
+        async def save_fact_executor_unleased(
+            *,
+            subject: str,
+            predicate: str,
+            value: str,
+            confidence: float,
+            confidence_requested: float | None = None,
+            invocation_id: object = None,
+        ) -> FactWriteReceipt:
+            from kestrel_sovereign.agent.invocation import ensure_invocation_id
+
+            invocation_id = ensure_invocation_id(invocation_id)
+            binding = fact_binding()
+            mapping = map_legacy_fact(
+                subject,
+                predicate,
+                value,
+                tenant_id=binding.tenant_id,
+            )
+            operation_id, digest = _operation_material(
+                action="save",
+                subject=subject,
+                predicate=predicate,
+                value=value,
+                confidence_requested=(
+                    confidence
+                    if confidence_requested is None
+                    else confidence_requested
+                ),
+                invocation_id=invocation_id,
+            )
+            source = _source_for_operation(
+                operation_id,
+                digest,
+                binding.owning_agent_id,
+            )
+            assertion = _assertion(
+                binding=binding,
+                mapping=mapping,
+                source=source,
+                confidence=confidence,
+            )
+            replay_binding = _governed_assertion_replay_binding(
+                assertion,
+                source,
+                digest,
+            )
+
+            for attempt in range(max_fact_state_retries):
+                replay = await self._storage._replay_governed_assertion_operation(
+                    operation_id,
+                    replay_binding,
+                )
+                if replay is not None:
+                    return _write_receipt_from_replay(
+                        replay,
+                        source=source,
+                        operation_id=operation_id,
+                    )
+                legacy_erased = (
+                    await self._storage._terminalize_legacy_erased_explicit_fact_operation(
+                        operation_id,
+                        replay_binding,
+                    )
+                )
+                if legacy_erased is not None:
+                    return _write_receipt_from_replay(
+                        legacy_erased,
+                        source=source,
+                        operation_id=operation_id,
+                    )
+
+                current = await current_for_mapping(mapping)
+                prior = current[0] if current else None
+                try:
+                    if (
+                        prior is not None
+                        and prior.object == mapping.object
+                        and prior.confidence == Decimal(str(confidence))
+                    ):
+                        if not isinstance(prior.lineage, DirectLineage):
+                            raise FactLifecycleError(
+                                "current save_fact assertion lacks direct provenance"
+                            )
+                        replacement = replace_fact_assertion(
+                            prior,
+                            revision_id=source.source_occurrence_id,
+                            asserted_at=source.received_at,
+                            supersedes_revision_id=None,
+                            lineage=DirectLineage(
+                                (
+                                    *prior.lineage.source_occurrence_ids,
+                                    source.source_occurrence_id,
+                                )
+                            ),
+                        )
+                        result = await self.append_assertion_source(
+                            prior.revision_id,
+                            replacement,
+                            source_occurrences=(source,),
+                            operation_id=operation_id,
+                        )
+                        if not result.accepted:
+                            return FactWriteReceipt(
+                                saved=False,
+                                assertion_id=None,
+                                revision_id=None,
+                                validation_disposition=_disposition(result.report),
+                                validation_report_id=result.report.report_id,
+                                provenance_reference=source.source_occurrence_id,
+                                provenance_digest=source.content_digest,
+                                operation_id=operation_id,
+                                idempotent=False,
+                                superseded_assertion_id=prior.assertion_id,
+                                error=(
+                                    "canonical validation did not accept the "
+                                    "fact provenance"
+                                ),
+                            )
+                        return FactWriteReceipt(
+                            saved=True,
+                            assertion_id=result.replacement.assertion_id,
+                            revision_id=result.replacement.revision_id,
+                            validation_disposition=_disposition(result.report),
+                            validation_report_id=result.report.report_id,
+                            provenance_reference=source.source_occurrence_id,
+                            provenance_digest=source.content_digest,
+                            operation_id=operation_id,
+                            idempotent=result.idempotent,
+                            superseded_assertion_id=result.predecessor.assertion_id,
+                        )
+
+                    if prior is None:
+                        terminal = await terminal_for_assertion(
+                            assertion,
+                            mapping,
+                        )
+                        if terminal is not None:
+                            result = await self._restore_explicit_fact_assertion(
+                                terminal.revision_id,
+                                assertion,
+                                source_occurrences=(source,),
+                                operation_id=operation_id,
+                            )
+                            if not result.accepted:
+                                return FactWriteReceipt(
+                                    saved=False,
+                                    assertion_id=None,
+                                    revision_id=None,
+                                    validation_disposition=_disposition(
+                                        result.report
+                                    ),
+                                    validation_report_id=(
+                                        result.report.report_id
+                                    ),
+                                    provenance_reference=(
+                                        source.source_occurrence_id
+                                    ),
+                                    provenance_digest=source.content_digest,
+                                    operation_id=operation_id,
+                                    idempotent=False,
+                                    superseded_assertion_id=(
+                                        terminal.assertion_id
+                                    ),
+                                    error=(
+                                        "canonical validation did not accept "
+                                        "the restored fact"
+                                    ),
+                                )
+                            return FactWriteReceipt(
+                                saved=True,
+                                assertion_id=(
+                                    result.replacement.assertion_id
+                                ),
+                                revision_id=result.replacement.revision_id,
+                                validation_disposition=_disposition(
+                                    result.report
+                                ),
+                                validation_report_id=result.report.report_id,
+                                provenance_reference=(
+                                    source.source_occurrence_id
+                                ),
+                                provenance_digest=source.content_digest,
+                                operation_id=operation_id,
+                                idempotent=result.idempotent,
+                                superseded_assertion_id=(
+                                    result.predecessor.assertion_id
+                                ),
+                            )
+                        result = await self.put_assertion(
+                            assertion,
+                            source_occurrences=(source,),
+                            operation_id=operation_id,
+                        )
+                        if not result.accepted:
+                            return FactWriteReceipt(
+                                saved=False,
+                                assertion_id=None,
+                                revision_id=None,
+                                validation_disposition=_disposition(result.report),
+                                validation_report_id=result.report.report_id,
+                                provenance_reference=source.source_occurrence_id,
+                                provenance_digest=source.content_digest,
+                                operation_id=operation_id,
+                                idempotent=False,
+                                error="canonical validation did not accept the fact",
+                            )
+                        return FactWriteReceipt(
+                            saved=True,
+                            assertion_id=result.assertion.assertion_id,
+                            revision_id=result.assertion.revision_id,
+                            validation_disposition=_disposition(result.report),
+                            validation_report_id=result.report.report_id,
+                            provenance_reference=source.source_occurrence_id,
+                            provenance_digest=source.content_digest,
+                            operation_id=operation_id,
+                            idempotent=result.idempotent,
+                        )
+
+                    result = await self.supersede_assertion(
+                        prior.revision_id,
+                        assertion,
+                        source_occurrences=(source,),
+                        operation_id=operation_id,
+                    )
+                    if not result.accepted:
+                        return FactWriteReceipt(
+                            saved=False,
+                            assertion_id=None,
+                            revision_id=None,
+                            validation_disposition=_disposition(result.report),
+                            validation_report_id=result.report.report_id,
+                            provenance_reference=source.source_occurrence_id,
+                            provenance_digest=source.content_digest,
+                            operation_id=operation_id,
+                            idempotent=False,
+                            superseded_assertion_id=prior.assertion_id,
+                            error=(
+                                "canonical validation did not accept the replacement fact"
+                            ),
+                        )
+                    return FactWriteReceipt(
+                        saved=True,
+                        assertion_id=result.replacement.assertion_id,
+                        revision_id=result.replacement.revision_id,
+                        validation_disposition=_disposition(result.report),
+                        validation_report_id=result.report.report_id,
+                        provenance_reference=source.source_occurrence_id,
+                        provenance_digest=source.content_digest,
+                        operation_id=operation_id,
+                        idempotent=result.idempotent,
+                        superseded_assertion_id=result.predecessor.assertion_id,
+                    )
+                except (AssertionConflictError, SemanticValidationStoreError) as error:
+                    if (
+                        not is_retryable_state_conflict(error)
+                        or attempt + 1 == max_fact_state_retries
+                    ):
+                        if not is_retryable_state_conflict(error):
+                            raise
+                        raise FactLifecycleError(
+                            "canonical fact state changed during bounded write retries"
+                        ) from error
+            raise AssertionError("bounded fact write loop exhausted")
+
+        async def forget_fact_executor_unleased(
+            *,
+            subject: str,
+            predicate: str,
+            invocation_id: object = None,
+        ) -> FactDeleteReceipt:
+            from kestrel_sovereign.agent.invocation import ensure_invocation_id
+
+            invocation_id = ensure_invocation_id(invocation_id)
+            binding = fact_binding()
+            mapping = map_legacy_fact(
+                subject,
+                predicate,
+                "forgetting-target",
+                tenant_id=binding.tenant_id,
+            )
+            operation_id, _ = _operation_material(
+                action="forget",
+                subject=subject,
+                predicate=predicate,
+                value=None,
+                confidence_requested=None,
+                invocation_id=invocation_id,
+            )
+
+            for attempt in range(max_fact_state_retries):
+                replay = (
+                    await self._storage._replay_explicit_fact_forget_operation(
+                        operation_id,
+                        mapping.subject,
+                        mapping.predicate,
+                    )
+                )
+                if replay is not None:
+                    if not replay.deleted:
+                        return FactDeleteReceipt(
+                            deleted=False,
+                            assertion_id=None,
+                            revision_id=None,
+                            provenance_reference=None,
+                            operation_id=operation_id,
+                            idempotent=replay.idempotent,
+                            error=(
+                                "no current save_fact assertion exists for the "
+                                "mapped subject/predicate"
+                            ),
+                        )
+                    deletion = replay.deletion
+                    if deletion is None:  # pragma: no cover - property contract
+                        raise AssertionError("deleted replay lacks deletion receipt")
+                    return FactDeleteReceipt(
+                        deleted=True,
+                        assertion_id=deletion.deleted.assertion_id,
+                        revision_id=deletion.deleted.revision_id,
+                        provenance_reference=await adapter_source_reference(
+                            deletion.deleted
+                        ),
+                        operation_id=operation_id,
+                        idempotent=True,
+                    )
+
+                current = await current_for_mapping(mapping)
+                try:
+                    if not current:
+                        no_op = await self._storage._record_explicit_fact_forget_noop(
+                            operation_id,
+                            mapping.subject,
+                            mapping.predicate,
+                        )
+                        return FactDeleteReceipt(
+                            deleted=False,
+                            assertion_id=None,
+                            revision_id=None,
+                            provenance_reference=None,
+                            operation_id=operation_id,
+                            idempotent=no_op.idempotent,
+                            error=(
+                                "no current save_fact assertion exists for the "
+                                "mapped subject/predicate"
+                            ),
+                        )
+                    target = current[0]
+                    provenance_reference = await adapter_source_reference(target)
+                    result = await self._delete_explicit_fact_assertion(
+                        target.assertion_id,
+                        target.revision_id,
+                        operation_id=operation_id,
+                        explicit_fact_selector=(
+                            mapping.subject,
+                            mapping.predicate,
+                        ),
+                    )
+                    return FactDeleteReceipt(
+                        deleted=True,
+                        assertion_id=result.deleted.assertion_id,
+                        revision_id=result.deleted.revision_id,
+                        provenance_reference=provenance_reference,
+                        operation_id=operation_id,
+                        idempotent=result.idempotent,
+                    )
+                except AssertionConflictError as error:
+                    if attempt + 1 == max_fact_state_retries:
+                        raise FactLifecycleError(
+                            "canonical fact state changed during bounded forget retries"
+                        ) from error
+            raise AssertionError("bounded fact forget loop exhausted")
+
+        async def save_fact_executor(**kwargs) -> FactWriteReceipt:
+            self._acquire_explicit_fact_lease()
+            try:
+                return await save_fact_executor_unleased(**kwargs)
+            finally:
+                self._release_explicit_fact_lease()
+
+        async def forget_fact_executor(**kwargs) -> FactDeleteReceipt:
+            self._acquire_explicit_fact_lease()
+            try:
+                return await forget_fact_executor_unleased(**kwargs)
+            finally:
+                self._release_explicit_fact_lease()
+
+        self.__save_explicit_fact = save_fact_executor
+        self.__forget_explicit_fact = forget_fact_executor
         logger.info(f"PrivacyEnforcingStorage initialized with config: storage={self._privacy_config.storage}, llm={self._privacy_config.llm_location}")
 
     def set_observability_purge(self, purge_callable) -> None:
@@ -1480,6 +2016,19 @@ class PrivacyEnforcingStorage:
     @property
     def _privacy_mode(self) -> PrivacyMode:
         return self.privacy_mode
+
+    def _acquire_explicit_fact_lease(self) -> None:
+        """Linearize one fact operation before any async storage await."""
+        with self._explicit_fact_lease_lock:
+            self._assert_semantic_assertion_write_allowed("explicit_fact")
+            self._active_explicit_fact_leases += 1
+
+    def _release_explicit_fact_lease(self) -> None:
+        """Release exactly one fact lease, including cancellation paths."""
+        with self._explicit_fact_lease_lock:
+            if self._active_explicit_fact_leases <= 0:
+                raise RuntimeError("explicit fact privacy lease underflow")
+            self._active_explicit_fact_leases -= 1
     
     def set_privacy_mode(self, mode: Union[PrivacyMode, PrivacyConfig, str]) -> None:
         """
@@ -1495,14 +2044,24 @@ class PrivacyEnforcingStorage:
         is preserved across the EPHEMERAL→exit transition because the
         purge needs to read it before clearing.
         """
-        old_config = self._privacy_config
         new_config = self._to_config(mode)
-        was_ephemeral = old_config.is_ephemeral()
-        is_ephemeral = new_config.is_ephemeral()
-        if is_ephemeral and not was_ephemeral:
-            self._entered_ephemeral_at = self._now_iso()
-        self._privacy_config = new_config
-        self._policy = PrivacyPolicy.from_config(self._privacy_config)
+        with self._explicit_fact_lease_lock:
+            old_config = self._privacy_config
+            if (
+                new_config != old_config
+                and self._active_explicit_fact_leases > 0
+            ):
+                raise PrivacyViolationError(
+                    "privacy configuration transition refused while an "
+                    "explicit semantic fact operation is in flight; retry "
+                    "the transition after that operation completes"
+                )
+            was_ephemeral = old_config.is_ephemeral()
+            is_ephemeral = new_config.is_ephemeral()
+            if is_ephemeral and not was_ephemeral:
+                self._entered_ephemeral_at = self._now_iso()
+            self._privacy_config = new_config
+            self._policy = PrivacyPolicy.from_config(self._privacy_config)
         logger.info(f"Privacy config changed: storage={old_config.storage}->{self._privacy_config.storage}, llm={old_config.llm_location}->{self._privacy_config.llm_location}")
 
     async def _sweep_store(self, store: str, coro_factory) -> "StorePurgeResult":
@@ -2442,6 +3001,40 @@ class PrivacyEnforcingStorage:
                 "pipeline; this wrapper will not silently rewrite canonical terms."
             )
 
+    async def save_explicit_fact(
+        self,
+        *,
+        subject: str,
+        predicate: str,
+        value: str,
+        confidence: float,
+        confidence_requested: float | None = None,
+        invocation_id: object = None,
+    ):
+        """Run explicit teaching through this wrapper's captured authority."""
+        return await self.__save_explicit_fact(
+            subject=subject,
+            predicate=predicate,
+            value=value,
+            confidence=confidence,
+            confidence_requested=confidence_requested,
+            invocation_id=invocation_id,
+        )
+
+    async def forget_explicit_fact(
+        self,
+        *,
+        subject: str,
+        predicate: str,
+        invocation_id: object = None,
+    ):
+        """Run explicit-fact deletion through the same privacy boundary."""
+        return await self.__forget_explicit_fact(
+            subject=subject,
+            predicate=predicate,
+            invocation_id=invocation_id,
+        )
+
     async def put_assertion(self, assertion, *, source_occurrences=(), operation_id=None):
         """Govern normal assertion ingestion through the SHACL write boundary.
 
@@ -2491,6 +3084,42 @@ class PrivacyEnforcingStorage:
             **validation_options,
         )
 
+    async def append_assertion_source(
+        self,
+        expected_predecessor_revision_id,
+        replacement,
+        *,
+        source_occurrences=(),
+        **validation_options,
+    ):
+        """Append direct provenance through the privacy-governed writer."""
+        self._assert_semantic_assertion_write_allowed("append_assertion_source")
+        return await self._storage.append_assertion_source(
+            expected_predecessor_revision_id,
+            replacement,
+            source_occurrences=source_occurrences,
+            **validation_options,
+        )
+
+    async def _restore_explicit_fact_assertion(
+        self,
+        expected_terminal_revision_id,
+        replacement,
+        *,
+        source_occurrences=(),
+        **validation_options,
+    ):
+        """Restore a direct terminal shell through the governed writer."""
+        self._assert_semantic_assertion_write_allowed(
+            "restore_explicit_fact_assertion"
+        )
+        return await self._storage._restore_explicit_fact_assertion(
+            expected_terminal_revision_id,
+            replacement,
+            source_occurrences=source_occurrences,
+            **validation_options,
+        )
+
     async def retract_assertion(self, assertion_id, expected_revision_id, *, operation_id=None):
         # The result contains the retracted assertion and every dependent.
         # Volatile sessions have no local semantic store, so returning that
@@ -2500,11 +3129,36 @@ class PrivacyEnforcingStorage:
             assertion_id, expected_revision_id, operation_id=operation_id,
         )
 
-    async def delete_assertion(self, assertion_id, expected_revision_id, *, operation_id=None):
+    async def delete_assertion(
+        self,
+        assertion_id,
+        expected_revision_id,
+        *,
+        operation_id=None,
+    ):
         # A deletion result likewise includes durable dependent content.
         self._assert_semantic_assertion_read_allowed("deletions")
         return await self._storage.delete_assertion(
-            assertion_id, expected_revision_id, operation_id=operation_id,
+            assertion_id,
+            expected_revision_id,
+            operation_id=operation_id,
+        )
+
+    async def _delete_explicit_fact_assertion(
+        self,
+        assertion_id,
+        expected_revision_id,
+        *,
+        operation_id,
+        explicit_fact_selector,
+    ):
+        """Delete one adapter fact through its selector-bound lifecycle."""
+        self._assert_semantic_assertion_read_allowed("explicit fact deletion")
+        return await self._storage._delete_explicit_fact_assertion(
+            assertion_id,
+            expected_revision_id,
+            operation_id=operation_id,
+            explicit_fact_selector=explicit_fact_selector,
         )
 
     async def invalidate_assertion_eligibility(self, assertion_id, expected_revision_id, *, operation_id=None):
@@ -3822,6 +4476,22 @@ class _PrivacyGoverningSemanticValidationService:
             **validation_options,
         )
 
+    async def append_assertion_source(
+        self,
+        expected_predecessor_revision_id,
+        replacement,
+        *,
+        source_occurrences=(),
+        **validation_options,
+    ):
+        """Validate a provenance append through the privacy-governed path."""
+        return await self._wrapper.append_assertion_source(
+            expected_predecessor_revision_id,
+            replacement,
+            source_occurrences=source_occurrences,
+            **validation_options,
+        )
+
     async def validate_current(self, **validation_options):
         self._wrapper._assert_semantic_assertion_read_allowed("validation")
         self._wrapper._assert_semantic_assertion_write_allowed("validate_current")
@@ -3841,7 +4511,8 @@ class _PrivacyGoverningSemanticValidationService:
             raise AttributeError(name)
         raise PrivacyViolationError(
             f"Semantic-validation facade refuses to forward {name!r}: use the "
-            "governed put_assertion, supersede_assertion, validate_current, "
+            "governed put_assertion, supersede_assertion, "
+            "append_assertion_source, validate_current, "
             "full_audit_and_repair, or reports surfaces."
         )
 

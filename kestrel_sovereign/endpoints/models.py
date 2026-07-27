@@ -17,7 +17,13 @@ from kestrel_sovereign.llm.model_metadata import ModelCategory
 from kestrel_sovereign.sql_utils import safe_column_name
 from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.features.bootstrap.feature import rename_agent_core
-from kestrel_sovereign.endpoints.agent_helpers import get_agent, get_caller
+from kestrel_sovereign.endpoints.agent_helpers import (
+    get_agent,
+    get_caller,
+    request_invocation_provenance,
+    resolve_request_invocation_id,
+)
+from kestrel_sovereign.agent.invocation import invocation_id_response_header
 from kestrel_sovereign.features.storage_access import (
     hides_persisted_user_content,
     resolve_feature_database,
@@ -2613,7 +2619,7 @@ def list_models_v1(request: Request):
 
 
 @router.post("/v1/chat/completions")
-async def chat_completions(request: Request):
+async def chat_completions(request: Request, http_response: Response):
     """Chat Completions-compatible endpoint.
 
     Respects the 'model' field from the request body. When a model is provided
@@ -2639,12 +2645,19 @@ async def chat_completions(request: Request):
 
         # Extract user_passphrase for USER_BYOK agents
         user_passphrase = data.get("user_passphrase")
+        request_id = resolve_request_invocation_id(request, data)
+        invocation_provenance = request_invocation_provenance(
+            request,
+            source_locator="POST:/v1/chat/completions",
+        )
 
         assistant_text = await agent.process_input(
             user_input,
             model_override=model_override,
             caller=get_caller(request),
             user_passphrase=user_passphrase,
+            invocation_id=request_id,
+            invocation_provenance=invocation_provenance,
         )
 
         # Report the model that was actually routed, not just what the
@@ -2670,6 +2683,7 @@ async def chat_completions(request: Request):
             ],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
+        http_response.headers["X-Request-ID"] = invocation_id_response_header(request_id)
         return resp
     except HTTPException:
         # Preserve the original status code (notably 503 from get_agent
