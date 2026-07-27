@@ -158,6 +158,68 @@ def test_openai_compatible_endpoints_return_minimal_contracts():
         _restore_app(app, original)
 
 
+def test_chat_completions_forwards_body_retry_id_and_authenticated_provenance():
+    """OpenAI-compatible retries must reach governed tools as one invocation."""
+    llm_service = MagicMock()
+    llm_service.providers = [{"model": "gpt-5-mini"}]
+    llm_service.get_active_model_id = MagicMock(return_value="gpt-5-mini")
+    agent = MagicMock(llm_service=llm_service)
+    agent.process_input = AsyncMock(return_value="hello")
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/v1/chat/completions",
+                    headers={"X-API-Key": "test-key"},
+                    json={
+                        "id": "openai-retry-2765",
+                        "messages": [{"role": "user", "content": "teach this"}],
+                    },
+                )
+
+        assert response.status_code == 200
+        assert response.headers["X-Request-ID"] == "openai-retry-2765"
+        _, kwargs = agent.process_input.await_args
+        assert kwargs["invocation_id"] == "openai-retry-2765"
+        provenance = kwargs["invocation_provenance"]
+        assert provenance.actor == "api_key"
+        assert provenance.source_kind == "http_request"
+        assert provenance.source_locator == "POST:/v1/chat/completions"
+    finally:
+        _restore_app(app, original)
+
+
+def test_chat_completions_encodes_unicode_retry_id_for_response_header():
+    """A valid UTF-8 body retry ID must not fail after the agent turn runs."""
+    llm_service = MagicMock()
+    llm_service.providers = [{"model": "gpt-5-mini"}]
+    llm_service.get_active_model_id = MagicMock(return_value="gpt-5-mini")
+    agent = MagicMock(llm_service=llm_service)
+    agent.process_input = AsyncMock(return_value="hello")
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/v1/chat/completions",
+                    headers={"X-API-Key": "test-key"},
+                    json={
+                        "id": "retry-☃",
+                        "messages": [{"role": "user", "content": "teach this"}],
+                    },
+                )
+
+        assert response.status_code == 200, response.text
+        assert response.headers["X-Request-ID"] == "retry-%E2%98%83"
+        _, kwargs = agent.process_input.await_args
+        assert kwargs["invocation_id"] == "retry-☃"
+    finally:
+        _restore_app(app, original)
+
+
 # ============================================================================
 # Backend-honest model reporting (#426)
 # ============================================================================

@@ -450,6 +450,39 @@ class TestPrivacyMode:
         mock_privacy_agent.set_mode.assert_called_once_with(PrivacyMode.ISOLATED)
 
     @pytest.mark.asyncio
+    async def test_storage_refusal_returns_retryable_non_applied_transition(
+        self,
+        tmp_path,
+    ):
+        """An in-flight durable fact cannot leave agent/privacy state split."""
+        from kestrel_sovereign.storage.privacy_wrapper import (
+            PRIVACY_TRANSITION_RETRY_MESSAGE,
+            PrivacyViolationError,
+        )
+
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+            privacy_mode=PrivacyMode.NORMAL,
+        )
+        agent.storage = MagicMock()
+        agent.storage.set_privacy_mode.side_effect = PrivacyViolationError(
+            "explicit semantic fact operation is in flight"
+        )
+        agent.privacy_agent = MagicMock()
+        agent.privacy_agent.evaluate_transition = _no_confirm_evaluate()
+
+        result = await agent.set_privacy_mode_with_effects(
+            PrivacyMode.ISOLATED
+        )
+
+        assert result.applied is False
+        assert result.retryable_conflict is True
+        assert result.message == PRIVACY_TRANSITION_RETRY_MESSAGE
+        assert agent._privacy_mode is PrivacyMode.NORMAL
+        agent.privacy_agent.set_mode.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_set_privacy_mode_returns_privacy_agent_message(self, tmp_path):
         """set_privacy_mode() returns the canonical privacy-agent status message."""
         agent = KestrelAgent(

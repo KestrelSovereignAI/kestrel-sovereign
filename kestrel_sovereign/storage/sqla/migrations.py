@@ -32,7 +32,11 @@ import struct
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
-from ..async_assertion_store import _erasure_receipt_key
+from ..async_assertion_store import (
+    _erasure_receipt_key,
+    _legacy_erasure_assertion_key,
+    _now,
+)
 
 if TYPE_CHECKING:
     from ..async_database import AsyncDatabase
@@ -40,7 +44,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-_SEMANTIC_ASSERTION_SCHEMA_VERSION = "semantic_assertion_store_v3"
+_SEMANTIC_ASSERTION_SCHEMA_VERSION = "semantic_assertion_store_v5"
 _SEMANTIC_VALIDATION_SCHEMA_VERSION = "semantic_validation_reports_v1"
 _SEMANTIC_MAINTENANCE_SCHEMA_VERSION = "semantic_maintenance_v1"
 _SEMANTIC_MAINTENANCE_CURSOR_SCHEMA_VERSION = "semantic_maintenance_v2_cursor"
@@ -126,7 +130,7 @@ async def _ensure_erasure_receipts_are_opaque(db: "AsyncDatabase") -> None:
     )
     for tenant_id, operation_id, receipt in rows:
         try:
-            generation = int(json.loads(receipt).get("generation"))
+            generation = json.loads(receipt).get("generation")
         except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
             # A malformed legacy retry record must not keep an opaque payload
             # around.  Deleting it fails closed: retrying after restart reports
@@ -137,7 +141,10 @@ async def _ensure_erasure_receipts_are_opaque(db: "AsyncDatabase") -> None:
                 (tenant_id, operation_id),
             )
             continue
-        if generation < 1:
+        # Generations are ledger ordinals, not numeric measurements.  Reject
+        # booleans and floats instead of silently truncating a legacy value
+        # such as 1.5 to generation 1 and authenticating the wrong fence.
+        if type(generation) is not int or generation < 1:
             await db.execute(
                 "DELETE FROM semantic_assertion_erasure_receipts "
                 "WHERE tenant_id = ? AND operation_id = ?",
@@ -346,6 +353,25 @@ async def migrate_semantic_assertion_store(db: "AsyncDatabase") -> None:
             created_at TEXT NOT NULL,
             PRIMARY KEY (tenant_id, operation_id)
         )""",
+        """CREATE TABLE IF NOT EXISTS semantic_assertion_erased_operation_tombstones (
+            tenant_id TEXT NOT NULL,
+            purpose TEXT NOT NULL,
+            operation_key TEXT NOT NULL,
+            request_key TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, purpose, operation_key),
+            UNIQUE (tenant_id, operation_key),
+            CHECK (generation > 0)
+        )""",
+        """CREATE TABLE IF NOT EXISTS semantic_assertion_legacy_erasure_fences (
+            tenant_id TEXT NOT NULL,
+            assertion_key TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, assertion_key),
+            CHECK (generation > 0)
+        )""",
         "CREATE INDEX IF NOT EXISTS idx_semantic_assertion_current ON semantic_assertions(tenant_id, current_revision_id)",
         "CREATE INDEX IF NOT EXISTS idx_semantic_revision_query ON semantic_assertion_revisions(tenant_id, status, subject_value, predicate_value, revision_id)",
         "CREATE INDEX IF NOT EXISTS idx_semantic_revision_object ON semantic_assertion_revisions(tenant_id, predicate_value, object_kind, object_value)",
@@ -357,6 +383,8 @@ async def migrate_semantic_assertion_store(db: "AsyncDatabase") -> None:
         "CREATE INDEX IF NOT EXISTS idx_semantic_inference_derivation_input ON semantic_inference_derivation_inputs(tenant_id, input_revision_id, derivation_id)",
         "CREATE INDEX IF NOT EXISTS idx_semantic_outbox_changes ON semantic_projection_outbox(tenant_id, generation, created_at, event_id)",
         "CREATE INDEX IF NOT EXISTS idx_semantic_erasure_changes ON semantic_projection_erasure_outbox(tenant_id, generation, created_at, event_id)",
+        "CREATE INDEX IF NOT EXISTS idx_semantic_erased_operation_tombstones ON semantic_assertion_erased_operation_tombstones(tenant_id, operation_key)",
+        "CREATE INDEX IF NOT EXISTS idx_semantic_legacy_erasure_fences ON semantic_assertion_legacy_erasure_fences(tenant_id, assertion_key)",
     )
     async with db.transaction():
         # PostgreSQL's catalog DDL can race even with IF NOT EXISTS.  A
@@ -378,9 +406,65 @@ async def migrate_semantic_assertion_store(db: "AsyncDatabase") -> None:
             await db.execute("DELETE FROM semantic_schema_migrations WHERE 0", ())
         if await _semantic_schema_marker_exists(db):
             return
+        legacy_upgrade = await db.fetchone(
+            "SELECT 1 FROM semantic_schema_migrations "
+            "WHERE version IN (?, ?)",
+            (
+                "semantic_assertion_store_v3",
+                "semantic_assertion_store_v4",
+            ),
+        )
         for statement in statements:
             await db.execute(statement, ())
         await _ensure_erasure_receipts_are_opaque(db)
+        if legacy_upgrade is not None:
+            # v3 erased content-bearing operation receipts before blinded
+            # per-operation tombstones existed.  Preserve only an opaque,
+            # per-assertion fence derived from the erasure request digest.
+            # This cannot recover the lost operation IDs or content, but it
+            # lets the adapter reject the exact deterministic semantic
+            # identity instead of imposing a tenant-wide write freeze.
+            legacy_erasure_rows = await db.fetchall(
+                "SELECT tenant_id, request_digest, MAX(generation) "
+                "FROM semantic_assertion_erasure_receipts "
+                "GROUP BY tenant_id, request_digest",
+                (),
+            )
+            for tenant_id, request_digest, generation in legacy_erasure_rows:
+                request_digest = str(request_digest)
+                if (
+                    len(request_digest) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in request_digest
+                    )
+                    or type(generation) is not int
+                    or generation < 1
+                ):
+                    raise ValueError(
+                        "legacy semantic erasure receipt has malformed opaque state"
+                    )
+                assertion_key = _legacy_erasure_assertion_key(
+                    request_digest
+                )
+                existing = await db.fetchone(
+                    "SELECT generation "
+                    "FROM semantic_assertion_legacy_erasure_fences "
+                    "WHERE tenant_id = ? AND assertion_key = ?",
+                    (tenant_id, assertion_key),
+                )
+                if existing is None:
+                    await db.execute(
+                        "INSERT INTO semantic_assertion_legacy_erasure_fences "
+                        "(tenant_id, assertion_key, generation, created_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (
+                            tenant_id,
+                            assertion_key,
+                            generation,
+                            _now(),
+                        ),
+                    )
         await db.execute(
             "INSERT INTO semantic_schema_migrations (version) VALUES (?)",
             (_SEMANTIC_ASSERTION_SCHEMA_VERSION,),

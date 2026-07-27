@@ -63,6 +63,24 @@ class BridgeRequest(BaseModel):
         None,
         description="Optional DID for identity verification of the caller.",
     )
+    request_id: Optional[str] = Field(
+        None,
+        description=(
+            "Opaque client-generated idempotency key. Reuse it only when "
+            "retrying the same gateway delivery."
+        ),
+        min_length=1,
+        max_length=256,
+    )
+    invocation_id: Optional[str] = Field(
+        None,
+        description=(
+            "Alias for request_id for gateways that call their delivery key "
+            "an invocation id."
+        ),
+        min_length=1,
+        max_length=256,
+    )
 
 
 class BridgeResponse(BaseModel):

@@ -25,14 +25,17 @@ Usage:
 import json
 import logging
 import time
-import uuid
-from typing import Optional
-
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
 from kestrel_sovereign.rate_limit import limiter
-from kestrel_sovereign.endpoints.agent_helpers import get_agent, get_caller
+from kestrel_sovereign.endpoints.agent_helpers import (
+    get_agent,
+    get_caller,
+    request_invocation_provenance,
+    resolve_request_invocation_id,
+)
+from kestrel_sovereign.agent.invocation import invocation_id_response_header
 
 from .protocol import (
     BridgeCapabilitiesResponse,
@@ -79,7 +82,11 @@ def get_router() -> APIRouter:
 
     @router.post("/invoke", response_model=BridgeResponse)
     @limiter.limit("120/minute")
-    async def bridge_invoke(request: Request, body: BridgeRequest):
+    async def bridge_invoke(
+        request: Request,
+        body: BridgeRequest,
+        http_response: Response,
+    ):
         """
         Synchronous bridge invocation.
 
@@ -106,6 +113,11 @@ def get_router() -> APIRouter:
 
         # Build context note from gateway context
         context_note = _build_context_note(body)
+        request_id = resolve_request_invocation_id(request, body)
+        invocation_provenance = request_invocation_provenance(
+            request,
+            source_locator="POST:/api/bridge/invoke",
+        )
 
         # Route through the agent's process_input
         try:
@@ -118,9 +130,14 @@ def get_router() -> APIRouter:
                 model_override=body.model_override,
                 session_id=session.id,
                 caller=get_caller(request),
+                invocation_id=request_id,
+                invocation_provenance=invocation_provenance,
             )
-        except Exception as e:
-            logger.error(f"Bridge invoke error: {e}", exc_info=True)
+        except Exception:
+            # Exception text and tracebacks can contain bridge message/context
+            # content.  The client receives only the fixed HTTP detail below;
+            # logs retain the event category and no request-derived material.
+            logger.error("Bridge invoke failed")
             raise HTTPException(status_code=500, detail="Agent processing error.")
 
         elapsed_ms = int((time.monotonic() - start_ms) * 1000)
@@ -133,6 +150,7 @@ def get_router() -> APIRouter:
             duration_ms=elapsed_ms,
         )
 
+        http_response.headers["X-Request-ID"] = invocation_id_response_header(request_id)
         return BridgeResponse(
             message=response_text,
             session_id=session.id,
@@ -140,6 +158,7 @@ def get_router() -> APIRouter:
                 "channel_type": body.channel_type.value,
                 "duration_ms": elapsed_ms,
                 "gateway_session_id": body.session_id,
+                "request_id": request_id,
             },
         )
 
@@ -185,10 +204,21 @@ def get_router() -> APIRouter:
         user_input = body.message
         if context_note:
             user_input = f"{user_input}\n\n[Bridge context: {context_note}]"
+        request_id = resolve_request_invocation_id(request, body)
+        invocation_provenance = request_invocation_provenance(
+            request,
+            source_locator="POST:/api/bridge/stream",
+        )
 
         async def event_generator():
             full_response = []
+            request_lifecycle_registered = False
             try:
+                if hasattr(agent, "register_active_request"):
+                    agent.register_active_request(request_id)
+                else:
+                    agent._current_request_id = request_id
+                request_lifecycle_registered = True
                 # Wave 5E: bridge consumers (Slack/Discord/email/etc.)
                 # don't speak the chat-protocol revise sentinel —
                 # strip it before serializing each chunk into the
@@ -199,6 +229,8 @@ def get_router() -> APIRouter:
                     model_override=body.model_override,
                     session_id=session.id,
                     caller=get_caller(request),
+                    request_id=request_id,
+                    invocation_provenance=invocation_provenance,
                 ):
                     chunk = strip_revise_sentinels(chunk)
                     if not chunk:
@@ -214,6 +246,7 @@ def get_router() -> APIRouter:
                     "session_id": session.id,
                     "duration_ms": elapsed_ms,
                     "channel_type": body.channel_type.value,
+                    "request_id": request_id,
                 })
                 yield f"data: {complete_data}\n\n"
 
@@ -226,19 +259,26 @@ def get_router() -> APIRouter:
                     duration_ms=elapsed_ms,
                 )
             except Exception as e:
-                # #2674 finding 3: the FULL error goes to the operator log (a
-                # separate trust boundary); the SSE client gets ONLY a stable safe
-                # payload built by the SAME shared boundary /api/agent/stream uses.
+                # The SSE client gets only the stable safe payload built by
+                # the same shared boundary /api/agent/stream uses.  Logging
+                # also remains content-safe for gateway-provided input.
                 # Reflecting ``str(e)`` verbatim leaked a
                 # BRIDGE_STRICT_WITHHELD_PROSE_MARKER (Terra): an adapter that
                 # raises after yielding partial prose wraps that late exception,
                 # so its text can carry withheld response content under a strict
                 # buffered audit. Never emit the underlying/message/provider text.
-                logger.error(f"Bridge stream error: {e}", exc_info=True)
+                logger.error("Bridge stream failed")
                 from kestrel_sovereign.llm.streaming_errors import (
                     bridge_sse_error_event,
                 )
                 yield bridge_sse_error_event(e)
+            finally:
+                # Bridge streams use the same counted lifecycle contract as
+                # /api/agent/stream.  Duplicate retry ids deliberately share
+                # a cancellation key; each generator releases only its own
+                # registration in this finally block.
+                if request_lifecycle_registered:
+                    agent._cleanup_cancelled_request(request_id)
 
         return StreamingResponse(
             event_generator(),
@@ -247,6 +287,7 @@ def get_router() -> APIRouter:
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
+                "X-Request-ID": invocation_id_response_header(request_id),
             },
         )
 

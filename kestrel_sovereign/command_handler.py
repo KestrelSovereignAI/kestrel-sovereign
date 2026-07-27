@@ -13,6 +13,10 @@ from dataclasses import dataclass
 from enum import Enum
 
 from kestrel_sovereign.privacy import PrivacyMode
+from kestrel_sovereign.storage.privacy_wrapper import (
+    PRIVACY_TRANSITION_RETRY_MESSAGE,
+    PrivacyViolationError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -527,6 +531,8 @@ class CommandHandler:
             except ValueError:
                 valid_modes = ", ".join([m.value for m in PrivacyMode])
                 return f"Invalid privacy mode. Valid modes are: {valid_modes}"
+            except PrivacyViolationError:
+                return PRIVACY_TRANSITION_RETRY_MESSAGE
         return self.agent.privacy_agent.get_status()
     
     async def _cmd_confirm_privacy(self, user_input: str) -> str:
@@ -547,8 +553,11 @@ class CommandHandler:
                 f"Use !confirm-privacy-mode {pending.value} to confirm, or "
                 f"!privacy {pending.value} is superseded by choosing another mode."
             )
-        result = await self.agent.confirm_privacy_transition()
-        return result.message
+        try:
+            result = await self.agent.confirm_privacy_transition()
+            return result.message
+        except PrivacyViolationError:
+            return PRIVACY_TRANSITION_RETRY_MESSAGE
 
     def _cmd_get_privacy_mode(self, user_input: str) -> str:
         """Handle !get-privacy-mode command. Delegates to PrivacyAgent."""

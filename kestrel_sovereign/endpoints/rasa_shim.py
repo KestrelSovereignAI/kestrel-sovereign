@@ -19,9 +19,14 @@ import asyncio
 import logging
 import os
 import secrets
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel
 
+from kestrel_sovereign.endpoints.agent_helpers import (
+    request_invocation_provenance,
+    resolve_request_invocation_id,
+)
+from kestrel_sovereign.agent.invocation import invocation_id_response_header
 from kestrel_sovereign.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
@@ -70,6 +75,8 @@ _SMS_CONTEXT = (
 class RasaWebhookRequest(BaseModel):
     sender: str
     message: str
+    request_id: str | None = None
+    invocation_id: str | None = None
 
 
 class RasaWebhookResponse(BaseModel):
@@ -79,7 +86,11 @@ class RasaWebhookResponse(BaseModel):
 
 @router.post("/webhook", response_model=list[RasaWebhookResponse])
 @limiter.limit("30/minute")
-async def rasa_webhook(request: Request, payload: RasaWebhookRequest):
+async def rasa_webhook(
+    request: Request,
+    payload: RasaWebhookRequest,
+    http_response: Response,
+):
     """
     Rasa REST-channel compatible webhook.
 
@@ -107,6 +118,15 @@ async def rasa_webhook(request: Request, payload: RasaWebhookRequest):
 
     # Prepend SMS context so the agent can calibrate its response length and tone
     enriched_input = f"{_SMS_CONTEXT}{message}"
+    request_id = resolve_request_invocation_id(request, payload)
+    invocation_provenance = request_invocation_provenance(
+        request,
+        source_locator="POST:/webhooks/rest/webhook",
+        # The endpoint's shared-secret gate authenticates a gateway service,
+        # not the untrusted payload ``sender``. Record that service principal
+        # rather than falsely attributing a patient delivery to the agent.
+        fallback_actor="rasa_webhook",
+    )
 
     try:
         agent = request.app.state.agent
@@ -115,8 +135,11 @@ async def rasa_webhook(request: Request, payload: RasaWebhookRequest):
                 user_input=enriched_input,
                 session_id=f"sms:{sender}",  # namespace prevents collision with UI sessions
                 include_memories=False,  # HIPAA: prevent cross-patient memory leakage
+                invocation_id=request_id,
+                invocation_provenance=invocation_provenance,
             )
         logger.info(f"[rasa-shim] sender={sender} msg_len={len(message)} resp_len={len(response_text)}")
+        http_response.headers["X-Request-ID"] = invocation_id_response_header(request_id)
         return [RasaWebhookResponse(recipient_id=sender, text=response_text)]
 
     except Exception as exc:

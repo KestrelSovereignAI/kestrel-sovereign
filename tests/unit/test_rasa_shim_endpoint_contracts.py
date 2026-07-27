@@ -46,11 +46,12 @@ def test_rasa_webhook_does_not_force_hardcoded_model_override():
             with TestClient(app) as client:
                 response = client.post(
                     "/webhooks/rest/webhook",
-                    headers=_api_headers(),
+                    headers={**_api_headers(), "X-Request-ID": "rasa-retry-2765"},
                     json={"sender": "patient-123", "message": "BP was 140/90"},
                 )
 
         assert response.status_code == 200
+        assert response.headers["X-Request-ID"] == "rasa-retry-2765"
         assert response.json() == [
             {
                 "recipient_id": "patient-123",
@@ -62,6 +63,12 @@ def test_rasa_webhook_does_not_force_hardcoded_model_override():
         _, kwargs = agent.process_input.await_args
         assert kwargs["session_id"] == "sms:patient-123"
         assert kwargs["include_memories"] is False
+        assert kwargs["invocation_id"] == "rasa-retry-2765"
+        assert (
+            kwargs["invocation_provenance"].source_locator
+            == "POST:/webhooks/rest/webhook"
+        )
+        assert kwargs["invocation_provenance"].actor == "rasa_webhook"
         assert "Patient says: BP was 140/90" in kwargs["user_input"]
         assert "model_override" not in kwargs
     finally:

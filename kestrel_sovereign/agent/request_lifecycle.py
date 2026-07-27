@@ -23,12 +23,18 @@ class RequestLifecycleMixin:
         """Track an active request for later cancellation and cleanup."""
         if not hasattr(self, "_active_request_ids"):
             self._active_request_ids = set()
+        if not isinstance(getattr(self, "_active_request_counts", None), dict):
+            self._active_request_counts = {}
+        counts = self._active_request_counts
+        was_inactive = counts.get(request_id, 0) == 0
+        counts[request_id] = counts.get(request_id, 0) + 1
         self._active_request_ids.add(request_id)
         # Stamp the registration time (monotonic) so abandoned request
         # ids can be aged out as stale (#1558).
         if not hasattr(self, "_active_request_started_at"):
             self._active_request_started_at = {}
-        self._active_request_started_at[request_id] = time.monotonic()
+        if was_inactive:
+            self._active_request_started_at[request_id] = time.monotonic()
         # Preserve the legacy "current request" fallback for callers that
         # do not yet pass an explicit request ID.
         self._current_request_id = request_id
@@ -59,6 +65,12 @@ class RequestLifecycleMixin:
     def _cleanup_cancelled_request(self, request_id: str):
         """Remove a request from the cancelled set after it's been handled."""
         active_request_ids = getattr(self, "_active_request_ids", None)
+        counts = getattr(self, "_active_request_counts", None)
+        if isinstance(counts, dict) and counts.get(request_id, 0) > 1:
+            counts[request_id] -= 1
+            return
+        if isinstance(counts, dict):
+            counts.pop(request_id, None)
         if active_request_ids is not None:
             active_request_ids.discard(request_id)
         started = getattr(self, "_active_request_started_at", None)
@@ -120,6 +132,9 @@ class RequestLifecycleMixin:
                 stale.append(rid)
         for rid in stale:
             active.discard(rid)
+            counts = getattr(self, "_active_request_counts", None)
+            if isinstance(counts, dict):
+                counts.pop(rid, None)
             started.pop(rid, None)
             cancelled = getattr(self, "_cancelled_requests", None)
             if cancelled is not None:

@@ -443,13 +443,14 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
+| `forget_fact` | `!memory-forget-fact` | `memory` | `subject`, `predicate` | 67 | `enabled` |
 | `memory_admin_unpin_all` | `!memory-admin-unpin-all` | `system` |  | 32 | `enabled` |
 | `memory_admin_unpin_oldest` | `!memory-admin-unpin-oldest` | `system` | `count` | 55 | `enabled` |
 | `memory_pin` | `!memory-pin` | `memory` | `message_id`, `reason` | 100 | `enabled` |
 | `memory_pin_stats` | `!memory-pin-stats` | `system` |  | 40 | `enabled` |
 | `memory_pinned` | `!memory-pinned` | `memory` |  | 37 | `enabled` |
 | `memory_release` | `!memory-release` | `memory` | `message_id` | 67 | `enabled` |
-| `save_fact` | `!memory-save-fact` | `memory` | `subject`, `predicate`, `value`, `confidence` | 236 | `enabled` |
+| `save_fact` | `!memory-save-fact` | `memory` | `subject`, `predicate`, `value`, `confidence` | 182 | `enabled` |
 
 ### `model` (ModelAgent)
 
@@ -512,7 +513,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
-| `recall` | `!recall` | `memory` | `query`, `item_type`, `limit` | 179 | `enabled` |
+| `recall` | `!recall` | `memory` | `query`, `item_type`, `limit` | 184 | `enabled` |
 | `recall_delete` | `!recall delete` | `memory` | `item_id` | 41 | `enabled` |
 | `recall_get` | `!recall get` | `memory` | `item_id` | 46 | `enabled` |
 | `recall_list` | `!recall list` | `memory` | `item_type`, `limit` | 108 | `enabled` |
@@ -1022,11 +1023,12 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!memory trash` | `memory` | `[limit]` | List soft-deleted (trashed) individual messages so you can find one to restore_message_by_id or purge_message_by_id. Returns message_id, session_id, role, a short preview, and when it was trashed — most-recently-trashed first. This is the message-level counterpart to list_conversations(include_trashed=True), which lists whole trashed sessions; use this to find messages that were trashed individually (e.g. by delete_messages) inside otherwise-live conversations. |
 | `!memory-admin-unpin-all` | `memory_agency` |  | Administrative command: remove ALL active pins for this agent. Sovereign/admin use only. |
 | `!memory-admin-unpin-oldest` | `memory_agency` | `<count>` | Administrative command: remove the N oldest active pins. Sovereign/admin use only. |
+| `!memory-forget-fact` | `memory_agency` | `<subject> <predicate>` | Delete a current canonical fact previously created by save_fact. Uses the same supported local subject/predicate mapping. |
 | `!memory-pin` | `memory_agency` | `<message_id> [reason]` | Pin a memory so it resists decay and stays retrievable. Use this for memories the agent considers important to preserve. |
 | `!memory-pin-stats` | `memory_agency` |  | Show memory pin statistics -- total messages, pinned count, released count, ratios, quota usage, and pin age information. |
 | `!memory-pinned` | `memory_agency` |  | List all currently pinned memories with their reasons. Use this to review what the agent has chosen to protect. |
 | `!memory-release` | `memory_agency` | `<message_id>` | Release a pinned memory so it resumes normal decay. Use this when a previously important memory is no longer needed. |
-| `!memory-save-fact` | `memory_agency` | `<subject> <predicate> <value> [confidence]` | Save a learned fact to the Knowledge Graph. Use this when the user tells you something worth remembering permanently, like preferences, personal details, or important information. The fact appears immediately in the Knowledge Graph panel. Use 'user' as the subject for facts about the user. Call once per distinct fact — do not save the same fact with different subject names. |
+| `!memory-save-fact` | `memory_agency` | `<subject> <predicate> <value> [confidence]` | Save an explicitly approved canonical fact. The current mapping supports subject 'user' and predicate 'preferred_deploy_region'. Unsupported local terms are rejected rather than guessed. |
 | `!model` | `model` |  | Report the currently active AI model. Read-only; takes no arguments. |
 | `!model-info` | `model` | `<model_name>` | Get detailed information about a specific model. |
 | `!model-list` | `model` | `[use_cache]` | List all available AI models. |
@@ -1047,7 +1049,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!restart events` | `restart_coordinator` | `[limit] [since]` | List recent restart_status lifecycle events for chat-history reload and the agent's pre-turn snapshot. Newest first; uses the typed event records persisted alongside each SSE emit (#1562). |
 | `!restart list` | `restart_coordinator` | `[status]` | List restart requests, optionally filtered by status. Valid statuses: pending\|approved\|updating\|executing\|completed\|rejected\|canceled (omit status for all). An unknown status is rejected with the valid set rather than silently returning no rows.<br><br>Returns: data={count: int, requests: [<public dict>, ...]}. |
 | `!restart request` | `restart_coordinator` | `<reason> [urgency] [policy] [desired_window] [operation] [update_profile] [target_ref] [repo_path] [allow_migrations]` | File a durable restart request. The host coordinator evaluates safety and executes when conditions are met.<br><br>urgency: one of low\|normal\|high\|critical (default 'normal'); common synonyms are accepted ('medium'→normal, 'urgent'→high, 'emergency'→critical). Higher urgency is executed first.<br>policy: one of idle_agents_only\|allow_busy_after_timeout\|manual_only (default 'idle_agents_only'):<br>  - idle_agents_only: execute only while this agent is idle (no in-flight cognition turns or real background work).<br>  - allow_busy_after_timeout: prefer idle, but execute anyway once the request has aged past the busy timeout even if the agent is still busy.<br>  - manual_only: never auto-execute; the row waits for an explicit dispatch.<br><br>operation='restart_only' (default) restarts the current code and NEVER updates it. operation='update_then_restart' first runs an explicit, allowlisted update profile (e.g. 'sovereign_local_uv_sync': git fetch + checkout target_ref + uv sync) against a local checkout, then restarts into the new code. Update mode requires update_profile and target_ref; repo_path defaults to the local Sovereign checkout. Updating/installing is always explicit and audited — it is never an implicit side effect of a plain restart.<br><br>Returns: data={created: bool, request: <public dict>}. The filed request's id is at data.request.id (NOT a top-level request_id) — pass it to list_restart_requests or cancel_restart_request. |
-| `!recall` | `save` | `<query> [item_type] [limit]` | Search saved items and learned facts. Find previously saved stashes, excerpts, files, and items by meaning, plus facts saved via save_fact (matched by keyword). Optional item_type filter must be one of: stash, file, excerpt, structured; passing one scopes the search to saved items only. |
+| `!recall` | `save` | `<query> [item_type] [limit]` | Search saved items. Find previously saved stashes, excerpts, files, and items by meaning; legacy learned-fact graph rows may also appear by keyword during the compatibility window. Optional item_type filter must be one of: stash, file, excerpt, structured; passing one scopes the search to saved items only. |
 | `!recall delete` | `save` | `<item_id>` | Delete a saved item by ID. |
 | `!recall get` | `save` | `<item_id>` | Get the full content of a saved item by ID. |
 | `!recall list` | `save` | `[item_type] [limit]` | List all saved items, optionally filtered by type. Optional item_type filter must be one of: stash, file, excerpt, structured. |
@@ -1124,6 +1126,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!wellness-history` | `wellness` | `[limit]` | View wellness trends over time |
 
 <!-- END AUTO-GENERATED FEATURE INVENTORY -->
+
 
 
 
