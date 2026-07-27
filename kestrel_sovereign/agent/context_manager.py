@@ -201,6 +201,12 @@ class ContextResult:
     # orchestrator reuses this same object for governance-delta notices so the
     # two views cannot drift when model state changes during context assembly.
     state_of_mind: Any = None
+    # Exact canonical assertions rendered into this turn's dynamic context.
+    # This is a content-free, immutable identity projection from the committed
+    # plan — never a mutable ContextBuilder ``last_*`` side channel.  Turn
+    # persistence uses it to make later fact erasure retract only artifacts
+    # that actually depended on the assertion.
+    semantic_recall_dependencies: Tuple[Tuple[str, str], ...] = ()
 
 
 class ContextManager:
@@ -1197,7 +1203,52 @@ class ContextManager:
             degraded_mode=plan.degraded_mode,
             mandatory_system_tokens=plan.mandatory_system_tokens,
             state_of_mind=plan.state_of_mind,
+            semantic_recall_dependencies=ContextManager._semantic_recall_dependencies(
+                plan
+            ),
         )
+
+    @staticmethod
+    def _semantic_recall_dependencies(
+        plan: ContextBuildPlan,
+    ) -> Tuple[Tuple[str, str], ...]:
+        """Return assertion/revision identities from the committed RAG plan.
+
+        Only an INCLUDED RAG section is model-visible.  The values below are
+        deliberately extracted from the typed section details that fed that
+        section, not from ``ContextBuilder.last_semantic_recall_metadata``:
+        another concurrent context build may already have overwritten that
+        mutable diagnostic field by the time the caller persists this turn.
+        """
+        rag = plan.sections.get("rag")
+        if rag is None or not rag.included:
+            return ()
+        recall = rag.details.get("semantic_recall")
+        if not isinstance(recall, dict) or recall.get("status") != "used":
+            return ()
+        assertions = recall.get("assertions")
+        if not isinstance(assertions, (list, tuple)):
+            return ()
+
+        dependencies: list[Tuple[str, str]] = []
+        seen: set[Tuple[str, str]] = set()
+        for assertion in assertions:
+            if not isinstance(assertion, dict):
+                continue
+            assertion_id = assertion.get("assertion_id")
+            revision_id = assertion.get("revision_id")
+            if (
+                not isinstance(assertion_id, str)
+                or not assertion_id
+                or not isinstance(revision_id, str)
+                or not revision_id
+            ):
+                continue
+            dependency = (assertion_id, revision_id)
+            if dependency not in seen:
+                seen.add(dependency)
+                dependencies.append(dependency)
+        return tuple(dependencies)
 
     # ------------------------------------------------------------------
     # Canonical plan stages — each produces/commits one section. Content

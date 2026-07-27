@@ -3368,6 +3368,120 @@ class AsyncConversationStore:
                 logger.warning(f"Message {message_id} not found for agent {self.agent_id}")
             return updated
 
+    async def _semantic_recall_dependency_rows(
+        self, assertion_id: str
+    ) -> List[Tuple[int, Dict[str, Any]]]:
+        """Return this agent's rows linked to one canonical assertion.
+
+        The lookup is an exact JSON identity match, never a scan over message
+        content.  It includes archived and trashed artifacts deliberately: a
+        later restore must not make a forgotten fact reappear in context.
+        """
+        if not isinstance(assertion_id, str) or not assertion_id:
+            raise ValueError("assertion_id must be a non-empty string")
+        if self.db.backend_type == "postgres":
+            rows = await self.db.fetchall(
+                "SELECT id, metadata FROM conversation_history "
+                "WHERE agent_id = ? AND EXISTS ("
+                "SELECT 1 FROM jsonb_array_elements("
+                "CASE jsonb_typeof(metadata::jsonb -> "
+                "'semantic_recall_dependencies') "
+                "WHEN 'array' THEN metadata::jsonb -> "
+                "'semantic_recall_dependencies' ELSE '[]'::jsonb END"
+                ") AS dependency "
+                "WHERE dependency ->> 'assertion_id' = ?"
+                ") ORDER BY id ASC",
+                (self.agent_id, assertion_id),
+            )
+        else:
+            rows = await self.db.fetchall(
+                "SELECT id, metadata FROM conversation_history "
+                "WHERE agent_id = ? AND EXISTS ("
+                "SELECT 1 FROM json_each(CASE "
+                "WHEN json_type(CASE WHEN json_valid(COALESCE(metadata, '{}')) "
+                "THEN metadata ELSE '{}' END, "
+                "'$.semantic_recall_dependencies') = 'array' THEN json_extract("
+                "CASE WHEN json_valid(COALESCE(metadata, '{}')) THEN metadata "
+                "ELSE '{}' END, '$.semantic_recall_dependencies') "
+                "ELSE '[]' END) AS dependency "
+                "WHERE json_extract(CASE WHEN json_valid(dependency.value) "
+                "THEN dependency.value ELSE '{}' END, '$.assertion_id') = ?"
+                ") ORDER BY id ASC",
+                (self.agent_id, assertion_id),
+            )
+
+        matched: List[Tuple[int, Dict[str, Any]]] = []
+        for row_id, raw_metadata in rows:
+            try:
+                metadata = (
+                    dict(raw_metadata)
+                    if isinstance(raw_metadata, dict)
+                    else json.loads(raw_metadata) if raw_metadata else {}
+                )
+            except (TypeError, json.JSONDecodeError):
+                # The SQL predicate only admits valid JSON in SQLite; keep the
+                # defensive guard for old/manual PostgreSQL rows.
+                continue
+            if isinstance(metadata, dict):
+                matched.append((int(row_id), metadata))
+        return matched
+
+    async def exclude_semantic_recall_dependencies(
+        self, assertion_id: str,
+    ) -> Tuple[int, ...]:
+        """Exclude every conversation artifact linked to ``assertion_id``.
+
+        This is intentionally a reversible context exclusion rather than a
+        string-based deletion.  The privacy wrapper invokes it in the same
+        transaction as canonical fact deletion; callers receive exact message
+        IDs only so dependent episode summaries can be excluded too.
+        """
+        rows = await self._semantic_recall_dependency_rows(assertion_id)
+        message_ids: list[int] = []
+        for message_id, metadata in rows:
+            updates: Dict[str, Any] = {"excluded_from_context": True}
+            if not metadata.get("excluded_reason"):
+                updates["excluded_reason"] = "semantic_assertion_deleted"
+            if await self.update_message_metadata(message_id, updates):
+                message_ids.append(message_id)
+        return tuple(message_ids)
+
+    async def scrub_semantic_recall_dependencies(
+        self, assertion_id: str,
+    ) -> int:
+        """Remove erased assertion IDs from already-excluded artifacts.
+
+        Physical canonical erasure must not leave a durable reference to the
+        erased identifier.  ``excluded_from_context`` is deliberately sticky:
+        scrubbing lineage never re-admits the derivative content.
+        """
+        rows = await self._semantic_recall_dependency_rows(assertion_id)
+        scrubbed = 0
+        for message_id, metadata in rows:
+            dependencies = metadata.get("semantic_recall_dependencies")
+            if not isinstance(dependencies, list):
+                continue
+            retained = [
+                dependency
+                for dependency in dependencies
+                if not (
+                    isinstance(dependency, dict)
+                    and dependency.get("assertion_id") == assertion_id
+                )
+            ]
+            if len(retained) == len(dependencies):
+                continue
+            updated = await self.update_message_metadata(
+                message_id,
+                {
+                    "semantic_recall_dependencies": retained,
+                    "excluded_from_context": True,
+                },
+            )
+            if updated:
+                scrubbed += 1
+        return scrubbed
+
     async def atomic_increment_metadata_counter(
         self,
         message_id: int,

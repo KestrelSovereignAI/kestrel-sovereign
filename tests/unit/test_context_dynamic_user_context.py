@@ -162,6 +162,33 @@ async def test_dynamic_user_context_memories_only_when_rag_empty():
 
 
 @pytest.mark.asyncio
+async def test_context_result_carries_only_committed_semantic_recall_lineage():
+    """Turn persistence must use the committed plan, not mutable builder state."""
+    cm = _make_cm(rag_result="[Assertion] the governed fact")
+    cm.context_builder.last_semantic_recall_metadata = {
+        "status": "used",
+        "assertions": (
+            {
+                "assertion_id": "assertion-opaque-id",
+                "revision_id": "revision-opaque-id",
+                "score": 0.99,
+            },
+        ),
+    }
+
+    result = await cm.build_context(
+        query="which region?", constitution="CONSTITUTION_TEXT"
+    )
+    # Mutating the builder's diagnostic field after planning cannot alter the
+    # turn's identity projection.
+    cm.context_builder.last_semantic_recall_metadata = {"status": "disabled"}
+
+    assert result.semantic_recall_dependencies == (
+        ("assertion-opaque-id", "revision-opaque-id"),
+    )
+
+
+@pytest.mark.asyncio
 async def test_memory_access_recorded_only_after_context_insertion():
     cm = _make_cm(memories_result="placeholder", rag_result="")
     cm.memory_manager.retrieve_memories.return_value = RetrievedMemoryBlock(

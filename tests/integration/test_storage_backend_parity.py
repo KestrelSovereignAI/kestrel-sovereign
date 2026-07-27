@@ -573,6 +573,44 @@ async def test_save_fact_adapter_has_canonical_create_retry_supersede_delete_res
         assert replacement_replay.assertion_id == replacement.assertion_id
         assert await raw_storage.get_nodes_by_type("learned_fact") == []
 
+        # A recalled answer is a derivative only when the persisted turn
+        # carries this exact canonical identity. Same text without the link is
+        # intentionally unrelated and must survive governed forget.
+        await raw_storage.add_conversation(
+            "assistant",
+            "kite-2748-region-7f3b",
+            metadata={
+                "semantic_recall_dependencies": [
+                    {
+                        "assertion_id": replacement.assertion_id,
+                        "revision_id": replacement.revision_id,
+                    }
+                ]
+            },
+        )
+        await raw_storage.add_conversation("assistant", "kite-2748-region-7f3b")
+        recall_rows = await raw_storage.conversation.get_full_history_with_ids(
+            include_excluded=True
+        )
+        linked_row = next(
+            row
+            for row in recall_rows
+            if row["metadata"].get("semantic_recall_dependencies")
+        )
+        episode_id = f"episode:{tenant}:semantic-recall-derivative"
+        await raw_storage.db.execute(
+            "INSERT INTO memory_episodes "
+            "(id, agent_id, title, summary, key_message_ids, excluded_from_context) "
+            "VALUES (?, ?, ?, ?, ?, 0)",
+            (
+                episode_id,
+                tenant,
+                "semantic recall derivative",
+                "must be excluded with its linked turn",
+                json.dumps([str(linked_row["id"])]),
+            ),
+        )
+
         deleted = await storage.forget_explicit_fact(
             subject="user",
             predicate="preferred_deploy_region",
@@ -580,6 +618,26 @@ async def test_save_fact_adapter_has_canonical_create_retry_supersede_delete_res
         )
         assert deleted.deleted is True
         assert await storage.get_assertion(replacement.assertion_id) is None
+        hidden_row = next(
+            row
+            for row in await raw_storage.conversation.get_full_history_with_ids(
+                include_excluded=True
+            )
+            if row["id"] == linked_row["id"]
+        )
+        assert hidden_row["metadata"]["excluded_from_context"] is True
+        assert (
+            await raw_storage.db.fetchone(
+                "SELECT excluded_from_context FROM memory_episodes WHERE id = ?",
+                (episode_id,),
+            )
+        ) == (1,)
+        visible_same_text = await raw_storage.get_conversation_history()
+        assert any(
+            row["content"] == "kite-2748-region-7f3b"
+            and not row.get("metadata", {}).get("semantic_recall_dependencies")
+            for row in visible_same_text
+        )
         deleted_replay = await storage.forget_explicit_fact(
             subject="user",
             predicate="preferred_deploy_region",
@@ -624,6 +682,65 @@ async def test_save_fact_adapter_has_canonical_create_retry_supersede_delete_res
         assert await restarted_raw.get_nodes_by_type("learned_fact") == []
     finally:
         await restarted_raw.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_physical_erasure_scrubs_exact_semantic_recall_lineage(
+    db_backend, tmp_path
+):
+    """Permanent erasure leaves the derivative hidden but ID-free."""
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path, "semantic-recall-physical-erasure"
+    )
+    raw_storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    try:
+        storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
+        fact = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="kite-2748-region-7f3b",
+            confidence=0.9,
+            invocation_id="semantic-recall-physical-erasure-save",
+        )
+        await raw_storage.add_conversation(
+            "assistant",
+            "kite-2748-region-7f3b",
+            metadata={
+                "semantic_recall_dependencies": [
+                    {
+                        "assertion_id": fact.assertion_id,
+                        "revision_id": fact.revision_id,
+                    }
+                ]
+            },
+        )
+        linked_row = next(
+            row
+            for row in await raw_storage.conversation.get_full_history_with_ids(
+                include_excluded=True
+            )
+            if row["metadata"].get("semantic_recall_dependencies")
+        )
+
+        erased = await storage.erase_assertion(
+            fact.assertion_id,
+            operation_id="semantic-recall-physical-erasure-delete",
+        )
+
+        assert fact.assertion_id in erased.erased_assertion_ids
+        assert await raw_storage.get_assertion(fact.assertion_id) is None
+        hidden_row = next(
+            row
+            for row in await raw_storage.conversation.get_full_history_with_ids(
+                include_excluded=True
+            )
+            if row["id"] == linked_row["id"]
+        )
+        assert hidden_row["metadata"]["excluded_from_context"] is True
+        assert hidden_row["metadata"]["semantic_recall_dependencies"] == []
+    finally:
+        await raw_storage.close()
 
 
 @pytest.mark.asyncio

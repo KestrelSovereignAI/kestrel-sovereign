@@ -75,6 +75,9 @@ async def test_streaming_persists_post_tool_content_and_pre_tool_metadata():
     context_result.system_prompt = "system"
     context_result.dynamic_user_context = "ctx"
     context_result.messages = []
+    context_result.semantic_recall_dependencies = (
+        ("assertion-opaque-id", "revision-opaque-id"),
+    )
     mock_agent.context_manager = MagicMock()
     mock_agent.context_manager.build_context = AsyncMock(return_value=context_result)
 
@@ -143,6 +146,13 @@ async def test_streaming_persists_post_tool_content_and_pre_tool_metadata():
 
     persisted = assistant_inserts[0]["content"]
     metadata = assistant_inserts[0].get("metadata") or {}
+    assert metadata["semantic_recall_dependencies"] == [
+        {"assertion_id": "assertion-opaque-id", "revision_id": "revision-opaque-id"}
+    ]
+    user_inserts = [c for c in add_convo_calls if c["role"] == "user"]
+    assert user_inserts[0]["metadata"]["semantic_recall_dependencies"] == [
+        {"assertion_id": "assertion-opaque-id", "revision_id": "revision-opaque-id"}
+    ]
 
     assert persisted == "Found the epic. Wave 2 is in flight."
     assert "I'll check the github epic." not in persisted

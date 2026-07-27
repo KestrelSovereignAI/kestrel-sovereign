@@ -696,6 +696,43 @@ def _metadata(item: RankedAssertion) -> Mapping[str, Any]:
     }
 
 
+def persistence_dependency_metadata(
+    dependencies: Iterable[tuple[str, str]],
+) -> dict[str, list[dict[str, str]]]:
+    """Project rendered semantic-recall lineage into conversation metadata.
+
+    The projection intentionally contains only immutable assertion/revision
+    identities.  It never copies a recalled claim, score, ontology, or source
+    locator into the durable conversation row.  Callers merge this *after*
+    tool metadata so an untrusted tool result cannot replace the relationship.
+    """
+    persisted: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    try:
+        items = iter(dependencies)
+    except TypeError:
+        return {}
+    for item in items:
+        if not isinstance(item, tuple) or len(item) != 2:
+            continue
+        assertion_id, revision_id = item
+        if (
+            not isinstance(assertion_id, str)
+            or not assertion_id
+            or not isinstance(revision_id, str)
+            or not revision_id
+        ):
+            continue
+        dependency = (assertion_id, revision_id)
+        if dependency in seen:
+            continue
+        seen.add(dependency)
+        persisted.append(
+            {"assertion_id": assertion_id, "revision_id": revision_id}
+        )
+    return {"semantic_recall_dependencies": persisted} if persisted else {}
+
+
 __all__ = [
     "AssertionRecallCandidate",
     "HybridRecallResult",
@@ -703,5 +740,6 @@ __all__ = [
     "SemanticRecallConfig",
     "SemanticRecallWeights",
     "coerce_config",
+    "persistence_dependency_metadata",
     "render_hybrid_context",
 ]

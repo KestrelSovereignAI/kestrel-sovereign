@@ -25,6 +25,7 @@ from kestrel_sovereign.agent.invocation import (
     current_invocation_id,
 )
 from kestrel_sovereign.agent.context_manager import CONTEXT_HISTORY_LIMIT
+from kestrel_sovereign.agent.semantic_recall import persistence_dependency_metadata
 from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
 from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
 from kestrel_sovereign.security.input_guardrails import (
@@ -103,6 +104,21 @@ REVISE_SENTINEL_SUFFIX = "\x1e"
 # hash). Keep peak memory for one turn's pasted images bounded.
 _MAX_EAGER_IMAGES = 6
 _MAX_EAGER_IMAGE_BYTES = 12 * 1024 * 1024  # 12 MB (a touch over the 10 MB upload cap)
+
+
+def _with_semantic_recall_metadata(
+    metadata: Optional[Dict[str, Any]],
+    semantic_recall_metadata: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Attach trusted, content-free recall lineage to an assistant artifact.
+
+    Semantic lineage is intentionally applied last: model/tool metadata is
+    response-derived and must not replace the exact assertion relationship
+    emitted by the committed context plan.
+    """
+    if not semantic_recall_metadata:
+        return metadata
+    return {**(metadata or {}), **semantic_recall_metadata}
 
 
 def _looks_like_image(data: bytes) -> bool:
@@ -1243,6 +1259,9 @@ class StreamingMixin:
             reflection_guidance=reflection_guidance,
             tools=feature_tools,
         )
+        semantic_recall_metadata = persistence_dependency_metadata(
+            getattr(context_result, "semantic_recall_dependencies", ())
+        )
 
         # B / #1309 + C / #1311 degraded-mode fail-closed (streaming
         # path). When ``build_context`` returns ``degraded_mode=True``
@@ -1289,7 +1308,7 @@ class StreamingMixin:
         # #1662: persist attachment refs on the user turn so the composer's
         # images/docs survive reload (and a later turn can resolve them). The
         # bytes live in the encrypted file store; only the refs ride here.
-        _user_meta = {"sent_form": True}
+        _user_meta = {"sent_form": True, **semantic_recall_metadata}
         if attachments:
             _user_meta["attachments"] = attachments
         await self.privacy_agent.add_conversation(
@@ -1909,7 +1928,11 @@ class StreamingMixin:
             if buffer_audit:
                 meta = None
             await self._persist_assistant_turn_safely(
-                tool_final_text, metadata=meta, session_id=session_id,
+                tool_final_text,
+                metadata=_with_semantic_recall_metadata(
+                    meta, semantic_recall_metadata
+                ),
+                session_id=session_id,
                 request_id=request_id,
                 response=tool_response,
             )
@@ -2130,7 +2153,9 @@ class StreamingMixin:
                 inline_meta = None
             await self._persist_assistant_turn_safely(
                 final_text,
-                metadata=inline_meta,
+                metadata=_with_semantic_recall_metadata(
+                    inline_meta, semantic_recall_metadata
+                ),
                 session_id=session_id, request_id=request_id,
                 response=tool_response,
             )
@@ -2233,7 +2258,9 @@ class StreamingMixin:
                 _no_tool_meta = None
             await self._persist_assistant_turn_safely(
                 final_text,
-                metadata=_no_tool_meta,
+                metadata=_with_semantic_recall_metadata(
+                    _no_tool_meta, semantic_recall_metadata
+                ),
                 session_id=session_id,
                 request_id=request_id,
                 response=tool_response,

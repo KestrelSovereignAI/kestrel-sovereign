@@ -1,0 +1,95 @@
+"""Exact, content-independent retraction of semantic-recall derivatives."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from kestrel_sovereign.storage.async_conversation_store import (
+    AsyncConversationStore,
+)
+from kestrel_sovereign.storage.async_storage import AsyncStorage
+
+
+@pytest.fixture
+async def storage(tmp_path: Path, monkeypatch):
+    """A real SQLite store without embedding-provider I/O."""
+    monkeypatch.setenv("KESTREL_DISABLE_CONVERSATION_EMBEDDINGS", "true")
+    result = await AsyncStorage.create_sqlite(str(tmp_path / "derivatives.db"))
+    result.agent_id = "semantic-derivative-agent"
+    result.conversation = AsyncConversationStore(
+        result.db, agent_id=result.agent_id
+    )
+    try:
+        yield result
+    finally:
+        await result.close()
+
+
+@pytest.mark.asyncio
+async def test_exclusion_is_exact_and_scrubbing_keeps_artifact_hidden(storage):
+    """Same text is not authority: only exact lineage may be retracted."""
+    linked_metadata = {
+        "semantic_recall_dependencies": [
+            {"assertion_id": "assertion-a", "revision_id": "revision-a"}
+        ]
+    }
+    # The identical text deliberately proves there is no content/string match.
+    await storage.add_conversation(
+        "assistant", "kite-2748-region-7f3b", metadata=linked_metadata
+    )
+    await storage.add_conversation("assistant", "kite-2748-region-7f3b")
+    rows = await storage.conversation.get_full_history_with_ids(
+        include_excluded=True
+    )
+    linked_row = next(
+        row
+        for row in rows
+        if row["metadata"].get("semantic_recall_dependencies")
+    )
+
+    await storage.db.execute(
+        "INSERT INTO memory_episodes "
+        "(id, agent_id, title, summary, key_message_ids, excluded_from_context) "
+        "VALUES (?, ?, ?, ?, ?, 0)",
+        (
+            "episode-linked",
+            storage.agent_id,
+            "linked episode",
+            "derived summary",
+            json.dumps([str(linked_row["id"])]),
+        ),
+    )
+
+    async with storage.transaction():
+        message_ids = await storage._exclude_semantic_recall_dependencies(
+            "assertion-a"
+        )
+        episode_ids = await storage._exclude_memory_episodes_for_key_message_ids(
+            message_ids
+        )
+
+    assert message_ids == (linked_row["id"],)
+    assert episode_ids == ("episode-linked",)
+    # Normal history exclusion and the central memory-retriever filter both
+    # consume this sticky marker; the same-text unlinked row remains visible.
+    assert [row["id"] for row in await storage.get_conversation_history()] == [
+        row["id"] for row in rows if row["id"] != linked_row["id"]
+    ]
+    assert await storage.db.fetchone(
+        "SELECT excluded_from_context FROM memory_episodes WHERE id = ?",
+        ("episode-linked",),
+    ) == (1,)
+
+    assert await storage._scrub_semantic_recall_dependencies("assertion-a") == 1
+    hidden = next(
+        row
+        for row in await storage.conversation.get_full_history_with_ids(
+            include_excluded=True
+        )
+        if row["id"] == linked_row["id"]
+    )
+    assert hidden["metadata"]["excluded_from_context"] is True
+    assert hidden["metadata"]["semantic_recall_dependencies"] == []

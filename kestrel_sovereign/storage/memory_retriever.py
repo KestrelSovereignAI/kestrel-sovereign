@@ -431,6 +431,13 @@ class MemoryRetriever:
             content = msg.get("content", "")
             metadata = msg.get("metadata", {}) or {}
 
+            # A canonical fact deletion marks only its exact derived turn
+            # artifacts as excluded. Candidate sources above intentionally
+            # include history, salient, lexical, and vector-hydrated rows, so
+            # this central gate is the final backstop for every retrieval path.
+            if metadata.get("excluded_from_context"):
+                continue
+
             # Operator/signal transport and explicit commands are control
             # plane records, not autobiographical memories. They can contain
             # vocabulary that spuriously dominates kNN (especially the query

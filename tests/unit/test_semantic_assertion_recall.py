@@ -12,6 +12,7 @@ from kestrel_sovereign.agent.semantic_recall import (
     SemanticRecallConfig,
     SemanticRecallWeights,
     coerce_config,
+    persistence_dependency_metadata,
     render_hybrid_context,
 )
 from kestrel_sovereign.agent.context_builder import ContextBuilder
@@ -364,3 +365,21 @@ def test_claim_character_limit_caps_the_whole_serialized_claim():
     # Subject + predicate alone consume the cap: it is not a per-term cap.
     from kestrel_sovereign.agent.semantic_recall import _claim_text
     assert len(_claim_text(assertion, 30)) == 30
+
+
+def test_persistence_dependency_metadata_is_content_free_and_deduplicated():
+    metadata = persistence_dependency_metadata(
+        [
+            ("assertion-1", "revision-1"),
+            ("assertion-1", "revision-1"),
+            ("assertion-2", "revision-2"),
+        ]
+    )
+
+    assert metadata == {
+        "semantic_recall_dependencies": [
+            {"assertion_id": "assertion-1", "revision_id": "revision-1"},
+            {"assertion_id": "assertion-2", "revision_id": "revision-2"},
+        ]
+    }
+    assert "claim" not in repr(metadata).lower()

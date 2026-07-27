@@ -1885,6 +1885,13 @@ class PrivacyEnforcingStorage:
                     deletion = replay.deletion
                     if deletion is None:  # pragma: no cover - property contract
                         raise AssertionError("deleted replay lacks deletion receipt")
+                    # Older receipts may be replayed after this companion
+                    # exclusion was introduced. Re-apply the exact, idempotent
+                    # closure so a retry cannot leave stale derivatives behind.
+                    async with self.transaction():
+                        await self._exclude_semantic_recall_derivatives(
+                            deletion.deleted.assertion_id
+                        )
                     return FactDeleteReceipt(
                         deleted=True,
                         assertion_id=deletion.deleted.assertion_id,
@@ -1918,15 +1925,19 @@ class PrivacyEnforcingStorage:
                         )
                     target = current[0]
                     provenance_reference = await adapter_source_reference(target)
-                    result = await self._delete_explicit_fact_assertion(
-                        target.assertion_id,
-                        target.revision_id,
-                        operation_id=operation_id,
-                        explicit_fact_selector=(
-                            mapping.subject,
-                            mapping.predicate,
-                        ),
-                    )
+                    async with self.transaction():
+                        result = await self._delete_explicit_fact_assertion(
+                            target.assertion_id,
+                            target.revision_id,
+                            operation_id=operation_id,
+                            explicit_fact_selector=(
+                                mapping.subject,
+                                mapping.predicate,
+                            ),
+                        )
+                        await self._exclude_semantic_recall_derivatives(
+                            result.deleted.assertion_id
+                        )
                     return FactDeleteReceipt(
                         deleted=True,
                         assertion_id=result.deleted.assertion_id,
@@ -3169,10 +3180,33 @@ class PrivacyEnforcingStorage:
             assertion_id, expected_revision_id, operation_id=operation_id,
         )
 
+    async def _exclude_semantic_recall_derivatives(self, assertion_id: str) -> None:
+        """Exclude exact downstream conversation/episode artifacts.
+
+        This helper is intentionally private to the governed assertion
+        lifecycle.  It consumes the assertion identity returned by storage,
+        rather than a free-form content selector, so forgetting cannot touch
+        same-text but unlinked conversation history.
+        """
+        message_ids = await self._storage._exclude_semantic_recall_dependencies(
+            assertion_id
+        )
+        if message_ids:
+            await self._storage._exclude_memory_episodes_for_key_message_ids(
+                message_ids
+            )
+
     async def erase_assertion(self, assertion_id, *, operation_id=None):
         # Physical erasure is never blocked by a privacy mode, a pin, or a
-        # derived reference.  The normalized store computes its full closure.
-        return await self._storage.erase_assertion(assertion_id, operation_id=operation_id)
+        # derived reference.  Exclude downstream artifacts before the ledger
+        # ID is scrubbed; the transaction makes the closure all-or-nothing.
+        async with self.transaction():
+            await self._exclude_semantic_recall_derivatives(assertion_id)
+            result = await self._storage.erase_assertion(
+                assertion_id, operation_id=operation_id
+            )
+            await self._storage._scrub_semantic_recall_dependencies(assertion_id)
+            return result
 
     def _assert_semantic_assertion_read_allowed(self, operation: str) -> None:
         """Keep volatile sessions from observing durable semantic knowledge.

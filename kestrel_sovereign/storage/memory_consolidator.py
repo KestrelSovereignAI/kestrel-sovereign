@@ -413,7 +413,7 @@ class MemoryConsolidator:
         """
         rows = await self._db.fetchall(
             """SELECT key_message_ids FROM memory_episodes
-               WHERE agent_id = ?""",
+               WHERE agent_id = ? AND COALESCE(excluded_from_context, 0) = 0""",
             (self.agent_id,),
         )
         covered: set = set()
@@ -841,6 +841,7 @@ class MemoryConsolidator:
             rows = await self._db.fetchall(
                 """SELECT id, title, summary FROM memory_episodes
                    WHERE agent_id = ? AND embedding_vec IS NULL
+                     AND COALESCE(excluded_from_context, 0) = 0
                    ORDER BY created_at DESC
                    LIMIT ?""",
                 (self.agent_id, limit),
@@ -979,7 +980,10 @@ class MemoryConsolidator:
             from kestrel_sovereign.storage.vector import get_vector_backend
 
             spec = build_episode_spec(dimension=len(query_embedding))
-            filter_kwargs: Dict[str, Any] = {"agent_id": self.agent_id}
+            filter_kwargs: Dict[str, Any] = {
+                "agent_id": self.agent_id,
+                "excluded_from_context": 0,
+            }
             if hasattr(service, "current_profile_id"):
                 try:
                     pid = service.current_profile_id()
@@ -1045,6 +1049,7 @@ class MemoryConsolidator:
                            ({score_clause}) AS token_match_count
                     FROM memory_episodes
                     WHERE agent_id = ?
+                      AND COALESCE(excluded_from_context, 0) = 0
                       AND ({token_clause})
                     {exclude_clause}
                     ORDER BY token_match_count DESC, created_at DESC
@@ -1075,7 +1080,8 @@ class MemoryConsolidator:
                        key_message_ids, emotional_arc, created_at, importance,
                        access_count
                 FROM memory_episodes
-                WHERE agent_id = ? AND id IN ({placeholders})""",
+                WHERE agent_id = ? AND id IN ({placeholders})
+                  AND COALESCE(excluded_from_context, 0) = 0""",
             (self.agent_id, *ids),
         )
         by_id = {r[0]: MemoryEpisode.from_row(r) for r in rows or []}
@@ -1435,7 +1441,7 @@ class MemoryConsolidator:
                       key_message_ids, emotional_arc, created_at, importance,
                       access_count
                FROM memory_episodes
-               WHERE agent_id = ?
+               WHERE agent_id = ? AND COALESCE(excluded_from_context, 0) = 0
                ORDER BY created_at DESC
                LIMIT ? OFFSET ?""",
             (self.agent_id, limit, offset)

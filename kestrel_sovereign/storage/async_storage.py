@@ -9,6 +9,7 @@ environment variable KESTREL_DB_BACKEND.
 """
 import asyncio
 import io
+import json
 import os
 import logging
 import tarfile
@@ -20,7 +21,7 @@ from typing import Dict, Optional, List, Any, Union
 
 from .async_database import AsyncDatabase
 from .async_file_store import AsyncFileStore
-from .async_conversation_store import AsyncConversationStore
+from .async_conversation_store import AsyncConversationStore, _rows_affected
 from .destructive_audit import DestructiveAuditLog, audit_db_path_for
 from .async_graph_store import AsyncGraphStore, GraphNode, Edge, NodeSwapResult
 from .async_assertion_store import (
@@ -534,6 +535,67 @@ class AsyncStorage:
         if not self._initialized:
             await self.initialize()
         return await self.conversation.delete_message(message_id)
+
+    async def _exclude_semantic_recall_dependencies(
+        self, assertion_id: str,
+    ) -> tuple[int, ...]:
+        """Exclude exact assertion-derived conversation artifacts.
+
+        Private on purpose: only the governed assertion lifecycle may call
+        this companion operation, never an arbitrary user-supplied selector.
+        """
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.exclude_semantic_recall_dependencies(
+            assertion_id
+        )
+
+    async def _scrub_semantic_recall_dependencies(self, assertion_id: str) -> int:
+        """Drop a physically erased assertion ID from excluded artifacts."""
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.scrub_semantic_recall_dependencies(
+            assertion_id
+        )
+
+    async def _exclude_memory_episodes_for_key_message_ids(
+        self, message_ids: tuple[int, ...],
+    ) -> tuple[str, ...]:
+        """Exclude episodes whose exact key-message identity intersects IDs.
+
+        Episode summaries are derivatives of conversation artifacts.  They
+        cannot remain prompt-visible once an input artifact is excluded, even
+        if the summary happens not to repeat the fact verbatim.
+        """
+        if not self._initialized:
+            await self.initialize()
+        requested_ids = {str(message_id) for message_id in message_ids}
+        if not requested_ids:
+            return ()
+        rows = await self.db.fetchall(
+            "SELECT id, key_message_ids FROM memory_episodes "
+            "WHERE agent_id = ? AND COALESCE(excluded_from_context, 0) = 0",
+            (self.agent_id,),
+        )
+        excluded: list[str] = []
+        for episode_id, raw_key_ids in rows:
+            try:
+                key_ids = json.loads(raw_key_ids) if isinstance(raw_key_ids, str) else raw_key_ids
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(key_ids, list) or not requested_ids.intersection(
+                str(key_id) for key_id in key_ids
+            ):
+                continue
+            result = await self.db.execute_commit(
+                "UPDATE memory_episodes SET excluded_from_context = 1 "
+                "WHERE id = ? AND agent_id = ? "
+                "AND COALESCE(excluded_from_context, 0) = 0",
+                (episode_id, self.agent_id),
+            )
+            if _rows_affected(result) > 0:
+                excluded.append(str(episode_id))
+        return tuple(excluded)
 
     async def restore_message(self, message_id: int) -> bool:
         """Restore a soft-deleted message — facade delegator (#763)."""
