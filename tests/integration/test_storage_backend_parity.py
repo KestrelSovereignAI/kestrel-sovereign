@@ -435,6 +435,43 @@ async def test_erasure_emits_an_opaque_retryable_change_on_both_backends(
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_shacl_reports_and_governed_write_are_backend_neutral(db_backend, tmp_path):
+    """Pinned reports and their assertion links round-trip on SQLite and PostgreSQL."""
+    tenant, identity = await _incepted_assertion_identity(tmp_path, "shacl-report")
+    storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    try:
+        assertion = _semantic_assertion(tenant, "shacl-report-revision", value="validated")
+        result = await storage.put_validated_assertion(
+            assertion,
+            source_occurrences=(_semantic_source("parity-source"),),
+        )
+
+        assert result.accepted is True
+        assert result.report.conforms is True
+        reports = await storage.semantic_validation_service().reports.list(
+            assertion_id=assertion.assertion_id
+        )
+        assert reports == [result.report]
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM semantic_validation_report_assertions "
+            "WHERE tenant_id = ? AND assertion_id = ?",
+            (tenant, assertion.assertion_id),
+        ) == 1
+        await storage.erase_assertion(assertion.assertion_id)
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM semantic_validation_reports WHERE tenant_id = ?",
+            (tenant,),
+        ) == 0
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM semantic_validation_results WHERE tenant_id = ?",
+            (tenant,),
+        ) == 0
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_concurrent_postgres_initializers_serialize_semantic_migration(db_backend):
     """A shared PostgreSQL fleet must not race assertion-schema DDL at boot."""
     if db_backend.backend_type != "postgres":

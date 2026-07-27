@@ -807,8 +807,12 @@ class AsyncDatabase:
         # provenance state in graph JSON: the migration owns one transactional
         # schema on both SQLite and PostgreSQL and propagates failure so a
         # partial authority is never treated as ready.
-        from .sqla.migrations import migrate_semantic_assertion_store
+        from .sqla.migrations import (
+            migrate_semantic_assertion_store,
+            migrate_semantic_validation_reports,
+        )
         await migrate_semantic_assertion_store(self)
+        await migrate_semantic_validation_reports(self)
 
         # #2649: legacy graph/file/chunk rows predate the authoritative
         # ownership ledgers above. These backfills prove ownership only from

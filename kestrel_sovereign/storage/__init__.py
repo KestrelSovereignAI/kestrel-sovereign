@@ -45,8 +45,16 @@ from .async_assertion_store import (
     SemanticAssertionStore,
     SupersessionResult,
     TenantIsolationError,
+    ValidationQuarantineResult,
 )
 from .async_rag_store import AsyncRAGStore
+from .semantic_validation import (
+    AsyncSemanticValidationReportStore,
+    GovernedAssertionWriteResult,
+    GovernedAssertionSupersessionResult,
+    GovernedSemanticValidationService,
+    SemanticValidationStoreError,
+)
 from .agent_resource_store import (
     AgentResourceStore,
     AgentResourceVersion,
@@ -107,9 +115,13 @@ __all__ = [
     "AsyncGraphStore",
     "AsyncAssertionStore",
     "AsyncRAGStore",
+    "AsyncSemanticValidationReportStore",
     "AgentResourceStore",
     "AgentResourceVersion",
     "SOUL_MARKDOWN_RESOURCE_TYPE",
+    "GovernedAssertionWriteResult",
+    "GovernedAssertionSupersessionResult",
+    "GovernedSemanticValidationService",
     # BM25 search
     "BM25Index",
     "AsyncBM25Index",
@@ -129,6 +141,8 @@ __all__ = [
     "SemanticAssertionStore",
     "SupersessionResult",
     "TenantIsolationError",
+    "ValidationQuarantineResult",
+    "SemanticValidationStoreError",
     # Privacy
     "PrivacyEnforcingStorage",
     "PrivacyViolationError",

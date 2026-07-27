@@ -557,6 +557,28 @@ class SemanticKnowledgeRegistry:
                     f"expected {resource.sha256}, got {actual}"
                 )
 
+    def read_verified_resource(self, resource: SemanticResource) -> bytes:
+        """Return one registry resource only after checking its immutable pin.
+
+        Semantic consumers must not open package files by a caller-provided
+        path.  Keeping this read behind the registry preserves the same exact
+        resource, digest, and offline boundary used for capability selection.
+        """
+        registered = self.resolve(resource.identifier, resource.version)
+        if registered != resource:
+            raise KnowledgeRegistryError(
+                f"semantic resource {resource.key} does not match the registered pin"
+            )
+        self.verify_resources((registered,))
+        if self._resource_reader is None:  # pragma: no cover - guarded above.
+            raise MissingPackageResourceError("semantic registry has no package-resource reader")
+        try:
+            return self._resource_reader(registered.package_resource)
+        except (FileNotFoundError, ModuleNotFoundError) as exc:
+            raise MissingPackageResourceError(
+                f"{registered.key} package resource is missing: {registered.package_resource}"
+            ) from exc
+
     def _validate_metadata(self) -> None:
         namespaces: dict[str, SemanticResource] = {}
         for resource in self._by_key.values():

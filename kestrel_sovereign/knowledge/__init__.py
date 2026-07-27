@@ -91,6 +91,22 @@ if TYPE_CHECKING:
         get_knowledge_registry,
         load_knowledge_registry,
     )
+    from .shacl_validation import (
+        DEFAULT_SHACL_WRITE_POLICY,
+        GovernedShaclValidationService,
+        ShaclCapabilityUnavailable,
+        ShaclSnapshotMismatch,
+        ShaclValidationError,
+        ShaclValidationLimits,
+        ShaclValidationReport,
+        ShaclWritePolicy,
+        ShapeSetReference,
+        ValidationFinding,
+        ValidationSeverity,
+        ValidationSource,
+        ValidationState,
+        ValidationWriteAction,
+    )
 
 __all__ = [
     "ArtifactPin",
@@ -142,6 +158,15 @@ __all__ = [
     "Resource",
     "ResourceKind",
     "ResourceRequirement",
+    "DEFAULT_SHACL_WRITE_POLICY",
+    "GovernedShaclValidationService",
+    "ShaclCapabilityUnavailable",
+    "ShaclSnapshotMismatch",
+    "ShaclValidationError",
+    "ShaclValidationLimits",
+    "ShaclValidationReport",
+    "ShaclWritePolicy",
+    "ShapeSetReference",
     "SemanticCapabilityContract",
     "SemanticKnowledgeRegistry",
     "SemanticResource",
@@ -152,6 +177,11 @@ __all__ = [
     "Sparql12AssertionReadAdapter",
     "StandardsMaturity",
     "TemporalInterval",
+    "ValidationFinding",
+    "ValidationSeverity",
+    "ValidationSource",
+    "ValidationState",
+    "ValidationWriteAction",
     "VersionConstraint",
     "Visibility",
     "XSD_BOOLEAN",
@@ -218,6 +248,25 @@ _RDF_CODEC_EXPORTS = frozenset(
     }
 )
 
+_SHACL_VALIDATION_EXPORTS = frozenset(
+    {
+        "DEFAULT_SHACL_WRITE_POLICY",
+        "GovernedShaclValidationService",
+        "ShaclCapabilityUnavailable",
+        "ShaclSnapshotMismatch",
+        "ShaclValidationError",
+        "ShaclValidationLimits",
+        "ShaclValidationReport",
+        "ShaclWritePolicy",
+        "ShapeSetReference",
+        "ValidationFinding",
+        "ValidationSeverity",
+        "ValidationSource",
+        "ValidationState",
+        "ValidationWriteAction",
+    }
+)
+
 
 def __getattr__(name: str):
     """Lazily expose optional boundaries so registry CLI execution stays clean."""
@@ -229,4 +278,8 @@ def __getattr__(name: str):
         from . import rdf_codec
 
         return getattr(rdf_codec, name)
+    if name in _SHACL_VALIDATION_EXPORTS:
+        from . import shacl_validation
+
+        return getattr(shacl_validation, name)
     raise AttributeError(name)

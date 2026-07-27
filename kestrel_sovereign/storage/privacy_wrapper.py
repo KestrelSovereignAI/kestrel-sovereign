@@ -2443,16 +2443,53 @@ class PrivacyEnforcingStorage:
             )
 
     async def put_assertion(self, assertion, *, source_occurrences=(), operation_id=None):
-        self._assert_semantic_assertion_write_allowed("put_assertion")
-        return await self._storage.put_assertion(
-            assertion, source_occurrences=source_occurrences, operation_id=operation_id,
+        """Govern normal assertion ingestion through the SHACL write boundary.
+
+        Raw ``AsyncStorage.put_assertion`` remains deliberately available only
+        on an explicitly selected raw storage authority for migrations and
+        tightly controlled lifecycle/control-plane work.  Agent-facing
+        privacy storage never forwards an ordinary ingestion call around its
+        required validation report.
+        """
+        return await self.put_validated_assertion(
+            assertion,
+            source_occurrences=source_occurrences,
+            operation_id=operation_id,
         )
 
-    async def supersede_assertion(self, expected_predecessor_revision_id, replacement, *, source_occurrences=(), operation_id=None):
+    async def put_validated_assertion(
+        self,
+        assertion,
+        *,
+        source_occurrences=(),
+        **validation_options,
+    ):
+        """Validate and persist an assertion through the privacy-governed path."""
+        self._assert_semantic_assertion_write_allowed("put_validated_assertion")
+        return await self._storage.put_validated_assertion(
+            assertion,
+            source_occurrences=source_occurrences,
+            **validation_options,
+        )
+
+    def semantic_validation_service(self):
+        """Return a privacy-governed facade for SHACL validation and reports."""
+        return _PrivacyGoverningSemanticValidationService(self)
+
+    async def supersede_assertion(
+        self,
+        expected_predecessor_revision_id,
+        replacement,
+        *,
+        source_occurrences=(),
+        **validation_options,
+    ):
+        """Govern replacements through full tentative-state SHACL validation."""
         self._assert_semantic_assertion_write_allowed("supersede_assertion")
-        return await self._storage.supersede_assertion(
+        return await self._storage.supersede_validated_assertion(
             expected_predecessor_revision_id, replacement,
-            source_occurrences=source_occurrences, operation_id=operation_id,
+            source_occurrences=source_occurrences,
+            **validation_options,
         )
 
     async def retract_assertion(self, assertion_id, expected_revision_id, *, operation_id=None):
@@ -3683,6 +3720,94 @@ class PrivacyEnforcingStorage:
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
+
+
+class _PrivacyGoverningSemanticValidationReports:
+    """Read-only, privacy-governed view of tenant validation reports."""
+
+    __slots__ = ("_wrapper",)
+
+    def __init__(self, wrapper: PrivacyEnforcingStorage) -> None:
+        self._wrapper = wrapper
+
+    def _reports(self):
+        return self._wrapper._storage.semantic_validation_service().reports
+
+    async def get(self, report_id: str):
+        self._wrapper._assert_semantic_assertion_read_allowed("validation report reads")
+        return await self._reports().get(report_id)
+
+    async def list(self, *, assertion_id: str | None = None, limit: int = 100):
+        self._wrapper._assert_semantic_assertion_read_allowed("validation report listing")
+        return await self._reports().list(assertion_id=assertion_id, limit=limit)
+
+    def __getattr__(self, name):
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        raise PrivacyViolationError(
+            f"Validation-report facade refuses to forward {name!r}: reports are "
+            "read only through get/list so callers cannot persist private validation "
+            "data outside the governed assertion path."
+        )
+
+
+class _PrivacyGoverningSemanticValidationService:
+    """Privacy facade that cannot bypass governed SHACL assertion ingestion."""
+
+    __slots__ = ("_wrapper",)
+
+    def __init__(self, wrapper: PrivacyEnforcingStorage) -> None:
+        self._wrapper = wrapper
+
+    @property
+    def reports(self) -> _PrivacyGoverningSemanticValidationReports:
+        return _PrivacyGoverningSemanticValidationReports(self._wrapper)
+
+    async def put_assertion(self, assertion, *, source_occurrences=(), **validation_options):
+        return await self._wrapper.put_validated_assertion(
+            assertion,
+            source_occurrences=source_occurrences,
+            **validation_options,
+        )
+
+    async def supersede_assertion(
+        self,
+        expected_predecessor_revision_id,
+        replacement,
+        *,
+        source_occurrences=(),
+        **validation_options,
+    ):
+        """Validate a replacement through the same privacy-governed boundary."""
+        return await self._wrapper.supersede_assertion(
+            expected_predecessor_revision_id,
+            replacement,
+            source_occurrences=source_occurrences,
+            **validation_options,
+        )
+
+    async def validate_current(self, **validation_options):
+        self._wrapper._assert_semantic_assertion_read_allowed("validation")
+        self._wrapper._assert_semantic_assertion_write_allowed("validate_current")
+        return await self._wrapper._storage.semantic_validation_service().validate_current(
+            **validation_options,
+        )
+
+    async def full_audit_and_repair(self, **validation_options):
+        self._wrapper._assert_semantic_assertion_read_allowed("validation")
+        self._wrapper._assert_semantic_assertion_write_allowed("full_audit_and_repair")
+        return await self._wrapper._storage.semantic_validation_service().full_audit_and_repair(
+            **validation_options,
+        )
+
+    def __getattr__(self, name):
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        raise PrivacyViolationError(
+            f"Semantic-validation facade refuses to forward {name!r}: use the "
+            "governed put_assertion, supersede_assertion, validate_current, "
+            "full_audit_and_repair, or reports surfaces."
+        )
 
 
 

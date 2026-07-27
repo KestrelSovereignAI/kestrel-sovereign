@@ -1030,6 +1030,24 @@ class AsyncStorage:
             assertion_id, expected_revision_id, operation_id=operation_id,
         )
 
+    async def quarantine_assertion_for_validation(
+        self,
+        assertion_id: str,
+        expected_revision_id: str,
+        *,
+        report_id: str,
+        operation_id: Optional[str] = None,
+    ):
+        """Apply a validation failure through canonical lifecycle metadata."""
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().quarantine_for_validation(
+            assertion_id,
+            expected_revision_id,
+            report_id=report_id,
+            operation_id=operation_id,
+        )
+
     async def erase_assertion(self, assertion_id: str, *, operation_id: Optional[str] = None):
         if not self._initialized:
             await self.initialize()
@@ -1044,6 +1062,55 @@ class AsyncStorage:
         if not self._initialized:
             await self.initialize()
         return await self._assertion_store().changes_since(generation, limit=limit)
+
+    def semantic_validation_service(self):
+        """Return the tenant-bound SHACL service for this canonical store."""
+        if not self._initialized:
+            raise RuntimeError(
+                "Governed semantic validation requires initialized, agent-bound AsyncStorage"
+            )
+        from .semantic_validation import GovernedSemanticValidationService
+
+        return GovernedSemanticValidationService(self._assertion_store())
+
+    async def put_validated_assertion(self, assertion, *, source_occurrences=(), **validation_options):
+        """Validate a full tentative post-state before a canonical assertion write.
+
+        Low-level ``put_assertion`` remains the storage primitive used by
+        migrations and controlled lifecycle tests.  New governed callers use
+        this explicit service entry point so a reject/quarantine disposition
+        has no canonical write side effect.
+        """
+        if not self._initialized:
+            await self.initialize()
+        return await self.semantic_validation_service().put_assertion(
+            assertion,
+            source_occurrences=source_occurrences,
+            **validation_options,
+        )
+
+    async def supersede_validated_assertion(
+        self,
+        expected_predecessor_revision_id: str,
+        replacement,
+        *,
+        source_occurrences=(),
+        **validation_options,
+    ):
+        """Validate and atomically commit a canonical assertion replacement.
+
+        The raw ``supersede_assertion`` primitive remains for controlled
+        lifecycle work. Agent-facing callers must use this boundary so a
+        replacement cannot become eligible without its SHACL report.
+        """
+        if not self._initialized:
+            await self.initialize()
+        return await self.semantic_validation_service().supersede_assertion(
+            expected_predecessor_revision_id,
+            replacement,
+            source_occurrences=source_occurrences,
+            **validation_options,
+        )
 
     async def assertion_inference_inputs(self, query=None):
         if not self._initialized:

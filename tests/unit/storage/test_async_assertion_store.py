@@ -354,6 +354,54 @@ async def test_retraction_and_erasure_cascade_to_derived_and_eligibility() -> No
 
 
 @pytest.mark.asyncio
+async def test_validation_quarantine_uses_change_metadata_and_invalidates_derived_consumers() -> None:
+    storage = await _storage()
+    try:
+        root = direct("validation-root")
+        await storage.put_assertion(root, source_occurrences=(source("source-1"),))
+        child = derived("validation-child", root.revision_id)
+        await storage.put_assertion(child)
+        checkpoint = await storage.assertion_checkpoint()
+
+        quarantined = await storage.quarantine_assertion_for_validation(
+            root.assertion_id,
+            root.revision_id,
+            report_id="validation-report-1",
+        )
+
+        assert quarantined.quarantined.status is AssertionStatus.QUARANTINED
+        assert quarantined.invalidated_revision_ids == (root.revision_id, child.revision_id)
+        assert await storage.get_assertion(root.assertion_id) is None
+        assert await storage.get_assertion(child.assertion_id) is None
+        changes = await storage.assertion_changes_since(checkpoint.generation)
+        assert [change.operation for change in changes] == ["validation_quarantined", "retracted"]
+        assert all(change.eligible is False for change in changes)
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_governed_assertion_write_persists_a_pinned_validation_report_before_acceptance() -> None:
+    storage = await _storage()
+    try:
+        assertion = direct("governed-validation-write")
+
+        result = await storage.put_validated_assertion(
+            assertion,
+            source_occurrences=(source("source-1"),),
+        )
+
+        assert result.accepted is True
+        assert result.write is not None
+        assert result.report.conforms is True
+        assert await storage.get_assertion(assertion.assertion_id) == assertion
+        reports = await storage.semantic_validation_service().reports.list(assertion_id=assertion.assertion_id)
+        assert reports == [result.report]
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_derived_supports_must_be_current_active_and_eligible() -> None:
     storage = await _storage()
     try:
@@ -874,7 +922,29 @@ async def test_privacy_wrapper_governs_assertions_and_graph_proxy_denies_new_sur
             # not own a close here.
             pass
         written = await normal.put_assertion(assertion, source_occurrences=(source("privacy-source"),))
-        assert written.assertion == assertion
+        assert written.accepted is True
+        assert written.write is not None
+        assert written.write.assertion == assertion
+        assert await normal.semantic_validation_service().reports.list(
+            assertion_id=assertion.assertion_id
+        ) == [written.report]
+
+        replacement = direct(
+            "privacy-supersession-revision",
+            value="europe-west1",
+            source_id="privacy-supersession-source",
+        )
+        superseded = await normal.supersede_assertion(
+            assertion.revision_id,
+            replacement,
+            source_occurrences=(source("privacy-supersession-source"),),
+        )
+        assert superseded.accepted is True
+        assert superseded.write is not None
+        assert superseded.write.replacement.assertion_id == replacement.assertion_id
+        assert await normal.semantic_validation_service().reports.list(
+            assertion_id=replacement.assertion_id
+        ) == [superseded.report]
     finally:
         await storage.close()
 
