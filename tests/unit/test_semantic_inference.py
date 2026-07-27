@@ -240,10 +240,11 @@ def test_semantic_maintenance_limits_are_strictly_operator_configured() -> None:
         maintenance_limits_from_config({"unbounded": 1})
 
 
-def test_semantic_maintenance_prior_snapshot_exception_is_explicit() -> None:
-    assert maintenance_allows_prior_verified_snapshot(
-        {"allow_prior_verified_snapshot": True}
-    )
+def test_semantic_maintenance_prior_snapshot_exception_is_disabled() -> None:
+    with pytest.raises(SemanticMaintenanceError, match="durable governed corpus snapshot"):
+        maintenance_allows_prior_verified_snapshot(
+            {"allow_prior_verified_snapshot": True}
+        )
     assert not maintenance_allows_prior_verified_snapshot({})
     with pytest.raises(ValueError, match="must be a boolean"):
         maintenance_limits_from_config({"allow_prior_verified_snapshot": 1})
@@ -346,7 +347,6 @@ def test_validation_only_semantic_maintenance_is_an_operator_state(tmp_path) -> 
     agent_dir.mkdir()
     (agent_dir / "kestrel.toml").write_text(
         "[semantic_maintenance]\nmax_assertions = 7\n"
-        "allow_prior_verified_snapshot = true\n"
     )
 
     agent = KestrelAgent(
@@ -357,7 +357,7 @@ def test_validation_only_semantic_maintenance_is_an_operator_state(tmp_path) -> 
     assert agent.semantic_inference_profile is None
     assert agent.semantic_maintenance_configured is True
     assert agent.semantic_maintenance_limits.max_assertions == 7
-    assert agent.semantic_maintenance_allow_prior_verified_snapshot is True
+    assert agent.semantic_maintenance_allow_prior_verified_snapshot is False
 
 
 def test_managed_maintenance_limits_override_stale_agent_toml(tmp_path) -> None:
@@ -907,7 +907,8 @@ async def test_semantic_maintenance_replays_its_generated_derivation_before_chec
         limits=SemanticMaintenanceLimits(max_assertions=3, max_derivations=3),
     )
     first = await service.run()
-    assert first.status is SemanticMaintenanceStatus.COMPLETE
+    assert first.status is SemanticMaintenanceStatus.PARTIAL
+    assert first.reason == "repair_change_replay"
     assert first.assertions_inferred == 1
 
     state_row = await assertion_store._database.fetchone(  # noqa: SLF001 - durable cursor contract
@@ -931,10 +932,10 @@ async def test_semantic_maintenance_replays_its_generated_derivation_before_chec
 
 
 @pytest.mark.asyncio
-async def test_training_readiness_allows_only_an_explicit_prior_verified_snapshot(
+async def test_training_readiness_rejects_historical_maintenance_without_snapshot(
     assertion_store,
 ) -> None:
-    """A stale semantic cursor is safe only under the operator exception."""
+    """A historical run is not a durable governed corpus snapshot."""
     await _put(
         assertion_store,
         "verified-first",
@@ -957,12 +958,383 @@ async def test_training_readiness_allows_only_an_explicit_prior_verified_snapsho
     assert not current.ready
     assert current.reason == "semantic_maintenance_checkpoint_behind"
 
-    prior = await service.training_readiness(
-        allow_prior_verified_snapshot=True
+    with pytest.raises(SemanticMaintenanceError, match="durable governed corpus snapshot"):
+        await service.training_readiness(allow_prior_verified_snapshot=True)
+
+
+@pytest.mark.asyncio
+async def test_semantic_repair_pages_with_a_durable_cursor(assertion_store) -> None:
+    """Repeated repair calls resume after completed pages instead of rescanning."""
+    predicate = IRI("https://example.test/repair-predicate")
+    for revision in ("repair-a", "repair-b", "repair-c"):
+        await _put(
+            assertion_store,
+            revision,
+            IRI(f"https://example.test/{revision}"),
+            predicate,
+            Literal(revision, XSD_STRING),
+        )
+
+    service = SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=None,
+        limits=SemanticMaintenanceLimits(max_assertions=1),
     )
-    assert prior.ready
-    assert prior.using_prior_verified_snapshot
-    assert prior.reason == "prior_verified_snapshot_policy_allowed"
+
+    first = await service.rebuild()
+    assert first.status is SemanticMaintenanceStatus.PARTIAL
+    assert first.backlog_assertions == 2
+    second = await service.rebuild()
+    assert second.status is SemanticMaintenanceStatus.PARTIAL
+    assert second.backlog_assertions == 1
+    third = await service.rebuild()
+    assert third.status is SemanticMaintenanceStatus.COMPLETE
+    assert third.backlog_assertions == 0
+
+    state = await assertion_store._database.fetchone(  # noqa: SLF001 - cursor contract
+        "SELECT repair_cursor_revision_id, repair_active "
+        "FROM semantic_maintenance_state WHERE tenant_id = ?",
+        (assertion_store.tenant_id,),
+    )
+    assert state == (None, 0)
+
+
+@pytest.mark.asyncio
+async def test_explicit_repair_uses_bounded_context_on_each_durable_page(
+    assertion_store, monkeypatch
+) -> None:
+    """Explicit repair never hides an unbounded snapshot behind one page."""
+    predicate = IRI("https://example.test/repair-complete-context")
+    for revision in ("context-a", "context-b", "context-c"):
+        await _put(
+            assertion_store,
+            revision,
+            IRI(f"https://example.test/{revision}"),
+            predicate,
+            Literal(revision, XSD_STRING),
+        )
+    observed: list[bool] = []
+    original = GovernedSemanticValidationService.validate_current
+
+    async def capture_context(self, *args, **kwargs):
+        observed.append(kwargs["bounded_focus_only"])
+        return await original(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        GovernedSemanticValidationService,
+        "validate_current",
+        capture_context,
+    )
+    service = SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=None,
+        limits=SemanticMaintenanceLimits(max_assertions=1),
+    )
+
+    assert (await service.rebuild()).status is SemanticMaintenanceStatus.PARTIAL
+    assert (await service.rebuild()).status is SemanticMaintenanceStatus.PARTIAL
+    assert (await service.rebuild()).status is SemanticMaintenanceStatus.COMPLETE
+    assert observed == [True, True, True]
+
+
+@pytest.mark.asyncio
+async def test_interrupted_explicit_repair_keeps_its_durable_mode_on_sleep_resume(
+    assertion_store, monkeypatch
+) -> None:
+    """A normal sleep continues the explicit repair instead of resetting it."""
+    predicate = IRI("https://example.test/repair-resume-mode")
+    for revision in ("resume-a", "resume-b", "resume-c"):
+        await _put(
+            assertion_store,
+            revision,
+            IRI(f"https://example.test/{revision}"),
+            predicate,
+            Literal(revision, XSD_STRING),
+        )
+    observed: list[bool] = []
+    original = GovernedSemanticValidationService.validate_current
+
+    async def capture_context(self, *args, **kwargs):
+        observed.append(kwargs["bounded_focus_only"])
+        return await original(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        GovernedSemanticValidationService,
+        "validate_current",
+        capture_context,
+    )
+    service = SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=None,
+        limits=SemanticMaintenanceLimits(max_assertions=1),
+    )
+
+    assert (await service.rebuild()).status is SemanticMaintenanceStatus.PARTIAL
+    state = await assertion_store._database.fetchone(  # noqa: SLF001 - durable repair contract
+        "SELECT repair_mode, repair_active FROM semantic_maintenance_state "
+        "WHERE tenant_id = ?",
+        (assertion_store.tenant_id,),
+    )
+    assert state == ("full_rebuild", 1)
+
+    assert (await service.run()).status is SemanticMaintenanceStatus.PARTIAL
+    assert (await service.run()).status is SemanticMaintenanceStatus.COMPLETE
+    assert observed == [True, True, True]
+
+
+@pytest.mark.asyncio
+async def test_explicit_repair_never_exports_the_tenant_for_one_page(
+    assertion_store, monkeypatch
+) -> None:
+    """Repair uses the same bounded validation context as incremental sleep."""
+    for revision in ("repair-bounded-a", "repair-bounded-b"):
+        await _put(
+            assertion_store,
+            revision,
+            IRI(f"https://example.test/{revision}"),
+            IRI("https://example.test/repair-bounded-predicate"),
+            Literal(revision, XSD_STRING),
+        )
+
+    async def must_not_export(*_args, **_kwargs):
+        raise AssertionError("explicit repair exported the tenant graph")
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.storage.async_assertion_store.AsyncAssertionStore.export_snapshot",
+        must_not_export,
+    )
+    result = await SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=None,
+        limits=SemanticMaintenanceLimits(max_assertions=1),
+    ).rebuild()
+
+    assert result.status is SemanticMaintenanceStatus.PARTIAL
+    assert result.assertions_validated == 1
+
+
+@pytest.mark.asyncio
+async def test_semantic_repair_replays_a_write_behind_its_lexical_cursor(
+    assertion_store,
+) -> None:
+    """A concurrent write cannot be skipped merely because its revision sorts earlier."""
+    predicate = IRI("https://example.test/repair-race-predicate")
+    for revision in ("repair-a", "repair-b", "repair-c"):
+        await _put(
+            assertion_store,
+            revision,
+            IRI(f"https://example.test/{revision}"),
+            predicate,
+            Literal(revision, XSD_STRING),
+        )
+    service = SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=None,
+        limits=SemanticMaintenanceLimits(max_assertions=1),
+    )
+
+    first = await service.rebuild()
+    assert first.status is SemanticMaintenanceStatus.PARTIAL
+    await _put(
+        assertion_store,
+        "repair-0",
+        IRI("https://example.test/repair-race-late"),
+        predicate,
+        Literal("late", XSD_STRING),
+    )
+
+    assert (await service.rebuild()).status is SemanticMaintenanceStatus.PARTIAL
+    replay = await service.rebuild()
+    assert replay.status is SemanticMaintenanceStatus.PARTIAL
+    assert replay.reason == "repair_change_replay"
+
+    consumed = await service.run()
+    assert consumed.status is SemanticMaintenanceStatus.COMPLETE
+    assert consumed.changes_consumed == 1
+    assert consumed.assertions_validated == 1
+
+
+@pytest.mark.asyncio
+async def test_bounded_maintenance_uses_targeted_inference_not_a_global_source_scan(
+    assertion_store,
+) -> None:
+    """A one-assertion maintenance page advances even when the KB has two sources."""
+    class_a = IRI("https://example.test/TargetedClassA")
+    class_b = IRI("https://example.test/TargetedClassB")
+    subject = IRI("https://example.test/targeted-subject")
+    await _put(assertion_store, "targeted-a-sub-b", class_a, RDFS_SUBCLASS, class_b)
+    await _put(assertion_store, "targeted-subject-a", subject, RDF_TYPE, class_a)
+    service = SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=_profile(),
+        limits=SemanticMaintenanceLimits(max_assertions=1, max_derivations=3),
+    )
+
+    first = await service.run()
+    assert first.status is SemanticMaintenanceStatus.PARTIAL
+    assert first.reason != "source_assertions"
+    second = await service.run()
+    assert second.reason != "source_assertions"
+    # The generated assertion is deliberately replayed before the durable
+    # maintenance cursor reaches the final no-op state.
+    for _ in range(3):
+        result = await service.run()
+        if result.status is SemanticMaintenanceStatus.NO_OP:
+            break
+        assert result.reason != "source_assertions"
+    else:
+        pytest.fail("targeted inference did not drain its bounded maintenance work")
+
+
+@pytest.mark.asyncio
+async def test_targeted_inference_defers_when_indexed_context_overflows(
+    assertion_store,
+) -> None:
+    """A filled context page must not be mistaken for a complete closure."""
+    subject = IRI("https://example.test/context-overflow-subject")
+    predicate = IRI("https://example.test/context-overflow-predicate")
+    target = await _put(
+        assertion_store,
+        "context-overflow-a-target",
+        subject,
+        predicate,
+        IRI("https://example.test/context-overflow-object-a"),
+    )
+    await _put(
+        assertion_store,
+        "context-overflow-z-peer",
+        subject,
+        predicate,
+        IRI("https://example.test/context-overflow-object-z"),
+    )
+
+    result = await BoundedInferenceService(
+        assertion_store,
+        _profile(),
+        limits=InferenceLimits(max_source_assertions=2),
+    ).materialize_targets(
+        (target.assertion_id,),
+        max_context_assertions=1,
+    )
+
+    assert result.status is ClosureStatus.INCOMPLETE
+    assert result.incomplete_reason == "context_assertions"
+
+
+@pytest.mark.asyncio
+async def test_incremental_maintenance_never_exports_the_tenant_for_one_target(
+    assertion_store, monkeypatch
+) -> None:
+    """``max_assertions`` bounds primary validation reads, not just focus IDs."""
+    for revision in ("bounded-a", "bounded-b"):
+        await _put(
+            assertion_store,
+            revision,
+            IRI(f"https://example.test/{revision}"),
+            IRI("https://example.test/bounded-predicate"),
+            Literal(revision, XSD_STRING),
+        )
+
+    async def must_not_export(*_args, **_kwargs):
+        raise AssertionError("incremental validation exported the tenant graph")
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.storage.async_assertion_store.AsyncAssertionStore.export_snapshot",
+        must_not_export,
+    )
+    result = await SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=None,
+        limits=SemanticMaintenanceLimits(max_assertions=1),
+    ).run()
+
+    assert result.status is SemanticMaintenanceStatus.PARTIAL
+    assert result.assertions_validated == 1
+    assert result.backlog_assertions == 1
+
+
+@pytest.mark.asyncio
+async def test_incremental_contradiction_compares_changed_assertion_to_older_peer(
+    assertion_store,
+) -> None:
+    """Pair deduplication must not depend on assertion-ID ordering."""
+    subject = IRI("https://example.test/subject")
+    property_p = IRI("https://example.test/p")
+    property_q = IRI("https://example.test/q")
+    object_y = IRI("https://example.test/y")
+    object_z = IRI("https://example.test/z")
+    await _put(assertion_store, "p-sub-q", property_p, RDFS_SUBPROPERTY, property_q)
+    await _put(assertion_store, "source-p", subject, property_p, object_y)
+    await _put(assertion_store, "existing-q", subject, property_q, object_z)
+
+    service = SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=_profile(),
+        limits=SemanticMaintenanceLimits(max_assertions=3, max_derivations=3),
+    )
+    first = await service.run()
+    assert first.status is SemanticMaintenanceStatus.PARTIAL
+    assert first.reason == "repair_change_replay"
+
+    result = await service.run()
+    assert result.status is SemanticMaintenanceStatus.COMPLETE
+    assert result.contradictions == 1
+    report = await assertion_store._database.fetchone(  # noqa: SLF001 - durable evidence
+        "SELECT report_kind, status FROM semantic_maintenance_reports "
+        "WHERE tenant_id = ?",
+        (assertion_store.tenant_id,),
+    )
+    assert report == ("contradiction_candidate", "review_required")
+
+
+@pytest.mark.asyncio
+async def test_contradiction_context_excludes_the_changed_assertion_at_query_time(
+    assertion_store,
+) -> None:
+    """A one-row contextual page must contain a competitor, not the target itself."""
+    subject = IRI("https://example.test/context-subject")
+    predicate = IRI("https://example.test/context-predicate")
+    await _put(assertion_store, "context-existing", subject, predicate, Literal("old", XSD_STRING))
+    service = SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=None,
+        limits=SemanticMaintenanceLimits(max_assertions=1, max_context_assertions=1),
+    )
+    assert (await service.run()).status is SemanticMaintenanceStatus.COMPLETE
+
+    await _put(assertion_store, "context-changed", subject, predicate, Literal("new", XSD_STRING))
+    result = await service.run()
+
+    assert result.status is SemanticMaintenanceStatus.COMPLETE
+    assert result.contradictions == 1
+
+
+@pytest.mark.asyncio
+async def test_contradiction_context_pages_remaining_competitors(assertion_store) -> None:
+    """A contested predicate resumes after the contextual competitor cursor."""
+    subject = IRI("https://example.test/context-page-subject")
+    predicate = IRI("https://example.test/context-page-predicate")
+    await _put(assertion_store, "context-peer-a", subject, predicate, Literal("a", XSD_STRING))
+    await _put(assertion_store, "context-peer-b", subject, predicate, Literal("b", XSD_STRING))
+    service = SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=None,
+        limits=SemanticMaintenanceLimits(max_assertions=2, max_context_assertions=1),
+    )
+    assert (await service.run()).status is SemanticMaintenanceStatus.COMPLETE
+
+    await _put(assertion_store, "context-page-changed", subject, predicate, Literal("c", XSD_STRING))
+    first = await service.run()
+    assert first.status is SemanticMaintenanceStatus.PARTIAL
+    assert first.reason == "contradiction_context_budget"
+    second = await service.run()
+    assert second.status is SemanticMaintenanceStatus.COMPLETE
+    reports = await assertion_store._database.fetchval(  # noqa: SLF001 - durable backlog contract
+        "SELECT COUNT(*) FROM semantic_maintenance_reports WHERE tenant_id = ? "
+        "AND report_kind = 'contradiction_candidate'",
+        (assertion_store.tenant_id,),
+    )
+    assert reports == 3
 
 
 @pytest.mark.asyncio
@@ -1013,6 +1385,37 @@ async def test_incomplete_validation_is_not_reused_when_maintenance_budget_chang
     assert second.reason == "validation_incomplete"
     assert len(calls) == 2
     assert calls[0] != calls[1]
+
+
+@pytest.mark.asyncio
+async def test_context_budget_change_invalidates_completed_maintenance_checkpoint(
+    assertion_store,
+) -> None:
+    """Context bounds are part of the maintenance capability identity."""
+    await _put(
+        assertion_store,
+        "context-budget-capability",
+        IRI("https://example.test/context-budget-subject"),
+        IRI("https://example.test/context-budget-predicate"),
+        Literal("value", XSD_STRING),
+    )
+    initial = SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=None,
+        limits=SemanticMaintenanceLimits(max_context_assertions=1),
+    )
+    assert (await initial.run()).status is SemanticMaintenanceStatus.COMPLETE
+
+    expanded = SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=None,
+        limits=SemanticMaintenanceLimits(max_context_assertions=2),
+    )
+    result = await expanded.run()
+
+    assert result.status is SemanticMaintenanceStatus.COMPLETE
+    assert result.assertions_validated == 1
+    assert result.status is not SemanticMaintenanceStatus.NO_OP
 
 
 @pytest.mark.asyncio
@@ -1681,3 +2084,59 @@ async def test_ontology_version_change_invalidates_prior_materialization(asserti
     newer_profile = InferenceProfile(newer_ontology, "1.0.0")
     assert (await BoundedInferenceService(assertion_store, newer_profile).materialize_incremental()).complete
     assert await assertion_store.query(AssertionQuery(subject=subject, predicate=RDF_TYPE, object=class_b)) == []
+
+
+@pytest.mark.asyncio
+async def test_profile_change_reconciles_obsolete_proofs_before_maintenance_completes(
+    assertion_store,
+) -> None:
+    """A new profile cannot leave facts proven only by the old profile active."""
+    class_a = IRI("https://example.test/ProfileClassA")
+    class_b = IRI("https://example.test/ProfileClassB")
+    subject = IRI("https://example.test/profile-subject")
+    owl_equivalent_class = IRI("http://www.w3.org/2002/07/owl#equivalentClass")
+    await _put(assertion_store, "profile-a-equivalent-b", class_a, owl_equivalent_class, class_b)
+    await _put(assertion_store, "profile-subject-a", subject, RDF_TYPE, class_a)
+    assert (
+        await BoundedInferenceService(
+            assertion_store, _profile(owl=True)
+        ).materialize_incremental()
+    ).complete
+    assert await assertion_store.query(
+        AssertionQuery(subject=subject, predicate=RDF_TYPE, object=class_b)
+    )
+
+    maintenance = SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=_profile(),
+        limits=SemanticMaintenanceLimits(max_assertions=10, max_derivations=1),
+    )
+
+    first = await maintenance.run()
+    assert first.status is SemanticMaintenanceStatus.PARTIAL, first.reason
+    assert first.reason in {"derivation_budget", "repair_change_replay"}
+    for _ in range(4):
+        if await assertion_store.query(
+            AssertionQuery(subject=subject, predicate=RDF_TYPE, object=class_b)
+        ) == []:
+            break
+        follow_up = await maintenance.run()
+        assert follow_up.status is SemanticMaintenanceStatus.PARTIAL
+    else:
+        pytest.fail("obsolete profile conclusion remained active after reconciliation pages")
+    for _ in range(10):
+        final = await maintenance.run()
+        if final.status in (
+            SemanticMaintenanceStatus.COMPLETE,
+            SemanticMaintenanceStatus.NO_OP,
+        ):
+            break
+    else:
+        pytest.fail("profile-change maintenance did not drain its replay")
+    proofs = await assertion_store._database.fetchval(  # noqa: SLF001 - proof retirement contract
+        "SELECT COUNT(*) FROM semantic_inference_derivations "
+        "WHERE tenant_id = ? AND active = 1",
+        (assertion_store.tenant_id,),
+    )
+    assert proofs == 0
+    assert (await maintenance.training_readiness()).ready

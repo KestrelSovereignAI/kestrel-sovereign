@@ -870,14 +870,6 @@ class SchedulerFeature(Feature):
                 maintenance_limits=getattr(
                     self.agent, "semantic_maintenance_limits", None
                 ),
-                allow_prior_verified_snapshot=(
-                    getattr(
-                        self.agent,
-                        "semantic_maintenance_allow_prior_verified_snapshot",
-                        False,
-                    )
-                    is True
-                ),
             )
         except Exception as error:  # noqa: BLE001 - fail closed at the data boundary
             logger.warning(
@@ -892,11 +884,6 @@ class SchedulerFeature(Feature):
                 ),
             )
         if state.ready:
-            if state.using_prior_verified_snapshot:
-                logger.warning(
-                    "Scheduler: training_cycle using operator-permitted prior "
-                    "verified semantic snapshot"
-                )
             return None
         return ScheduledTaskOutcome(
             status="blocked",

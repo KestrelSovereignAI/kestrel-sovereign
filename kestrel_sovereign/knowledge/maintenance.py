@@ -33,6 +33,7 @@ from .inference import (
     ClosureStatus,
     InferenceLimits,
     InferenceProfile,
+    InferenceReconciliationResult,
 )
 from .shacl_validation import (
     ShapeSetReference,
@@ -66,10 +67,9 @@ class SemanticMaintenanceTrainingReadiness:
     """Content-free durable prerequisite for a training-corpus consumer.
 
     ``ready`` is true only when the active semantic capability has a complete
-    maintenance checkpoint at the current assertion cursor.  An operator may
-    explicitly permit a *previously* complete checkpoint for the same
-    capability; that exception is visible in ``using_prior_verified_snapshot``
-    and never treats a partial or failed attempt itself as verified.
+    maintenance checkpoint at the current assertion cursor. Historical
+    maintenance evidence is not an immutable training-corpus snapshot and
+    therefore never makes stale data ready.
     """
 
     ready: bool
@@ -86,6 +86,7 @@ class SemanticMaintenanceLimits:
     max_derivations: int = 1_000
     max_shapes: int = 1
     max_reports: int = 32
+    max_context_assertions: int = 100
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -93,6 +94,7 @@ class SemanticMaintenanceLimits:
             "max_derivations",
             "max_shapes",
             "max_reports",
+            "max_context_assertions",
         ):
             value = getattr(self, field_name)
             if type(value) is not int or not 1 <= value <= 1_000:
@@ -126,6 +128,7 @@ def maintenance_limits_from_config(config: Mapping[str, object]) -> SemanticMain
         "max_derivations",
         "max_shapes",
         "max_reports",
+        "max_context_assertions",
     }
     unexpected = set(config).difference(allowed)
     if unexpected:
@@ -139,6 +142,11 @@ def maintenance_limits_from_config(config: Mapping[str, object]) -> SemanticMain
     ):
         raise SemanticMaintenanceError(
             "semantic maintenance allow_prior_verified_snapshot must be a boolean"
+        )
+    if config.get("allow_prior_verified_snapshot") is True:
+        raise SemanticMaintenanceError(
+            "prior verified snapshot consumption is unavailable until a durable "
+            "governed corpus snapshot exists"
         )
     values: dict[str, int | float] = {}
     for name in allowed - {
@@ -162,15 +170,14 @@ def maintenance_limits_from_config(config: Mapping[str, object]) -> SemanticMain
 
 
 def maintenance_allows_prior_verified_snapshot(config: Mapping[str, object]) -> bool:
-    """Read the explicit operator exception for stale verified training input.
+    """Reject the retired stale-corpus escape hatch.
 
-    Keep this separate from :class:`SemanticMaintenanceLimits`: it is a
-    consumer policy, not a work budget.  Parsing through the limit parser
-    preserves one strict schema for the shared configuration table.
+    This compatibility helper remains importable while #2751 owns the actual
+    immutable snapshot boundary. It never authorizes stale corpus use.
     """
 
     maintenance_limits_from_config(config)
-    return bool(config.get("allow_prior_verified_snapshot", False))
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,6 +247,16 @@ class _MaintenanceState:
     checkpoint_generation: int
     checkpoint_event_id: str | None
     status: SemanticMaintenanceStatus
+    repair_cursor_revision_id: str | None
+    repair_active: bool
+    repair_mode: str | None
+    repair_scan_complete: bool
+    repair_checkpoint_generation: int | None
+    repair_checkpoint_event_id: str | None
+    repair_reconcile_cursor_derivation_id: str | None
+    audit_assertion_id: str | None
+    audit_assertion_revision_id: str | None
+    audit_competitor_cursor_revision_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,6 +277,10 @@ class _AuditOutcome:
     counts: dict[str, int]
     report_budget_exhausted: bool = False
     remaining_assertions: int = 0
+    competitor_backlog: bool = False
+    audit_assertion_id: str | None = None
+    audit_assertion_revision_id: str | None = None
+    audit_competitor_cursor_revision_id: str | None = None
 
 
 class SemanticMaintenanceService:
@@ -336,6 +357,13 @@ class SemanticMaintenanceService:
 
         run_id = ""
         state: _MaintenanceState | None = None
+        state_matches = False
+        force_current_scan = False
+        repair_checkpoint: AssertionCheckpoint | None = None
+        repair_page_cursor: str | None = None
+        repair_mode: str | None = None
+        repair_scan_complete = False
+        repair_reconcile_cursor: str | None = None
         try:
             # State is only trustworthy once this worker holds the tenant's
             # cross-process lease.  A former holder must never pick up an old
@@ -398,16 +426,71 @@ class SemanticMaintenanceService:
                 )
                 return result
 
-            force_current_scan = full_rebuild or not state_matches
+            # A capability change and an explicit repair both scan the active
+            # graph in deterministic pages.  The repair mode, scan completion,
+            # and obsolete-proof cursor are all durable: a normal sleep must
+            # resume an interrupted explicit repair under its original policy,
+            # not reinterpret it as an incremental no-context invocation.
+            force_current_scan = (
+                full_rebuild
+                or not state_matches
+                or (state_matches and state.repair_active)
+            )
             source_changes: tuple[AssertionChange, ...] = ()
             fallback_full_audit = False
             if force_current_scan:
-                _, snapshot = await self._assertions.export_snapshot()
-                target_assertions = snapshot[: self.limits.max_assertions]
-                backlog = max(0, len(snapshot) - len(target_assertions))
-                changes_consumed = len(target_assertions)
+                if state_matches and state.repair_active:
+                    repair_cursor = state.repair_cursor_revision_id
+                    repair_mode = state.repair_mode or (
+                        "full_rebuild" if full_rebuild else "profile_change"
+                    )
+                    repair_scan_complete = state.repair_scan_complete
+                    repair_reconcile_cursor = (
+                        state.repair_reconcile_cursor_derivation_id
+                    )
+                    # v3 repair rows did not retain the scan origin.  Their
+                    # durable maintenance checkpoint is the only safe lower
+                    # bound: replaying too much is idempotent, skipping an
+                    # event observed by a former repair worker is not.
+                    repair_checkpoint = await self._event_checkpoint(
+                        AssertionCheckpoint(
+                            self._assertions.tenant_id,
+                            (
+                                state.repair_checkpoint_generation
+                                if state.repair_checkpoint_generation is not None
+                                else state.checkpoint_generation
+                            ),
+                            (
+                                state.repair_checkpoint_event_id
+                                if state.repair_checkpoint_generation is not None
+                                else state.checkpoint_event_id
+                            ),
+                        )
+                    )
+                else:
+                    repair_cursor = None
+                    repair_checkpoint = await self._event_checkpoint(initial)
+                    repair_mode = "full_rebuild" if full_rebuild else "profile_change"
+                repair_page_cursor = repair_cursor
+                if repair_scan_complete:
+                    target_assertions = ()
+                    backlog = 0
+                    changes_consumed = 0
+                    next_repair_cursor = None
+                else:
+                    target_assertions, backlog = await self._current_scan_page(
+                        repair_cursor
+                    )
+                    changes_consumed = len(target_assertions)
+                    next_repair_cursor = (
+                        target_assertions[-1].revision_id if backlog else None
+                    )
                 ineligible_changes = 0
                 processed_checkpoint: AssertionCheckpoint | None = None
+                # Keep the selected page retryable on any later partial path.
+                # Completion is decided only after the proof-reconciliation
+                # phase has also drained.
+                repair_active = True
             else:
                 batch = await self._changes_after(
                     AssertionCheckpoint(
@@ -432,6 +515,28 @@ class SemanticMaintenanceService:
                     if source_changes
                     else None
                 )
+                next_repair_cursor = None
+                repair_active = False
+                if fallback_full_audit:
+                    # Opaque erasure or a non-local deleted revision cannot
+                    # be acknowledged from a focused target list. Restart a
+                    # bounded active scan instead of treating this sleep unit
+                    # as permission for ``export_snapshot()``.
+                    target_assertions, scan_backlog = await self._current_scan_page(
+                        None
+                    )
+                    force_current_scan = True
+                    repair_checkpoint = await self._event_checkpoint(initial)
+                    repair_page_cursor = None
+                    repair_mode = "current_scan"
+                    repair_scan_complete = False
+                    repair_reconcile_cursor = None
+                    backlog = max(backlog, scan_backlog)
+                    next_repair_cursor = (
+                        target_assertions[-1].revision_id if scan_backlog else None
+                    )
+                    repair_active = True
+                    fallback_full_audit = False
             target_key = tuple(
                 f"{item.assertion_id}:{item.revision_id}" for item in target_assertions
             )
@@ -440,7 +545,7 @@ class SemanticMaintenanceService:
                     "profile": profile_key,
                     "source_generation": initial.generation,
                     "targets": target_key,
-                    "full_rebuild": full_rebuild,
+                    "repair_mode": repair_mode,
                 }
             )
             await self._record_running(run_id, profile_key, initial.generation)
@@ -458,7 +563,6 @@ class SemanticMaintenanceService:
                         run_id,
                         target_assertions,
                         started,
-                        full_audit=(full_rebuild and not backlog) or fallback_full_audit,
                     )
                 reports_created += int(created)
                 assertions_validated = len(target_assertions)
@@ -481,6 +585,39 @@ class SemanticMaintenanceService:
                         capability_versions=capability_versions,
                     )
                     await self._record_run(result, profile_key)
+                    await self._record_state(
+                        result,
+                        profile_key,
+                        lease,
+                        checkpoint_event_id=(
+                            state.checkpoint_event_id if state_matches else None
+                        ),
+                        repair_cursor_revision_id=(
+                            repair_page_cursor if force_current_scan else None
+                        ),
+                        repair_active=force_current_scan,
+                        repair_mode=(repair_mode if force_current_scan else None),
+                        repair_scan_complete=(
+                            repair_scan_complete if force_current_scan else False
+                        ),
+                        repair_checkpoint=repair_checkpoint,
+                        repair_reconcile_cursor_derivation_id=(
+                            repair_reconcile_cursor if force_current_scan else None
+                        ),
+                        audit_assertion_id=(
+                            state.audit_assertion_id if state_matches else None
+                        ),
+                        audit_assertion_revision_id=(
+                            state.audit_assertion_revision_id
+                            if state_matches
+                            else None
+                        ),
+                        audit_competitor_cursor_revision_id=(
+                            state.audit_competitor_cursor_revision_id
+                            if state_matches
+                            else None
+                        ),
+                    )
                     return result
 
             if not await self._renew_lease(lease):
@@ -496,6 +633,17 @@ class SemanticMaintenanceService:
                     started,
                     reports_created=reports_created,
                     lease=lease,
+                    audit_assertion_id=(
+                        state.audit_assertion_id if state_matches else None
+                    ),
+                    audit_assertion_revision_id=(
+                        state.audit_assertion_revision_id if state_matches else None
+                    ),
+                    audit_competitor_cursor_revision_id=(
+                        state.audit_competitor_cursor_revision_id
+                        if state_matches
+                        else None
+                    ),
                 )
             audit = audit_outcome.counts
             reports_created += audit["reports_created"]
@@ -527,6 +675,100 @@ class SemanticMaintenanceService:
                     capability_versions=capability_versions,
                 )
                 await self._record_run(result, profile_key)
+                await self._record_state(
+                    result,
+                    profile_key,
+                    lease,
+                    checkpoint_event_id=(
+                        state.checkpoint_event_id if state_matches else None
+                    ),
+                        repair_cursor_revision_id=(
+                            repair_page_cursor if force_current_scan else None
+                        ),
+                        repair_active=force_current_scan,
+                        repair_mode=(repair_mode if force_current_scan else None),
+                        repair_scan_complete=(
+                            repair_scan_complete if force_current_scan else False
+                        ),
+                        repair_checkpoint=repair_checkpoint,
+                        repair_reconcile_cursor_derivation_id=(
+                            repair_reconcile_cursor if force_current_scan else None
+                        ),
+                        audit_assertion_id=(
+                            audit_outcome.audit_assertion_id
+                        or (state.audit_assertion_id if state_matches else None)
+                    ),
+                    audit_assertion_revision_id=(
+                        audit_outcome.audit_assertion_revision_id
+                        or (
+                            state.audit_assertion_revision_id
+                            if state_matches
+                            else None
+                        )
+                    ),
+                    audit_competitor_cursor_revision_id=(
+                        audit_outcome.audit_competitor_cursor_revision_id
+                        or (
+                            state.audit_competitor_cursor_revision_id
+                            if state_matches
+                            else None
+                        )
+                    ),
+                )
+                return result
+            if audit_outcome.competitor_backlog:
+                result = self._result(
+                    run_id=run_id,
+                    status=SemanticMaintenanceStatus.PARTIAL,
+                    reason="contradiction_context_budget",
+                    source_generation=initial.generation,
+                    checkpoint_generation=(
+                        state.checkpoint_generation if state_matches else 0
+                    ),
+                    changes_consumed=changes_consumed,
+                    assertions_validated=assertions_validated,
+                    assertions_retracted=audit["retracted"],
+                    reports_created=reports_created,
+                    contradictions=audit["contradictions"],
+                    supersession_candidates=audit["supersession_candidates"],
+                    expired_assertions=audit["expired"],
+                    orphan_provenance=audit["orphans"],
+                    invalid_eligibility=(
+                        audit["invalid_eligibility"] + ineligible_changes
+                    ),
+                    backlog_assertions=max(1, backlog),
+                    backlog_reports=1,
+                    duration_ms=self._duration_ms(started),
+                    capability_versions=capability_versions,
+                )
+                await self._record_run(result, profile_key)
+                await self._record_state(
+                    result,
+                    profile_key,
+                    lease,
+                    checkpoint_event_id=(
+                        state.checkpoint_event_id if state_matches else None
+                    ),
+                        repair_cursor_revision_id=(
+                            repair_page_cursor if force_current_scan else None
+                        ),
+                        repair_active=force_current_scan,
+                        repair_mode=(repair_mode if force_current_scan else None),
+                        repair_scan_complete=(
+                            repair_scan_complete if force_current_scan else False
+                        ),
+                        repair_checkpoint=repair_checkpoint,
+                        repair_reconcile_cursor_derivation_id=(
+                            repair_reconcile_cursor if force_current_scan else None
+                        ),
+                        audit_assertion_id=audit_outcome.audit_assertion_id,
+                    audit_assertion_revision_id=(
+                        audit_outcome.audit_assertion_revision_id
+                    ),
+                    audit_competitor_cursor_revision_id=(
+                        audit_outcome.audit_competitor_cursor_revision_id
+                    ),
+                )
                 return result
             self._check_budget(started)
             inferred = 0
@@ -538,7 +780,8 @@ class SemanticMaintenanceService:
                     self.inference_limits,
                     max_source_assertions=min(
                         self.inference_limits.max_source_assertions,
-                        self.limits.max_assertions,
+                        self._primary_assertion_limit
+                        + self.limits.max_context_assertions,
                     ),
                     max_generated_assertions=min(
                         self.inference_limits.max_generated_assertions,
@@ -559,10 +802,16 @@ class SemanticMaintenanceService:
                     fencing_token=lease.fencing_token,
                     lease_seconds=self._LEASE_SECONDS,
                 ):
-                    materialized = (
-                        await inference_service.rebuild()
-                        if full_rebuild
-                        else await inference_service.materialize_incremental()
+                    materialized = await inference_service.materialize_targets(
+                        tuple(item.assertion_id for item in target_assertions),
+                        max_context_assertions=min(
+                            self.limits.max_context_assertions,
+                            max(
+                                0,
+                                inference_service.limits.max_source_assertions
+                                - len(target_assertions),
+                            ),
+                        ),
                     )
                 inferred = materialized.generated_assertions
                 retracted += materialized.retracted_assertions
@@ -592,9 +841,79 @@ class SemanticMaintenanceService:
                         capability_versions=capability_versions,
                     )
                     await self._record_run(result, profile_key)
+                    await self._record_state(
+                        result,
+                        profile_key,
+                        lease,
+                        checkpoint_event_id=(
+                            state.checkpoint_event_id if state_matches else None
+                        ),
+                        repair_cursor_revision_id=(
+                            repair_page_cursor if force_current_scan else None
+                        ),
+                        repair_active=force_current_scan,
+                        repair_mode=(repair_mode if force_current_scan else None),
+                        repair_scan_complete=(
+                            repair_scan_complete if force_current_scan else False
+                        ),
+                        repair_checkpoint=repair_checkpoint,
+                        repair_reconcile_cursor_derivation_id=(
+                            repair_reconcile_cursor if force_current_scan else None
+                        ),
+                        audit_assertion_id=(
+                            state.audit_assertion_id if state_matches else None
+                        ),
+                        audit_assertion_revision_id=(
+                            state.audit_assertion_revision_id
+                            if state_matches
+                            else None
+                        ),
+                        audit_competitor_cursor_revision_id=(
+                            state.audit_competitor_cursor_revision_id
+                            if state_matches
+                            else None
+                        ),
+                    )
                     return result
 
             self._check_budget(started)
+            reconciliation: InferenceReconciliationResult | None = None
+            if force_current_scan and not backlog:
+                # A completed assertion scan is only the first half of a
+                # profile/ontology repair.  Retire stale active proof rows in
+                # deterministic pages before maintenance may publish a
+                # complete checkpoint.  A scan-only fallback for an opaque
+                # deletion has no changed profile to reconcile.
+                repair_scan_complete = True
+                if repair_mode in ("full_rebuild", "profile_change"):
+                    if not await self._renew_lease(lease):
+                        raise SemanticMaintenanceError("semantic_maintenance_lease_lost")
+                    async with self._assertions.maintenance_fence(
+                        holder_id=lease.holder_id,
+                        fencing_token=lease.fencing_token,
+                        lease_seconds=self._LEASE_SECONDS,
+                    ):
+                        reconciliation = (
+                            await BoundedInferenceService.reconcile_obsolete_derivations_page(
+                                self._assertions,
+                                active_profile_key=(
+                                    self.inference_profile.key
+                                    if self.inference_profile is not None
+                                    else None
+                                ),
+                                cursor=repair_reconcile_cursor,
+                                max_derivations=self.limits.max_derivations,
+                                run_id=run_id,
+                            )
+                        )
+                    retracted += reconciliation.retracted_assertions
+                    repair_reconcile_cursor = reconciliation.next_cursor
+            reconciliation_backlog = (
+                reconciliation.backlog if reconciliation is not None else 0
+            )
+            repair_active = force_current_scan and bool(
+                backlog or reconciliation_backlog
+            )
             # A maintenance unit may write validation reports, audit repairs,
             # or inferred assertions.  Those are fresh canonical changes, not
             # inputs that this unit has validated and audited end-to-end.  The
@@ -605,7 +924,24 @@ class SemanticMaintenanceService:
             # A generation is a transaction boundary rather than a cursor: a
             # supersession can emit several events at it, so partial state
             # keeps the final processed event ID as well as its generation.
-            if backlog:
+            repair_replay_required = False
+            if force_current_scan and not backlog:
+                if repair_checkpoint is None:
+                    raise SemanticMaintenanceError("repair scan is missing its origin checkpoint")
+                # The lexical scan cursor does not order concurrent writes.
+                # Keep the checkpoint taken before the first repair page and
+                # replay every outbox event after it on the next ordinary
+                # maintenance unit.  Advancing to this page's ``initial``
+                # checkpoint would lose a write whose revision ID sorts
+                # behind the already-persisted repair cursor.
+                durable_checkpoint = repair_checkpoint
+                repair_replay_required = bool(
+                    await self._assertions.changes_after(
+                        repair_checkpoint,
+                        limit=1,
+                    )
+                )
+            elif backlog:
                 if processed_checkpoint is not None:
                     durable_checkpoint = processed_checkpoint
                 elif state_matches:
@@ -621,8 +957,6 @@ class SemanticMaintenanceService:
             else:
                 if processed_checkpoint is not None:
                     durable_checkpoint = processed_checkpoint
-                elif force_current_scan:
-                    durable_checkpoint = initial
                 elif state_matches:
                     durable_checkpoint = AssertionCheckpoint(
                         self._assertions.tenant_id,
@@ -635,13 +969,21 @@ class SemanticMaintenanceService:
                     )
             status = (
                 SemanticMaintenanceStatus.PARTIAL
-                if backlog
+                if backlog or reconciliation_backlog or repair_replay_required
                 else SemanticMaintenanceStatus.COMPLETE
             )
             result = self._result(
                 run_id=run_id,
                 status=status,
-                reason="assertion_budget" if backlog else None,
+                reason=(
+                    "assertion_budget"
+                    if backlog
+                    else "derivation_budget"
+                    if reconciliation_backlog
+                    else "repair_change_replay"
+                    if repair_replay_required
+                    else None
+                ),
                 source_generation=initial.generation,
                 checkpoint_generation=durable_checkpoint.generation,
                 changes_consumed=changes_consumed,
@@ -656,7 +998,11 @@ class SemanticMaintenanceService:
                     audit["invalid_eligibility"] + ineligible_changes
                 ),
                 reports_created=reports_created,
-                backlog_assertions=backlog,
+                backlog_assertions=max(
+                    backlog,
+                    reconciliation_backlog,
+                    int(repair_replay_required),
+                ),
                 duration_ms=self._duration_ms(started),
                 capability_versions=capability_versions,
             )
@@ -669,6 +1015,14 @@ class SemanticMaintenanceService:
                 profile_key,
                 lease,
                 checkpoint_event_id=durable_checkpoint.latest_event_id,
+                repair_cursor_revision_id=next_repair_cursor,
+                repair_active=repair_active,
+                repair_mode=(repair_mode if repair_active else None),
+                repair_scan_complete=(repair_scan_complete if repair_active else False),
+                repair_checkpoint=(repair_checkpoint if repair_active else None),
+                repair_reconcile_cursor_derivation_id=(
+                    repair_reconcile_cursor if repair_active else None
+                ),
             )
             return result
         except _MaintenanceBudgetExceeded:
@@ -683,6 +1037,44 @@ class SemanticMaintenanceService:
                 capability_versions=capability_versions,
             )
             await self._record_run(result, profile_key)
+            if run_id:
+                # A timeout after selecting a repair page must leave that
+                # page retryable.  Recording only the run result used to
+                # discard the newly introduced scan cursor and restart from
+                # the first lexical page forever.
+                await self._record_state(
+                    result,
+                    profile_key,
+                    lease,
+                    checkpoint_event_id=(
+                        state.checkpoint_event_id if state_matches and state else None
+                    ),
+                    repair_cursor_revision_id=(
+                        repair_page_cursor if force_current_scan else None
+                    ),
+                    repair_active=force_current_scan,
+                    repair_mode=(repair_mode if force_current_scan else None),
+                    repair_scan_complete=(
+                        repair_scan_complete if force_current_scan else False
+                    ),
+                    repair_checkpoint=repair_checkpoint,
+                    repair_reconcile_cursor_derivation_id=(
+                        repair_reconcile_cursor if force_current_scan else None
+                    ),
+                    audit_assertion_id=(
+                        state.audit_assertion_id if state_matches and state else None
+                    ),
+                    audit_assertion_revision_id=(
+                        state.audit_assertion_revision_id
+                        if state_matches and state
+                        else None
+                    ),
+                    audit_competitor_cursor_revision_id=(
+                        state.audit_competitor_cursor_revision_id
+                        if state_matches and state
+                        else None
+                    ),
+                )
             return result
         except MaintenanceLeaseLostError:
             result = self._result(
@@ -698,6 +1090,10 @@ class SemanticMaintenanceService:
             await self._record_run(result, profile_key)
             return result
         except Exception as error:
+            logger.exception(
+                "semantic maintenance failed",
+                extra={"semantic_maintenance_tenant_id": self._assertions.tenant_id},
+            )
             result = self._result(
                 run_id=run_id or f"failed:{initial.generation}",
                 status=SemanticMaintenanceStatus.FAILED,
@@ -714,8 +1110,18 @@ class SemanticMaintenanceService:
             await self._release_lease(lease)
 
     async def rebuild(self) -> SemanticMaintenanceResult:
-        """Run the explicit bounded semantic repair path under the same lease."""
+        """Run the explicit, page-oriented semantic repair path under one lease."""
         return await self.run(full_rebuild=True)
+
+    @property
+    def _primary_assertion_limit(self) -> int:
+        """Keep one maintenance unit within both primary-work budgets."""
+        if self.inference_profile is None:
+            return self.limits.max_assertions
+        return min(
+            self.limits.max_assertions,
+            self.inference_limits.max_source_assertions,
+        )
 
     async def training_readiness(
         self,
@@ -725,16 +1131,21 @@ class SemanticMaintenanceService:
         """Read whether a scheduled training consumer may use semantic data.
 
         This is deliberately a read-only check over the durable state written
-        by maintenance.  It uses the same capability identity as ``run()``, so
+        by maintenance. It uses the same capability identity as ``run()``, so
         a changed ontology, shape profile, or effective maintenance budget
-        invalidates an earlier verification.  The optional exception requires
-        a prior *complete* result for that exact identity; a partial/failed
-        current attempt never becomes a verified snapshot by assertion.
+        invalidates an earlier verification. A historical complete run is not
+        a durable corpus snapshot, so stale semantic data remains blocked until
+        the governed snapshot boundary provides one.
         """
 
         if type(allow_prior_verified_snapshot) is not bool:
             raise SemanticMaintenanceError(
                 "allow_prior_verified_snapshot must be a boolean"
+            )
+        if allow_prior_verified_snapshot:
+            raise SemanticMaintenanceError(
+                "prior verified snapshot consumption is unavailable until a durable "
+                "governed corpus snapshot exists"
             )
         current = await self._assertions.checkpoint()
         profile_key = _digest(self._capability_versions())
@@ -755,21 +1166,6 @@ class SemanticMaintenanceService:
         ):
             return SemanticMaintenanceTrainingReadiness(True, None)
 
-        if allow_prior_verified_snapshot:
-            prior = await self._database.fetchone(
-                "SELECT 1 FROM semantic_maintenance_runs "
-                "WHERE tenant_id = ? AND profile_key = ? "
-                "AND status IN ('complete', 'no_op') "
-                "ORDER BY completed_at DESC, run_id DESC LIMIT 1",
-                (self._assertions.tenant_id, profile_key),
-            )
-            if prior is not None:
-                return SemanticMaintenanceTrainingReadiness(
-                    True,
-                    "prior_verified_snapshot_policy_allowed",
-                    using_prior_verified_snapshot=True,
-                )
-
         if state is None:
             reason = "semantic_maintenance_state_missing"
         elif state.profile_key != profile_key:
@@ -783,6 +1179,54 @@ class SemanticMaintenanceService:
             reason = "semantic_maintenance_checkpoint_behind"
         return SemanticMaintenanceTrainingReadiness(False, reason)
 
+    async def _current_scan_page(
+        self, cursor: str | None
+    ) -> tuple[tuple[Assertion, ...], int]:
+        """Read one indexed active page and a count-only repair backlog."""
+        targets = tuple(
+            await self._assertions.query(
+                AssertionQuery(limit=self._primary_assertion_limit, cursor=cursor)
+            )
+        )
+        remaining = await self._assertions.active_assertion_count(cursor=cursor)
+        return targets, max(0, remaining - len(targets))
+
+    async def _event_checkpoint(
+        self, checkpoint: AssertionCheckpoint
+    ) -> AssertionCheckpoint:
+        """Normalize a replay cursor to the generation of its event.
+
+        The canonical generation also advances for proof-ledger membership
+        changes, which deliberately emit no assertion outbox event.  A raw
+        ``checkpoint()`` can therefore carry a current generation newer than
+        its latest event.  ``changes_after()`` correctly rejects that invalid
+        pair; repair origins must retain the event's own generation instead.
+        """
+        if checkpoint.latest_event_id is None:
+            return checkpoint
+        row = await self._database.fetchone(
+            "SELECT generation FROM semantic_projection_outbox "
+            "WHERE tenant_id = ? AND event_id = ? "
+            "UNION ALL "
+            "SELECT generation FROM semantic_projection_erasure_outbox "
+            "WHERE tenant_id = ? AND event_id = ? LIMIT 1",
+            (
+                self._assertions.tenant_id,
+                checkpoint.latest_event_id,
+                self._assertions.tenant_id,
+                checkpoint.latest_event_id,
+            ),
+        )
+        return (
+            checkpoint
+            if row is None
+            else AssertionCheckpoint(
+                checkpoint.tenant_id,
+                int(row[0]),
+                checkpoint.latest_event_id,
+            )
+        )
+
     async def _changes_after(self, checkpoint: AssertionCheckpoint) -> _ChangeBatch:
         """Take one event-bounded batch without splitting cursor semantics.
 
@@ -791,7 +1235,7 @@ class SemanticMaintenanceService:
         A second one-event probe preserves the exact assertion budget at the
         API's maximum page size.
         """
-        work_limit = self.limits.max_assertions
+        work_limit = self._primary_assertion_limit
         changes = await self._assertions.changes_after(
             checkpoint,
             limit=min(1_000, work_limit + 1),
@@ -862,15 +1306,15 @@ class SemanticMaintenanceService:
                 fallback_full_audit = True
 
         ordered = tuple(sorted(targets.values(), key=lambda item: item.assertion_id))
-        if len(ordered) > self.limits.max_assertions:
-            return ordered[: self.limits.max_assertions], True
+        if len(ordered) > self._primary_assertion_limit:
+            return ordered[: self._primary_assertion_limit], True
         return ordered, fallback_full_audit
 
     async def _affected_active_targets(
         self, removed: Assertion
     ) -> tuple[tuple[Assertion, ...], bool]:
         """Find a bounded active term-neighbourhood for an inactive revision."""
-        query_limit = min(1_000, self.limits.max_assertions + 1)
+        query_limit = min(1_000, self._primary_assertion_limit + 1)
         queries = (
             AssertionQuery(subject=removed.subject, limit=query_limit),
             AssertionQuery(predicate=removed.predicate, limit=query_limit),
@@ -885,15 +1329,13 @@ class SemanticMaintenanceService:
             for assertion in matches:
                 related[assertion.assertion_id] = assertion
         ordered = tuple(sorted(related.values(), key=lambda item: item.assertion_id))
-        return ordered, overflow or len(ordered) > self.limits.max_assertions
+        return ordered, overflow or len(ordered) > self._primary_assertion_limit
 
     async def _revalidate(
         self,
         run_id: str,
         targets: Sequence[Assertion],
         started: float,
-        *,
-        full_audit: bool,
     ) -> tuple[ShaclValidationReport, bool]:
         self._check_budget(started)
         row = await self._database.fetchone(
@@ -917,14 +1359,16 @@ class SemanticMaintenanceService:
                 )
             ),
             "run_id": run_id,
+            # Repair pages use the same bounded focused contract as sleep.
+            # Full-tenant context is never concealed behind a one-assertion
+            # repair page: a non-local shape returns an explicit incomplete
+            # report until the operator supplies a sufficiently bounded local
+            # context strategy instead of materializing the whole tenant.
+            "bounded_focus_only": True,
         }
-        report = (
-            await validation.full_audit_and_repair(**options)
-            if full_audit
-            else await validation.validate_current(
-                assertion_ids=tuple(item.assertion_id for item in targets),
-                **options,
-            )
+        report = await validation.validate_current(
+            assertion_ids=tuple(item.assertion_id for item in targets),
+            **options,
         )
         return report, True
 
@@ -936,6 +1380,9 @@ class SemanticMaintenanceService:
         *,
         reports_created: int,
         lease: _MaintenanceLease,
+        audit_assertion_id: str | None,
+        audit_assertion_revision_id: str | None,
+        audit_competitor_cursor_revision_id: str | None,
     ) -> _AuditOutcome:
         counts = {
             "contradictions": 0,
@@ -1009,16 +1456,30 @@ class SemanticMaintenanceService:
                         ),
                     )
                     continue
+            competitor_cursor = (
+                audit_competitor_cursor_revision_id
+                if (
+                    audit_assertion_id == current.assertion_id
+                    and audit_assertion_revision_id == current.revision_id
+                )
+                else None
+            )
             competing = await self._assertions.query(
                 AssertionQuery(
                     subject=current.subject,
                     predicate=current.predicate,
-                    limit=1_000,
+                    # Competitors are bounded contextual reads, never an
+                    # unbounded tenant scan. A wider conflicting set remains
+                    # visible through a later maintenance unit.
+                    # This is context work rather than primary maintenance
+                    # work. Its own explicit budget prevents one contested
+                    # predicate from consuming every changed assertion slot.
+                    limit=self.limits.max_context_assertions,
+                    cursor=competitor_cursor,
+                    exclude_assertion_ids=(current.assertion_id,),
                 )
             )
             for other in competing:
-                if other.assertion_id <= current.assertion_id:
-                    continue
                 if other.object.identity_mapping() == current.object.identity_mapping():
                     continue
                 evidence = {
@@ -1042,10 +1503,37 @@ class SemanticMaintenanceService:
                         counts,
                         report_budget_exhausted=True,
                         remaining_assertions=len(targets) - position,
+                        audit_assertion_id=current.assertion_id,
+                        audit_assertion_revision_id=current.revision_id,
+                        audit_competitor_cursor_revision_id=competitor_cursor,
                     )
-                counts["contradictions"] += 1
-                counts["reports_created"] += int(created)
-                counts["supersession_candidates"] += 1
+                # The durable evidence digest deduplicates a pair when both
+                # sides changed in this batch. Do not use assertion-ID order
+                # as a shortcut: it misses changed-vs-unchanged pairs.
+                if created:
+                    counts["contradictions"] += 1
+                    counts["reports_created"] += 1
+                    counts["supersession_candidates"] += 1
+            if len(competing) == self.limits.max_context_assertions:
+                probe = await self._assertions.query(
+                    AssertionQuery(
+                        subject=current.subject,
+                        predicate=current.predicate,
+                        limit=1,
+                        cursor=competing[-1].revision_id,
+                        exclude_assertion_ids=(current.assertion_id,),
+                    )
+                )
+                if probe:
+                    return _AuditOutcome(
+                        counts,
+                        competitor_backlog=True,
+                        audit_assertion_id=current.assertion_id,
+                        audit_assertion_revision_id=current.revision_id,
+                        audit_competitor_cursor_revision_id=(
+                            competing[-1].revision_id
+                        ),
+                    )
         return _AuditOutcome(counts)
 
     async def _record_candidate(
@@ -1107,7 +1595,12 @@ class SemanticMaintenanceService:
 
     async def _state(self) -> _MaintenanceState | None:
         row = await self._database.fetchone(
-            "SELECT profile_key, checkpoint_generation, checkpoint_event_id, status "
+            "SELECT profile_key, checkpoint_generation, checkpoint_event_id, status, "
+            "repair_cursor_revision_id, repair_active, repair_mode, repair_scan_complete, "
+            "repair_checkpoint_generation, repair_checkpoint_event_id, "
+            "repair_reconcile_cursor_derivation_id, audit_assertion_id, "
+            "audit_assertion_revision_id, "
+            "audit_competitor_cursor_revision_id "
             "FROM semantic_maintenance_state "
             "WHERE tenant_id = ?",
             (self._assertions.tenant_id,),
@@ -1120,6 +1613,16 @@ class SemanticMaintenanceService:
                 int(row[1]),
                 (str(row[2]) if row[2] is not None else None),
                 SemanticMaintenanceStatus(str(row[3])),
+                (str(row[4]) if row[4] is not None else None),
+                bool(row[5]),
+                (str(row[6]) if row[6] is not None else None),
+                bool(row[7]),
+                (int(row[8]) if row[8] is not None else None),
+                (str(row[9]) if row[9] is not None else None),
+                (str(row[10]) if row[10] is not None else None),
+                (str(row[11]) if row[11] is not None else None),
+                (str(row[12]) if row[12] is not None else None),
+                (str(row[13]) if row[13] is not None else None),
             )
         )
 
@@ -1177,20 +1680,39 @@ class SemanticMaintenanceService:
         lease: _MaintenanceLease,
         *,
         checkpoint_event_id: str | None = None,
+        repair_cursor_revision_id: str | None = None,
+        repair_active: bool = False,
+        repair_mode: str | None = None,
+        repair_scan_complete: bool = False,
+        repair_checkpoint: AssertionCheckpoint | None = None,
+        repair_reconcile_cursor_derivation_id: str | None = None,
+        audit_assertion_id: str | None = None,
+        audit_assertion_revision_id: str | None = None,
+        audit_competitor_cursor_revision_id: str | None = None,
     ) -> None:
         try:
             async with self._database.transaction():
                 await self._renew_fenced_lease_in_transaction(lease)
                 changed = await self._database.execute(
                     "INSERT INTO semantic_maintenance_state "
-                    "(tenant_id, profile_key, checkpoint_generation, checkpoint_event_id, run_id, status, capability_versions, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                    "(tenant_id, profile_key, checkpoint_generation, checkpoint_event_id, run_id, status, capability_versions, repair_cursor_revision_id, repair_active, repair_mode, repair_scan_complete, repair_checkpoint_generation, repair_checkpoint_event_id, repair_reconcile_cursor_derivation_id, audit_assertion_id, audit_assertion_revision_id, audit_competitor_cursor_revision_id, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(tenant_id) DO UPDATE SET "
                     "profile_key = excluded.profile_key, "
                     "checkpoint_generation = excluded.checkpoint_generation, "
                     "checkpoint_event_id = excluded.checkpoint_event_id, "
                     "run_id = excluded.run_id, status = excluded.status, "
                     "capability_versions = excluded.capability_versions, "
+                    "repair_cursor_revision_id = excluded.repair_cursor_revision_id, "
+                    "repair_active = excluded.repair_active, "
+                    "repair_mode = excluded.repair_mode, "
+                    "repair_scan_complete = excluded.repair_scan_complete, "
+                    "repair_checkpoint_generation = excluded.repair_checkpoint_generation, "
+                    "repair_checkpoint_event_id = excluded.repair_checkpoint_event_id, "
+                    "repair_reconcile_cursor_derivation_id = excluded.repair_reconcile_cursor_derivation_id, "
+                    "audit_assertion_id = excluded.audit_assertion_id, "
+                    "audit_assertion_revision_id = excluded.audit_assertion_revision_id, "
+                    "audit_competitor_cursor_revision_id = excluded.audit_competitor_cursor_revision_id, "
                     "updated_at = excluded.updated_at",
                     (
                         self._assertions.tenant_id,
@@ -1200,6 +1722,24 @@ class SemanticMaintenanceService:
                         result.run_id,
                         result.status.value,
                         _json(result.capability_versions),
+                        repair_cursor_revision_id,
+                        int(repair_active),
+                        repair_mode,
+                        int(repair_scan_complete),
+                        (
+                            repair_checkpoint.generation
+                            if repair_checkpoint is not None
+                            else None
+                        ),
+                        (
+                            repair_checkpoint.latest_event_id
+                            if repair_checkpoint is not None
+                            else None
+                        ),
+                        repair_reconcile_cursor_derivation_id,
+                        audit_assertion_id,
+                        audit_assertion_revision_id,
+                        audit_competitor_cursor_revision_id,
                         _now(),
                     ),
                 )
@@ -1301,6 +1841,7 @@ class SemanticMaintenanceService:
             "max_derivations": self.limits.max_derivations,
             "max_shapes": self.limits.max_shapes,
             "max_reports": self.limits.max_reports,
+            "max_context_assertions": self.limits.max_context_assertions,
         }
         versions = {
             "semantic_maintenance": "v2",

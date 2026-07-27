@@ -1646,6 +1646,31 @@ async def test_nonlocal_incremental_revalidation_falls_back_to_full_audit() -> N
 
 
 @pytest.mark.asyncio
+async def test_bounded_incremental_revalidation_defers_nonlocal_shape_context() -> None:
+    """Sleep maintenance must not replace a one-target budget with a full export."""
+    storage, changed = await _nonlocal_focus_storage()
+    try:
+        service = GovernedSemanticValidationService(
+            storage._assertion_store(),
+            validator=GovernedShaclValidationService(_registry(_NONLOCAL_FOCUS_SHAPES)),
+        )
+        report = await service.validate_current(
+            assertion_ids=(changed.assertion_id,),
+            shape_set=ShapeSetReference("test-shapes", "1.0.0"),
+            validation_capability="validation-profile:test-core",
+            bounded_focus_only=True,
+        )
+
+        assert report.state is ValidationState.INCOMPLETE
+        assert [finding.code for finding in report.findings] == [
+            "incremental_context_unavailable"
+        ]
+        assert await storage.get_assertion(changed.assertion_id) is not None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("source", "expected_action"),
     (

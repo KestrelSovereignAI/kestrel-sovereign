@@ -1252,6 +1252,9 @@ class AssertionQuery:
     observed_at: Instant | datetime | str | None = None
     limit: int = 100
     cursor: str | None = None
+    # Keep this final so existing positional callers retain their historical
+    # narrowing-field order; it is still a narrowing-only query constraint.
+    exclude_assertion_ids: tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         if self.subject is not None and not isinstance(self.subject, IRI):
@@ -1263,6 +1266,15 @@ class AssertionQuery:
         if isinstance(self.object, Literal):
             self.object.identity_mapping()
         object.__setattr__(self, "assertion_ids", _unique_identifiers(self.assertion_ids, "assertion_ids") if self.assertion_ids else ())
+        object.__setattr__(
+            self,
+            "exclude_assertion_ids",
+            _unique_identifiers(self.exclude_assertion_ids, "exclude_assertion_ids")
+            if self.exclude_assertion_ids
+            else (),
+        )
+        if set(self.assertion_ids).intersection(self.exclude_assertion_ids):
+            _fail("query assertion_ids and exclude_assertion_ids must not overlap")
         statuses = tuple(_enum(value, AssertionStatus, "query status") for value in self.statuses)
         states = tuple(_enum(value, EpistemicState, "query epistemic_state") for value in self.epistemic_states)
         if len(set(statuses)) != len(statuses) or len(set(states)) != len(states):
@@ -1286,6 +1298,7 @@ class AssertionQuery:
             "predicate": self.predicate.to_mapping() if self.predicate else None,
             "object": self.object.to_mapping() if self.object else None,
             "assertion_ids": list(self.assertion_ids),
+            "exclude_assertion_ids": list(self.exclude_assertion_ids),
             "statuses": [item.value for item in self.statuses],
             "epistemic_states": [item.value for item in self.epistemic_states],
             "valid_at": self.valid_at.to_mapping() if self.valid_at else None,
@@ -1297,18 +1310,27 @@ class AssertionQuery:
     @classmethod
     def from_mapping(cls, value: object) -> AssertionQuery:
         fields = {"kind", "subject", "predicate", "object", "assertion_ids", "statuses", "epistemic_states", "valid_at", "observed_at", "limit", "cursor"}
-        data = _mapping_fields(value, "AssertionQuery", required=fields, optional={"schema_version"})
+        data = _mapping_fields(
+            value,
+            "AssertionQuery",
+            required=fields,
+            optional={"schema_version", "exclude_assertion_ids"},
+        )
         _mapping_version(data, "AssertionQuery")
         if data["kind"] != "assertion_query":
             _fail("AssertionQuery.kind must be assertion_query")
         for field_name in ("assertion_ids", "statuses", "epistemic_states"):
             if isinstance(data[field_name], (str, bytes)) or not isinstance(data[field_name], Sequence):
                 _fail(f"AssertionQuery.{field_name} must be an array")
+        excluded = data.get("exclude_assertion_ids", ())
+        if isinstance(excluded, (str, bytes)) or not isinstance(excluded, Sequence):
+            _fail("AssertionQuery.exclude_assertion_ids must be an array")
         return cls(
             subject=IRI.from_mapping(data["subject"]) if data["subject"] is not None else None,
             predicate=IRI.from_mapping(data["predicate"]) if data["predicate"] is not None else None,
             object=_object_from_mapping(data["object"]) if data["object"] is not None else None,
             assertion_ids=tuple(data["assertion_ids"]),
+            exclude_assertion_ids=tuple(excluded),
             statuses=tuple(data["statuses"]),
             epistemic_states=tuple(data["epistemic_states"]),
             valid_at=Instant.from_mapping(data["valid_at"]) if data["valid_at"] is not None else None,

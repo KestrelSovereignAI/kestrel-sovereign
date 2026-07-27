@@ -44,6 +44,10 @@ _SEMANTIC_ASSERTION_SCHEMA_VERSION = "semantic_assertion_store_v3"
 _SEMANTIC_VALIDATION_SCHEMA_VERSION = "semantic_validation_reports_v1"
 _SEMANTIC_MAINTENANCE_SCHEMA_VERSION = "semantic_maintenance_v1"
 _SEMANTIC_MAINTENANCE_CURSOR_SCHEMA_VERSION = "semantic_maintenance_v2_cursor"
+_SEMANTIC_MAINTENANCE_REPAIR_CURSOR_SCHEMA_VERSION = "semantic_maintenance_v3_repair_cursor"
+_SEMANTIC_MAINTENANCE_RESUME_SCHEMA_VERSION = "semantic_maintenance_v4_resume_state"
+_SEMANTIC_MAINTENANCE_AUDIT_REVISION_SCHEMA_VERSION = "semantic_maintenance_v5_audit_revision"
+_SEMANTIC_MAINTENANCE_REPAIR_MODE_SCHEMA_VERSION = "semantic_maintenance_v6_repair_mode"
 _SEMANTIC_ASSERTION_LOCK_DOMAIN = b"kestrel:semantic-assertion-schema:v1\0"
 
 
@@ -474,8 +478,21 @@ async def migrate_semantic_maintenance(db: "AsyncDatabase") -> None:
             run_id TEXT NOT NULL,
             status TEXT NOT NULL,
             capability_versions TEXT NOT NULL,
+            repair_cursor_revision_id TEXT,
+            repair_active INTEGER NOT NULL DEFAULT 0,
+            repair_mode TEXT,
+            repair_scan_complete INTEGER NOT NULL DEFAULT 0,
+            repair_checkpoint_generation INTEGER,
+            repair_checkpoint_event_id TEXT,
+            repair_reconcile_cursor_derivation_id TEXT,
+            audit_assertion_id TEXT,
+            audit_assertion_revision_id TEXT,
+            audit_competitor_cursor_revision_id TEXT,
             updated_at TEXT NOT NULL,
             CHECK (checkpoint_generation >= 0),
+            CHECK (repair_active IN (0, 1)),
+            CHECK (repair_scan_complete IN (0, 1)),
+            CHECK (repair_mode IS NULL OR repair_mode IN ('full_rebuild', 'profile_change', 'current_scan')),
             CHECK (status IN ('complete', 'partial', 'failed', 'no_op'))
         )""",
         """CREATE TABLE IF NOT EXISTS semantic_maintenance_runs (
@@ -567,6 +584,155 @@ async def migrate_semantic_maintenance(db: "AsyncDatabase") -> None:
             await db.execute(
                 "INSERT INTO semantic_schema_migrations (version) VALUES (?)",
                 (_SEMANTIC_MAINTENANCE_CURSOR_SCHEMA_VERSION,),
+            )
+
+        repair_cursor_migration = await db.fetchone(
+            "SELECT 1 FROM semantic_schema_migrations WHERE version = ?",
+            (_SEMANTIC_MAINTENANCE_REPAIR_CURSOR_SCHEMA_VERSION,),
+        )
+        if repair_cursor_migration is None:
+            if db.backend_type == "postgres":
+                columns = await db.fetchall(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() "
+                    "AND table_name = 'semantic_maintenance_state' "
+                    "AND column_name IN ('repair_cursor_revision_id', 'repair_active')",
+                    (),
+                )
+                column_names = {str(row[0]) for row in columns}
+            else:
+                columns = await db.fetchall(
+                    "PRAGMA table_info(semantic_maintenance_state)", ()
+                )
+                column_names = {str(row[1]) for row in columns}
+            if "repair_cursor_revision_id" not in column_names:
+                await db.execute(
+                    "ALTER TABLE semantic_maintenance_state "
+                    "ADD COLUMN repair_cursor_revision_id TEXT",
+                    (),
+                )
+            if "repair_active" not in column_names:
+                await db.execute(
+                    "ALTER TABLE semantic_maintenance_state "
+                    "ADD COLUMN repair_active INTEGER NOT NULL DEFAULT 0",
+                    (),
+                )
+            await db.execute(
+                "INSERT INTO semantic_schema_migrations (version) VALUES (?)",
+                (_SEMANTIC_MAINTENANCE_REPAIR_CURSOR_SCHEMA_VERSION,),
+            )
+
+        resume_migration = await db.fetchone(
+            "SELECT 1 FROM semantic_schema_migrations WHERE version = ?",
+            (_SEMANTIC_MAINTENANCE_RESUME_SCHEMA_VERSION,),
+        )
+        if resume_migration is None:
+            if db.backend_type == "postgres":
+                columns = await db.fetchall(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() "
+                    "AND table_name = 'semantic_maintenance_state' "
+                    "AND column_name IN ("
+                    "'repair_checkpoint_generation', 'repair_checkpoint_event_id', "
+                    "'audit_assertion_id', 'audit_competitor_cursor_revision_id'"
+                    ")",
+                    (),
+                )
+                column_names = {str(row[0]) for row in columns}
+            else:
+                columns = await db.fetchall(
+                    "PRAGMA table_info(semantic_maintenance_state)", ()
+                )
+                column_names = {str(row[1]) for row in columns}
+            for column, declaration in (
+                ("repair_checkpoint_generation", "INTEGER"),
+                ("repair_checkpoint_event_id", "TEXT"),
+                ("audit_assertion_id", "TEXT"),
+                ("audit_competitor_cursor_revision_id", "TEXT"),
+            ):
+                if column not in column_names:
+                    await db.execute(
+                        "ALTER TABLE semantic_maintenance_state "
+                        f"ADD COLUMN {column} {declaration}",
+                        (),
+                    )
+            await db.execute(
+                "INSERT INTO semantic_schema_migrations (version) VALUES (?)",
+                (_SEMANTIC_MAINTENANCE_RESUME_SCHEMA_VERSION,),
+            )
+
+        audit_revision_migration = await db.fetchone(
+            "SELECT 1 FROM semantic_schema_migrations WHERE version = ?",
+            (_SEMANTIC_MAINTENANCE_AUDIT_REVISION_SCHEMA_VERSION,),
+        )
+        if audit_revision_migration is None:
+            if db.backend_type == "postgres":
+                column = await db.fetchone(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() "
+                    "AND table_name = 'semantic_maintenance_state' "
+                    "AND column_name = 'audit_assertion_revision_id'",
+                    (),
+                )
+            else:
+                columns = await db.fetchall(
+                    "PRAGMA table_info(semantic_maintenance_state)", ()
+                )
+                column = next(
+                    (
+                        item
+                        for item in columns
+                        if item[1] == "audit_assertion_revision_id"
+                    ),
+                    None,
+                )
+            if column is None:
+                await db.execute(
+                    "ALTER TABLE semantic_maintenance_state "
+                    "ADD COLUMN audit_assertion_revision_id TEXT",
+                    (),
+                )
+            await db.execute(
+                "INSERT INTO semantic_schema_migrations (version) VALUES (?)",
+                (_SEMANTIC_MAINTENANCE_AUDIT_REVISION_SCHEMA_VERSION,),
+            )
+
+        repair_mode_migration = await db.fetchone(
+            "SELECT 1 FROM semantic_schema_migrations WHERE version = ?",
+            (_SEMANTIC_MAINTENANCE_REPAIR_MODE_SCHEMA_VERSION,),
+        )
+        if repair_mode_migration is None:
+            if db.backend_type == "postgres":
+                columns = await db.fetchall(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() "
+                    "AND table_name = 'semantic_maintenance_state' "
+                    "AND column_name IN ("
+                    "'repair_mode', 'repair_scan_complete', "
+                    "'repair_reconcile_cursor_derivation_id'"
+                    ")",
+                    (),
+                )
+                column_names = {str(row[0]) for row in columns}
+            else:
+                columns = await db.fetchall(
+                    "PRAGMA table_info(semantic_maintenance_state)", ()
+                )
+                column_names = {str(row[1]) for row in columns}
+            for column, declaration in (
+                ("repair_mode", "TEXT"),
+                ("repair_scan_complete", "INTEGER NOT NULL DEFAULT 0"),
+                ("repair_reconcile_cursor_derivation_id", "TEXT"),
+            ):
+                if column not in column_names:
+                    await db.execute(
+                        "ALTER TABLE semantic_maintenance_state "
+                        f"ADD COLUMN {column} {declaration}",
+                        (),
+                    )
+            await db.execute(
+                "INSERT INTO semantic_schema_migrations (version) VALUES (?)",
+                (_SEMANTIC_MAINTENANCE_REPAIR_MODE_SCHEMA_VERSION,),
             )
 
 

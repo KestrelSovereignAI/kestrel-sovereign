@@ -1734,7 +1734,6 @@ class TestTaskExecutor:
             None,
             inference_limits=None,
             maintenance_limits=None,
-            allow_prior_verified_snapshot=False,
         )
 
     @pytest.mark.asyncio

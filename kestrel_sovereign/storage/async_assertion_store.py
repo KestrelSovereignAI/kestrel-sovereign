@@ -3038,6 +3038,11 @@ class AsyncAssertionStore:
         if query.assertion_ids:
             clauses.append(f"a.assertion_id IN ({_placeholders(query.assertion_ids)})")
             params.extend(query.assertion_ids)
+        if query.exclude_assertion_ids:
+            clauses.append(
+                f"a.assertion_id NOT IN ({_placeholders(query.exclude_assertion_ids)})"
+            )
+            params.extend(query.exclude_assertion_ids)
         statuses = query.statuses or (AssertionStatus.ACTIVE,)
         clauses.append(f"r.status IN ({_placeholders(statuses)})")
         params.extend(status.value for status in statuses)
@@ -3095,6 +3100,34 @@ class AsyncAssertionStore:
         return await self._query_current(
             AssertionQuery(limit=limit, cursor=cursor), eligible_only=True
         )
+
+    async def active_assertion_count(self, *, cursor: str | None = None) -> int:
+        """Count active current assertions after an optional revision cursor.
+
+        Semantic repair uses this aggregate for an exact backlog count without
+        materializing the rest of the tenant graph.
+        """
+        if cursor is not None and (not isinstance(cursor, str) or not cursor):
+            raise AssertionStoreError(
+                "active assertion cursor must be a non-empty string or null"
+            )
+        tenant_id, _ = self._require_scope()
+        clauses = [
+            "a.tenant_id = ?",
+            "a.current_revision_id = r.revision_id",
+            "r.status = ?",
+        ]
+        params: list[object] = [tenant_id, AssertionStatus.ACTIVE.value]
+        if cursor is not None:
+            clauses.append("r.revision_id > ?")
+            params.append(cursor)
+        value = await self._database.fetchval(
+            "SELECT COUNT(*) FROM semantic_assertions a "
+            "JOIN semantic_assertion_revisions r ON r.tenant_id = a.tenant_id "
+            "WHERE " + " AND ".join(clauses),
+            tuple(params),
+        )
+        return int(value or 0)
 
     async def _complete_active_assertions(self) -> tuple[Assertion, ...]:
         """Return every active current assertion in this store's bound tenant.
