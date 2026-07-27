@@ -1031,6 +1031,115 @@ async def test_save_fact_maintenance_reopen_is_a_true_noop(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_noop_cursor_uses_event_generation_after_ledger_advance_and_restart(
+    tmp_path,
+) -> None:
+    """A ledger-only generation must not corrupt the durable outbox cursor."""
+
+    identity_dir = tmp_path / "identity"
+    credentials = await create_kestrel_identity_async(
+        str(identity_dir),
+        identity_method="did:pkh",
+        agent_name="Semantic maintenance event cursor restart",
+    )
+    key_id = f"kestrel_{credentials.agent_did.rsplit(':', 1)[-1]}"
+    identity = load_agent_identity(key_id, identity_dir)
+    capability = _resolve_authenticated_agent_assertion_capability(
+        credentials.agent_did,
+        identity,
+    )
+    database_path = str(tmp_path / "semantic-event-cursor.db")
+    first_storage = AsyncStorage(
+        database_path,
+        agent_id=credentials.agent_did,
+        _assertion_tenant_capability=capability,
+    )
+    await first_storage.initialize()
+    try:
+        store = first_storage._assertion_store()
+        _GOVERNED_STORAGES[id(store)] = first_storage
+        class_a = IRI("https://example.test/EventCursorClassA")
+        class_b = IRI("https://example.test/EventCursorClassB")
+        subject = IRI("https://example.test/event-cursor-subject")
+        await _put(store, "event-cursor-a-sub-b", class_a, RDFS_SUBCLASS, class_b)
+        await _put(store, "event-cursor-subject-a", subject, RDF_TYPE, class_a)
+        service = SemanticMaintenanceService(
+            store,
+            inference_profile=_profile(),
+            limits=SemanticMaintenanceLimits(max_assertions=3, max_derivations=3),
+        )
+
+        # Initial capability repair materializes a conclusion, then the next
+        # unit consumes that outbox event.  The inference proof ledger also
+        # advances the canonical generation without emitting an outbox event.
+        assert (await service.run()).status is SemanticMaintenanceStatus.PARTIAL
+        for _ in range(4):
+            completed = await service.run()
+            if completed.status is SemanticMaintenanceStatus.COMPLETE:
+                break
+        else:
+            pytest.fail("maintenance did not consume its generated conclusion")
+
+        raw_checkpoint = await store.checkpoint()
+        state_before_noop = await store._database.fetchone(  # noqa: SLF001 - cursor regression
+            "SELECT checkpoint_generation, checkpoint_event_id "
+            "FROM semantic_maintenance_state WHERE tenant_id = ?",
+            (store.tenant_id,),
+        )
+        assert state_before_noop is not None
+        event_generation = await store._database.fetchval(  # noqa: SLF001 - outbox cursor contract
+            "SELECT generation FROM semantic_projection_outbox "
+            "WHERE tenant_id = ? AND event_id = ?",
+            (store.tenant_id, state_before_noop[1]),
+        )
+        assert event_generation is not None
+        assert int(state_before_noop[0]) == int(event_generation)
+        assert raw_checkpoint.generation > int(event_generation)
+
+        no_op = await service.run()
+        assert no_op.status is SemanticMaintenanceStatus.NO_OP
+        assert no_op.checkpoint_generation == int(event_generation)
+        assert await store._database.fetchone(  # noqa: SLF001 - durable cursor contract
+            "SELECT checkpoint_generation, checkpoint_event_id "
+            "FROM semantic_maintenance_state WHERE tenant_id = ?",
+            (store.tenant_id,),
+        ) == state_before_noop
+
+        await _put(
+            store,
+            "event-cursor-new-direct-fact",
+            IRI("https://example.test/event-cursor-new-subject"),
+            IRI("https://example.test/event-cursor-new-predicate"),
+            Literal("new", XSD_STRING),
+        )
+    finally:
+        _GOVERNED_STORAGES.pop(id(store), None)
+        await first_storage.close()
+
+    restarted_storage = AsyncStorage(
+        database_path,
+        agent_id=credentials.agent_did,
+        _assertion_tenant_capability=capability,
+    )
+    await restarted_storage.initialize()
+    try:
+        restarted_store = restarted_storage._assertion_store()
+        _GOVERNED_STORAGES[id(restarted_store)] = restarted_storage
+        restarted = SemanticMaintenanceService(
+            restarted_store,
+            inference_profile=_profile(),
+            limits=SemanticMaintenanceLimits(max_assertions=3, max_derivations=3),
+        )
+        resumed = await restarted.run()
+        assert resumed.status is SemanticMaintenanceStatus.COMPLETE
+        assert resumed.changes_consumed == 1
+        assert (await restarted.run()).status is SemanticMaintenanceStatus.NO_OP
+    finally:
+        _GOVERNED_STORAGES.pop(id(restarted_store), None)
+        await restarted_storage.close()
+
+
+@pytest.mark.asyncio
 async def test_semantic_maintenance_replays_its_generated_derivation_before_checkpointing(
     assertion_store,
 ) -> None:
@@ -1069,6 +1178,55 @@ async def test_semantic_maintenance_replays_its_generated_derivation_before_chec
     assert third.changes_consumed == 0
     readiness = await service.training_readiness()
     assert readiness.ready
+
+
+@pytest.mark.asyncio
+async def test_incremental_maintenance_replays_generated_events_before_readiness(
+    assertion_store,
+) -> None:
+    """Normal input batches must replay their own derived outbox events too."""
+
+    service = SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=_profile(),
+        limits=SemanticMaintenanceLimits(max_assertions=3, max_derivations=3),
+    )
+    # Establish the selected capability first.  The subsequent facts therefore
+    # take the ordinary ``materialize_targets`` path rather than repair scan.
+    assert (await service.run()).status is SemanticMaintenanceStatus.NO_OP
+
+    class_a = IRI("https://example.test/IncrementalClassA")
+    class_b = IRI("https://example.test/IncrementalClassB")
+    subject = IRI("https://example.test/incremental-subject")
+    await _put(
+        assertion_store,
+        "incremental-a-sub-b",
+        class_a,
+        RDFS_SUBCLASS,
+        class_b,
+    )
+    await _put(
+        assertion_store,
+        "incremental-subject-a",
+        subject,
+        RDF_TYPE,
+        class_a,
+    )
+
+    first = await service.run()
+    assert first.status is SemanticMaintenanceStatus.PARTIAL
+    assert first.reason == "change_replay"
+    assert first.assertions_inferred == 1
+    assert first.backlog_assertions >= 1
+    readiness = await service.training_readiness()
+    assert not readiness.ready
+    assert readiness.reason == "semantic_maintenance_partial"
+
+    second = await service.run()
+    assert second.status is SemanticMaintenanceStatus.COMPLETE
+    assert second.changes_consumed == 1
+    assert (await service.training_readiness()).ready
+    assert (await service.run()).status is SemanticMaintenanceStatus.NO_OP
 
 
 @pytest.mark.asyncio
@@ -1608,11 +1766,14 @@ async def test_incremental_maintenance_joins_schema_after_schema_checkpoint(
     await _put(assertion_store, "incremental-join-instance", subject, RDF_TYPE, class_a)
     result = await service.run()
 
-    assert result.status is SemanticMaintenanceStatus.COMPLETE
-    assert result.reason is None
+    assert result.status is SemanticMaintenanceStatus.PARTIAL
+    assert result.reason == "change_replay"
     assert await assertion_store.query(
         AssertionQuery(subject=subject, predicate=RDF_TYPE, object=class_b)
     )
+    replay = await service.run()
+    assert replay.status is SemanticMaintenanceStatus.COMPLETE
+    assert replay.changes_consumed == 1
 
 
 @pytest.mark.asyncio
@@ -1813,6 +1974,109 @@ async def test_context_budget_change_invalidates_completed_maintenance_checkpoin
 
 
 @pytest.mark.asyncio
+async def test_validation_capability_digest_tracks_registry_selected_pins(
+    assertion_store,
+    monkeypatch,
+) -> None:
+    """One selector must not hide a different verified profile artifact."""
+
+    import kestrel_sovereign.knowledge.maintenance as maintenance_module
+    from kestrel_sovereign.knowledge.registry import (
+        KnowledgeRegistryError,
+        get_knowledge_registry,
+    )
+
+    service = SemanticMaintenanceService(assertion_store, inference_profile=None)
+    await _put(
+        assertion_store,
+        "capability-pin-target",
+        IRI("https://example.test/capability-pin-subject"),
+        IRI("https://example.test/capability-pin-predicate"),
+        Literal("value", XSD_STRING),
+    )
+    initial = await service.run()
+    assert initial.status is SemanticMaintenanceStatus.COMPLETE
+    initial_pins = initial.capability_versions["validation_artifact_pins"]
+
+    registry = get_knowledge_registry()
+    selected_profile = registry.select_capability(service.validation_capability)
+    selected_shapes = registry.resolve_capability(
+        service.shape_set.identifier,
+        service.shape_set.version,
+    )
+    changed_sha = "0" * 64
+    if selected_profile.resource.sha256 == changed_sha:
+        changed_sha = "f" * 64
+    changed_resource = replace(selected_profile.resource, sha256=changed_sha)
+
+    def replace_profile_resource(resource):
+        if (
+            resource.identifier == selected_profile.resource.identifier
+            and resource.version == selected_profile.resource.version
+        ):
+            return changed_resource
+        return resource
+
+    changed_profile = replace(
+        selected_profile,
+        resource=changed_resource,
+        import_closure=tuple(
+            replace_profile_resource(item)
+            for item in selected_profile.import_closure
+        ),
+    )
+    changed_shapes = replace(
+        selected_shapes,
+        import_closure=tuple(
+            replace_profile_resource(item)
+            for item in selected_shapes.import_closure
+        ),
+    )
+
+    class ChangedPinRegistry:
+        def select_capability(self, capability, **kwargs):
+            assert capability == service.validation_capability
+            return changed_profile
+
+        def resolve_capability(self, identifier, version, **kwargs):
+            assert (identifier, version) == (
+                service.shape_set.identifier,
+                service.shape_set.version,
+            )
+            return changed_shapes
+
+    monkeypatch.setattr(
+        maintenance_module,
+        "get_knowledge_registry",
+        lambda: ChangedPinRegistry(),
+    )
+    stale = await service.training_readiness()
+    assert not stale.ready
+    assert stale.reason == "semantic_maintenance_capability_mismatch"
+
+    changed = await service.run()
+    assert changed.status is SemanticMaintenanceStatus.COMPLETE
+    assert changed.status is not SemanticMaintenanceStatus.NO_OP
+    assert changed.capability_versions["validation_artifact_pins"] != initial_pins
+
+    class UnavailableRegistry:
+        def select_capability(self, capability, **kwargs):
+            raise KnowledgeRegistryError("missing selected validation artifact")
+
+    monkeypatch.setattr(
+        maintenance_module,
+        "get_knowledge_registry",
+        lambda: UnavailableRegistry(),
+    )
+    unavailable = await service.training_readiness()
+    assert not unavailable.ready
+    assert unavailable.reason == "semantic_maintenance_capability_unavailable"
+    failed = await service.run()
+    assert failed.status is SemanticMaintenanceStatus.FAILED
+    assert failed.reason == "semantic_maintenance_capability_unavailable"
+
+
+@pytest.mark.asyncio
 async def test_semantic_maintenance_records_review_only_contradiction_candidate(
     assertion_store,
 ) -> None:
@@ -1934,6 +2198,137 @@ async def test_semantic_maintenance_lease_is_atomic_and_fences_state_writes(
 
 
 @pytest.mark.asyncio
+async def test_terminal_maintenance_evidence_is_fenced_and_atomic(
+    assertion_store,
+    monkeypatch,
+) -> None:
+    """A stale worker cannot overwrite a successor's terminal run evidence."""
+
+    first_service = SemanticMaintenanceService(assertion_store, inference_profile=None)
+    successor_service = SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=None,
+    )
+    first = await first_service._acquire_lease("terminal-first")  # noqa: SLF001
+    assert first is not None
+    try:
+        await first_service._record_running(  # noqa: SLF001 - run evidence setup
+            "shared-terminal-run",
+            "profile",
+            0,
+            first,
+        )
+        await assertion_store._database.execute(  # noqa: SLF001 - expiry interleaving
+            "UPDATE semantic_maintenance_leases SET expires_at = 0 WHERE tenant_id = ?",
+            (assertion_store.tenant_id,),
+        )
+        successor = await successor_service._acquire_lease("terminal-successor")  # noqa: SLF001
+        assert successor is not None
+        try:
+            await successor_service._record_running(  # noqa: SLF001 - successor attempt
+                "shared-terminal-run",
+                "profile",
+                0,
+                successor,
+            )
+            complete = successor_service._result(  # noqa: SLF001 - terminal fixture
+                run_id="shared-terminal-run",
+                status=SemanticMaintenanceStatus.COMPLETE,
+                reason=None,
+                source_generation=0,
+                checkpoint_generation=0,
+                capability_versions={},
+            )
+            await successor_service._record_state(  # noqa: SLF001 - atomic terminal commit
+                complete,
+                "profile",
+                successor,
+            )
+
+            stale_failed = first_service._result(  # noqa: SLF001 - stale terminal fixture
+                run_id="shared-terminal-run",
+                status=SemanticMaintenanceStatus.FAILED,
+                reason="semantic_maintenance_lease_lost",
+                source_generation=0,
+                checkpoint_generation=0,
+                capability_versions={},
+            )
+            with pytest.raises(
+                SemanticMaintenanceError,
+                match="semantic_maintenance_lease_lost",
+            ):
+                await first_service._record_run(  # noqa: SLF001 - stale run evidence contract
+                    stale_failed,
+                    "profile",
+                    first,
+                )
+            with pytest.raises(
+                SemanticMaintenanceError,
+                match="semantic_maintenance_lease_lost",
+            ):
+                await first_service._record_state(  # noqa: SLF001 - stale writer contract
+                    stale_failed,
+                    "profile",
+                    first,
+                )
+            assert await assertion_store._database.fetchone(  # noqa: SLF001 - terminal evidence contract
+                "SELECT status, reason FROM semantic_maintenance_runs "
+                "WHERE tenant_id = ? AND run_id = ?",
+                (assertion_store.tenant_id, "shared-terminal-run"),
+            ) == ("complete", None)
+            assert await assertion_store._database.fetchone(  # noqa: SLF001 - state contract
+                "SELECT run_id, status FROM semantic_maintenance_state WHERE tenant_id = ?",
+                (assertion_store.tenant_id,),
+            ) == ("shared-terminal-run", "complete")
+
+            await successor_service._record_running(  # noqa: SLF001 - crash-window setup
+                "crash-window-run",
+                "profile",
+                0,
+                successor,
+            )
+            crash_result = successor_service._result(  # noqa: SLF001 - crash fixture
+                run_id="crash-window-run",
+                status=SemanticMaintenanceStatus.PARTIAL,
+                reason="assertion_budget",
+                source_generation=0,
+                checkpoint_generation=0,
+                capability_versions={},
+            )
+            original_execute = assertion_store._database.execute
+
+            async def fail_state_write(sql, params=()):
+                if "INSERT INTO semantic_maintenance_state" in sql:
+                    raise RuntimeError("simulated state-write crash")
+                return await original_execute(sql, params)
+
+            monkeypatch.setattr(
+                assertion_store._database,
+                "execute",
+                fail_state_write,
+            )
+            with pytest.raises(TransactionError, match="simulated state-write crash"):
+                await successor_service._record_state(  # noqa: SLF001 - atomic rollback contract
+                    crash_result,
+                    "profile",
+                    successor,
+                )
+            assert await assertion_store._database.fetchone(  # noqa: SLF001 - crash atomicity
+                "SELECT status FROM semantic_maintenance_runs "
+                "WHERE tenant_id = ? AND run_id = ?",
+                (assertion_store.tenant_id, "crash-window-run"),
+            ) == ("running",)
+            assert await assertion_store._database.fetchone(  # noqa: SLF001 - prior state survives
+                "SELECT run_id, status FROM semantic_maintenance_state WHERE tenant_id = ?",
+                (assertion_store.tenant_id,),
+            ) == ("shared-terminal-run", "complete")
+        finally:
+            await successor_service._release_lease(successor)  # noqa: SLF001
+    finally:
+        await first_service._release_lease(first)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
 async def test_semantic_maintenance_resumes_same_generation_supersession_events(
     assertion_store,
 ) -> None:
@@ -2035,6 +2430,104 @@ async def test_semantic_maintenance_revalidates_active_neighbours_after_delete(
     assert observed_focus
     assert surviving.assertion_id in set(observed_focus[0] or ())
     assert await assertion_store.get_assertion(surviving.assertion_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_deleted_neighbour_targets_share_one_global_context_budget(
+    assertion_store,
+    monkeypatch,
+) -> None:
+    """Many deletions cannot multiply three full neighbour queries each."""
+
+    subject = IRI("https://example.test/shared-deletion-neighbourhood")
+    survivors = [
+        await _put(
+            assertion_store,
+            f"shared-survivor-{index}",
+            subject,
+            IRI(f"https://example.test/shared-survivor-predicate-{index}"),
+            Literal(f"survivor-{index}", XSD_STRING),
+        )
+        for index in range(4)
+    ]
+    removed = [
+        await _put(
+            assertion_store,
+            f"shared-deleted-{index}",
+            subject,
+            IRI(f"https://example.test/shared-deleted-predicate-{index}"),
+            Literal(f"deleted-{index}", XSD_STRING),
+        )
+        for index in range(5)
+    ]
+    limits = SemanticMaintenanceLimits(
+        max_assertions=3,
+        max_context_assertions=2,
+    )
+    service = SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=None,
+        limits=limits,
+    )
+    for _ in range(8):
+        settled = await service.run()
+        if settled.status is SemanticMaintenanceStatus.COMPLETE:
+            break
+    else:
+        pytest.fail("initial maintenance did not drain the active graph")
+
+    for assertion in removed:
+        await assertion_store.delete(assertion.assertion_id, assertion.revision_id)
+
+    neighbour_queries: list[AssertionQuery] = []
+    original_query = type(assertion_store).query
+
+    async def capture_neighbour_query(self, query=None):
+        if self is assertion_store and isinstance(query, AssertionQuery) and (
+            query.subject == subject
+            and query.predicate is None
+            and query.object is None
+            and not query.assertion_ids
+            and not query.exclude_assertion_ids
+        ):
+            neighbour_queries.append(query)
+        return await original_query(self, query)
+
+    observed_focus: list[tuple[str, ...]] = []
+    original_validate = GovernedSemanticValidationService.validate_current
+
+    async def capture_focus(self, *args, **kwargs):
+        focus = kwargs.get("assertion_ids")
+        if focus is not None:
+            observed_focus.append(tuple(focus))
+        return await original_validate(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        type(assertion_store),
+        "query",
+        capture_neighbour_query,
+    )
+    monkeypatch.setattr(
+        GovernedSemanticValidationService,
+        "validate_current",
+        capture_focus,
+    )
+    result = await service.run()
+
+    assert result.status is SemanticMaintenanceStatus.PARTIAL
+    assert result.reason == "assertion_budget"
+    assert result.backlog_assertions >= 1
+    # The first shared-subject query hits the remaining-context sentinel.  A
+    # bounded current-scan fallback takes over instead of probing every
+    # deleted assertion's subject/predicate/object neighbourhood.
+    assert len(neighbour_queries) == 1
+    assert neighbour_queries[0].subject == subject
+    assert all(query.limit <= limits.max_context_assertions + 1 for query in neighbour_queries)
+    assert observed_focus
+    assert len(observed_focus[0]) <= limits.max_assertions
+    assert set(observed_focus[0]).issubset(
+        {item.assertion_id for item in survivors}
+    )
 
 
 @pytest.mark.asyncio

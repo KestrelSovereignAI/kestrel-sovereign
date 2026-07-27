@@ -35,6 +35,13 @@ from .inference import (
     InferenceProfile,
     InferenceReconciliationResult,
 )
+from .registry import (
+    ArtifactPin,
+    ExperimentalCapabilityError,
+    KnowledgeRegistryError,
+    ResourceKind,
+    get_knowledge_registry,
+)
 from .shacl_validation import (
     ShapeSetReference,
     ShaclValidationLimits,
@@ -338,8 +345,29 @@ class SemanticMaintenanceService:
         finite budget rather than treated as an unbounded nightly closure.
         """
         started = monotonic()
-        capability_versions = self._capability_versions()
-        initial = await self._assertions.checkpoint()
+        source_checkpoint = await self._assertions.checkpoint()
+        # ``checkpoint()`` reports the latest canonical generation, which can
+        # advance for proof-ledger bookkeeping without an assertion outbox
+        # event.  State/result cursors that retain an event ID must instead
+        # retain that event's generation or ``changes_after()`` rejects them.
+        initial = await self._event_checkpoint(source_checkpoint)
+        try:
+            capability_versions = self._capability_versions()
+        except SemanticMaintenanceError:
+            # Do not let a stale capability digest turn an unavailable or
+            # unverifiable validation profile into an apparent no-op.  There
+            # is no trustworthy profile key under which to persist this
+            # result, so readiness will independently deny it as well.
+            return self._result(
+                run_id=f"failed:capability:{source_checkpoint.generation}",
+                status=SemanticMaintenanceStatus.FAILED,
+                reason="semantic_maintenance_capability_unavailable",
+                source_generation=source_checkpoint.generation,
+                checkpoint_generation=0,
+                backlog_assertions=1,
+                duration_ms=self._duration_ms(started),
+                capability_versions={},
+            )
         profile_key = _digest(capability_versions)
         holder_id = uuid4().hex
         lease = await self._acquire_lease(holder_id)
@@ -348,7 +376,7 @@ class SemanticMaintenanceService:
                 run_id=f"busy:{initial.generation}",
                 status=SemanticMaintenanceStatus.PARTIAL,
                 reason="semantic_maintenance_busy",
-                source_generation=initial.generation,
+                source_generation=source_checkpoint.generation,
                 checkpoint_generation=0,
                 backlog_assertions=1,
                 duration_ms=self._duration_ms(started),
@@ -357,6 +385,8 @@ class SemanticMaintenanceService:
 
         run_id = ""
         state: _MaintenanceState | None = None
+        state_checkpoint: AssertionCheckpoint | None = None
+        state_checkpoint_generation = 0
         state_matches = False
         force_current_scan = False
         repair_checkpoint: AssertionCheckpoint | None = None
@@ -370,6 +400,20 @@ class SemanticMaintenanceService:
             # checkpoint and later overwrite its successor's state.
             state = await self._state()
             state_matches = state is not None and state.profile_key == profile_key
+            state_checkpoint = (
+                await self._event_checkpoint(
+                    AssertionCheckpoint(
+                        self._assertions.tenant_id,
+                        state.checkpoint_generation,
+                        state.checkpoint_event_id,
+                    )
+                )
+                if state is not None
+                else None
+            )
+            state_checkpoint_generation = (
+                state_checkpoint.generation if state_checkpoint is not None else 0
+            )
             # A fresh tenant with no canonical generation has no assertions,
             # derivations, validation focus, or provenance to inspect. Record
             # its selected capability checkpoint without constructing either
@@ -380,12 +424,11 @@ class SemanticMaintenanceService:
                     run_id=run_id,
                     status=SemanticMaintenanceStatus.NO_OP,
                     reason=None,
-                    source_generation=0,
+                    source_generation=source_checkpoint.generation,
                     checkpoint_generation=0,
                     duration_ms=self._duration_ms(started),
                     capability_versions=capability_versions,
                 )
-                await self._record_run(result, profile_key)
                 await self._record_state(
                     result,
                     profile_key,
@@ -396,14 +439,11 @@ class SemanticMaintenanceService:
             if (
                 not full_rebuild
                 and state_matches
+                and state_checkpoint is not None
                 and state.status
                 in (SemanticMaintenanceStatus.COMPLETE, SemanticMaintenanceStatus.NO_OP)
                 and self._checkpoint_matches(
-                    AssertionCheckpoint(
-                        self._assertions.tenant_id,
-                        state.checkpoint_generation,
-                        state.checkpoint_event_id,
-                    ),
+                    state_checkpoint,
                     initial,
                 )
             ):
@@ -412,12 +452,11 @@ class SemanticMaintenanceService:
                     run_id=run_id,
                     status=SemanticMaintenanceStatus.NO_OP,
                     reason=None,
-                    source_generation=initial.generation,
+                    source_generation=source_checkpoint.generation,
                     checkpoint_generation=initial.generation,
                     duration_ms=self._duration_ms(started),
                     capability_versions=capability_versions,
                 )
-                await self._record_run(result, profile_key)
                 await self._record_state(
                     result,
                     profile_key,
@@ -492,19 +531,20 @@ class SemanticMaintenanceService:
                 # phase has also drained.
                 repair_active = True
             else:
-                batch = await self._changes_after(
-                    AssertionCheckpoint(
-                        self._assertions.tenant_id,
-                        state.checkpoint_generation,
-                        state.checkpoint_event_id,
+                if state_checkpoint is None:
+                    raise SemanticMaintenanceError(
+                        "semantic maintenance state is missing its checkpoint"
                     )
+                batch = await self._changes_after(
+                    state_checkpoint
                 )
                 source_changes = batch.changes
                 changes_consumed = len(source_changes)
                 backlog = batch.backlog
                 ineligible_changes = batch.ineligible_changes
                 target_assertions, fallback_full_audit = await self._current_targets(
-                    source_changes
+                    source_changes,
+                    started=started,
                 )
                 processed_checkpoint = (
                     AssertionCheckpoint(
@@ -548,7 +588,12 @@ class SemanticMaintenanceService:
                     "repair_mode": repair_mode,
                 }
             )
-            await self._record_running(run_id, profile_key, initial.generation)
+            await self._record_running(
+                run_id,
+                profile_key,
+                source_checkpoint.generation,
+                lease,
+            )
             self._check_budget(started)
 
             reports_created = 0
@@ -571,9 +616,9 @@ class SemanticMaintenanceService:
                         run_id=run_id,
                         status=SemanticMaintenanceStatus.PARTIAL,
                         reason="validation_incomplete",
-                        source_generation=initial.generation,
+                        source_generation=source_checkpoint.generation,
                         checkpoint_generation=(
-                            state.checkpoint_generation if state_matches else 0
+                            state_checkpoint_generation if state_matches else 0
                         ),
                         changes_consumed=changes_consumed,
                         assertions_validated=assertions_validated,
@@ -584,7 +629,6 @@ class SemanticMaintenanceService:
                         duration_ms=self._duration_ms(started),
                         capability_versions=capability_versions,
                     )
-                    await self._record_run(result, profile_key)
                     await self._record_state(
                         result,
                         profile_key,
@@ -652,9 +696,9 @@ class SemanticMaintenanceService:
                     run_id=run_id,
                     status=SemanticMaintenanceStatus.PARTIAL,
                     reason="report_budget",
-                    source_generation=initial.generation,
+                    source_generation=source_checkpoint.generation,
                     checkpoint_generation=(
-                        state.checkpoint_generation if state_matches else 0
+                        state_checkpoint_generation if state_matches else 0
                     ),
                     changes_consumed=changes_consumed,
                     assertions_validated=assertions_validated,
@@ -674,7 +718,6 @@ class SemanticMaintenanceService:
                     duration_ms=self._duration_ms(started),
                     capability_versions=capability_versions,
                 )
-                await self._record_run(result, profile_key)
                 await self._record_state(
                     result,
                     profile_key,
@@ -721,9 +764,9 @@ class SemanticMaintenanceService:
                     run_id=run_id,
                     status=SemanticMaintenanceStatus.PARTIAL,
                     reason="contradiction_context_budget",
-                    source_generation=initial.generation,
+                    source_generation=source_checkpoint.generation,
                     checkpoint_generation=(
-                        state.checkpoint_generation if state_matches else 0
+                        state_checkpoint_generation if state_matches else 0
                     ),
                     changes_consumed=changes_consumed,
                     assertions_validated=assertions_validated,
@@ -741,7 +784,6 @@ class SemanticMaintenanceService:
                     duration_ms=self._duration_ms(started),
                     capability_versions=capability_versions,
                 )
-                await self._record_run(result, profile_key)
                 await self._record_state(
                     result,
                     profile_key,
@@ -820,9 +862,9 @@ class SemanticMaintenanceService:
                         run_id=run_id,
                         status=SemanticMaintenanceStatus.PARTIAL,
                         reason=materialized.incomplete_reason or "inference_incomplete",
-                        source_generation=initial.generation,
+                        source_generation=source_checkpoint.generation,
                         checkpoint_generation=(
-                            state.checkpoint_generation if state_matches else 0
+                            state_checkpoint_generation if state_matches else 0
                         ),
                         changes_consumed=changes_consumed,
                         assertions_validated=assertions_validated,
@@ -840,7 +882,6 @@ class SemanticMaintenanceService:
                         duration_ms=self._duration_ms(started),
                         capability_versions=capability_versions,
                     )
-                    await self._record_run(result, profile_key)
                     await self._record_state(
                         result,
                         profile_key,
@@ -924,7 +965,8 @@ class SemanticMaintenanceService:
             # A generation is a transaction boundary rather than a cursor: a
             # supersession can emit several events at it, so partial state
             # keeps the final processed event ID as well as its generation.
-            repair_replay_required = False
+            post_work_replay_required = False
+            post_work_replay_reason: str | None = None
             if force_current_scan and not backlog:
                 if repair_checkpoint is None:
                     raise SemanticMaintenanceError("repair scan is missing its origin checkpoint")
@@ -935,21 +977,23 @@ class SemanticMaintenanceService:
                 # checkpoint would lose a write whose revision ID sorts
                 # behind the already-persisted repair cursor.
                 durable_checkpoint = repair_checkpoint
-                repair_replay_required = bool(
+                post_work_replay_required = bool(
                     await self._assertions.changes_after(
                         repair_checkpoint,
                         limit=1,
                     )
                 )
+                if post_work_replay_required:
+                    post_work_replay_reason = "repair_change_replay"
             elif backlog:
                 if processed_checkpoint is not None:
                     durable_checkpoint = processed_checkpoint
                 elif state_matches:
-                    durable_checkpoint = AssertionCheckpoint(
-                        self._assertions.tenant_id,
-                        state.checkpoint_generation,
-                        state.checkpoint_event_id,
-                    )
+                    if state_checkpoint is None:
+                        raise SemanticMaintenanceError(
+                            "semantic maintenance state is missing its checkpoint"
+                        )
+                    durable_checkpoint = state_checkpoint
                 else:
                     durable_checkpoint = AssertionCheckpoint(
                         self._assertions.tenant_id, 0, None
@@ -958,18 +1002,34 @@ class SemanticMaintenanceService:
                 if processed_checkpoint is not None:
                     durable_checkpoint = processed_checkpoint
                 elif state_matches:
-                    durable_checkpoint = AssertionCheckpoint(
-                        self._assertions.tenant_id,
-                        state.checkpoint_generation,
-                        state.checkpoint_event_id,
-                    )
+                    if state_checkpoint is None:
+                        raise SemanticMaintenanceError(
+                            "semantic maintenance state is missing its checkpoint"
+                        )
+                    durable_checkpoint = state_checkpoint
                 else:
                     durable_checkpoint = AssertionCheckpoint(
                         self._assertions.tenant_id, 0, None
                     )
+                # Normal incremental materialization can create derived
+                # assertions after its selected input events.  They are not
+                # covered merely because this unit's inference call returned
+                # COMPLETE: they must be observed as inputs by another
+                # bounded maintenance unit before training/readiness can
+                # claim closure.
+                if not force_current_scan and not backlog:
+                    self._check_budget(started)
+                    post_work_replay_required = bool(
+                        await self._assertions.changes_after(
+                            durable_checkpoint,
+                            limit=1,
+                        )
+                    )
+                    if post_work_replay_required:
+                        post_work_replay_reason = "change_replay"
             status = (
                 SemanticMaintenanceStatus.PARTIAL
-                if backlog or reconciliation_backlog or repair_replay_required
+                if backlog or reconciliation_backlog or post_work_replay_required
                 else SemanticMaintenanceStatus.COMPLETE
             )
             result = self._result(
@@ -980,11 +1040,11 @@ class SemanticMaintenanceService:
                     if backlog
                     else "derivation_budget"
                     if reconciliation_backlog
-                    else "repair_change_replay"
-                    if repair_replay_required
+                    else post_work_replay_reason
+                    if post_work_replay_required
                     else None
                 ),
-                source_generation=initial.generation,
+                source_generation=source_checkpoint.generation,
                 checkpoint_generation=durable_checkpoint.generation,
                 changes_consumed=changes_consumed,
                 assertions_validated=assertions_validated,
@@ -1001,12 +1061,11 @@ class SemanticMaintenanceService:
                 backlog_assertions=max(
                     backlog,
                     reconciliation_backlog,
-                    int(repair_replay_required),
+                    int(post_work_replay_required),
                 ),
                 duration_ms=self._duration_ms(started),
                 capability_versions=capability_versions,
             )
-            await self._record_run(result, profile_key)
             # A partial batch has completed its bounded unit.  Its checkpoint
             # is therefore durable; the nonzero backlog says exactly why the
             # next sleep must take another unit rather than claiming closure.
@@ -1030,13 +1089,12 @@ class SemanticMaintenanceService:
                 run_id=run_id or f"budget:{initial.generation}",
                 status=SemanticMaintenanceStatus.PARTIAL,
                 reason="wall_time",
-                source_generation=initial.generation,
-                checkpoint_generation=(state.checkpoint_generation if state else 0),
+                source_generation=source_checkpoint.generation,
+                checkpoint_generation=state_checkpoint_generation,
                 backlog_assertions=1,
                 duration_ms=self._duration_ms(started),
                 capability_versions=capability_versions,
             )
-            await self._record_run(result, profile_key)
             if run_id:
                 # A timeout after selecting a repair page must leave that
                 # page retryable.  Recording only the run result used to
@@ -1075,19 +1133,21 @@ class SemanticMaintenanceService:
                         else None
                     ),
                 )
+            else:
+                await self._record_run_if_current(result, profile_key, lease)
             return result
         except MaintenanceLeaseLostError:
             result = self._result(
                 run_id=run_id or f"failed:{initial.generation}",
                 status=SemanticMaintenanceStatus.FAILED,
                 reason="semantic_maintenance_lease_lost",
-                source_generation=initial.generation,
-                checkpoint_generation=(state.checkpoint_generation if state else 0),
+                source_generation=source_checkpoint.generation,
+                checkpoint_generation=state_checkpoint_generation,
                 backlog_assertions=1,
                 duration_ms=self._duration_ms(started),
                 capability_versions=capability_versions,
             )
-            await self._record_run(result, profile_key)
+            await self._record_run_if_current(result, profile_key, lease)
             return result
         except Exception as error:
             logger.exception(
@@ -1098,13 +1158,13 @@ class SemanticMaintenanceService:
                 run_id=run_id or f"failed:{initial.generation}",
                 status=SemanticMaintenanceStatus.FAILED,
                 reason=(str(error) if isinstance(error, SemanticMaintenanceError) else type(error).__name__),
-                source_generation=initial.generation,
-                checkpoint_generation=(state.checkpoint_generation if state else 0),
+                source_generation=source_checkpoint.generation,
+                checkpoint_generation=state_checkpoint_generation,
                 backlog_assertions=1,
                 duration_ms=self._duration_ms(started),
                 capability_versions=capability_versions,
             )
-            await self._record_run(result, profile_key)
+            await self._record_run_if_current(result, profile_key, lease)
             return result
         finally:
             await self._release_lease(lease)
@@ -1147,20 +1207,34 @@ class SemanticMaintenanceService:
                 "prior verified snapshot consumption is unavailable until a durable "
                 "governed corpus snapshot exists"
             )
-        current = await self._assertions.checkpoint()
-        profile_key = _digest(self._capability_versions())
+        current = await self._event_checkpoint(await self._assertions.checkpoint())
+        try:
+            profile_key = _digest(self._capability_versions())
+        except SemanticMaintenanceError:
+            return SemanticMaintenanceTrainingReadiness(
+                False,
+                "semantic_maintenance_capability_unavailable",
+            )
         state = await self._state()
-        if (
-            state is not None
-            and state.profile_key == profile_key
-            and state.status
-            in (SemanticMaintenanceStatus.COMPLETE, SemanticMaintenanceStatus.NO_OP)
-            and self._checkpoint_matches(
+        state_checkpoint = (
+            await self._event_checkpoint(
                 AssertionCheckpoint(
                     self._assertions.tenant_id,
                     state.checkpoint_generation,
                     state.checkpoint_event_id,
-                ),
+                )
+            )
+            if state is not None
+            else None
+        )
+        if (
+            state is not None
+            and state_checkpoint is not None
+            and state.profile_key == profile_key
+            and state.status
+            in (SemanticMaintenanceStatus.COMPLETE, SemanticMaintenanceStatus.NO_OP)
+            and self._checkpoint_matches(
+                state_checkpoint,
                 current,
             )
         ):
@@ -1260,7 +1334,10 @@ class SemanticMaintenanceService:
         )
 
     async def _current_targets(
-        self, changes: Sequence[AssertionChange]
+        self,
+        changes: Sequence[AssertionChange],
+        *,
+        started: float,
     ) -> tuple[tuple[Assertion, ...], bool]:
         """Resolve active validation/audit focus for lifecycle changes.
 
@@ -1275,8 +1352,17 @@ class SemanticMaintenanceService:
         acknowledge the event cursor.
         """
         targets: dict[str, Assertion] = {}
+        context_target_ids: set[str] = set()
+        queried_neighbourhoods: dict[tuple[str, object], bool] = {}
         fallback_full_audit = False
         for change in changes:
+            self._check_budget(started)
+            if fallback_full_audit:
+                # Once a deletion cannot be safely localized, the caller
+                # will use the bounded current-scan path.  Additional
+                # neighbour probes cannot improve that fallback and would
+                # merely multiply the work for one input batch.
+                break
             if change.assertion_id is None:
                 fallback_full_audit = True
                 continue
@@ -1296,13 +1382,27 @@ class SemanticMaintenanceService:
             if historical is None:
                 fallback_full_audit = True
                 continue
-            related, overflow = await self._affected_active_targets(historical)
+            related, overflow, has_active_neighbour = await self._affected_active_targets(
+                historical,
+                remaining_context_assertions=(
+                    self.limits.max_context_assertions - len(context_target_ids)
+                ),
+                started=started,
+                known_assertion_ids=set(targets),
+                queried_neighbourhoods=queried_neighbourhoods,
+            )
             for assertion in related:
+                if assertion.assertion_id in targets:
+                    continue
+                if len(context_target_ids) >= self.limits.max_context_assertions:
+                    overflow = True
+                    break
                 targets[assertion.assertion_id] = assertion
+                context_target_ids.add(assertion.assertion_id)
             # A removed fact with no active term neighbour can still affect a
             # non-local shape (for example, a required relationship), so it
             # must use the full-audit path rather than becoming a no-op.
-            if overflow or not related:
+            if overflow or not has_active_neighbour:
                 fallback_full_audit = True
 
         ordered = tuple(sorted(targets.values(), key=lambda item: item.assertion_id))
@@ -1311,25 +1411,73 @@ class SemanticMaintenanceService:
         return ordered, fallback_full_audit
 
     async def _affected_active_targets(
-        self, removed: Assertion
-    ) -> tuple[tuple[Assertion, ...], bool]:
-        """Find a bounded active term-neighbourhood for an inactive revision."""
-        query_limit = min(1_000, self._primary_assertion_limit + 1)
-        queries = (
-            AssertionQuery(subject=removed.subject, limit=query_limit),
-            AssertionQuery(predicate=removed.predicate, limit=query_limit),
-            AssertionQuery(object=removed.object, limit=query_limit),
+        self,
+        removed: Assertion,
+        *,
+        remaining_context_assertions: int,
+        started: float,
+        known_assertion_ids: set[str],
+        queried_neighbourhoods: dict[tuple[str, object], bool],
+    ) -> tuple[tuple[Assertion, ...], bool, bool]:
+        """Find a globally bounded active term-neighbourhood for a deletion.
+
+        Deletions often share terms.  Cache those indexed probes and spend one
+        shared context allowance across the whole input batch rather than
+        granting every deleted revision another three full-sized queries.
+        """
+
+        query_specs = (
+            ("subject", removed.subject),
+            ("predicate", removed.predicate),
+            ("object", removed.object),
         )
         related: dict[str, Assertion] = {}
         overflow = False
-        for query in queries:
+        has_active_neighbour = False
+        for field, term in query_specs:
+            self._check_budget(started)
+            query_key = (field, term)
+            previous_has_active = queried_neighbourhoods.get(query_key)
+            if previous_has_active is not None:
+                has_active_neighbour = has_active_neighbour or previous_has_active
+                continue
+            remaining = remaining_context_assertions - len(related)
+            if remaining <= 0:
+                # We cannot establish a new relation without exceeding the
+                # unit-wide context cap, so defer to the bounded full scan.
+                return (
+                    tuple(
+                        sorted(related.values(), key=lambda item: item.assertion_id)
+                    ),
+                    True,
+                    has_active_neighbour,
+                )
+            query_limit = min(1_000, remaining + 1)
+            if field == "subject":
+                query = AssertionQuery(subject=removed.subject, limit=query_limit)
+            elif field == "predicate":
+                query = AssertionQuery(predicate=removed.predicate, limit=query_limit)
+            else:
+                query = AssertionQuery(object=removed.object, limit=query_limit)
             matches = await self._assertions.query(query)
+            has_matches = bool(matches)
+            queried_neighbourhoods[query_key] = has_matches
+            has_active_neighbour = has_active_neighbour or has_matches
             if len(matches) == query_limit:
                 overflow = True
             for assertion in matches:
+                if assertion.assertion_id in known_assertion_ids:
+                    continue
+                if assertion.assertion_id in related:
+                    continue
+                if len(related) >= remaining_context_assertions:
+                    overflow = True
+                    break
                 related[assertion.assertion_id] = assertion
+            if overflow:
+                break
         ordered = tuple(sorted(related.values(), key=lambda item: item.assertion_id))
-        return ordered, overflow or len(ordered) > self._primary_assertion_limit
+        return ordered, overflow, has_active_neighbour
 
     async def _revalidate(
         self,
@@ -1627,18 +1775,82 @@ class SemanticMaintenanceService:
         )
 
     async def _record_running(
-        self, run_id: str, profile_key: str, source_generation: int
+        self,
+        run_id: str,
+        profile_key: str,
+        source_generation: int,
+        lease: _MaintenanceLease,
     ) -> None:
         now = _now()
-        await self._database.execute(
-            "INSERT INTO semantic_maintenance_runs "
-            "(tenant_id, run_id, profile_key, source_generation, status, reason, result_mapping, started_at, completed_at) "
-            "VALUES (?, ?, ?, ?, 'running', NULL, '{}', ?, NULL) "
-            "ON CONFLICT(tenant_id, run_id) DO UPDATE SET status = 'running', reason = NULL, started_at = excluded.started_at, completed_at = NULL",
-            (self._assertions.tenant_id, run_id, profile_key, source_generation, now),
-        )
+        try:
+            async with self._database.transaction():
+                await self._renew_fenced_lease_in_transaction(lease)
+                await self._database.execute(
+                    "INSERT INTO semantic_maintenance_runs "
+                    "(tenant_id, run_id, profile_key, source_generation, status, reason, result_mapping, started_at, completed_at) "
+                    "VALUES (?, ?, ?, ?, 'running', NULL, '{}', ?, NULL) "
+                    "ON CONFLICT(tenant_id, run_id) DO UPDATE SET "
+                    "profile_key = excluded.profile_key, "
+                    "source_generation = excluded.source_generation, "
+                    "status = 'running', reason = NULL, "
+                    "result_mapping = '{}', started_at = excluded.started_at, "
+                    "completed_at = NULL",
+                    (
+                        self._assertions.tenant_id,
+                        run_id,
+                        profile_key,
+                        source_generation,
+                        now,
+                    ),
+                )
+        except TransactionError as error:
+            if isinstance(error.__cause__, MaintenanceLeaseLostError):
+                raise SemanticMaintenanceError("semantic_maintenance_lease_lost") from error
+            raise
 
-    async def _record_run(self, result: SemanticMaintenanceResult, profile_key: str) -> None:
+    async def _record_run(
+        self,
+        result: SemanticMaintenanceResult,
+        profile_key: str,
+        lease: _MaintenanceLease,
+    ) -> None:
+        """Persist a terminal run only while this exact lease remains current."""
+        try:
+            async with self._database.transaction():
+                await self._renew_fenced_lease_in_transaction(lease)
+                await self._write_terminal_run_in_transaction(result, profile_key)
+        except TransactionError as error:
+            if isinstance(error.__cause__, MaintenanceLeaseLostError):
+                raise SemanticMaintenanceError("semantic_maintenance_lease_lost") from error
+            raise
+        self._log_result(result)
+
+    async def _record_run_if_current(
+        self,
+        result: SemanticMaintenanceResult,
+        profile_key: str,
+        lease: _MaintenanceLease,
+    ) -> bool:
+        """Best-effort terminal evidence for an already-failed worker.
+
+        A result returned to a stale caller is useful diagnostics, but it must
+        not become durable evidence after a successor owns the fence.
+        """
+
+        try:
+            await self._record_run(result, profile_key, lease)
+        except SemanticMaintenanceError as error:
+            if str(error) == "semantic_maintenance_lease_lost":
+                return False
+            raise
+        return True
+
+    async def _write_terminal_run_in_transaction(
+        self,
+        result: SemanticMaintenanceResult,
+        profile_key: str,
+    ) -> None:
+        """Write terminal evidence under the caller's already-renewed fence."""
         now = _now()
         await self._database.execute(
             "INSERT INTO semantic_maintenance_runs "
@@ -1657,6 +1869,8 @@ class SemanticMaintenanceService:
                 now,
             ),
         )
+
+    def _log_result(self, result: SemanticMaintenanceResult) -> None:
         logger.info(
             "semantic_maintenance",
             extra={
@@ -1693,6 +1907,11 @@ class SemanticMaintenanceService:
         try:
             async with self._database.transaction():
                 await self._renew_fenced_lease_in_transaction(lease)
+                # Keep terminal evidence and its authoritative state in one
+                # lease-fenced transaction.  A stale holder cannot overwrite
+                # a successor's terminal row, and a crash cannot commit one
+                # half of the terminal record without the other.
+                await self._write_terminal_run_in_transaction(result, profile_key)
                 changed = await self._database.execute(
                     "INSERT INTO semantic_maintenance_state "
                     "(tenant_id, profile_key, checkpoint_generation, checkpoint_event_id, run_id, status, capability_versions, repair_cursor_revision_id, repair_active, repair_mode, repair_scan_complete, repair_checkpoint_generation, repair_checkpoint_event_id, repair_reconcile_cursor_derivation_id, audit_assertion_id, audit_assertion_revision_id, audit_competitor_cursor_revision_id, updated_at) "
@@ -1749,6 +1968,7 @@ class SemanticMaintenanceService:
             raise
         if changed != 1:
             raise SemanticMaintenanceError("semantic_maintenance_lease_lost")
+        self._log_result(result)
 
     async def _database_time(self) -> float:
         if self._database.backend_type == "postgres":
@@ -1835,6 +2055,7 @@ class SemanticMaintenanceService:
         return changed == 1
 
     def _capability_versions(self) -> dict[str, str]:
+        validation_pins = self._validation_artifact_pins()
         maintenance_budget = {
             "max_wall_time_seconds": self.limits.max_wall_time_seconds,
             "max_assertions": self.limits.max_assertions,
@@ -1844,11 +2065,25 @@ class SemanticMaintenanceService:
             "max_context_assertions": self.limits.max_context_assertions,
         }
         versions = {
-            "semantic_maintenance": "v2",
+            "semantic_maintenance": "v3",
             "maintenance_budget": _digest(maintenance_budget),
             "shape_set": f"{self.shape_set.identifier}@{self.shape_set.version}",
             "validation_capability": self.validation_capability,
             "validation_profile_version": self.validation_profile_version or "registry-selected",
+            # A capability string is only a selector.  The selected profile,
+            # its imports, and the shape-set import closure are the immutable
+            # validation contract that must invalidate an earlier no-op when
+            # the registry selects different bytes under the same selector.
+            "validation_artifact_pins": _digest(
+                [
+                    {
+                        "identifier": pin.identifier,
+                        "version": str(pin.version),
+                        "sha256": pin.sha256,
+                    }
+                    for pin in validation_pins
+                ]
+            ),
         }
         if self.inference_profile is not None:
             versions["inference_profile"] = self.inference_profile.key
@@ -1858,6 +2093,65 @@ class SemanticMaintenanceService:
                 f"{self.inference_profile.ontology.version}"
             )
         return versions
+
+    def _validation_artifact_pins(self) -> tuple[ArtifactPin, ...]:
+        """Resolve the exact, verified SHACL artifacts used by maintenance.
+
+        ``validation_capability`` is intentionally not itself a durable
+        identity: the registry can select a different pin for the same
+        capability.  Mirror the validator's capability/shape compatibility
+        checks before any early no-op or readiness decision, and retain every
+        verified profile/shape import pin in a canonical order.
+        """
+
+        try:
+            registry = get_knowledge_registry()
+            profile = registry.select_capability(self.validation_capability)
+            if profile.resource.kind is not ResourceKind.VALIDATION_PROFILE:
+                raise SemanticMaintenanceError(
+                    "semantic_maintenance_validation_capability_unavailable"
+                )
+            if (
+                self.validation_profile_version is not None
+                and str(profile.resource.version) != self.validation_profile_version
+            ):
+                raise SemanticMaintenanceError(
+                    "semantic_maintenance_validation_capability_unavailable"
+                )
+            shapes = registry.resolve_capability(
+                self.shape_set.identifier,
+                self.shape_set.version,
+            )
+        except (ExperimentalCapabilityError, KnowledgeRegistryError) as error:
+            raise SemanticMaintenanceError(
+                "semantic_maintenance_validation_capability_unavailable"
+            ) from error
+
+        if shapes.resource.kind is not ResourceKind.SHAPE_SET:
+            raise SemanticMaintenanceError(
+                "semantic_maintenance_validation_capability_unavailable"
+            )
+        shape_imports = {
+            (item.identifier, str(item.version)) for item in shapes.import_closure
+        }
+        if (profile.resource.identifier, str(profile.resource.version)) not in shape_imports:
+            raise SemanticMaintenanceError(
+                "semantic_maintenance_validation_capability_unavailable"
+            )
+
+        pins = {
+            (pin.identifier, str(pin.version), pin.sha256): pin
+            for pin in (
+                profile.resource.pin,
+                *profile.artifact_pins,
+                shapes.resource.pin,
+                *shapes.artifact_pins,
+            )
+        }
+        return tuple(
+            pins[key]
+            for key in sorted(pins)
+        )
 
     @staticmethod
     def _checkpoint_matches(
