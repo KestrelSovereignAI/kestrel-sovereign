@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Optional
 from uuid import uuid4
@@ -141,11 +142,21 @@ class TurnLifecycleMixin:
         A2A causation chain propagation) will plumb it into Signal
         envelopes so dispatcher-driven cognition can mark its CausationFrame
         with the receiving turn.
+
+        Entry and exit log at INFO, and the acquisition carries an agent-scoped
+        label. Both exist because of #2770: a turn that stalled inside this
+        region left `process_input called` as the last record for that agent, so
+        an operator could not tell a working turn from a wedged one, nor which
+        turn was holding the lock. Begin/end at DEBUG was invisible in
+        production. Two INFO lines per turn is a deliberate trade for a bounded
+        region that can otherwise silently hold an agent hostage for minutes.
         """
         turn_id = f"turn_{uuid4().hex[:12]}"
         mgr = self._get_lock_manager()
-        async with mgr.acquire({ResourceLock.CONVERSATION}):
-            logger.debug("turn_lifecycle: %s begin", turn_id)
+        label = f"{getattr(self, 'agent_name', None) or 'agent'} {turn_id}"
+        started = time.monotonic()
+        async with mgr.acquire({ResourceLock.CONVERSATION}, label=label):
+            logger.info("turn_lifecycle: %s begin", label)
             token = _CURRENT_TURN_ID.set(turn_id)
             try:
                 yield turn_id
@@ -157,4 +168,10 @@ class TurnLifecycleMixin:
                 # an old chat window (#1809). Set inside the turn body by
                 # process_input / the streaming turn; both run under this lock.
                 self._active_session_id = None
-                logger.debug("turn_lifecycle: %s end", turn_id)
+                # Duration on the exit line so a slow turn is measurable from
+                # the log alone, without correlating two timestamps by hand.
+                logger.info(
+                    "turn_lifecycle: %s end after %.1fs",
+                    label,
+                    time.monotonic() - started,
+                )
