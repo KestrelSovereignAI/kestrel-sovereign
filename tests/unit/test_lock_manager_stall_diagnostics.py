@@ -62,15 +62,93 @@ async def test_holder_defaults_to_lock_name_without_a_label():
 async def test_long_hold_is_reported_while_it_is_still_happening(
     fast_thresholds, caplog
 ):
-    """The signal that was missing: a warning from the holder's side, naming it,
+    """The signal that was missing: a report from the holder's side, naming it,
     emitted *during* the stall rather than only in hindsight."""
     mgr = OrderedLockManager()
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.INFO):
         async with mgr.acquire({ResourceLock.CONVERSATION}, label="Nellie turn_abc"):
             await asyncio.sleep(0.1)
 
     assert "has held the conversation lock" in caplog.text
     assert "Nellie turn_abc" in caplog.text
+
+
+async def test_a_slow_solo_turn_is_not_a_warning(fast_thresholds, caplog):
+    """A long hold with nobody blocked is a slow turn, not a fault.
+
+    Emitting WARNING here would fire on every legitimate long generation (the
+    tolerated envelope is ~600s per attempt, retried), and WARNING-keyed alerting
+    would learn to ignore the one line this change exists to make meaningful.
+    """
+    mgr = OrderedLockManager()
+    with caplog.at_level(logging.INFO):
+        async with mgr.acquire({ResourceLock.CONVERSATION}, label="solo-turn"):
+            await asyncio.sleep(0.1)
+
+    assert "nothing is waiting on it" in caplog.text
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+async def test_a_long_hold_that_blocks_someone_is_a_warning(fast_thresholds, caplog):
+    """Contention is the incident shape, and only here may the log claim work is
+    queued — with a real count, not an assumption."""
+    mgr = OrderedLockManager()
+    released = asyncio.Event()
+
+    async def holder():
+        async with mgr.acquire({ResourceLock.CONVERSATION}, label="holding-turn"):
+            await released.wait()
+
+    async def waiter():
+        async with mgr.acquire({ResourceLock.CONVERSATION}, label="blocked-turn"):
+            pass
+
+    with caplog.at_level(logging.WARNING):
+        holding = asyncio.ensure_future(holder())
+        await asyncio.sleep(0.01)
+        blocked = asyncio.ensure_future(waiter())
+        await asyncio.sleep(0.1)
+        released.set()
+        await asyncio.gather(holding, blocked)
+
+    assert "holding-turn" in caplog.text
+    assert "1 acquirer(s) blocked behind it" in caplog.text
+
+
+async def test_waiter_count_does_not_leak_when_a_waiter_is_cancelled(
+    fast_thresholds, caplog
+):
+    """A cancelled waiter that stayed counted would make every later holder
+    report phantom queued turns for the life of the process."""
+    mgr = OrderedLockManager()
+    released = asyncio.Event()
+
+    async def holder():
+        async with mgr.acquire({ResourceLock.CONVERSATION}, label="holding"):
+            await released.wait()
+
+    async def waiter():
+        async with mgr.acquire({ResourceLock.CONVERSATION}, label="doomed"):
+            pass
+
+    holding = asyncio.ensure_future(holder())
+    await asyncio.sleep(0.01)
+    blocked = asyncio.ensure_future(waiter())
+    await asyncio.sleep(0.03)
+    blocked.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await blocked
+    released.set()
+    await holding
+
+    # A later solo hold must report itself as unblocked, not as contended.
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        async with mgr.acquire({ResourceLock.CONVERSATION}, label="later-solo"):
+            await asyncio.sleep(0.1)
+
+    assert "nothing is waiting on it" in caplog.text
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
 async def test_a_blocked_waiter_reports_who_is_holding(fast_thresholds, caplog):
@@ -112,19 +190,27 @@ async def test_quiet_when_nothing_is_slow(fast_thresholds, caplog):
 
 async def test_watchdogs_do_not_outlive_the_hold(fast_thresholds, caplog):
     """A cancelled watchdog must not keep reporting a hold that already ended,
-    and must not leak a task past the context manager."""
+    and must not leak a task past the context manager.
+
+    The task-count assertion is exact: ``acquire`` now awaits its cancelled
+    watchdogs, so by the time the block exits none of them remain pending. A
+    tolerance of +1 here would have let a single genuinely-leaked watchdog pass.
+    """
     mgr = OrderedLockManager()
-    before = len(asyncio.all_tasks())
+    before = asyncio.all_tasks()
 
     async with mgr.acquire({ResourceLock.CONVERSATION}, label="short-turn"):
         pass
 
+    assert asyncio.all_tasks() == before
+
     caplog.clear()
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.INFO):
         await asyncio.sleep(0.1)
 
+    # A surviving watchdog would have logged within this window, since the
+    # patched threshold is 0.02s.
     assert "short-turn" not in caplog.text
-    assert len(asyncio.all_tasks()) <= before + 1
 
 
 async def test_lock_is_released_when_the_body_raises(fast_thresholds):

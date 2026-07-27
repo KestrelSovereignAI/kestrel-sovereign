@@ -48,9 +48,15 @@ logger = logging.getLogger(__name__)
 SLOW_WAIT_WARN_SECONDS = 30.0
 
 # How long a single holder may hold a lock before it is reported, and then
-# re-reported. Above the p99 healthy turn but far below the ~600s-per-attempt
-# ceiling an LLM call can reach, so a genuine stall surfaces while it is still
-# happening rather than only in hindsight.
+# re-reported. Far below the ~600s-per-attempt ceiling an LLM call can reach, so
+# a genuine stall surfaces while it is still happening rather than only in
+# hindsight.
+#
+# A long hold is NOT by itself a fault: a healthy generation can legitimately run
+# for minutes with nothing else queued. So the severity of a hold report depends
+# on whether anyone is actually blocked (see ``_warn_while_holding``) — otherwise
+# every slow-but-normal turn would emit WARNINGs for its whole duration and
+# WARNING-keyed alerting would learn to ignore exactly this signal.
 SLOW_HOLD_WARN_SECONDS = 60.0
 
 
@@ -89,6 +95,10 @@ class OrderedLockManager:
         self._locks: dict[ResourceLock, asyncio.Lock] = {}
         self._registry_lock = asyncio.Lock()
         self._holders: dict[ResourceLock, LockHolder] = {}
+        # Blocked acquirers per lock. ``asyncio.Lock`` exposes no public waiter
+        # count, and a holder cannot otherwise tell whether it is blocking
+        # anyone — which is the difference between "slow" and "harmful".
+        self._waiters: dict[ResourceLock, int] = {}
 
     async def _get(self, name: ResourceLock) -> asyncio.Lock:
         # Lazy creation; protected so first-use races don't double-create.
@@ -119,6 +129,13 @@ class OrderedLockManager:
                 lock = await self._get(name)
                 await self._acquire_one(name, lock, label)
                 acquired.append((name, lock))
+                # One hold watchdog per lock actually taken, contended or not —
+                # a hold cannot be reported from the wait side, since a stall
+                # with no waiter produces no waiter to report it. The cost is a
+                # Task allocation per acquisition; it does not reach the genuine
+                # hot path because the frequent dispatcher/scheduler sources
+                # declare empty resource sets, and an empty acquire never enters
+                # this loop at all.
                 watchdogs.append(
                     asyncio.ensure_future(self._warn_while_holding(name))
                 )
@@ -128,6 +145,11 @@ class OrderedLockManager:
             # hold that has already ended.
             for watchdog in reversed(watchdogs):
                 watchdog.cancel()
+            if watchdogs:
+                # Observe the cancellations rather than just requesting them, so
+                # an interpreter/loop teardown mid-hold cannot surface "Task was
+                # destroyed but it is pending!" noise from these diagnostics.
+                await asyncio.gather(*watchdogs, return_exceptions=True)
             for name, lock in reversed(acquired):
                 self._holders.pop(name, None)
                 lock.release()
@@ -147,7 +169,7 @@ class OrderedLockManager:
         acquisition path untouched and bolts observability alongside it.
         """
         if not lock.locked():
-            # Uncontended fast path — no task churn on the hot path. A lock
+            # Uncontended fast path: skip the wait watchdog entirely. A lock
             # taken between this check and the acquire below simply costs a
             # missed wait warning, never correctness.
             await lock.acquire()
@@ -155,9 +177,18 @@ class OrderedLockManager:
             return
 
         watchdog = asyncio.ensure_future(self._warn_while_waiting(name, label))
+        self._waiters[name] = self._waiters.get(name, 0) + 1
         try:
             await lock.acquire()
         finally:
+            # Decrement on EVERY exit, including cancellation — a cancelled
+            # waiter that stayed counted would make later holders report phantom
+            # queued turns forever.
+            remaining = self._waiters.get(name, 1) - 1
+            if remaining > 0:
+                self._waiters[name] = remaining
+            else:
+                self._waiters.pop(name, None)
             watchdog.cancel()
         self._holders[name] = LockHolder(label or name.value, time.monotonic())
 
@@ -176,7 +207,7 @@ class OrderedLockManager:
                 held = f"held {holder.held_seconds():.0f}s by {holder.label}"
             logger.warning(
                 "%s has been waiting %.0fs for the %s lock (%s). The holder is "
-                "still running; nothing is being dropped.",
+                "still holding; nothing is being dropped.",
                 label or "an acquirer",
                 waited,
                 name.value,
@@ -189,19 +220,37 @@ class OrderedLockManager:
         This is the signal that was missing in #2770: it fires while the stall
         is happening, from the holder's side, so an operator does not have to
         infer a wedge from the absence of logs.
+
+        Severity tracks actual harm rather than elapsed time. A long hold with
+        nobody waiting is a slow turn — real, worth seeing, but not a fault, and
+        emitting WARNING for it would train operators to ignore this exact line.
+        A long hold with blocked acquirers is the incident shape, and only then
+        may this claim that work is queued — the holder has no other way to know,
+        so the count comes from the manager's own waiter bookkeeping.
         """
         while True:
             await asyncio.sleep(SLOW_HOLD_WARN_SECONDS)
             holder = self._holders.get(name)
             if holder is None:
                 return
-            logger.warning(
-                "%s has held the %s lock for %.0fs. Every other turn for this "
-                "agent is queued behind it.",
-                holder.label,
-                name.value,
-                holder.held_seconds(),
-            )
+            waiting = self._waiters.get(name, 0)
+            if waiting:
+                logger.warning(
+                    "%s has held the %s lock for %.0fs with %d acquirer(s) "
+                    "blocked behind it.",
+                    holder.label,
+                    name.value,
+                    holder.held_seconds(),
+                    waiting,
+                )
+            else:
+                logger.info(
+                    "%s has held the %s lock for %.0fs (nothing is waiting on "
+                    "it).",
+                    holder.label,
+                    name.value,
+                    holder.held_seconds(),
+                )
 
     def is_held(self, name: ResourceLock) -> bool:
         """Best-effort introspection for tests/debug. Not for routing logic."""
