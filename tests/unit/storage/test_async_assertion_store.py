@@ -38,7 +38,10 @@ from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage, PrivacyViolationError
 from kestrel_sovereign.privacy import PrivacyMode
-from kestrel_sovereign.storage.sqla.migrations import migrate_semantic_assertion_store
+from kestrel_sovereign.storage.sqla.migrations import (
+    migrate_semantic_assertion_store,
+    migrate_semantic_validation_reports,
+)
 from kestrel_sovereign.security.assertion_tenant_resolver import (
     _resolve_authenticated_agent_assertion_capability,
 )
@@ -292,6 +295,9 @@ async def test_supersession_is_atomic_and_exposes_invalidation_data() -> None:
             source_occurrences=(source("replacement-source"),), operation_id="replace-region",
         )
 
+        assert result.accepted is True
+        assert result.report.conforms is True
+        assert result.write is not None
         assert result.predecessor.status.value == "superseded"
         assert result.replacement.supersedes_revision_id == result.predecessor.revision_id
         assert result.invalidated_revision_ids == (first.revision_id,)
@@ -349,6 +355,48 @@ async def test_retraction_and_erasure_cascade_to_derived_and_eligibility() -> No
         assert changes[0].eligible is False
         assert changes[0].generation == erased.generation
         assert (await store.assertion_checkpoint()).latest_event_id == changes[0].event_id
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_direct_validation_quarantine_is_refused_outside_the_governed_repair_path() -> None:
+    storage = await _storage()
+    try:
+        root = direct("validation-root")
+        await storage.put_assertion(root, source_occurrences=(source("source-1"),))
+        child = derived("validation-child", root.revision_id)
+        await storage.put_assertion(child)
+        with pytest.raises(RuntimeError, match="Direct validation quarantine is unavailable"):
+            await storage.quarantine_assertion_for_validation(
+                root.assertion_id,
+                root.revision_id,
+                report_id="validation-report-1",
+            )
+
+        assert await storage.get_assertion(root.assertion_id) == root
+        assert await storage.get_assertion(child.assertion_id) == child
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_governed_assertion_write_persists_a_pinned_validation_report_before_acceptance() -> None:
+    storage = await _storage()
+    try:
+        assertion = direct("governed-validation-write")
+
+        result = await storage.put_validated_assertion(
+            assertion,
+            source_occurrences=(source("source-1"),),
+        )
+
+        assert result.accepted is True
+        assert result.write is not None
+        assert result.report.conforms is True
+        assert await storage.get_assertion(assertion.assertion_id) == assertion
+        reports = await storage.semantic_validation_service().reports.list(assertion_id=assertion.assertion_id)
+        assert reports == [result.report]
     finally:
         await storage.close()
 
@@ -751,6 +799,32 @@ async def test_migration_is_idempotent_and_failed_write_rolls_back() -> None:
 
 
 @pytest.mark.asyncio
+async def test_inference_and_validation_schema_migrations_coexist_idempotently() -> None:
+    """Independent schema markers preserve both durable semantic ledgers."""
+    db = await AsyncDatabase.sqlite(":memory:")
+    try:
+        await migrate_semantic_assertion_store(db)
+        await migrate_semantic_validation_reports(db)
+        await migrate_semantic_assertion_store(db)
+        await migrate_semantic_validation_reports(db)
+
+        assert await db.table_exists("semantic_inference_derivations")
+        assert await db.table_exists("semantic_inference_derivation_inputs")
+        assert await db.table_exists("semantic_validation_reports")
+        assert await db.table_exists("semantic_validation_results")
+        assert await db.fetchall(
+            "SELECT version FROM semantic_schema_migrations "
+            "WHERE version IN (?, ?) ORDER BY version",
+            ("semantic_assertion_store_v3", "semantic_validation_reports_v1"),
+        ) == [
+            ("semantic_assertion_store_v3",),
+            ("semantic_validation_reports_v1",),
+        ]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_migration_scrubs_legacy_erasure_receipt_identifiers() -> None:
     backend = SQLiteBackend(":memory:")
     await backend.connect()
@@ -874,7 +948,29 @@ async def test_privacy_wrapper_governs_assertions_and_graph_proxy_denies_new_sur
             # not own a close here.
             pass
         written = await normal.put_assertion(assertion, source_occurrences=(source("privacy-source"),))
-        assert written.assertion == assertion
+        assert written.accepted is True
+        assert written.write is not None
+        assert written.write.assertion == assertion
+        assert await normal.semantic_validation_service().reports.list(
+            assertion_id=assertion.assertion_id
+        ) == [written.report]
+
+        replacement = direct(
+            "privacy-supersession-revision",
+            value="europe-west1",
+            source_id="privacy-supersession-source",
+        )
+        superseded = await normal.supersede_assertion(
+            assertion.revision_id,
+            replacement,
+            source_occurrences=(source("privacy-supersession-source"),),
+        )
+        assert superseded.accepted is True
+        assert superseded.write is not None
+        assert superseded.write.replacement.assertion_id == replacement.assertion_id
+        assert await normal.semantic_validation_service().reports.list(
+            assertion_id=replacement.assertion_id
+        ) == [superseded.report]
     finally:
         await storage.close()
 

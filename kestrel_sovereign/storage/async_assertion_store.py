@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import time
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 from uuid import uuid4
 
 from kestrel_sovereign.knowledge import (
@@ -26,6 +26,10 @@ from kestrel_sovereign.knowledge import (
     EpistemicState,
     SourceOccurrence,
 )
+from kestrel_sovereign.knowledge.shacl_validation import (
+    ShaclValidationReport,
+    ValidationWriteAction,
+)
 
 from .async_database import AsyncDatabase
 from .db.interface import TransactionError
@@ -33,6 +37,7 @@ from .db.interface import TransactionError
 
 _ASSERTION_STORE_FACTORY_TOKEN = object()
 _ASSERTION_TENANT_CAPABILITY_TOKEN = object()
+_RAW_ASSERTION_MUTATION_CAPABILITY_TOKEN = object()
 _ERASURE_JOB_TTL_SECONDS = 300.0
 _MAX_ERASURE_JOBS = 256
 
@@ -69,6 +74,30 @@ def _issue_assertion_tenant_capability(
         _ASSERTION_TENANT_CAPABILITY_TOKEN,
         agent_id,
         agent_id,
+    )
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class _RawAssertionMutationCapability:
+    """Private migration-only authority for bypassing governed ingestion."""
+
+    tenant_id: str
+
+    def __init__(self, token: object, tenant_id: str) -> None:
+        if token is not _RAW_ASSERTION_MUTATION_CAPABILITY_TOKEN:
+            raise TypeError("raw assertion mutation capabilities are issued internally")
+        object.__setattr__(self, "tenant_id", tenant_id)
+
+
+def _issue_raw_assertion_mutation_capability(
+    tenant_capability: _AssertionTenantCapability,
+) -> _RawAssertionMutationCapability:
+    """Issue a narrowly scoped private capability for one verified migration."""
+    if type(tenant_capability) is not _AssertionTenantCapability:
+        raise TypeError("raw assertion mutation capability requires tenant authority")
+    return _RawAssertionMutationCapability(
+        _RAW_ASSERTION_MUTATION_CAPABILITY_TOKEN,
+        tenant_capability.tenant_id,
     )
 
 
@@ -157,6 +186,28 @@ class DeletionResult:
 
 
 @dataclass(frozen=True, slots=True)
+class ValidationQuarantineResult:
+    """A validation-driven lifecycle transition and its derived invalidations."""
+
+    quarantined: Assertion
+    invalidated: tuple[Assertion, ...]
+    invalidated_revision_ids: tuple[str, ...]
+    generation: int
+    idempotent: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationQuarantineBatchResult:
+    """One report-backed, all-or-nothing validation repair transition."""
+
+    quarantined: tuple[Assertion, ...]
+    invalidated: tuple[Assertion, ...]
+    invalidated_revision_ids: tuple[str, ...]
+    generation: int
+    idempotent: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class ErasureResult:
     erased_assertion_ids: tuple[str, ...]
     erased_revision_ids: tuple[str, ...]
@@ -231,6 +282,20 @@ def _assertion_with(
     return Assertion.from_mapping(mapping)
 
 
+def _validation_report_targets(report: ShaclValidationReport) -> tuple[str, ...]:
+    """Return each assertion a quarantine report requires us to repair."""
+    targets = {
+        assertion_id
+        for finding in report.findings
+        for assertion_id in finding.affected_assertion_ids
+    }
+    if not targets or any(
+        not finding.affected_assertion_ids for finding in report.findings
+    ):
+        targets.update(report.assertion_ids)
+    return tuple(sorted(targets))
+
+
 class AsyncAssertionStore:
     """One canonical, normalized assertion authority for a single tenant.
 
@@ -278,6 +343,19 @@ class AsyncAssertionStore:
             raise TenantIsolationError("Assertion tenant_id does not match the bound tenant")
         if assertion.owning_agent_id != owner:
             raise TenantIsolationError("Assertion owning_agent_id does not match the bound owner")
+
+    def _require_raw_mutation_capability(
+        self,
+        capability: object | None,
+    ) -> None:
+        if type(capability) is not _RawAssertionMutationCapability:
+            raise AssertionStoreError(
+                "raw assertion mutation requires a migration-only capability"
+            )
+        if capability.tenant_id != self.tenant_id:
+            raise TenantIsolationError(
+                "raw assertion mutation capability does not match the bound tenant"
+            )
 
     async def _generation(self) -> int:
         """Read generation without creating durable tenant state."""
@@ -861,8 +939,114 @@ class AsyncAssertionStore:
         *,
         source_occurrences: Sequence[SourceOccurrence] = (),
         operation_id: str | None = None,
+        expected_generation: int | None = None,
+        _migration_capability: _RawAssertionMutationCapability | None = None,
     ) -> AssertionWriteResult:
-        """Persist one initial assertion revision atomically and idempotently."""
+        """Private migration-only raw initial assertion mutation."""
+        self._require_raw_mutation_capability(_migration_capability)
+        operation_id, request = self._validate_initial_assertion_write(
+            assertion,
+            source_occurrences=source_occurrences,
+            operation_id=operation_id,
+            expected_generation=expected_generation,
+        )
+        async with self._mutation():
+            written, _ = await self._put_initial_assertion_in_mutation(
+                assertion,
+                source_occurrences=source_occurrences,
+                operation_id=operation_id,
+                request=request,
+                expected_generation=expected_generation,
+            )
+            return written
+
+    async def put_assertion_with_validation_report(
+        self,
+        assertion: Assertion,
+        report: ShaclValidationReport,
+        *,
+        source_occurrences: Sequence[SourceOccurrence] = (),
+        operation_id: str | None = None,
+        expected_generation: int | None = None,
+    ) -> AssertionWriteResult:
+        """Atomically accept one assertion and its required SHACL report.
+
+        A governed write cannot expose an accepted canonical revision until its
+        report, normalized report links/results, generation, and outbox receipt
+        can commit in the same assertion-authority transaction.  Rejected
+        pre-publication reports use :meth:`persist_validation_report` instead,
+        because there is no canonical assertion to commit with them.
+        """
+        operation_id, request = self._validate_initial_assertion_write(
+            assertion,
+            source_occurrences=source_occurrences,
+            operation_id=operation_id,
+            expected_generation=expected_generation,
+        )
+        self._validate_accepted_validation_report(assertion, report)
+        async with self._mutation():
+            written, replay = await self._put_initial_assertion_in_mutation(
+                assertion,
+                source_occurrences=source_occurrences,
+                operation_id=operation_id,
+                request=request,
+                expected_generation=expected_generation,
+                validation_report_id=report.report_id,
+            )
+            if replay is None:
+                await self._persist_validation_report_in_transaction(report)
+            else:
+                await self._validation_report_from_receipt(replay)
+            return written
+
+    async def publish_inferred_assertion(
+        self,
+        assertion: Assertion,
+        *,
+        operation_id: str | None = None,
+    ) -> AssertionWriteResult:
+        """Publish a lineage-validated result from the bounded materializer.
+
+        This is deliberately narrower than the migration-only raw writer:
+        only an active inferred assertion with canonical derived lineage can
+        cross it.  Public asserted/imported ingestion remains report-governed
+        through :class:`AsyncStorage`; this preserves one trusted, bounded
+        publication capability for the inference engine without reopening a
+        generic validation bypass.
+        """
+        if (
+            not isinstance(assertion, Assertion)
+            or assertion.status is not AssertionStatus.ACTIVE
+            or assertion.epistemic_state is not EpistemicState.INFERRED
+            or not isinstance(assertion.lineage, DerivedLineage)
+        ):
+            raise AssertionStoreError(
+                "inference publication requires an active inferred assertion with derived lineage"
+            )
+        operation_id, request = self._validate_initial_assertion_write(
+            assertion,
+            source_occurrences=(),
+            operation_id=operation_id,
+            expected_generation=None,
+        )
+        async with self._mutation():
+            written, _ = await self._put_initial_assertion_in_mutation(
+                assertion,
+                source_occurrences=(),
+                operation_id=operation_id,
+                request=request,
+                expected_generation=None,
+            )
+            return written
+
+    def _validate_initial_assertion_write(
+        self,
+        assertion: Assertion,
+        *,
+        source_occurrences: Sequence[SourceOccurrence],
+        operation_id: str | None,
+        expected_generation: int | None,
+    ) -> tuple[str, dict[str, object]]:
         if not isinstance(assertion, Assertion):
             raise AssertionStoreError("put_assertion requires a canonical Assertion")
         self._check_assertion_scope(assertion)
@@ -870,36 +1054,388 @@ class AsyncAssertionStore:
             raise AssertionStoreError(
                 "put_assertion only accepts an initial active revision with no superseded predecessor"
             )
-        operation_id = operation_id or f"revision:{assertion.revision_id}"
+        if expected_generation is not None and (
+            type(expected_generation) is not int or expected_generation < 0
+        ):
+            raise AssertionStoreError("expected_generation must be a non-negative integer")
+        resolved_operation_id = operation_id or f"revision:{assertion.revision_id}"
         request = {"assertion": assertion.to_mapping(), "sources": [s.to_mapping() for s in source_occurrences]}
-        async with self._mutation():
-            digest, replay = await self._operation(operation_id, "put", request)
-            if replay is not None:
-                replayed = await self._revision(str(replay["revision_id"]))
-                if replayed is None:
-                    raise AssertionConflictError("idempotent assertion receipt no longer has a revision")
-                return AssertionWriteResult(replayed, int(replay["generation"]), str(replay["event_id"]), True)
-            existing_revision = await self._revision(assertion.revision_id)
-            if existing_revision is not None:
-                if existing_revision != assertion:
-                    raise AssertionConflictError("revision_id is immutable and already stores a different assertion")
-                checkpoint = await self.checkpoint()
-                return AssertionWriteResult(assertion, checkpoint.generation, "", True)
-            current = await self._current(assertion.assertion_id)
-            if current is not None:
-                raise AssertionConflictError("append through supersede/retract; put_assertion only creates an initial revision")
-            await self._store_sources(source_occurrences)
-            await self._validate_lineage(assertion, source_occurrences)
-            await self._write_revision(assertion, source_occurrences)
-            await self._set_current(assertion)
-            generation = await self._advance_generation()
-            event_id = await self._event(assertion, "accepted", generation)
-            await self._record_operation(
-                operation_id, "put", digest,
-                {"revision_id": assertion.revision_id, "generation": generation, "event_id": event_id},
-                [assertion.assertion_id], [assertion.revision_id],
+        return resolved_operation_id, request
+
+    async def _put_initial_assertion_in_mutation(
+        self,
+        assertion: Assertion,
+        *,
+        source_occurrences: Sequence[SourceOccurrence],
+        operation_id: str,
+        request: dict[str, object],
+        expected_generation: int | None,
+        validation_report_id: str | None = None,
+    ) -> tuple[AssertionWriteResult, dict[str, object] | None]:
+        """Write an already-validated initial revision inside ``_mutation``."""
+        digest, replay = await self._operation(operation_id, "put", request)
+        if replay is not None:
+            replayed = await self._revision(str(replay["revision_id"]))
+            if replayed is None:
+                raise AssertionConflictError("idempotent assertion receipt no longer has a revision")
+            return (
+                AssertionWriteResult(replayed, int(replay["generation"]), str(replay["event_id"]), True),
+                replay,
             )
-            return AssertionWriteResult(assertion, generation, event_id)
+        if expected_generation is not None and await self._generation() != expected_generation:
+            raise AssertionConflictError("validation generation is no longer current; revalidate before writing")
+        existing_revision = await self._revision(assertion.revision_id)
+        if existing_revision is not None:
+            if existing_revision != assertion:
+                raise AssertionConflictError("revision_id is immutable and already stores a different assertion")
+            checkpoint = await self.checkpoint()
+            return AssertionWriteResult(assertion, checkpoint.generation, "", True), None
+        current = await self._current(assertion.assertion_id)
+        if current is not None:
+            raise AssertionConflictError("append through supersede/retract; put_assertion only creates an initial revision")
+        await self._store_sources(source_occurrences)
+        await self._validate_lineage(assertion, source_occurrences)
+        await self._write_revision(assertion, source_occurrences)
+        await self._set_current(assertion)
+        generation = await self._advance_generation()
+        event_id = await self._event(assertion, "accepted", generation)
+        receipt = {
+            "revision_id": assertion.revision_id,
+            "generation": generation,
+            "event_id": event_id,
+        }
+        if validation_report_id is not None:
+            receipt["validation_report_id"] = validation_report_id
+        await self._record_operation(
+            operation_id, "put", digest,
+            receipt,
+            [assertion.assertion_id], [assertion.revision_id],
+        )
+        return AssertionWriteResult(assertion, generation, event_id), None
+
+    async def replay_governed_initial_write(
+        self,
+        assertion: Assertion,
+        *,
+        source_occurrences: Sequence[SourceOccurrence] = (),
+        operation_id: str | None = None,
+    ) -> tuple[ShaclValidationReport, AssertionWriteResult] | None:
+        """Return the original report and receipt for one governed write retry.
+
+        This lookup deliberately happens before a caller snapshots or rejects
+        an already-current assertion.  The operation ledger, report, and
+        revision commit in one transaction, so a matching receipt is the sole
+        authoritative idempotency result for the governed boundary.
+        """
+        resolved_operation_id, request = self._validate_initial_assertion_write(
+            assertion,
+            source_occurrences=source_occurrences,
+            operation_id=operation_id,
+            expected_generation=None,
+        )
+        _, replay = await self._operation(resolved_operation_id, "put", request)
+        if replay is None:
+            return None
+        report = await self._validation_report_from_receipt(replay)
+        replayed = await self._revision(str(replay["revision_id"]))
+        if replayed is None:
+            raise AssertionConflictError("idempotent assertion receipt no longer has a revision")
+        self._validate_accepted_validation_report(replayed, report)
+        return report, AssertionWriteResult(
+            replayed,
+            int(replay["generation"]),
+            str(replay["event_id"]),
+            True,
+        )
+
+    def _validate_validation_report(self, report: ShaclValidationReport) -> None:
+        if not isinstance(report, ShaclValidationReport):
+            raise AssertionStoreError("validation report must be a ShaclValidationReport")
+        if report.tenant_id != self.tenant_id:
+            raise TenantIsolationError("validation report tenant does not match the bound assertion tenant")
+
+    def _validate_accepted_validation_report(
+        self,
+        assertion: Assertion,
+        report: ShaclValidationReport,
+    ) -> None:
+        self._validate_validation_report(report)
+        if report.action not in (
+            ValidationWriteAction.ACCEPT,
+            ValidationWriteAction.ACCEPT_WITH_REPORT,
+        ):
+            raise AssertionStoreError("only accepted validation reports can accompany a canonical assertion write")
+        if report.assertion_ids != (assertion.assertion_id,):
+            raise AssertionStoreError(
+                "accepted validation report must identify exactly the assertion committed with it"
+            )
+
+    async def _validation_report_from_receipt(
+        self,
+        receipt: dict[str, object],
+    ) -> ShaclValidationReport:
+        """Load the report atomically paired with a governed operation receipt."""
+        report_id = receipt.get("validation_report_id")
+        if not isinstance(report_id, str) or not report_id:
+            raise AssertionConflictError(
+                "operation_id was already used for an ungoverned semantic mutation"
+            )
+        row = await self._database.fetchone(
+            "SELECT report_mapping FROM semantic_validation_reports "
+            "WHERE tenant_id = ? AND report_id = ?",
+            (self.tenant_id, report_id),
+        )
+        if row is None:
+            raise AssertionConflictError(
+                "governed semantic operation receipt no longer has its validation report"
+            )
+        try:
+            report = ShaclValidationReport.from_mapping(json.loads(row[0]))
+        except (KeyError, TypeError, json.JSONDecodeError, ValueError) as error:
+            raise AssertionConflictError(
+                "governed semantic operation receipt has a malformed validation report"
+            ) from error
+        self._validate_validation_report(report)
+        return report
+
+    async def persist_validation_report(self, report: ShaclValidationReport) -> ShaclValidationReport:
+        """Persist a tenant-bound report when no canonical write is pending."""
+        self._validate_validation_report(report)
+        async with self._database.transaction():
+            await self._persist_validation_report_in_transaction(report)
+        return report
+
+    async def _persist_validation_report_in_transaction(
+        self,
+        report: ShaclValidationReport,
+    ) -> None:
+        """Write report rows in the caller's existing canonical transaction."""
+        encoded = _json(report.to_mapping())
+        existing = await self._database.fetchone(
+            "SELECT report_mapping FROM semantic_validation_reports "
+            "WHERE tenant_id = ? AND report_id = ?",
+            (self.tenant_id, report.report_id),
+        )
+        if existing is not None:
+            if existing[0] != encoded:
+                raise AssertionStoreError(
+                    "validation report id is immutable and already stores different data"
+                )
+            return
+        await self._database.execute(
+            "INSERT INTO semantic_validation_reports "
+            "(report_id, tenant_id, report_version, assertion_ids, shape_set_id, shape_set_version, "
+            "validation_profile_id, validation_profile_version, checkpoint_generation, run_id, "
+            "state, action, source, evaluated_at, report_mapping) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                report.report_id,
+                self.tenant_id,
+                report.report_version,
+                _json(list(report.assertion_ids)),
+                report.shape_set.identifier,
+                report.shape_set.version,
+                report.validation_profile.identifier,
+                str(report.validation_profile.version),
+                report.checkpoint_generation,
+                report.run_id,
+                report.state.value,
+                report.action.value,
+                report.source.value,
+                report.evaluated_at,
+                encoded,
+            ),
+        )
+        report_assertion_ids = set(report.assertion_ids)
+        for finding in report.findings:
+            report_assertion_ids.update(finding.affected_assertion_ids)
+        for assertion_id in sorted(report_assertion_ids):
+            await self._database.execute(
+                "INSERT INTO semantic_validation_report_assertions "
+                "(tenant_id, report_id, assertion_id) VALUES (?, ?, ?)",
+                (self.tenant_id, report.report_id, assertion_id),
+            )
+        for ordinal, finding in enumerate(report.findings):
+            await self._database.execute(
+                "INSERT INTO semantic_validation_results "
+                "(tenant_id, report_id, ordinal, assertion_id, shape_id, constraint_code, severity) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    self.tenant_id,
+                    report.report_id,
+                    ordinal,
+                    finding.focus_assertion_id,
+                    finding.shape_id,
+                    finding.code,
+                    finding.severity.value,
+                ),
+            )
+
+    async def persist_validation_report_and_quarantine(
+        self,
+        report: ShaclValidationReport,
+        *,
+        expected_revisions: Mapping[str, str],
+    ) -> ValidationQuarantineBatchResult:
+        """Persist one quarantine report and repair every target atomically.
+
+        The snapshot revision map is a compare-and-swap fence.  This one
+        assertion-authority transaction commits the report, every lifecycle
+        transition, eligibility invalidation, generation update, and emitted
+        outbox event together; a stale target or any write failure rolls all of
+        them back rather than leaving an authoritative report beside active
+        invalid data.
+        """
+        self._validate_validation_report(report)
+        if report.action is not ValidationWriteAction.QUARANTINE:
+            raise AssertionStoreError(
+                "atomic validation repair requires a quarantine report"
+            )
+        targets = _validation_report_targets(report)
+        if not isinstance(expected_revisions, Mapping):
+            raise AssertionStoreError("validation repair requires target revision mappings")
+        normalized_revisions: dict[str, str] = {}
+        for assertion_id, revision_id in expected_revisions.items():
+            if not isinstance(assertion_id, str) or not assertion_id:
+                raise AssertionStoreError("validation repair assertion ids must be non-empty strings")
+            if not isinstance(revision_id, str) or not revision_id:
+                raise AssertionStoreError("validation repair revision ids must be non-empty strings")
+            normalized_revisions[assertion_id] = revision_id
+        if not set(targets).issubset(normalized_revisions):
+            raise AssertionConflictError(
+                "validation snapshot is missing a report-affected assertion revision"
+            )
+        operation_id = f"validation-report-quarantine:{report.report_id}"
+        request = {
+            "report_id": report.report_id,
+            "targets": [[assertion_id, normalized_revisions[assertion_id]] for assertion_id in targets],
+        }
+        async with self._mutation():
+            digest, replay = await self._operation(
+                operation_id,
+                "validation-report-quarantine",
+                request,
+            )
+            if replay is not None:
+                await self._validation_report_from_receipt(replay)
+                quarantined = tuple(
+                    item
+                    for item in (
+                        await self._revision(str(revision_id))
+                        for revision_id in replay["quarantined_revision_ids"]
+                    )
+                    if item is not None
+                )
+                invalidated = tuple(
+                    item
+                    for item in (
+                        await self._revision(str(revision_id))
+                        for revision_id in replay["invalidation_state_revision_ids"]
+                    )
+                    if item is not None
+                )
+                if (
+                    len(quarantined) != len(replay["quarantined_revision_ids"])
+                    or len(invalidated)
+                    != len(replay["invalidation_state_revision_ids"])
+                ):
+                    raise AssertionConflictError(
+                        "idempotent validation repair receipt lost its lifecycle revisions"
+                    )
+                return ValidationQuarantineBatchResult(
+                    quarantined,
+                    invalidated,
+                    tuple(str(item) for item in replay["invalidated_revision_ids"]),
+                    int(replay["generation"]),
+                    True,
+                )
+
+            current_by_assertion_id: dict[str, Assertion] = {}
+            for assertion_id in targets:
+                current = await self._current(assertion_id)
+                if (
+                    current is None
+                    or current.revision_id != normalized_revisions[assertion_id]
+                    or current.status is not AssertionStatus.ACTIVE
+                ):
+                    raise AssertionConflictError(
+                        "validation target is no longer the expected active tenant assertion"
+                    )
+                current_by_assertion_id[assertion_id] = current
+
+            # This is intentionally inside the same transaction as the CAS
+            # fence and transitions.  A report never outlives a failed repair.
+            await self._persist_validation_report_in_transaction(report)
+            roots = tuple(current_by_assertion_id[assertion_id] for assertion_id in targets)
+            root_revision_ids = {item.revision_id for item in roots}
+            dependents = [
+                item
+                for item in await self._dependent_current_revisions(root_revision_ids)
+                if item.status is AssertionStatus.ACTIVE
+                and item.revision_id not in root_revision_ids
+            ]
+            invalidated_revision_ids = [*sorted(root_revision_ids)]
+            quarantined: list[Assertion] = []
+            for current in roots:
+                await self._invalidate_eligibility(current.revision_id)
+                state = _assertion_with(
+                    current,
+                    revision_id=uuid4().hex,
+                    status=AssertionStatus.QUARANTINED,
+                    supersedes_revision_id=None,
+                )
+                await self._write_revision(state, ())
+                await self._set_current(state)
+                quarantined.append(state)
+
+            invalidated: list[Assertion] = []
+            for dependent in dependents:
+                await self._invalidate_eligibility(dependent.revision_id)
+                invalidated_revision_ids.append(dependent.revision_id)
+                state = _assertion_with(
+                    dependent,
+                    revision_id=uuid4().hex,
+                    status=AssertionStatus.RETRACTED,
+                    supersedes_revision_id=None,
+                    epistemic_state=EpistemicState.RETRACTED,
+                )
+                await self._write_revision(state, ())
+                await self._set_current(state)
+                invalidated.append(state)
+
+            # A no-target report has no canonical data to invalidate.  Retain
+            # it atomically with its tenant serialization but do not fabricate
+            # a generation/event for a graph that did not change.
+            generation = await self._advance_generation() if roots else await self._generation()
+            quarantine_events = [
+                await self._event(item, "validation_quarantined", generation)
+                for item in quarantined
+            ]
+            dependent_events = [
+                await self._event(item, "retracted", generation) for item in invalidated
+            ]
+            receipt = {
+                "validation_report_id": report.report_id,
+                "quarantined_revision_ids": [item.revision_id for item in quarantined],
+                "invalidation_state_revision_ids": [item.revision_id for item in invalidated],
+                "invalidated_revision_ids": invalidated_revision_ids,
+                "generation": generation,
+                "event_ids": [*quarantine_events, *dependent_events],
+            }
+            await self._record_operation(
+                operation_id,
+                "validation-report-quarantine",
+                digest,
+                receipt,
+                [item.assertion_id for item in (*quarantined, *invalidated)],
+                [item.revision_id for item in (*quarantined, *invalidated)],
+            )
+            return ValidationQuarantineBatchResult(
+                tuple(quarantined),
+                tuple(invalidated),
+                tuple(invalidated_revision_ids),
+                generation,
+            )
 
     async def supersede(
         self,
@@ -908,87 +1444,215 @@ class AsyncAssertionStore:
         *,
         source_occurrences: Sequence[SourceOccurrence] = (),
         operation_id: str | None = None,
+        _migration_capability: _RawAssertionMutationCapability | None = None,
     ) -> SupersessionResult:
-        """Compare-and-swap an active revision with a superseded state and replacement."""
+        """Private migration-only raw canonical supersession."""
+        self._require_raw_mutation_capability(_migration_capability)
+        operation_id, request = self._validate_supersession(
+            expected_predecessor_revision_id,
+            replacement,
+            source_occurrences=source_occurrences,
+            operation_id=operation_id,
+            expected_generation=None,
+        )
+        async with self._mutation():
+            result, _ = await self._supersede_in_mutation(
+                expected_predecessor_revision_id,
+                replacement,
+                source_occurrences=source_occurrences,
+                operation_id=operation_id,
+                request=request,
+                expected_generation=None,
+            )
+            return result
+
+    async def supersede_with_validation_report(
+        self,
+        expected_predecessor_revision_id: str,
+        replacement: Assertion,
+        report: ShaclValidationReport,
+        *,
+        source_occurrences: Sequence[SourceOccurrence] = (),
+        operation_id: str | None = None,
+        expected_generation: int | None = None,
+    ) -> SupersessionResult:
+        """Atomically supersede an assertion and persist its accepted SHACL report."""
+        operation_id, request = self._validate_supersession(
+            expected_predecessor_revision_id,
+            replacement,
+            source_occurrences=source_occurrences,
+            operation_id=operation_id,
+            expected_generation=expected_generation,
+        )
+        self._validate_accepted_validation_report(replacement, report)
+        async with self._mutation():
+            result, replay = await self._supersede_in_mutation(
+                expected_predecessor_revision_id,
+                replacement,
+                source_occurrences=source_occurrences,
+                operation_id=operation_id,
+                request=request,
+                expected_generation=expected_generation,
+                validation_report_id=report.report_id,
+            )
+            if replay is None:
+                await self._persist_validation_report_in_transaction(report)
+            else:
+                await self._validation_report_from_receipt(replay)
+            return result
+
+    def _validate_supersession(
+        self,
+        expected_predecessor_revision_id: str,
+        replacement: Assertion,
+        *,
+        source_occurrences: Sequence[SourceOccurrence],
+        operation_id: str | None,
+        expected_generation: int | None,
+    ) -> tuple[str, dict[str, object]]:
         if not isinstance(replacement, Assertion):
             raise AssertionStoreError("supersede requires a canonical Assertion replacement")
         self._check_assertion_scope(replacement)
         if replacement.status is not AssertionStatus.ACTIVE:
             raise AssertionStoreError("a supersession replacement must be active")
-        operation_id = operation_id or f"supersede:{expected_predecessor_revision_id}:{replacement.revision_id}"
+        if expected_generation is not None and (
+            type(expected_generation) is not int or expected_generation < 0
+        ):
+            raise AssertionStoreError("expected_generation must be a non-negative integer")
+        resolved_operation_id = operation_id or f"supersede:{expected_predecessor_revision_id}:{replacement.revision_id}"
         request = {
             "expected": expected_predecessor_revision_id,
             "replacement": replacement.to_mapping(),
             "sources": [s.to_mapping() for s in source_occurrences],
         }
-        async with self._mutation():
-            digest, replay = await self._operation(operation_id, "supersede", request)
-            if replay is not None:
-                predecessor = await self._revision(str(replay["predecessor_revision_id"]))
-                applied = await self._revision(str(replay["replacement_revision_id"]))
-                if predecessor is None or applied is None:
-                    raise AssertionConflictError("idempotent supersession receipt no longer has its revisions")
-                return SupersessionResult(
+        return resolved_operation_id, request
+
+    async def replay_governed_supersession(
+        self,
+        expected_predecessor_revision_id: str,
+        replacement: Assertion,
+        *,
+        source_occurrences: Sequence[SourceOccurrence] = (),
+        operation_id: str | None = None,
+    ) -> tuple[ShaclValidationReport, SupersessionResult] | None:
+        """Return the original accepted report and receipt for a retry."""
+        resolved_operation_id, request = self._validate_supersession(
+            expected_predecessor_revision_id,
+            replacement,
+            source_occurrences=source_occurrences,
+            operation_id=operation_id,
+            expected_generation=None,
+        )
+        _, replay = await self._operation(resolved_operation_id, "supersede", request)
+        if replay is None:
+            return None
+        report = await self._validation_report_from_receipt(replay)
+        predecessor = await self._revision(str(replay["predecessor_revision_id"]))
+        applied = await self._revision(str(replay["replacement_revision_id"]))
+        if predecessor is None or applied is None:
+            raise AssertionConflictError("idempotent supersession receipt no longer has its revisions")
+        self._validate_accepted_validation_report(applied, report)
+        return report, SupersessionResult(
+            predecessor,
+            applied,
+            int(replay["generation"]),
+            tuple(replay["event_ids"]),
+            tuple(replay["invalidated_revision_ids"]),
+            True,
+        )
+
+    async def _supersede_in_mutation(
+        self,
+        expected_predecessor_revision_id: str,
+        replacement: Assertion,
+        *,
+        source_occurrences: Sequence[SourceOccurrence],
+        operation_id: str,
+        request: dict[str, object],
+        expected_generation: int | None,
+        validation_report_id: str | None = None,
+    ) -> tuple[SupersessionResult, dict[str, object] | None]:
+        """Apply a pre-validated supersession inside the tenant mutation."""
+        digest, replay = await self._operation(operation_id, "supersede", request)
+        if replay is not None:
+            predecessor = await self._revision(str(replay["predecessor_revision_id"]))
+            applied = await self._revision(str(replay["replacement_revision_id"]))
+            if predecessor is None or applied is None:
+                raise AssertionConflictError("idempotent supersession receipt no longer has its revisions")
+            return (
+                SupersessionResult(
                     predecessor, applied, int(replay["generation"]),
                     tuple(replay["event_ids"]), tuple(replay["invalidated_revision_ids"]), True,
-                )
-            predecessor = await self._revision(expected_predecessor_revision_id)
-            if predecessor is None or predecessor.status is not AssertionStatus.ACTIVE:
-                raise AssertionConflictError("expected predecessor is not an active tenant revision")
-            current = await self._current(predecessor.assertion_id)
-            if current is None or current.revision_id != expected_predecessor_revision_id:
-                raise AssertionConflictError("expected predecessor is no longer the current revision")
-            if replacement.supersedes_revision_id not in (None, expected_predecessor_revision_id):
-                raise AssertionStoreError("replacement cannot name an unrelated superseded revision")
-            await self._store_sources(source_occurrences)
-            await self._validate_lineage(replacement, source_occurrences)
-            predecessor_state = _assertion_with(
-                predecessor, revision_id=uuid4().hex, status=AssertionStatus.SUPERSEDED,
-                supersedes_revision_id=expected_predecessor_revision_id,
+                ),
+                replay,
             )
-            replacement_state = _assertion_with(
-                replacement, revision_id=replacement.revision_id, status=AssertionStatus.ACTIVE,
-                supersedes_revision_id=predecessor_state.revision_id,
+        if expected_generation is not None and await self._generation() != expected_generation:
+            raise AssertionConflictError("validation generation is no longer current; revalidate before superseding")
+        predecessor = await self._revision(expected_predecessor_revision_id)
+        if predecessor is None or predecessor.status is not AssertionStatus.ACTIVE:
+            raise AssertionConflictError("expected predecessor is not an active tenant revision")
+        current = await self._current(predecessor.assertion_id)
+        if current is None or current.revision_id != expected_predecessor_revision_id:
+            raise AssertionConflictError("expected predecessor is no longer the current revision")
+        if replacement.supersedes_revision_id not in (None, expected_predecessor_revision_id):
+            raise AssertionStoreError("replacement cannot name an unrelated superseded revision")
+        await self._store_sources(source_occurrences)
+        await self._validate_lineage(replacement, source_occurrences)
+        predecessor_state = _assertion_with(
+            predecessor, revision_id=uuid4().hex, status=AssertionStatus.SUPERSEDED,
+            supersedes_revision_id=expected_predecessor_revision_id,
+        )
+        replacement_state = _assertion_with(
+            replacement, revision_id=replacement.revision_id, status=AssertionStatus.ACTIVE,
+            supersedes_revision_id=predecessor_state.revision_id,
+        )
+        # Every derived current revision that names the predecessor loses a
+        # support. Retraction is transitive in this same transaction, so a
+        # projection never observes a replacement alongside stale support.
+        dependent_states: list[Assertion] = []
+        invalidated_revision_ids = [expected_predecessor_revision_id]
+        for dependent in await self._dependent_current_revisions([expected_predecessor_revision_id]):
+            if dependent.status is not AssertionStatus.ACTIVE:
+                continue
+            await self._invalidate_eligibility(dependent.revision_id)
+            invalidated_revision_ids.append(dependent.revision_id)
+            state = _assertion_with(
+                dependent, revision_id=uuid4().hex, status=AssertionStatus.RETRACTED,
+                supersedes_revision_id=None, epistemic_state=EpistemicState.RETRACTED,
             )
-            # Every derived current revision that names the predecessor loses
-            # a support.  Retraction is transitive and happens in this same
-            # transaction; a projection never sees a replacement while an old
-            # support-derived row remains eligible.
-            dependent_states: list[Assertion] = []
-            invalidated_revision_ids = [expected_predecessor_revision_id]
-            await self._invalidate_eligibility(expected_predecessor_revision_id)
-            for dependent in await self._dependent_current_revisions([expected_predecessor_revision_id]):
-                if dependent.status is not AssertionStatus.ACTIVE:
-                    continue
-                await self._invalidate_eligibility(dependent.revision_id)
-                invalidated_revision_ids.append(dependent.revision_id)
-                state = _assertion_with(
-                    dependent, revision_id=uuid4().hex, status=AssertionStatus.RETRACTED,
-                    supersedes_revision_id=None, epistemic_state=EpistemicState.RETRACTED,
-                )
-                await self._write_revision(state, ())
-                await self._set_current(state)
-                dependent_states.append(state)
-            await self._write_revision(predecessor_state, ())
-            await self._set_current(predecessor_state)
-            await self._write_revision(replacement_state, source_occurrences)
-            await self._set_current(replacement_state)
-            generation = await self._advance_generation()
-            old_event = await self._event(predecessor_state, "superseded", generation)
-            new_event = await self._event(replacement_state, "accepted", generation)
-            dependent_events = [await self._event(item, "retracted", generation) for item in dependent_states]
-            await self._record_operation(
-                operation_id, "supersede", digest,
-                {"predecessor_revision_id": predecessor_state.revision_id, "replacement_revision_id": replacement_state.revision_id,
-                 "generation": generation, "event_ids": [old_event, new_event, *dependent_events],
-                 "invalidated_revision_ids": invalidated_revision_ids},
-                [predecessor.assertion_id, replacement_state.assertion_id, *[item.assertion_id for item in dependent_states]],
-                [predecessor_state.revision_id, replacement_state.revision_id, *[item.revision_id for item in dependent_states]],
-            )
-            return SupersessionResult(
+            await self._write_revision(state, ())
+            await self._set_current(state)
+            dependent_states.append(state)
+        await self._invalidate_eligibility(expected_predecessor_revision_id)
+        await self._write_revision(predecessor_state, ())
+        await self._set_current(predecessor_state)
+        await self._write_revision(replacement_state, source_occurrences)
+        await self._set_current(replacement_state)
+        generation = await self._advance_generation()
+        old_event = await self._event(predecessor_state, "superseded", generation)
+        new_event = await self._event(replacement_state, "accepted", generation)
+        dependent_events = [await self._event(item, "retracted", generation) for item in dependent_states]
+        receipt = {
+            "predecessor_revision_id": predecessor_state.revision_id,
+            "replacement_revision_id": replacement_state.revision_id,
+            "generation": generation,
+            "event_ids": [old_event, new_event, *dependent_events],
+            "invalidated_revision_ids": invalidated_revision_ids,
+        }
+        if validation_report_id is not None:
+            receipt["validation_report_id"] = validation_report_id
+        await self._record_operation(
+            operation_id, "supersede", digest, receipt,
+            [predecessor.assertion_id, replacement_state.assertion_id, *[item.assertion_id for item in dependent_states]],
+            [predecessor_state.revision_id, replacement_state.revision_id, *[item.revision_id for item in dependent_states]],
+        )
+        return (
+            SupersessionResult(
                 predecessor_state, replacement_state, generation,
                 (old_event, new_event, *dependent_events), tuple(invalidated_revision_ids),
-            )
+            ),
+            None,
+        )
 
     async def _deactivate_inference_derivations_for_inputs(
         self,
@@ -1327,6 +1991,103 @@ class AsyncAssertionStore:
                 [item.assertion_id for item in retracted], [item.revision_id for item in retracted],
             )
             return RetractionResult(tuple(retracted), tuple(invalidated), generation)
+
+    async def quarantine_for_validation(
+        self,
+        assertion_id: str,
+        expected_revision_id: str,
+        *,
+        report_id: str,
+        operation_id: str | None = None,
+        _migration_capability: _RawAssertionMutationCapability | None = None,
+    ) -> ValidationQuarantineResult:
+        """Private migration-only single-assertion lifecycle repair.
+
+        Normal validation must use
+        :meth:`persist_validation_report_and_quarantine`, which keeps report
+        persistence and every report target in one transaction.  This legacy
+        primitive is capability-restricted so it cannot become a public path
+        that pairs an arbitrary report id with a partial lifecycle change.
+        """
+        self._require_raw_mutation_capability(_migration_capability)
+        if not isinstance(report_id, str) or not report_id:
+            raise AssertionStoreError("validation quarantine requires a non-empty report_id")
+        operation_id = operation_id or f"validation-quarantine:{report_id}:{assertion_id}:{expected_revision_id}"
+        request = {
+            "assertion_id": assertion_id,
+            "expected_revision_id": expected_revision_id,
+            "report_id": report_id,
+        }
+        async with self._mutation():
+            digest, replay = await self._operation(operation_id, "validation-quarantine", request)
+            if replay is not None:
+                quarantined = await self._revision(str(replay["quarantined_revision_id"]))
+                invalidated = [
+                    await self._revision(str(item))
+                    for item in replay["invalidation_state_revision_ids"]
+                ]
+                if quarantined is None or any(item is None for item in invalidated):
+                    raise AssertionConflictError("idempotent validation quarantine receipt lost its revisions")
+                return ValidationQuarantineResult(
+                    quarantined,
+                    tuple(item for item in invalidated if item is not None),
+                    tuple(replay["invalidated_revision_ids"]),
+                    int(replay["generation"]),
+                    True,
+                )
+            current = await self._current(assertion_id)
+            if current is None or current.revision_id != expected_revision_id or current.status is not AssertionStatus.ACTIVE:
+                raise AssertionConflictError("expected revision is not the active current tenant assertion")
+            dependents = await self._dependent_current_revisions([current.revision_id])
+            invalidated_revision_ids = [current.revision_id]
+            await self._invalidate_eligibility(current.revision_id)
+            quarantined = _assertion_with(
+                current,
+                revision_id=uuid4().hex,
+                status=AssertionStatus.QUARANTINED,
+                supersedes_revision_id=None,
+            )
+            await self._write_revision(quarantined, ())
+            await self._set_current(quarantined)
+            invalidated: list[Assertion] = []
+            for dependent in dependents:
+                if dependent.status is not AssertionStatus.ACTIVE:
+                    continue
+                await self._invalidate_eligibility(dependent.revision_id)
+                invalidated_revision_ids.append(dependent.revision_id)
+                state = _assertion_with(
+                    dependent,
+                    revision_id=uuid4().hex,
+                    status=AssertionStatus.RETRACTED,
+                    supersedes_revision_id=None,
+                    epistemic_state=EpistemicState.RETRACTED,
+                )
+                await self._write_revision(state, ())
+                await self._set_current(state)
+                invalidated.append(state)
+            generation = await self._advance_generation()
+            quarantine_event = await self._event(quarantined, "validation_quarantined", generation)
+            dependent_events = [await self._event(item, "retracted", generation) for item in invalidated]
+            await self._record_operation(
+                operation_id,
+                "validation-quarantine",
+                digest,
+                {
+                    "quarantined_revision_id": quarantined.revision_id,
+                    "invalidation_state_revision_ids": [item.revision_id for item in invalidated],
+                    "invalidated_revision_ids": invalidated_revision_ids,
+                    "generation": generation,
+                    "event_ids": [quarantine_event, *dependent_events],
+                },
+                [quarantined.assertion_id, *[item.assertion_id for item in invalidated]],
+                [quarantined.revision_id, *[item.revision_id for item in invalidated]],
+            )
+            return ValidationQuarantineResult(
+                quarantined,
+                tuple(invalidated),
+                tuple(invalidated_revision_ids),
+                generation,
+            )
 
     async def delete(
         self,
@@ -1751,6 +2512,39 @@ class AsyncAssertionStore:
                     "VALUES (?, ?, ?, ?)",
                     (tenant_id, derivation_id, revision_id, ordinal),
                 )
+    async def _delete_validation_reports_referencing(
+        self,
+        assertion_ids: Sequence[str],
+    ) -> None:
+        """Erase report artifacts that retain a physically erased identity."""
+        if not assertion_ids:
+            return
+        tenant_id, _ = self._require_scope()
+        identifiers = tuple(sorted(set(assertion_ids)))
+        report_rows = await self._database.fetchall(
+            "SELECT DISTINCT report_id FROM semantic_validation_report_assertions "
+            "WHERE tenant_id = ? "
+            f"AND assertion_id IN ({_placeholders(identifiers)})",
+            (tenant_id,) + identifiers,
+        )
+        report_ids = tuple(row[0] for row in report_rows)
+        if not report_ids:
+            return
+        await self._database.execute(
+            "DELETE FROM semantic_validation_results WHERE tenant_id = ? "
+            f"AND report_id IN ({_placeholders(report_ids)})",
+            (tenant_id,) + report_ids,
+        )
+        await self._database.execute(
+            "DELETE FROM semantic_validation_report_assertions WHERE tenant_id = ? "
+            f"AND report_id IN ({_placeholders(report_ids)})",
+            (tenant_id,) + report_ids,
+        )
+        await self._database.execute(
+            "DELETE FROM semantic_validation_reports WHERE tenant_id = ? "
+            f"AND report_id IN ({_placeholders(report_ids)})",
+            (tenant_id,) + report_ids,
+        )
 
     async def erase(self, assertion_id: str, *, operation_id: str | None = None) -> ErasureResult:
         """Physically erase an assertion and its transitive derived closure.
@@ -1915,6 +2709,7 @@ class AsyncAssertionStore:
                 (tenant_id,) + revision_tuple,
             )
             await self._delete_operations_referencing(assertion_ids, revision_ids)
+            await self._delete_validation_reports_referencing(assertion_tuple)
             await self._database.execute(
                 f"DELETE FROM semantic_assertions WHERE tenant_id = ? AND assertion_id IN ({_placeholders(assertion_tuple)})",
                 (tenant_id,) + assertion_tuple,
@@ -2120,5 +2915,6 @@ SemanticAssertionStore = AsyncAssertionStore
 __all__ = [
     "AssertionChange", "AssertionCheckpoint", "AssertionConflictError", "AssertionStoreError",
     "AssertionWriteResult", "AsyncAssertionStore", "DeletionResult", "ErasureResult", "RetractionResult",
-    "SemanticAssertionStore", "SupersessionResult", "TenantIsolationError",
+    "SemanticAssertionStore", "SupersessionResult", "TenantIsolationError", "ValidationQuarantineBatchResult",
+    "ValidationQuarantineResult",
 ]

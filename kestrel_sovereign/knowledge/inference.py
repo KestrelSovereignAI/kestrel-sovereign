@@ -977,7 +977,10 @@ class BoundedInferenceService:
             assertion = self._derived_assertion(fact, run_id, primary, inputs)
             current = await self._store.get_assertion(fact.assertion_id, include_inactive=True)
             if current is None:
-                result = await self._store.put_assertion(assertion, operation_id=f"inference-put:{run_id}:{fact.assertion_id}")
+                result = await self._store.publish_inferred_assertion(
+                    assertion,
+                    operation_id=f"inference-put:{run_id}:{fact.assertion_id}",
+                )
             elif current.status is AssertionStatus.ACTIVE:
                 result = None
             elif current.epistemic_state is EpistemicState.RETRACTED and isinstance(current.lineage, DerivedLineage):

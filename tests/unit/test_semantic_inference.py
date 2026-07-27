@@ -51,6 +51,7 @@ ONTOLOGY = OntologyRef(
     "e362812917fddab7cfab3dc35553ad292725e8f264e05f376077340e91034db5",
     "semantic-kb-v1",
 )
+_GOVERNED_STORAGES: dict[int, AsyncStorage] = {}
 
 
 @pytest.fixture
@@ -65,8 +66,13 @@ async def assertion_store(tmp_path):
     storage = AsyncStorage(":memory:", agent_id=credentials.agent_did, _assertion_tenant_capability=capability)
     await storage.initialize()
     try:
-        yield storage._assertion_store()  # Exercise the same bound facade materializers receive.
+        store = storage._assertion_store()
+        # Materialization operates on the bound canonical store, while source
+        # fixtures must cross the same governed ingestion boundary as agents.
+        _GOVERNED_STORAGES[id(store)] = storage
+        yield store
     finally:
+        _GOVERNED_STORAGES.pop(id(storage._assertion_store()), None)
         await storage.close()
 
 
@@ -102,7 +108,11 @@ def _assertion(store, revision_id: str, subject: IRI, predicate: IRI, object_: I
 
 async def _put(store, revision_id: str, subject: IRI, predicate: IRI, object_: IRI | Literal) -> Assertion:
     assertion = _assertion(store, revision_id, subject, predicate, object_)
-    await store.put_assertion(assertion, source_occurrences=(_source(f"source:{revision_id}"),))
+    result = await _GOVERNED_STORAGES[id(store)].put_assertion(
+        assertion,
+        source_occurrences=(_source(f"source:{revision_id}"),),
+    )
+    assert result.accepted
     return assertion
 
 
@@ -339,11 +349,12 @@ async def test_lifecycle_changes_deactivate_inference_ledger_before_sleep(
             RDFS_SUBCLASS,
             class_b,
         )
-        await assertion_store.supersede(
+        result = await _GOVERNED_STORAGES[id(assertion_store)].supersede_assertion(
             hierarchy.revision_id,
             replacement,
             source_occurrences=(_source("source:a-sub-b-replacement"),),
         )
+        assert result.accepted
     else:
         await assertion_store.invalidate_assertion_eligibility(
             hierarchy.assertion_id, hierarchy.revision_id
@@ -469,6 +480,7 @@ async def test_initialized_privacy_storage_revokes_disabled_inference(tmp_path) 
     await raw_storage.initialize()
     try:
         store = raw_storage._assertion_store()
+        _GOVERNED_STORAGES[id(store)] = raw_storage
         class_a = IRI("https://example.test/ClassA")
         class_b = IRI("https://example.test/ClassB")
         subject = IRI("https://example.test/subject")
@@ -495,6 +507,7 @@ async def test_initialized_privacy_storage_revokes_disabled_inference(tmp_path) 
             AssertionQuery(subject=subject, predicate=RDF_TYPE, object=class_b)
         ) == []
     finally:
+        _GOVERNED_STORAGES.pop(id(store), None)
         await raw_storage.close()
 
 
@@ -867,11 +880,13 @@ async def test_status_and_lineage_survive_sqlite_restart(tmp_path) -> None:
     await first.initialize()
     try:
         store = first._assertion_store()
+        _GOVERNED_STORAGES[id(store)] = first
         await _put(store, "a-sub-b", class_a, RDFS_SUBCLASS, class_b)
         await _put(store, "subject-a", subject, RDF_TYPE, class_a)
         result = await first.materialize_semantic_inference(profile)
         inferred = (await first.query_assertions(AssertionQuery(subject=subject, predicate=RDF_TYPE, object=class_b)))[0]
     finally:
+        _GOVERNED_STORAGES.pop(id(store), None)
         await first.close()
 
     restarted = AsyncStorage(database_path, agent_id=credentials.agent_did, _assertion_tenant_capability=capability)
