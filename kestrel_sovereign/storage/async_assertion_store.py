@@ -611,7 +611,12 @@ class AsyncAssertionStore:
                 (assertion.revision_id, tenant_id, assertion.assertion_id),
             )
 
-    async def _invalidate_eligibility(self, revision_id: str) -> None:
+    async def _invalidate_eligibility(
+        self,
+        revision_id: str,
+        *,
+        deactivate_inference_derivations: bool = True,
+    ) -> None:
         """Make a historical revision unusable by every index/training reader.
 
         The separate eligibility row is the projection-facing tombstone.  The
@@ -629,11 +634,20 @@ class AsyncAssertionStore:
             "WHERE tenant_id = ? AND revision_id = ?",
             (_now(), tenant_id, revision_id),
         )
+        if deactivate_inference_derivations:
+            await self._deactivate_inference_derivations_for_inputs((revision_id,))
 
-    async def _event(self, assertion: Assertion, operation: str, generation: int) -> str:
+    async def _event(
+        self,
+        assertion: Assertion,
+        operation: str,
+        generation: int,
+        *,
+        eligible: bool | None = None,
+    ) -> str:
         tenant_id, _ = self._require_scope()
         event_id = uuid4().hex
-        eligible = assertion.status is AssertionStatus.ACTIVE
+        eligible = assertion.status is AssertionStatus.ACTIVE if eligible is None else eligible
         await self._database.execute(
             "INSERT INTO semantic_projection_outbox "
             "(event_id, tenant_id, assertion_id, revision_id, operation, generation, eligible, created_at) "
@@ -942,6 +956,7 @@ class AsyncAssertionStore:
             # support-derived row remains eligible.
             dependent_states: list[Assertion] = []
             invalidated_revision_ids = [expected_predecessor_revision_id]
+            await self._invalidate_eligibility(expected_predecessor_revision_id)
             for dependent in await self._dependent_current_revisions([expected_predecessor_revision_id]):
                 if dependent.status is not AssertionStatus.ACTIVE:
                     continue
@@ -954,7 +969,6 @@ class AsyncAssertionStore:
                 await self._write_revision(state, ())
                 await self._set_current(state)
                 dependent_states.append(state)
-            await self._invalidate_eligibility(expected_predecessor_revision_id)
             await self._write_revision(predecessor_state, ())
             await self._set_current(predecessor_state)
             await self._write_revision(replacement_state, source_occurrences)
@@ -976,6 +990,44 @@ class AsyncAssertionStore:
                 (old_event, new_event, *dependent_events), tuple(invalidated_revision_ids),
             )
 
+    async def _deactivate_inference_derivations_for_inputs(
+        self,
+        input_revision_ids: Iterable[str],
+    ) -> tuple[str, ...]:
+        """Deactivate every active proof that names a withdrawn support.
+
+        Canonical derivation inputs drive the lifecycle cascade, while the
+        inference ledger records all alternate proofs.  Both need the same
+        invalidation point: otherwise ``explain()`` can expose a proof whose
+        premise has already been retracted, superseded, deleted, or rejected
+        by validation.  The caller is always inside the tenant mutation
+        transaction, so the conclusion and its active proof set change
+        atomically.
+        """
+        tenant_id, _ = self._require_scope()
+        revision_ids = tuple(sorted(set(input_revision_ids)))
+        if not revision_ids:
+            return ()
+        rows = await self._database.fetchall(
+            "SELECT DISTINCT d.derivation_id "
+            "FROM semantic_inference_derivations d "
+            "JOIN semantic_inference_derivation_inputs i "
+            "  ON i.tenant_id = d.tenant_id AND i.derivation_id = d.derivation_id "
+            "WHERE d.tenant_id = ? AND d.active = 1 "
+            f"AND i.input_revision_id IN ({_placeholders(revision_ids)}) "
+            "ORDER BY d.derivation_id ASC",
+            (tenant_id,) + revision_ids,
+        )
+        derivation_ids = tuple(str(row[0]) for row in rows)
+        if derivation_ids:
+            await self._database.execute(
+                "UPDATE semantic_inference_derivations SET active = 0 "
+                "WHERE tenant_id = ? "
+                f"AND derivation_id IN ({_placeholders(derivation_ids)})",
+                (tenant_id,) + derivation_ids,
+            )
+        return derivation_ids
+
     async def _dependent_current_revisions(self, input_revision_ids: Iterable[str]) -> list[Assertion]:
         tenant_id, _ = self._require_scope()
         pending = set(input_revision_ids)
@@ -984,6 +1036,7 @@ class AsyncAssertionStore:
         while pending:
             batch = tuple(sorted(pending))
             pending.clear()
+            await self._deactivate_inference_derivations_for_inputs(batch)
             rows = await self._database.fetchall(
                 "SELECT DISTINCT r.assertion_id, r.revision_id, r.assertion_mapping FROM semantic_derivation_inputs d "
                 "JOIN semantic_assertions a ON a.tenant_id = d.tenant_id "
@@ -1249,12 +1302,14 @@ class AsyncAssertionStore:
             current = await self._current(assertion_id)
             if current is None or current.revision_id != expected_revision_id or current.status is not AssertionStatus.ACTIVE:
                 raise AssertionConflictError("expected revision is not the active current tenant assertion")
+            await self._invalidate_eligibility(current.revision_id)
             dependents = await self._dependent_current_revisions([current.revision_id])
             to_retract = [current] + [item for item in dependents if item.status is AssertionStatus.ACTIVE]
             retracted: list[Assertion] = []
             invalidated: list[str] = []
             for item in to_retract:
-                await self._invalidate_eligibility(item.revision_id)
+                if item.revision_id != current.revision_id:
+                    await self._invalidate_eligibility(item.revision_id)
                 state = _assertion_with(
                     item, revision_id=uuid4().hex, status=AssertionStatus.RETRACTED,
                     supersedes_revision_id=None, epistemic_state=EpistemicState.RETRACTED,
@@ -1305,9 +1360,9 @@ class AsyncAssertionStore:
             current = await self._current(assertion_id)
             if current is None or current.revision_id != expected_revision_id or current.status is not AssertionStatus.ACTIVE:
                 raise AssertionConflictError("expected revision is not the active current tenant assertion")
+            await self._invalidate_eligibility(current.revision_id)
             dependents = await self._dependent_current_revisions([current.revision_id])
             invalidated_revision_ids = [current.revision_id]
-            await self._invalidate_eligibility(current.revision_id)
             deleted = _assertion_with(
                 current, revision_id=uuid4().hex, status=AssertionStatus.DELETED,
                 supersedes_revision_id=None,
@@ -1343,6 +1398,102 @@ class AsyncAssertionStore:
                 [deleted.revision_id, *[item.revision_id for item in invalidated]],
             )
             return DeletionResult(deleted, tuple(invalidated), tuple(invalidated_revision_ids), generation)
+
+    async def invalidate_assertion_eligibility(
+        self,
+        assertion_id: str,
+        expected_revision_id: str,
+        *,
+        operation_id: str | None = None,
+    ) -> RetractionResult:
+        """Withdraw validation eligibility and retract unsupported conclusions.
+
+        Validation loss is not a semantic retraction of the source statement:
+        its audit revision remains current, but it may no longer support an
+        inferred assertion.  This path deactivates every affected ledger proof
+        and retracts only conclusions with no independent active derivation.
+        """
+        operation_id = operation_id or (
+            f"invalidate-eligibility:{assertion_id}:{expected_revision_id}"
+        )
+        request = {
+            "assertion_id": assertion_id,
+            "expected_revision_id": expected_revision_id,
+        }
+        async with self._mutation():
+            digest, replay = await self._operation(
+                operation_id, "invalidate_eligibility", request
+            )
+            if replay is not None:
+                retracted = [
+                    await self._revision(str(revision_id))
+                    for revision_id in replay["retracted_revision_ids"]
+                ]
+                if any(item is None for item in retracted):
+                    raise AssertionConflictError(
+                        "idempotent eligibility receipt no longer has its revisions"
+                    )
+                return RetractionResult(
+                    tuple(item for item in retracted if item is not None),
+                    tuple(replay["invalidated_revision_ids"]),
+                    int(replay["generation"]),
+                    True,
+                )
+            current = await self._current(assertion_id)
+            if (
+                current is None
+                or current.revision_id != expected_revision_id
+                or current.status is not AssertionStatus.ACTIVE
+            ):
+                raise AssertionConflictError(
+                    "expected revision is not the active current tenant assertion"
+                )
+            await self._invalidate_eligibility(current.revision_id)
+            dependents = await self._dependent_current_revisions((current.revision_id,))
+            invalidated_revision_ids = [current.revision_id]
+            retracted: list[Assertion] = []
+            for dependent in dependents:
+                if dependent.status is not AssertionStatus.ACTIVE:
+                    continue
+                await self._invalidate_eligibility(dependent.revision_id)
+                invalidated_revision_ids.append(dependent.revision_id)
+                state = _assertion_with(
+                    dependent,
+                    revision_id=uuid4().hex,
+                    status=AssertionStatus.RETRACTED,
+                    supersedes_revision_id=None,
+                    epistemic_state=EpistemicState.RETRACTED,
+                )
+                await self._write_revision(state, ())
+                await self._set_current(state)
+                retracted.append(state)
+            generation = await self._advance_generation()
+            source_event = await self._event(
+                current,
+                "validation_ineligible",
+                generation,
+                eligible=False,
+            )
+            dependent_events = [
+                await self._event(item, "retracted", generation)
+                for item in retracted
+            ]
+            await self._record_operation(
+                operation_id,
+                "invalidate_eligibility",
+                digest,
+                {
+                    "retracted_revision_ids": [item.revision_id for item in retracted],
+                    "invalidated_revision_ids": invalidated_revision_ids,
+                    "generation": generation,
+                    "event_ids": [source_event, *dependent_events],
+                },
+                [current.assertion_id, *[item.assertion_id for item in retracted]],
+                [current.revision_id, *[item.revision_id for item in retracted]],
+            )
+            return RetractionResult(
+                tuple(retracted), tuple(invalidated_revision_ids), generation
+            )
 
     async def _sanitize_surviving_references_after_erasure(
         self,
@@ -1507,7 +1658,9 @@ class AsyncAssertionStore:
         mapping["lineage"] = lineage.to_mapping()
         replacement = Assertion.from_mapping(mapping)
         await self._validate_lineage(replacement, ())
-        await self._invalidate_eligibility(assertion.revision_id)
+        await self._invalidate_eligibility(
+            assertion.revision_id, deactivate_inference_derivations=False
+        )
         await self._write_revision(replacement, ())
         await self._set_current(replacement)
         return replacement
@@ -1796,9 +1949,31 @@ class AsyncAssertionStore:
         query = query or AssertionQuery()
         if not isinstance(query, AssertionQuery):
             raise AssertionStoreError("query requires AssertionQuery")
+        return await self._query_current(query)
+
+    async def _query_current(
+        self,
+        query: AssertionQuery,
+        *,
+        eligible_only: bool = False,
+    ) -> list[Assertion]:
+        """Run one tenant-bound current-assertion query with optional eligibility.
+
+        Materialization must filter eligibility in SQL, before a page enters
+        memory.  Keeping that predicate in this shared query primitive also
+        ensures the service cannot accidentally observe a different tenant's
+        projection tombstones.
+        """
         tenant_id, _ = self._require_scope()
         clauses = ["a.tenant_id = ?", "a.current_revision_id = r.revision_id"]
         params: list[object] = [tenant_id]
+        eligibility_join = ""
+        if eligible_only:
+            eligibility_join = (
+                " JOIN semantic_projection_eligibility e "
+                "ON e.tenant_id = r.tenant_id AND e.revision_id = r.revision_id"
+            )
+            clauses.extend(("r.eligible = 1", "e.eligible = 1"))
         if query.subject is not None:
             clauses.append("r.subject_value = ?")
             params.append(query.subject.value)
@@ -1837,21 +2012,44 @@ class AsyncAssertionStore:
             params.append(query.cursor)
         params.append(query.limit)
         rows = await self._database.fetchall(
-            "SELECT r.assertion_mapping FROM semantic_assertions a "
-            "JOIN semantic_assertion_revisions r ON r.tenant_id = a.tenant_id "
-            "WHERE " + " AND ".join(clauses) + " ORDER BY r.revision_id ASC LIMIT ?",
+            (
+                "SELECT r.assertion_mapping FROM semantic_assertions a "
+                "JOIN semantic_assertion_revisions r ON r.tenant_id = a.tenant_id "
+                + eligibility_join
+                + " WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY r.revision_id ASC LIMIT ?"
+            ),
             tuple(params),
         )
         return [Assertion.from_mapping(json.loads(row[0])) for row in rows]
 
     async def inference_inputs(self, query: AssertionQuery | None = None) -> list[Assertion]:
         """Return only current, active, projection-eligible tenant assertions."""
-        values = await self.query(query)
-        return [
-            value for value in values
-            if value.status is AssertionStatus.ACTIVE
-            and await self._is_current_active_eligible_revision(value.revision_id)
-        ]
+        query = query or AssertionQuery()
+        if not isinstance(query, AssertionQuery):
+            raise AssertionStoreError("inference_inputs requires AssertionQuery")
+        return await self._query_current(query, eligible_only=True)
+
+    async def inference_inputs_page(
+        self,
+        *,
+        cursor: str | None = None,
+        limit: int = 1000,
+    ) -> list[Assertion]:
+        """Return one bounded page of eligible inference inputs.
+
+        The cursor is a revision ID in the store's deterministic order.  This
+        intentionally accepts no tenant parameter: the store's authenticated
+        scope remains the only source of tenant selection.
+        """
+        if cursor is not None and (not isinstance(cursor, str) or not cursor):
+            raise AssertionStoreError("inference input cursor must be a non-empty string or null")
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise AssertionStoreError("inference input limit must be an integer in [1, 1000]")
+        return await self._query_current(
+            AssertionQuery(limit=limit, cursor=cursor), eligible_only=True
+        )
 
     async def export_snapshot(self, query: AssertionQuery | None = None) -> tuple[AssertionCheckpoint, tuple[Assertion, ...]]:
         """Return a tenant-bound active snapshot for a caller already scoped here.

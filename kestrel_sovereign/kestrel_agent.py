@@ -529,6 +529,7 @@ class KestrelAgent(
         sovereign_trust_root_path: Optional[str] = None,
         identity_export_dir: Optional[Path] = None,
         semantic_inference_profile: Optional["InferenceProfile"] = None,
+        semantic_inference_limits: Optional["InferenceLimits"] = None,
         semantic_inference_configured: bool = False,
     ):
         """
@@ -581,6 +582,9 @@ class KestrelAgent(
                        construction so it never depends on process CWD.
             semantic_inference_profile: Parsed, exact semantic materialization
                        profile injected by a managed agent configuration.
+            semantic_inference_limits: Parsed, bounded materialization limits
+                       injected with the selected profile.  The limits remain
+                       operator configuration rather than service constants.
             semantic_inference_configured: Whether the managed configuration
                        explicitly supplied the profile, including an explicit
                        disabled profile. When true it takes precedence over a
@@ -672,11 +676,20 @@ class KestrelAgent(
         # incremental maintenance pass and never selects a profile itself.
         # Managed agents receive this from their LocalAgentConfig; direct
         # agents retain the existing per-agent TOML control surface below.
+        from kestrel_sovereign.knowledge.inference import (
+            InferenceError,
+            InferenceLimits,
+        )
+
+        if semantic_inference_limits is not None and not isinstance(
+            semantic_inference_limits, InferenceLimits
+        ):
+            raise RuntimeError("Invalid semantic inference limits")
         self.semantic_inference_profile = semantic_inference_profile
+        self.semantic_inference_limits = semantic_inference_limits or InferenceLimits()
         self.semantic_inference_configured = semantic_inference_configured
         if semantic_inference_profile is not None:
             from kestrel_sovereign.knowledge.inference import (
-                InferenceError,
                 validate_inference_profile,
             )
 
@@ -694,13 +707,16 @@ class KestrelAgent(
                         f"Invalid {SEMANTIC_INFERENCE_CONFIG_ENV} configuration"
                     ) from exc
                 from kestrel_sovereign.knowledge.inference import (
-                    InferenceError,
+                    inference_limits_from_config,
                     inference_profile_from_config,
                     validate_inference_profile,
                 )
 
                 try:
                     self.semantic_inference_profile = inference_profile_from_config(
+                        environment_profile
+                    )
+                    self.semantic_inference_limits = inference_limits_from_config(
                         environment_profile
                     )
                     if self.semantic_inference_profile is not None:
@@ -737,7 +753,7 @@ class KestrelAgent(
                         and "semantic_inference" in toml_data
                     ):
                         from kestrel_sovereign.knowledge.inference import (
-                            InferenceError,
+                            inference_limits_from_config,
                             inference_profile_from_config,
                             validate_inference_profile,
                         )
@@ -745,6 +761,11 @@ class KestrelAgent(
                         try:
                             self.semantic_inference_profile = (
                                 inference_profile_from_config(
+                                    toml_data["semantic_inference"]
+                                )
+                            )
+                            self.semantic_inference_limits = (
+                                inference_limits_from_config(
                                     toml_data["semantic_inference"]
                                 )
                             )

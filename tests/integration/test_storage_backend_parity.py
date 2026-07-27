@@ -311,6 +311,110 @@ async def test_derived_assertion_lifecycle_parity(db_backend, tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_semantic_inference_ledger_retracts_invalid_proofs_on_both_backends(
+    db_backend,
+    tmp_path,
+):
+    """PostgreSQL and SQLite deactivate stale alternate-proof rows identically."""
+    from kestrel_sovereign.knowledge import (
+        Assertion,
+        AssertionQuery,
+        BoundedInferenceService,
+        DirectLineage,
+        EpistemicState,
+        InferenceProfile,
+        IRI,
+        OntologyRef,
+        SourceOccurrence,
+    )
+
+    tenant, identity = await _incepted_assertion_identity(tmp_path, "inference-ledger")
+    storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    ontology = OntologyRef(
+        "http://www.w3.org/2000/01/rdf-schema#",
+        "1.0.0",
+        "e362812917fddab7cfab3dc35553ad292725e8f264e05f376077340e91034db5",
+        "semantic-kb-v1",
+    )
+    profile = InferenceProfile(ontology, "1.0.0")
+    subproperty = IRI("http://www.w3.org/2000/01/rdf-schema#subPropertyOf")
+
+    def semantic_assertion(revision_id, subject, predicate, object_):
+        source_id = f"inference-source:{revision_id}"
+        return Assertion(
+            tenant_id=tenant,
+            owning_agent_id=tenant,
+            subject=subject,
+            predicate=predicate,
+            object=object_,
+            revision_id=revision_id,
+            confidence="1",
+            confidence_method="parity",
+            confidence_basis="parity",
+            epistemic_state=EpistemicState.ASSERTED,
+            asserted_at="2026-07-26T14:02:11Z",
+            ontology_version=ontology,
+            lineage=DirectLineage((source_id,)),
+            privacy_classification="normal",
+            release_policy_reference="policy:private-v1",
+        )
+
+    async def put(revision_id, subject, predicate, object_):
+        assertion = semantic_assertion(revision_id, subject, predicate, object_)
+        await storage.put_assertion(
+            assertion,
+            source_occurrences=(
+                SourceOccurrence(
+                    source_occurrence_id=f"inference-source:{revision_id}",
+                    source_kind="parity-test",
+                    locator=f"parity:{revision_id}",
+                    received_at="2026-07-26T14:02:11Z",
+                ),
+            ),
+        )
+        return assertion
+
+    try:
+        subject = IRI("https://example.test/subject")
+        object_ = IRI("https://example.test/object")
+        property_p = IRI("https://example.test/p")
+        property_q = IRI("https://example.test/q")
+        property_r = IRI("https://example.test/r")
+        direct_path = await put("p-sub-q", property_p, subproperty, property_q)
+        await put("p-sub-r", property_p, subproperty, property_r)
+        await put("r-sub-q", property_r, subproperty, property_q)
+        await put("statement", subject, property_p, object_)
+
+        service = BoundedInferenceService(storage._assertion_store(), profile)
+        assert (await service.materialize_incremental()).complete
+        conclusion = (
+            await storage.query_assertions(
+                AssertionQuery(subject=subject, predicate=property_q, object=object_)
+            )
+        )[0]
+        await storage.delete_assertion(direct_path.assertion_id, direct_path.revision_id)
+
+        retained = await storage.get_assertion(conclusion.assertion_id)
+        assert retained is not None
+        explanations = await service.explain(conclusion.assertion_id)
+        assert explanations
+        assert all(
+            direct_path.revision_id not in explanation.premise_revision_ids
+            for explanation in explanations
+        )
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM semantic_inference_derivations d "
+            "JOIN semantic_inference_derivation_inputs i "
+            "  ON i.tenant_id = d.tenant_id AND i.derivation_id = d.derivation_id "
+            "WHERE d.tenant_id = ? AND d.active = 1 AND i.input_revision_id = ?",
+            (tenant, direct_path.revision_id),
+        ) == 0
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_erasure_scrubs_historical_derived_lineage_on_both_backends(
     db_backend,
     tmp_path,

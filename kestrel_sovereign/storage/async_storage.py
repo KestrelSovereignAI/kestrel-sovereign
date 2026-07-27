@@ -1037,6 +1037,14 @@ class AsyncStorage:
             assertion_id, expected_revision_id, operation_id=operation_id,
         )
 
+    async def invalidate_assertion_eligibility(self, assertion_id: str, expected_revision_id: str, *, operation_id: Optional[str] = None):
+        """Withdraw a source's validation eligibility and cascade unsupported inference."""
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().invalidate_assertion_eligibility(
+            assertion_id, expected_revision_id, operation_id=operation_id,
+        )
+
     async def erase_assertion(self, assertion_id: str, *, operation_id: Optional[str] = None):
         if not self._initialized:
             await self.initialize()

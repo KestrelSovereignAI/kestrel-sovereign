@@ -1558,11 +1558,12 @@ class TestLoadFromConfig:
                 "enabled": True,
                 "rdfs_version": "1.0.0",
                 "ontology": {
-                    "namespace": "kestrel-test",
-                    "version": "1",
-                    "content_digest": "sha256:test",
+                    "namespace": "http://www.w3.org/2000/01/rdf-schema#",
+                    "version": "1.0.0",
+                    "content_digest": "e362812917fddab7cfab3dc35553ad292725e8f264e05f376077340e91034db5",
                     "compatibility_profile": "semantic-kb-v1",
                 },
+                "limits": {"max_source_assertions": 17},
             },
         )
 
@@ -1571,9 +1572,17 @@ class TestLoadFromConfig:
 
         profile = mock_agent_cls.call_args.kwargs["semantic_inference_profile"]
         assert profile == InferenceProfile(
-            OntologyRef("kestrel-test", "1", "sha256:test", "semantic-kb-v1"),
+            OntologyRef(
+                "http://www.w3.org/2000/01/rdf-schema#",
+                "1.0.0",
+                "e362812917fddab7cfab3dc35553ad292725e8f264e05f376077340e91034db5",
+                "semantic-kb-v1",
+            ),
             "1.0.0",
         )
+        assert mock_agent_cls.call_args.kwargs[
+            "semantic_inference_limits"
+        ].max_source_assertions == 17
         assert mock_agent_cls.call_args.kwargs["semantic_inference_configured"] is True
 
     @pytest.mark.asyncio
@@ -1600,9 +1609,9 @@ class TestLoadFromConfig:
                 "enabled": True,
                 "rdfs_version": "9.9.9",
                 "ontology": {
-                    "namespace": "kestrel-test",
-                    "version": "1",
-                    "content_digest": "sha256:test",
+                    "namespace": "http://www.w3.org/2000/01/rdf-schema#",
+                    "version": "1.0.0",
+                    "content_digest": "e362812917fddab7cfab3dc35553ad292725e8f264e05f376077340e91034db5",
                     "compatibility_profile": "semantic-kb-v1",
                 },
             },

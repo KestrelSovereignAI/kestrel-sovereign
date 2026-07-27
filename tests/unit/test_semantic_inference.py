@@ -22,17 +22,20 @@ from kestrel_sovereign.knowledge import (
     DirectLineage,
     EpistemicState,
     IRI,
+    InferenceError,
     InferenceLimits,
     InferenceProfile,
     Literal,
     OntologyRef,
     SourceOccurrence,
     XSD_STRING,
+    inference_limits_from_config,
     inference_profile_from_config,
 )
-from kestrel_sovereign.knowledge.inference import ENGINE_VERSION
+from kestrel_sovereign.knowledge.inference import ENGINE_VERSION, validate_inference_profile
 from kestrel_sovereign.storage.async_assertion_store import AssertionConflictError
 from kestrel_sovereign.storage.db import TransactionError
+from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
 from kestrel_sovereign.security.assertion_tenant_resolver import (
     _resolve_authenticated_agent_assertion_capability,
 )
@@ -42,7 +45,12 @@ from kestrel_sovereign.storage.async_storage import AsyncStorage
 RDF_TYPE = IRI("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
 RDFS_SUBCLASS = IRI("http://www.w3.org/2000/01/rdf-schema#subClassOf")
 RDFS_SUBPROPERTY = IRI("http://www.w3.org/2000/01/rdf-schema#subPropertyOf")
-ONTOLOGY = OntologyRef("kestrel-test", "1", "sha256:test", "semantic-kb-v1")
+ONTOLOGY = OntologyRef(
+    "http://www.w3.org/2000/01/rdf-schema#",
+    "1.0.0",
+    "e362812917fddab7cfab3dc35553ad292725e8f264e05f376077340e91034db5",
+    "semantic-kb-v1",
+)
 
 
 @pytest.fixture
@@ -119,6 +127,81 @@ def test_explicit_semantic_inference_config_constructs_versioned_profile() -> No
     assert profile == _profile(owl=True)
 
 
+def test_semantic_inference_limits_are_strictly_operator_configured() -> None:
+    config = {
+        "enabled": True,
+        "rdfs_version": "1.0.0",
+        "ontology": {
+            "namespace": ONTOLOGY.namespace,
+            "version": ONTOLOGY.version,
+            "content_digest": ONTOLOGY.content_digest,
+            "compatibility_profile": ONTOLOGY.compatibility_profile,
+        },
+        "limits": {
+            "max_source_assertions": 23,
+            "max_iterations": 7,
+            "max_generated_assertions": 31,
+            "max_wall_time_seconds": 1.25,
+            "max_memory_items": 47,
+        },
+    }
+
+    assert inference_limits_from_config(config) == InferenceLimits(
+        max_source_assertions=23,
+        max_iterations=7,
+        max_generated_assertions=31,
+        max_wall_time_seconds=1.25,
+        max_memory_items=47,
+    )
+    with pytest.raises(InferenceError, match="unsupported fields"):
+        inference_limits_from_config({**config, "limits": {"unknown": 1}})
+    with pytest.raises(InferenceError, match="must be an integer"):
+        inference_limits_from_config(
+            {**config, "limits": {"max_source_assertions": True}}
+        )
+
+
+@pytest.mark.parametrize("wall_time_literal", ("nan", "+inf"))
+def test_toml_semantic_inference_limits_reject_non_finite_wall_time(
+    tmp_path, wall_time_literal: str
+) -> None:
+    """TOML's accepted non-finite floats must not disable the time budget."""
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    (agent_dir / "kestrel.toml").write_text(
+        "\n".join(
+            (
+                "[semantic_inference]",
+                "enabled = false",
+                "",
+                "[semantic_inference.limits]",
+                f"max_wall_time_seconds = {wall_time_literal}",
+            )
+        )
+    )
+
+    with pytest.raises(RuntimeError, match=r"Invalid \[semantic_inference\] configuration"):
+        KestrelAgent(
+            did="did:test:non-finite-inference-limit",
+            storage_path=str(agent_dir / "kestrel_prime.db"),
+        )
+
+
+def test_semantic_inference_profile_requires_an_exact_registry_ontology_pin() -> None:
+    invalid = InferenceProfile(
+        OntologyRef(
+            ONTOLOGY.namespace,
+            ONTOLOGY.version,
+            "sha256:not-the-registry-digest",
+            ONTOLOGY.compatibility_profile,
+        ),
+        "1.0.0",
+    )
+
+    with pytest.raises(InferenceError, match="ontology digest"):
+        validate_inference_profile(invalid)
+
+
 def test_semantic_profile_load_is_independent_of_malformed_privacy_config(tmp_path) -> None:
     """An unrelated privacy typo cannot turn off an explicitly approved profile."""
     agent_dir = tmp_path / "agent"
@@ -137,6 +220,9 @@ def test_semantic_profile_load_is_independent_of_malformed_privacy_config(tmp_pa
                 f'version = "{ONTOLOGY.version}"',
                 f'content_digest = "{ONTOLOGY.content_digest}"',
                 f'compatibility_profile = "{ONTOLOGY.compatibility_profile}"',
+                '',
+                '[semantic_inference.limits]',
+                'max_generated_assertions = 19',
             )
         )
     )
@@ -147,6 +233,7 @@ def test_semantic_profile_load_is_independent_of_malformed_privacy_config(tmp_pa
     )
 
     assert agent.semantic_inference_profile == _profile()
+    assert agent.semantic_inference_limits.max_generated_assertions == 19
     assert agent._privacy_computer_access is False
 
 
@@ -214,7 +301,58 @@ async def test_independent_derivation_survives_primary_premise_retraction(assert
     # lifecycle cascade, so the conclusion remains live before the next batch.
     retained = await assertion_store.get_assertion(conclusion.assertion_id)
     assert retained is not None and retained.status.value == "active"
+    explanations = await service.explain(conclusion.assertion_id)
+    assert explanations
+    assert all(
+        direct_path.revision_id not in explanation.premise_revision_ids
+        for explanation in explanations
+    )
     assert await assertion_store.get_assertion(direct.assertion_id) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ("delete", "supersede", "validation_loss"))
+async def test_lifecycle_changes_deactivate_inference_ledger_before_sleep(
+    assertion_store,
+    operation: str,
+) -> None:
+    class_a = IRI("https://example.test/ClassA")
+    class_b = IRI("https://example.test/ClassB")
+    subject = IRI("https://example.test/subject")
+    hierarchy = await _put(assertion_store, "a-sub-b", class_a, RDFS_SUBCLASS, class_b)
+    await _put(assertion_store, "subject-a", subject, RDF_TYPE, class_a)
+    service = BoundedInferenceService(assertion_store, _profile())
+    assert (await service.materialize_incremental()).complete
+    conclusion = (
+        await assertion_store.query(
+            AssertionQuery(subject=subject, predicate=RDF_TYPE, object=class_b)
+        )
+    )[0]
+
+    if operation == "delete":
+        await assertion_store.delete(hierarchy.assertion_id, hierarchy.revision_id)
+    elif operation == "supersede":
+        replacement = _assertion(
+            assertion_store,
+            "a-sub-b-replacement",
+            class_a,
+            RDFS_SUBCLASS,
+            class_b,
+        )
+        await assertion_store.supersede(
+            hierarchy.revision_id,
+            replacement,
+            source_occurrences=(_source("source:a-sub-b-replacement"),),
+        )
+    else:
+        await assertion_store.invalidate_assertion_eligibility(
+            hierarchy.assertion_id, hierarchy.revision_id
+        )
+
+    assert await service.explain(conclusion.assertion_id) == ()
+    assert await assertion_store.query(
+        AssertionQuery(subject=subject, predicate=RDF_TYPE, object=class_b)
+    ) == []
 
 
 @pytest.mark.asyncio
@@ -312,6 +450,55 @@ async def test_explicit_inference_revocation_retracts_materializations_and_ledge
 
 
 @pytest.mark.asyncio
+async def test_initialized_privacy_storage_revokes_disabled_inference(tmp_path) -> None:
+    """The normal initialized agent path keeps disablement governed and effective."""
+    identity_dir = tmp_path / "identity"
+    credentials = await create_kestrel_identity_async(
+        str(identity_dir), identity_method="did:pkh", agent_name="Privacy semantic test"
+    )
+    key_id = f"kestrel_{credentials.agent_did.rsplit(':', 1)[-1]}"
+    identity = load_agent_identity(key_id, identity_dir)
+    capability = _resolve_authenticated_agent_assertion_capability(
+        credentials.agent_did, identity
+    )
+    raw_storage = AsyncStorage(
+        ":memory:",
+        agent_id=credentials.agent_did,
+        _assertion_tenant_capability=capability,
+    )
+    await raw_storage.initialize()
+    try:
+        store = raw_storage._assertion_store()
+        class_a = IRI("https://example.test/ClassA")
+        class_b = IRI("https://example.test/ClassB")
+        subject = IRI("https://example.test/subject")
+        await _put(store, "a-sub-b", class_a, RDFS_SUBCLASS, class_b)
+        await _put(store, "subject-a", subject, RDF_TYPE, class_a)
+        storage = PrivacyEnforcingStorage(raw_storage, "normal")
+        assert (await storage.materialize_semantic_inference(_profile())).complete
+
+        class Agent(SleepMixin):
+            semantic_inference_profile = None
+            semantic_inference_configured = True
+
+            def __init__(self) -> None:
+                self.storage = storage
+
+        report = await Agent().sleep(
+            skip_consolidation=True,
+            skip_export=True,
+            skip_reflection=True,
+        )
+        assert report.semantic_inference is not None
+        assert report.semantic_inference["status"] == "disabled"
+        assert await raw_storage.query_assertions(
+            AssertionQuery(subject=subject, predicate=RDF_TYPE, object=class_b)
+        ) == []
+    finally:
+        await raw_storage.close()
+
+
+@pytest.mark.asyncio
 async def test_inference_reactivation_cannot_replace_retracted_direct_assertion(assertion_store) -> None:
     direct = await _put(
         assertion_store,
@@ -361,7 +548,7 @@ async def test_concurrent_direct_write_is_not_covered_by_complete_checkpoint(ass
     original_persist = service._persist_facts
     direct_write: asyncio.Task | None = None
 
-    async def persist_while_direct_write_arrives(facts, run_id):
+    async def persist_while_direct_write_arrives(facts, run_id, started):
         nonlocal direct_write
         if direct_write is None:
             direct_write = asyncio.create_task(
@@ -370,7 +557,7 @@ async def test_concurrent_direct_write_is_not_covered_by_complete_checkpoint(ass
             # Let the writer reach the tenant lock while the materializer is
             # publishing.  It must wait until the complete checkpoint commits.
             await asyncio.sleep(0)
-        return await original_persist(facts, run_id)
+        return await original_persist(facts, run_id, started)
 
     service._persist_facts = persist_while_direct_write_arrives  # type: ignore[method-assign]
     first = await service.materialize_incremental()
@@ -388,13 +575,15 @@ async def test_concurrent_direct_write_is_not_covered_by_complete_checkpoint(ass
 @pytest.mark.asyncio
 async def test_sleep_runs_incremental_inference_for_approved_profile() -> None:
     profile = _profile()
+    limits = InferenceLimits(max_source_assertions=23)
 
     class Storage:
         def __init__(self) -> None:
             self.profiles = []
 
-        async def materialize_semantic_inference(self, selected_profile):
+        async def materialize_semantic_inference(self, selected_profile, *, limits=None):
             self.profiles.append(selected_profile)
+            self.limits = limits
             return SimpleNamespace(
                 status=ClosureStatus.COMPLETE,
                 incomplete_reason=None,
@@ -407,6 +596,7 @@ async def test_sleep_runs_incremental_inference_for_approved_profile() -> None:
     class Agent(SleepMixin):
         def __init__(self) -> None:
             self.semantic_inference_profile = profile
+            self.semantic_inference_limits = limits
             self.storage = Storage()
 
     agent = Agent()
@@ -416,6 +606,7 @@ async def test_sleep_runs_incremental_inference_for_approved_profile() -> None:
         skip_reflection=True,
     )
     assert agent.storage.profiles == [profile]
+    assert agent.storage.limits is limits
     assert report.semantic_inference == {
         "status": "complete",
         "incomplete_reason": None,
@@ -431,7 +622,7 @@ async def test_sleep_marks_success_false_when_enabled_inference_fails() -> None:
     profile = _profile()
 
     class Storage:
-        async def materialize_semantic_inference(self, selected_profile):
+        async def materialize_semantic_inference(self, selected_profile, *, limits=None):
             assert selected_profile == profile
             raise RuntimeError("publication failed")
 
@@ -535,6 +726,44 @@ async def test_publication_failure_records_terminal_failed_state(assertion_store
     assert run is not None
     assert run[0] == ClosureStatus.FAILED.value
     assert run[1] is not None
+    assert await assertion_store.query(
+        AssertionQuery(subject=subject, predicate=RDF_TYPE, object=class_b)
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_publication_time_budget_is_recorded_incomplete_after_rollback(
+    assertion_store,
+) -> None:
+    """A budget error wrapped by the publication transaction is not a failure."""
+    class_a = IRI("https://example.test/ClassA")
+    class_b = IRI("https://example.test/ClassB")
+    subject = IRI("https://example.test/subject")
+    await _put(assertion_store, "a-sub-b", class_a, RDFS_SUBCLASS, class_b)
+    await _put(assertion_store, "subject-a", subject, RDF_TYPE, class_a)
+
+    service = BoundedInferenceService(
+        assertion_store,
+        _profile(),
+        limits=InferenceLimits(max_wall_time_seconds=60),
+    )
+    original_replace = service._replace_active_derivations
+
+    async def replace_after_time_limit(facts, run_id, started) -> None:
+        # The ledger method checks the supplied start time after it has begun
+        # publication.  The transaction wrapper turns that _BudgetExceeded
+        # into TransactionError, which must still surface as INCOMPLETE.
+        await original_replace(facts, run_id, started - 61)
+
+    service._replace_active_derivations = replace_after_time_limit  # type: ignore[method-assign]
+    result = await service.materialize_incremental()
+
+    assert result.status is ClosureStatus.INCOMPLETE
+    assert result.incomplete_reason == "wall_time"
+    state = await service.closure_state()
+    assert state is not None
+    assert state.status is ClosureStatus.INCOMPLETE
+    assert state.incomplete_reason == "wall_time"
     assert await assertion_store.query(
         AssertionQuery(subject=subject, predicate=RDF_TYPE, object=class_b)
     ) == []
@@ -668,7 +897,12 @@ async def test_ontology_version_change_invalidates_prior_materialization(asserti
     assert (await first.materialize_incremental()).complete
     assert await assertion_store.query(AssertionQuery(subject=subject, predicate=RDF_TYPE, object=class_b))
 
-    newer_ontology = OntologyRef("kestrel-test", "2", "sha256:new", "semantic-kb-v1")
+    newer_ontology = OntologyRef(
+        "https://kestrel.ai/vocab/",
+        "1.1.0",
+        "2d14444f4f42fd8beda98f8da5b052e44652a624755943a0a6e7927fef395ebb",
+        "semantic-kb-v1",
+    )
     newer_profile = InferenceProfile(newer_ontology, "1.0.0")
     assert (await BoundedInferenceService(assertion_store, newer_profile).materialize_incremental()).complete
     assert await assertion_store.query(AssertionQuery(subject=subject, predicate=RDF_TYPE, object=class_b)) == []

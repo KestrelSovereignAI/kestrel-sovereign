@@ -530,7 +530,10 @@ class SleepMixin:
             )
             return False
         try:
-            result = await materialize(profile)
+            result = await materialize(
+                profile,
+                limits=getattr(self, "semantic_inference_limits", None),
+            )
         except Exception:  # Inference maintenance cannot leave sleep half-run.
             report.semantic_inference = {
                 "status": "failed",

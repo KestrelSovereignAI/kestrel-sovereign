@@ -15,6 +15,8 @@ from enum import Enum
 import hashlib
 import json
 import logging
+import math
+from collections import deque
 from importlib import resources
 from time import monotonic
 from typing import Callable, Iterable, Mapping, Sequence, TYPE_CHECKING
@@ -23,7 +25,6 @@ from uuid import uuid4
 from .assertion import (
     Assertion,
     AssertionObject,
-    AssertionQuery,
     AssertionStatus,
     DerivedLineage,
     EpistemicState,
@@ -94,9 +95,10 @@ class InferenceLimits:
         if (
             not isinstance(self.max_wall_time_seconds, (int, float))
             or isinstance(self.max_wall_time_seconds, bool)
+            or not math.isfinite(self.max_wall_time_seconds)
             or self.max_wall_time_seconds <= 0
         ):
-            raise InferenceError("max_wall_time_seconds must be positive")
+            raise InferenceError("max_wall_time_seconds must be a positive finite number")
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +157,18 @@ def inference_profile_from_config(config: Mapping[str, object]) -> InferenceProf
     """
     if not isinstance(config, Mapping):
         raise InferenceError("[semantic_inference] must be a table")
+    allowed_fields = {
+        "enabled", "rdfs_version", "owl2rl_version", "ontology", "limits",
+    }
+    unexpected_fields = set(config).difference(allowed_fields)
+    if unexpected_fields:
+        raise InferenceError(
+            "semantic inference configuration has unsupported fields: "
+            + ", ".join(sorted(map(str, unexpected_fields)))
+        )
+    # Validate the paired budget at the same explicit approval boundary.
+    # Agent startup later retains the parsed object and passes it to sleep.
+    inference_limits_from_config(config)
     enabled = config.get("enabled", False)
     if type(enabled) is not bool:
         raise InferenceError("semantic inference enabled must be a boolean")
@@ -170,6 +184,12 @@ def inference_profile_from_config(config: Mapping[str, object]) -> InferenceProf
         "content_digest",
         "compatibility_profile",
     )
+    unexpected_ontology_fields = set(ontology).difference(required_ontology_fields)
+    if unexpected_ontology_fields:
+        raise InferenceError(
+            "semantic inference ontology has unsupported fields: "
+            + ", ".join(sorted(map(str, unexpected_ontology_fields)))
+        )
     if any(not isinstance(ontology.get(field), str) or not ontology[field] for field in required_ontology_fields):
         raise InferenceError("semantic inference ontology requires exact namespace, version, content_digest, and compatibility_profile")
 
@@ -191,6 +211,59 @@ def inference_profile_from_config(config: Mapping[str, object]) -> InferenceProf
     )
 
 
+def inference_limits_from_config(config: Mapping[str, object]) -> InferenceLimits:
+    """Parse one strict, operator-owned materialization budget.
+
+    Limits live beside the exact rule/ontology approval so a deployment cannot
+    silently inherit an unreviewed library or process default.  Omitting the
+    optional table preserves the bounded service defaults; every supplied
+    value, however, must have the exact expected primitive type.
+    """
+    if not isinstance(config, Mapping):
+        raise InferenceError("[semantic_inference] must be a table")
+    raw_limits = config.get("limits")
+    if raw_limits is None:
+        return InferenceLimits()
+    if not isinstance(raw_limits, Mapping):
+        raise InferenceError("[semantic_inference.limits] must be a table")
+    allowed_fields = {
+        "max_source_assertions",
+        "max_iterations",
+        "max_generated_assertions",
+        "max_wall_time_seconds",
+        "max_memory_items",
+    }
+    unexpected_fields = set(raw_limits).difference(allowed_fields)
+    if unexpected_fields:
+        raise InferenceError(
+            "semantic inference limits have unsupported fields: "
+            + ", ".join(sorted(map(str, unexpected_fields)))
+        )
+    values: dict[str, int | float] = {}
+    for name in (
+        "max_source_assertions",
+        "max_iterations",
+        "max_generated_assertions",
+        "max_memory_items",
+    ):
+        if name in raw_limits:
+            value = raw_limits[name]
+            if type(value) is not int:
+                raise InferenceError(f"semantic inference limit {name} must be an integer")
+            values[name] = value
+    if "max_wall_time_seconds" in raw_limits:
+        value = raw_limits["max_wall_time_seconds"]
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise InferenceError(
+                "semantic inference limit max_wall_time_seconds must be a number"
+            )
+        values["max_wall_time_seconds"] = value
+    try:
+        return InferenceLimits(**values)
+    except TypeError as error:  # Defensive: keep this parser's public error stable.
+        raise InferenceError("invalid semantic inference limits") from error
+
+
 def validate_inference_profile(profile: InferenceProfile) -> None:
     """Validate the exact local artifacts selected by an inference profile.
 
@@ -204,12 +277,35 @@ def validate_inference_profile(profile: InferenceProfile) -> None:
         raise InferenceError("semantic inference validation requires an InferenceProfile")
     registry = get_knowledge_registry()
     try:
+        ontology_version = SemanticVersion.parse(profile.ontology.version)
+    except ValueError as error:
+        raise InferenceError("the pinned ontology version must be an exact semantic version") from error
+    ontology_matches = [
+        resource
+        for resource in registry.resources
+        if resource.kind is ResourceKind.ONTOLOGY
+        and resource.namespace == profile.ontology.namespace
+        and resource.version == ontology_version
+    ]
+    if len(ontology_matches) != 1:
+        raise InferenceError("the pinned ontology namespace and version are unavailable")
+    ontology = ontology_matches[0]
+    if profile.ontology.content_digest != ontology.sha256:
+        raise InferenceError("the pinned ontology digest does not match the local registry")
+    if profile.ontology.compatibility_profile != registry.contract_version:
+        raise InferenceError("the pinned ontology compatibility profile is unsupported")
+    try:
         rdfs = registry.resolve_capability("rdfs-v1", profile.rdfs_version)
     except KnowledgeRegistryError as error:
         raise InferenceError("the pinned RDFS rule profile is unavailable") from error
     if rdfs.resource.kind is not ResourceKind.RULE_PROFILE:
         raise InferenceError("rdfs-v1 must resolve to a rule profile")
-    _read_profile(rdfs.resource.package_resource, "rdfs-v1")
+    rdfs_profile = _read_profile(rdfs.resource.package_resource, "rdfs-v1")
+    expected_rdfs = {
+        "rdfs:subClassOf", "rdfs:subPropertyOf", "rdfs:domain", "rdfs:range",
+    }
+    if set(rdfs_profile.get("entailment", ())) != expected_rdfs:
+        raise InferenceError("the pinned RDFS profile has an unsupported rule allowlist")
     if profile.owl2rl_version is None:
         return
     try:
@@ -307,6 +403,25 @@ class _BudgetExceeded(RuntimeError):
         self.reason = reason
 
 
+def _budget_exhaustion_from(error: BaseException) -> _BudgetExceeded | None:
+    """Return a materialization budget error preserved as an explicit cause.
+
+    The storage backends deliberately translate exceptions raised in a
+    transaction to their public transaction error.  ``__cause__`` retains the
+    original bounded-work outcome, which is semantically distinct from a
+    persistence failure.  Follow only explicit causes (not incidental context)
+    and guard against a malformed cyclic exception chain.
+    """
+    current: BaseException | None = error
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        if isinstance(current, _BudgetExceeded):
+            return current
+        visited.add(id(current))
+        current = current.__cause__
+    return None
+
+
 class BoundedInferenceService:
     """The sole materializer for the pinned RDFS / OWL 2 RL profile.
 
@@ -326,6 +441,8 @@ class BoundedInferenceService:
 
         if not isinstance(store, AsyncAssertionStore):
             raise InferenceError("BoundedInferenceService requires an agent-bound AsyncAssertionStore")
+        if limits is not None and not isinstance(limits, InferenceLimits):
+            raise InferenceError("BoundedInferenceService limits must be InferenceLimits")
         self._store = store
         self.profile = profile
         self.limits = limits or InferenceLimits()
@@ -409,23 +526,24 @@ class BoundedInferenceService:
         # premise is just as correct as an inserted premise), but consuming the
         # tenant-bound change stream makes the incremental checkpoint explicit
         # and avoids treating this normal path as an operator repair rebuild.
-        changes = ()
-        if not full_rebuild and prior is not None:
-            changes = tuple(
-                await self._store.changes_since(
-                    prior.source_generation,
-                    limit=min(1000, self.limits.max_source_assertions),
-                )
-            )
-
         run_id = self._run_id(initial_checkpoint.generation, full_rebuild)
+        changes = ()
         await self._record_run(
             run_id, initial_checkpoint.generation, ClosureStatus.RUNNING, None,
             {"incremental": not full_rebuild, "changed_assertions": len(changes)}, complete=False,
         )
         started = monotonic()
         try:
-            sources = await self._source_facts()
+            if not full_rebuild and prior is not None:
+                self._check_time(started)
+                changes = tuple(
+                    await self._store.changes_since(
+                        prior.source_generation,
+                        limit=min(1000, self.limits.max_source_assertions),
+                    )
+                )
+                self._check_time(started)
+            sources = await self._source_facts(started)
             facts = self._close(sources, started)
         except _BudgetExceeded as error:
             await self._record_run(
@@ -474,9 +592,11 @@ class BoundedInferenceService:
                         len(sources), 0, 0, 0, not full_rebuild,
                     )
 
-                retracted = await self._reconcile_stale(facts, run_id)
-                generated, derivations = await self._persist_facts(facts, run_id)
-                await self._replace_active_derivations(facts, run_id)
+                retracted = await self._reconcile_stale(facts, run_id, started)
+                generated, derivations = await self._persist_facts(
+                    facts, run_id, started
+                )
+                await self._replace_active_derivations(facts, run_id, started)
                 final_checkpoint = await self._store.checkpoint()
                 await self._record_run(
                     run_id, final_checkpoint.generation, ClosureStatus.COMPLETE, None,
@@ -491,6 +611,38 @@ class BoundedInferenceService:
                     complete=True,
                 )
         except Exception as error:
+            budget_error = _budget_exhaustion_from(error)
+            if budget_error is not None:
+                # ``inference_publication()`` uses the canonical store's
+                # transaction boundary.  SQLite and PostgreSQL wrap an error
+                # raised in that scope in ``TransactionError`` after rolling
+                # back, so inspect the causal chain here rather than allowing
+                # a publication-time budget limit to be recorded as FAILED.
+                await self._record_run(
+                    run_id,
+                    initial_checkpoint.generation,
+                    ClosureStatus.INCOMPLETE,
+                    budget_error.reason,
+                    {
+                        "incremental": not full_rebuild,
+                        "changed_assertions": len(changes),
+                        "phase": "publication",
+                    },
+                    complete=True,
+                )
+                return MaterializationResult(
+                    run_id,
+                    self.profile.key,
+                    initial_checkpoint.generation,
+                    initial_checkpoint.generation,
+                    ClosureStatus.INCOMPLETE,
+                    budget_error.reason,
+                    len(sources),
+                    0,
+                    0,
+                    0,
+                    not full_rebuild,
+                )
             # The publication transaction has rolled back before this handler
             # runs. Record its terminal state outside that transaction so a
             # failed reconciliation, persistence, ledger replacement, or
@@ -527,22 +679,55 @@ class BoundedInferenceService:
             len(sources), generated, derivations, retracted, not full_rebuild,
         )
 
-    async def _source_facts(self) -> dict[str, _Fact]:
-        assertions = await _all_active_assertions(self._store)
-        source_assertions = [
-            assertion for assertion in assertions
-            if assertion.epistemic_state is not EpistemicState.INFERRED
-            and assertion.ontology_version == self.profile.ontology
-        ]
-        if len(source_assertions) > self.limits.max_source_assertions:
-            raise _BudgetExceeded("source_assertions")
-        return {
-            assertion.assertion_id: _Fact(
-                assertion.assertion_id, assertion.subject, assertion.predicate,
-                assertion.object, 0, assertion,
+    async def _source_facts(self, started: float) -> dict[str, _Fact]:
+        """Stream eligible direct facts without retaining an unbounded store scan."""
+        cursor: str | None = None
+        sources: dict[str, _Fact] = {}
+        while True:
+            self._check_time(started)
+            # Retained source facts and the current result page coexist while
+            # this loop filters it.  Fit the page in the remaining budget,
+            # then remove each item as it becomes a retained fact (or is
+            # discarded) so the accounting remains true throughout the scan.
+            page_size = min(
+                1000,
+                self.limits.max_source_assertions,
+                max(1, self.limits.max_memory_items - len(sources)),
             )
-            for assertion in sorted(source_assertions, key=lambda item: item.assertion_id)
-        }
+            page = deque(
+                await self._store.inference_inputs_page(
+                    cursor=cursor, limit=page_size
+                )
+            )
+            self._check_time(started)
+            if not page:
+                return sources
+            received_count = len(page)
+            self._check_memory(sources, transient_items=len(page))
+            next_cursor = page[-1].revision_id
+            while page:
+                assertion = page.popleft()
+                self._check_time(started)
+                if (
+                    assertion.epistemic_state is EpistemicState.INFERRED
+                    or assertion.ontology_version != self.profile.ontology
+                ):
+                    self._check_memory(sources, transient_items=len(page))
+                    continue
+                if len(sources) >= self.limits.max_source_assertions:
+                    raise _BudgetExceeded("source_assertions")
+                sources[assertion.assertion_id] = _Fact(
+                    assertion.assertion_id,
+                    assertion.subject,
+                    assertion.predicate,
+                    assertion.object,
+                    0,
+                    assertion,
+                )
+                self._check_memory(sources, transient_items=len(page))
+            if received_count < page_size:
+                return sources
+            cursor = next_cursor
 
     def _close(self, facts: dict[str, _Fact], started: float) -> dict[str, _Fact]:
         self._check_memory(facts)
@@ -687,45 +872,86 @@ class BoundedInferenceService:
         if monotonic() - started > self.limits.max_wall_time_seconds:
             raise _BudgetExceeded("wall_time")
 
-    def _check_memory(self, facts: dict[str, _Fact]) -> None:
-        item_count = len(facts) + sum(len(fact.derivations) for fact in facts.values())
+    def _check_memory(
+        self,
+        facts: dict[str, _Fact],
+        *,
+        transient_items: int = 0,
+    ) -> None:
+        item_count = (
+            len(facts)
+            + sum(len(fact.derivations) for fact in facts.values())
+            + transient_items
+        )
         if item_count > self.limits.max_memory_items:
             raise _BudgetExceeded("memory")
 
-    async def _reconcile_stale(self, facts: dict[str, _Fact], run_id: str) -> int:
+    async def _reconcile_stale(
+        self,
+        facts: dict[str, _Fact],
+        run_id: str,
+        started: float,
+    ) -> int:
         desired = set(facts)
-        stale = [
-            assertion for assertion in await _all_active_assertions(self._store)
-            if assertion.epistemic_state is EpistemicState.INFERRED
-            and isinstance(assertion.lineage, DerivedLineage)
-            and assertion.lineage.engine_version == ENGINE_VERSION
-            and (
-                assertion.assertion_id not in desired
-                or assertion.ontology_version != self.profile.ontology
-                or assertion.lineage.profile_version != self.profile.rule_profile_version
-            )
-        ]
         retracted = 0
-        for assertion in sorted(stale, key=lambda item: item.assertion_id):
-            # A previous stale root can transitively retract this assertion.
-            # Re-read the current pointer rather than turning that normal
-            # lifecycle cascade into an optimistic-concurrency failure.
-            current = await self._store.get_assertion(assertion.assertion_id, include_inactive=True)
-            if (
-                current is None
-                or current.status is not AssertionStatus.ACTIVE
-                or current.revision_id != assertion.revision_id
-            ):
-                continue
-            await self._store.retract(
-                assertion.assertion_id,
-                assertion.revision_id,
-                operation_id=f"inference-retract:{run_id}:{assertion.revision_id}",
+        cursor: str | None = None
+        while True:
+            self._check_time(started)
+            page_size = min(1000, self.limits.max_memory_items)
+            page = await self._store.inference_inputs_page(
+                cursor=cursor, limit=page_size
             )
-            retracted += 1
+            self._check_time(started)
+            if not page:
+                return retracted
+            self._check_memory(facts, transient_items=len(page))
+            next_cursor = page[-1].revision_id
+            # Mutating the result page in place avoids retaining a second
+            # page-sized stale list under the same inference memory limit.
+            page.sort(key=lambda item: item.assertion_id)
+            for assertion in page:
+                if not (
+                    assertion.epistemic_state is EpistemicState.INFERRED
+                    and isinstance(assertion.lineage, DerivedLineage)
+                    and assertion.lineage.engine_version == ENGINE_VERSION
+                    and (
+                        assertion.assertion_id not in desired
+                        or assertion.ontology_version != self.profile.ontology
+                        or assertion.lineage.profile_version
+                        != self.profile.rule_profile_version
+                    )
+                ):
+                    continue
+                self._check_time(started)
+                # A previous stale root can transitively retract this assertion.
+                # Re-read the current pointer rather than turning that normal
+                # lifecycle cascade into an optimistic-concurrency failure.
+                current = await self._store.get_assertion(
+                    assertion.assertion_id, include_inactive=True
+                )
+                if (
+                    current is None
+                    or current.status is not AssertionStatus.ACTIVE
+                    or current.revision_id != assertion.revision_id
+                ):
+                    continue
+                await self._store.retract(
+                    assertion.assertion_id,
+                    assertion.revision_id,
+                    operation_id=f"inference-retract:{run_id}:{assertion.revision_id}",
+                )
+                retracted += 1
+            if len(page) < page_size:
+                return retracted
+            cursor = next_cursor
         return retracted
 
-    async def _persist_facts(self, facts: dict[str, _Fact], run_id: str) -> tuple[int, int]:
+    async def _persist_facts(
+        self,
+        facts: dict[str, _Fact],
+        run_id: str,
+        started: float,
+    ) -> tuple[int, int]:
         generated = [fact for fact in facts.values() if not fact.is_source]
         revision_ids = {
             fact.assertion_id: fact.source_assertion.revision_id
@@ -733,6 +959,7 @@ class BoundedInferenceService:
         }
         persisted: list[_Fact] = []
         for fact in sorted(generated, key=lambda item: (item.depth, item.assertion_id)):
+            self._check_time(started)
             # A conclusion can have an alternate proof discovered later than
             # its first proof.  The lexicographically first signature is not
             # necessarily topologically publishable (it may name an inferred
@@ -805,7 +1032,12 @@ class BoundedInferenceService:
             release_policy_reference="policy:inference-private-v1",
         )
 
-    async def _replace_active_derivations(self, facts: dict[str, _Fact], run_id: str) -> None:
+    async def _replace_active_derivations(
+        self,
+        facts: dict[str, _Fact],
+        run_id: str,
+        started: float,
+    ) -> None:
         tenant_id = self._store.tenant_id
         database = self._store._database  # noqa: SLF001 - same internal persistence boundary
         await database.execute(
@@ -814,10 +1046,12 @@ class BoundedInferenceService:
             (tenant_id, self.profile.key),
         )
         for fact in sorted((item for item in facts.values() if not item.is_source), key=lambda item: item.assertion_id):
+            self._check_time(started)
             current = await self._store.get_assertion(fact.assertion_id)
             if current is None or current.epistemic_state is not EpistemicState.INFERRED:
                 continue
             for derivation in sorted(fact.derivations.values(), key=lambda item: item.signature):
+                self._check_time(started)
                 derivation_id = "derivation:" + _sha256({
                     "profile_key": self.profile.key,
                     "assertion_id": fact.assertion_id,
@@ -826,6 +1060,7 @@ class BoundedInferenceService:
                 })
                 premises = []
                 for premise in derivation.premises:
+                    self._check_time(started)
                     premise_assertion = await self._store.get_assertion(premise)
                     if premise_assertion is None:
                         raise InferenceError("active closure premise disappeared during ledger write")
@@ -910,21 +1145,6 @@ InferenceService = BoundedInferenceService
 SemanticInferenceService = BoundedInferenceService
 
 
-async def _all_active_assertions(store: "AsyncAssertionStore") -> list[Assertion]:
-    cursor: str | None = None
-    values: list[Assertion] = []
-    while True:
-        page = await store.query(AssertionQuery(limit=1000, cursor=cursor))
-        if not page:
-            return values
-        for assertion in page:
-            if await store._is_current_active_eligible_revision(assertion.revision_id):  # noqa: SLF001
-                values.append(assertion)
-        if len(page) < 1000:
-            return values
-        cursor = page[-1].revision_id
-
-
 def _matching_paths(
     snapshot: Sequence[_Fact],
     chain: tuple[IRI, ...],
@@ -1004,6 +1224,7 @@ __all__ = [
     "InferenceError",
     "InferenceLimits",
     "InferenceProfile",
+    "inference_limits_from_config",
     "inference_profile_from_config",
     "validate_inference_profile",
     "InferenceService",
