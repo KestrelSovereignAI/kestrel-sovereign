@@ -61,6 +61,13 @@ from kestrel_sovereign.storage.async_storage import AsyncStorage
 RDF_TYPE = IRI("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
 RDFS_SUBCLASS = IRI("http://www.w3.org/2000/01/rdf-schema#subClassOf")
 RDFS_SUBPROPERTY = IRI("http://www.w3.org/2000/01/rdf-schema#subPropertyOf")
+RDFS_DOMAIN = IRI("http://www.w3.org/2000/01/rdf-schema#domain")
+RDFS_RANGE = IRI("http://www.w3.org/2000/01/rdf-schema#range")
+OWL_EQUIVALENT_CLASS = IRI("http://www.w3.org/2002/07/owl#equivalentClass")
+OWL_EQUIVALENT_PROPERTY = IRI("http://www.w3.org/2002/07/owl#equivalentProperty")
+OWL_INVERSE_OF = IRI("http://www.w3.org/2002/07/owl#inverseOf")
+OWL_TRANSITIVE_PROPERTY = IRI("http://www.w3.org/2002/07/owl#TransitiveProperty")
+OWL_SYMMETRIC_PROPERTY = IRI("http://www.w3.org/2002/07/owl#SymmetricProperty")
 ONTOLOGY = OntologyRef(
     "http://www.w3.org/2000/01/rdf-schema#",
     "1.0.0",
@@ -1190,7 +1197,7 @@ async def test_bounded_maintenance_uses_targeted_inference_not_a_global_source_s
 async def test_targeted_inference_defers_when_indexed_context_overflows(
     assertion_store,
 ) -> None:
-    """A filled context page must not be mistaken for a complete closure."""
+    """A filled rule-premise page must not be mistaken for a complete closure."""
     subject = IRI("https://example.test/context-overflow-subject")
     predicate = IRI("https://example.test/context-overflow-predicate")
     target = await _put(
@@ -1201,11 +1208,12 @@ async def test_targeted_inference_defers_when_indexed_context_overflows(
         IRI("https://example.test/context-overflow-object-a"),
     )
     await _put(
-        assertion_store,
-        "context-overflow-z-peer",
-        subject,
-        predicate,
-        IRI("https://example.test/context-overflow-object-z"),
+        assertion_store, "context-overflow-p-sub-q", predicate,
+        RDFS_SUBPROPERTY, IRI("https://example.test/context-overflow-q"),
+    )
+    await _put(
+        assertion_store, "context-overflow-p-sub-r", predicate,
+        RDFS_SUBPROPERTY, IRI("https://example.test/context-overflow-r"),
     )
 
     result = await BoundedInferenceService(
@@ -1219,6 +1227,259 @@ async def test_targeted_inference_defers_when_indexed_context_overflows(
 
     assert result.status is ClosureStatus.INCOMPLETE
     assert result.incomplete_reason == "context_assertions"
+
+
+@pytest.mark.asyncio
+async def test_targeted_inference_follows_allowlisted_role_crossing_joins(
+    assertion_store,
+) -> None:
+    """A target page includes every bounded direct premise role its rules need."""
+    subject = IRI("https://example.test/targeted-joins/subject")
+    object_ = IRI("https://example.test/targeted-joins/object")
+    terminal = IRI("https://example.test/targeted-joins/terminal")
+    class_a = IRI("https://example.test/targeted-joins/ClassA")
+    class_b = IRI("https://example.test/targeted-joins/ClassB")
+    class_c = IRI("https://example.test/targeted-joins/ClassC")
+    class_d = IRI("https://example.test/targeted-joins/ClassD")
+    class_e = IRI("https://example.test/targeted-joins/ClassE")
+    class_f = IRI("https://example.test/targeted-joins/ClassF")
+    property_p = IRI("https://example.test/targeted-joins/p")
+    property_q = IRI("https://example.test/targeted-joins/q")
+    property_r = IRI("https://example.test/targeted-joins/r")
+    property_s = IRI("https://example.test/targeted-joins/s")
+    property_t = IRI("https://example.test/targeted-joins/t")
+    property_u = IRI("https://example.test/targeted-joins/u")
+    property_v = IRI("https://example.test/targeted-joins/v")
+
+    targets = (
+        await _put(assertion_store, "joins-type", subject, RDF_TYPE, class_a),
+        await _put(assertion_store, "joins-subproperty", subject, property_p, object_),
+        await _put(assertion_store, "joins-domain", subject, property_q, object_),
+        await _put(assertion_store, "joins-range", subject, property_r, object_),
+        await _put(assertion_store, "joins-inverse", subject, property_s, object_),
+        await _put(assertion_store, "joins-symmetric", subject, property_t, object_),
+        await _put(assertion_store, "joins-transitive-left", subject, property_u, object_),
+        await _put(assertion_store, "joins-equivalent-property", subject, property_v, object_),
+        await _put(assertion_store, "joins-equivalent-class", terminal, RDF_TYPE, class_e),
+    )
+    await _put(assertion_store, "joins-class-schema", class_a, RDFS_SUBCLASS, class_b)
+    await _put(assertion_store, "joins-property-schema", property_p, RDFS_SUBPROPERTY, property_q)
+    await _put(assertion_store, "joins-domain-schema", property_q, RDFS_DOMAIN, class_c)
+    await _put(assertion_store, "joins-range-schema", property_r, RDFS_RANGE, class_d)
+    await _put(assertion_store, "joins-inverse-schema", property_s, OWL_INVERSE_OF, property_q)
+    await _put(assertion_store, "joins-symmetric-schema", property_t, RDF_TYPE, OWL_SYMMETRIC_PROPERTY)
+    await _put(assertion_store, "joins-transitive-schema", property_u, RDF_TYPE, OWL_TRANSITIVE_PROPERTY)
+    await _put(assertion_store, "joins-transitive-right", object_, property_u, terminal)
+    await _put(assertion_store, "joins-equivalent-property-schema", property_v, OWL_EQUIVALENT_PROPERTY, property_r)
+    await _put(assertion_store, "joins-equivalent-class-schema", class_e, OWL_EQUIVALENT_CLASS, class_f)
+
+    result = await BoundedInferenceService(
+        assertion_store,
+        _profile(owl=True),
+        limits=InferenceLimits(max_source_assertions=40),
+    ).materialize_targets(
+        tuple(target.assertion_id for target in targets),
+        max_context_assertions=30,
+    )
+
+    assert result.status is ClosureStatus.COMPLETE
+    for expected_subject, expected_predicate, expected_object in (
+        (subject, RDF_TYPE, class_b),
+        (subject, property_q, object_),
+        (subject, RDF_TYPE, class_c),
+        (object_, RDF_TYPE, class_d),
+        (object_, property_q, subject),
+        (object_, property_t, subject),
+        (subject, property_u, terminal),
+        (subject, property_r, object_),
+        (terminal, RDF_TYPE, class_f),
+    ):
+        assert await assertion_store.query(
+            AssertionQuery(
+                subject=expected_subject,
+                predicate=expected_predicate,
+                object=expected_object,
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_targeted_inference_follows_reverse_oriented_owl_schema_joins(
+    assertion_store,
+) -> None:
+    """Targeted work joins OWL schema facts whose relevant endpoint is RHS."""
+    service = BoundedInferenceService(
+        assertion_store,
+        _profile(owl=True),
+        limits=InferenceLimits(max_source_assertions=4),
+    )
+
+    class_a = IRI("https://example.test/reverse-joins/ClassA")
+    class_b = IRI("https://example.test/reverse-joins/ClassB")
+    class_subject = IRI("https://example.test/reverse-joins/class-subject")
+    class_target = await _put(
+        assertion_store,
+        "reverse-equivalent-class-target",
+        class_subject,
+        RDF_TYPE,
+        class_b,
+    )
+    await _put(
+        assertion_store,
+        "reverse-equivalent-class-schema",
+        class_a,
+        OWL_EQUIVALENT_CLASS,
+        class_b,
+    )
+
+    property_p = IRI("https://example.test/reverse-joins/p")
+    property_q = IRI("https://example.test/reverse-joins/q")
+    property_subject = IRI("https://example.test/reverse-joins/property-subject")
+    property_object = IRI("https://example.test/reverse-joins/property-object")
+    property_target = await _put(
+        assertion_store,
+        "reverse-equivalent-property-target",
+        property_subject,
+        property_q,
+        property_object,
+    )
+    await _put(
+        assertion_store,
+        "reverse-equivalent-property-schema",
+        property_p,
+        OWL_EQUIVALENT_PROPERTY,
+        property_q,
+    )
+
+    inverse_p = IRI("https://example.test/reverse-joins/inverse-p")
+    inverse_q = IRI("https://example.test/reverse-joins/inverse-q")
+    inverse_subject = IRI("https://example.test/reverse-joins/inverse-subject")
+    inverse_object = IRI("https://example.test/reverse-joins/inverse-object")
+    inverse_target = await _put(
+        assertion_store,
+        "reverse-inverse-target",
+        inverse_subject,
+        inverse_p,
+        inverse_object,
+    )
+    await _put(
+        assertion_store,
+        "reverse-inverse-schema",
+        inverse_q,
+        OWL_INVERSE_OF,
+        inverse_p,
+    )
+
+    for target in (class_target, property_target, inverse_target):
+        result = await service.materialize_targets(
+            (target.assertion_id,), max_context_assertions=1
+        )
+        assert result.status is ClosureStatus.COMPLETE
+
+    for expected_subject, expected_predicate, expected_object in (
+        (class_subject, RDF_TYPE, class_a),
+        (property_subject, property_p, property_object),
+        (inverse_object, inverse_q, inverse_subject),
+    ):
+        assert await assertion_store.query(
+            AssertionQuery(
+                subject=expected_subject,
+                predicate=expected_predicate,
+                object=expected_object,
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_targeted_inference_defers_when_reverse_owl_schema_context_overflows(
+    assertion_store,
+) -> None:
+    """A reverse OWL schema page over budget never reports a complete closure."""
+    class_a = IRI("https://example.test/reverse-overflow/ClassA")
+    class_b = IRI("https://example.test/reverse-overflow/ClassB")
+    class_c = IRI("https://example.test/reverse-overflow/ClassC")
+    subject = IRI("https://example.test/reverse-overflow/subject")
+    target = await _put(
+        assertion_store,
+        "reverse-overflow-target",
+        subject,
+        RDF_TYPE,
+        class_b,
+    )
+    await _put(
+        assertion_store,
+        "reverse-overflow-a-equivalent-b",
+        class_a,
+        OWL_EQUIVALENT_CLASS,
+        class_b,
+    )
+    await _put(
+        assertion_store,
+        "reverse-overflow-c-equivalent-b",
+        class_c,
+        OWL_EQUIVALENT_CLASS,
+        class_b,
+    )
+
+    result = await BoundedInferenceService(
+        assertion_store,
+        _profile(owl=True),
+        limits=InferenceLimits(max_source_assertions=2),
+    ).materialize_targets(
+        (target.assertion_id,), max_context_assertions=1
+    )
+
+    assert result.status is ClosureStatus.INCOMPLETE
+    assert result.incomplete_reason == "context_assertions"
+
+
+@pytest.mark.asyncio
+async def test_paged_repair_uses_role_crossing_schema_context(assertion_store) -> None:
+    """One-assertion repair pages still join an unchanged class schema."""
+    class_a = IRI("https://example.test/repair-join/ClassA")
+    class_b = IRI("https://example.test/repair-join/ClassB")
+    subject = IRI("https://example.test/repair-join/subject")
+    await _put(assertion_store, "repair-join-a-schema", class_a, RDFS_SUBCLASS, class_b)
+    await _put(assertion_store, "repair-join-b-instance", subject, RDF_TYPE, class_a)
+    service = SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=_profile(),
+        limits=SemanticMaintenanceLimits(max_assertions=1, max_context_assertions=1),
+    )
+
+    result = await service.rebuild()
+    assert result.status is SemanticMaintenanceStatus.PARTIAL
+    assert result.reason != "context_assertions"
+
+    assert await assertion_store.query(
+        AssertionQuery(subject=subject, predicate=RDF_TYPE, object=class_b)
+    )
+
+
+@pytest.mark.asyncio
+async def test_incremental_maintenance_joins_schema_after_schema_checkpoint(
+    assertion_store,
+) -> None:
+    """A newly changed instance joins schema maintained by an earlier sleep."""
+    class_a = IRI("https://example.test/incremental-join/ClassA")
+    class_b = IRI("https://example.test/incremental-join/ClassB")
+    subject = IRI("https://example.test/incremental-join/subject")
+    await _put(assertion_store, "incremental-join-schema", class_a, RDFS_SUBCLASS, class_b)
+    service = SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=_profile(),
+        limits=SemanticMaintenanceLimits(max_assertions=1, max_context_assertions=1),
+    )
+    assert (await service.run()).status is SemanticMaintenanceStatus.COMPLETE
+
+    await _put(assertion_store, "incremental-join-instance", subject, RDF_TYPE, class_a)
+    result = await service.run()
+
+    assert result.status is SemanticMaintenanceStatus.COMPLETE
+    assert result.reason is None
+    assert await assertion_store.query(
+        AssertionQuery(subject=subject, predicate=RDF_TYPE, object=class_b)
+    )
 
 
 @pytest.mark.asyncio

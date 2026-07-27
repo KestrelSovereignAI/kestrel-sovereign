@@ -890,13 +890,13 @@ class BoundedInferenceService:
         self._check_time(started)
         facts: dict[str, _Fact] = {}
 
-        def add(assertion: Assertion) -> None:
+        def add(assertion: Assertion) -> bool:
             if (
                 assertion.epistemic_state is EpistemicState.INFERRED
                 or assertion.ontology_version != self.profile.ontology
                 or assertion.assertion_id in facts
             ):
-                return
+                return False
             if len(facts) >= self.limits.max_source_assertions:
                 raise _BudgetExceeded("source_assertions")
             facts[assertion.assertion_id] = _Fact(
@@ -908,55 +908,230 @@ class BoundedInferenceService:
                 assertion,
             )
             self._check_memory(facts)
+            return True
 
         for assertion in selected:
             add(assertion)
 
-        # A one-hop, term-indexed neighbourhood is explicit context rather
-        # than a disguised closure scan. It is enough to join a changed fact
-        # to a directly adjacent schema/data fact, and a larger dependency is
-        # deferred to a later bounded target or explicit repair.
+        # Targeted inference cannot infer a complete local unit by reading
+        # only the target's same-role neighbours.  For example, ``x type A``
+        # joins ``A subClassOf B`` through the target *object* and the schema
+        # assertion's *subject*.  Expand a bounded worklist of only the
+        # indexed joins admitted by this rule profile.  This is intentionally
+        # not a graph walk: every lookup is a specific rule premise and an
+        # overflow makes the unit incomplete rather than silently omitting a
+        # consequence.
         remaining_context_reads = min(
             max_context_assertions,
             self.limits.max_source_assertions - len(facts),
         )
-        for target in tuple(facts.values()):
-            for term in (
-                {"subject": target.subject},
-                {"predicate": target.predicate},
-                {"object": target.object},
-            ):
-                if remaining_context_reads <= 0:
-                    # Context is an explicit bounded dependency, not a hint.
-                    # Once the caller has spent its allowance, prove that the
-                    # next term index has no additional row before declaring
-                    # the target closure complete.  The probe is deliberately
-                    # not materialized into the fact set.
-                    if max_context_assertions and await self._has_context_row(
-                        term,
-                        cursor=None,
-                        excluded_assertion_ids=tuple(facts),
-                        started=started,
-                    ):
-                        raise _BudgetExceeded("context_assertions")
-                    continue
-                query = AssertionQuery(**term, limit=remaining_context_reads)
-                self._check_time(started)
-                context_page = await self._store.inference_inputs(query)
-                # Count every row read, including a target repeated by one of
-                # its term indexes. A distinct-fact cap alone would let a
-                # dense neighbourhood consume arbitrary database work.
-                remaining_context_reads -= len(context_page)
-                for assertion in context_page:
-                    add(assertion)
-                if len(context_page) == query.limit and await self._has_context_row(
+        pending_facts = deque(facts.values())
+        pending_terms: deque[dict[str, IRI]] = deque()
+        seen_terms: set[tuple[tuple[str, str], ...]] = set()
+
+        def schedule(term: dict[str, IRI]) -> None:
+            # ``AssertionQuery`` accepts only one value for each indexed role;
+            # the IRI's canonical value is sufficient to deduplicate a query.
+            key = tuple(sorted((name, value.value) for name, value in term.items()))
+            if key not in seen_terms:
+                seen_terms.add(key)
+                pending_terms.append(term)
+
+        # A changed property-chain member can require an unchanged chain axiom
+        # that names it inside a compact literal, so no subject/object index can
+        # identify that axiom.  The allowlisted profile is still bounded: scan
+        # only the chain-axiom predicate and defer if that indexed page exceeds
+        # the explicit context budget.
+        if self.profile.owl2rl_version is not None:
+            schedule({"predicate": IRI(OWL_PROPERTY_CHAIN_AXIOM)})
+
+        while pending_facts or pending_terms:
+            while pending_facts:
+                fact = pending_facts.popleft()
+                for term in self._target_context_terms(fact):
+                    schedule(term)
+
+            if not pending_terms:
+                break
+            term = pending_terms.popleft()
+            if remaining_context_reads <= 0:
+                # A zero context budget is a real boundary too.  Probe every
+                # required premise index so a caller cannot checkpoint a
+                # truncated closure merely because it admitted no context
+                # rows into memory.
+                if await self._has_context_row(
                     term,
-                    cursor=context_page[-1].revision_id,
+                    cursor=None,
                     excluded_assertion_ids=tuple(facts),
                     started=started,
                 ):
                     raise _BudgetExceeded("context_assertions")
+                continue
+
+            query = AssertionQuery(
+                **term,
+                limit=remaining_context_reads,
+                exclude_assertion_ids=tuple(facts),
+            )
+            self._check_time(started)
+            context_page = await self._store.inference_inputs(query)
+            # Count every newly materialized context fact. Known primary and
+            # previously admitted facts are excluded in SQL, so a repeated
+            # premise lookup cannot consume the budget needed for a distinct
+            # dependency. A distinct-fact cap alone would let a dense index
+            # consume arbitrary database work.
+            remaining_context_reads -= len(context_page)
+            for assertion in context_page:
+                if add(assertion):
+                    pending_facts.append(facts[assertion.assertion_id])
+            if len(context_page) == query.limit and await self._has_context_row(
+                term,
+                cursor=context_page[-1].revision_id,
+                excluded_assertion_ids=tuple(facts),
+                started=started,
+            ):
+                raise _BudgetExceeded("context_assertions")
         return facts
+
+    def _target_context_terms(self, fact: _Fact) -> tuple[dict[str, IRI], ...]:
+        """Return the indexed direct-premise joins for one source fact.
+
+        The target path publishes only conclusions whose source premises fit in
+        the explicit context allowance.  Each entry therefore corresponds to
+        a role crossing used by :meth:`_apply_rules`; it is deliberately more
+        precise than a generic subject/predicate/object neighbourhood.
+        """
+        terms: list[dict[str, IRI]] = []
+
+        def by_subject(value: IRI) -> None:
+            terms.append({"subject": value})
+
+        def by_predicate(value: IRI) -> None:
+            terms.append({"predicate": value})
+
+        def by_object(value: IRI) -> None:
+            terms.append({"object": value})
+
+        def by_predicate_object(predicate: str, value: IRI) -> None:
+            """Schedule one bounded reverse schema lookup.
+
+            A bare object lookup would make a common class or property IRI a
+            graph-wide context scan.  These reverse joins are deliberately
+            constrained to the one OWL predicate that can supply the missing
+            rule premise, so they retain the ordinary target path's explicit
+            count, memory, and wall-time bounds.
+            """
+            terms.append({"predicate": IRI(predicate), "object": value})
+
+        predicate = fact.predicate.value
+        object_ = fact.object
+
+        if predicate == RDF_TYPE:
+            if not isinstance(object_, IRI):
+                return tuple(terms)
+            # ``x type A`` joins class hierarchy/equivalence at ``A``.
+            by_subject(object_)
+            if self.profile.owl2rl_version is not None:
+                # ``B owl:equivalentClass A`` is the reverse-oriented
+                # counterpart to ``A owl:equivalentClass B``.  It is not
+                # found by the subject lookup above, but it entails the same
+                # class bridge for ``x type A``.
+                by_predicate_object(OWL_EQUIVALENT_CLASS, object_)
+            if (
+                self.profile.owl2rl_version is not None
+                and object_.value
+                in (OWL_TRANSITIVE_PROPERTY, OWL_SYMMETRIC_PROPERTY)
+            ):
+                # ``P type owl:TransitiveProperty`` and its symmetric
+                # counterpart join all direct statements using ``P``.
+                by_predicate(fact.subject)
+                by_subject(fact.subject)
+            return tuple(terms)
+
+        if predicate == RDFS_SUBCLASS and isinstance(object_, IRI):
+            # ``A subClassOf B`` affects instances of A, predecessors of A,
+            # and the hierarchy/equivalence that continues from B.
+            by_subject(fact.subject)
+            by_object(fact.subject)
+            by_subject(object_)
+            return tuple(terms)
+
+        if (
+            self.profile.owl2rl_version is not None
+            and predicate == OWL_EQUIVALENT_CLASS
+            and isinstance(object_, IRI)
+        ):
+            # Equivalence is a bidirectional class bridge, so both class
+            # endpoints may have affected instances or hierarchy premises.
+            by_subject(fact.subject)
+            by_object(fact.subject)
+            by_subject(object_)
+            by_object(object_)
+            return tuple(terms)
+
+        if predicate == RDFS_SUBPROPERTY and isinstance(object_, IRI):
+            # ``P subPropertyOf Q`` joins P statements, P predecessors, and
+            # definitions continuing from Q.
+            by_subject(fact.subject)
+            by_object(fact.subject)
+            by_predicate(fact.subject)
+            by_subject(object_)
+            return tuple(terms)
+
+        if (
+            self.profile.owl2rl_version is not None
+            and predicate == OWL_EQUIVALENT_PROPERTY
+            and isinstance(object_, IRI)
+        ):
+            for endpoint in (fact.subject, object_):
+                by_subject(endpoint)
+                by_object(endpoint)
+                by_predicate(endpoint)
+            return tuple(terms)
+
+        if predicate in (RDFS_DOMAIN, RDFS_RANGE) and isinstance(object_, IRI):
+            # Domain/range declarations join every direct P statement, then
+            # continue through the declared class hierarchy.
+            by_subject(fact.subject)
+            by_predicate(fact.subject)
+            by_subject(object_)
+            return tuple(terms)
+
+        if (
+            self.profile.owl2rl_version is not None
+            and predicate == OWL_INVERSE_OF
+            and isinstance(object_, IRI)
+        ):
+            for endpoint in (fact.subject, object_):
+                by_subject(endpoint)
+                by_predicate(endpoint)
+            return tuple(terms)
+
+        if (
+            self.profile.owl2rl_version is not None
+            and predicate == OWL_PROPERTY_CHAIN_AXIOM
+        ):
+            by_subject(fact.subject)
+            chain = _property_chain(object_)
+            if chain is not None:
+                for chain_predicate in chain:
+                    by_predicate(chain_predicate)
+            return tuple(terms)
+
+        # An ordinary statement joins its predicate's schema declarations.
+        # Those declarations schedule their own statement/class neighbours,
+        # including inverse, symmetric, transitive, and domain/range paths.
+        by_subject(fact.predicate)
+        if self.profile.owl2rl_version is not None:
+            # These are the reverse-oriented forms of the two property
+            # schema joins above.  ``q equivalentProperty p`` and
+            # ``q inverseOf p`` must be visible when the changed statement
+            # uses ``p`` even though both schema assertions have ``q`` as
+            # their subject.  Predicate restriction preserves the bounded
+            # targeted path; a bare ``object=p`` lookup would not.
+            by_predicate_object(OWL_EQUIVALENT_PROPERTY, fact.predicate)
+            by_predicate_object(OWL_INVERSE_OF, fact.predicate)
+        return tuple(terms)
 
     async def _has_context_row(
         self,
