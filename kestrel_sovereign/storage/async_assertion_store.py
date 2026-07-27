@@ -5139,8 +5139,14 @@ class AsyncAssertionStore:
             ), eligible_only=True,
         )
         sources = await self._sources_for_assertions(selected)
-        # Repeat the generation fence after provenance I/O; callers must retry
-        # rather than publishing a half-old semantic snapshot.
+        # Repeat both maintenance and generation fences after provenance I/O;
+        # maintenance status can change without an assertion generation bump.
+        final_readiness = await SemanticMaintenanceService(
+            self, inference_profile=inference_profile,
+            inference_limits=inference_limits, limits=maintenance_limits,
+        ).training_readiness()
+        if not final_readiness.ready:
+            raise SemanticRecallUnavailableError(final_readiness.reason or "semantic_maintenance_unavailable")
         if (await self.checkpoint()).generation != expected_checkpoint_generation:
             raise SemanticRecallUnavailableError("semantic_recall_checkpoint_changed")
         return tuple(AssertionRecallCandidate(item, sources.get(item.assertion_id, ()), True) for item in selected)
