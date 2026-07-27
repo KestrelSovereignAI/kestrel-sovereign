@@ -1043,6 +1043,13 @@ class BoundedInferenceService:
     ) -> None:
         tenant_id = self._store.tenant_id
         database = self._store._database  # noqa: SLF001 - same internal persistence boundary
+        # A materialization can change only the active proof set for an
+        # existing conclusion.  That still changes the lifecycle graph used
+        # by governed supersession planning, even though no canonical
+        # assertion revision is written.  Capture the semantic membership
+        # before replacement so that a real proof/input change advances the
+        # tenant generation in this same publication transaction.
+        before_membership = await self._active_derivation_membership()
         await database.execute(
             "UPDATE semantic_inference_derivations SET active = 0 "
             "WHERE tenant_id = ? AND profile_key = ?",
@@ -1093,6 +1100,58 @@ class BoundedInferenceService:
                         "(tenant_id, derivation_id, input_revision_id, ordinal) VALUES (?, ?, ?, ?)",
                         (tenant_id, derivation_id, revision_id, ordinal),
                     )
+        if before_membership != await self._active_derivation_membership():
+            # ``inference_publication()`` owns the tenant lock, so this is
+            # the same atomic CAS fence observed by governed validation.
+            # Lifecycle mutations already advance this generation whenever
+            # they deactivate proofs; this covers the materializer-only path
+            # that adds/removes an alternate active proof without changing a
+            # canonical assertion revision.
+            await self._store._advance_generation()  # noqa: SLF001
+
+    async def _active_derivation_membership(
+        self,
+    ) -> tuple[tuple[str, str, str, tuple[str, ...]], ...]:
+        """Return this profile's active proof graph without run metadata.
+
+        A new run ID or generated timestamp does not change lifecycle
+        planning.  The exact active derivation identity, conclusion revision,
+        and ordered premise revisions do.  Keeping this comparison here makes
+        generation advancement depend on the semantic ledger state rather
+        than the implementation's deactivate-then-upsert mechanics.
+        """
+        rows = await self._store._database.fetchall(  # noqa: SLF001
+            "SELECT d.derivation_id, d.derived_assertion_id, d.derived_revision_id, "
+            "i.input_revision_id FROM semantic_inference_derivations d "
+            "LEFT JOIN semantic_inference_derivation_inputs i "
+            "ON i.tenant_id = d.tenant_id AND i.derivation_id = d.derivation_id "
+            "WHERE d.tenant_id = ? AND d.profile_key = ? AND d.active = 1 "
+            "ORDER BY d.derivation_id ASC, i.ordinal ASC",
+            (self._store.tenant_id, self.profile.key),
+        )
+        membership: list[tuple[str, str, str, tuple[str, ...]]] = []
+        derivation_id: str | None = None
+        derived_assertion_id = ""
+        derived_revision_id = ""
+        premises: list[str] = []
+        for row in rows:
+            row_derivation_id = str(row[0])
+            if derivation_id is not None and row_derivation_id != derivation_id:
+                membership.append(
+                    (derivation_id, derived_assertion_id, derived_revision_id, tuple(premises))
+                )
+                premises = []
+            if row_derivation_id != derivation_id:
+                derivation_id = row_derivation_id
+                derived_assertion_id = str(row[1])
+                derived_revision_id = str(row[2])
+            if row[3] is not None:
+                premises.append(str(row[3]))
+        if derivation_id is not None:
+            membership.append(
+                (derivation_id, derived_assertion_id, derived_revision_id, tuple(premises))
+            )
+        return tuple(membership)
 
     async def _record_run(
         self,

@@ -29,6 +29,7 @@ import json
 import hashlib
 import logging
 import struct
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
 from ..async_assertion_store import _erasure_receipt_key
@@ -59,6 +60,21 @@ async def _semantic_schema_marker_exists(db: "AsyncDatabase") -> bool:
         (_SEMANTIC_ASSERTION_SCHEMA_VERSION,),
     )
     return row is not None
+
+
+@asynccontextmanager
+async def _semantic_validation_migration_transaction(db: "AsyncDatabase"):
+    """Serialize a validation-schema marker read with SQLite's writer slot."""
+    if db.backend_type == "sqlite":
+        # The normal SQLite transaction begins deferred.  Once it has read a
+        # schema marker, attempting to promote it to a writer races another
+        # initializer and fails immediately instead of observing busy_timeout.
+        # Begin as the writer so every marker read below is serialized.
+        async with db.backend.transaction(immediate=True):  # type: ignore[call-arg]
+            yield
+        return
+    async with db.transaction():
+        yield
 
 
 async def _ensure_erasure_receipts_are_opaque(db: "AsyncDatabase") -> None:
@@ -372,12 +388,6 @@ async def migrate_semantic_validation_reports(db: "AsyncDatabase") -> None:
     validation reports are auditable projections of the same semantic tenant
     and have no independent assertion or eligibility write path.
     """
-    row = await db.fetchone(
-        "SELECT 1 FROM semantic_schema_migrations WHERE version = ?",
-        (_SEMANTIC_VALIDATION_SCHEMA_VERSION,),
-    )
-    if row is not None:
-        return
     statements = (
         """CREATE TABLE IF NOT EXISTS semantic_validation_reports (
             report_id TEXT PRIMARY KEY,
@@ -423,7 +433,7 @@ async def migrate_semantic_validation_reports(db: "AsyncDatabase") -> None:
         "CREATE INDEX IF NOT EXISTS idx_semantic_validation_report_assertion ON semantic_validation_report_assertions(tenant_id, assertion_id, report_id)",
         "CREATE INDEX IF NOT EXISTS idx_semantic_validation_result_tenant_assertion ON semantic_validation_results(tenant_id, assertion_id, report_id)",
     )
-    async with db.transaction():
+    async with _semantic_validation_migration_transaction(db):
         if db.backend_type == "postgres":
             await db.execute("SELECT pg_advisory_xact_lock(?)", (_semantic_assertion_lock_id(),))
         await db.execute(

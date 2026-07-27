@@ -120,6 +120,39 @@ def _profile(*, owl: bool = False) -> InferenceProfile:
     return InferenceProfile(ONTOLOGY, "1.0.0", "1.0.0" if owl else None)
 
 
+async def _materialize_ungrounded_alternate_proof_cycle(
+    assertion_store,
+) -> tuple[Assertion, BoundedInferenceService, Assertion, Assertion]:
+    """Build the RDFS cycle used to test grounded lifecycle retraction."""
+    subject = IRI("https://example.test/subject")
+    object_ = IRI("https://example.test/object")
+    property_p = IRI("https://example.test/p")
+    property_q = IRI("https://example.test/q")
+    property_r = IRI("https://example.test/r")
+    predecessor = await _put(
+        assertion_store, "p-sub-q", property_p, RDFS_SUBPROPERTY, property_q
+    )
+    await _put(assertion_store, "q-sub-r", property_q, RDFS_SUBPROPERTY, property_r)
+    await _put(assertion_store, "r-sub-q", property_r, RDFS_SUBPROPERTY, property_q)
+    await _put(assertion_store, "statement", subject, property_p, object_)
+
+    service = BoundedInferenceService(assertion_store, _profile())
+    assert (await service.materialize_incremental()).complete
+    conclusion_q = (
+        await assertion_store.query(
+            AssertionQuery(subject=subject, predicate=property_q, object=object_)
+        )
+    )[0]
+    conclusion_r = (
+        await assertion_store.query(
+            AssertionQuery(subject=subject, predicate=property_r, object=object_)
+        )
+    )[0]
+    assert len(await service.explain(conclusion_q.assertion_id)) >= 2
+    assert len(await service.explain(conclusion_r.assertion_id)) >= 2
+    return predecessor, service, conclusion_q, conclusion_r
+
+
 def test_explicit_semantic_inference_config_constructs_versioned_profile() -> None:
     profile = inference_profile_from_config(
         {
@@ -318,6 +351,63 @@ async def test_independent_derivation_survives_primary_premise_retraction(assert
         for explanation in explanations
     )
     assert await assertion_store.get_assertion(direct.assertion_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_supersession_retracts_ungrounded_alternate_proof_cycle(
+    assertion_store,
+) -> None:
+    """A proof cycle cannot keep its conclusions alive after its only seed leaves.
+
+    ``S Q O`` has a direct proof through ``P subPropertyOf Q`` and an
+    alternate proof through inferred ``S R O``.  ``S R O`` in turn has an
+    alternate proof through ``S Q O``.  Once the only ``P -> Q`` source is
+    superseded, the surviving ledger rows form an ungrounded SCC and must be
+    withdrawn before the governed tentative graph is validated or committed.
+    """
+    predecessor, service, conclusion_q, conclusion_r = (
+        await _materialize_ungrounded_alternate_proof_cycle(assertion_store)
+    )
+    property_p = IRI("https://example.test/p")
+    property_t = IRI("https://example.test/t")
+
+    replacement = _assertion(
+        assertion_store, "p-sub-t", property_p, RDFS_SUBPROPERTY, property_t
+    )
+    plan = await assertion_store.plan_supersession_lifecycle(
+        predecessor.revision_id, replacement
+    )
+    planned_revision_ids = {assertion.revision_id for assertion in plan.post_state}
+    assert conclusion_q.revision_id not in planned_revision_ids
+    assert conclusion_r.revision_id not in planned_revision_ids
+
+    result = await _GOVERNED_STORAGES[id(assertion_store)].supersede_assertion(
+        predecessor.revision_id,
+        replacement,
+        source_occurrences=(_source("source:p-sub-t"),),
+    )
+    assert result.accepted
+    assert await assertion_store.get_assertion(conclusion_q.assertion_id) is None
+    assert await assertion_store.get_assertion(conclusion_r.assertion_id) is None
+    assert await service.explain(conclusion_q.assertion_id) == ()
+    assert await service.explain(conclusion_r.assertion_id) == ()
+
+
+@pytest.mark.asyncio
+async def test_retraction_retracts_ungrounded_alternate_proof_cycle(
+    assertion_store,
+) -> None:
+    """The live retraction cascade uses the same grounded lifecycle plan."""
+    predecessor, service, conclusion_q, conclusion_r = (
+        await _materialize_ungrounded_alternate_proof_cycle(assertion_store)
+    )
+
+    await assertion_store.retract(predecessor.assertion_id, predecessor.revision_id)
+
+    assert await assertion_store.get_assertion(conclusion_q.assertion_id) is None
+    assert await assertion_store.get_assertion(conclusion_r.assertion_id) is None
+    assert await service.explain(conclusion_q.assertion_id) == ()
+    assert await service.explain(conclusion_r.assertion_id) == ()
 
 
 @pytest.mark.asyncio

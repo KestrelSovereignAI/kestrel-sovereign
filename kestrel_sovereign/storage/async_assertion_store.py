@@ -169,6 +169,25 @@ class SupersessionResult:
 
 
 @dataclass(frozen=True, slots=True)
+class SupersessionLifecyclePlan:
+    """The ledger-aware active graph a supersession will leave behind.
+
+    The canonical derivation-input table contains one chosen lineage per
+    inferred assertion, while the inference ledger records every independently
+    sufficient proof.  A supersession must use the latter before deciding
+    which conclusions leave the active graph.  This plan is deliberately
+    shared by governed pre-commit validation and the canonical mutation, so a
+    SHACL report cannot validate a graph different from the graph committed.
+    """
+
+    predecessor: Assertion
+    dependent_assertions: tuple[Assertion, ...]
+    withdrawn_revision_ids: tuple[str, ...]
+    deactivated_derivation_ids: tuple[str, ...]
+    post_state: tuple[Assertion, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class RetractionResult:
     retracted: tuple[Assertion, ...]
     invalidated_revision_ids: tuple[str, ...]
@@ -1561,6 +1580,57 @@ class AsyncAssertionStore:
             True,
         )
 
+    async def plan_supersession_lifecycle(
+        self,
+        expected_predecessor_revision_id: str,
+        replacement: Assertion,
+    ) -> SupersessionLifecyclePlan:
+        """Compute the exact active graph for one prospective supersession.
+
+        This is a read-only peer primitive for the governed validation service
+        and ``_supersede_in_mutation``.  It must remain the sole place that
+        decides whether an inferred conclusion loses all of its proofs: the
+        canonical lineage can be withdrawn while another active ledger proof
+        keeps the conclusion live.
+        """
+        self._check_assertion_scope(replacement)
+        predecessor = await self._revision(expected_predecessor_revision_id)
+        if predecessor is None or predecessor.status is not AssertionStatus.ACTIVE:
+            raise AssertionConflictError("expected predecessor is not an active tenant revision")
+        current = await self._current(predecessor.assertion_id)
+        if current is None or current.revision_id != expected_predecessor_revision_id:
+            raise AssertionConflictError("expected predecessor is no longer the current revision")
+        if replacement.supersedes_revision_id not in (None, expected_predecessor_revision_id):
+            raise AssertionStoreError("replacement cannot name an unrelated superseded revision")
+
+        dependents, deactivated_derivation_ids = (
+            await self._plan_dependent_current_revisions(
+                (expected_predecessor_revision_id,)
+            )
+        )
+        withdrawn_revision_ids = (
+            expected_predecessor_revision_id,
+            *(assertion.revision_id for assertion in dependents),
+        )
+        withdrawn = set(withdrawn_revision_ids)
+        current_assertions = await self._complete_active_assertions()
+        if expected_predecessor_revision_id not in {
+            assertion.revision_id for assertion in current_assertions
+        }:
+            raise AssertionConflictError("expected predecessor is no longer the current revision")
+        post_state = tuple(
+            assertion
+            for assertion in current_assertions
+            if assertion.revision_id not in withdrawn
+        ) + (replacement,)
+        return SupersessionLifecyclePlan(
+            predecessor=predecessor,
+            dependent_assertions=tuple(dependents),
+            withdrawn_revision_ids=tuple(withdrawn_revision_ids),
+            deactivated_derivation_ids=tuple(deactivated_derivation_ids),
+            post_state=post_state,
+        )
+
     async def _supersede_in_mutation(
         self,
         expected_predecessor_revision_id: str,
@@ -1588,16 +1658,13 @@ class AsyncAssertionStore:
             )
         if expected_generation is not None and await self._generation() != expected_generation:
             raise AssertionConflictError("validation generation is no longer current; revalidate before superseding")
-        predecessor = await self._revision(expected_predecessor_revision_id)
-        if predecessor is None or predecessor.status is not AssertionStatus.ACTIVE:
-            raise AssertionConflictError("expected predecessor is not an active tenant revision")
-        current = await self._current(predecessor.assertion_id)
-        if current is None or current.revision_id != expected_predecessor_revision_id:
-            raise AssertionConflictError("expected predecessor is no longer the current revision")
-        if replacement.supersedes_revision_id not in (None, expected_predecessor_revision_id):
-            raise AssertionStoreError("replacement cannot name an unrelated superseded revision")
         await self._store_sources(source_occurrences)
         await self._validate_lineage(replacement, source_occurrences)
+        plan = await self.plan_supersession_lifecycle(
+            expected_predecessor_revision_id,
+            replacement,
+        )
+        predecessor = plan.predecessor
         predecessor_state = _assertion_with(
             predecessor, revision_id=uuid4().hex, status=AssertionStatus.SUPERSEDED,
             supersedes_revision_id=expected_predecessor_revision_id,
@@ -1606,16 +1673,21 @@ class AsyncAssertionStore:
             replacement, revision_id=replacement.revision_id, status=AssertionStatus.ACTIVE,
             supersedes_revision_id=predecessor_state.revision_id,
         )
-        # Every derived current revision that names the predecessor loses a
-        # support. Retraction is transitive in this same transaction, so a
-        # projection never observes a replacement alongside stale support.
+        # Apply the same plan used to construct the governed tentative graph.
+        # In particular, only ledger proofs selected by the planner deactivate;
+        # an alternate proof keeps its conclusion in the active state.
+        await self._deactivate_inference_derivation_ids(
+            plan.deactivated_derivation_ids
+        )
         dependent_states: list[Assertion] = []
-        invalidated_revision_ids = [expected_predecessor_revision_id]
-        for dependent in await self._dependent_current_revisions([expected_predecessor_revision_id]):
+        invalidated_revision_ids = list(plan.withdrawn_revision_ids)
+        for dependent in plan.dependent_assertions:
             if dependent.status is not AssertionStatus.ACTIVE:
                 continue
-            await self._invalidate_eligibility(dependent.revision_id)
-            invalidated_revision_ids.append(dependent.revision_id)
+            await self._invalidate_eligibility(
+                dependent.revision_id,
+                deactivate_inference_derivations=False,
+            )
             state = _assertion_with(
                 dependent, revision_id=uuid4().hex, status=AssertionStatus.RETRACTED,
                 supersedes_revision_id=None, epistemic_state=EpistemicState.RETRACTED,
@@ -1623,7 +1695,10 @@ class AsyncAssertionStore:
             await self._write_revision(state, ())
             await self._set_current(state)
             dependent_states.append(state)
-        await self._invalidate_eligibility(expected_predecessor_revision_id)
+        await self._invalidate_eligibility(
+            expected_predecessor_revision_id,
+            deactivate_inference_derivations=False,
+        )
         await self._write_revision(predecessor_state, ())
         await self._set_current(predecessor_state)
         await self._write_revision(replacement_state, source_occurrences)
@@ -1683,92 +1758,154 @@ class AsyncAssertionStore:
             (tenant_id,) + revision_ids,
         )
         derivation_ids = tuple(str(row[0]) for row in rows)
-        if derivation_ids:
-            await self._database.execute(
-                "UPDATE semantic_inference_derivations SET active = 0 "
-                "WHERE tenant_id = ? "
-                f"AND derivation_id IN ({_placeholders(derivation_ids)})",
-                (tenant_id,) + derivation_ids,
-            )
+        await self._deactivate_inference_derivation_ids(derivation_ids)
         return derivation_ids
 
-    async def _dependent_current_revisions(self, input_revision_ids: Iterable[str]) -> list[Assertion]:
-        tenant_id, _ = self._require_scope()
-        pending = set(input_revision_ids)
-        discovered: dict[str, Assertion] = {}
-        invalidated = set(pending)
-        while pending:
-            batch = tuple(sorted(pending))
-            pending.clear()
-            await self._deactivate_inference_derivations_for_inputs(batch)
-            rows = await self._database.fetchall(
-                "SELECT DISTINCT r.assertion_id, r.revision_id, r.assertion_mapping FROM semantic_derivation_inputs d "
-                "JOIN semantic_assertions a ON a.tenant_id = d.tenant_id "
-                "  AND a.current_revision_id = d.derived_revision_id "
-                "JOIN semantic_assertion_revisions r ON r.tenant_id = a.tenant_id "
-                "  AND r.revision_id = d.derived_revision_id "
-                f"WHERE d.tenant_id = ? AND d.input_revision_id IN ({_placeholders(batch)}) "
-                "ORDER BY r.assertion_id ASC, r.revision_id ASC",
-                (tenant_id,) + batch,
-            )
-            for row in rows:
-                assertion = Assertion.from_mapping(json.loads(row[2]))
-                if assertion.revision_id in discovered:
-                    continue
-                if await self._has_surviving_inference_derivation(
-                    assertion.revision_id, invalidated
-                ):
-                    # The canonical revision has an independently supported
-                    # materialization derivation.  Its primary lineage may be
-                    # losing a premise, but retracting the assertion would
-                    # incorrectly remove the surviving conclusion.
-                    continue
-                if assertion.revision_id not in discovered:
-                    discovered[assertion.revision_id] = assertion
-                    invalidated.add(assertion.revision_id)
-                    pending.add(assertion.revision_id)
-        return list(discovered.values())
-
-    async def _has_surviving_inference_derivation(
+    async def _deactivate_inference_derivation_ids(
         self,
-        derived_revision_id: str,
-        invalidated_revision_ids: set[str],
-    ) -> bool:
-        """Whether an inference-ledger derivation still independently supports a fact.
+        derivation_ids: Iterable[str],
+    ) -> None:
+        """Deactivate an already-planned set of tenant-local ledger proofs."""
+        resolved = tuple(sorted(set(derivation_ids)))
+        if not resolved:
+            return
+        tenant_id, _ = self._require_scope()
+        await self._database.execute(
+            "UPDATE semantic_inference_derivations SET active = 0 "
+            "WHERE tenant_id = ? AND active = 1 "
+            f"AND derivation_id IN ({_placeholders(resolved)})",
+            (tenant_id,) + resolved,
+        )
 
-        ``semantic_derivation_inputs`` records the canonical primary lineage
-        for compatibility and transitive erasure.  The materializer ledger can
-        hold additional premise sets for the same conclusion.  Lifecycle
-        mutations consult that ledger before cascading a retraction so one
-        withdrawn path cannot retract a conclusion that another active path
-        still proves.
+    async def _plan_dependent_current_revisions(
+        self,
+        input_revision_ids: Iterable[str],
+    ) -> tuple[list[Assertion], tuple[str, ...]]:
+        """Find the grounded surviving inference closure after a withdrawal.
+
+        Ledger proof rows are not independently sufficient merely because all
+        of their immediate inputs are still current.  In particular, two
+        inferred conclusions can point at each other after their only direct
+        support is withdrawn.  Treating either side of that SCC as surviving
+        would retain a stale closure indefinitely.
+
+        The lifecycle graph therefore uses a least fixed point: seed it with
+        current, eligible direct facts, then admit an inferred current revision
+        only when one active derivation has *every* premise already grounded.
+        The prospective supersession planner and every live lifecycle cascade
+        share this method, keeping validation and mutation semantics identical.
         """
         tenant_id, _ = self._require_scope()
+        withdrawn = set(input_revision_ids)
         rows = await self._database.fetchall(
-            "SELECT derivation_id FROM semantic_inference_derivations "
-            "WHERE tenant_id = ? AND derived_revision_id = ? AND active = 1 "
-            "ORDER BY derivation_id ASC",
-            (tenant_id, derived_revision_id),
+            "SELECT r.revision_id, r.assertion_mapping "
+            "FROM semantic_assertions a "
+            "JOIN semantic_assertion_revisions r ON r.tenant_id = a.tenant_id "
+            "  AND r.revision_id = a.current_revision_id "
+            "JOIN semantic_projection_eligibility e ON e.tenant_id = r.tenant_id "
+            "  AND e.revision_id = r.revision_id "
+            "WHERE a.tenant_id = ? AND r.status = ? "
+            "  AND r.eligible = 1 AND e.eligible = 1 "
+            "ORDER BY r.revision_id ASC",
+            (tenant_id, AssertionStatus.ACTIVE.value),
         )
-        for (derivation_id,) in rows:
-            inputs = await self._database.fetchall(
-                "SELECT input_revision_id FROM semantic_inference_derivation_inputs "
-                "WHERE tenant_id = ? AND derivation_id = ? ORDER BY ordinal ASC",
-                (tenant_id, derivation_id),
-            )
-            if not inputs:
-                continue
-            premise_ids = [str(row[0]) for row in inputs]
-            if any(revision_id in invalidated_revision_ids for revision_id in premise_ids):
-                continue
-            premises_are_eligible = True
-            for revision_id in premise_ids:
-                if not await self._is_current_active_eligible_revision(revision_id):
-                    premises_are_eligible = False
-                    break
-            if premises_are_eligible:
-                return True
-        return False
+        current = {
+            str(revision_id): Assertion.from_mapping(json.loads(mapping))
+            for revision_id, mapping in rows
+        }
+        inferred = {
+            revision_id: assertion
+            for revision_id, assertion in current.items()
+            if isinstance(assertion.lineage, DerivedLineage)
+        }
+
+        # The canonical lineage is a compatibility fallback only for inferred
+        # revisions that predate the inference ledger.  Once a revision has
+        # ledger history, an inactive proof is an intentional withdrawal (for
+        # example, a disabled profile), not permission to revive its canonical
+        # lineage as a synthetic proof.
+        ledger_history_rows = await self._database.fetchall(
+            "SELECT DISTINCT derived_revision_id "
+            "FROM semantic_inference_derivations WHERE tenant_id = ?",
+            (tenant_id,),
+        )
+        revisions_with_ledger_history = {
+            str(row[0]) for row in ledger_history_rows
+        }
+        derivation_rows = await self._database.fetchall(
+            "SELECT d.derivation_id, d.derived_revision_id, i.input_revision_id "
+            "FROM semantic_inference_derivations d "
+            "LEFT JOIN semantic_inference_derivation_inputs i "
+            "  ON i.tenant_id = d.tenant_id AND i.derivation_id = d.derivation_id "
+            "WHERE d.tenant_id = ? AND d.active = 1 "
+            "ORDER BY d.derivation_id ASC, i.ordinal ASC",
+            (tenant_id,),
+        )
+        active_derivations: dict[str, tuple[str, tuple[str, ...]]] = {}
+        for derivation_id, derived_revision_id, input_revision_id in derivation_rows:
+            resolved_id = str(derivation_id)
+            derived_id = str(derived_revision_id)
+            existing = active_derivations.get(resolved_id)
+            inputs = () if existing is None else existing[1]
+            if input_revision_id is not None:
+                inputs += (str(input_revision_id),)
+            active_derivations[resolved_id] = (derived_id, inputs)
+
+        grounded = {
+            revision_id
+            for revision_id, assertion in current.items()
+            if revision_id not in withdrawn
+            and not isinstance(assertion.lineage, DerivedLineage)
+        }
+        grounded_derivations: set[str] = set()
+        changed = True
+        while changed:
+            changed = False
+            for derivation_id in sorted(active_derivations):
+                derived_revision_id, premises = active_derivations[derivation_id]
+                if (
+                    derived_revision_id in withdrawn
+                    or derived_revision_id not in inferred
+                    or not premises
+                    or not set(premises).issubset(grounded)
+                ):
+                    continue
+                if derivation_id not in grounded_derivations:
+                    grounded_derivations.add(derivation_id)
+                    changed = True
+                if derived_revision_id not in grounded:
+                    grounded.add(derived_revision_id)
+                    changed = True
+            for revision_id in sorted(inferred):
+                assertion = inferred[revision_id]
+                if (
+                    revision_id in withdrawn
+                    or revision_id in revisions_with_ledger_history
+                    or not assertion.lineage.input_revision_ids
+                    or not set(assertion.lineage.input_revision_ids).issubset(grounded)
+                ):
+                    continue
+                if revision_id not in grounded:
+                    grounded.add(revision_id)
+                    changed = True
+
+        dependent_assertions = [
+            inferred[revision_id]
+            for revision_id in sorted(inferred)
+            if revision_id not in withdrawn and revision_id not in grounded
+        ]
+        return (
+            dependent_assertions,
+            tuple(sorted(set(active_derivations).difference(grounded_derivations))),
+        )
+
+    async def _dependent_current_revisions(self, input_revision_ids: Iterable[str]) -> list[Assertion]:
+        """Apply the shared grounded lifecycle plan to a live mutation."""
+        dependents, deactivated_derivation_ids = (
+            await self._plan_dependent_current_revisions(input_revision_ids)
+        )
+        await self._deactivate_inference_derivation_ids(deactivated_derivation_ids)
+        return dependents
 
     async def revoke_semantic_inference(
         self,
@@ -2846,16 +2983,41 @@ class AsyncAssertionStore:
             AssertionQuery(limit=limit, cursor=cursor), eligible_only=True
         )
 
+    async def _complete_active_assertions(self) -> tuple[Assertion, ...]:
+        """Return every active current assertion in this store's bound tenant.
+
+        ``AssertionQuery`` defaults to an API-safe page of 100 rows.  That is
+        appropriate for ordinary reads, but lifecycle planning and governed
+        SHACL validation must operate on the complete active graph.  Keep the
+        cursor walk here so every such caller has one authoritative snapshot
+        collection path rather than silently inheriting the public page limit.
+        """
+        assertions: list[Assertion] = []
+        cursor: str | None = None
+        while True:
+            page = await self._query_current(
+                AssertionQuery(limit=1000, cursor=cursor)
+            )
+            assertions.extend(page)
+            if len(page) < 1000:
+                return tuple(assertions)
+            cursor = page[-1].revision_id
+
     async def export_snapshot(self, query: AssertionQuery | None = None) -> tuple[AssertionCheckpoint, tuple[Assertion, ...]]:
         """Return a tenant-bound active snapshot for a caller already scoped here.
 
         The store deliberately has no per-call tenant argument.  Export callers
         receive only records selected through the same lifecycle-filtered query
         used by inference; a higher layer may further apply release policy and
-        destination governance without widening this canonical scope.
+        destination governance without widening this canonical scope.  An
+        unqualified snapshot is the complete active graph, not the first
+        public-query page; an explicit query retains its caller-selected page
+        semantics.
         """
         checkpoint = await self.checkpoint()
-        return checkpoint, tuple(await self.query(query))
+        if query is not None:
+            return checkpoint, tuple(await self.query(query))
+        return checkpoint, await self._complete_active_assertions()
 
     async def checkpoint(self) -> AssertionCheckpoint:
         tenant_id, _ = self._require_scope()

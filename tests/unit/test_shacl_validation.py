@@ -47,8 +47,12 @@ from kestrel_sovereign.storage.async_assertion_store import (
     AssertionStoreError,
     _issue_assertion_tenant_capability,
 )
+from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+from kestrel_sovereign.storage.sqla.migrations import (
+    migrate_semantic_validation_reports,
+)
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage.semantic_validation import (
     AsyncSemanticValidationReportStore,
@@ -680,6 +684,194 @@ async def test_shacl_validation_loss_deactivates_only_affected_inference_proofs(
 
 
 @pytest.mark.asyncio
+async def test_governed_supersession_validates_the_ledger_surviving_conclusion() -> None:
+    """A tentative graph retains a conclusion with a non-primary live proof."""
+    tenant = "did:example:tenant"
+    storage = AsyncStorage(
+        ":memory:",
+        agent_id=tenant,
+        _assertion_tenant_capability=_issue_assertion_tenant_capability(tenant),
+    )
+
+    def source(revision_id: str) -> SourceOccurrence:
+        return SourceOccurrence(
+            source_occurrence_id=f"source:{revision_id}",
+            source_kind="test",
+            locator=f"test:{revision_id}",
+            received_at="2026-07-26T00:00:00Z",
+        )
+
+    def assertion(
+        revision_id: str,
+        subject: IRI,
+        predicate: IRI,
+        object_: IRI,
+    ) -> Assertion:
+        return Assertion(
+            tenant_id=tenant,
+            owning_agent_id=tenant,
+            subject=subject,
+            predicate=predicate,
+            object=object_,
+            revision_id=revision_id,
+            confidence="1",
+            confidence_method="test",
+            confidence_basis="test",
+            epistemic_state=EpistemicState.ASSERTED,
+            asserted_at="2026-07-26T00:00:00Z",
+            ontology_version=INFERENCE_ONTOLOGY,
+            lineage=DirectLineage((f"source:{revision_id}",)),
+            privacy_classification="normal",
+            release_policy_reference="policy:test",
+        )
+
+    async def put(
+        revision_id: str,
+        subject: IRI,
+        predicate: IRI,
+        object_: IRI,
+    ) -> Assertion:
+        candidate = assertion(revision_id, subject, predicate, object_)
+        result = await storage.put_assertion(
+            candidate,
+            source_occurrences=(source(revision_id),),
+        )
+        assert result.accepted
+        return candidate
+
+    await storage.initialize()
+    try:
+        subject = IRI("https://example.test/subject")
+        object_ = IRI("https://example.test/object")
+        property_p = IRI("https://example.test/p")
+        property_q = IRI("https://example.test/q")
+        property_r = IRI("https://example.test/r")
+        property_other = IRI("https://example.test/other")
+        property_flag = IRI("https://example.test/flag")
+        direct_path = await put("p-sub-q", property_p, RDFS_SUBPROPERTY, property_q)
+        await put("p-sub-r", property_p, RDFS_SUBPROPERTY, property_r)
+        indirect_terminal = await put("r-sub-q", property_r, RDFS_SUBPROPERTY, property_q)
+        await put("statement", subject, property_p, object_)
+        await put("forbidden-flag", subject, property_flag, object_)
+
+        inference = BoundedInferenceService(
+            storage._assertion_store(),
+            InferenceProfile(INFERENCE_ONTOLOGY, "1.0.0"),
+        )
+        assert (await inference.materialize_incremental()).complete
+        conclusion = (
+            await storage.query_assertions(
+                AssertionQuery(
+                    subject=subject,
+                    predicate=property_q,
+                    object=object_,
+                )
+            )
+        )[0]
+        primary = next(
+            (
+                item
+                for item in (direct_path, indirect_terminal)
+                if item.revision_id in conclusion.lineage.input_revision_ids
+            ),
+            None,
+        )
+        assert primary is not None
+
+        replacement = replace(
+            primary,
+            revision_id="superseded-hierarchy-replacement",
+            object=property_other,
+            assertion_id=None,
+            lineage=DirectLineage(("source:superseded-hierarchy-replacement",)),
+        )
+        shapes = f"""
+        @prefix sh: <http://www.w3.org/ns/shacl#> .
+        <https://example.test/retained-conclusion> a sh:NodeShape ;
+          sh:targetSubjectsOf <{property_q.value}> ;
+          sh:property [ sh:path <{property_flag.value}> ; sh:maxCount 0 ] .
+        """
+        validation = GovernedSemanticValidationService(
+            storage._assertion_store(),
+            validator=GovernedShaclValidationService(_registry(shapes)),
+        )
+
+        result = await validation.supersede_assertion(
+            primary.revision_id,
+            replacement,
+            source_occurrences=(source("superseded-hierarchy-replacement"),),
+            shape_set=ShapeSetReference("test-shapes", "1.0.0"),
+            validation_capability="validation-profile:test-core",
+        )
+
+        # The alternate hierarchy path leaves the inferred Q assertion active,
+        # so the selected SHACL shape must see—and reject—that post-state.
+        assert result.accepted is False
+        assert result.report.action is ValidationWriteAction.REJECT
+        assert await storage.get_assertion(primary.assertion_id) == primary
+        assert await storage.get_assertion(conclusion.assertion_id) == conclusion
+
+        # Commit the same replacement under a conformant shape set.  The
+        # mutation reuses the planner, so it retains exactly the conclusion
+        # whose presence made the first tentative graph nonconformant.
+        accepting = GovernedSemanticValidationService(
+            storage._assertion_store(),
+            validator=GovernedShaclValidationService(_registry(CORE_SHAPES)),
+        )
+        applied = await accepting.supersede_assertion(
+            primary.revision_id,
+            replacement,
+            source_occurrences=(source("superseded-hierarchy-replacement"),),
+            shape_set=ShapeSetReference("test-shapes", "1.0.0"),
+            validation_capability="validation-profile:test-core",
+        )
+        assert applied.accepted is True
+        assert await storage.get_assertion(primary.assertion_id) is None
+        assert await storage.get_assertion(conclusion.assertion_id) == conclusion
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_sqlite_initializers_serialize_validation_schema_migration(
+    tmp_path,
+) -> None:
+    """Two SQLite connections never race the validation report DDL marker."""
+    database_path = str(tmp_path / "concurrent-validation.sqlite")
+    bootstrap = AsyncStorage(database_path, agent_id="did:example:bootstrap")
+    await bootstrap.initialize()
+    try:
+        # Existing databases reach this migration with the assertion schema in
+        # place but no validation marker.  Reproduce exactly that upgrade
+        # boundary without racing SQLite connection setup itself.
+        await bootstrap.db.execute(
+            "DELETE FROM semantic_schema_migrations WHERE version = ?",
+            ("semantic_validation_reports_v1",),
+        )
+    finally:
+        await bootstrap.close()
+
+    storages = [
+        AsyncStorage(database_path, agent_id=f"did:example:initializer:{index}")
+        for index in range(2)
+    ]
+    try:
+        for storage in storages:
+            await storage._backend.connect()  # noqa: SLF001 - isolated migration race setup
+            storage.db = AsyncDatabase(storage._backend)  # noqa: SLF001 - see above
+        await asyncio.gather(
+            *(migrate_semantic_validation_reports(storage.db) for storage in storages)
+        )
+        rows = await storages[0].db.fetchall(
+            "SELECT version FROM semantic_schema_migrations WHERE version = ?",
+            ("semantic_validation_reports_v1",),
+        )
+        assert rows == [("semantic_validation_reports_v1",)]
+    finally:
+        await asyncio.gather(*(storage.close() for storage in storages))
+
+
+@pytest.mark.asyncio
 async def test_revalidation_retries_on_cas_conflict_without_quarantining_a_newer_revision(monkeypatch) -> None:
     storage = AsyncStorage(
         ":memory:",
@@ -998,6 +1190,163 @@ async def test_shared_shacl_focus_quarantines_every_affected_assertion(increment
 
 
 @pytest.mark.asyncio
+async def test_governed_supersession_retries_when_materialization_adds_an_alternate_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proof-only materialization cannot commit a stale validated graph.
+
+    The alternate direct support is accepted after the initial closure, so the
+    first lifecycle plan correctly omits the inferred Q conclusion.  Injecting
+    materialization after SHACL validation but before the canonical commit
+    adds that proof without writing another inferred assertion revision.  The
+    ledger-only generation advance must force a replan, which then exposes the
+    retained conclusion to SHACL and rejects the supersession.
+    """
+    tenant = "did:example:ledger-cas"
+    storage = AsyncStorage(
+        ":memory:",
+        agent_id=tenant,
+        _assertion_tenant_capability=_issue_assertion_tenant_capability(tenant),
+    )
+
+    def source(revision_id: str) -> SourceOccurrence:
+        return SourceOccurrence(
+            source_occurrence_id=f"source:{revision_id}",
+            source_kind="test",
+            locator=f"test:{revision_id}",
+            received_at="2026-07-26T00:00:00Z",
+        )
+
+    def assertion(
+        revision_id: str,
+        subject: IRI,
+        predicate: IRI,
+        object_: IRI,
+    ) -> Assertion:
+        return Assertion(
+            tenant_id=tenant,
+            owning_agent_id=tenant,
+            subject=subject,
+            predicate=predicate,
+            object=object_,
+            revision_id=revision_id,
+            confidence="1",
+            confidence_method="test",
+            confidence_basis="test",
+            epistemic_state=EpistemicState.ASSERTED,
+            asserted_at="2026-07-26T00:00:00Z",
+            ontology_version=INFERENCE_ONTOLOGY,
+            lineage=DirectLineage((f"source:{revision_id}",)),
+            privacy_classification="normal",
+            release_policy_reference="policy:test",
+        )
+
+    async def put(
+        revision_id: str,
+        subject: IRI,
+        predicate: IRI,
+        object_: IRI,
+    ) -> Assertion:
+        candidate = assertion(revision_id, subject, predicate, object_)
+        result = await storage.put_assertion(
+            candidate,
+            source_occurrences=(source(revision_id),),
+        )
+        assert result.accepted
+        return candidate
+
+    await storage.initialize()
+    try:
+        subject = IRI("https://example.test/subject")
+        object_ = IRI("https://example.test/object")
+        property_p = IRI("https://example.test/p")
+        property_q = IRI("https://example.test/q")
+        property_r = IRI("https://example.test/r")
+        property_other = IRI("https://example.test/other")
+        property_flag = IRI("https://example.test/flag")
+        direct_path = await put("p-sub-q", property_p, RDFS_SUBPROPERTY, property_q)
+        await put("statement-through-p", subject, property_p, object_)
+        await put("forbidden-flag", subject, property_flag, object_)
+
+        assertion_store = storage._assertion_store()
+        inference = BoundedInferenceService(
+            assertion_store,
+            InferenceProfile(INFERENCE_ONTOLOGY, "1.0.0"),
+        )
+        assert (await inference.materialize_incremental()).complete
+        conclusion = (
+            await storage.query_assertions(
+                AssertionQuery(subject=subject, predicate=property_q, object=object_)
+            )
+        )[0]
+
+        # These direct assertions provide an alternate Q proof, but only the
+        # materializer records that proof in the active inference ledger.
+        await put("statement-through-r", subject, property_r, object_)
+        await put("r-sub-q", property_r, RDFS_SUBPROPERTY, property_q)
+        replacement = replace(
+            direct_path,
+            revision_id="p-sub-other",
+            object=property_other,
+            assertion_id=None,
+            lineage=DirectLineage(("source:p-sub-other",)),
+        )
+        plan = await assertion_store.plan_supersession_lifecycle(
+            direct_path.revision_id,
+            replacement,
+        )
+        assert conclusion.revision_id not in {
+            assertion.revision_id for assertion in plan.post_state
+        }
+
+        shapes = f"""
+        @prefix sh: <http://www.w3.org/ns/shacl#> .
+        <https://example.test/retained-conclusion> a sh:NodeShape ;
+          sh:targetSubjectsOf <{property_q.value}> ;
+          sh:property [ sh:path <{property_flag.value}> ; sh:maxCount 0 ] .
+        """
+        validation = GovernedSemanticValidationService(
+            assertion_store,
+            validator=GovernedShaclValidationService(_registry(shapes)),
+        )
+        original_commit = AsyncAssertionStore.supersede_with_validation_report
+        materialized_between_validation_and_commit = False
+
+        async def commit_after_materialization(store, *args, **kwargs):
+            nonlocal materialized_between_validation_and_commit
+            if store is assertion_store and not materialized_between_validation_and_commit:
+                materialized_between_validation_and_commit = True
+                checkpoint = await assertion_store.checkpoint()
+                assert (await inference.materialize_incremental()).complete
+                # The conclusion already existed.  This checkpoint movement
+                # is therefore the ledger-only CAS fence under test.
+                assert (await assertion_store.checkpoint()).generation > checkpoint.generation
+            return await original_commit(store, *args, **kwargs)
+
+        monkeypatch.setattr(
+            AsyncAssertionStore,
+            "supersede_with_validation_report",
+            commit_after_materialization,
+        )
+        result = await validation.supersede_assertion(
+            direct_path.revision_id,
+            replacement,
+            source_occurrences=(source("p-sub-other"),),
+            shape_set=ShapeSetReference("test-shapes", "1.0.0"),
+            validation_capability="validation-profile:test-core",
+        )
+
+        assert materialized_between_validation_and_commit
+        assert result.accepted is False
+        assert result.report.action is ValidationWriteAction.REJECT
+        assert await storage.get_assertion(direct_path.assertion_id) == direct_path
+        assert await storage.get_assertion(conclusion.assertion_id) == conclusion
+        assert len(await inference.explain(conclusion.assertion_id)) >= 2
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_governed_supersession_rejects_an_invalid_tentative_post_state() -> None:
     storage = AsyncStorage(
         ":memory:",
@@ -1030,6 +1379,106 @@ async def test_governed_supersession_rejects_an_invalid_tentative_post_state() -
         assert result.report.action is ValidationWriteAction.REJECT
         assert await storage.get_assertion(original.assertion_id) == original
         assert await storage.get_assertion(replacement.assertion_id) is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_governed_supersession_validates_the_complete_graph_beyond_query_page_limit() -> None:
+    """Governed lifecycle planning never validates only the first API page."""
+    storage = AsyncStorage(
+        ":memory:",
+        agent_id="did:example:tenant",
+        _assertion_tenant_capability=_issue_assertion_tenant_capability("did:example:tenant"),
+    )
+    await storage.initialize()
+    try:
+        subject = IRI("https://example.test/candidate")
+        predicate = IRI("https://example.test/related")
+
+        async def put(candidate: Assertion, source_id: str) -> None:
+            written = await storage.put_assertion(
+                candidate,
+                source_occurrences=(_candidate_source(source_id),),
+            )
+            assert written.accepted
+
+        original_source = "complete-snapshot-target-source"
+        original = _candidate_assertion("000-complete-snapshot-target", source_id=original_source)
+        await put(original, original_source)
+
+        # These rows sort between the predecessor and the retained assertion.
+        # The latter must still participate in both the tentative SHACL graph
+        # and the lifecycle mutation despite the public read default of 100.
+        for index in range(99):
+            source_id = f"complete-snapshot-filler-source-{index:03d}"
+            filler = replace(
+                _candidate_assertion(
+                    f"filler-complete-snapshot-{index:03d}", source_id=source_id
+                ),
+                assertion_id=None,
+                subject=IRI(f"https://example.test/filler/{index:03d}"),
+            )
+            await put(filler, source_id)
+
+        retained_source = "complete-snapshot-retained-source"
+        retained = replace(
+            _candidate_assertion("zzz-complete-snapshot-retained", source_id=retained_source),
+            assertion_id=None,
+            object=IRI("https://example.test/retained-object"),
+        )
+        await put(retained, retained_source)
+
+        _, snapshot = await storage.export_assertion_snapshot()
+        assert len(snapshot) == 101
+        assert {item.revision_id for item in snapshot} >= {
+            original.revision_id,
+            retained.revision_id,
+        }
+
+        replacement_source = "complete-snapshot-replacement-source"
+        replacement = replace(
+            _candidate_assertion(
+                "complete-snapshot-replacement", source_id=replacement_source
+            ),
+            assertion_id=None,
+            object=IRI("https://example.test/replacement-object"),
+        )
+        plan = await storage._assertion_store().plan_supersession_lifecycle(
+            original.revision_id,
+            replacement,
+        )
+        assert len(plan.post_state) == 101
+        assert retained.revision_id in {
+            assertion.revision_id for assertion in plan.post_state
+        }
+
+        shapes = f"""
+        @prefix sh: <http://www.w3.org/ns/shacl#> .
+        <https://example.test/complete-snapshot-shape> a sh:NodeShape ;
+          sh:targetNode <{subject.value}> ;
+          sh:property [ sh:path <{predicate.value}> ; sh:maxCount 1 ] .
+        """
+        validation = GovernedSemanticValidationService(
+            storage._assertion_store(),
+            validator=GovernedShaclValidationService(_registry(shapes)),
+        )
+
+        result = await validation.supersede_assertion(
+            original.revision_id,
+            replacement,
+            source_occurrences=(_candidate_source(replacement_source),),
+            shape_set=ShapeSetReference("test-shapes", "1.0.0"),
+            validation_capability="validation-profile:test-core",
+        )
+
+        # Replacement plus the 101st retained assertion exceed the shape's
+        # cardinality.  A page-limited tentative graph would have accepted
+        # this mutation and left the invalid retained assertion active.
+        assert result.accepted is False
+        assert result.report.action is ValidationWriteAction.REJECT
+        assert await storage.get_assertion(original.assertion_id) == original
+        assert await storage.get_assertion(retained.assertion_id) == retained
     finally:
         await storage.close()
 
