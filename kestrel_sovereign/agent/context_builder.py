@@ -369,7 +369,11 @@ class ContextBuilder:
                         inference_limits=self._semantic_inference_limits,
                         maintenance_limits=self._semantic_maintenance_limits,
                     )
-                    semantic_scores = await self._semantic_scores(query, recalled.candidates)
+                    semantic_scores = await self._semantic_scores(
+                        query, recalled.candidates,
+                        max_claim_characters=recall_config.max_claim_characters,
+                        batch_size=recall_config.embedding_batch_size,
+                    )
                     ordered = sorted(
                         recalled.candidates,
                         key=lambda item: (-semantic_scores[item.assertion.assertion_id], item.assertion.assertion_id),
@@ -400,7 +404,7 @@ class ContextBuilder:
                     # graph result; retain the established RAG path.
                     logger.warning("Semantic recall unavailable: %s", exc)
                     self.last_semantic_recall_metadata = {
-                        "status": "unavailable", "reason": str(exc)[:128],
+                        "status": "unavailable", "reason": self._semantic_failure_reason(exc),
                     }
         else:
             self.last_semantic_recall_metadata = {"status": "disabled"}
@@ -413,7 +417,7 @@ class ContextBuilder:
             for res in rag_results
         )
 
-    async def _semantic_scores(self, query: str, candidates) -> Dict[str, float]:
+    async def _semantic_scores(self, query: str, candidates, *, max_claim_characters: int, batch_size: int) -> Dict[str, float]:
         """Score already-authorized candidates in one embedding batch.
 
         Assertions never get a second persisted vector index. The existing
@@ -424,18 +428,40 @@ class ContextBuilder:
         if not candidates:
             return {}
         from kestrel_sovereign.agent.semantic_recall import _claim_text
-        from kestrel_sovereign.llm.embedding_service import get_provider_embedding_service, semantic_search
+        from kestrel_sovereign.llm.embedding_service import aembed_retrieval_query, cosine_similarity, get_provider_embedding_service
         service = get_provider_embedding_service(self._llm_service)
         if service is None:
             raise RuntimeError("semantic_embedding_capability_unavailable")
-        claims = [_claim_text(item.assertion, 1200) for item in candidates]
-        hits = await semantic_search(query, claims, service, top_k=len(claims))
-        if len(hits) != len(claims):
-            raise RuntimeError("semantic embedding capability returned incomplete candidate scores")
-        return {
-            candidates[int(hit["index"])].assertion.assertion_id: float(hit["score"])
-            for hit in hits
+        query_embedding = await aembed_retrieval_query(service, query)
+        if query_embedding is None:
+            raise RuntimeError("semantic_embedding_capability_unavailable")
+        scores: Dict[str, float] = {}
+        for start in range(0, len(candidates), batch_size):
+            batch = candidates[start:start + batch_size]
+            embeddings = await service.aembed_batch([
+                _claim_text(item.assertion, max_claim_characters) for item in batch
+            ])
+            if len(embeddings) != len(batch) or any(value is None for value in embeddings):
+                raise RuntimeError("semantic_embedding_capability_unavailable")
+            scores.update({
+                item.assertion.assertion_id: cosine_similarity(query_embedding, embedding)
+                for item, embedding in zip(batch, embeddings)
+            })
+        return scores
+
+    @staticmethod
+    def _semantic_failure_reason(error: Exception) -> str:
+        """Never serialize provider exception text into retrieval metadata."""
+        known = {
+            "semantic_embedding_capability_unavailable",
+            "semantic_recall_candidate_window_exceeded",
+            "semantic_maintenance_capability_unavailable",
+            "semantic_maintenance_checkpoint_behind",
+            "semantic_maintenance_state_missing",
+            "semantic_maintenance_partial",
         }
+        value = str(error)
+        return value if value in known else "semantic_recall_capability_unavailable"
 
     def get_session_briefing(self) -> str:
         """

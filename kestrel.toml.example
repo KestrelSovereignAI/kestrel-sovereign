@@ -125,6 +125,7 @@ exclude_repos = []
 semantic_recall_enabled = false
 semantic_recall_candidate_limit = 32
 semantic_recall_candidate_scan_limit = 2000
+semantic_recall_embedding_batch_size = 64
 semantic_recall_work_limit = 24
 semantic_recall_result_limit = 8
 semantic_recall_max_tokens = 1200
