@@ -40,6 +40,7 @@ from kestrel_sovereign.storage.async_storage import AsyncStorage
 from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage, PrivacyViolationError
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage.sqla.migrations import (
+    _SEMANTIC_MAINTENANCE_ERASURE_REDACTION_SCHEMA_VERSION,
     migrate_semantic_assertion_store,
     migrate_semantic_validation_reports,
 )
@@ -508,6 +509,408 @@ async def test_retraction_and_erasure_cascade_to_derived_and_eligibility() -> No
         assert (await store.assertion_checkpoint()).latest_event_id == changes[0].event_id
     finally:
         await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_erasure_scrubs_maintenance_artifacts_and_forces_restart_resync(
+    tmp_path,
+) -> None:
+    """Maintenance evidence/cursors cannot retain an erased canonical closure."""
+    db_path = tmp_path / "maintenance-erasure.db"
+    storage = AsyncStorage(
+        str(db_path),
+        agent_id=TENANT,
+        _assertion_tenant_capability=_assertion_capability(TENANT),
+    )
+    await storage.initialize()
+    db = storage.db
+    root = direct(
+        "maintenance-erasure-root",
+        value="erased-maintenance-secret",
+        source_id="maintenance-erasure-source",
+    )
+    unrelated = direct(
+        "maintenance-erasure-unrelated",
+        value="maintenance-unrelated",
+        source_id="maintenance-unrelated-source",
+    )
+    other_tenant = f"{OTHER_TENANT}:maintenance-erasure"
+    other_state = (
+        "other-profile",
+        17,
+        "other-event",
+        "other-run",
+        "complete",
+        '{"other":"capability"}',
+        "other-repair-cursor",
+        1,
+        "current_scan",
+        1,
+        16,
+        "other-repair-event",
+        "other-derivation-cursor",
+        "other-assertion",
+        "other-revision",
+        "other-competitor-cursor",
+        "2026-07-27T00:00:00Z",
+    )
+    try:
+        written = await storage.put_assertion(
+            root,
+            source_occurrences=(source("maintenance-erasure-source"),),
+        )
+        await storage.put_assertion(
+            unrelated,
+            source_occurrences=(source("maintenance-unrelated-source"),),
+        )
+        # Establish a real matching maintenance state before replacing every
+        # resumable cursor with an erased value.  The public run also proves
+        # the erased state has a normal worker path before this regression.
+        await storage.run_semantic_maintenance(None)
+        await db.execute(
+            "UPDATE semantic_maintenance_state SET "
+            "checkpoint_generation = ?, checkpoint_event_id = ?, status = 'complete', "
+            "repair_cursor_revision_id = ?, repair_active = 1, repair_mode = 'current_scan', "
+            "repair_scan_complete = 1, repair_checkpoint_generation = ?, "
+            "repair_checkpoint_event_id = NULL, repair_reconcile_cursor_derivation_id = ?, "
+            "audit_assertion_id = ?, audit_assertion_revision_id = ?, "
+            "audit_competitor_cursor_revision_id = ? "
+            "WHERE tenant_id = ?",
+            (
+                written.generation,
+                written.event_id,
+                root.revision_id,
+                written.generation,
+                root.revision_id,
+                root.assertion_id,
+                root.revision_id,
+                root.revision_id,
+                TENANT,
+            ),
+        )
+        await db.execute(
+            "INSERT INTO semantic_maintenance_state "
+            "(tenant_id, profile_key, checkpoint_generation, checkpoint_event_id, run_id, "
+            "status, capability_versions, repair_cursor_revision_id, repair_active, repair_mode, "
+            "repair_scan_complete, repair_checkpoint_generation, repair_checkpoint_event_id, "
+            "repair_reconcile_cursor_derivation_id, audit_assertion_id, audit_assertion_revision_id, "
+            "audit_competitor_cursor_revision_id, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (other_tenant, *other_state),
+        )
+
+        async def record_report(
+            tenant_id: str,
+            report_id: str,
+            evidence: object,
+        ) -> None:
+            await db.execute(
+                "INSERT INTO semantic_maintenance_reports "
+                "(tenant_id, report_id, report_kind, evidence_digest, status, evidence_mapping, "
+                "created_at, updated_at) VALUES (?, ?, 'contradiction_candidate', ?, "
+                "'review_required', ?, '2026-07-27T00:00:00Z', '2026-07-27T00:00:00Z')",
+                (
+                    tenant_id,
+                    report_id,
+                    f"digest:{report_id}",
+                    json.dumps(evidence, sort_keys=True),
+                ),
+            )
+
+        await record_report(
+            TENANT,
+            "maintenance-erased-flat",
+            {
+                "assertion_id": root.assertion_id,
+                "revision_id": root.revision_id,
+                "content": "erased-maintenance-secret",
+            },
+        )
+        await record_report(
+            TENANT,
+            "maintenance-erased-nested",
+            {
+                "evidence": [
+                    {"assertion_ids": [unrelated.assertion_id, root.assertion_id]},
+                    {"cursor": f"revision:{root.revision_id}"},
+                ]
+            },
+        )
+        await record_report(
+            TENANT,
+            "maintenance-unrelated",
+            {
+                "assertion_id": unrelated.assertion_id,
+                "revision_id": unrelated.revision_id,
+                "content": "maintenance-unrelated",
+            },
+        )
+        await record_report(
+            other_tenant,
+            "maintenance-other-tenant",
+            {
+                "assertion_id": "other-assertion",
+                "revision_id": "other-revision",
+                "content": "other-tenant-content",
+            },
+        )
+        await db.execute(
+            "INSERT INTO semantic_maintenance_leases "
+            "(tenant_id, holder_id, fencing_token, expires_at, updated_at) "
+            "VALUES (?, 'stale-maintenance-worker', 4, 9999999999, "
+            "'2026-07-27T00:00:00Z')",
+            (TENANT,),
+        )
+
+        erased = await storage.erase_assertion(
+            root.assertion_id,
+            operation_id="maintenance-artifact-erasure",
+        )
+        state = await db.fetchone(
+            "SELECT checkpoint_generation, checkpoint_event_id, status, "
+            "repair_cursor_revision_id, repair_active, repair_mode, repair_scan_complete, "
+            "repair_checkpoint_generation, repair_checkpoint_event_id, "
+            "repair_reconcile_cursor_derivation_id, audit_assertion_id, "
+            "audit_assertion_revision_id, audit_competitor_cursor_revision_id "
+            "FROM semantic_maintenance_state WHERE tenant_id = ?",
+            (TENANT,),
+        )
+        assert state == (
+            erased.generation,
+            None,
+            "partial",
+            None,
+            0,
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        assert await db.fetchone(
+            "SELECT holder_id, fencing_token, expires_at "
+            "FROM semantic_maintenance_leases WHERE tenant_id = ?",
+            (TENANT,),
+        ) == ("physical-erasure", 5, 0.0)
+        assert await db.fetchone(
+            "SELECT checkpoint_generation, checkpoint_event_id, status, "
+            "repair_cursor_revision_id, repair_active, repair_mode, repair_scan_complete, "
+            "repair_checkpoint_generation, repair_checkpoint_event_id, "
+            "repair_reconcile_cursor_derivation_id, audit_assertion_id, "
+            "audit_assertion_revision_id, audit_competitor_cursor_revision_id "
+            "FROM semantic_maintenance_state WHERE tenant_id = ?",
+            (other_tenant,),
+        ) == (
+            other_state[1],
+            other_state[2],
+            other_state[4],
+            other_state[6],
+            other_state[7],
+            other_state[8],
+            other_state[9],
+            other_state[10],
+            other_state[11],
+            other_state[12],
+            other_state[13],
+            other_state[14],
+            other_state[15],
+        )
+        report_ids = await db.fetchall(
+            "SELECT report_id FROM semantic_maintenance_reports "
+            "WHERE tenant_id = ? ORDER BY report_id",
+            (TENANT,),
+        )
+        assert report_ids == [("maintenance-unrelated",)]
+        assert await db.fetchone(
+            "SELECT evidence_mapping FROM semantic_maintenance_reports "
+            "WHERE tenant_id = ? AND report_id = ?",
+            (other_tenant, "maintenance-other-tenant"),
+        ) is not None
+        for table_name in (
+            "semantic_maintenance_state",
+            "semantic_maintenance_runs",
+            "semantic_maintenance_leases",
+            "semantic_maintenance_reports",
+        ):
+            rows = await db.fetchall(f"SELECT * FROM {table_name}")
+            serialized = repr(rows)
+            assert root.assertion_id not in serialized
+            assert root.revision_id not in serialized
+            assert "erased-maintenance-secret" not in serialized
+        changes = await storage.assertion_changes_since(written.generation)
+        erasure_changes = [change for change in changes if change.operation == "erased"]
+        assert len(erasure_changes) == 1
+        assert erasure_changes[0].assertion_id is None
+        assert erasure_changes[0].revision_id is None
+        assert erasure_changes[0].generation == erased.generation
+    finally:
+        await storage.close()
+
+    restarted = AsyncStorage(
+        str(db_path),
+        agent_id=TENANT,
+        _assertion_tenant_capability=_assertion_capability(TENANT),
+    )
+    await restarted.initialize()
+    try:
+        resync = await restarted.run_semantic_maintenance(None)
+        assert resync.status.value != "no_op"
+        assert resync.changes_consumed >= 1
+        assert await restarted.get_assertion(root.assertion_id) is None
+        assert await restarted.db.fetchone(
+            "SELECT 1 FROM semantic_maintenance_reports "
+            "WHERE tenant_id = ? AND report_id = ?",
+            (TENANT, "maintenance-unrelated"),
+        ) is not None
+    finally:
+        await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_maintenance_migration_redacts_legacy_erasure_artifacts(tmp_path) -> None:
+    """An upgrade cannot retain pre-redaction report/cursor identifiers."""
+    db_path = tmp_path / "legacy-maintenance-erasure.db"
+    storage = AsyncStorage(
+        str(db_path),
+        agent_id=TENANT,
+        _assertion_tenant_capability=_assertion_capability(TENANT),
+    )
+    await storage.initialize()
+    legacy_assertion_id = "legacy-erased-assertion"
+    legacy_revision_id = "legacy-erased-revision"
+    legacy_content = "legacy-erased-content"
+    unaffected_tenant = f"{OTHER_TENANT}:legacy-maintenance"
+    try:
+        await storage.db.execute(
+            "INSERT INTO semantic_maintenance_state "
+            "(tenant_id, profile_key, checkpoint_generation, checkpoint_event_id, run_id, "
+            "status, capability_versions, repair_cursor_revision_id, repair_active, repair_mode, "
+            "repair_scan_complete, repair_checkpoint_generation, repair_checkpoint_event_id, "
+            "repair_reconcile_cursor_derivation_id, audit_assertion_id, audit_assertion_revision_id, "
+            "audit_competitor_cursor_revision_id, updated_at) "
+            "VALUES (?, 'legacy-profile', 12, 'legacy-event', 'legacy-run', 'complete', '{}', "
+            "?, 1, 'current_scan', 1, 11, 'legacy-repair-event', ?, ?, ?, ?, "
+            "'2026-07-27T00:00:00Z')",
+            (
+                TENANT,
+                legacy_revision_id,
+                legacy_revision_id,
+                legacy_assertion_id,
+                legacy_revision_id,
+                legacy_revision_id,
+            ),
+        )
+        await storage.db.execute(
+            "INSERT INTO semantic_maintenance_reports "
+            "(tenant_id, report_id, report_kind, evidence_digest, status, evidence_mapping, "
+            "created_at, updated_at) VALUES (?, 'legacy-report', 'contradiction_candidate', "
+            "'legacy-digest', 'review_required', ?, '2026-07-27T00:00:00Z', "
+            "'2026-07-27T00:00:00Z')",
+            (
+                TENANT,
+                json.dumps(
+                    {
+                        "assertion_id": legacy_assertion_id,
+                        "revision_id": legacy_revision_id,
+                        "content": legacy_content,
+                    }
+                ),
+            ),
+        )
+        await storage.db.execute(
+            "INSERT INTO semantic_maintenance_leases "
+            "(tenant_id, holder_id, fencing_token, expires_at, updated_at) "
+            "VALUES (?, 'legacy-worker', 4, 9999999999, '2026-07-27T00:00:00Z')",
+            (TENANT,),
+        )
+        await storage.db.execute(
+            "INSERT INTO semantic_maintenance_state "
+            "(tenant_id, profile_key, checkpoint_generation, checkpoint_event_id, run_id, "
+            "status, capability_versions, repair_cursor_revision_id, repair_active, repair_mode, "
+            "repair_scan_complete, repair_checkpoint_generation, repair_checkpoint_event_id, "
+            "repair_reconcile_cursor_derivation_id, audit_assertion_id, audit_assertion_revision_id, "
+            "audit_competitor_cursor_revision_id, updated_at) "
+            "VALUES (?, 'unaffected-profile', 3, 'unaffected-event', 'unaffected-run', "
+            "'complete', '{}', NULL, 0, NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, "
+            "'2026-07-27T00:00:00Z')",
+            (unaffected_tenant,),
+        )
+        await storage.db.execute(
+            "INSERT INTO semantic_maintenance_reports "
+            "(tenant_id, report_id, report_kind, evidence_digest, status, evidence_mapping, "
+            "created_at, updated_at) VALUES (?, 'unaffected-report', 'contradiction_candidate', "
+            "'unaffected-digest', 'review_required', '{\"safe\":true}', "
+            "'2026-07-27T00:00:00Z', '2026-07-27T00:00:00Z')",
+            (unaffected_tenant,),
+        )
+        await storage.db.execute(
+            "INSERT INTO semantic_projection_erasure_outbox "
+            "(event_id, tenant_id, operation, generation, created_at) "
+            "VALUES ('legacy-erasure-event', ?, 'erased', 12, '2026-07-27T00:00:00Z')",
+            (TENANT,),
+        )
+        await storage.db.execute(
+            "DELETE FROM semantic_schema_migrations WHERE version = ?",
+            (_SEMANTIC_MAINTENANCE_ERASURE_REDACTION_SCHEMA_VERSION,),
+        )
+    finally:
+        await storage.close()
+
+    restarted = AsyncStorage(
+        str(db_path),
+        agent_id=TENANT,
+        _assertion_tenant_capability=_assertion_capability(TENANT),
+    )
+    await restarted.initialize()
+    try:
+        assert await restarted.db.fetchval(
+            "SELECT COUNT(*) FROM semantic_maintenance_reports WHERE tenant_id = ?",
+            (TENANT,),
+        ) == 0
+        assert await restarted.db.fetchone(
+            "SELECT checkpoint_generation, checkpoint_event_id, status, "
+            "repair_cursor_revision_id, repair_active, repair_mode, repair_scan_complete, "
+            "repair_checkpoint_generation, repair_checkpoint_event_id, "
+            "repair_reconcile_cursor_derivation_id, audit_assertion_id, "
+            "audit_assertion_revision_id, audit_competitor_cursor_revision_id "
+            "FROM semantic_maintenance_state WHERE tenant_id = ?",
+            (TENANT,),
+        ) == (0, None, "partial", None, 0, None, 0, None, None, None, None, None, None)
+        assert await restarted.db.fetchone(
+            "SELECT holder_id, fencing_token, expires_at "
+            "FROM semantic_maintenance_leases WHERE tenant_id = ?",
+            (TENANT,),
+        ) == ("schema-erasure-redaction", 5, 0.0)
+        assert await restarted.db.fetchone(
+            "SELECT 1 FROM semantic_schema_migrations WHERE version = ?",
+            (_SEMANTIC_MAINTENANCE_ERASURE_REDACTION_SCHEMA_VERSION,),
+        ) == (1,)
+        assert await restarted.db.fetchone(
+            "SELECT checkpoint_generation, checkpoint_event_id, status "
+            "FROM semantic_maintenance_state WHERE tenant_id = ?",
+            (unaffected_tenant,),
+        ) == (3, "unaffected-event", "complete")
+        assert await restarted.db.fetchone(
+            "SELECT evidence_mapping FROM semantic_maintenance_reports "
+            "WHERE tenant_id = ? AND report_id = 'unaffected-report'",
+            (unaffected_tenant,),
+        ) == ('{"safe":true}',)
+        for table_name in (
+            "semantic_maintenance_state",
+            "semantic_maintenance_runs",
+            "semantic_maintenance_leases",
+            "semantic_maintenance_reports",
+        ):
+            rows = await restarted.db.fetchall(f"SELECT * FROM {table_name}")
+            serialized = repr(rows)
+            assert legacy_assertion_id not in serialized
+            assert legacy_revision_id not in serialized
+            assert legacy_content not in serialized
+    finally:
+        await restarted.close()
 
 
 @pytest.mark.asyncio

@@ -2142,6 +2142,152 @@ async def test_erasure_emits_an_opaque_retryable_change_on_both_backends(
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_erasure_redacts_maintenance_artifacts_on_both_backends(
+    db_backend,
+    tmp_path,
+):
+    """JSON report evidence and every resumable cursor share erasure semantics."""
+    tenant, identity = await _incepted_assertion_identity(tmp_path, "maintenance-erasure")
+    storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    try:
+        root = _semantic_assertion(
+            tenant,
+            "maintenance-erasure-root",
+            value="maintenance-erasure-secret",
+        )
+        unrelated = _semantic_assertion(
+            tenant,
+            "maintenance-erasure-unrelated",
+            value="maintenance-unrelated",
+        )
+        written = await storage.put_assertion(
+            root,
+            source_occurrences=(_semantic_source("parity-source"),),
+        )
+        await storage.put_assertion(
+            unrelated,
+            source_occurrences=(_semantic_source("parity-source"),),
+        )
+        await storage.db.execute(
+            "INSERT INTO semantic_maintenance_state "
+            "(tenant_id, profile_key, checkpoint_generation, checkpoint_event_id, run_id, "
+            "status, capability_versions, repair_cursor_revision_id, repair_active, repair_mode, "
+            "repair_scan_complete, repair_checkpoint_generation, repair_checkpoint_event_id, "
+            "repair_reconcile_cursor_derivation_id, audit_assertion_id, audit_assertion_revision_id, "
+            "audit_competitor_cursor_revision_id, updated_at) "
+            "VALUES (?, 'maintenance-profile', ?, ?, 'maintenance-run', 'complete', '{}', "
+            "?, 1, 'current_scan', 1, ?, NULL, ?, ?, ?, ?, '2026-07-27T00:00:00Z')",
+            (
+                tenant,
+                written.generation,
+                written.event_id,
+                root.revision_id,
+                written.generation,
+                root.revision_id,
+                root.assertion_id,
+                root.revision_id,
+                root.revision_id,
+            ),
+        )
+
+        async def record_report(report_id: str, evidence: object) -> None:
+            await storage.db.execute(
+                "INSERT INTO semantic_maintenance_reports "
+                "(tenant_id, report_id, report_kind, evidence_digest, status, evidence_mapping, "
+                "created_at, updated_at) VALUES (?, ?, 'contradiction_candidate', ?, "
+                "'review_required', ?, '2026-07-27T00:00:00Z', '2026-07-27T00:00:00Z')",
+                (
+                    tenant,
+                    report_id,
+                    f"digest:{report_id}",
+                    json.dumps(evidence, sort_keys=True),
+                ),
+            )
+
+        await record_report(
+            "maintenance-erasure-flat",
+            {
+                "assertion_id": root.assertion_id,
+                "revision_id": root.revision_id,
+                "content": "maintenance-erasure-secret",
+            },
+        )
+        await record_report(
+            "maintenance-erasure-nested",
+            {
+                "nested": [
+                    {"assertion_ids": [root.assertion_id]},
+                    {"cursor": f"revision:{root.revision_id}"},
+                ]
+            },
+        )
+        await record_report(
+            "maintenance-erasure-unrelated",
+            {
+                "assertion_id": unrelated.assertion_id,
+                "revision_id": unrelated.revision_id,
+            },
+        )
+
+        erased = await storage.erase_assertion(
+            root.assertion_id,
+            operation_id="maintenance-erasure-parity",
+        )
+
+        assert await storage.db.fetchall(
+            "SELECT report_id FROM semantic_maintenance_reports "
+            "WHERE tenant_id = ? ORDER BY report_id",
+            (tenant,),
+        ) == [("maintenance-erasure-unrelated",)]
+        assert await storage.db.fetchone(
+            "SELECT checkpoint_generation, checkpoint_event_id, status, "
+            "repair_cursor_revision_id, repair_active, repair_mode, repair_scan_complete, "
+            "repair_checkpoint_generation, repair_checkpoint_event_id, "
+            "repair_reconcile_cursor_derivation_id, audit_assertion_id, "
+            "audit_assertion_revision_id, audit_competitor_cursor_revision_id "
+            "FROM semantic_maintenance_state WHERE tenant_id = ?",
+            (tenant,),
+        ) == (
+            erased.generation,
+            None,
+            "partial",
+            None,
+            0,
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        for table_name in (
+            "semantic_maintenance_state",
+            "semantic_maintenance_runs",
+            "semantic_maintenance_leases",
+            "semantic_maintenance_reports",
+        ):
+            rows = await storage.db.fetchall(
+                f"SELECT * FROM {table_name} WHERE tenant_id = ?",
+                (tenant,),
+            )
+            serialized = repr(rows)
+            assert root.assertion_id not in serialized
+            assert root.revision_id not in serialized
+            assert "maintenance-erasure-secret" not in serialized
+        changes = await storage.assertion_changes_since(written.generation)
+        erasure_changes = [change for change in changes if change.operation == "erased"]
+        assert len(erasure_changes) == 1
+        assert erasure_changes[0].assertion_id is None
+        assert erasure_changes[0].revision_id is None
+        assert erasure_changes[0].generation == erased.generation
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_shacl_reports_and_governed_write_are_backend_neutral(db_backend, tmp_path):
     """Pinned reports and their assertion links round-trip on SQLite and PostgreSQL."""
     tenant, identity = await _incepted_assertion_identity(tmp_path, "shacl-report")

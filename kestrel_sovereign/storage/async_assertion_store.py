@@ -47,6 +47,7 @@ _EXPLICIT_FACT_FORGET_NOOP_OPERATION = "explicit_fact_forget_noop"
 _LEGACY_ERASED_EXPLICIT_FACT_OPERATION = "legacy_erased_explicit_fact"
 _EXPLICIT_FACT_SAVE_OPERATION_PREFIX = "memory-agency-save-fact-v1:save:"
 _EXPLICIT_FACT_FORGET_OPERATION_PREFIX = "memory-agency-save-fact-v1:forget:"
+_ERASURE_MAINTENANCE_LEASE_HOLDER = "physical-erasure"
 
 
 @dataclass(frozen=True, slots=True)
@@ -859,8 +860,32 @@ class AsyncAssertionStore:
         if changed != 1:
             raise MaintenanceLeaseLostError("semantic_maintenance_lease_lost")
 
+    async def _revoke_maintenance_lease_for_erasure(self) -> None:
+        """Fence a maintenance worker before an erasure takes the tenant lock.
+
+        Maintenance renews its lease before it locks the canonical tenant row.
+        Physical erasure must take that same lock order: otherwise a worker
+        holding the lease can wait on the tenant row while erasure waits on
+        the lease, or can publish a report naming a revision after erasure has
+        scrubbed it.  The expired replacement lease makes every pre-erasure
+        worker fail its next fenced write, while a new worker can acquire a
+        fresh token after this transaction commits.
+        """
+        tenant_id, _ = self._require_scope()
+        await self._database.execute(
+            "INSERT INTO semantic_maintenance_leases "
+            "(tenant_id, holder_id, fencing_token, expires_at, updated_at) "
+            "VALUES (?, ?, 1, 0, ?) "
+            "ON CONFLICT(tenant_id) DO UPDATE SET "
+            "holder_id = excluded.holder_id, "
+            "fencing_token = semantic_maintenance_leases.fencing_token + 1, "
+            "expires_at = excluded.expires_at, "
+            "updated_at = excluded.updated_at",
+            (tenant_id, _ERASURE_MAINTENANCE_LEASE_HOLDER, _now()),
+        )
+
     @asynccontextmanager
-    async def _mutation(self):
+    async def _mutation(self, *, revoke_maintenance_lease: bool = False):
         """Run one canonical mutation with a tenant serialization boundary.
 
         Database backends deliberately wrap any exception raised inside a
@@ -870,6 +895,12 @@ class AsyncAssertionStore:
         """
         try:
             async with self._database.transaction():
+                if revoke_maintenance_lease:
+                    if _MAINTENANCE_FENCE.get() is not None:
+                        raise AssertionStoreError(
+                            "physical erasure cannot run inside a maintenance lease"
+                        )
+                    await self._revoke_maintenance_lease_for_erasure()
                 await self._renew_maintenance_fence_in_mutation()
                 await self._lock_tenant()
                 yield
@@ -4507,6 +4538,173 @@ class AsyncAssertionStore:
             (tenant_id,) + report_ids,
         )
 
+    @staticmethod
+    def _maintenance_evidence_references_erased_identifier(
+        evidence: object,
+        identifiers: frozenset[str],
+    ) -> bool:
+        """Return whether arbitrary JSON evidence retains an erased identifier.
+
+        Maintenance evidence is structured JSON today, but this redaction
+        boundary must also cover nested compatibility payloads and an ID
+        embedded in a diagnostic string.  Report evidence that references an
+        erased assertion cannot remain semantically honest after redaction, so
+        callers delete the whole report rather than trying to invent partial
+        evidence or a replacement digest.
+        """
+        if isinstance(evidence, str):
+            return any(identifier in evidence for identifier in identifiers)
+        if isinstance(evidence, Mapping):
+            return any(
+                AsyncAssertionStore._maintenance_evidence_references_erased_identifier(
+                    key, identifiers
+                )
+                or AsyncAssertionStore._maintenance_evidence_references_erased_identifier(
+                    value, identifiers
+                )
+                for key, value in evidence.items()
+            )
+        if isinstance(evidence, (list, tuple)):
+            return any(
+                AsyncAssertionStore._maintenance_evidence_references_erased_identifier(
+                    item, identifiers
+                )
+                for item in evidence
+            )
+        return False
+
+    async def _delete_maintenance_reports_referencing(
+        self,
+        assertion_ids: Sequence[str],
+        revision_ids: Sequence[str],
+    ) -> None:
+        """Delete current-tenant maintenance evidence made invalid by erasure.
+
+        SQLite and PostgreSQL expose incompatible JSON query operators.  Read
+        the tenant-bound evidence text and inspect its decoded JSON here so
+        the redaction contract is identical on both backends and does not put
+        an erased selector into a query, log, or durable audit field.
+        """
+        identifiers = frozenset(
+            identifier
+            for identifier in (*assertion_ids, *revision_ids)
+            if isinstance(identifier, str) and identifier
+        )
+        if not identifiers:
+            return
+        tenant_id, _ = self._require_scope()
+        rows = await self._database.fetchall(
+            "SELECT report_id, evidence_digest, evidence_mapping "
+            "FROM semantic_maintenance_reports WHERE tenant_id = ?",
+            (tenant_id,),
+        )
+        report_ids: list[str] = []
+        for report_id, evidence_digest, encoded_evidence in rows:
+            references_erased_identifier = (
+                str(report_id) in identifiers
+                or str(evidence_digest) in identifiers
+            )
+            if not references_erased_identifier:
+                try:
+                    evidence = json.loads(encoded_evidence)
+                except (TypeError, ValueError, RecursionError):
+                    # An unreadable report cannot prove it omits the erased
+                    # data.  It is not a valid maintenance artifact, and
+                    # retaining it would turn malformed JSON into a redaction
+                    # escape hatch.
+                    references_erased_identifier = True
+                else:
+                    references_erased_identifier = (
+                        self._maintenance_evidence_references_erased_identifier(
+                            evidence,
+                            identifiers,
+                        )
+                    )
+            if references_erased_identifier:
+                report_ids.append(str(report_id))
+        if not report_ids:
+            return
+        await self._database.execute(
+            "DELETE FROM semantic_maintenance_reports WHERE tenant_id = ? "
+            f"AND report_id IN ({_placeholders(report_ids)})",
+            (tenant_id, *report_ids),
+        )
+
+    async def _maintenance_state_columns(self) -> set[str]:
+        """Read the deployed maintenance-state shape for legacy databases."""
+        if self._database.backend_type == "postgres":
+            rows = await self._database.fetchall(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'semantic_maintenance_state'",
+                (),
+            )
+            return {str(row[0]) for row in rows}
+        rows = await self._database.fetchall(
+            "PRAGMA table_info(semantic_maintenance_state)",
+            (),
+        )
+        return {str(row[1]) for row in rows}
+
+    async def _rewind_maintenance_state_after_erasure(self, generation: int) -> None:
+        """Clear all maintenance cursors and replay the opaque erasure event.
+
+        A maintenance checkpoint with a null event ID deliberately takes the
+        legacy ``generation >=`` recovery branch in ``changes_after``.  By
+        writing the committed erasure generation before its opaque event is
+        inserted, the next bounded maintenance run must consume that event and
+        choose its existing full-audit/resynchronization path.  Clearing every
+        cursor also prevents a stale assertion, revision, or derivation cursor
+        from steering work back into the erased closure.
+        """
+        columns = await self._maintenance_state_columns()
+        if not columns:
+            return
+        assignments: list[str] = []
+        params: list[object] = []
+
+        def assign(column: str, value: object) -> None:
+            if column in columns:
+                assignments.append(f"{column} = ?")
+                params.append(value)
+
+        assign("checkpoint_generation", generation)
+        assign("checkpoint_event_id", None)
+        assign("status", "partial")
+        assign("repair_cursor_revision_id", None)
+        assign("repair_active", 0)
+        assign("repair_mode", None)
+        assign("repair_scan_complete", 0)
+        assign("repair_checkpoint_generation", None)
+        assign("repair_checkpoint_event_id", None)
+        assign("repair_reconcile_cursor_derivation_id", None)
+        assign("audit_assertion_id", None)
+        assign("audit_assertion_revision_id", None)
+        assign("audit_competitor_cursor_revision_id", None)
+        assign("updated_at", _now())
+        if not assignments:
+            return
+        tenant_id, _ = self._require_scope()
+        await self._database.execute(
+            "UPDATE semantic_maintenance_state SET "
+            + ", ".join(assignments)
+            + " WHERE tenant_id = ?",
+            (*params, tenant_id),
+        )
+
+    async def _sanitize_maintenance_after_erasure(
+        self,
+        assertion_ids: Sequence[str],
+        revision_ids: Sequence[str],
+        generation: int,
+    ) -> None:
+        """Remove erased maintenance evidence and reset its resumable state."""
+        await self._delete_maintenance_reports_referencing(
+            assertion_ids,
+            revision_ids,
+        )
+        await self._rewind_maintenance_state_after_erasure(generation)
+
     async def erase(self, assertion_id: str, *, operation_id: str | None = None) -> ErasureResult:
         """Physically erase an assertion and its transitive derived closure.
 
@@ -4520,7 +4718,7 @@ class AsyncAssertionStore:
         # the target assertion ID in the receipt key itself.
         operation_id = operation_id or f"erase:{_operation_digest({'assertion_id': assertion_id})}"
         request = {"assertion_id": assertion_id}
-        async with self._mutation():
+        async with self._mutation(revoke_maintenance_lease=True):
             digest, replay = await self._erasure_operation(operation_id, request)
             if replay is not None:
                 remembered = self._remembered_erasure_job(operation_id, digest)
@@ -4675,6 +4873,11 @@ class AsyncAssertionStore:
             await self._tombstone_and_delete_operations_referencing(
                 assertion_ids,
                 revision_ids,
+                generation,
+            )
+            await self._sanitize_maintenance_after_erasure(
+                assertion_tuple,
+                revision_tuple,
                 generation,
             )
             await self._database.execute(

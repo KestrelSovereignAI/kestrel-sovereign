@@ -52,6 +52,9 @@ _SEMANTIC_MAINTENANCE_REPAIR_CURSOR_SCHEMA_VERSION = "semantic_maintenance_v3_re
 _SEMANTIC_MAINTENANCE_RESUME_SCHEMA_VERSION = "semantic_maintenance_v4_resume_state"
 _SEMANTIC_MAINTENANCE_AUDIT_REVISION_SCHEMA_VERSION = "semantic_maintenance_v5_audit_revision"
 _SEMANTIC_MAINTENANCE_REPAIR_MODE_SCHEMA_VERSION = "semantic_maintenance_v6_repair_mode"
+_SEMANTIC_MAINTENANCE_ERASURE_REDACTION_SCHEMA_VERSION = (
+    "semantic_maintenance_v7_erasure_redaction"
+)
 _SEMANTIC_ASSERTION_LOCK_DOMAIN = b"kestrel:semantic-assertion-schema:v1\0"
 
 
@@ -817,6 +820,68 @@ async def migrate_semantic_maintenance(db: "AsyncDatabase") -> None:
             await db.execute(
                 "INSERT INTO semantic_schema_migrations (version) VALUES (?)",
                 (_SEMANTIC_MAINTENANCE_REPAIR_MODE_SCHEMA_VERSION,),
+            )
+
+        erasure_redaction_migration = await db.fetchone(
+            "SELECT 1 FROM semantic_schema_migrations WHERE version = ?",
+            (_SEMANTIC_MAINTENANCE_ERASURE_REDACTION_SCHEMA_VERSION,),
+        )
+        if erasure_redaction_migration is None:
+            # Earlier maintenance releases retained assertion/revision IDs in
+            # report JSON and resumable cursor columns.  A completed erasure
+            # deliberately leaves only opaque receipts, so an upgrade cannot
+            # identify every prior target without recreating the privacy leak.
+            # Invalidate the rebuildable maintenance layer only for tenants
+            # with a retained opaque erasure event.  The next bounded worker
+            # replays from generation zero and receives that event before it
+            # can claim a fresh checkpoint; tenants with no erasure keep
+            # their unrelated reports and state intact.
+            affected_tenants = await db.fetchall(
+                "SELECT DISTINCT tenant_id FROM semantic_projection_erasure_outbox",
+                (),
+            )
+            tenant_ids = tuple(str(row[0]) for row in affected_tenants)
+            if tenant_ids:
+                for tenant_id in tenant_ids:
+                    # Maintenance writes renew this lease before locking the
+                    # canonical tenant.  Replacing it first fences a worker
+                    # that started before the upgrade from recreating a
+                    # redacted report after this transaction commits.
+                    await db.execute(
+                        "INSERT INTO semantic_maintenance_leases "
+                        "(tenant_id, holder_id, fencing_token, expires_at, updated_at) "
+                        "VALUES (?, 'schema-erasure-redaction', 1, 0, ?) "
+                        "ON CONFLICT(tenant_id) DO UPDATE SET "
+                        "holder_id = excluded.holder_id, "
+                        "fencing_token = semantic_maintenance_leases.fencing_token + 1, "
+                        "expires_at = excluded.expires_at, "
+                        "updated_at = excluded.updated_at",
+                        (tenant_id, _now()),
+                    )
+                placeholders = ", ".join("?" for _ in tenant_ids)
+                await db.execute(
+                    "DELETE FROM semantic_maintenance_reports WHERE tenant_id IN ("
+                    + placeholders
+                    + ")",
+                    tenant_ids,
+                )
+                await db.execute(
+                    "UPDATE semantic_maintenance_state SET "
+                    "checkpoint_generation = 0, checkpoint_event_id = NULL, "
+                    "status = 'partial', repair_cursor_revision_id = NULL, "
+                    "repair_active = 0, repair_mode = NULL, repair_scan_complete = 0, "
+                    "repair_checkpoint_generation = NULL, repair_checkpoint_event_id = NULL, "
+                    "repair_reconcile_cursor_derivation_id = NULL, audit_assertion_id = NULL, "
+                    "audit_assertion_revision_id = NULL, "
+                    "audit_competitor_cursor_revision_id = NULL, updated_at = ? "
+                    "WHERE tenant_id IN ("
+                    + placeholders
+                    + ")",
+                    (_now(), *tenant_ids),
+                )
+            await db.execute(
+                "INSERT INTO semantic_schema_migrations (version) VALUES (?)",
+                (_SEMANTIC_MAINTENANCE_ERASURE_REDACTION_SCHEMA_VERSION,),
             )
 
 
