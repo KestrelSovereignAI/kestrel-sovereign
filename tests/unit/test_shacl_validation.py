@@ -280,6 +280,53 @@ def test_core_logical_qualified_property_and_compound_path_fixtures() -> None:
     assert report.findings == ()
 
 
+def test_qualified_value_shapes_disjoint_changes_the_qualified_count() -> None:
+    """Derived SHACL Core fixture for the sibling qualified-shape rule."""
+    shapes = """
+    @prefix ex: <https://example.test/> .
+    @prefix sh: <http://www.w3.org/ns/shacl#> .
+
+    ex:QualifiedGroups a sh:NodeShape ; sh:targetNode ex:subject ;
+      sh:property [
+        sh:path ex:tag ;
+        sh:qualifiedValueShape [ sh:class ex:Primary ] ;
+        sh:qualifiedValueShapesDisjoint true ;
+        sh:qualifiedMinCount 1
+      ] ;
+      sh:property [
+        sh:path ex:tag ;
+        sh:qualifiedValueShape [ sh:class ex:Secondary ] ;
+        sh:qualifiedMinCount 1
+      ] .
+    """
+    graph = Graph()
+    graph.add((EX.subject, EX.tag, EX.overlap))
+    graph.add((EX.overlap, RDF.type, EX.Primary))
+    graph.add((EX.overlap, RDF.type, EX.Secondary))
+
+    report = _validate(shapes, graph)
+
+    assert report.state is ValidationState.NONCONFORMANT
+    assert [finding.code for finding in report.findings] == ["qualified_min_count"]
+
+
+def test_deactivated_property_shapes_never_evaluate_their_path() -> None:
+    shapes = """
+    @prefix ex: <https://example.test/> .
+    @prefix sh: <http://www.w3.org/ns/shacl#> .
+
+    ex:Nested a sh:NodeShape ; sh:targetNode ex:subject ;
+      sh:property [ sh:deactivated true ] .
+    ex:TopLevel a sh:PropertyShape ; sh:targetNode ex:subject ;
+      sh:deactivated true .
+    """
+
+    report = _validate(shapes, Graph())
+
+    assert report.state is ValidationState.CONFORMS
+    assert report.findings == ()
+
+
 def test_incremental_focus_uses_full_graph_and_matches_full_audit_for_changed_node() -> None:
     graph = _person_graph()
     graph.add((EX.ben, RDF.type, EX.Person))
@@ -411,6 +458,37 @@ async def test_reports_are_versioned_persisted_and_tenant_scoped() -> None:
 
 
 @pytest.mark.asyncio
+async def test_public_storage_ingestion_cannot_bypass_its_accepted_validation_report() -> None:
+    storage = AsyncStorage(
+        ":memory:",
+        agent_id="did:example:tenant",
+        _assertion_tenant_capability=_issue_assertion_tenant_capability("did:example:tenant"),
+    )
+    await storage.initialize()
+    try:
+        assertion = _candidate_assertion("public-governed-ingestion")
+
+        result = await storage.put_assertion(
+            assertion,
+            source_occurrences=(_candidate_source(),),
+        )
+
+        assert result.accepted is True
+        assert result.report.conforms is True
+        assert result.write is not None
+        assert await storage.semantic_validation_service().reports.list(
+            assertion_id=assertion.assertion_id
+        ) == [result.report]
+        with pytest.raises(AssertionStoreError, match="migration-only capability"):
+            await storage._assertion_store().put_assertion(
+                _candidate_assertion("raw-bypass-attempt"),
+                source_occurrences=(_candidate_source(),),
+            )
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_accepted_assertion_and_validation_report_commit_or_roll_back_together(monkeypatch) -> None:
     storage = AsyncStorage(
         ":memory:",
@@ -503,35 +581,31 @@ async def test_revalidation_retries_on_cas_conflict_without_quarantining_a_newer
             storage._assertion_store(),
             validator=GovernedShaclValidationService(_registry(_REJECT_CURRENT_REVISION_SHAPES)),
         )
-        quarantine = storage._assertion_store().quarantine_for_validation
+        repair = storage._assertion_store().persist_validation_report_and_quarantine
         attempted_revisions: list[str] = []
 
-        async def supersede_before_first_cas(
+        async def supersede_before_first_repair(
             _store,
-            assertion_id,
-            expected_revision_id,
+            report,
             *,
-            report_id,
-            operation_id=None,
+            expected_revisions,
         ):
-            attempted_revisions.append(expected_revision_id)
+            attempted_revisions.append(expected_revisions[original.assertion_id])
             if len(attempted_revisions) == 1:
                 await storage.supersede_assertion(
                     original.revision_id,
                     replacement,
                     source_occurrences=(source,),
                 )
-            return await quarantine(
-                assertion_id,
-                expected_revision_id,
-                report_id=report_id,
-                operation_id=operation_id,
+            return await repair(
+                report,
+                expected_revisions=expected_revisions,
             )
 
         monkeypatch.setattr(
             AsyncAssertionStore,
-            "quarantine_for_validation",
-            supersede_before_first_cas,
+            "persist_validation_report_and_quarantine",
+            supersede_before_first_repair,
         )
         report = await service.validate_current(
             shape_set=ShapeSetReference("test-shapes", "1.0.0"),
@@ -545,6 +619,49 @@ async def test_revalidation_retries_on_cas_conflict_without_quarantining_a_newer
         revisions = await storage.list_assertion_revisions(original.assertion_id)
         assert revisions[-1].status.value == "quarantined"
         assert revisions[-1].supersedes_revision_id is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_quarantine_report_and_every_lifecycle_transition_roll_back_together(monkeypatch) -> None:
+    storage = AsyncStorage(
+        ":memory:",
+        agent_id="did:example:tenant",
+        _assertion_tenant_capability=_issue_assertion_tenant_capability("did:example:tenant"),
+    )
+    await storage.initialize()
+    try:
+        assertion = _candidate_assertion("atomic-quarantine-revision")
+        await storage.put_assertion(assertion, source_occurrences=(_candidate_source(),))
+        service = GovernedSemanticValidationService(
+            storage._assertion_store(),
+            validator=GovernedShaclValidationService(_registry(_REJECT_CURRENT_REVISION_SHAPES)),
+        )
+        report_count = await storage.db.fetchval(
+            "SELECT COUNT(*) FROM semantic_validation_reports"
+        )
+        write_revision = AsyncAssertionStore._write_revision
+
+        async def fail_quarantine_state(_store, candidate, sources):
+            if candidate.status.value == "quarantined":
+                raise AssertionStoreError("forced lifecycle repair failure")
+            return await write_revision(_store, candidate, sources)
+
+        monkeypatch.setattr(AsyncAssertionStore, "_write_revision", fail_quarantine_state)
+        with pytest.raises(AssertionStoreError, match="forced lifecycle repair failure"):
+            await service.validate_current(
+                shape_set=ShapeSetReference("test-shapes", "1.0.0"),
+                validation_capability="validation-profile:test-core",
+            )
+
+        assert await storage.get_assertion(assertion.assertion_id) == assertion
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM semantic_validation_reports"
+        ) == report_count
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM semantic_projection_outbox"
+        ) == 1
     finally:
         await storage.close()
 
@@ -759,7 +876,8 @@ async def test_shared_shacl_focus_quarantines_every_affected_assertion(increment
         }
         assert await storage.get_assertion(first.assertion_id) is None
         assert await storage.get_assertion(second.assertion_id) is None
-        assert await service.reports.list(assertion_id=second.assertion_id) == [report]
+        reports = await service.reports.list(assertion_id=second.assertion_id)
+        assert report in reports
     finally:
         await storage.close()
 

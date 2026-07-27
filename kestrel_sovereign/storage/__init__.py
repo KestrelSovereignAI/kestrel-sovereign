@@ -45,6 +45,7 @@ from .async_assertion_store import (
     SemanticAssertionStore,
     SupersessionResult,
     TenantIsolationError,
+    ValidationQuarantineBatchResult,
     ValidationQuarantineResult,
 )
 from .async_rag_store import AsyncRAGStore
@@ -141,6 +142,7 @@ __all__ = [
     "SemanticAssertionStore",
     "SupersessionResult",
     "TenantIsolationError",
+    "ValidationQuarantineBatchResult",
     "ValidationQuarantineResult",
     "SemanticValidationStoreError",
     # Privacy

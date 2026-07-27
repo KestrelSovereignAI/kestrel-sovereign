@@ -292,6 +292,9 @@ async def test_supersession_is_atomic_and_exposes_invalidation_data() -> None:
             source_occurrences=(source("replacement-source"),), operation_id="replace-region",
         )
 
+        assert result.accepted is True
+        assert result.report.conforms is True
+        assert result.write is not None
         assert result.predecessor.status.value == "superseded"
         assert result.replacement.supersedes_revision_id == result.predecessor.revision_id
         assert result.invalidated_revision_ids == (first.revision_id,)
@@ -354,28 +357,22 @@ async def test_retraction_and_erasure_cascade_to_derived_and_eligibility() -> No
 
 
 @pytest.mark.asyncio
-async def test_validation_quarantine_uses_change_metadata_and_invalidates_derived_consumers() -> None:
+async def test_direct_validation_quarantine_is_refused_outside_the_governed_repair_path() -> None:
     storage = await _storage()
     try:
         root = direct("validation-root")
         await storage.put_assertion(root, source_occurrences=(source("source-1"),))
         child = derived("validation-child", root.revision_id)
         await storage.put_assertion(child)
-        checkpoint = await storage.assertion_checkpoint()
+        with pytest.raises(RuntimeError, match="Direct validation quarantine is unavailable"):
+            await storage.quarantine_assertion_for_validation(
+                root.assertion_id,
+                root.revision_id,
+                report_id="validation-report-1",
+            )
 
-        quarantined = await storage.quarantine_assertion_for_validation(
-            root.assertion_id,
-            root.revision_id,
-            report_id="validation-report-1",
-        )
-
-        assert quarantined.quarantined.status is AssertionStatus.QUARANTINED
-        assert quarantined.invalidated_revision_ids == (root.revision_id, child.revision_id)
-        assert await storage.get_assertion(root.assertion_id) is None
-        assert await storage.get_assertion(child.assertion_id) is None
-        changes = await storage.assertion_changes_since(checkpoint.generation)
-        assert [change.operation for change in changes] == ["validation_quarantined", "retracted"]
-        assert all(change.eligible is False for change in changes)
+        assert await storage.get_assertion(root.assertion_id) == root
+        assert await storage.get_assertion(child.assertion_id) == child
     finally:
         await storage.close()
 

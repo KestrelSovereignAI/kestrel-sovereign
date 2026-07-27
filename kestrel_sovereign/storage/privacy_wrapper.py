@@ -2445,11 +2445,10 @@ class PrivacyEnforcingStorage:
     async def put_assertion(self, assertion, *, source_occurrences=(), operation_id=None):
         """Govern normal assertion ingestion through the SHACL write boundary.
 
-        Raw ``AsyncStorage.put_assertion`` remains deliberately available only
-        on an explicitly selected raw storage authority for migrations and
-        tightly controlled lifecycle/control-plane work.  Agent-facing
-        privacy storage never forwards an ordinary ingestion call around its
-        required validation report.
+        ``AsyncStorage.put_assertion`` is governed too.  Private raw mutation
+        capabilities exist only for tightly controlled migrations, so an
+        agent-facing privacy storage cannot forward ordinary ingestion around
+        its required validation report.
         """
         return await self.put_validated_assertion(
             assertion,

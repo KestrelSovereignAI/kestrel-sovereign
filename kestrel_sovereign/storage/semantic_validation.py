@@ -3,7 +3,8 @@
 The report repository shares the canonical assertion database and is scoped by
 an already-authenticated assertion store.  It is not a writable validation
 database, and it never updates projection eligibility itself: failed
-revalidation goes through ``quarantine_for_validation()``, which emits the
+revalidation goes through the assertion store's atomic
+``persist_validation_report_and_quarantine()`` transition, which emits the
 canonical change metadata consumed by downstream projections.
 """
 
@@ -34,6 +35,7 @@ from .async_assertion_store import (
     AssertionWriteResult,
     AsyncAssertionStore,
     SupersessionResult,
+    TenantIsolationError,
 )
 
 
@@ -60,6 +62,31 @@ class GovernedAssertionWriteResult:
     def accepted(self) -> bool:
         return self.write is not None
 
+    # These compatibility accessors let legacy callers that only consumed an
+    # accepted receipt migrate without discarding the now-required report.  A
+    # rejected decision has no receipt and therefore cannot masquerade as one.
+    @property
+    def assertion(self) -> Assertion:
+        if self.write is None:
+            raise SemanticValidationStoreError("rejected governed write has no assertion receipt")
+        return self.write.assertion
+
+    @property
+    def generation(self) -> int:
+        if self.write is None:
+            raise SemanticValidationStoreError("rejected governed write has no generation receipt")
+        return self.write.generation
+
+    @property
+    def event_id(self) -> str:
+        if self.write is None:
+            raise SemanticValidationStoreError("rejected governed write has no event receipt")
+        return self.write.event_id
+
+    @property
+    def idempotent(self) -> bool:
+        return self.write.idempotent if self.write is not None else False
+
 
 @dataclass(frozen=True, slots=True)
 class GovernedAssertionSupersessionResult:
@@ -71,6 +98,40 @@ class GovernedAssertionSupersessionResult:
     @property
     def accepted(self) -> bool:
         return self.write is not None
+
+    @property
+    def predecessor(self) -> Assertion:
+        if self.write is None:
+            raise SemanticValidationStoreError("rejected governed supersession has no receipt")
+        return self.write.predecessor
+
+    @property
+    def replacement(self) -> Assertion:
+        if self.write is None:
+            raise SemanticValidationStoreError("rejected governed supersession has no receipt")
+        return self.write.replacement
+
+    @property
+    def generation(self) -> int:
+        if self.write is None:
+            raise SemanticValidationStoreError("rejected governed supersession has no generation receipt")
+        return self.write.generation
+
+    @property
+    def event_ids(self) -> tuple[str, ...]:
+        if self.write is None:
+            raise SemanticValidationStoreError("rejected governed supersession has no event receipt")
+        return self.write.event_ids
+
+    @property
+    def invalidated_revision_ids(self) -> tuple[str, ...]:
+        if self.write is None:
+            raise SemanticValidationStoreError("rejected governed supersession has no receipt")
+        return self.write.invalidated_revision_ids
+
+    @property
+    def idempotent(self) -> bool:
+        return self.write.idempotent if self.write is not None else False
 
 
 class AsyncSemanticValidationReportStore:
@@ -219,14 +280,17 @@ class GovernedSemanticValidationService:
                 focus_assertion_ids=focus_map,
                 limits=limits,
             )
-            await self._reports.persist(report)
             if report.action is not ValidationWriteAction.QUARANTINE:
+                await self._reports.persist(report)
                 return report
             snapshot_revisions = {
                 assertion.assertion_id: assertion.revision_id for assertion in assertions
             }
             try:
-                await self._quarantine_failed_current_assertions(report, snapshot_revisions)
+                await self._persist_and_quarantine_failed_current_assertions(
+                    report,
+                    snapshot_revisions,
+                )
             except AssertionConflictError:
                 if attempt + 1 == max_quarantine_retries:
                     raise SemanticValidationStoreError(
@@ -263,7 +327,7 @@ class GovernedSemanticValidationService:
         if not isinstance(assertion, Assertion):
             raise SemanticValidationStoreError("governed assertion write requires a canonical Assertion")
         if assertion.tenant_id != self._assertions.tenant_id:
-            raise SemanticValidationStoreError("candidate assertion tenant does not match the bound tenant")
+            raise TenantIsolationError("candidate assertion tenant does not match the bound tenant")
         if type(max_commit_retries) is not int or not 1 <= max_commit_retries <= 10:
             raise SemanticValidationStoreError("max_commit_retries must be an integer in [1, 10]")
         replay = await self._assertions.replay_governed_initial_write(
@@ -359,7 +423,7 @@ class GovernedSemanticValidationService:
         if not isinstance(replacement, Assertion):
             raise SemanticValidationStoreError("governed supersession requires a canonical Assertion replacement")
         if replacement.tenant_id != self._assertions.tenant_id:
-            raise SemanticValidationStoreError("replacement assertion tenant does not match the bound tenant")
+            raise TenantIsolationError("replacement assertion tenant does not match the bound tenant")
         if type(max_commit_retries) is not int or not 1 <= max_commit_retries <= 10:
             raise SemanticValidationStoreError("max_commit_retries must be an integer in [1, 10]")
         replay = await self._assertions.replay_governed_supersession(
@@ -454,27 +518,18 @@ class GovernedSemanticValidationService:
             run_id=run_id,
         )
 
-    async def _quarantine_failed_current_assertions(
+    async def _persist_and_quarantine_failed_current_assertions(
         self,
         report: ShaclValidationReport,
         snapshot_revisions: Mapping[str, str],
     ) -> None:
-        targets = {
-            assertion_id
-            for finding in report.findings
-            for assertion_id in finding.affected_assertion_ids
-        }
-        if not targets:
-            targets.update(report.assertion_ids)
-        for assertion_id in sorted(targets):
-            expected_revision_id = snapshot_revisions.get(assertion_id)
-            if expected_revision_id is None:
-                continue
-            await self._assertions.quarantine_for_validation(
-                assertion_id,
-                expected_revision_id,
-                report_id=report.report_id,
-            )
+        await self._assertions.persist_validation_report_and_quarantine(
+            report,
+            # The assertion store derives report targets once, then requires a
+            # snapshot revision for every one.  Passing the complete snapshot
+            # lets an incomplete finding fail safe to report.assertion_ids.
+            expected_revisions=snapshot_revisions,
+        )
 
 
 def _canonical_validation_graph(

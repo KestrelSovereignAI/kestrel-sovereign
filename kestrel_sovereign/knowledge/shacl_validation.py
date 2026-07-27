@@ -712,7 +712,13 @@ class _ValidationContext:
             severity = _severity(self.shapes_graph.value(shape, SH.severity))
             self._validate_common_constraints(shape, focus, (focus,), severity, depth)
             for property_shape in self.shapes_graph.objects(shape, SH.property):
-                self.validate_property_shape(property_shape, focus, severity, depth + 1)
+                self.validate_property_shape(
+                    property_shape,
+                    focus,
+                    severity,
+                    depth + 1,
+                    parent_shape=shape,
+                )
         finally:
             self._active.remove(marker)
         return len(self.findings) == before
@@ -723,10 +729,18 @@ class _ValidationContext:
         focus: object,
         inherited_severity: ValidationSeverity,
         depth: int,
+        *,
+        parent_shape: object | None = None,
     ) -> bool:
         self.check_budget()
         if depth > self.limits.max_shape_depth:
             raise _ValidationIncomplete("shape_recursion_limit_exhausted")
+        # sh:deactivated applies to property shapes just as it applies to node
+        # shapes.  It must short-circuit before evaluating the path: a disabled
+        # shape is permitted to contain an otherwise malformed or unavailable
+        # path without affecting conformance.
+        if _boolean(self.shapes_graph.value(shape, SH.deactivated)):
+            return True
         path = self.shapes_graph.value(shape, SH.path)
         if path is None:
             raise ValueError("property shape has no path")
@@ -742,7 +756,15 @@ class _ValidationContext:
         )
         severity = _severity(self.shapes_graph.value(shape, SH.severity), inherited_severity)
         before = len(self.findings)
-        self._validate_common_constraints(shape, focus, values, severity, depth, path)
+        self._validate_common_constraints(
+            shape,
+            focus,
+            values,
+            severity,
+            depth,
+            path,
+            parent_shape=parent_shape,
+        )
         return len(self.findings) == before
 
     def _validate_common_constraints(
@@ -753,6 +775,8 @@ class _ValidationContext:
         severity: ValidationSeverity,
         depth: int,
         path: object | None = None,
+        *,
+        parent_shape: object | None = None,
     ) -> None:
         graph = self.shapes_graph
         count = len(values)
@@ -898,9 +922,36 @@ class _ValidationContext:
                     self.finding(severity, code, shape, focus, path)
         qualified_shape = graph.value(shape, SH.qualifiedValueShape)
         if qualified_shape is not None:
-            qualified_count = sum(
-                self._probe_node_shape(qualified_shape, value, depth=depth + 1) for value in values
-            )
+            qualified_values = {
+                value
+                for value in values
+                if self._probe_node_shape(qualified_shape, value, depth=depth + 1)
+            }
+            if (
+                _boolean(graph.value(shape, SH.qualifiedValueShapesDisjoint))
+                and parent_shape is not None
+            ):
+                # SHACL Core's disjoint qualified-values parameter excludes a
+                # value from this property shape's qualified count when it
+                # also conforms to any *sibling* qualified value shape.  The
+                # predicate is not a standalone violation; it changes the
+                # count used by qualifiedMinCount/qualifiedMaxCount.
+                sibling_qualified_shapes = (
+                    graph.value(sibling, SH.qualifiedValueShape)
+                    for sibling in graph.objects(parent_shape, SH.property)
+                    if sibling != shape
+                )
+                for sibling_shape in sibling_qualified_shapes:
+                    if sibling_shape is None:
+                        continue
+                    qualified_values = {
+                        value
+                        for value in qualified_values
+                        if not self._probe_node_shape(
+                            sibling_shape, value, depth=depth + 1
+                        )
+                    }
+            qualified_count = len(qualified_values)
             minimum = _integer(graph.value(shape, SH.qualifiedMinCount))
             maximum = _integer(graph.value(shape, SH.qualifiedMaxCount))
             if minimum is not None and qualified_count < minimum:

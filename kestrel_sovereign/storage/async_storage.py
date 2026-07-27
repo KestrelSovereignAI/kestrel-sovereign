@@ -967,10 +967,18 @@ class AsyncStorage:
         return self._assertions
 
     async def put_assertion(self, assertion, *, source_occurrences=(), operation_id: Optional[str] = None):
+        """Govern canonical ingestion and return its required SHACL report.
+
+        A public agent-bound storage facade is an ingestion boundary, not a
+        migration authority.  It therefore cannot create an active canonical
+        assertion without the accepted report committed beside it.
+        """
         if not self._initialized:
             await self.initialize()
-        return await self._assertion_store().put_assertion(
-            assertion, source_occurrences=source_occurrences, operation_id=operation_id,
+        return await self.semantic_validation_service().put_assertion(
+            assertion,
+            source_occurrences=source_occurrences,
+            operation_id=operation_id,
         )
 
     async def get_assertion(self, assertion_id: str, *, include_inactive: bool = False):
@@ -1009,11 +1017,14 @@ class AsyncStorage:
         return await self._assertion_store().derivation_inputs(revision_id)
 
     async def supersede_assertion(self, expected_predecessor_revision_id: str, replacement, *, source_occurrences=(), operation_id: Optional[str] = None):
+        """Govern canonical supersession and return its required SHACL report."""
         if not self._initialized:
             await self.initialize()
-        return await self._assertion_store().supersede(
-            expected_predecessor_revision_id, replacement,
-            source_occurrences=source_occurrences, operation_id=operation_id,
+        return await self.semantic_validation_service().supersede_assertion(
+            expected_predecessor_revision_id,
+            replacement,
+            source_occurrences=source_occurrences,
+            operation_id=operation_id,
         )
 
     async def retract_assertion(self, assertion_id: str, expected_revision_id: str, *, operation_id: Optional[str] = None):
@@ -1038,14 +1049,11 @@ class AsyncStorage:
         report_id: str,
         operation_id: Optional[str] = None,
     ):
-        """Apply a validation failure through canonical lifecycle metadata."""
-        if not self._initialized:
-            await self.initialize()
-        return await self._assertion_store().quarantine_for_validation(
-            assertion_id,
-            expected_revision_id,
-            report_id=report_id,
-            operation_id=operation_id,
+        """Refuse partial validation repair outside the governed audit path."""
+        raise RuntimeError(
+            "Direct validation quarantine is unavailable; use "
+            "semantic_validation_service().validate_current() or "
+            "full_audit_and_repair() so the report and every repair commit atomically"
         )
 
     async def erase_assertion(self, assertion_id: str, *, operation_id: Optional[str] = None):
@@ -1076,10 +1084,9 @@ class AsyncStorage:
     async def put_validated_assertion(self, assertion, *, source_occurrences=(), **validation_options):
         """Validate a full tentative post-state before a canonical assertion write.
 
-        Low-level ``put_assertion`` remains the storage primitive used by
-        migrations and controlled lifecycle tests.  New governed callers use
-        this explicit service entry point so a reject/quarantine disposition
-        has no canonical write side effect.
+        This named entry point is equivalent to :meth:`put_assertion`; both
+        public ingestion surfaces are governed so callers cannot select an
+        unvalidated shortcut.
         """
         if not self._initialized:
             await self.initialize()
@@ -1099,9 +1106,9 @@ class AsyncStorage:
     ):
         """Validate and atomically commit a canonical assertion replacement.
 
-        The raw ``supersede_assertion`` primitive remains for controlled
-        lifecycle work. Agent-facing callers must use this boundary so a
-        replacement cannot become eligible without its SHACL report.
+        This named entry point is equivalent to :meth:`supersede_assertion`;
+        no public replacement surface can make data eligible without its SHACL
+        report.
         """
         if not self._initialized:
             await self.initialize()
