@@ -79,6 +79,56 @@ async def test_count_tokens_uses_real_endpoint():
     assert sent["messages"]
 
 
+@pytest.mark.asyncio
+async def test_claude_max_lists_models_with_oauth_route_client():
+    adapter = ClaudeMaxAdapter()
+    token_manager = MagicMock()
+    token_manager.access_token = AsyncMock(return_value="refreshed-oauth-token")
+    adapter._oauth_token_manager = token_manager
+    client = MagicMock()
+    client.auth_token = "expired-oauth-token"
+    client.api_key = None
+
+    async def list_models_after_refresh():
+        assert client.auth_token == "refreshed-oauth-token"
+        assert client.api_key is None
+        return MagicMock(data=[
+            MagicMock(
+                id="claude-haiku-4-5-20251001",
+                display_name="Claude Haiku 4.5",
+                created_at="2025-10-01T00:00:00Z",
+                max_input_tokens=200_000,
+            ),
+            MagicMock(
+                id="claude-opus-5",
+                display_name="Claude Opus 5",
+                created_at="2026-07-01T00:00:00Z",
+                max_input_tokens=1_000_000,
+            ),
+        ])
+
+    client.models.list = AsyncMock(side_effect=list_models_after_refresh)
+
+    models = await adapter.list_models(client)
+
+    token_manager.access_token.assert_awaited_once_with()
+    client.models.list.assert_awaited_once_with()
+    assert client.auth_token == "refreshed-oauth-token"
+    assert client.api_key is None
+    assert [model.id for model in models] == [
+        "claude-haiku-4-5-20251001",
+        "claude-opus-5",
+    ]
+    assert models[1].provider == "anthropic"
+    assert models[1].context_limit == 1_000_000
+
+
+@pytest.mark.asyncio
+async def test_claude_max_model_discovery_requires_route_client():
+    with pytest.raises(ValueError, match="requires its Anthropic client"):
+        await ClaudeMaxAdapter().list_models()
+
+
 def test_apply_request_options_default_no_op():
     adapter = AnthropicAdapter()
     kwargs = {"max_tokens": 1024}
