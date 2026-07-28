@@ -11,11 +11,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
 import subprocess
+import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -3041,3 +3044,401 @@ async def test_repeated_sweeps_emit_exactly_one_completion_wake(tmp_path):
 
     assert len(agent.process_input_calls) == 1
     assert (await get_request(backend, req.id)).wake_delivered is True
+
+
+# ---------------------------------------------------------------------------
+# #2667 — a dispatched restart that never happens must not vanish silently
+# ---------------------------------------------------------------------------
+
+
+def _dead_child(tmp_path, returncode=1, stderr="kestrel: no such command\n"):
+    """A restart subprocess that exited instead of restarting the host.
+
+    Carries a real stderr FILE, matching production: the child must outlive
+    this process, so its stderr cannot be a pipe whose read end dies with us.
+    """
+    err_path = tmp_path / "restart.err"
+    err_path.write_text(stderr)
+
+    class _Dead:
+        pid = 4242
+
+        def __init__(self):
+            self.returncode = returncode
+            self._kestrel_stderr_path = str(err_path)
+
+        def poll(self):
+            return returncode
+
+    return _Dead()
+
+
+class _LiveChild:
+    """A restart subprocess still running — the healthy case."""
+
+    pid = 4243
+    returncode = None
+
+    def poll(self):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_dead_restart_child_returns_the_row_for_retry(tmp_path):
+    """``Popen`` returning is not evidence the restart happened. A child that
+    exits without restarting the host left the row ``executing`` forever with
+    no error event and no notice to anyone (#2667).
+    """
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+    feat._restart_dispatch_grace = 0
+    created = await feat.request_restart(reason="ship")
+    req_id = created.data["request"]["id"]
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+        return_value=_dead_child(tmp_path),
+    ):
+        await feat.restart_coordinator()
+    await agent.drain_background_tasks()
+
+    row = await get_request(backend, req_id)
+    assert row.status == "pending", "a failed dispatch must not stay executing"
+    # The reason names the exit status AND the child's own complaint, which
+    # used to go to DEVNULL.
+    assert "exited 1" in row.status_reason
+    assert "no such command" in row.status_reason
+
+
+@pytest.mark.asyncio
+async def test_live_restart_child_leaves_the_row_executing(tmp_path):
+    """The watchdog must RUN and decline to act on a restart still in flight.
+
+    Asserting only "the row is still executing" would be toothless: with no
+    watchdog at all the row stays executing for exactly that reason, so the
+    test passes with and without the fix. It must show the watchdog was
+    consulted and returned no failure.
+    """
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+    feat._restart_dispatch_grace = 0
+    created = await feat.request_restart(reason="ship")
+    req_id = created.data["request"]["id"]
+
+    consulted = []
+    real_check = feat._restart_dispatch_failure
+
+    def _spy(proc):
+        verdict = real_check(proc)
+        consulted.append(verdict)
+        return verdict
+
+    feat._restart_dispatch_failure = _spy
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+        return_value=_LiveChild(),
+    ):
+        await feat.restart_coordinator()
+    await agent.drain_background_tasks()
+
+    assert consulted, "the watchdog never ran"
+    assert all(v is None for v in consulted), (
+        f"a live child must not be judged a failure; got {consulted}"
+    )
+    row = await get_request(backend, req_id)
+    assert row.status == "executing"
+    # Still tracked as in flight, so the reconciler leaves it alone too.
+    assert req_id in feat._executing_since
+
+
+@pytest.mark.asyncio
+async def test_unverifiable_child_is_not_claimed_as_a_failure(tmp_path):
+    """A handle that cannot report an integer exit status is not evidence of
+    anything. Concluding failure from it would bounce live restarts."""
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+    assert feat._restart_dispatch_failure(MagicMock()) is None
+
+
+@pytest.mark.asyncio
+async def test_stranded_executing_row_is_recovered_by_the_sweep(tmp_path):
+    """The durable backstop. Before this, the coordinator scanned only
+    pending/approved and ``cancel_restart_request`` refused executing rows, so
+    a row whose restart never happened had NO path back — and the next
+    unrelated restart would terminalize it as 'completed', reporting success
+    for a restart that never ran (#2667).
+    """
+    from kestrel_sovereign.features.restart_coordinator.feature import (
+        _PROCESS_BOOT_ID,
+    )
+
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="stranded",
+    )
+    await update_status(
+        backend, req.id, status="executing",
+        expected_current_status="pending",
+        executing_boot_id=_PROCESS_BOOT_ID,
+    )
+    # Stamped by this process but with no dispatch in flight — nothing is
+    # waiting on it and nothing else will ever move it.
+    assert req.id not in feat._executing_since
+    # This instance has been up past the grace window, so an untracked row is
+    # genuinely orphaned rather than one a previous instance just started.
+    from kestrel_sovereign.features.restart_coordinator.feature import (
+        STALE_EXECUTING_SECONDS,
+    )
+
+    feat._instance_started_at -= STALE_EXECUTING_SECONDS + 1
+
+    reset = await feat._reconcile_stranded_executing_rows()
+    assert reset == [req.id]
+    row = await get_request(backend, req.id)
+    assert row.status == "pending"
+    assert "did not happen" in row.status_reason
+
+
+@pytest.mark.asyncio
+async def test_reconciler_leaves_a_prior_boot_row_for_the_wake_sweep(tmp_path):
+    """A row stamped by a PRIOR boot means the restart provably happened — it
+    belongs to the post-restart wake sweep, not to stranded-row recovery."""
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="prior boot",
+    )
+    await update_status(
+        backend, req.id, status="executing",
+        expected_current_status="pending",
+        executing_boot_id="a-different-boot",
+    )
+
+    assert await feat._reconcile_stranded_executing_rows() == []
+    row = await get_request(backend, req.id)
+    assert row.status == "executing"
+
+
+@pytest.mark.asyncio
+async def test_reconciler_leaves_an_in_flight_dispatch_alone(tmp_path):
+    """A dispatch this process started moments ago is in flight, not stuck."""
+    from kestrel_sovereign.features.restart_coordinator.feature import (
+        _PROCESS_BOOT_ID,
+    )
+
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="in flight",
+    )
+    await update_status(
+        backend, req.id, status="executing",
+        expected_current_status="pending",
+        executing_boot_id=_PROCESS_BOOT_ID,
+    )
+    feat._executing_since[req.id] = time.monotonic()
+
+    assert await feat._reconcile_stranded_executing_rows() == []
+    assert (await get_request(backend, req.id)).status == "executing"
+
+
+@pytest.mark.asyncio
+async def test_restart_child_stderr_is_a_file_not_a_pipe(tmp_path):
+    """The restart child must OUTLIVE this process, so its stderr cannot be a
+    pipe: the read end dies with us, and the child would take EPIPE on its next
+    write — breaking the very restart we are performing. A chatty child would
+    also block forever on a full pipe buffer nobody is reading.
+
+    Exercises the real spawn path, not a double.
+    """
+    feat, _agent = await _make_feature(tmp_path)
+    with patch(
+        "kestrel_sovereign.features.restart_coordinator.feature.shutil.which",
+        return_value="/bin/echo",
+    ):
+        proc = feat._spawn_restart_subprocess()
+    try:
+        assert proc.stderr is None, (
+            "stderr must not be a pipe — it dies with this process"
+        )
+        # The assertion above is equally true of the old DEVNULL, so it alone
+        # proves nothing. THIS is the discriminator: a real file on disk that
+        # survives us and that the child can write to without blocking.
+        path = proc._kestrel_stderr_path
+        assert os.path.exists(path), "stderr must go to a real file"
+    finally:
+        proc.wait(timeout=10)
+        feat._read_restart_stderr_tail(proc)
+
+    # The tail read cleans the file up rather than leaking one per restart.
+    assert not os.path.exists(path)
+
+
+@pytest.mark.asyncio
+async def test_dead_child_stderr_tail_is_read_and_cleaned_up(tmp_path):
+    """The child's last line is the only evidence of why a dispatch failed,
+    and reading it must not leave a file behind on every failure."""
+    feat, _agent = await _make_feature(tmp_path)
+    err = tmp_path / "boom.err"
+    err.write_text("first line\nkestrel: boom\n")
+
+    class _Dead:
+        pid = 99
+        _kestrel_stderr_path = str(err)
+
+        def poll(self):
+            return 7
+
+    proc = _Dead()
+    reason = feat._restart_dispatch_failure(proc)
+    assert "exited 7" in reason
+    assert "kestrel: boom" in reason
+    assert not err.exists(), "the stderr file must not be left behind"
+
+
+@pytest.mark.asyncio
+async def test_boot_sweeps_stderr_files_orphaned_by_successful_restarts(
+    tmp_path, monkeypatch,
+):
+    """A SUCCESSFUL restart kills this process before it can clean up its
+    child's stderr file, so those are orphaned by definition. Boot is the only
+    place that can collect them; without this it is one file per restart,
+    forever. A recent file must survive — it may belong to a live dispatch.
+    """
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    old = tmp_path / "kestrel-restart-old.err"
+    new = tmp_path / "kestrel-restart-new.err"
+    unrelated = tmp_path / "something-else.err"
+    for p in (old, new, unrelated):
+        p.write_text("x")
+    os.utime(old, (0, 0))
+    os.utime(unrelated, (0, 0))
+
+    removed = RestartCoordinatorFeature._sweep_orphaned_restart_stderr()
+
+    assert removed == 1
+    assert not old.exists()
+    assert new.exists(), "a recent file may belong to a dispatch in flight"
+    assert unrelated.exists(), "the sweep must not touch unrelated files"
+
+
+@pytest.mark.asyncio
+async def test_reconciler_cannot_reset_a_dispatch_mid_transition(tmp_path):
+    """TOCTOU guard, probing the actual window.
+
+    ``update_status`` awaits. If the in-flight record is written AFTER it
+    returns, there is a window where the row is durably ``executing`` under
+    this boot id with NO entry in ``_executing_since`` — and the reconciler
+    treats exactly that as an orphan. A cron tick landing there resets a
+    dispatch that is very much alive.
+
+    This runs the reconciler INSIDE that window (from within update_status,
+    immediately after the executing row commits) rather than after the fact,
+    which is the only placement that can tell the two orderings apart.
+    """
+    from kestrel_sovereign.features.restart_coordinator import feature as fm
+
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+    feat._restart_dispatch_grace = 0
+    created = await feat.request_restart(reason="ship")
+    req_id = created.data["request"]["id"]
+
+    real_update_status = fm.update_status
+    fired = {"count": 0}
+
+    async def _reconcile_inside_the_window(db, request_id, **kwargs):
+        landed = await real_update_status(db, request_id, **kwargs)
+        if kwargs.get("status") == "executing" and landed:
+            # A concurrent cron tick, arriving at the worst possible moment.
+            fired["count"] += 1
+            await feat._reconcile_stranded_executing_rows()
+        return landed
+
+    fm.update_status = _reconcile_inside_the_window
+    try:
+        with patch.object(
+            RestartCoordinatorFeature, "_spawn_restart_subprocess",
+            return_value=_LiveChild(),
+        ):
+            await feat.restart_coordinator()
+        await agent.drain_background_tasks()
+    finally:
+        fm.update_status = real_update_status
+
+    assert fired["count"] == 1, "the window was never exercised"
+    row = await get_request(backend, req_id)
+    assert row.status == "executing", (
+        "a concurrent reconciler reset a dispatch that was still in flight"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_instance_does_not_orphan_a_previous_ones_dispatch(
+    tmp_path,
+):
+    """The boot id is module-scoped but ``_executing_since`` is per-INSTANCE.
+    A feature reload inside the same process therefore starts with an empty
+    map, and the untracked-row branch does no age check of its own — so
+    without a guard it would reset a dispatch the previous instance started
+    moments ago, on the first tick.
+    """
+    from kestrel_sovereign.features.restart_coordinator.feature import (
+        _PROCESS_BOOT_ID,
+    )
+
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="in flight",
+    )
+    await update_status(
+        backend, req.id, status="executing",
+        expected_current_status="pending",
+        executing_boot_id=_PROCESS_BOOT_ID,
+    )
+
+    # Simulate the reload: same process, brand-new feature instance.
+    reloaded = RestartCoordinatorFeature(agent)
+    await reloaded.initialize()
+    assert req.id not in reloaded._executing_since
+
+    assert await reloaded._reconcile_stranded_executing_rows() == [], (
+        "a just-reloaded instance must not orphan a live dispatch"
+    )
+    assert (await get_request(backend, req.id)).status == "executing"
+
+
+@pytest.mark.asyncio
+async def test_repeated_dispatch_failures_stop_rather_than_flap(tmp_path):
+    """Returning the row to `pending` means the next tick re-dispatches. For a
+    permanently broken restart that turns "stuck forever" into "flaps forever"
+    — a doomed subprocess every minute, each with its own status event. After
+    a few identical failures the request is rejected terminally instead.
+    """
+    from kestrel_sovereign.features.restart_coordinator.feature import (
+        MAX_RESTART_DISPATCH_ATTEMPTS,
+    )
+
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+    feat._restart_dispatch_grace = 0
+    created = await feat.request_restart(reason="ship")
+    req_id = created.data["request"]["id"]
+
+    for _ in range(MAX_RESTART_DISPATCH_ATTEMPTS):
+        with patch.object(
+            RestartCoordinatorFeature, "_spawn_restart_subprocess",
+            return_value=_dead_child(tmp_path),
+        ):
+            await feat.restart_coordinator()
+        await agent.drain_background_tasks()
+
+    row = await get_request(backend, req_id)
+    assert row.status == "rejected", (
+        f"expected a terminal reject after "
+        f"{MAX_RESTART_DISPATCH_ATTEMPTS} failures, got {row.status}"
+    )
+    assert "giving up" in row.status_reason
+    assert row.completed_at is not None
