@@ -333,12 +333,19 @@ async def test_inheritance_scenario():
 # QUESTION 7: Is this actually faster/better than cloud storage?
 # ============================================================================
 
+@pytest.mark.bench
 @pytest.mark.asyncio
 async def test_performance_vs_cloud():
     """
     QUESTION: Is this IPFS stuff actually practical? Or is it slow/expensive?
 
     ANSWER: For small data (agent conversations), it's FAST and CHEAP.
+
+    Marked 'bench' — this is a wall-clock throughput assertion, and the 200
+    conversation writes it does to set up the measurement cost ~33s, 4.5% of
+    the integration tier on their own. Timing thresholds are also the least
+    trustworthy thing to assert on a shared CI runner. Run it locally, or
+    with `-m bench`.
     """
     import time
 
