@@ -1481,34 +1481,53 @@ class AsyncDatabase:
                 (name,),
             )
 
-    async def _run_ownership_backfills_once(self, name: str) -> None:
-        """Run the #2649 ownership backfills exactly once, serialized.
+    @asynccontextmanager
+    async def migration_lock(self, name: str):
+        """Serialize a one-time migration across concurrent initializers.
 
         ``_init_schema`` runs on every ``from_pool()`` (frinz calls it per
-        request), so a post-upgrade request burst would otherwise have every
-        initializer observe no marker and run the heavy scans concurrently —
-        the lock contention/timeout this fix targets. Take a transaction-scoped
-        advisory lock (Postgres) so exactly one initializer performs the
-        migration while the rest wait, then re-check the marker under the lock
-        and skip. The whole migration + marker commit atomically, so an
-        interrupted upgrade leaves no marker and retries on the next boot.
-        SQLite needs no advisory lock — its single writer already serializes.
+        request), so without this a post-upgrade request burst has every
+        initializer observe the same un-migrated database and do the work
+        concurrently — the lock contention and statement timeouts #2649
+        targeted. Exactly one holder runs at a time for a given ``name``;
+        the rest wait and then find the work already done.
+
+        Two obligations on the caller, both load-bearing:
+
+        1. **Re-check your own gate after entering.** A concurrent initializer
+           may have finished while this one waited on the lock, so the check
+           that decided to enter is stale by the time the body runs.
+        2. **Do the whole migration inside the block.** It is one transaction,
+           so an interrupted upgrade rolls back every part of it and the next
+           boot retries from a consistent state. Work split across the
+           boundary can commit half — a schema change whose data backfill
+           never ran, which no later boot will notice is missing.
+
+        Postgres takes a transaction-scoped advisory lock keyed on ``name``.
+        SQLite begins the transaction IMMEDIATE: a deferred ``BEGIN`` that has
+        already read fails outright when it later tries to upgrade to the
+        writer slot, instead of waiting out ``busy_timeout`` and retrying.
         """
-        async with self.transaction():
-            if self.backend_type == "postgres":
+        if self.backend_type == "postgres":
+            async with self.transaction():
                 await self._backend.execute(
                     "SELECT pg_advisory_xact_lock(?)", (_backfill_lock_id(name),)
                 )
-            else:
-                # SQLite transactions BEGIN deferred, so two initializers could
-                # both read a missing marker and the second would raise
-                # "database is locked" when it upgrades mid-backfill. Promote to
-                # the single write slot with a no-op write BEFORE the marker
-                # read (busy_timeout makes the loser wait, then it skips) —
-                # mirroring the lexical-cleanup serialization.
-                await self._backend.execute(
-                    "DELETE FROM schema_backfills WHERE 0"
-                )
+                yield
+            return
+        if self.backend_type == "sqlite":
+            async with self._backend.transaction(immediate=True):  # type: ignore[call-arg]
+                yield
+            return
+        # No other backend ships with a concurrent initializer, so a plain
+        # transaction preserves the atomicity guarantee above; only the
+        # mutual exclusion is unavailable.
+        async with self.transaction():
+            yield
+
+    async def _run_ownership_backfills_once(self, name: str) -> None:
+        """Run the #2649 ownership backfills exactly once, serialized."""
+        async with self.migration_lock(name):
             # Double-checked: a concurrent initializer may have completed the
             # migration between the fast-path check and acquiring the lock.
             if await self._backfill_completed(name):
@@ -1549,9 +1568,22 @@ class AsyncDatabase:
     async def _column_exists(self, table: str, column: str) -> bool:
         """Verify a column exists on a table after a migration ran."""
         if self.backend_type == "postgres":
+            # Probe the relation the search path actually resolves — the same
+            # one ``ALTER TABLE`` and every unqualified read will hit — rather
+            # than a schema guessed by name. Both name-based forms are wrong
+            # in opposite directions: an unscoped ``information_schema`` query
+            # unions columns from EVERY schema on the path, so a same-named
+            # table elsewhere reports columns this one lacks and the migration
+            # is skipped as already-applied; scoping to ``current_schema()``
+            # names only the FIRST schema on the path, so a table resolving
+            # from a later one reports every column missing and the migration
+            # never converges. ``to_regclass`` asks the question the ALTER
+            # answers. Matches ``PostgresBackend.table_exists`` and the
+            # conversation-store column probe.
             row = await self._backend.fetch_one(
-                "SELECT COUNT(*) FROM information_schema.columns "
-                "WHERE table_name=? AND column_name=?",
+                "SELECT COUNT(*) FROM pg_attribute "
+                "WHERE attrelid = to_regclass(?) AND attname = ? "
+                "AND attnum > 0 AND NOT attisdropped",
                 (table, column),
             )
         else:

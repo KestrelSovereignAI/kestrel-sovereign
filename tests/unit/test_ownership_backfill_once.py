@@ -15,7 +15,9 @@ database (frinz companion creation 500'd / hung):
    first, then joins — same result, no explosion.
 """
 
+import asyncio
 from typing import Iterator
+from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
@@ -117,3 +119,124 @@ async def test_document_chunk_backfill_assigns_only_single_owner_files(db):
     assert owners == [(ca, "agentA")], (
         "only the single-owner file's chunk should be assigned; got %r" % (owners,)
     )
+
+
+# ---------------------------------------------------------------------------
+# ``migration_lock`` — the serialization above, extracted so feature schemas
+# can reuse it instead of reimplementing it. The restart coordinator's
+# ``restart_requests`` migration (#2774) is the first other caller.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_migration_lock_rolls_the_whole_body_back(db):
+    """One transaction spans the entire migration, so an interruption leaves
+    nothing behind.
+
+    Callers rely on this to make the schema its own marker: a column and the
+    data backfill that column implies land together or not at all, which
+    removes "column added, backfill never ran" from the state space rather
+    than adding a ledger to detect it afterwards.
+    """
+    with pytest.raises(Exception):
+        async with db.migration_lock("rollback_probe"):
+            await db.execute(
+                "INSERT INTO schema_backfills (name) VALUES (?)",
+                ("half-applied",),
+            )
+            raise RuntimeError("interrupted mid-migration")
+
+    assert await db._backfill_completed("half-applied") is False, (
+        "a partial migration must not survive the failure that stopped it"
+    )
+
+
+@pytest.mark.asyncio
+async def test_migration_lock_serializes_concurrent_holders(db):
+    """Exactly one holder runs at a time, so a post-upgrade request burst does
+    the migration once instead of stampeding it (``_init_schema`` runs on
+    every ``from_pool()``, which frinz calls per request)."""
+    order: list[str] = []
+
+    async def _hold(tag: str) -> None:
+        async with db.migration_lock("contended"):
+            order.append(f"enter-{tag}")
+            await asyncio.sleep(0)
+            order.append(f"exit-{tag}")
+
+    await asyncio.gather(_hold("a"), _hold("b"))
+
+    assert order in (
+        ["enter-a", "exit-a", "enter-b", "exit-b"],
+        ["enter-b", "exit-b", "enter-a", "exit-a"],
+    ), f"holders interleaved: {order}"
+
+
+@pytest.mark.asyncio
+async def test_migration_lock_takes_the_sqlite_writer_slot_up_front(db):
+    """SQLite must BEGIN IMMEDIATE, not deferred.
+
+    A deferred transaction that has already read fails outright when it later
+    tries to upgrade to the writer slot — it does not wait out
+    ``busy_timeout`` — so a second initializer racing the first raises
+    "database is locked" mid-migration instead of waiting and then finding the
+    work done.
+    """
+    from kestrel_sovereign.storage.db import SQLiteBackend
+
+    real = SQLiteBackend.transaction
+    seen: list = []
+
+    def _record(self, *, immediate: bool = False):
+        seen.append(immediate)
+        return real(self, immediate=immediate)
+
+    with patch.object(SQLiteBackend, "transaction", _record):
+        async with db.migration_lock("writer_slot"):
+            pass
+
+    assert seen == [True], f"expected one IMMEDIATE transaction, got {seen}"
+
+
+@pytest.mark.asyncio
+async def test_postgres_column_probe_follows_the_resolved_relation():
+    """The column probe must ask about the relation the search path resolves.
+
+    Name-based probes are wrong in both directions, and both failures are
+    silent — no exception, no log:
+
+    - Unscoped, ``information_schema.columns`` unions columns from EVERY
+      schema on the search path, so a same-named table elsewhere reports
+      columns this one lacks and the migration is skipped as already-applied.
+    - Scoped to ``current_schema()``, it names only the FIRST schema on the
+      path, so a table that resolves from a later one reports every column
+      missing and the migration never converges. With callers failing closed
+      on an incomplete migration, that disables a feature on a database that
+      is perfectly fine.
+
+    ``to_regclass`` asks the question ``ALTER TABLE`` answers. Same pattern as
+    ``PostgresBackend.table_exists`` and the conversation-store probe.
+    """
+    seen: list = []
+
+    class _FakePostgresBackend:
+        backend_type = "postgres"
+
+        async def fetch_one(self, sql, params=()):
+            seen.append((sql, params))
+            return (1,)
+
+    db = AsyncDatabase(_FakePostgresBackend())
+
+    assert await db._column_exists("restart_requests", "wake_dispatched_at")
+
+    sql, params = seen[-1]
+    assert "to_regclass" in sql, sql
+    assert "current_schema" not in sql, (
+        "current_schema() names the first schema on the path, not the one "
+        "holding the table"
+    )
+    assert "information_schema" not in sql, (
+        "an unscoped information_schema query unions every schema on the path"
+    )
+    assert params == ("restart_requests", "wake_dispatched_at")

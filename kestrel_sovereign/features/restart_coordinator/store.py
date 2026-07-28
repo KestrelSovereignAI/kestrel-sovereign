@@ -69,9 +69,23 @@ KNOWN_URGENCIES = frozenset({"low", "normal", "high", "critical"})
 # a plain restart.
 KNOWN_OPERATIONS = frozenset({"restart_only", "update_then_restart"})
 
+# Stamped onto ``wake_dispatch_boot_id`` for rows already delivered when the
+# dispatch-observability columns were added (#2774). Reads as "delivered under
+# the old flow; whether a wake was actually dispatched is unrecoverable" — it
+# does NOT assert a dispatch happened, because some of those rows provably had
+# none: a host with no usable dispatcher marks a row delivered without sending
+# anything (see ``_deliver_restart_completed``). Its job is to keep '' meaning
+# "no wake was ever dispatched for this row", which is the negative evidence
+# #2774 needs.
+PRE_MIGRATION_BOOT_ID = "pre-migration"
+
 # Columns added after the original #1512 schema. Applied additively via
 # ALTER TABLE so a feature loading against a pre-existing table picks
 # them up without losing data.
+#
+# ORDER IS LOAD-BEARING: ``_COLUMN_BACKFILLS`` runs in this order, and the
+# wake_dispatch_boot_id backfill reads what the wake_delivered backfill
+# writes. Asserted at import time below.
 _ADDED_COLUMNS = (
     ("operation", "TEXT DEFAULT 'restart_only'"),
     ("update_repo_path", "TEXT DEFAULT ''"),
@@ -90,7 +104,63 @@ _ADDED_COLUMNS = (
     # flag, set once the COGNITION wake lands Status.OK). The sweep retries the
     # wake while this is 0; it never re-terminalizes an already-completed row.
     ("wake_delivered", "INTEGER DEFAULT 0"),
+    # When the post-restart wake was DISPATCHED, as distinct from when its
+    # turn completed (#2774). ``wake_delivered`` only flips once the woken
+    # cognition turn returns Status.OK, which is necessarily AFTER that turn
+    # ends — so the turn the wake itself woke can never observe the flag as
+    # true, and the row appears to contradict its own consumer. These columns
+    # are stamped just before the signal is handed to the dispatcher, so "did
+    # this boot try to wake this row, and when" is answerable during that turn
+    # and usable as negative evidence when a wake genuinely never fired.
+    ("wake_dispatched_at", "TEXT DEFAULT ''"),
+    ("wake_dispatch_boot_id", "TEXT DEFAULT ''"),
+    # How many completion wakes have been dispatched for this row. The #2738
+    # failure was ~18 re-emissions inside one boot; a count makes that storm
+    # visible in the row itself rather than only in the logs.
+    ("wake_dispatch_count", "INTEGER DEFAULT 0"),
 )
+
+# One-time data backfills for legacy rows, keyed by the column whose addition
+# makes them necessary. Each runs in the same transaction as its ``ALTER``
+# (see ``_migrate_columns_once``), so the schema itself is the marker: if the
+# column is present, this backfill has already run or was never needed.
+_COLUMN_BACKFILLS = {
+    "wake_delivered": (
+        # Pre-#1819 a row only reached 'completed' AFTER its wake was
+        # delivered — terminalization was delivery-gated.
+        # ``list_requests_needing_wake`` selects ``completed AND
+        # wake_delivered = 0``, so without this every historical completed
+        # restart is re-woken on the first post-upgrade sweep.
+        "UPDATE restart_requests SET wake_delivered = 1 "
+        "WHERE status = 'completed'",
+        (),
+    ),
+    "wake_dispatch_boot_id": (
+        # A row delivered before these columns existed carries no dispatch
+        # record. Stamp the sentinel rather than a fabricated timestamp.
+        #
+        # Keyed on wake_delivered, NOT on status: a row that is completed but
+        # undelivered has not had a wake land, so it must keep '' and stay
+        # eligible for the sweep's retry.
+        "UPDATE restart_requests SET wake_dispatch_boot_id = ? "
+        "WHERE wake_delivered = 1 AND wake_dispatch_boot_id = ''",
+        (PRE_MIGRATION_BOOT_ID,),
+    ),
+}
+
+# The sentinel backfill reads what the delivered backfill writes, and both are
+# driven off ``_ADDED_COLUMNS`` order. Not an ``assert``: this is load-bearing
+# and asserts are stripped under ``python -O``, which is exactly when a silent
+# miscompile would hurt.
+_backfill_order = [c for c, _ in _ADDED_COLUMNS if c in _COLUMN_BACKFILLS]
+if _backfill_order.index("wake_delivered") > _backfill_order.index(
+    "wake_dispatch_boot_id"
+):
+    raise RuntimeError(
+        "wake_delivered must be backfilled before the wake_dispatch_boot_id "
+        "sentinel that reads it"
+    )
+del _backfill_order
 
 # Canonical column order shared by every SELECT below and ``from_row``.
 _COLUMNS = (
@@ -98,7 +168,8 @@ _COLUMNS = (
     "urgency, policy, status, status_reason, completed_at, operation, "
     "update_repo_path, update_target_ref, update_profile, "
     "update_allow_migrations, update_log, requester_request_id, "
-    "executing_boot_id, origin_session_id, wake_delivered"
+    "executing_boot_id, origin_session_id, wake_delivered, "
+    "wake_dispatched_at, wake_dispatch_boot_id, wake_dispatch_count"
 )
 
 
@@ -138,6 +209,13 @@ class RestartRequest:
     # ``completed`` (restart finished) with ``wake_delivered=False`` while the
     # wake is still being retried.
     wake_delivered: bool = False
+    # When the wake was dispatched and from which boot (#2774). Set on
+    # dispatch acceptance, so it is already visible to the turn the wake
+    # woke — unlike ``wake_delivered``, which cannot be by construction.
+    wake_dispatched_at: str = ""
+    wake_dispatch_boot_id: str = ""
+    # Number of completion wakes dispatched for this row (#2738).
+    wake_dispatch_count: int = 0
 
     @classmethod
     def from_row(cls, row: Iterable[Any]) -> "RestartRequest":
@@ -167,6 +245,9 @@ class RestartRequest:
             executing_boot_id=str(g(17) or ""),
             origin_session_id=str(g(18) or ""),
             wake_delivered=bool(int(g(19) or 0)),
+            wake_dispatched_at=str(g(20) or ""),
+            wake_dispatch_boot_id=str(g(21) or ""),
+            wake_dispatch_count=int(g(22) or 0),
         )
 
     def update_log_dict(self) -> Dict[str, Any]:
@@ -201,7 +282,72 @@ class RestartRequest:
             "executing_boot_id": self.executing_boot_id,
             "origin_session_id": self.origin_session_id,
             "wake_delivered": self.wake_delivered,
+            # Exposed so introspection can distinguish "no wake was ever sent"
+            # from "a wake was sent and its turn has not finished yet" (#2774).
+            # Reading only ``wake_delivered`` conflates the two.
+            "wake_dispatched_at": self.wake_dispatched_at,
+            "wake_dispatch_boot_id": self.wake_dispatch_boot_id,
+            "wake_dispatch_count": self.wake_dispatch_count,
         }
+
+
+async def _missing_columns(db) -> list:
+    """The ``_ADDED_COLUMNS`` entries not yet on ``restart_requests``, in order."""
+    missing = []
+    for col, col_def in _ADDED_COLUMNS:
+        if not await db._column_exists("restart_requests", col):
+            missing.append((col, col_def))
+    return missing
+
+
+async def _migrate_columns_once(db) -> None:
+    """Add the post-#1512 columns and run their legacy backfills, atomically.
+
+    **The schema is the marker.** A backfill exists to put legacy rows into
+    the shape the new column implies, so it is needed exactly when this call
+    is the one adding that column. Every ALTER and its backfill therefore run
+    inside a single ``migration_lock`` transaction: either the column and its
+    backfilled data both land, or neither does and the next boot retries from
+    the same starting point.
+
+    That atomicity is the whole point, and it is what the previous
+    implementation lacked. It ran each ALTER on its own and inferred "already
+    migrated" from the ALTER *raising* — which could not distinguish a
+    duplicate column from a genuinely failed ALTER (lock timeout, disk
+    pressure, a Postgres permission error), and left a crash window in which
+    the column committed but its backfill never ran. A separate migration
+    ledger would close the window at the cost of a second source of truth that
+    can disagree with the schema; one transaction closes it with none.
+
+    A backfill must never run against a column that was already present. These
+    statements rewrite live rows — ``wake_delivered = 1`` on every completed
+    request would mark a genuinely undelivered wake as delivered and suppress
+    the sweep that is still trying to retry it, permanently losing that wake.
+    """
+    if not await _missing_columns(db):
+        return
+    async with db.migration_lock("restart_requests_columns"):
+        # Re-checked under the lock: a concurrent initializer may have run the
+        # whole migration while this one waited.
+        for col, col_def in await _missing_columns(db):
+            await db._migrate_add_column("restart_requests", col, col_def)
+            backfill = _COLUMN_BACKFILLS.get(col)
+            if backfill is not None:
+                sql, params = backfill
+                await db.execute(sql, params)
+                logger.info(
+                    "restart_requests: added %s and backfilled legacy rows",
+                    col,
+                )
+        # Every read projects the full column list, so a migration that
+        # half-applied must not report success and let each subsequent query
+        # fail instead.
+        still_missing = [col for col, _ in await _missing_columns(db)]
+        if still_missing:
+            raise RuntimeError(
+                "restart_requests is missing column(s) after migration: "
+                + ", ".join(still_missing)
+            )
 
 
 async def ensure_restart_requests_table(db) -> None:
@@ -228,34 +374,14 @@ async def ensure_restart_requests_table(db) -> None:
             requester_request_id TEXT DEFAULT '',
             executing_boot_id TEXT DEFAULT '',
             origin_session_id TEXT DEFAULT '',
-            wake_delivered INTEGER DEFAULT 0
+            wake_delivered INTEGER DEFAULT 0,
+            wake_dispatched_at TEXT DEFAULT '',
+            wake_dispatch_boot_id TEXT DEFAULT '',
+            wake_dispatch_count INTEGER DEFAULT 0
         )
         """
     )
-    # Additively backfill the #1539 columns on a pre-existing table.
-    for col, col_def in _ADDED_COLUMNS:
-        try:
-            await db.execute(
-                f"ALTER TABLE restart_requests ADD COLUMN {col} {col_def}"
-            )
-        except Exception:
-            # Column already exists — expected on every non-first run.
-            continue
-        # The ALTER succeeded → this column was just added on THIS run.
-        # One-time data backfill for the new column:
-        if col == "wake_delivered":
-            # Pre-#1819, a row only reached 'completed' AFTER its wake was
-            # delivered (terminalization was delivery-gated). The new
-            # ``list_requests_needing_wake`` selects ``completed AND
-            # wake_delivered = 0``, so without this backfill every historical
-            # completed restart would be re-woken on the first post-upgrade
-            # sweep. Mark them delivered. This runs exactly once — on later
-            # boots the ALTER raises (column exists) and we skip, so a
-            # genuinely-undelivered new-flow wake still retries across reboots.
-            await db.execute(
-                "UPDATE restart_requests SET wake_delivered = 1 "
-                "WHERE status = 'completed'"
-            )
+    await _migrate_columns_once(db)
     await db.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_restart_requests_status
@@ -408,6 +534,41 @@ async def mark_wake_delivered(db, request_id: str) -> bool:
     )
     return await _write_landed(
         db, result, request_id, lambda row: row.wake_delivered,
+    )
+
+
+async def mark_wake_dispatched(
+    db, request_id: str, *, dispatched_at: str, boot_id: str,
+) -> bool:
+    """Record that a post-restart wake was DISPATCHED (#2774).
+
+    Stamped immediately before the signal is handed to the dispatcher, which
+    is the last moment guaranteed to precede the woken turn — the dispatcher
+    starts the turn as soon as it has the signal, so any later write races the
+    reader it exists for. ``wake_delivered`` structurally cannot answer this:
+    it is only set once the woken turn returns ``Status.OK``, i.e. after the
+    turn that would read it has ended.
+
+    Every dispatch is recorded, not only the first: ``wake_dispatched_at``
+    means what its name says (when we last dispatched) and
+    ``wake_dispatch_count`` makes a re-emission storm countable from the row.
+    The original failure was ~18 re-emissions within a single boot (#2738), and
+    observability that kept only the first would have shown one timestamp for
+    the whole event.
+    """
+    result = await db.execute(
+        "UPDATE restart_requests SET wake_dispatched_at = ?, "
+        "wake_dispatch_boot_id = ?, "
+        "wake_dispatch_count = COALESCE(wake_dispatch_count, 0) + 1 "
+        "WHERE id = ?",
+        (dispatched_at, boot_id, request_id),
+    )
+    return await _write_landed(
+        db, result, request_id,
+        lambda row: (
+            row.wake_dispatched_at == dispatched_at
+            and row.wake_dispatch_boot_id == boot_id
+        ),
     )
 
 
