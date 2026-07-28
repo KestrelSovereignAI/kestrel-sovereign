@@ -2226,12 +2226,33 @@ class RestartCoordinatorFeature(Feature):
         return True
 
     async def _mark_wake_delivered(self, row) -> None:
-        """Flag the post-restart wake as delivered so it isn't re-dispatched."""
+        """Flag the post-restart wake as delivered so it isn't re-dispatched.
+
+        A failure here is NOT cosmetic and is not logged at DEBUG. The wake has
+        already been consumed, so leaving ``wake_delivered = 0`` makes every
+        later sweep rediscover the row and re-emit a completion wake the agent
+        has already handled — the one-per-minute storm in #2738 — while the
+        row reports negative evidence that contradicts its own consumer
+        (#2774). Both the raising case and the silent no-op (a write that
+        matched no row) are surfaced so the condition leaves a record rather
+        than only symptoms. #2660 documents 2,045 signal_log writes lost to
+        SQLite lock contention, so this is not a hypothetical trigger.
+        """
+        request_id = getattr(row, "id", "?")
         try:
-            await mark_wake_delivered(self._db, row.id)
-            row.wake_delivered = True
-        except Exception as e:  # pragma: no cover - defensive
-            logger.debug(
-                "restart sweep: failed to flag wake_delivered for %s: %s",
-                getattr(row, "id", "?"), e,
+            landed = await mark_wake_delivered(self._db, row.id)
+        except Exception as e:
+            logger.warning(
+                "restart sweep: failed to flag wake_delivered for %s: %s; "
+                "until this write lands the next sweep will re-emit this "
+                "completion wake", request_id, e,
             )
+            return
+        if not landed:
+            logger.warning(
+                "restart sweep: wake_delivered write for %s matched no row; "
+                "until this write lands the next sweep will re-emit this "
+                "completion wake", request_id,
+            )
+            return
+        row.wake_delivered = True
