@@ -3917,3 +3917,63 @@ async def test_an_unusable_schema_disables_coordinator_storage_for_the_boot(
     result = await feat.list_restart_requests()
     assert result.status is ToolResultStatus.ERROR
     assert "storage unavailable" in result.error
+
+
+@pytest.mark.asyncio
+async def test_a_lost_delivered_write_storms_but_never_claims_delivery(
+    tmp_path, caplog, monkeypatch,
+):
+    """The #2738 mechanism end to end, with the write LOST.
+
+    Re-emission is not the bug — it is the retry guarantee, and it is supposed
+    to keep going while the flag reads 0. The bug was the pre-fix behaviour
+    where the failed write was swallowed at DEBUG and the in-memory row was
+    marked delivered anyway, so the row claimed a delivery the database never
+    recorded. #2660 documents 2,045 signal_log writes lost to SQLite lock
+    contention, so a lost write is not hypothetical.
+
+    NOTE the logging is deliberately NOT one line per re-emission.
+    ``_mark_wake_delivered`` is only reached when the ack supervisor observes
+    ``Status.OK``; a re-dispatch that coalesces into an in-flight ack never
+    gets there and leaves no log line. The storm is therefore visible in full
+    only through ``wake_dispatch_count`` (#2774) — which is precisely what
+    that column was added for. Both numbers are asserted exactly, so a change
+    to either is caught rather than absorbed.
+    """
+    from kestrel_sovereign.features.restart_coordinator import feature as fm
+
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="pre-restart",
+    )
+    await update_status(
+        backend, req.id, status="executing", expected_current_status="pending",
+    )
+    await feat.initialize()
+
+    async def _lost_write(db, request_id):
+        """The write reports, truthfully, that it matched no row."""
+        return False
+
+    monkeypatch.setattr(fm, "mark_wake_delivered", _lost_write)
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            wake_tasks = await feat._reap_post_restart_rows()
+            if wake_tasks:
+                await asyncio.gather(*wake_tasks)
+            await agent.drain_background_tasks()
+
+    row = await get_request(backend, req.id)
+    assert row.wake_delivered is False, (
+        "the row must never claim a delivery the database did not record"
+    )
+    assert row.wake_dispatch_count == 3, (
+        "the retry is intact and the row itself records the storm"
+    )
+
+    lost = [r for r in caplog.records if "matched no row" in r.getMessage()]
+    assert len(lost) == 1, (
+        f"exactly one dispatch reached the ack path; the other two coalesced "
+        f"without reaching it (see docstring). Got {len(lost)} warnings"
+    )
