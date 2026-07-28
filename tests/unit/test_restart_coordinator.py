@@ -27,6 +27,10 @@ from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.restart_coordinator import (
     RestartCoordinatorFeature,
 )
+from kestrel_sovereign.features.restart_coordinator.feature import (
+    _MAX_NAMED_BUSY_KINDS,
+    _describe_background_tasks,
+)
 from kestrel_sovereign.features.restart_coordinator.store import (
     ensure_restart_requests_table,
     get_request,
@@ -1307,9 +1311,6 @@ async def test_cron_does_not_complete_same_process_executing_row(tmp_path):
 
     feat, backend, agent = await _real_dispatch_feature(tmp_path)
     await feat.initialize()
-    # Don't make the drain below sit out the real dispatch-watch grace (#2667);
-    # this test is about the boot stamp, not the watchdog's timing.
-    feat._restart_dispatch_grace = 0
     created = await feat.request_restart(reason="ship")
     req_id = created.data["request"]["id"]
 
@@ -2047,7 +2048,7 @@ async def test_idle_ignores_signal_log_infra_tasks(tmp_path):
     async def _never():
         await asyncio.Event().wait()
 
-    log_task = asyncio.create_task(_never(), name="signal_log:heartbeat:abc123")
+    log_task = asyncio.create_task(_never(), name="durable_signal_log:heartbeat:abc123")
     sweep_task = asyncio.create_task(_never(), name="a2a_question_expiry_sweep")
     work_task = asyncio.create_task(_never(), name="signal_dispatch:heartbeat:abc123")
     try:
@@ -2062,7 +2063,16 @@ async def test_idle_ignores_signal_log_infra_tasks(tmp_path):
         feat.agent._background_tasks = {log_task, sweep_task, work_task}
         busy = feat._agent_appears_idle()
         assert busy["idle"] is False
-        assert busy["reason"] == "1 background task(s) in flight"
+        # The reason names the ONE genuine blocker (#2665) and no infra task,
+        # so an operator can tell what is actually holding the restart.
+        # Raw asyncio tasks carry no age stamp — only _track_background_task
+        # stamps them — so the age reads as unknown rather than fabricated.
+        assert busy["reason"] == (
+            "1 background task(s) in flight: "
+            "signal_dispatch:heartbeat:abc123 (age unknown)"
+        )
+        assert "durable_signal_log" not in busy["reason"]
+        assert "a2a_question_expiry_sweep" not in busy["reason"]
     finally:
         log_task.cancel()
         sweep_task.cancel()
@@ -2106,7 +2116,16 @@ async def test_idle_ignores_a2a_question_supervisor_tasks(tmp_path):
         feat.agent._background_tasks = {sup_task, replay_task, work_task}
         busy = feat._agent_appears_idle()
         assert busy["idle"] is False
-        assert busy["reason"] == "1 background task(s) in flight"
+        # Naming the blocker is what makes a phantom entry diagnosable: the
+        # live report of "2 background tasks" against an empty task store was
+        # unfalsifiable while the reason was a bare count (#2665).
+        # Raw asyncio tasks carry no age stamp — only _track_background_task
+        # stamps them — so the age reads as unknown rather than fabricated.
+        assert busy["reason"] == (
+            "1 background task(s) in flight: "
+            "signal_dispatch:heartbeat:abc123 (age unknown)"
+        )
+        assert "a2a_question_supervisor" not in busy["reason"]
     finally:
         sup_task.cancel()
         replay_task.cancel()
@@ -2762,6 +2781,272 @@ async def test_delivered_ack_supervisor_self_removes_from_owned(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# #2665 — deferral reasons must name the blocking handles, not just count them
+# ---------------------------------------------------------------------------
+
+
+class _FakeTask:
+    """A background task with a name and a known age."""
+
+    def __init__(self, name, age_seconds=0.0, now=1000000.0):
+        self._name = name
+        self._kestrel_started_at = now - age_seconds
+
+    def get_name(self):
+        return self._name
+
+
+def test_busy_deferral_names_the_blocking_tasks():
+    """A bare count is not reconcilable against the task store. The live report
+    of "2 background tasks in flight" alongside `list_my_tasks` returning zero
+    rows was undiagnosable precisely because the coordinator never said WHICH
+    handles it meant (#2665).
+    """
+    described = _describe_background_tasks(
+        [
+            _FakeTask("signal_dispatch:talon:sig_1", age_seconds=5),
+            _FakeTask("a2a_send:claw", age_seconds=1),
+        ],
+        now=1000.0,
+    )
+    assert "signal_dispatch:talon:sig_1" in described
+    assert "a2a_send:claw" in described
+
+
+def test_busy_deferral_reports_age_not_just_identity():
+    """Age is what separates "busy" from "wedged", and #2665's symptom was a
+    duration symptom. The adjacent active-request path already reports age;
+    this one used to report none, so a task stuck for hours rendered
+    identically to one that appeared a moment ago.
+    """
+    described = _describe_background_tasks(
+        [_FakeTask("signal_dispatch:stuck", age_seconds=7200)],
+        now=1000000.0,
+    )
+    assert "2h" in described
+
+
+def test_oldest_task_is_reported_first():
+    """Oldest first puts the likely culprit at the front of a truncated list."""
+    described = _describe_background_tasks(
+        [
+            _FakeTask("young:a", age_seconds=1),
+            _FakeTask("ancient:b", age_seconds=9999),
+            _FakeTask("middle:c", age_seconds=100),
+        ],
+        now=100000.0,
+    )
+    assert described.index("ancient") < described.index("middle")
+    assert described.index("middle") < described.index("young")
+
+
+def test_a_flood_of_one_kind_cannot_hide_the_wedged_task():
+    """The regression this ordering exists for. Sorted alphabetically and
+    truncated to five, six `a2a_*` tasks pushed a wedged `signal_dispatch:*`
+    out of the string entirely — the bound doing the OPPOSITE of its job at
+    exactly the moment it engaged. Grouping by kind means no kind can be
+    truncated away by the volume of another.
+    """
+    tasks = [
+        _FakeTask(f"a2a_complete:{i:08d}", age_seconds=1) for i in range(6)
+    ]
+    tasks.append(_FakeTask("signal_dispatch:channels:sig_WEDGED", age_seconds=900))
+
+    described = _describe_background_tasks(tasks, now=100000.0)
+
+    assert "sig_WEDGED" in described, (
+        f"the wedged task must not be truncated away; got: {described}"
+    )
+    # And the flood is summarised rather than spending the whole budget.
+    assert "x6" in described
+
+
+def test_duplicate_kinds_are_collapsed_with_a_count():
+    """Five identically-named tasks used to render five times, spending the
+    entire budget on one bit of information."""
+    described = _describe_background_tasks(
+        [_FakeTask("post_response_memory_enrichment", age_seconds=i)
+         for i in range(5)],
+        now=1000.0,
+    )
+    assert "x5" in described
+    assert described.count("post_response_memory_enrichment") == 1
+
+
+def test_busy_deferral_bounds_the_named_kinds():
+    """Deferral reasons are persisted as a status-event row on every cron tick
+    with no dedupe, so the string must stay bounded for a wedged restart."""
+    described = _describe_background_tasks(
+        [_FakeTask(f"kind{i}:x", age_seconds=i)
+         for i in range(_MAX_NAMED_BUSY_KINDS + 3)],
+        now=1000.0,
+    )
+    assert "+3 more kind(s)" in described
+
+
+def test_a_single_pathological_name_cannot_dominate():
+    described = _describe_background_tasks(
+        [_FakeTask("x" * 500, age_seconds=1)], now=1000.0,
+    )
+    assert len(described) < 200
+
+
+def test_busy_deferral_survives_a_task_without_a_readable_name():
+    """An unnamed or introspection-hostile handle must not break the idle gate
+    — reporting it as unnamed is still more useful than a bare count.
+    """
+    class _Hostile:
+        def get_name(self):
+            raise RuntimeError("no name for you")
+
+    assert "<unnamed>" in _describe_background_tasks([_Hostile()], now=1000.0)
+
+
+def test_unstamped_task_reports_unknown_age_rather_than_guessing():
+    """A task predating the age stamp must not be reported with a fabricated
+    age."""
+    class _Unstamped:
+        def get_name(self):
+            return "legacy:task"
+
+    described = _describe_background_tasks([_Unstamped()], now=1000.0)
+    assert "age unknown" in described
+
+
+@pytest.mark.asyncio
+async def test_idle_gate_reason_carries_task_names_end_to_end(tmp_path):
+    """The names must reach the reason string the coordinator actually emits,
+    not just the helper.
+    """
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+
+    async def _never():
+        await asyncio.sleep(3600)
+
+    blocker = asyncio.create_task(_never(), name="signal_dispatch:blocking")
+    agent._background_tasks = {blocker}
+    try:
+        state = feat._agent_appears_idle()
+        assert state["idle"] is False
+        assert "signal_dispatch:blocking" in state["reason"]
+    finally:
+        blocker.cancel()
+        await asyncio.gather(blocker, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# #2738 — a lost wake_delivered write must never pass for a successful one
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mark_wake_delivered_reports_whether_the_write_landed(tmp_path):
+    """It previously returned ``None`` and discarded the rowcount, so callers
+    could not tell a persisted flag from a lost one."""
+    from kestrel_sovereign.features.restart_coordinator.store import (
+        mark_wake_delivered,
+    )
+
+    backend = await _backend(tmp_path)
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="r",
+    )
+
+    assert await mark_wake_delivered(backend, req.id) is True
+    assert await mark_wake_delivered(backend, "no-such-request") is False
+
+
+@pytest.mark.asyncio
+async def test_lost_wake_delivered_write_is_reported_not_swallowed(
+    tmp_path, caplog,
+):
+    """The failure used to be swallowed at DEBUG while the in-memory row was
+    marked delivered anyway — so the row claimed a delivery the database never
+    recorded, and the sweep re-emitted forever with nothing saying why."""
+    feat, _agent = await _make_feature(tmp_path)
+    ghost = SimpleNamespace(id="does-not-exist", wake_delivered=False)
+
+    with caplog.at_level(logging.WARNING):
+        await feat._mark_wake_delivered(ghost)
+
+    assert ghost.wake_delivered is False, (
+        "a write that matched no row must not report success"
+    )
+    assert any(
+        "matched no row" in r.getMessage() for r in caplog.records
+    ), "a lost wake_delivered write must be reported at WARNING"
+
+
+@pytest.mark.asyncio
+async def test_a_lost_write_never_claims_delivery_across_repeated_sweeps(
+    tmp_path, caplog,
+):
+    """When the write is LOST the sweep keeps re-emitting — that is the retry
+    guarantee working. What must not happen is the pre-fix behaviour, where the
+    row was marked delivered in memory anyway.
+
+    The happy path alone would NOT catch this: the pre-fix code's write also
+    landed when nothing went wrong, and #2738 only manifests when it does not.
+    """
+    from kestrel_sovereign.features.restart_coordinator import feature as fm
+
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="pre-restart",
+    )
+    await update_status(
+        backend, req.id, status="executing",
+        expected_current_status="pending",
+    )
+    await feat.initialize()
+
+    async def _lost_write(db, request_id):
+        return False
+
+    original = fm.mark_wake_delivered
+    fm.mark_wake_delivered = _lost_write
+    try:
+        with caplog.at_level(logging.WARNING):
+            for _ in range(3):
+                tasks = await feat._reap_post_restart_rows()
+                if tasks:
+                    await asyncio.gather(*tasks)
+                await agent.drain_background_tasks()
+    finally:
+        fm.mark_wake_delivered = original
+
+    row = await get_request(backend, req.id)
+    assert row.wake_delivered is False, (
+        "the row must never claim a delivery the database did not record"
+    )
+    assert any("matched no row" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_repeated_sweeps_emit_exactly_one_completion_wake(tmp_path):
+    """With the write landing, repeated sweeps produce exactly ONE wake."""
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="pre-restart",
+    )
+    await update_status(
+        backend, req.id, status="executing",
+        expected_current_status="pending",
+    )
+    await feat.initialize()
+
+    for _ in range(5):
+        tasks = await feat._reap_post_restart_rows()
+        if tasks:
+            await asyncio.gather(*tasks)
+        await agent.drain_background_tasks()
+
+    assert len(agent.process_input_calls) == 1
+    assert (await get_request(backend, req.id)).wake_delivered is True
+
+
+# ---------------------------------------------------------------------------
 # #2667 — a dispatched restart that never happens must not vanish silently
 # ---------------------------------------------------------------------------
 
@@ -3157,114 +3442,3 @@ async def test_repeated_dispatch_failures_stop_rather_than_flap(tmp_path):
     )
     assert "giving up" in row.status_reason
     assert row.completed_at is not None
-
-
-# ---------------------------------------------------------------------------
-# #2738 — a lost wake_delivered write must never pass for a successful one
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_mark_wake_delivered_reports_whether_the_write_landed(tmp_path):
-    """It previously returned ``None`` and discarded the rowcount, so callers
-    could not tell a persisted flag from a lost one."""
-    from kestrel_sovereign.features.restart_coordinator.store import (
-        mark_wake_delivered,
-    )
-
-    backend = await _backend(tmp_path)
-    req = await insert_request(
-        backend, requested_by_agent="did:test:agent", reason="r",
-    )
-
-    assert await mark_wake_delivered(backend, req.id) is True
-    assert await mark_wake_delivered(backend, "no-such-request") is False
-
-
-@pytest.mark.asyncio
-async def test_lost_wake_delivered_write_is_reported_not_swallowed(
-    tmp_path, caplog,
-):
-    """The failure used to be swallowed at DEBUG while the in-memory row was
-    marked delivered anyway — so the row claimed a delivery the database never
-    recorded, and the sweep re-emitted forever with nothing saying why."""
-    feat, _agent = await _make_feature(tmp_path)
-    ghost = SimpleNamespace(id="does-not-exist", wake_delivered=False)
-
-    with caplog.at_level(logging.WARNING):
-        await feat._mark_wake_delivered(ghost)
-
-    assert ghost.wake_delivered is False, (
-        "a write that matched no row must not report success"
-    )
-    assert any(
-        "matched no row" in r.getMessage() for r in caplog.records
-    ), "a lost wake_delivered write must be reported at WARNING"
-
-
-@pytest.mark.asyncio
-async def test_a_lost_write_never_claims_delivery_across_repeated_sweeps(
-    tmp_path, caplog,
-):
-    """When the write is LOST the sweep keeps re-emitting — that is the retry
-    guarantee working. What must not happen is the pre-fix behaviour, where the
-    row was marked delivered in memory anyway.
-
-    The happy path alone would NOT catch this: the pre-fix code's write also
-    landed when nothing went wrong, and #2738 only manifests when it does not.
-    """
-    from kestrel_sovereign.features.restart_coordinator import feature as fm
-
-    feat, backend, agent = await _real_dispatch_feature(tmp_path)
-    req = await insert_request(
-        backend, requested_by_agent="did:test:agent", reason="pre-restart",
-    )
-    await update_status(
-        backend, req.id, status="executing",
-        expected_current_status="pending",
-    )
-    await feat.initialize()
-
-    async def _lost_write(db, request_id):
-        return False
-
-    original = fm.mark_wake_delivered
-    fm.mark_wake_delivered = _lost_write
-    try:
-        with caplog.at_level(logging.WARNING):
-            for _ in range(3):
-                tasks = await feat._reap_post_restart_rows()
-                if tasks:
-                    await asyncio.gather(*tasks)
-                await agent.drain_background_tasks()
-    finally:
-        fm.mark_wake_delivered = original
-
-    row = await get_request(backend, req.id)
-    assert row.wake_delivered is False, (
-        "the row must never claim a delivery the database did not record"
-    )
-    assert any("matched no row" in r.getMessage() for r in caplog.records)
-
-
-@pytest.mark.asyncio
-async def test_repeated_sweeps_emit_exactly_one_completion_wake(tmp_path):
-    """With the write landing, repeated sweeps produce exactly ONE wake."""
-    feat, backend, agent = await _real_dispatch_feature(tmp_path)
-    req = await insert_request(
-        backend, requested_by_agent="did:test:agent", reason="pre-restart",
-    )
-    await update_status(
-        backend, req.id, status="executing",
-        expected_current_status="pending",
-    )
-    await feat.initialize()
-
-    for _ in range(5):
-        tasks = await feat._reap_post_restart_rows()
-        if tasks:
-            await asyncio.gather(*tasks)
-        await agent.drain_background_tasks()
-
-    assert len(agent.process_input_calls) == 1
-    assert (await get_request(backend, req.id)).wake_delivered is True

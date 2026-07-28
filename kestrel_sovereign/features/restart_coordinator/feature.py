@@ -175,9 +175,16 @@ def _tail(raw: Any) -> str:
 # Background-task name prefixes for *infrastructure* work that must never
 # hold off an idle restart (#1626). Three shapes all wedged
 # ``idle_agents_only`` forever by being counted as "busy":
-#   - ``signal_log:`` — fire-and-forget log writes that complete in well
-#     under a second but are minted continuously by heartbeats/scheduler
-#     ticks, so one is almost always alive when the idle check runs.
+#   - ``durable_signal_log`` — fire-and-forget log writes that complete in
+#     well under a second but are minted continuously by heartbeats/scheduler
+#     ticks, so one is almost always alive when the idle check runs. Covers
+#     both ``durable_signal_log:`` and ``durable_signal_log_writer:``.
+#     NOTE these are currently dispatcher-owned (``_outcome_log_tasks``) and
+#     so do not reach the agent set this predicate reads — the entry is kept
+#     because the exclusion is a statement of INTENT about this class of task,
+#     and because the old ``signal_log:`` spelling listed here had been dead
+#     since #2713 renamed them, which is the same list-drifts-from-reality
+#     failure #2665 is about.
 #   - ``a2a_question_expiry_sweep`` — an intentionally permanent ``while
 #     True`` maintenance daemon (peers feature) that never completes.
 #   - ``a2a_question_supervisor:`` — the sender-side SSE subscription
@@ -200,7 +207,7 @@ def _tail(raw: Any) -> str:
 # it was just never read here. New long-lived/bookkeeping daemons must be
 # named with a prefix listed here (or excluded from ``_background_tasks``).
 _INFRA_TASK_PREFIXES = (
-    "signal_log:",
+    "durable_signal_log",
     "a2a_question_expiry_sweep",
     "a2a_question_supervisor:",
 )
@@ -214,6 +221,93 @@ def _is_infra_background_task(task) -> bool:
     except Exception:
         return False
     return name.startswith(_INFRA_TASK_PREFIXES)
+
+
+# How many task KINDS to describe individually in a deferral reason before
+# summarising the rest. The bound exists because a deferring request writes a
+# status-event row every cron tick (``* * * * *``) with no dedupe, so an
+# unbounded reason accumulates in the event store for as long as the restart
+# stays wedged.
+_MAX_NAMED_BUSY_KINDS = 5
+
+# Single task names are capped so one pathological name cannot dominate.
+_MAX_BUSY_NAME_CHARS = 80
+
+
+def _task_age_seconds(task, now: float) -> Optional[float]:
+    """How long ``task`` has been running, or ``None`` if unstamped."""
+    started = getattr(task, "_kestrel_started_at", None)
+    if not isinstance(started, (int, float)):
+        return None
+    return max(0.0, now - started)
+
+
+def _format_age(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "age unknown"
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    return f"{int(seconds // 3600)}h"
+
+
+def _describe_background_tasks(tasks, now: Optional[float] = None) -> str:
+    """Describe the tasks blocking an idle restart, not just how many (#2665).
+
+    A bare count ("2 background tasks in flight") cannot be reconciled against
+    anything: the live report of two in-flight tasks alongside a task store
+    returning zero rows was undiagnosable precisely because the coordinator
+    never said WHICH handles it meant.
+
+    Grouped by KIND and ordered OLDEST FIRST, both deliberately:
+
+    - Truncating a flat list sorted by name hides whatever sorts late. Six
+      ``a2a_*`` tasks would push a wedged ``signal_dispatch:*`` past the bound
+      and out of the string — the bound doing the opposite of its job at
+      exactly the moment it engages. Collapsing by kind means no kind can be
+      truncated away by the volume of another.
+    - Age is what separates "busy" from "wedged", and #2665's symptom was a
+      duration symptom. Oldest first puts the likely culprit at the front.
+    """
+    now = time.monotonic() if now is None else now
+    kinds: Dict[str, Dict[str, Any]] = {}
+    for task in tasks:
+        try:
+            name = task.get_name() or "<unnamed>"
+        except Exception:
+            name = "<unnamed>"
+        name = name[:_MAX_BUSY_NAME_CHARS]
+        # Kind is the stable leading segment; the tail is the per-instance id.
+        kind = name.split(":", 1)[0] if ":" in name else name
+        age = _task_age_seconds(task, now)
+        entry = kinds.setdefault(
+            kind, {"count": 0, "oldest": None, "example": name},
+        )
+        entry["count"] += 1
+        if age is not None and (
+            entry["oldest"] is None or age > entry["oldest"]
+        ):
+            entry["oldest"] = age
+            entry["example"] = name
+
+    def _sort_key(item):
+        # Oldest first; unstamped last but still ahead of nothing.
+        oldest = item[1]["oldest"]
+        return (0 if oldest is not None else 1, -(oldest or 0.0), item[0])
+
+    ordered = sorted(kinds.items(), key=_sort_key)
+    shown = ordered[:_MAX_NAMED_BUSY_KINDS]
+    parts = []
+    for _kind, entry in shown:
+        label = entry["example"]
+        if entry["count"] > 1:
+            label = f"{label} x{entry['count']}"
+        parts.append(f"{label} ({_format_age(entry['oldest'])})")
+    remaining = len(ordered) - len(shown)
+    if remaining > 0:
+        parts.append(f"+{remaining} more kind(s)")
+    return ", ".join(parts)
 
 
 class RestartCoordinatorFeature(Feature):
@@ -1158,7 +1252,18 @@ class RestartCoordinatorFeature(Feature):
             return self._agent_appears_idle(ignore_request_id=ignore_request_id)
         for other in agents:
             excl = ignore_request_id if other is self.agent else ""
-            state = self._agent_appears_idle(ignore_request_id=excl, agent=other)
+            # Name tasks only for OUR agent. This reason is persisted to the
+            # coordinator agent's event store and pushed on its SSE stream, so
+            # enumerating a sibling's tasks would publish that agent's
+            # topology — peer counterparties, active integrations, DIDs — to a
+            # different tenant. On a multi-tenant host that is a disclosure,
+            # and #2665 is a self-diagnosis: nothing here needs sibling task
+            # identity, only that the sibling is busy.
+            state = self._agent_appears_idle(
+                ignore_request_id=excl,
+                agent=other,
+                name_tasks=(other is self.agent),
+            )
             if not state["idle"]:
                 name = getattr(other, "name", None) or getattr(other, "did", "?")
                 return {
@@ -1169,6 +1274,7 @@ class RestartCoordinatorFeature(Feature):
 
     def _agent_appears_idle(
         self, ignore_request_id: str = "", agent: Any = None,
+        name_tasks: bool = True,
     ) -> Dict[str, Any]:
         """Idle check against an agent's in-flight surface.
 
@@ -1282,9 +1388,15 @@ class RestartCoordinatorFeature(Feature):
             except (TypeError, AttributeError):
                 alive = []
             if alive:
+                detail = (
+                    f": {_describe_background_tasks(alive)}"
+                    if name_tasks else ""
+                )
                 return {
                     "idle": False,
-                    "reason": f"{len(alive)} background task(s) in flight",
+                    "reason": (
+                        f"{len(alive)} background task(s) in flight{detail}"
+                    ),
                 }
 
         if not any_surface_seen:

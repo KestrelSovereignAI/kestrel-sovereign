@@ -5663,6 +5663,13 @@ Expected Duration: {expected_duration}
     def _track_background_task(self, coro, *, name: str) -> asyncio.Task:
         """Start agent-owned background work and remove it when complete."""
         task = asyncio.create_task(coro, name=name)
+        # ``asyncio.Task`` carries no creation time, and age is what separates
+        # "busy" from "wedged" when something inspects this set — the restart
+        # coordinator's idle gate reports it so an operator can tell a task
+        # that appeared once from one stuck for hours (#2665). Stamped at the
+        # single chokepoint that owns the set, so nothing has to maintain a
+        # parallel map that could outlive the task.
+        task._kestrel_started_at = time.monotonic()  # type: ignore[attr-defined]
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
         return task
