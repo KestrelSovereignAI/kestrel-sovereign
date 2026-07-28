@@ -19,12 +19,15 @@ runtime layout.
 from __future__ import annotations
 
 import asyncio
+import glob
 import json
 import logging
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -76,6 +79,27 @@ _OUTPUT_TAIL_CHARS = 2000
 # any real turn yet breaks the deadlock well inside the ~20 min window
 # observed in #1558.
 STALE_ACTIVE_REQUEST_SECONDS = 900
+
+# How long to wait after spawning the detached restart before concluding the
+# dispatch failed. A real restart kills this process well inside the window;
+# still being alive with a dead child means it did not happen (#2667).
+RESTART_DISPATCH_GRACE_SECONDS = 10
+
+# How often to check the child within that window.
+_DISPATCH_POLL_SECONDS = 0.5
+
+# Failed dispatch attempts for one request in one boot before the coordinator
+# stops retrying and rejects it. A permanently broken ``kestrel restart`` would
+# otherwise spawn a doomed subprocess every cron tick indefinitely.
+MAX_RESTART_DISPATCH_ATTEMPTS = 3
+
+# An ``executing`` row stamped with THIS boot older than this never had its
+# restart happen — the process it was going to kill is still running it. The
+# in-dispatch check catches the common case; this is the backstop for a row
+# whose verification never ran (feature reloaded, task cancelled, crash
+# between the status write and the spawn) and which would otherwise sit in
+# ``executing`` forever with no path back (#2667).
+STALE_EXECUTING_SECONDS = 600
 
 # Per-process boot identifier (#1796). Generated once at import, so it is
 # stable for the lifetime of THIS host process and differs from any prior
@@ -212,6 +236,21 @@ class RestartCoordinatorFeature(Feature):
         # cron-tick retry from re-enqueuing a duplicate wake while a long
         # cognition turn is still in flight (#1796).
         self._inflight_restart_acks: set = set()
+        # request_id -> monotonic time THIS process crossed it into
+        # ``executing``. Used to tell a dispatch still in flight from one that
+        # silently failed, without a schema column: a row stamped with this
+        # boot id but absent here has no dispatch behind it (#2667).
+        self._executing_since: Dict[str, float] = {}
+        # Failed dispatch attempts per request in THIS boot, so a permanently
+        # broken restart stops being retried rather than flapping forever.
+        self._dispatch_failures: Dict[str, int] = {}
+        # When THIS feature instance came up. The boot id is module-scoped but
+        # this map is per-instance, so a reload must not treat the previous
+        # instance's in-flight dispatches as orphans the moment it starts.
+        self._instance_started_at = time.monotonic()
+        # Instance-level so a host (or a test) can tune how long to wait
+        # before concluding a dispatched restart never happened.
+        self._restart_dispatch_grace = RESTART_DISPATCH_GRACE_SECONDS
         self._db = resolve_feature_database(self.agent)
         if self._db is not None:
             try:
@@ -259,6 +298,10 @@ class RestartCoordinatorFeature(Feature):
                     RegistrationPolicy.OPTIONAL,
                 )
             )
+
+        # A successful restart orphans its child's stderr file (this process
+        # dies before it can clean up), so boot is the only place that can.
+        self._sweep_orphaned_restart_stderr()
 
         # Recover any row left in ``updating`` by a host that went down
         # mid-update (operator restart, crash) BEFORE the executing
@@ -656,6 +699,12 @@ class RestartCoordinatorFeature(Feature):
         # this from re-waking a row whose turn is already running.
         await self._reap_post_restart_rows()
 
+        # Recover rows this process crossed into ``executing`` whose restart
+        # never happened. Without this the sweep only ever scans pending rows,
+        # ``cancel_restart_request`` refuses executing ones, and the row has
+        # no path back at all (#2667).
+        await self._reconcile_stranded_executing_rows()
+
         pending = await list_requests(self._db, status="pending")
         approved = await list_requests(self._db, status="approved")
         candidates = pending + approved
@@ -718,6 +767,15 @@ class RestartCoordinatorFeature(Feature):
                 "updating" if req.operation == "update_then_restart"
                 else "executing"
             )
+            if initial_state == "executing":
+                # Record BEFORE the transition commits. ``update_status``
+                # awaits, so recording after it leaves a window where the row
+                # is durably ``executing`` under this boot id with no entry
+                # here — and ``_reconcile_stranded_executing_rows`` treats
+                # exactly that as an orphan and resets a dispatch that is
+                # very much alive. Popped again below if the transition loses
+                # its race.
+                self._executing_since[req.id] = time.monotonic()
             moved = await update_status(
                 self._db, req.id,
                 status=initial_state,
@@ -735,6 +793,8 @@ class RestartCoordinatorFeature(Feature):
                 ),
             )
             if not moved:
+                if initial_state == "executing":
+                    self._executing_since.pop(req.id, None)
                 deferred.append({
                     "request_id": req.id,
                     "reason": "lost race against another transition",
@@ -802,6 +862,9 @@ class RestartCoordinatorFeature(Feature):
                 # Update done and still safe — NOW cross into ``executing``
                 # right before the spawn so the post-restart sweep
                 # recognizes the restart we are about to perform.
+                # Recorded before the write for the same reason as the
+                # straight-to-executing path above.
+                self._executing_since[req.id] = time.monotonic()
                 moved = await update_status(
                     self._db, req.id,
                     status="executing",
@@ -810,6 +873,7 @@ class RestartCoordinatorFeature(Feature):
                     executing_boot_id=_PROCESS_BOOT_ID,
                 )
                 if not moved:
+                    self._executing_since.pop(req.id, None)
                     deferred.append({
                         "request_id": req.id,
                         "reason": "lost race after update before restart",
@@ -818,7 +882,7 @@ class RestartCoordinatorFeature(Feature):
                 await self._emit_status_event(req, state="executing")
 
             try:
-                self._spawn_restart_subprocess()
+                proc = self._spawn_restart_subprocess()
             except Exception as e:
                 logger.error(
                     "restart_coordinator: spawn failed: %s", e,
@@ -834,6 +898,14 @@ class RestartCoordinatorFeature(Feature):
                     deferral_reason=f"spawn failed: {e}",
                 )
                 continue
+
+            # Popen returning does not mean the restart happened. Watch the
+            # child in the background: if we are still alive after the grace
+            # window and it is not, the row must NOT be left ``executing`` — a
+            # later unrelated restart would find a prior-boot executing row
+            # and terminalize it as "completed", reporting a restart that
+            # never occurred (#2667).
+            self._arm_restart_dispatch_watch(proc, req.id)
 
             executed.append({"request_id": req.id})
             # Only execute one per poll — the host process is about
@@ -1576,13 +1648,27 @@ class RestartCoordinatorFeature(Feature):
                 "stderr_tail": "",
             }
 
-    def _spawn_restart_subprocess(self) -> None:
+    def _spawn_restart_subprocess(self) -> subprocess.Popen:
         """Spawn a detached ``kestrel restart`` subprocess.
 
         ``start_new_session=True`` dissociates the child from the
         Kestrel host's process group so the restart survives our
         impending shutdown. ``close_fds=True`` ensures we leak no
         file descriptors into the new session.
+
+        Returns the handle so the caller can verify the child actually stayed
+        up. ``Popen`` only raises when the binary cannot be exec'd at all — a
+        child that starts and immediately dies raises nothing, and discarding
+        the handle made that outcome indistinguishable from success (#2667).
+
+        ``stderr`` goes to a FILE, not ``DEVNULL`` and deliberately not a pipe.
+        DEVNULL threw away the only evidence of why a dispatch failed. A pipe
+        would be worse than either: this child must OUTLIVE us, and a pipe's
+        read end dies with us, so a successful restart would leave the child
+        taking EPIPE on its next stderr write — we would be breaking the very
+        restart we are trying to perform. A chatty child would also block on a
+        full pipe buffer that nobody is reading. A file has neither problem
+        and still survives for us to read.
         """
         cmd: List[str]
         kestrel_bin = shutil.which("kestrel")
@@ -1593,14 +1679,288 @@ class RestartCoordinatorFeature(Feature):
         logger.info(
             "restart_coordinator: spawning detached restart %s", cmd,
         )
-        subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            close_fds=True,
+        stderr_file = tempfile.NamedTemporaryFile(
+            prefix="kestrel-restart-", suffix=".err", delete=False,
         )
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_file,
+                start_new_session=True,
+                close_fds=True,
+            )
+        finally:
+            # Our copy of the descriptor is not needed once the child holds
+            # one; the path is what we read back.
+            stderr_file.close()
+        # Carried on the handle so the watchdog can find it without threading
+        # a second value through every call site.
+        proc._kestrel_stderr_path = stderr_file.name  # type: ignore[attr-defined]
+        logger.info(
+            "restart_coordinator: restart subprocess pid=%s (stderr: %s)",
+            proc.pid, stderr_file.name,
+        )
+        return proc
+
+    def _restart_dispatch_failure(
+        self, proc: subprocess.Popen,
+    ) -> Optional[str]:
+        """Why the restart dispatch failed, or ``None`` if it looks healthy.
+
+        A successful restart kills THIS process, so still being alive while
+        the child has already exited means the restart did not happen.
+
+        Only an integer exit status counts as evidence. Anything else —
+        a still-running child, or a handle that cannot report a status —
+        returns ``None``: claiming a failure we cannot demonstrate would
+        bounce a restart that is actually in flight.
+        """
+        try:
+            returncode = proc.poll()
+        except Exception:  # pragma: no cover - defensive
+            return None
+        if not isinstance(returncode, int):
+            return None
+        # The child is gone and we are not. Read what it said on the way out.
+        detail = self._read_restart_stderr_tail(proc)
+        reason = (
+            f"restart subprocess (pid {proc.pid}) exited {returncode} "
+            "without restarting the host"
+        )
+        return f"{reason}: {detail}" if detail else reason
+
+    @staticmethod
+    def _sweep_orphaned_restart_stderr(max_age_seconds: int = 86400) -> int:
+        """Delete restart stderr files left behind by SUCCESSFUL restarts.
+
+        The failure path cleans up its own file when it reads the tail. The
+        success path cannot: the restart kills this process mid-flight, so the
+        file is orphaned by definition. Without a sweep that is one small file
+        per restart, forever. Best-effort — a restart must never fail because
+        housekeeping did.
+        """
+        removed = 0
+        cutoff = time.time() - max_age_seconds
+        try:
+            candidates = glob.glob(
+                os.path.join(tempfile.gettempdir(), "kestrel-restart-*.err")
+            )
+        except OSError:  # pragma: no cover - defensive
+            return 0
+        for path in candidates:
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.unlink(path)
+                    removed += 1
+            except OSError:
+                continue
+        if removed:
+            logger.info(
+                "restart_coordinator: swept %d orphaned restart stderr "
+                "file(s)", removed,
+            )
+        return removed
+
+    @staticmethod
+    def _read_restart_stderr_tail(proc) -> str:
+        """Last stderr line of a dead restart child, and clean up its file."""
+        path = getattr(proc, "_kestrel_stderr_path", None)
+        if not path:
+            return ""
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                # Bounded: a failing child can be arbitrarily chatty and this
+                # string ends up in a status reason and a log line.
+                lines = fh.read(_OUTPUT_TAIL_CHARS).strip().splitlines()
+            return lines[-1] if lines else ""
+        except OSError:
+            return ""
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def _arm_restart_dispatch_watch(self, proc, request_id: str) -> bool:
+        """Start the dispatch watchdog, if this host can carry one.
+
+        A host with no background-task machinery (embedded runtime, test
+        double) cannot supervise the child. That must not fail the restart
+        itself — it only means this row's recovery falls to
+        ``_reconcile_stranded_executing_rows``, which needs no task at all.
+        Returns whether the watch was armed.
+        """
+        if not callable(getattr(self.agent, "_track_background_task", None)):
+            logger.debug(
+                "restart_coordinator: no background-task support; restart "
+                "dispatch for %s falls back to the stranded-row sweep",
+                request_id,
+            )
+            return False
+        self._track_owned_background_task(
+            self._watch_restart_dispatch(proc, request_id),
+            name=f"restart_dispatch_watch:{request_id}",
+        )
+        return True
+
+    async def _watch_restart_dispatch(self, proc, request_id: str) -> None:
+        """Recover the row if the detached restart dies instead of restarting.
+
+        Runs as a background task rather than inline: the coordinator tick
+        must not block for the grace window, and on the happy path this
+        process is killed mid-wait and the task simply never finishes.
+
+        Without this the failure had no record at all — ``Popen`` returning is
+        not evidence the restart happened, so the row sat ``executing``
+        forever with ``completed_at`` null and no error event, while the host
+        kept running old code with the update's new dependencies already
+        installed underneath it (#2667).
+        """
+        # POLL to the deadline rather than checking once at the end. The
+        # realistic failure — ``os.kill`` refused (EPERM: host under another
+        # uid, pid-file mismatch) — has ``cmd_stop`` burn ~5.5s on
+        # SIGTERM/poll/SIGKILL before ``cmd_start`` fails on the port, so the
+        # child dies around 7-10s. A single check at 10.0s is a coin flip
+        # against that, and losing it means the watchdog declares the dispatch
+        # healthy and recovery silently falls through to the 600s reconciler.
+        # We are alive for the whole window by definition, so polling is free.
+        grace = getattr(
+            self, "_restart_dispatch_grace", RESTART_DISPATCH_GRACE_SECONDS,
+        )
+        deadline = time.monotonic() + grace
+        reason = None
+        while True:
+            reason = self._restart_dispatch_failure(proc)
+            if reason is not None:
+                break
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(min(_DISPATCH_POLL_SECONDS, grace))
+        if reason is None:
+            return
+        logger.error("restart_coordinator: %s", reason)
+        row = await get_request(self._db, request_id)
+        if row is None or row.status != "executing":
+            return
+
+        # Returning the row to ``pending`` means the next tick re-dispatches.
+        # For a permanently broken restart (missing binary, a uid that cannot
+        # signal the host) that turns "stuck forever" into "flaps forever":
+        # a doomed subprocess every minute, each with its own status event and
+        # error log. After a few identical failures in this boot, stop and say
+        # so terminally instead of retrying into the same wall.
+        attempts = self._dispatch_failures.get(request_id, 0) + 1
+        self._dispatch_failures[request_id] = attempts
+        give_up = attempts >= MAX_RESTART_DISPATCH_ATTEMPTS
+        next_status = "rejected" if give_up else "pending"
+        next_reason = (
+            f"{reason}; giving up after {attempts} dispatch attempts this boot"
+            if give_up else reason
+        )
+
+        moved = await update_status(
+            self._db, request_id,
+            status=next_status,
+            status_reason=next_reason,
+            completed_at=(
+                datetime.now(timezone.utc).isoformat() if give_up else None
+            ),
+            expected_current_status="executing",
+        )
+        if not moved:
+            return
+        self._executing_since.pop(request_id, None)
+        if give_up:
+            self._dispatch_failures.pop(request_id, None)
+            logger.error(
+                "restart_coordinator: rejecting restart %s after %d failed "
+                "dispatch attempts", request_id, attempts,
+            )
+        await self._emit_status_event(
+            row, state=next_status,
+            **(
+                {"status_reason": next_reason} if give_up
+                else {"deferral_reason": next_reason}
+            ),
+        )
+
+    async def _reconcile_stranded_executing_rows(self) -> List[str]:
+        """Return rows this boot stranded in ``executing`` to ``pending``.
+
+        A row stamped with THIS process's boot id is a restart that was
+        dispatched but never happened — a restart that HAD happened would be
+        running a different process with a different id. Past
+        ``STALE_EXECUTING_SECONDS`` it is not "still in flight", it is stuck.
+
+        Before this, nothing could move such a row: the coordinator scans only
+        pending/approved, and ``cancel_restart_request`` refuses executing
+        rows. It sat there permanently, and worse, the NEXT unrelated restart
+        would see a row whose ``executing_boot_id`` no longer matches the new
+        process and terminalize it as "completed — post-restart sweep observed
+        agent re-init", reporting success for a restart that never ran (#2667).
+
+        Returns the ids reset, for the caller's audit trail.
+        """
+        if self._db is None:
+            return []
+        reset: List[str] = []
+        now = time.monotonic()
+        for row in await list_requests(self._db, status="executing"):
+            if row.executing_boot_id != _PROCESS_BOOT_ID:
+                # A prior boot's row: the restart provably happened, so this
+                # belongs to the post-restart wake sweep, not here.
+                continue
+            # Age is measured from when THIS process crossed the row into
+            # ``executing``, not from ``requested_at`` — a row that queued for
+            # hours before dispatch would otherwise look instantly stale.
+            started = self._executing_since.get(row.id)
+            if started is not None and (now - started) < STALE_EXECUTING_SECONDS:
+                continue
+            if started is None:
+                # Stamped by this process but absent from the in-flight map:
+                # the dispatch that owned it is gone (feature reload, cancelled
+                # task) and nothing is waiting on it.
+                #
+                # This branch must still wait. ``_PROCESS_BOOT_ID`` is
+                # module-scoped but the map is per-INSTANCE, so a feature
+                # reload inside the same process starts with an empty map and
+                # would otherwise take this branch — with no age check at all —
+                # and reset a dispatch the previous instance started moments
+                # ago. Requiring this instance to have been up for the same
+                # window closes that, since a genuinely stranded row is going
+                # nowhere and can wait.
+                if (now - self._instance_started_at) < STALE_EXECUTING_SECONDS:
+                    continue
+                reason = (
+                    "restart row is executing under this process with no "
+                    "dispatch in flight; the restart did not happen"
+                )
+            else:
+                reason = (
+                    "restart dispatched but this process is still running "
+                    f"after {STALE_EXECUTING_SECONDS}s; the restart did not "
+                    "happen"
+                )
+            moved = await update_status(
+                self._db, row.id,
+                status="pending",
+                status_reason=reason,
+                expected_current_status="executing",
+            )
+            if not moved:
+                continue
+            self._executing_since.pop(row.id, None)
+            logger.error(
+                "restart_coordinator: recovered stranded executing row %s "
+                "(%s)", row.id, reason,
+            )
+            await self._emit_status_event(
+                row, state="pending", deferral_reason=reason,
+            )
+            reset.append(row.id)
+        return reset
 
     async def _reset_interrupted_updates(self) -> None:
         """Reset rows stuck in ``updating`` back to ``pending`` for retry.
