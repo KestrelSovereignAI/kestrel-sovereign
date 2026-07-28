@@ -117,18 +117,22 @@ jobs:
         # ``-n auto`` parallelizes across runner cores via pytest-xdist
         # (already a dev dep). Note that ``auto`` resolves to **2 workers**
         # on the standard GitHub-hosted runner, not the 16 an earlier
-        # revision of this comment assumed — 12.4k tests land at ~8 min.
-        # Runner sizing is tracked in #2795. The PYTHONHASHSEED env at the
-        # workflow level keeps parametrize ordering deterministic across
-        # workers.
+        # revision of this comment assumed — 12.4k tests take ~5 min across
+        # five observed runs (one outlier at 8). Runner sizing is tracked in
+        # #2795. The PYTHONHASHSEED env at the workflow level keeps
+        # parametrize ordering deterministic across workers.
         #
-        # No ``-m "not bench"`` here, deliberately. The unit tier's only
-        # benchmark (test_50k_nodes_per_agent_query_under_50ms) runs in
-        # 0.4s locally / ~0.9s in CI — 0.2% of this job — and it is the
-        # only CI enforcement of the "<50ms per-agent query over 50k nodes"
-        # index SLA. Skipping it would buy under a second and give up the
-        # regression guard that would catch a dropped JSON-path index.
-        # The integration tier does exclude benchmarks; see below for why.
+        # No ``-m "not bench"`` here, deliberately — but only because the
+        # tier's one benchmark
+        # (test_50k_nodes_per_agent_query_under_50ms) costs 0.4s locally,
+        # under 0.3% of this job. It is not worth filtering out.
+        #
+        # Do NOT read that as "it guards the JSON-path indexes". Verified by
+        # mutation: with every SQLite JSON-path index removed, that
+        # benchmark still passes, and so does the structural
+        # TestIndexUsage::test_agent_status_query_uses_index. The only tests
+        # that fail are the by-name existence checks in TestJsonPathIndexes.
+        # See #2798. The integration tier does exclude benchmarks; below.
         run: uv run pytest tests/unit/ -n auto -v --tb=short -x --timeout=60
         timeout-minutes: 10
         env:
@@ -289,11 +293,14 @@ jobs:
   # "123 passed, 70 skipped in 9.88s".
   #
   # That is a property of the current secret configuration, NOT of the test
-  # suite's design. Roughly nine tests across tests/llm/ gate on a bare
-  # `OPENAI_API_KEY` check without also requiring the `live` marker or
-  # KESTREL_LIVE_TESTS. If someone adds OPENAI_API_KEY as a repo secret,
-  # those start issuing real provider calls on every PR — including PRs
-  # whose unit tier is red. Gate them properly before adding the secret.
+  # suite's design. Seven tests gate on a bare `OPENAI_API_KEY` check
+  # without also requiring KESTREL_LIVE_TESTS — three in
+  # tests/llm/test_token_tracking.py, four in
+  # tests/llm/test_streaming_tool_detection.py. If someone adds
+  # OPENAI_API_KEY as a repo secret, those start issuing real provider
+  # calls on every PR, including PRs whose unit tier is red. Gate them
+  # properly before adding the secret. (The pair in test_openai_adapter.py
+  # is already correctly gated on KESTREL_LIVE_TESTS=1 as well.)
   llm-tests:
     runs-on: ubuntu-latest
     needs: lint-and-imports
