@@ -3442,3 +3442,478 @@ async def test_repeated_dispatch_failures_stop_rather_than_flap(tmp_path):
     )
     assert "giving up" in row.status_reason
     assert row.completed_at is not None
+
+
+# ---------------------------------------------------------------------------
+# #2774 — schema migration is one atomic step, and a wake's DISPATCH is
+# recorded separately from its DELIVERY.
+#
+# ``wake_delivered`` only flips once the woken cognition turn returns
+# Status.OK, i.e. strictly after that turn ends. So the turn a wake wakes can
+# never observe the flag as true, and a row mid-delivery is indistinguishable
+# from one whose wake never fired at all. That made the field unusable as
+# negative evidence — the report that opened #2774 was a row recording
+# ``wake_delivered: false`` for a wake whose own consumer was reading it.
+# ---------------------------------------------------------------------------
+
+
+# The #1512 schema, before anything in ``_ADDED_COLUMNS`` existed.
+_ORIGINAL_1512_COLUMNS = (
+    "id TEXT PRIMARY KEY, requested_by_agent TEXT NOT NULL, "
+    "reason TEXT NOT NULL, requested_at TEXT NOT NULL, "
+    "desired_window TEXT DEFAULT '', urgency TEXT DEFAULT 'normal', "
+    "policy TEXT DEFAULT 'idle_agents_only', status TEXT DEFAULT 'pending', "
+    "status_reason TEXT DEFAULT '', completed_at TEXT"
+)
+
+
+async def _db_at_schema(tmp_path, filename, *, through_column=None):
+    """A ``restart_requests`` table frozen at a historical schema point.
+
+    ``through_column`` names the newest ``_ADDED_COLUMNS`` entry the table
+    has; everything after it is absent, exactly as on a database last touched
+    by that release. ``None`` gives the original #1512 table.
+
+    Derived from ``_ADDED_COLUMNS`` rather than hand-copied so a test cannot
+    quietly describe a schema that never shipped.
+    """
+    from kestrel_sovereign.features.restart_coordinator.store import (
+        _ADDED_COLUMNS,
+    )
+
+    cols = [_ORIGINAL_1512_COLUMNS]
+    if through_column is not None:
+        names = [c for c, _ in _ADDED_COLUMNS]
+        assert through_column in names, (
+            f"{through_column} is not an _ADDED_COLUMNS entry"
+        )
+        for col, col_def in _ADDED_COLUMNS:
+            cols.append(f"{col} {col_def}")
+            if col == through_column:
+                break
+
+    raw = SQLiteBackend(str(tmp_path / filename))
+    await raw.connect()
+    db = _track_test_database(AsyncDatabase(raw))
+    await db.execute(f"CREATE TABLE restart_requests ({', '.join(cols)})")
+    return db
+
+
+async def _insert_raw(db, request_id, **cols):
+    """Insert a row through raw SQL, bypassing the store's column contract.
+
+    Migration tests must be able to write rows a *pre-migration* build could
+    have written, which ``insert_request`` cannot express.
+    """
+    fields = {
+        "id": request_id,
+        "requested_by_agent": "did:test:agent",
+        "reason": "r",
+        "requested_at": "t",
+        **cols,
+    }
+    names = ", ".join(fields)
+    marks = ", ".join("?" for _ in fields)
+    await db.execute(
+        f"INSERT INTO restart_requests ({names}) VALUES ({marks})",
+        tuple(fields.values()),
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_interrupted_backfill_rolls_back_its_column_too(
+    tmp_path, monkeypatch,
+):
+    """A column and its legacy backfill land together or not at all.
+
+    The previous implementation ran each ALTER as its own statement and
+    inferred "already migrated" from the column merely existing. A process
+    that died between the ALTER committing and the backfill running left a
+    state no later boot could detect: the column was present, so every
+    subsequent boot skipped the backfill forever. For ``wake_delivered`` that
+    means every historical completed restart stays eligible for the sweep and
+    gets re-woken, every tick, permanently.
+
+    One transaction removes that state from the state space rather than adding
+    a ledger to detect it.
+    """
+    from kestrel_sovereign.features.restart_coordinator import store as rc_store
+
+    db = await _db_at_schema(
+        tmp_path, "interrupted.db", through_column="origin_session_id",
+    )
+    await _insert_raw(db, "old-done", status="completed", completed_at="t")
+
+    broken = dict(rc_store._COLUMN_BACKFILLS)
+    broken["wake_delivered"] = (
+        "UPDATE restart_requests SET no_such_column = 1", (),
+    )
+    monkeypatch.setattr(rc_store, "_COLUMN_BACKFILLS", broken)
+
+    with pytest.raises(Exception):
+        await ensure_restart_requests_table(db)
+
+    assert not await db._column_exists("restart_requests", "wake_delivered"), (
+        "the column must roll back with its own failed backfill — committing "
+        "it strands the backfill permanently, because every later boot sees "
+        "the column and skips"
+    )
+
+    # The next boot, with the backfill working, completes the whole migration.
+    monkeypatch.undo()
+    await ensure_restart_requests_table(db)
+    assert await db._column_exists("restart_requests", "wake_delivered")
+    assert (await get_request(db, "old-done")).wake_delivered is True, (
+        "the retry must run the backfill it previously rolled back"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_failed_alter_is_never_mistaken_for_an_existing_column(
+    tmp_path, monkeypatch,
+):
+    """An ALTER that fails for a real reason must fail the migration.
+
+    The previous code wrapped every ALTER in ``except Exception: continue``
+    with the comment "column already exists — expected on every non-first
+    run". A lock timeout, disk pressure, or a Postgres permission error is
+    indistinguishable there, and because every SELECT projects the full column
+    list, one silently-skipped ALTER makes each subsequent read raise for the
+    rest of the boot while this function still reports the table ready.
+    """
+    db = await _db_at_schema(
+        tmp_path, "failed-alter.db", through_column="origin_session_id",
+    )
+
+    async def _disk_full(self, table, column, col_def):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(AsyncDatabase, "_migrate_add_column", _disk_full)
+
+    with pytest.raises(Exception, match="disk full"):
+        await ensure_restart_requests_table(db)
+
+
+@pytest.mark.asyncio
+async def test_a_silently_skipped_column_fails_instead_of_reporting_ready(
+    tmp_path, monkeypatch,
+):
+    """The post-migration check is what makes "table ready" mean something.
+
+    Modelled on an ALTER that neither raises nor adds the column — the shape a
+    mis-scoped Postgres ``information_schema`` lookup produces, where the
+    migration is skipped as already-applied and any verification asking the
+    same wrong question agrees.
+    """
+    db = await _db_at_schema(
+        tmp_path, "skipped.db", through_column="origin_session_id",
+    )
+    real = AsyncDatabase._migrate_add_column
+
+    async def _skip_one(self, table, column, col_def):
+        if column == "wake_dispatch_count":
+            return
+        await real(self, table, column, col_def)
+
+    monkeypatch.setattr(AsyncDatabase, "_migrate_add_column", _skip_one)
+
+    with pytest.raises(Exception, match="wake_dispatch_count"):
+        await ensure_restart_requests_table(db)
+
+    monkeypatch.undo()
+    assert not await db._column_exists("restart_requests", "wake_delivered"), (
+        "a migration that cannot complete must leave nothing behind, so the "
+        "next boot starts from the same place rather than a partial schema"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_dispatch_sentinel_marks_delivered_rows_not_completed_ones(
+    tmp_path,
+):
+    """Legacy rows get dispatch evidence only where a wake actually landed.
+
+    ``pre-migration`` means "delivered under the old flow; whether a wake was
+    dispatched is unrecoverable" — it is deliberately not a claim that one
+    was, because some of those rows provably had none (a host with no usable
+    dispatcher marks a row delivered without sending anything). Its job is to
+    keep '' meaning "no wake was ever dispatched for this row", which is the
+    negative evidence #2774 needs.
+
+    So the sentinel is keyed on ``wake_delivered``, never on ``status``: a
+    completed-but-undelivered row is one the sweep is still retrying.
+    """
+    from kestrel_sovereign.features.restart_coordinator.store import (
+        PRE_MIGRATION_BOOT_ID,
+    )
+
+    db = await _db_at_schema(
+        tmp_path, "sentinel.db", through_column="wake_delivered",
+    )
+    await _insert_raw(
+        db, "delivered", status="completed", completed_at="t", wake_delivered=1,
+    )
+    await _insert_raw(
+        db, "undelivered", status="completed", completed_at="t",
+        wake_delivered=0,
+    )
+
+    await ensure_restart_requests_table(db)
+
+    assert (
+        await get_request(db, "delivered")
+    ).wake_dispatch_boot_id == PRE_MIGRATION_BOOT_ID
+    assert (await get_request(db, "undelivered")).wake_dispatch_boot_id == "", (
+        "a completed row whose wake never landed is still being retried; "
+        "stamping it would forge evidence of a dispatch that never happened"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_sentinel_backfill_never_reruns_on_a_migrated_database(
+    tmp_path,
+):
+    """Backfills are gated on the schema, so they cannot touch live rows twice.
+
+    A wake dispatched after the migration whose stamp was lost (the same
+    SQLite lock contention that cost #2660 its 2,045 signal_log writes) leaves
+    a delivered row with an empty stamp — indistinguishable, by value, from a
+    legacy row. Any gate other than "am I the one adding this column" re-runs
+    the sentinel over it and invents a dispatch record.
+    """
+    # The case with teeth: a LATER column is still missing, so the migration
+    # runs for real rather than short-circuiting on the fast path. The
+    # sentinel's own column is already present, so its backfill must not fire.
+    db = await _db_at_schema(
+        tmp_path, "partial.db", through_column="wake_dispatch_boot_id",
+    )
+    await _insert_raw(
+        db, "stamp-lost", status="completed", completed_at="t",
+        wake_delivered=1, wake_dispatch_boot_id="",
+    )
+
+    await ensure_restart_requests_table(db)
+
+    assert await db._column_exists("restart_requests", "wake_dispatch_count"), (
+        "the missing column must still be added — this is a real migration"
+    )
+    assert (await get_request(db, "stamp-lost")).wake_dispatch_boot_id == "", (
+        "this row was delivered by the CURRENT code, which stamps on "
+        "dispatch; an empty stamp here is a lost write, not a legacy row"
+    )
+
+    # And on a fully-migrated database the migration is not entered at all.
+    # ``ensure_restart_requests_table`` runs on every agent init, and entering
+    # takes SQLite's single writer slot (BEGIN IMMEDIATE) — the same
+    # every-boot cost #2649 gated its ownership backfills behind.
+    fresh = await _backend(tmp_path)
+    await _insert_raw(
+        fresh, "post-migration", status="completed", completed_at="t",
+        wake_delivered=1,
+    )
+    with patch.object(
+        AsyncDatabase, "migration_lock", side_effect=AssertionError(
+            "a database with nothing missing must not take the writer slot"
+        ),
+    ):
+        await ensure_restart_requests_table(fresh)
+    assert (
+        await get_request(fresh, "post-migration")
+    ).wake_dispatch_boot_id == ""
+
+
+@pytest.mark.asyncio
+async def test_every_dispatch_is_counted_so_a_wake_storm_shows_in_the_row(
+    tmp_path,
+):
+    """#2738 was ~18 re-emissions inside one boot. Recording only the first
+    dispatch would have shown a single timestamp for the whole event."""
+    from kestrel_sovereign.features.restart_coordinator.store import (
+        mark_wake_dispatched,
+    )
+
+    db = await _backend(tmp_path)
+    req = await insert_request(
+        db, requested_by_agent="did:test:agent", reason="storm",
+    )
+
+    for i in range(3):
+        assert await mark_wake_dispatched(
+            db, req.id, dispatched_at=f"t{i}", boot_id="boot-1",
+        ) is True
+
+    row = await get_request(db, req.id)
+    assert row.wake_dispatch_count == 3
+    assert row.wake_dispatched_at == "t2", "the stamp is the LATEST dispatch"
+    assert row.wake_dispatch_boot_id == "boot-1"
+
+    assert await mark_wake_dispatched(
+        db, "no-such-request", dispatched_at="t", boot_id="boot-1",
+    ) is False, "a write that matched no row must report that it did not land"
+
+
+@pytest.mark.asyncio
+async def test_the_dispatch_is_stamped_before_the_signal_is_handed_over(
+    tmp_path, monkeypatch,
+):
+    """Ordering, asserted directly rather than inferred from a race.
+
+    ``enqueue_signal`` starts the dispatch immediately, so every await after
+    it is a point at which the woken turn may already be running and reading
+    the row. Stamping afterwards — even one await later — races the very
+    reader the stamp exists for, and on a Postgres pool the two run on
+    different connections concurrently. Observing the stamp from inside the
+    turn (the test below) can pass on timing alone; this pins the mechanism.
+    """
+    import kestrel_sovereign.features.restart_coordinator.feature as fm
+
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="pre-restart",
+    )
+    await update_status(
+        backend, req.id, status="executing", expected_current_status="pending",
+    )
+    await feat.initialize()
+
+    order: list[str] = []
+    real_enqueue = agent.dispatcher.enqueue_signal
+    real_mark = fm.mark_wake_dispatched
+
+    def _record_enqueue(signal):
+        order.append("enqueue")
+        return real_enqueue(signal)
+
+    async def _record_mark(*args, **kwargs):
+        order.append("stamp")
+        return await real_mark(*args, **kwargs)
+
+    agent.dispatcher.enqueue_signal = _record_enqueue
+    monkeypatch.setattr(fm, "mark_wake_dispatched", _record_mark)
+
+    await asyncio.gather(*await feat.on_agent_ready())
+
+    assert order == ["stamp", "enqueue"], (
+        f"the dispatch stamp must be durable before the dispatcher can start "
+        f"the turn that reads it; got {order}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_woken_turn_can_see_that_its_own_wake_was_dispatched(
+    tmp_path,
+):
+    """The whole point of #2774, asserted from inside the woken turn.
+
+    ``wake_delivered`` is set from the acknowledgement of ``handle.wait()``,
+    which resolves only after ``process_input`` returns — so during the turn
+    it is necessarily still 0. Reading it there and concluding "no wake fired"
+    is what made the reported row contradict its own consumer. The dispatch
+    stamp is written before the turn starts and answers the question the flag
+    structurally cannot.
+    """
+    from kestrel_sovereign.features.restart_coordinator.feature import (
+        _PROCESS_BOOT_ID,
+    )
+
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="pre-restart",
+    )
+    await update_status(
+        backend, req.id, status="executing", expected_current_status="pending",
+    )
+
+    seen: dict = {}
+    original = agent.process_input
+
+    async def _observe_from_inside_the_turn(prompt, session_id=None):
+        row = await get_request(backend, req.id)
+        seen["dispatched_at"] = row.wake_dispatched_at
+        seen["boot_id"] = row.wake_dispatch_boot_id
+        seen["count"] = row.wake_dispatch_count
+        seen["delivered"] = row.wake_delivered
+        return await original(prompt, session_id=session_id)
+
+    agent.process_input = _observe_from_inside_the_turn
+
+    await feat.initialize()
+    await asyncio.gather(*await feat.on_agent_ready())
+
+    assert seen, "the wake never reached a turn"
+    assert seen["dispatched_at"], (
+        "the dispatch must be stamped BEFORE handle.wait() runs the turn; "
+        "stamped afterwards it is invisible to the turn that would read it"
+    )
+    assert seen["boot_id"] == _PROCESS_BOOT_ID
+    assert seen["count"] == 1
+    assert seen["delivered"] is False, (
+        "wake_delivered cannot be true inside the turn its own wake started — "
+        "that asymmetry is what #2774 reported, not a bug to fix here"
+    )
+
+    # And delivery is still recorded once the turn returns.
+    assert (await get_request(backend, req.id)).wake_delivered is True
+
+
+@pytest.mark.asyncio
+async def test_a_lost_dispatch_stamp_is_reported_and_never_blocks_the_wake(
+    tmp_path, caplog,
+):
+    """Observability is best-effort, but its failure is not silent.
+
+    These columns exist to BE the record of a dispatch, so dropping the write
+    without a word is the same asymmetry that made ``wake_delivered``
+    untrustworthy.
+    """
+    feat, _ = await _make_feature(tmp_path)
+    ghost = SimpleNamespace(
+        id="does-not-exist", wake_dispatched_at="",
+        wake_dispatch_boot_id="", wake_dispatch_count=0,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        await feat._mark_wake_dispatched(ghost)
+
+    assert ghost.wake_dispatched_at == "", (
+        "the in-memory row must not claim a stamp the database rejected"
+    )
+    assert ghost.wake_dispatch_count == 0
+    assert any(
+        "wake dispatch stamp" in r.getMessage() for r in caplog.records
+    ), "a lost dispatch stamp must be reported at WARNING"
+
+
+@pytest.mark.asyncio
+async def test_an_unusable_schema_disables_coordinator_storage_for_the_boot(
+    tmp_path,
+):
+    """Fail closed. A half-migrated table makes every read raise, so carrying
+    on with the handle leaves the feature reporting itself enabled while
+    waking nobody for the entire boot — the failure mode the store's
+    post-migration check exists to catch, reintroduced one level up."""
+    backend = await _backend(tmp_path)
+    agent = _make_agent(backend)
+    feat = RestartCoordinatorFeature(agent)
+
+    with patch(
+        "kestrel_sovereign.features.restart_coordinator.feature."
+        "ensure_restart_requests_table",
+        side_effect=RuntimeError(
+            "restart_requests is missing column(s) after migration: "
+            "wake_dispatched_at"
+        ),
+    ), patch(
+        "kestrel_sovereign.features.restart_coordinator.feature."
+        "ensure_restart_status_events_table",
+    ) as events_table:
+        await feat.initialize()
+
+    assert feat._db is None, (
+        "an unusable schema must drop the storage handle, not just log"
+    )
+    events_table.assert_not_called()
+
+    result = await feat.list_restart_requests()
+    assert result.status is ToolResultStatus.ERROR
+    assert "storage unavailable" in result.error

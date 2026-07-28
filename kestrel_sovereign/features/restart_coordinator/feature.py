@@ -58,6 +58,7 @@ from .store import (
     list_requests,
     list_requests_needing_wake,
     mark_wake_delivered,
+    mark_wake_dispatched,
     record_update_log,
     update_status,
 )
@@ -353,9 +354,21 @@ class RestartCoordinatorFeature(Feature):
                     "RestartCoordinatorFeature: restart_requests table ready"
                 )
             except Exception as e:
-                logger.warning(
-                    "RestartCoordinatorFeature: table init failed: %s", e,
+                # Fail CLOSED. Every read projects the full column list, so a
+                # half-migrated table makes each one raise — and merely
+                # warning here left the feature reporting itself enabled while
+                # waking nobody for the whole boot, which is exactly what the
+                # store's post-migration verification exists to prevent.
+                # Dropping the handle degrades the coordinator explicitly:
+                # its tools report storage unavailable and the sweep no-ops,
+                # instead of looking healthy and doing nothing.
+                logger.error(
+                    "RestartCoordinatorFeature: restart_requests schema is "
+                    "not usable; disabling coordinator storage for this "
+                    "boot: %s", e,
                 )
+                self._db = None
+        if self._db is not None:
             try:
                 # #1562 — typed restart-status event records. Additive
                 # CREATE TABLE IF NOT EXISTS, no existing column touched.
@@ -2219,6 +2232,20 @@ class RestartCoordinatorFeature(Feature):
         if row.id in self._inflight_restart_acks:
             return None
 
+        # Stamp BEFORE the signal is handed over. ``enqueue_signal`` starts
+        # the dispatch immediately, so every await after it — this write
+        # included — is a point at which the woken turn may already be running
+        # and reading this row. A stamp written afterwards races the very turn
+        # it exists to inform: the same "recorded too late to be read" shape
+        # as ``wake_delivered``, which is the whole of #2774.
+        #
+        # It therefore records the ATTEMPT. An enqueue that raises below
+        # leaves the stamp standing, and that is the honest reading: '' still
+        # means this sweep never tried to wake the row, which is the negative
+        # evidence the ticket needs, while a failed handoff is logged and
+        # leaves the row undelivered for the next sweep to retry.
+        await self._mark_wake_dispatched(row)
+
         try:
             from kestrel_sovereign.signals.sources.restart import (
                 build_signal_for_restart_completed,
@@ -2368,3 +2395,44 @@ class RestartCoordinatorFeature(Feature):
             )
             return
         row.wake_delivered = True
+
+    async def _mark_wake_dispatched(self, row) -> None:
+        """Record the wake dispatch, before the signal is handed over (#2774).
+
+        ``wake_delivered`` cannot answer "was a wake sent for this row" during
+        the woken turn, because it is only set once that same turn returns OK.
+
+        Best-effort by design: failing to record observability must never stop
+        the wake itself, so this logs and continues. It does log, though —
+        these columns exist to BE the record of a dispatch, and losing the
+        write silently is the same asymmetry that made ``wake_delivered``
+        untrustworthy in the first place.
+        """
+        request_id = getattr(row, "id", "?")
+        dispatched_at = datetime.now(timezone.utc).isoformat()
+        try:
+            stamped = await mark_wake_dispatched(
+                self._db, row.id,
+                dispatched_at=dispatched_at,
+                boot_id=_PROCESS_BOOT_ID,
+            )
+        except Exception as e:
+            logger.warning(
+                "restart sweep: failed to record wake dispatch for %s: %s; "
+                "the wake still fires, but this dispatch leaves no record",
+                request_id, e,
+            )
+            return
+        if not stamped:
+            logger.warning(
+                "restart sweep: wake dispatch stamp for %s matched no row; "
+                "the wake still fires, but this dispatch leaves no record",
+                request_id,
+            )
+            return
+        row.wake_dispatched_at = dispatched_at
+        row.wake_dispatch_boot_id = _PROCESS_BOOT_ID
+        # Keep the in-memory row consistent with the durable count: a stale 0
+        # here is what ``to_public_dict`` and the status events built from this
+        # object mid-sweep would publish.
+        row.wake_dispatch_count = (getattr(row, "wake_dispatch_count", 0) or 0) + 1
