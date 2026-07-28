@@ -373,11 +373,41 @@ async def list_requests_needing_wake(
     return [RestartRequest.from_row(r) for r in rows]
 
 
-async def mark_wake_delivered(db, request_id: str) -> None:
-    """Flag a request's post-restart wake as delivered (#1819)."""
-    await db.execute(
+async def _write_landed(db, result: Any, request_id: str, verify) -> bool:
+    """Did an ``UPDATE`` actually change a row?
+
+    The single contract for this module. Extracted from ``update_status``,
+    which has always checked this correctly, so the two cannot drift: the
+    project's SQLite/Postgres backends return the integer rowcount directly
+    from ``execute``, and only a legacy cursor-style backend needs the
+    re-read. ``verify`` confirms the intended change on that last path.
+    """
+    if isinstance(result, int):
+        return result > 0
+    rowcount = getattr(result, "rowcount", None)
+    if isinstance(rowcount, int):
+        return rowcount > 0
+    row = await get_request(db, request_id)
+    return row is not None and verify(row)
+
+
+async def mark_wake_delivered(db, request_id: str) -> bool:
+    """Flag a request's post-restart wake as delivered (#1819).
+
+    Returns whether the write actually landed. It previously returned ``None``
+    and discarded the rowcount ``execute`` hands back — the same value its
+    sibling ``update_status`` treats as authoritative twenty lines away. So a
+    write that matched no row was indistinguishable from one that succeeded,
+    ``wake_delivered`` stayed 0 with nothing recorded anywhere, and the next
+    sweep rediscovered the row and re-emitted a completion wake the agent had
+    already consumed — once a minute, for eighteen minutes (#2738).
+    """
+    result = await db.execute(
         "UPDATE restart_requests SET wake_delivered = 1 WHERE id = ?",
         (request_id,),
+    )
+    return await _write_landed(
+        db, result, request_id, lambda row: row.wake_delivered,
     )
 
 
@@ -443,15 +473,7 @@ async def update_status(
         sql += " AND status = ?"
         params_final.append(expected_current_status)
     result = await db.execute(sql, tuple(params_final))
-    # The project SQLite/Postgres backends return the integer
-    # rowcount directly from ``execute``. Treat the int form as
-    # authoritative (>0 = updated, 0 = expected-status mismatch
-    # i.e. lost the race). Only fall back to SELECT for legacy
-    # cursor-style backends.
-    if isinstance(result, int):
-        return result > 0
-    rowcount = getattr(result, "rowcount", None)
-    if isinstance(rowcount, int):
-        return rowcount > 0
-    row = await get_request(db, request_id)
-    return row is not None and row.status == status
+    # >0 = updated; 0 = expected-status mismatch, i.e. lost the race.
+    return await _write_landed(
+        db, result, request_id, lambda row: row.status == status,
+    )

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import shutil
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -2929,3 +2930,114 @@ async def test_idle_gate_reason_carries_task_names_end_to_end(tmp_path):
     finally:
         blocker.cancel()
         await asyncio.gather(blocker, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# #2738 — a lost wake_delivered write must never pass for a successful one
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mark_wake_delivered_reports_whether_the_write_landed(tmp_path):
+    """It previously returned ``None`` and discarded the rowcount, so callers
+    could not tell a persisted flag from a lost one."""
+    from kestrel_sovereign.features.restart_coordinator.store import (
+        mark_wake_delivered,
+    )
+
+    backend = await _backend(tmp_path)
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="r",
+    )
+
+    assert await mark_wake_delivered(backend, req.id) is True
+    assert await mark_wake_delivered(backend, "no-such-request") is False
+
+
+@pytest.mark.asyncio
+async def test_lost_wake_delivered_write_is_reported_not_swallowed(
+    tmp_path, caplog,
+):
+    """The failure used to be swallowed at DEBUG while the in-memory row was
+    marked delivered anyway — so the row claimed a delivery the database never
+    recorded, and the sweep re-emitted forever with nothing saying why."""
+    feat, _agent = await _make_feature(tmp_path)
+    ghost = SimpleNamespace(id="does-not-exist", wake_delivered=False)
+
+    with caplog.at_level(logging.WARNING):
+        await feat._mark_wake_delivered(ghost)
+
+    assert ghost.wake_delivered is False, (
+        "a write that matched no row must not report success"
+    )
+    assert any(
+        "matched no row" in r.getMessage() for r in caplog.records
+    ), "a lost wake_delivered write must be reported at WARNING"
+
+
+@pytest.mark.asyncio
+async def test_a_lost_write_never_claims_delivery_across_repeated_sweeps(
+    tmp_path, caplog,
+):
+    """When the write is LOST the sweep keeps re-emitting — that is the retry
+    guarantee working. What must not happen is the pre-fix behaviour, where the
+    row was marked delivered in memory anyway.
+
+    The happy path alone would NOT catch this: the pre-fix code's write also
+    landed when nothing went wrong, and #2738 only manifests when it does not.
+    """
+    from kestrel_sovereign.features.restart_coordinator import feature as fm
+
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="pre-restart",
+    )
+    await update_status(
+        backend, req.id, status="executing",
+        expected_current_status="pending",
+    )
+    await feat.initialize()
+
+    async def _lost_write(db, request_id):
+        return False
+
+    original = fm.mark_wake_delivered
+    fm.mark_wake_delivered = _lost_write
+    try:
+        with caplog.at_level(logging.WARNING):
+            for _ in range(3):
+                tasks = await feat._reap_post_restart_rows()
+                if tasks:
+                    await asyncio.gather(*tasks)
+                await agent.drain_background_tasks()
+    finally:
+        fm.mark_wake_delivered = original
+
+    row = await get_request(backend, req.id)
+    assert row.wake_delivered is False, (
+        "the row must never claim a delivery the database did not record"
+    )
+    assert any("matched no row" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_repeated_sweeps_emit_exactly_one_completion_wake(tmp_path):
+    """With the write landing, repeated sweeps produce exactly ONE wake."""
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="pre-restart",
+    )
+    await update_status(
+        backend, req.id, status="executing",
+        expected_current_status="pending",
+    )
+    await feat.initialize()
+
+    for _ in range(5):
+        tasks = await feat._reap_post_restart_rows()
+        if tasks:
+            await asyncio.gather(*tasks)
+        await agent.drain_background_tasks()
+
+    assert len(agent.process_input_calls) == 1
+    assert (await get_request(backend, req.id)).wake_delivered is True
