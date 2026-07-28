@@ -325,9 +325,23 @@ def _secure_storage_tree(root: Path) -> None:
             raise PhoenixStorageError(
                 f"Phoenix storage contains a special file; refusing custody: {path}"
             )
-        if st.st_nlink != 1:
+        # ``DirEntry.stat()`` above is the fast cached path (Win32
+        # FindFirstFile/FindNextFile data on Windows) and does not reliably
+        # populate ``st_nlink`` there — it reports 0 for perfectly normal,
+        # single-link files. A full ``os.stat()`` call forces the real
+        # syscall (GetFileInformationByHandle) and reports the correct
+        # count. Without this, the hard-link check below always raises on
+        # Windows, permanently refusing Phoenix custody regardless of the
+        # file's actual state.
+        try:
+            nlink = os.stat(path, follow_symlinks=False).st_nlink
+        except OSError as exc:
             raise PhoenixStorageError(
-                f"Phoenix storage file has {st.st_nlink} hard links; exclusive "
+                f"cannot inspect Phoenix storage entry {path}: {exc}"
+            ) from exc
+        if nlink != 1:
+            raise PhoenixStorageError(
+                f"Phoenix storage file has {nlink} hard links; exclusive "
                 f"custody cannot be established: {path}"
             )
         try:
