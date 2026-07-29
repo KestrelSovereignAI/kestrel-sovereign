@@ -3,7 +3,8 @@ name: Kestrel CI
 on:
   push:
     branches:
-      - 'main'     # Run on main pushes — lint-and-imports only (see `if:` on heavier jobs)
+      - 'main'     # Run on main pushes — lint, unit and the 3.14 install check.
+                   # integration-tests and llm-tests skip themselves (see their `if:`).
       - 'issue-*'  # Run on kestrel-talon feature branches
   pull_request:
     branches: [main, 'epic/**']  # Run on PRs targeting main and epic branches
@@ -114,10 +115,24 @@ jobs:
 
       - name: Run unit tests
         # ``-n auto`` parallelizes across runner cores via pytest-xdist
-        # (already a dev dep). Local benchmark on the unit suite: ~5 min
-        # serial → ~45 sec under -n auto on a 16-core runner. The
-        # PYTHONHASHSEED env at the workflow level keeps parametrize
-        # ordering deterministic across workers.
+        # (already a dev dep). Note that ``auto`` resolves to **2 workers**
+        # on the standard GitHub-hosted runner, not the 16 an earlier
+        # revision of this comment assumed — 12.4k tests take ~5 min across
+        # five observed runs (one outlier at 8). Runner sizing is tracked in
+        # #2795. The PYTHONHASHSEED env at the workflow level keeps
+        # parametrize ordering deterministic across workers.
+        #
+        # No ``-m "not bench"`` here, deliberately — but only because the
+        # tier's one benchmark
+        # (test_50k_nodes_per_agent_query_under_50ms) costs 0.4s locally,
+        # under 0.3% of this job. It is not worth filtering out.
+        #
+        # Do NOT read that as "it guards the JSON-path indexes". Verified by
+        # mutation: with every SQLite JSON-path index removed, that
+        # benchmark still passes, and so does the structural
+        # TestIndexUsage::test_agent_status_query_uses_index. The only tests
+        # that fail are the by-name existence checks in TestJsonPathIndexes.
+        # See #2798. The integration tier does exclude benchmarks; below.
         run: uv run pytest tests/unit/ -n auto -v --tb=short -x --timeout=60
         timeout-minutes: 10
         env:
@@ -163,6 +178,33 @@ jobs:
   # the squash-merge adds cost without new signal. The integration +
   # llm-tests suite is also the heaviest (services, GPUs, API credits),
   # more suited to local verification and special cases. See #682.
+  #
+  # `needs: unit-tests` gates this tier behind the cheap one: don't spend
+  # ~13 min of runner time here when the unit tier is already red.
+  #
+  # That gate is about runner time and signal quality, NOT money. Linux
+  # minutes on kestrel-sovereign bill $0 — it is a public repo and they are
+  # fully discounted (2026-07: 20,016 minutes, $120.10 gross, $0.00 net).
+  # clean-install.yml documents the same cost shape, and macOS/Windows are
+  # the SKUs that do bill here. An earlier revision of this comment claimed
+  # $69/month by misreading org-wide billing rollups as this repo's; see
+  # #2793.
+  #
+  # Sizing the gate honestly: of 11 failures in the last 100 runs, 8 were
+  # this job itself and only 3 were unit-tests, so it spares a wasted run
+  # about a quarter of the time. Breaking the chain to run the tiers in
+  # parallel measured 22 min → 14.8 min and is a real improvement, but the
+  # serialization is not the dominant cost — this job's own 12.8 min is.
+  # Parallelize it (#2794) and the chained path lands near 13 min anyway,
+  # with the gate intact.
+  #
+  # Both halves of the `if:` below are load-bearing. The `github.ref` half
+  # skips main-branch pushes. The `github.event_name` half is what keeps a
+  # manual `workflow_dispatch` release working: publish.yml calls this
+  # workflow as its release gate, and when dispatched from main the ref IS
+  # `refs/heads/main`. Reducing this to `github.ref != 'refs/heads/main'`
+  # would silently skip both test tiers inside the release gate, which
+  # would then report success on a partial run and publish to PyPI.
   integration-tests:
     runs-on: ubuntu-latest
     needs: unit-tests
@@ -215,10 +257,17 @@ jobs:
 
       - name: Run integration tests
         # NOT parallelized: integration tests share a single Postgres
-        # database and Redis instance, and most don't isolate state per-test.
-        # A follow-up PR can introduce per-worker schemas / databases and
-        # add ``-n auto`` here once the isolation work is done.
-        run: uv run pytest tests/integration/ -v --tb=short -x --timeout=120 -m "not docker_mcp and not cloud_resource"
+        # database and Redis instance. Measured scope of that sharing is
+        # narrower than it looks — 151 of the 1249 selected tests, in 9
+        # files — so the per-worker-database work needed to add ``-n auto``
+        # here is tractable. Tracked in #2794.
+        #
+        # ``not bench`` excludes test_performance_vs_cloud, a wall-clock
+        # throughput assertion costing ~33s (4.5% of this tier). Timing
+        # thresholds are the least trustworthy thing to assert on a shared
+        # runner. It still runs weekly via weekly-analysis.yml, which
+        # invokes run_tests.py with no marker filter.
+        run: uv run pytest tests/integration/ -v --tb=short -x --timeout=120 -m "not docker_mcp and not cloud_resource and not bench"
         timeout-minutes: 20
         env:
           KESTREL_AUDIT_MODE: skip
@@ -234,6 +283,29 @@ jobs:
           GITHUB_PAT: ${{ secrets.GH_PAT }}
 
   # LLM integration tests (require API keys)
+  #
+  # Note that `needs: integration-tests` is what skips this job on
+  # main-branch pushes — a job whose dependency is skipped is itself
+  # skipped, and integration-tests carries that `if:`. The dependency is
+  # doing two things at once. If it is ever re-pointed, this job needs the
+  # same `if:` stated outright or it will start running on main pushes.
+  #
+  # This job costs nothing in API credits today, and it is worth being
+  # precise about why: none of the provider secrets referenced below
+  # (OPENAI_API_KEY, TAVILY_API_KEY, REPLICATE_API_TOKEN, RUNPOD_API_KEY)
+  # are actually configured on this repository. They expand to the empty
+  # string and every credential-gated test skips — hence "123 passed,
+  # 70 skipped in 9.88s".
+  #
+  # That is a property of the current secret configuration, NOT of the test
+  # suite's design. Seven tests gate on a bare `OPENAI_API_KEY` check
+  # without also requiring KESTREL_LIVE_TESTS — three in
+  # tests/llm/test_token_tracking.py, four in
+  # tests/llm/test_streaming_tool_detection.py. If someone adds
+  # OPENAI_API_KEY as a repo secret, those start issuing real provider
+  # calls on every PR. Gate them properly before adding the secret. (The
+  # pair in test_openai_adapter.py is already correctly gated on
+  # KESTREL_LIVE_TESTS=1 as well.)
   llm-tests:
     runs-on: ubuntu-latest
     needs: integration-tests
