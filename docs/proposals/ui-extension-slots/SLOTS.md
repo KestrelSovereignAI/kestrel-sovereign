@@ -238,6 +238,54 @@ Key semantics:
   every rebuild).
 - **`events`** — subset of the §4 vocabulary that retriggers gate+render.
 
+### 3.1 Panel view-state provider (`viewState`, #2802)
+
+A **panel** contribution (`panels.js` `registerPanel`, not a positional zone)
+may declare an optional `viewState` provider so the framework persists its own
+view — active sub-tab, zoom/pan, scroll, drill/selection — across a body
+remount **and** a full page reload. This is the sanctioned replacement for a
+feature hand-rolling raw `localStorage` (what the observability panel did).
+
+```js
+registerPanel({
+    panelId: 'observability',
+    label: 'Metrics',
+    render(bodyEl, ctx) { /* ...build the panel... */ },
+
+    viewState: {
+        key: 'timeline',                       // sub-namespace within this panel
+        getState: () => ({ tab: activeTab, zoom, follow: liveFollow }),
+        setState: (s) => {                     // only called when a valid value was stored
+            activeTab   = s.tab   ?? activeTab;
+            zoom        = s.zoom  ?? zoom;
+            liveFollow  = s.follow ?? liveFollow;
+        },
+    },
+});
+```
+
+- **Storage is `ui_state.mjs` only** — no second raw-`localStorage` path. The
+  **framework** composes the key as `kestrel:ui:panel:<panelId>:<key>`, so two
+  panels **cannot** collide however they name their provider. `key` defaults to
+  `'view'` and is a per-panel sub-namespace, so one panel can hold several
+  independent slices under distinct keys.
+- **Not agent-scoped** — keys are fleet-shared, which is correct for a
+  fleet-wide view like the Timeline. A panel that genuinely wants per-agent
+  state folds the agent id into its own `key`.
+- **`getState()`** runs when the panel stops being the source of truth: the
+  registry activates another panel, the gate closes, the contribution is
+  re-registered/unregistered, or the page unloads (`pagehide`, with a
+  `visibilitychange`→hidden fallback for Safari). Returning `undefined` writes
+  nothing, so "not ready yet" never clobbers a good stored value.
+- **`setState(state)`** runs once per mount, right after `render`. A missing
+  key, corrupt stored value, or unavailable `localStorage` means `setState` is
+  simply **not** called and the panel keeps its own default.
+- **Never fatal, always additive** — a throwing or malformed provider is logged
+  and isolated; activation still completes. A panel that declares no `viewState`
+  behaves exactly as before. Note this deliberately does **not** reuse
+  `panel:hidden`, whose existing subscribers (`spawn.js`, `database.js`) stop
+  polling on it and must not fire on an ordinary tab switch.
+
 ---
 
 ## 4. Event vocabulary (the bus, ticket 02)
