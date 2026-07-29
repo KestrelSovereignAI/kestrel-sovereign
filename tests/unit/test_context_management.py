@@ -59,6 +59,12 @@ class TestTokenCounter:
         # Should be content tokens + overhead per message + priming
         assert count > 0
 
+    def test_count_empty_messages_is_zero(self):
+        """An empty conversation has no message or priming overhead."""
+        counter = get_token_counter("gpt-4")
+
+        assert counter.count_messages([]) == 0
+
     def test_get_context_limit_undiscovered_model(self):
         """Test getting context limit for model in catalog uses catalog value."""
         counter = get_token_counter("gpt-4")

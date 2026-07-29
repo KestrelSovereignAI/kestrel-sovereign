@@ -572,6 +572,22 @@ class TestMeasureContextBreakdown:
         assert hist["messages_kept_after_pruning"] <= hist["messages_total"]
         assert hist["raw_tokens"] >= 0
 
+    @pytest.mark.asyncio
+    async def test_empty_history_reports_zero_tokens(self, builder):
+        result = await builder.measure_context_breakdown(
+            query="",
+            history=[],
+            constitution="Be kind.",
+            include_briefing=False,
+            include_rag=False,
+        )
+
+        hist = result["sections"]["history"]
+        assert hist["tokens"] == 0
+        assert hist["raw_tokens"] == 0
+        assert hist["messages_total"] == 0
+        assert hist["messages_kept_after_pruning"] == 0
+
 
 # ---------------------------------------------------------------------------
 # Drift guard: the source-of-truth claim

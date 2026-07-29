@@ -19,7 +19,9 @@
 //     icon,               // optional icon class for the nav tab
 //     before,             // optional: insert the tab before this panelId's tab
 //     gate?(ctx),         // capability gate; an ungated-false panel shows no tab
-//     render?(bodyEl, ctx)// lazily invoked ONCE on first activation
+//     render?(bodyEl, ctx),// lazily invoked ONCE on first activation
+//     viewState?          // optional {key?, getState(), setState(s)} provider
+//                         // persisting the panel's own view state (#2802)
 //   })
 //
 // `render` preserves the existing lazy-load semantics (`setLazyLoaders`): a
@@ -40,6 +42,7 @@
 import { UI } from './registry.js';
 import bus from './bus.js';
 import { storeGet, storeSet } from '../ui_state.mjs';
+import { normalizeProvider, saveViewState, restoreViewState } from './view-state.js';
 
 /** @type {Map<string, object>} */
 const _panels = new Map();
@@ -49,6 +52,8 @@ const _rendered = new Set();
 let _navEl = null;
 let _hostEl = null;
 let _ctx = null;
+/** Panel id most recently passed to `activate` — the view-state snapshot source. */
+let _activePanelId = null;
 
 function _safe(fn, ...args) {
     try {
@@ -80,6 +85,64 @@ function _tabFor(panelId) {
 function _gateOk(def) {
     if (typeof def.gate !== 'function') return true;
     return !!_safe(def.gate, _ctx || {});
+}
+
+// ---- Panel view-state provider lifecycle (#2802) ---------------------------
+//
+// Strictly additive: everything below is a no-op for a panel that declares no
+// `viewState` provider, and no existing event/subscriber observes any change.
+// The save side runs at the three moments the panel's live DOM is about to stop
+// being the source of truth — deactivation (`activate` switching away), a
+// re-gate that drops the body, and page unload — and the restore side runs once,
+// on the panel's first (re)render, which is exactly the remount boundary.
+
+let _unloadHookInstalled = false;
+
+/** The validated provider for a registered panel, or null. */
+function _providerFor(panelId) {
+    return normalizeProvider(_panels.get(panelId));
+}
+
+/**
+ * Snapshot a panel's view state into `ui_state.mjs`. Guarded on `_rendered` so a
+ * panel whose body never rendered cannot overwrite a good stored value with its
+ * uninitialized default.
+ */
+function _saveView(panelId) {
+    if (!panelId || !_rendered.has(panelId)) return false;
+    const provider = _providerFor(panelId);
+    if (!provider) return false;
+    return saveViewState(panelId, provider);
+}
+
+/** Reapply a panel's persisted view state after its body (re)rendered. */
+function _restoreView(panelId) {
+    const provider = _providerFor(panelId);
+    if (!provider) return false;
+    return restoreViewState(panelId, provider);
+}
+
+// `activate()` does not run on unload, so a full page reload would otherwise
+// lose whatever the active panel accumulated since the last tab switch. Wired
+// lazily — only once some panel actually registers a provider — so a console
+// with no view-state consumer attaches no listeners at all. `pagehide` is the
+// bfcache-safe spelling of unload; `visibilitychange`->hidden covers Safari/iOS,
+// which may background a tab without ever firing `pagehide`.
+function _ensureUnloadHook() {
+    if (_unloadHookInstalled) return;
+    try {
+        if (typeof window === 'undefined' || !window || typeof window.addEventListener !== 'function') return;
+        const flush = () => { _saveView(_activePanelId); };
+        window.addEventListener('pagehide', flush);
+        window.addEventListener('visibilitychange', () => {
+            if (typeof document !== 'undefined' && document.visibilityState === 'hidden') flush();
+        });
+        _unloadHookInstalled = true;
+    } catch (err) {
+        // A host without a usable window (SSR, worker) simply gets no unload
+        // flush; the deactivation + re-gate snapshots still work.
+        console.error('[ui-ext panels] could not wire the view-state unload flush:', err);
+    }
 }
 
 function _buildTab(def) {
@@ -133,6 +196,9 @@ function _syncNav() {
             existing.dataset.registryAdopted = 'true';
         }
         if (!_gateOk(def)) {
+            // Snapshot the panel's view state BEFORE its body is dropped (#2802):
+            // a re-gate is a remount, and re-enabling re-renders from scratch.
+            _saveView(def.panelId);
             if (tab) tab.remove();
             // Drop the panel body when the panel gates off at runtime (feature
             // disabled) or at boot (host opt-out), and forget its rendered state
@@ -180,6 +246,12 @@ function _syncNav() {
  * is inserted immediately (so a late/feature registration appears without a
  * reload).
  *
+ * A contribution MAY declare an optional `viewState` provider
+ * ({@link import('./contract.js').PanelViewStateProvider}) — `{key?, getState(),
+ * setState(state)}` — and the registry persists its state through
+ * `ui_state.mjs`, restoring it on the panel's next render (#2802). Omitting it
+ * leaves the panel behaving exactly as before.
+ *
  * @param {object} def
  */
 export function registerPanel(def) {
@@ -187,8 +259,13 @@ export function registerPanel(def) {
         console.error('[ui-ext panels] registerPanel: contribution needs a string `panelId`');
         return;
     }
+    // Re-registration is the remount boundary (mountPanels re-registers every
+    // core panel on each mount), so snapshot the outgoing contribution's view
+    // state before `_rendered` is cleared and the body re-renders from scratch.
+    _saveView(def.panelId);
     _panels.set(def.panelId, def);
     _rendered.delete(def.panelId);
+    if (def.viewState) _ensureUnloadHook();
     if (_navEl) _syncNav();
 }
 
@@ -199,6 +276,9 @@ export function registerPanel(def) {
  */
 export function unregisterPanel(panelId) {
     if (!_panels.has(panelId)) return;
+    // Unregistration is a teardown boundary (a host destroying its mount), so
+    // snapshot before the contribution — and with it its provider — is dropped.
+    _saveView(panelId);
     _panels.delete(panelId);
     _rendered.delete(panelId);
     const tab = _tabFor(panelId);
@@ -242,6 +322,13 @@ export function syncNav() {
  */
 export function activate(panelId, ctx = {}) {
     const merged = { ...(_ctx || {}), ...ctx, panelId };
+    // Deactivation snapshot (#2802): the outgoing panel's live DOM stops being
+    // the source of truth here. This is deliberately NOT `panel:hidden` — that
+    // event is a teardown signal (spawn.js/database.js stop polling on it) and
+    // must keep firing only on a re-gate, so an ordinary tab switch stays
+    // behaviour-identical for every existing subscriber.
+    if (_activePanelId && _activePanelId !== panelId) _saveView(_activePanelId);
+    _activePanelId = panelId;
     const def = _panels.get(panelId);
     const root = document.getElementById(`panel-${panelId}`);
     if (def && !_rendered.has(panelId)) {
@@ -250,6 +337,10 @@ export function activate(panelId, ctx = {}) {
         if (typeof def.render === 'function' && body) {
             _safe(def.render, body, merged);
         }
+        // First render of this mount == the remount boundary, so reapply the
+        // persisted view state now that the panel's DOM exists. Subsequent
+        // activations skip this: the live body already holds the state.
+        _restoreView(panelId);
     }
     // Mount per-(panelId) sub-sections into the active panel's content. Gated by
     // ctx.panelId inside each contribution (PanelSectionContext).
@@ -265,6 +356,19 @@ export function panels() {
     return [..._panels.values()];
 }
 
+/**
+ * Persist a panel's view state right now (#2802). The registry already
+ * snapshots on deactivation, re-gate, re-registration, and page unload; this is
+ * the explicit escape hatch for a host that tears the whole mount down by
+ * another route (e.g. `mountPanels().destroy()` on agent switch).
+ *
+ * @param {string} [panelId] - defaults to the currently active panel.
+ * @returns {boolean} true when a value was written.
+ */
+export function flushViewState(panelId) {
+    return _saveView(panelId || _activePanelId);
+}
+
 /** Test/teardown affordance: forget all panels and unbind the nav/host. */
 export function _reset() {
     _panels.clear();
@@ -272,6 +376,7 @@ export function _reset() {
     _navEl = null;
     _hostEl = null;
     _ctx = null;
+    _activePanelId = null;
 }
 
 // ============================================================================
@@ -484,6 +589,7 @@ export const Panels = {
     syncNav,
     activate,
     panels,
+    flushViewState,
     initReveal,
     _reset,
 };

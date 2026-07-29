@@ -455,6 +455,77 @@ async def test_ensure_quarantines_legacy_duplicate_canonical_routes(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_quarantine_runs_even_when_route_state_already_exists(tmp_path):
+    """The quarantine is deliberately NOT a column-keyed backfill (#2791).
+
+    ``migrate_columns_once`` runs a backfill only when it is the call adding
+    that column. The unique canonical-route index below DEPENDS on the
+    quarantine having run, so keying it on ``route_state`` would break exactly
+    this database: one whose column predates the index — a build between the
+    two changes, or a crash between them. The quarantine would be skipped as
+    "already migrated" and the index would then fail to create, because the
+    collisions it exists to clear are still routable.
+
+    Running it unconditionally costs a grouped scan per init. That is the
+    trade, and this test is what makes it visible if someone later "optimises"
+    it into a keyed backfill.
+    """
+    raw = SQLiteBackend(str(tmp_path / "column-without-index.db"))
+    await raw.connect()
+    db = AsyncDatabase(raw)
+    try:
+        # route_state present, canonical-route index absent, collisions live.
+        await db.execute(
+            """
+            CREATE TABLE a2a_outbound_tasks (
+                id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, task_id TEXT NOT NULL,
+                recipient TEXT NOT NULL, recipient_agent_id TEXT, verb TEXT NOT NULL,
+                session_id TEXT NOT NULL, skill_id TEXT, dispatch_tool TEXT NOT NULL,
+                message_summary TEXT, created_at TEXT NOT NULL,
+                route_state TEXT NOT NULL DEFAULT 'routable',
+                terminal_state TEXT, terminal_at TEXT, error TEXT
+            )
+            """
+        )
+        for row_id, recipient in (("dup-a", "first"), ("dup-b", "second")):
+            await db.execute(
+                """
+                INSERT INTO a2a_outbound_tasks (
+                    id, agent_id, task_id, recipient, recipient_agent_id, verb,
+                    session_id, dispatch_tool, created_at, route_state
+                ) VALUES (?, ?, 'unindexed-collision', ?, ?, 'task', 's',
+                          'send_a2a_task', '2026-07-28T00:00:00+00:00', 'routable')
+                """,
+                (row_id, "emma", recipient, f"did:tenant-a:{recipient}"),
+            )
+
+        await ensure_a2a_outbound_tasks_table(db)
+
+        states = await db.fetchall(
+            """
+            SELECT route_state FROM a2a_outbound_tasks
+            WHERE agent_id = 'emma' AND task_id = 'unindexed-collision'
+            ORDER BY id
+            """
+        )
+        assert states == [(ROUTE_STATE_AMBIGUOUS,), (ROUTE_STATE_AMBIGUOUS,)], (
+            "the quarantine must run against a database whose route_state "
+            "column predates the canonical-route index"
+        )
+        # Note this cannot fail independently: if the quarantine is skipped,
+        # ``ensure_a2a_outbound_tasks_table`` above already raised on
+        # CREATE UNIQUE INDEX against the still-routable collision. Kept as
+        # the explicit statement of what the call was supposed to achieve.
+        index = await db.fetchone(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND "
+            "name='uq_a2a_outbound_tasks_canonical_route'"
+        )
+        assert index is not None
+    finally:
+        await raw.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.dual_backend
 async def test_concurrent_rekeys_have_exactly_one_canonical_route_owner(db_backend):
     """The database invariant, not a read predicate, resolves a rekey race.

@@ -7,6 +7,11 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 
 from kestrel_sovereign.a2a.types import Artifact, Message, Task, TaskState, TaskStatus, TextPart
+from kestrel_sovereign.agent.context_stages import (
+    ContextAssembly,
+    ContextBuildMode,
+    ContextBuildPlan,
+)
 
 
 def _prepare_app(agent):
@@ -150,9 +155,8 @@ def test_context_status_reports_whole_window_utilization_and_warning_band():
         assert "breakdown" in payload
         assert payload["breakdown"]["total_measured"] == 2900
         assert "sections" in payload["breakdown"]
-        # Legacy compatibility projections have no typed salvage disposition,
-        # so the endpoint fails honest and keeps the warning active.
-        assert payload["silently_pruned_path_active"] is True
+        # No salvage projection means there is no projected prune risk.
+        assert payload["silently_pruned_path_active"] is False
         agent.storage.get_conversation_history.assert_awaited_once_with(
             limit=50,
             session_id="session-1",
@@ -306,6 +310,68 @@ def test_context_status_uses_context_manager_dry_plan_and_preserves_unknowns():
         assert sections["memories"]["tokens"] is None
         assert sections["memories"]["status"] == "unknown"
         assert sections["rag"]["tokens"] is None
+    finally:
+        _restore_app(app, original)
+
+
+def test_context_status_real_empty_plan_has_no_silent_prune_warning():
+    """A real fresh-conversation plan must not imply that data was pruned."""
+
+    plan = ContextBuildPlan(
+        mode=ContextBuildMode.DRY_RUN,
+        model="gpt-5",
+        assembly=ContextAssembly(),
+        sections={},
+        budget_summary={},
+        context_limit=4000,
+        response_reserve=1024,
+        total_budget=2976,
+        total_tokens=0,
+        durable_salvage_enabled=False,
+    )
+
+    class PlanManager:
+        async def build_context_plan(self, **_kwargs):
+            return plan
+
+    class PrivacyHistory:
+        async def get_conversation_history(self, *, limit, session_id):
+            assert (limit, session_id) == (50, "fresh-session")
+            return []
+
+    async def get_governing_constitution(*, allow_lazy_anchor):
+        assert allow_lazy_anchor is False
+        return "THE ANCHORED CONSTITUTION"
+
+    agent = MagicMock()
+    agent._get_governing_constitution = get_governing_constitution
+    agent.context_manager = PlanManager()
+    agent.context_builder = MagicMock()
+    agent.tool_registry = None
+    agent.features = {}
+    agent.privacy_agent = PrivacyHistory()
+    agent._privacy_mode = SimpleNamespace(name="NORMAL")
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch(
+            "kestrel_sovereign.agent.context_builder.ContextBuilder",
+            side_effect=AssertionError("legacy measurement must not run"),
+        ), patch(
+            "kestrel_sovereign.agent.token_counter.get_token_counter",
+            return_value=_CounterStub(context_limit=4000),
+        ), patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/agent/context-status?session_id=fresh-session",
+                    headers=_api_headers(),
+                )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["breakdown"] == plan.to_breakdown()
+        assert payload["breakdown"]["salvage"]["status"] == "not_required"
+        assert payload["silently_pruned_path_active"] is False
     finally:
         _restore_app(app, original)
 

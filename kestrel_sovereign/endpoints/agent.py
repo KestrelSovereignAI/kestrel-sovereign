@@ -1517,7 +1517,7 @@ async def compute_context_status(
         # contains id-less/in-memory rows that no durable marker can link.
         salvage_projection = breakdown.get("salvage", {})
         silently_pruned_path_active = bool(
-            salvage_projection.get("silent_prune_possible", True)
+            salvage_projection.get("silent_prune_possible", False)
         )
 
         # #1503: route per-turn cap visibility. Some subscription tiers
