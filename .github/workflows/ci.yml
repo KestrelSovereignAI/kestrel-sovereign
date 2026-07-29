@@ -387,17 +387,22 @@ jobs:
   # Depends on lint-and-imports, not unit-tests, so the test tiers run in
   # parallel. The saving is structurally the unit tier's duration, since the
   # chained path was lint + unit + integration and the parallel one is lint +
-  # max(unit, integration): ~19 min becomes ~14, saving ~5. The chain's purpose —
-  # don't run the 12.8-minute tier beside an already-red unit tier — is
-  # preserved by cancel-expensive-tiers-when-unit-fails above, which kills
-  # the run the moment unit-tests fails.
+  # max(unit, integration): ~19 min becomes ~14, saving ~5. The chain's
+  # purpose — don't run the 12.8-minute tier beside an already-red unit tier
+  # — is preserved by cancel-expensive-tiers-when-unit-fails above, which
+  # kills the run the moment unit-tests fails.
   #
-  # To be clear about what that chain was and wasn't worth: it is about
-  # runner time and signal, not money. Linux minutes on kestrel-sovereign
-  # bill $0 (public repo, fully discounted; 2026-07 was 20,016 minutes,
-  # $120.10 gross, $0.00 net). An earlier revision of this comment claimed
-  # $69/month by misreading org-wide billing rollups as this repo's. The
-  # remaining lever on PR wall clock is this job's own 12.8 min — #2794.
+  # Sizing that gate honestly: of 11 failures in the last 100 runs, 8 were
+  # this job itself and only 3 were unit-tests, so it spares a wasted run
+  # about a quarter of the time.
+  #
+  # To be clear about what the chain was and wasn't worth: it is about runner
+  # time and signal, not money. Linux minutes on kestrel-sovereign bill $0 —
+  # public repo, fully discounted (2026-07: 20,016 minutes, $120.10 gross,
+  # $0.00 net), and so do macOS and Windows here despite their higher gross
+  # rate. An earlier revision of this comment claimed $69/month by misreading
+  # org-wide billing rollups as this repo's; see #2793. The remaining lever
+  # on PR wall clock is this job's own 12.8 min — #2794.
   #
   # Both halves of the `if:` below are load-bearing. The `github.ref` half
   # skips main-branch pushes. The `github.event_name` half is what keeps a
