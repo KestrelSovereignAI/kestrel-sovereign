@@ -11,8 +11,10 @@ It is shell embedded in YAML, which nothing else type-checks or exercises, and
 an error in the *skip* direction silently stops testing real changes. Worst
 case, it skips the integration tier inside publish.yml's release gate, where
 skipped jobs still let the ``ci`` job report success and publishing proceeds.
-So these tests run the ACTUAL script extracted from the workflow — not a copy
-— with ``gh`` stubbed and the real ``env:`` block supplied.
+So these tests run the ACTUAL script extracted from the workflow, with the
+step's own ``env:`` block resolved against a modelled ``github`` context and
+only ``gh`` stubbed. Nothing about the gate is restated here — restating it is
+how the first version of this file let a swapped ``github.ref_name`` pass.
 
 The invariant: the gate skips in exactly one situation — a push to a branch
 that already has an open, non-conflicting, same-repository PR onto a base this
@@ -81,20 +83,63 @@ def _gate_step() -> dict:
     return matching[0]
 
 
-def _env_for(event: str, ref: str) -> dict:
-    """The ``env:`` block the runner would hand the step.
+def _github_context(event: str, ref: str) -> dict:
+    """A faithful ``github`` context for one trigger.
 
-    The script reads only these — nothing is interpolated into its body, which
-    is the point: a hostile branch name cannot inject shell.
+    Values follow GitHub's own semantics, including the ones that make a
+    plausible-looking substitution wrong:
+
+    * ``ref_name`` is ``ref`` with the ``refs/heads/`` or ``refs/tags/`` prefix
+      stripped, and is populated on every event.
+    * ``head_ref`` is the PR source branch and is **empty on push events** —
+      the trap, because ``gh pr list --head ""`` behaves as if ``--head`` were
+      omitted and returns every open PR.
+    * ``actor`` is the triggering user, not the repository owner.
     """
+    is_pr = event == "pull_request"
     return {
-        "EVENT_NAME": event,
-        "REF": ref,
-        "REF_NAME": re.sub(r"^refs/(heads|tags)/", "", ref),
-        "REPO": "KestrelSovereignAI/kestrel-sovereign",
-        "REPO_OWNER": "KestrelSovereignAI",
-        "GH_TOKEN": "stub",
+        "token": "stub-token",
+        "event_name": event,
+        "ref": ref,
+        "ref_name": re.sub(r"^refs/(heads|tags)/", "", ref),
+        "head_ref": "some-contributor-branch" if is_pr else "",
+        "base_ref": "main" if is_pr else "",
+        "repository": "KestrelSovereignAI/kestrel-sovereign",
+        "repository_owner": "KestrelSovereignAI",
+        "actor": "some-contributor",
+        "run_id": "30467966311",
+        "run_number": "4213",
     }
+
+
+_EXPRESSION = re.compile(r"^\$\{\{\s*github\.(\w+)\s*\}\}$")
+
+
+def _env_for(event: str, ref: str) -> dict:
+    """Resolve the step's OWN ``env:`` block against a github context.
+
+    Deliberately not a hand-written stand-in. The env block is the entire
+    interface between the workflow and the script, so a fabricated one leaves
+    every expression in it unguarded — swapping ``github.ref_name`` for
+    ``github.head_ref`` would silently suppress the expensive tiers on every
+    push while every decision test stayed green.
+    """
+    context = _github_context(event, ref)
+    resolved = {}
+    for name, expression in _gate_step()["env"].items():
+        match = _EXPRESSION.match(str(expression).strip())
+        assert match, (
+            f"gate env {name}={expression!r} is not a plain ${{{{ github.* }}}} "
+            f"expression; this harness cannot resolve it faithfully"
+        )
+        key = match.group(1)
+        assert key in context, (
+            f"gate env {name} reads github.{key}, which this harness does not "
+            f"model. Add it to _github_context with GitHub's real semantics "
+            f"before relying on the result."
+        )
+        resolved[name] = context[key]
+    return resolved
 
 
 def _decide(event: str, ref: str, gh_mode: str) -> str:
@@ -202,7 +247,12 @@ class TestPrQueryFilter:
     """
 
     @staticmethod
-    def _filter(prs: list[dict], owner: str = "KestrelSovereignAI") -> list[str]:
+    def _filter(prs: list[dict], owner: str | None = None) -> list[str]:
+        # Take REPO_OWNER from the step's own env: block, not a literal, so an
+        # expression swap (github.repository_owner -> github.actor) shows up
+        # here as a rejected PR rather than passing silently.
+        if owner is None:
+            owner = _env_for("push", "refs/heads/issue-2800-x")["REPO_OWNER"]
         script = _gate_step()["run"]
         match = re.search(r"pr_filter='(.*?)'", script, re.DOTALL)
         assert match, f"could not locate pr_filter='…' in the gate script:\n{script}"
@@ -227,6 +277,16 @@ class TestPrQueryFilter:
 
     def test_ordinary_pr_is_kept(self):
         assert self._filter([self._pr()]) == ["main"]
+
+    def test_owner_comes_from_the_repository_not_the_actor(self):
+        """`github.actor` is the triggering user. Using it here would make the
+        same-repo filter reject our own PRs, so the gate would never find a
+        covering PR and the dedupe would silently stop working."""
+        env = _env_for("push", "refs/heads/issue-2800-x")
+        assert env["REPO_OWNER"] == env["REPO"].split("/")[0], (
+            f"REPO_OWNER ({env['REPO_OWNER']}) is not the owner half of REPO "
+            f"({env['REPO']}); the same-repo filter cannot match"
+        )
 
     def test_fork_pr_with_colliding_branch_name_is_rejected(self):
         """kestrel-sovereign is public. Anyone can fork it, push a branch named
@@ -364,10 +424,29 @@ class TestGateQueryInvocation:
     def test_queries_this_branch(self):
         assert '--head "$REF_NAME"' in self._script()
 
+    def test_head_is_never_empty_for_the_events_that_reach_the_query(self):
+        """`gh pr list --head ""` behaves as if --head were omitted and returns
+        every open PR, so an empty value here would find some other branch's PR
+        onto main and skip the expensive tiers on every push."""
+        for ref in ("refs/heads/issue-2800-x", "refs/heads/some-branch"):
+            assert _env_for("push", ref)["REF_NAME"], (
+                "REF_NAME resolves empty on a push event; the gate would match "
+                "unrelated PRs"
+            )
+
     def test_requests_the_fields_the_filter_needs(self):
-        script = self._script()
-        for field in ("baseRefName", "headRepositoryOwner", "mergeable"):
-            assert field in script, f"gh pr list must request {field}"
+        """Parses the --json argument specifically. A substring check against the
+        whole script passes even when a field is dropped, because every field
+        name also appears in the jq filter and the prose above it — and dropping
+        `mergeable` makes the CONFLICTING filter a silent no-op, since jq sees
+        null and `null != "CONFLICTING"` is true."""
+        match = re.search(r"--json ([\w,]+)", self._script())
+        assert match, "could not find the --json argument in the gate script"
+        requested = set(match.group(1).split(","))
+        assert {"baseRefName", "headRepositoryOwner", "mergeable"} <= requested, (
+            f"gh pr list requests {sorted(requested)}; the jq filter needs "
+            f"baseRefName, headRepositoryOwner and mergeable"
+        )
 
 
 class TestFailFast:

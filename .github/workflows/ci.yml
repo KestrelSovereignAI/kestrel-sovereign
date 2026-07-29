@@ -82,7 +82,8 @@ jobs:
   # worth making on the merge gate.
   #
   # It is a step here rather than its own job for two reasons: a separate job
-  # rounds up to a billed minute on every run to do three seconds of work,
+  # rounds up to a whole runner-minute on every run to do three seconds of
+  # work,
   # and it would be one more job the test tiers could be orphaned by. This
   # job is the root of the graph, so every tier can read its output no matter
   # how the tiers are wired to each other.
@@ -211,6 +212,12 @@ jobs:
   # Unit tests (no services needed)
   unit-tests:
     runs-on: ubuntu-latest
+    # Explicit `contents: read` so this job does NOT inherit the wider grant
+    # publish.yml's `ci:` job holds. Jobs of a called workflow inherit the
+    # caller's permissions when they declare none, which would hand this
+    # `actions: write` during a release. See test_ci_workflow_permissions.py.
+    permissions:
+      contents: read
     needs: lint-and-imports
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -271,18 +278,19 @@ jobs:
   #
   # The tiers used to be chained (`integration-tests: needs: unit-tests`), so
   # a red unit tier meant the 12.8-minute integration tier never started.
-  # Running them in parallel takes a PR from ~22 min to ~14.8, but on its own
-  # it gives that up: integration would run to completion beside a unit tier
-  # that already failed. This job restores the property.
+  # Running them in parallel takes a PR from ~19 min to ~14, but on its own it
+  # gives that up: integration would run to completion beside a unit tier that
+  # already failed. This job restores the property.
   #
   # It fires the moment unit-tests fails, and cancels the whole run — which
   # is the only granularity the API offers; there is no per-job cancel.
   #
   # Deliberately ONE-DIRECTIONAL: cheap failure kills the expensive tier, not
   # the reverse. Of 11 failures in the last 100 runs, 8 were integration-tests
-  # itself, and at that point unit-tests is usually still running (5.3 min vs
-  # 12.8). Cancelling on an integration failure would throw away the unit
-  # result the author needs for their next push.
+  # itself. Measured, those eight took 10.9-13.5 min while the longest
+  # concurrent unit run was 5.8, so unit-tests had already concluded in all
+  # eight — a reverse cancel would have had nothing left to cancel, and would
+  # only risk discarding a unit result that was still in flight.
   #
   # A separate job rather than a step inside unit-tests, so unit-tests has
   # already concluded `failure` before the cancel lands. A cancel issued from
@@ -312,8 +320,11 @@ jobs:
   # `inputs.ref == ''` excludes publish.yml's release gate. Jobs of a called
   # workflow belong to the CALLER's run, so `github.run_id` there is
   # publish.yml's: cancelling would also kill the in-flight clean-install
-  # matrix, which is the only place the billed macOS/Windows axis runs per
-  # release. On a tag push publish.yml passes the tag ref, so this is
+  # matrix, which is the only place the macOS/Windows axis runs per release.
+  # (Those SKUs cost ~10x Linux per minute gross, but net $0.00 on this public
+  # repo like everything else — 2026-07: macOS 82 min / $5.08 gross / $0.00
+  # net. The reason not to cancel it is losing the cross-platform result for
+  # that tag, not money.) On a tag push publish.yml passes the tag ref, so this is
   # non-empty exactly when we are the release gate.
   cancel-expensive-tiers-when-unit-fails:
     needs: unit-tests
@@ -334,6 +345,12 @@ jobs:
 
   python-314-install-check:
     runs-on: ubuntu-latest
+    # Explicit `contents: read` so this job does NOT inherit the wider grant
+    # publish.yml's `ci:` job holds. Jobs of a called workflow inherit the
+    # caller's permissions when they declare none, which would hand this
+    # `actions: write` during a release. See test_ci_workflow_permissions.py.
+    permissions:
+      contents: read
     needs: lint-and-imports
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -368,8 +385,9 @@ jobs:
   # more suited to local verification and special cases. See #682.
   #
   # Depends on lint-and-imports, not unit-tests, so the test tiers run in
-  # parallel. Chaining them end-to-end cost ~8 min of wall clock per PR;
-  # measured, a PR goes from ~22 min to ~14.8 min. The chain's purpose —
+  # parallel. The saving is structurally the unit tier's duration, since the
+  # chained path was lint + unit + integration and the parallel one is lint +
+  # max(unit, integration): ~19 min becomes ~14, saving ~5. The chain's purpose —
   # don't run the 12.8-minute tier beside an already-red unit tier — is
   # preserved by cancel-expensive-tiers-when-unit-fails above, which kills
   # the run the moment unit-tests fails.
@@ -397,6 +415,12 @@ jobs:
   # report success. `!= 'false'` means only an explicit skip decision skips.
   integration-tests:
     runs-on: ubuntu-latest
+    # Explicit `contents: read` so this job does NOT inherit the wider grant
+    # publish.yml's `ci:` job holds. Jobs of a called workflow inherit the
+    # caller's permissions when they declare none, which would hand this
+    # `actions: write` during a release. See test_ci_workflow_permissions.py.
+    permissions:
+      contents: read
     needs: lint-and-imports
     if: >-
       (github.event_name != 'push' || github.ref != 'refs/heads/main')
@@ -504,6 +528,12 @@ jobs:
   # KESTREL_LIVE_TESTS=1 as well.)
   llm-tests:
     runs-on: ubuntu-latest
+    # Explicit `contents: read` so this job does NOT inherit the wider grant
+    # publish.yml's `ci:` job holds. Jobs of a called workflow inherit the
+    # caller's permissions when they declare none, which would hand this
+    # `actions: write` during a release. See test_ci_workflow_permissions.py.
+    permissions:
+      contents: read
     needs: lint-and-imports
     if: >-
       (github.event_name != 'push' || github.ref != 'refs/heads/main')
