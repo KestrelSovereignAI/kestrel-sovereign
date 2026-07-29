@@ -179,15 +179,14 @@ jobs:
   # llm-tests suite is also the heaviest (services, GPUs, API credits),
   # more suited to local verification and special cases. See #682.
   #
-  # Depends on lint-and-imports, NOT unit-tests. Chaining the test tiers
-  # end-to-end serialized the whole workflow and cost ~8 min of wall clock
-  # per PR (22 min total, across which the four test-path jobs never
-  # overlapped). The chain existed as a cost gate — don't burn an
-  # integration runner when the unit tier is already red — but this repo is
-  # public, so Linux minutes are free, and the `concurrency:` block above
-  # already cancels superseded PR runs, which was the dominant source of
-  # waste. Neither this job nor llm-tests is a required status check on
-  # main, so the chain was never load-bearing for mergeability. See #2793.
+  # `needs: unit-tests` is a deliberate cost gate, not an accident: don't
+  # spend ~13 min of billed runner time here when the unit tier is already
+  # red. Linux minutes on this repo are NOT free — the org's included
+  # allowance runs out partway through the month and the remainder bills
+  # (2026-07: 36,191 Linux minutes, $217 gross, $69 net). Breaking this
+  # chain to run the tiers in parallel was tried and reverted; see #2793
+  # for the measurements. The serialization is not what makes a PR slow —
+  # this job's own 12.8 min is, which is #2794.
   #
   # Both halves of the `if:` below are load-bearing. The `github.ref` half
   # skips main-branch pushes. The `github.event_name` half is what keeps a
@@ -198,7 +197,7 @@ jobs:
   # would then report success on a partial run and publish to PyPI.
   integration-tests:
     runs-on: ubuntu-latest
-    needs: lint-and-imports
+    needs: unit-tests
     if: >-
       github.event_name != 'push' || github.ref != 'refs/heads/main'
     services:
@@ -275,22 +274,18 @@ jobs:
 
   # LLM integration tests (require API keys)
   #
-  # The `if:` below is load-bearing and must stay in sync with
-  # integration-tests. This job used to declare `needs: integration-tests`,
-  # and was skipped on main-branch pushes only as a *side effect* — a job
-  # whose dependency is skipped is itself skipped. Now that it depends on
-  # lint-and-imports instead (#2793), that condition has to be stated
-  # outright, or this job would start running on main pushes, which is a
-  # behavior change nobody asked for.
+  # Note that `needs: integration-tests` is what skips this job on
+  # main-branch pushes — a job whose dependency is skipped is itself
+  # skipped, and integration-tests carries that `if:`. The dependency is
+  # doing two things at once. If it is ever re-pointed, this job needs the
+  # same `if:` stated outright or it will start running on main pushes.
   #
-  # Running in parallel with the other tiers means this job no longer waits
-  # ~21 minutes to do ~10 seconds of work. It can now run when the unit tier
-  # is red, so it is worth being precise about what that costs in API
-  # credits today: nothing, because none of the provider secrets referenced
-  # below (OPENAI_API_KEY, TAVILY_API_KEY, REPLICATE_API_TOKEN,
-  # RUNPOD_API_KEY) are actually configured on this repository. They expand
-  # to the empty string, and every credential-gated test skips — hence
-  # "123 passed, 70 skipped in 9.88s".
+  # This job costs nothing in API credits today, and it is worth being
+  # precise about why: none of the provider secrets referenced below
+  # (OPENAI_API_KEY, TAVILY_API_KEY, REPLICATE_API_TOKEN, RUNPOD_API_KEY)
+  # are actually configured on this repository. They expand to the empty
+  # string and every credential-gated test skips — hence "123 passed,
+  # 70 skipped in 9.88s".
   #
   # That is a property of the current secret configuration, NOT of the test
   # suite's design. Seven tests gate on a bare `OPENAI_API_KEY` check
@@ -298,14 +293,12 @@ jobs:
   # tests/llm/test_token_tracking.py, four in
   # tests/llm/test_streaming_tool_detection.py. If someone adds
   # OPENAI_API_KEY as a repo secret, those start issuing real provider
-  # calls on every PR, including PRs whose unit tier is red. Gate them
-  # properly before adding the secret. (The pair in test_openai_adapter.py
-  # is already correctly gated on KESTREL_LIVE_TESTS=1 as well.)
+  # calls on every PR. Gate them properly before adding the secret. (The
+  # pair in test_openai_adapter.py is already correctly gated on
+  # KESTREL_LIVE_TESTS=1 as well.)
   llm-tests:
     runs-on: ubuntu-latest
-    needs: lint-and-imports
-    if: >-
-      github.event_name != 'push' || github.ref != 'refs/heads/main'
+    needs: integration-tests
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
