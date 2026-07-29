@@ -194,6 +194,11 @@ class TestPrQueryFilter:
 
     It has to reject two classes of PR that ``--head`` alone cannot, because
     ``--head`` matches on branch NAME only and takes no owner qualifier.
+
+    One caveat: ``gh --jq`` evaluates with gojq (embedded in gh), while this
+    runs the ``jq`` binary. ``env.*`` and ``select`` behave identically in
+    both, so the filter is faithful today — but a filter using a
+    gojq/jq-divergent construct would pass here and misbehave in CI.
     """
 
     @staticmethod
@@ -236,9 +241,14 @@ class TestPrQueryFilter:
         assert self._filter([self._pr(mergeable="CONFLICTING")]) == []
 
     def test_unknown_mergeability_is_kept(self):
-        """GitHub reports UNKNOWN while it computes the merge ref. Treating that
-        as conflicting would run the duplicate every time a PR is freshly
-        pushed, which is the common case."""
+        """GitHub reports UNKNOWN while it lazily computes the merge ref, which
+        is the normal answer right after the push that triggered this gate;
+        treating it as conflicting would run the duplicate nearly every time.
+
+        The cost is bounded but real: if the PR then turns out to conflict, no
+        pull_request run is created and that commit gets no integration or llm
+        coverage. Neither is a required check and the conflict-resolving push
+        re-runs everything, so the exposure is one commit wide."""
         assert self._filter([self._pr(mergeable="UNKNOWN")]) == ["main"]
 
     def test_keeps_only_the_qualifying_pr_among_several(self):
@@ -300,6 +310,66 @@ class TestWiring:
             assert GATE_OUTPUT not in str(jobs[name].get("if", ""))
 
 
+class TestTierConditions:
+    """The `if:` on both expensive tiers, clause by clause.
+
+    Three separate comment paragraphs in ci.yml call this condition
+    load-bearing, and until now nothing tested it. Each assertion below
+    corresponds to a mutation that left every other test green.
+    """
+
+    TIERS = ("integration-tests", "llm-tests")
+
+    @pytest.mark.parametrize("tier", TIERS)
+    def test_skips_main_branch_pushes(self, tier):
+        """Dropping this clause reruns the heaviest tiers on every squash-merge
+        to main — the regression #682 removed."""
+        condition = " ".join(_jobs()[tier]["if"].split())
+        assert "github.ref != 'refs/heads/main'" in condition
+
+    @pytest.mark.parametrize("tier", TIERS)
+    def test_keeps_the_event_name_clause(self, tier):
+        """Reducing the condition to the ref check alone would skip both tiers
+        inside a workflow_dispatch release from main — where github.ref IS
+        refs/heads/main — letting the `ci` gate report success on a partial run
+        and publishing to PyPI."""
+        condition = " ".join(_jobs()[tier]["if"].split())
+        assert "github.event_name != 'push'" in condition
+        assert "(github.event_name != 'push' || github.ref != 'refs/heads/main')" in condition
+
+    @pytest.mark.parametrize("tier", TIERS)
+    def test_tiers_are_not_chained_to_each_other(self, tier):
+        """Re-adding unit-tests (or integration-tests) to a tier's needs: would
+        silently restore the serial chain and give back the ~7 min saving."""
+        needs = str(_jobs()[tier].get("needs"))
+        assert needs == GATE_HOST_JOB, (
+            f"{tier} must depend on {GATE_HOST_JOB} alone to stay parallel; got {needs}"
+        )
+
+
+class TestGateQueryInvocation:
+    """The `gh pr list` invocation itself. Invisible to the decision tests,
+    because those stub `gh` out entirely."""
+
+    @staticmethod
+    def _script() -> str:
+        return _gate_step()["run"]
+
+    def test_queries_only_open_prs(self):
+        """`--state all` would mean that once any PR from a branch name closes
+        or merges, every future push to that name skips the expensive tiers
+        forever."""
+        assert "--state open" in self._script()
+
+    def test_queries_this_branch(self):
+        assert '--head "$REF_NAME"' in self._script()
+
+    def test_requests_the_fields_the_filter_needs(self):
+        script = self._script()
+        for field in ("baseRefName", "headRepositoryOwner", "mergeable"):
+            assert field in script, f"gh pr list must request {field}"
+
+
 class TestFailFast:
     """The tiers run in parallel, so the old `needs:` chain no longer stops the
     12.8-minute integration tier when the unit tier goes red. A dedicated job
@@ -310,7 +380,39 @@ class TestFailFast:
     def test_exists_and_triggers_on_unit_failure(self):
         job = _jobs()[self.JOB]
         assert job["needs"] == "unit-tests"
-        assert job["if"] == "failure()"
+        condition = " ".join(job["if"].split())
+        # An `if:` with no status function is implicitly ANDed with success(),
+        # so the bare comparison would never fire.
+        assert "always()" in condition
+        assert "needs.unit-tests.result == 'failure'" in condition
+
+    def test_does_not_fire_on_a_lint_failure(self):
+        """`failure()` walks transitive ancestors, so a lint-and-imports failure
+        would trigger it — cancelling the run for no benefit, since every tier
+        is already skipped by needs:, and converting a clean `failure`
+        conclusion into `cancelled`."""
+        condition = " ".join(_jobs()[self.JOB]["if"].split())
+        assert condition != "failure()"
+        assert "needs.unit-tests.result" in condition
+
+    def test_is_disabled_in_the_release_gate(self):
+        """Jobs of a called workflow belong to the CALLER's run, so github.run_id
+        here is publish.yml's. Cancelling would kill the in-flight clean-install
+        matrix — the only place the billed macOS/Windows axis runs per release."""
+        condition = " ".join(_jobs()[self.JOB]["if"].split())
+        assert "inputs.ref == ''" in condition
+
+    def test_actually_calls_the_cancel_endpoint(self):
+        """Replacing the POST with an echo leaves every other assertion green
+        and the fail-fast silently dead."""
+        step = _jobs()[self.JOB]["steps"][0]
+        assert "gh api --method POST" in step["run"]
+        assert "actions/runs/$RUN_ID/cancel" in step["run"]
+
+    def test_cancels_by_run_id_not_run_number(self):
+        """github.run_number is a per-workflow counter, not an API id; the cancel
+        would 404."""
+        assert _jobs()[self.JOB]["steps"][0]["env"]["RUN_ID"] == "${{ github.run_id }}"
 
     def test_is_one_directional(self):
         """It must depend on unit-tests ONLY. Adding integration-tests would make

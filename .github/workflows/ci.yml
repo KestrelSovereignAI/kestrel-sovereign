@@ -65,13 +65,21 @@ jobs:
   # `pull_request`. They do not dedupe because the `concurrency:` group keys
   # on `github.ref`, which differs between them (`refs/heads/issue-…` vs
   # `refs/pull/N/merge`). Measured over 100 runs: 22 of 43 `issue-*` SHAs
-  # built twice, ~4,100 wasted runner-minutes a month. See #2800.
+  # built twice, ~4,300 wasted runner-minutes a month. See #2800.
   #
   # This is hygiene, NOT a cost saving: kestrel-sovereign is public, so its
   # Linux minutes are fully discounted and bill $0 (2026-07: 20,016 minutes,
   # $120.10 gross, $0.00 net). clean-install.yml documents the same cost
-  # shape. The value is cleaner signal, ~4,100 fewer duplicated minutes, and
+  # shape. The value is cleaner signal, fewer duplicated minutes, and
   # insurance if this repo ever goes private.
+  #
+  # It recovers about two-thirds of that waste, not all of it: the gate
+  # suppresses integration-tests + llm-tests (13.5 of the ~19.9 job-minutes a
+  # full run costs), while lint-and-imports, unit-tests and
+  # python-314-install-check still run twice. So ~2,800 of the ~4,300
+  # duplicated minutes. Gating the rest would mean conditioning the required
+  # status checks, and a skipped job still posts a check run — not a trade
+  # worth making on the merge gate.
   #
   # It is a step here rather than its own job for two reasons: a separate job
   # rounds up to a billed minute on every run to do three seconds of work,
@@ -143,6 +151,16 @@ jobs:
           #                branch and suppress our run
           #   mergeable  — a CONFLICTING PR has no computable merge ref, so
           #                its run cannot be the fallback for this push
+          #
+          # UNKNOWN mergeability is treated as covered, and that is a real if
+          # bounded exposure rather than a free choice. GitHub computes the
+          # merge ref lazily, so UNKNOWN is the normal answer immediately
+          # after the push that triggered this gate — treating it as
+          # conflicting would run the duplicate nearly every time. But if the
+          # PR then turns out to conflict, no pull_request run is created and
+          # that commit gets no integration or llm coverage. Neither is a
+          # required check and the conflict-resolving push re-runs everything,
+          # so the window is one commit wide.
           # Reads REPO_OWNER from the environment rather than interpolating it,
           # so this stays a single-quoted string with no escaping. Covered
           # directly by TestPrQueryFilter, which runs it under real jq.
@@ -269,10 +287,40 @@ jobs:
   # A separate job rather than a step inside unit-tests, so unit-tests has
   # already concluded `failure` before the cancel lands. A cancel issued from
   # within a still-running job marks that job `cancelled`, which would hide
-  # which tier actually broke.
+  # which tier actually broke. Verified live (run 30465204112): unit-tests
+  # kept `failure`, integration-tests was cancelled at 5.9 min instead of
+  # running 12.4, and the run finished in 6.8 min instead of 15.5.
+  #
+  # Two consequences of using the cancel API, both real and neither obvious:
+  #
+  #   * This job cancels ITSELF along with the run, so it reports `cancelled`
+  #     rather than `success`. The POST lands first, so the cancel still
+  #     happens. It is not a required check, so nothing is blocked by it.
+  #   * The RUN's conclusion becomes `cancelled`, not `failure`. Anyone whose
+  #     Actions notifications are set to "only notify for failed workflows"
+  #     gets no notification for a run that ended this way. That is a real
+  #     downgrade in signal on main-branch pushes; the required `unit-tests`
+  #     check still reports `failure`, so PR mergeability is unaffected.
+  #
+  # `always() && needs.unit-tests.result == 'failure'`, not `failure()`. An
+  # `if:` with no status function is implicitly ANDed with `success()`, so the
+  # bare condition would never fire; and `failure()` walks TRANSITIVE
+  # ancestors, so a lint-and-imports failure — which already skips every tier
+  # through `needs:` — would cancel the run for no benefit and convert a clean
+  # `failure` conclusion into `cancelled`.
+  #
+  # `inputs.ref == ''` excludes publish.yml's release gate. Jobs of a called
+  # workflow belong to the CALLER's run, so `github.run_id` there is
+  # publish.yml's: cancelling would also kill the in-flight clean-install
+  # matrix, which is the only place the billed macOS/Windows axis runs per
+  # release. On a tag push publish.yml passes the tag ref, so this is
+  # non-empty exactly when we are the release gate.
   cancel-expensive-tiers-when-unit-fails:
     needs: unit-tests
-    if: failure()
+    if: >-
+      always()
+      && needs.unit-tests.result == 'failure'
+      && inputs.ref == ''
     runs-on: ubuntu-latest
     permissions:
       actions: write  # cancelling a run is an Actions write
