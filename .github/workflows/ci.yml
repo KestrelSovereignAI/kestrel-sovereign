@@ -179,14 +179,24 @@ jobs:
   # llm-tests suite is also the heaviest (services, GPUs, API credits),
   # more suited to local verification and special cases. See #682.
   #
-  # `needs: unit-tests` is a deliberate cost gate, not an accident: don't
-  # spend ~13 min of billed runner time here when the unit tier is already
-  # red. Linux minutes on this repo are NOT free — the org's included
-  # allowance runs out partway through the month and the remainder bills
-  # (2026-07: 36,191 Linux minutes, $217 gross, $69 net). Breaking this
-  # chain to run the tiers in parallel was tried and reverted; see #2793
-  # for the measurements. The serialization is not what makes a PR slow —
-  # this job's own 12.8 min is, which is #2794.
+  # `needs: unit-tests` gates this tier behind the cheap one: don't spend
+  # ~13 min of runner time here when the unit tier is already red.
+  #
+  # That gate is about runner time and signal quality, NOT money. Linux
+  # minutes on kestrel-sovereign bill $0 — it is a public repo and they are
+  # fully discounted (2026-07: 20,016 minutes, $120.10 gross, $0.00 net).
+  # clean-install.yml documents the same cost shape, and macOS/Windows are
+  # the SKUs that do bill here. An earlier revision of this comment claimed
+  # $69/month by misreading org-wide billing rollups as this repo's; see
+  # #2793.
+  #
+  # Sizing the gate honestly: of 11 failures in the last 100 runs, 8 were
+  # this job itself and only 3 were unit-tests, so it spares a wasted run
+  # about a quarter of the time. Breaking the chain to run the tiers in
+  # parallel measured 22 min → 14.8 min and is a real improvement, but the
+  # serialization is not the dominant cost — this job's own 12.8 min is.
+  # Parallelize it (#2794) and the chained path lands near 13 min anyway,
+  # with the gate intact.
   #
   # Both halves of the `if:` below are load-bearing. The `github.ref` half
   # skips main-branch pushes. The `github.event_name` half is what keeps a
