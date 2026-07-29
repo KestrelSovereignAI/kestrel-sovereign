@@ -14,13 +14,10 @@ existing tables are modified.
 from __future__ import annotations
 
 import json
-import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
-
-logger = logging.getLogger(__name__)
 
 
 # Terminal states — a request in any of these is locked. The
@@ -122,8 +119,9 @@ _ADDED_COLUMNS = (
 
 # One-time data backfills for legacy rows, keyed by the column whose addition
 # makes them necessary. Each runs in the same transaction as its ``ALTER``
-# (see ``_migrate_columns_once``), so the schema itself is the marker: if the
-# column is present, this backfill has already run or was never needed.
+# (see ``AsyncDatabase.migrate_columns_once``), so the schema itself is the
+# marker: if the column is present, this backfill has already run or was never
+# needed.
 _COLUMN_BACKFILLS = {
     "wake_delivered": (
         # Pre-#1819 a row only reached 'completed' AFTER its wake was
@@ -291,65 +289,6 @@ class RestartRequest:
         }
 
 
-async def _missing_columns(db) -> list:
-    """The ``_ADDED_COLUMNS`` entries not yet on ``restart_requests``, in order."""
-    missing = []
-    for col, col_def in _ADDED_COLUMNS:
-        if not await db._column_exists("restart_requests", col):
-            missing.append((col, col_def))
-    return missing
-
-
-async def _migrate_columns_once(db) -> None:
-    """Add the post-#1512 columns and run their legacy backfills, atomically.
-
-    **The schema is the marker.** A backfill exists to put legacy rows into
-    the shape the new column implies, so it is needed exactly when this call
-    is the one adding that column. Every ALTER and its backfill therefore run
-    inside a single ``migration_lock`` transaction: either the column and its
-    backfilled data both land, or neither does and the next boot retries from
-    the same starting point.
-
-    That atomicity is the whole point, and it is what the previous
-    implementation lacked. It ran each ALTER on its own and inferred "already
-    migrated" from the ALTER *raising* — which could not distinguish a
-    duplicate column from a genuinely failed ALTER (lock timeout, disk
-    pressure, a Postgres permission error), and left a crash window in which
-    the column committed but its backfill never ran. A separate migration
-    ledger would close the window at the cost of a second source of truth that
-    can disagree with the schema; one transaction closes it with none.
-
-    A backfill must never run against a column that was already present. These
-    statements rewrite live rows — ``wake_delivered = 1`` on every completed
-    request would mark a genuinely undelivered wake as delivered and suppress
-    the sweep that is still trying to retry it, permanently losing that wake.
-    """
-    if not await _missing_columns(db):
-        return
-    async with db.migration_lock("restart_requests_columns"):
-        # Re-checked under the lock: a concurrent initializer may have run the
-        # whole migration while this one waited.
-        for col, col_def in await _missing_columns(db):
-            await db._migrate_add_column("restart_requests", col, col_def)
-            backfill = _COLUMN_BACKFILLS.get(col)
-            if backfill is not None:
-                sql, params = backfill
-                await db.execute(sql, params)
-                logger.info(
-                    "restart_requests: added %s and backfilled legacy rows",
-                    col,
-                )
-        # Every read projects the full column list, so a migration that
-        # half-applied must not report success and let each subsequent query
-        # fail instead.
-        still_missing = [col for col, _ in await _missing_columns(db)]
-        if still_missing:
-            raise RuntimeError(
-                "restart_requests is missing column(s) after migration: "
-                + ", ".join(still_missing)
-            )
-
-
 async def ensure_restart_requests_table(db) -> None:
     """Create the table + indices if they don't already exist."""
     await db.execute(
@@ -381,7 +320,11 @@ async def ensure_restart_requests_table(db) -> None:
         )
         """
     )
-    await _migrate_columns_once(db)
+    # The platform owns the mechanism (one transaction per ALTER + backfill,
+    # schema-as-marker, post-migration verification); this declares only what.
+    await db.migrate_columns_once(
+        "restart_requests", _ADDED_COLUMNS, _COLUMN_BACKFILLS,
+    )
     await db.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_restart_requests_status

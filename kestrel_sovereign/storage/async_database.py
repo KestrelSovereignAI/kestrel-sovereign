@@ -1525,6 +1525,91 @@ class AsyncDatabase:
         async with self.transaction():
             yield
 
+    async def _missing_columns(self, table: str, columns) -> list:
+        """Which of ``columns`` are not yet on ``table``, in the given order."""
+        missing = []
+        for column, col_def in columns:
+            if not await self._column_exists(table, column):
+                missing.append((column, col_def))
+        return missing
+
+    async def migrate_columns_once(
+        self, table: str, columns, backfills=None, *, lock_name: str = "",
+    ) -> None:
+        """Add missing columns and their legacy backfills to ``table``, atomically.
+
+        Callers declare WHAT to migrate; this owns HOW. ``columns`` is an
+        ordered sequence of ``(name, column_definition)``. ``backfills`` maps a
+        column name to the ``(sql, params)`` that puts pre-existing rows into
+        the shape that column implies — keyed by the column whose *addition*
+        makes the backfill necessary.
+
+        **The schema is the marker.** A backfill is needed exactly when this
+        call is the one adding its column, so no separate ledger is kept. Each
+        ALTER and its backfill run inside one ``migration_lock`` transaction:
+        both land or neither does, and the next boot retries from the same
+        starting point.
+
+        That atomicity is the point. Doing it by hand — an ALTER per statement,
+        inferring "already migrated" from the ALTER *raising* — cannot tell a
+        duplicate column from a genuinely failed one (lock timeout, disk
+        pressure, a Postgres permission error), and leaves a window in which
+        the column commits but its backfill never runs. Nothing later can
+        detect that window, because the column is present, so every subsequent
+        boot skips the backfill forever. A ledger would detect it at the cost
+        of a second source of truth that can disagree with the schema; one
+        transaction removes it from the state space instead.
+
+        A backfill must never run against a column that was already there.
+        These statements rewrite live rows the running system owns, and the
+        damage is silent — see ``restart_requests``, where re-running one would
+        mark a genuinely undelivered wake as delivered and suppress the sweep
+        still retrying it.
+
+        ``columns`` order is honoured, so a backfill may read a column an
+        earlier entry backfills.
+
+        Raises if any column is still missing afterwards, rather than reporting
+        success and letting every later read fail: callers project their full
+        column list, so one silently-skipped ALTER breaks the table for the
+        rest of the boot.
+
+        ``lock_name`` defaults to ``<table>_columns``; pass one only to share a
+        lock with another migration that must not run concurrently.
+        """
+        # Materialized because ``columns`` is probed three times — before the
+        # lock, again under it, and once more to verify. A one-shot iterable
+        # would drain on the first probe, so no ALTER would run AND the
+        # verification below would see nothing missing and report success:
+        # the guarantee in this docstring, defeated by the same exhausted
+        # iterator that skipped the work. Cheap insurance on a public API that
+        # cannot see what its callers pass.
+        columns = tuple(columns)
+        backfills = backfills or {}
+        if not await self._missing_columns(table, columns):
+            return
+        async with self.migration_lock(lock_name or f"{table}_columns"):
+            # Re-checked under the lock: a concurrent initializer may have run
+            # the whole migration while this one waited.
+            for column, col_def in await self._missing_columns(table, columns):
+                await self._migrate_add_column(table, column, col_def)
+                backfill = backfills.get(column)
+                if backfill is not None:
+                    sql, params = backfill
+                    await self.execute(sql, params)
+                    logger.info(
+                        "%s: added %s and backfilled pre-existing rows",
+                        table, column,
+                    )
+            still_missing = [
+                c for c, _ in await self._missing_columns(table, columns)
+            ]
+            if still_missing:
+                raise RuntimeError(
+                    f"{table} is missing column(s) after migration: "
+                    + ", ".join(still_missing)
+                )
+
     async def _run_ownership_backfills_once(self, name: str) -> None:
         """Run the #2649 ownership backfills exactly once, serialized."""
         async with self.migration_lock(name):
