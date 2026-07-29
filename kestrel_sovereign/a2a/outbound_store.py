@@ -141,21 +141,31 @@ async def ensure_a2a_outbound_tasks_table(db) -> None:
     )
     # The outbound table is feature-owned, so it is created independently of
     # AsyncDatabase's core schema.  Existing agent databases predate stable
-    # recipient identity; migrate them in the same backend-aware path used by
-    # core schema migrations.  NULL remains the explicit legacy marker.
-    await db._migrate_add_column(
-        "a2a_outbound_tasks", "recipient_agent_id", "TEXT DEFAULT NULL",
+    # recipient identity and retained-route authorization; migrate them in the
+    # same backend-aware path used by core schema migrations.  NULL remains
+    # the explicit legacy marker for ``recipient_agent_id``.
+    await db.migrate_columns_once(
+        "a2a_outbound_tasks",
+        (
+            ("recipient_agent_id", "TEXT DEFAULT NULL"),
+            ("route_state", "TEXT NOT NULL DEFAULT 'routable'"),
+        ),
     )
     # Older rows were created before retained-route authorization existed.
     # Treat a unique historical task id as routable for local-host backwards
     # compatibility, but quarantine every historical collision before adding
     # the canonical-owner constraint below.  Keeping the rows preserves audit
     # history; marking them ambiguous makes ``get_outbound_task`` fail closed.
-    await db._migrate_add_column(
-        "a2a_outbound_tasks",
-        "route_state",
-        "TEXT NOT NULL DEFAULT 'routable'",
-    )
+    #
+    # Deliberately NOT passed to ``migrate_columns_once`` as a backfill keyed
+    # on ``route_state``.  A keyed backfill runs only when this call is the one
+    # adding the column, and the unique index below DEPENDS on the quarantine
+    # having run: a database whose ``route_state`` predates that index (a build
+    # between the two changes, or a crash between them) would skip the
+    # quarantine and then fail to create the index, because the collisions it
+    # exists to clear are still routable.  Running it unconditionally costs a
+    # grouped scan per init and guarantees the index can always be built.  That
+    # trade is the reason this is not the ``restart_requests`` pattern.
     await db.execute(
         """
         UPDATE a2a_outbound_tasks
