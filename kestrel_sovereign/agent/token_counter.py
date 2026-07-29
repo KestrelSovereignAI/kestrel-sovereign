@@ -179,8 +179,10 @@ class TokenCounter:
             content = msg.get("content", "")
             total += self.count(content) + MESSAGE_OVERHEAD
 
-        # Add priming tokens (assistant response start)
-        total += 3
+        # Add priming tokens (assistant response start) only when there is a
+        # conversation to prime.
+        if messages:
+            total += 3
 
         return total
 

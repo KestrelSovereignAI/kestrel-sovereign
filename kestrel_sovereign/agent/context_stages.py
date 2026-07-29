@@ -346,10 +346,10 @@ class ContextBuildPlan:
                     else 0
                 ),
                 "silent_prune_possible": (
-                    not self.durable_salvage_enabled
-                    or (
-                        pruned_span is not None
-                        and unmappable_count > 0
+                    pruned_span is not None
+                    and (
+                        not self.durable_salvage_enabled
+                        or unmappable_count > 0
                     )
                 ),
             },
