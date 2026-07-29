@@ -1,27 +1,40 @@
-"""Decision table for the ``duplicate-run-gate`` job in ``.github/workflows/ci.yml``.
+"""Decision table for the duplicate-run gate in ``.github/workflows/ci.yml``.
 
-That job decides whether the expensive CI tiers (integration-tests, and
-llm-tests via its ``needs:``) should run at all. It exists because a
-``kestrel-talon`` branch matches BOTH the ``issue-*`` push trigger and the
-``pull_request`` trigger, so once its PR is open every commit fires two
-complete CI runs on the same SHA. See #2800.
+The gate is a step of the ``unit-tests`` job. It decides whether the expensive
+CI tiers (``integration-tests``, and ``llm-tests`` through its ``needs:``)
+should run at all. It exists because a ``kestrel-talon`` branch matches BOTH
+the ``issue-*`` push trigger and the ``pull_request`` trigger, so once its PR
+is open every commit fires two complete CI runs on the same SHA. See #2800.
 
-The gate is shell embedded in YAML, which nothing else type-checks or
-exercises. Getting it wrong in the "skip" direction silently stops testing
-real changes, so these tests run the ACTUAL script extracted from the
-workflow — not a copy — with ``gh`` stubbed and the ``${{ }}`` expressions
-substituted the way Actions would.
+It is shell embedded in YAML, which nothing else type-checks or exercises, and
+an error in the *skip* direction silently stops testing real changes. Worst
+case, it skips the integration tier inside publish.yml's release gate, where
+skipped jobs still let the ``ci`` job report success and publishing proceeds.
+So these tests run the ACTUAL script extracted from the workflow — not a copy
+— with ``gh`` stubbed and the real ``env:`` block supplied.
 
 The invariant: the gate skips in exactly one situation — a push to a branch
-that already has an open PR onto a base this workflow actually runs for
-(``main`` or ``epic/**``). Everything else must run, including a PR onto an
-uncovered base such as a stacked PR, and every error path.
+that already has an open, non-conflicting, same-repository PR onto a base this
+workflow actually runs for (``main`` or ``epic/**``). Everything else runs,
+including stacked PRs onto an uncovered base, fork PRs from a branch with a
+colliding name, and every error path.
+
+Three layers are covered, because a bug in any one of them disarms the gate:
+
+1. the script's decisions (``TestSkips*`` / ``TestEveryOtherTriggerRuns`` / ``TestFailsOpen``)
+2. the ``--jq`` filter, which runs inside ``gh`` and so is invisible to a
+   stubbed ``gh`` (``TestPrQueryFilter``)
+3. the wiring between producer and consumer — step id, ``outputs:`` key, and
+   the consuming ``if:`` (``TestWiring``). A one-character typo here skips the
+   expensive tier on every trigger while every decision test stays green.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -31,17 +44,19 @@ import yaml
 
 CI_WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
 
-# Stubs for the one external command the gate calls. It asks for
-# ``--json baseRefName --jq '.[].baseRefName'``, so the stub emits one base
-# branch per line — the shape that matters, because an open PR only makes a
-# push redundant when that PR's base is one this workflow runs for.
+GATE_STEP_ID = "dedupe-gate"
+GATE_HOST_JOB = "unit-tests"
+GATE_OUTPUT = "run_expensive"
+
+# ``gh`` is stubbed, so these emit what the *filtered* query would return: one
+# base branch per line. The filter itself is covered by TestPrQueryFilter.
 GH_STUBS = {
     "no-pr": "gh() { :; }",
     "pr-onto-main": "gh() { echo main; }",
     "pr-onto-epic": "gh() { echo 'epic/semantic-kb'; }",
     "two-prs-onto-main": "gh() { printf 'main\\nmain\\n'; }",
-    # Stacked PR: base is another issue-* branch, which the `pull_request`
-    # trigger filter (main, epic/**) ignores — so NO pull_request run exists
+    # Stacked PR: base is another issue-* branch, which the pull_request
+    # trigger filter (main, epic/**) ignores — so no pull_request run exists
     # and this push run is the only coverage.
     "pr-onto-issue-branch": "gh() { echo 'issue-2793-ci-unchain-jobs'; }",
     "pr-onto-release-branch": "gh() { echo 'release/0.50'; }",
@@ -50,34 +65,52 @@ GH_STUBS = {
 }
 
 
-def _gate_script() -> str:
-    workflow = yaml.safe_load(CI_WORKFLOW.read_text())
-    steps = workflow["jobs"]["duplicate-run-gate"]["steps"]
-    return steps[0]["run"]
+def _jobs() -> dict:
+    return yaml.safe_load(CI_WORKFLOW.read_text())["jobs"]
 
 
-def _render(script: str, event: str, ref: str) -> str:
-    """Substitute the Actions expressions, as the runner would."""
-    ref_name = re.sub(r"^refs/(heads|tags)/", "", ref)
-    rendered = (
-        script.replace("${{ github.event_name }}", event)
-        .replace("${{ github.ref }}", ref)
-        .replace("${{ github.ref_name }}", ref_name)
-        .replace("${{ github.repository }}", "KestrelSovereignAI/kestrel-sovereign")
+def _gate_step() -> dict:
+    steps = _jobs()[GATE_HOST_JOB]["steps"]
+    matching = [s for s in steps if s.get("id") == GATE_STEP_ID]
+    assert len(matching) == 1, (
+        f"expected exactly one step with id={GATE_STEP_ID!r} in {GATE_HOST_JOB}, "
+        f"found {len(matching)}. The job output and the test harness both locate "
+        f"the gate by that id."
     )
-    assert "${{" not in rendered, f"unsubstituted expression:\n{rendered}"
-    return rendered
+    return matching[0]
+
+
+def _env_for(event: str, ref: str) -> dict:
+    """The ``env:`` block the runner would hand the step.
+
+    The script reads only these — nothing is interpolated into its body, which
+    is the point: a hostile branch name cannot inject shell.
+    """
+    return {
+        "EVENT_NAME": event,
+        "REF": ref,
+        "REF_NAME": re.sub(r"^refs/(heads|tags)/", "", ref),
+        "REPO": "KestrelSovereignAI/kestrel-sovereign",
+        "REPO_OWNER": "KestrelSovereignAI",
+        "GH_TOKEN": "stub",
+    }
 
 
 def _decide(event: str, ref: str, gh_mode: str) -> str:
-    """Run the real gate and return its ``run_expensive`` output."""
+    """Run the real gate script and return its decision."""
+    script = _gate_step()["run"]
+    assert "${{" not in script, (
+        "the gate interpolates an Actions expression into its script body; route "
+        f"it through env: instead, or a branch name can inject shell:\n{script}"
+    )
+
     handle = tempfile.NamedTemporaryFile("w", delete=False, suffix=".env")
     handle.close()
     try:
-        body = GH_STUBS[gh_mode] + "\n" + _render(_gate_script(), event, ref)
-        subprocess.run(
-            ["bash", "-c", body],
-            env={**os.environ, "GITHUB_OUTPUT": handle.name},
+        proc = subprocess.run(
+            # -e matches the runner's default shell (`bash -e {0}`).
+            ["bash", "-e", "-c", GH_STUBS[gh_mode] + "\n" + script],
+            env={**os.environ, "GITHUB_OUTPUT": handle.name, **_env_for(event, ref)},
             capture_output=True,
             text=True,
             timeout=30,
@@ -86,9 +119,13 @@ def _decide(event: str, ref: str, gh_mode: str) -> str:
     finally:
         os.unlink(handle.name)
 
-    matches = re.findall(r"^run_expensive=(\w+)$", written, re.MULTILINE)
-    assert matches, f"gate wrote no run_expensive decision; GITHUB_OUTPUT was:\n{written!r}"
-    # The script exits at its first decision, so exactly one line is correct.
+    assert proc.returncode == 0, (
+        f"gate exited {proc.returncode}. It runs inside {GATE_HOST_JOB}, a REQUIRED "
+        f"status check, so a non-zero exit blocks merges.\n"
+        f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
+    )
+    matches = re.findall(rf"^{GATE_OUTPUT}=(\w+)$", written, re.MULTILINE)
+    assert matches, f"gate wrote no decision; GITHUB_OUTPUT was:\n{written!r}"
     assert len(matches) == 1, f"gate wrote {len(matches)} decisions: {matches}"
     return matches[0]
 
@@ -97,25 +134,24 @@ class TestSkipsOnlyTheDuplicate:
     """The single case the gate exists to suppress."""
 
     @pytest.mark.parametrize(
-        "gh_mode", ["pr-onto-main", "pr-onto-epic", "two-prs-onto-main", "mixed-stacked-and-main"]
+        "gh_mode",
+        ["pr-onto-main", "pr-onto-epic", "two-prs-onto-main", "mixed-stacked-and-main"],
     )
     def test_branch_push_with_covered_pr_skips(self, gh_mode):
         assert _decide("push", "refs/heads/issue-2800-dedupe", gh_mode) == "false"
 
     def test_branch_push_before_pr_exists_runs(self):
-        """The pre-PR window is real: talon opens its PR 35 min to 2.7 h after
-        the first push, so this run is the only signal until then."""
+        """The pre-PR window is real: talon opens its PR 35 min to 2.7 h after the
+        first push, so this run is the only signal until then."""
         assert _decide("push", "refs/heads/issue-2800-dedupe", "no-pr") == "true"
 
 
 class TestPrMustActuallyTriggerThisWorkflow:
     """An open PR only makes a push redundant if that PR runs this workflow.
 
-    The ``pull_request`` trigger is filtered to base branches ``main`` and
-    ``epic/**``. A PR onto anything else produces no ``pull_request`` run, so
-    suppressing the push run would leave the commit with no integration
-    coverage at all. Stacked PRs onto another ``issue-*`` branch are the
-    realistic case.
+    ``pull_request`` is filtered to base branches ``main`` and ``epic/**``. A PR
+    onto anything else produces no run, so suppressing the push would leave the
+    commit with no integration coverage. Stacked PRs are the realistic case.
     """
 
     @pytest.mark.parametrize("gh_mode", ["pr-onto-issue-branch", "pr-onto-release-branch"])
@@ -132,8 +168,8 @@ class TestEveryOtherTriggerRuns:
             ("pull_request", "refs/pull/2801/merge", "pr-onto-main"),
             ("push", "refs/heads/main", "pr-onto-main"),
             ("workflow_dispatch", "refs/heads/some-branch", "no-pr"),
-            # publish.yml calls this workflow as its release gate. On a tag
-            # push the caller's ref is the tag; a workflow_dispatch release
+            # publish.yml calls this workflow as its release gate. A tag push
+            # arrives with the caller's tag ref; a workflow_dispatch release
             # from main arrives as event=workflow_dispatch.
             ("push", "refs/tags/v0.49.5", "no-pr"),
             ("push", "refs/tags/v0.49.5", "pr-onto-main"),
@@ -146,31 +182,116 @@ class TestEveryOtherTriggerRuns:
 class TestFailsOpen:
     """Any uncertainty must run the tests, never skip them."""
 
-    @pytest.mark.parametrize("gh_mode", ["api-failure"])
-    def test_unusable_pr_query_still_runs(self, gh_mode):
-        assert _decide("push", "refs/heads/issue-2800-dedupe", gh_mode) == "true"
+    def test_unusable_pr_query_still_runs(self):
+        assert _decide("push", "refs/heads/issue-2800-dedupe", "api-failure") == "true"
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="jq not installed")
+class TestPrQueryFilter:
+    """The ``--jq`` filter runs inside ``gh``, so a stubbed ``gh`` never exercises
+    it. Run it against representative ``gh pr list`` JSON instead.
+
+    It has to reject two classes of PR that ``--head`` alone cannot, because
+    ``--head`` matches on branch NAME only and takes no owner qualifier.
+    """
+
+    @staticmethod
+    def _filter(prs: list[dict], owner: str = "KestrelSovereignAI") -> list[str]:
+        script = _gate_step()["run"]
+        match = re.search(r"pr_filter='(.*?)'", script, re.DOTALL)
+        assert match, f"could not locate pr_filter='…' in the gate script:\n{script}"
+        proc = subprocess.run(
+            ["jq", "-r", match.group(1)],
+            input=json.dumps(prs),
+            env={**os.environ, "REPO_OWNER": owner},
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode == 0, f"jq failed: {proc.stderr}"
+        return proc.stdout.split()
+
+    @staticmethod
+    def _pr(base="main", owner="KestrelSovereignAI", mergeable="MERGEABLE"):
+        return {
+            "baseRefName": base,
+            "headRepositoryOwner": {"login": owner},
+            "mergeable": mergeable,
+        }
+
+    def test_ordinary_pr_is_kept(self):
+        assert self._filter([self._pr()]) == ["main"]
+
+    def test_fork_pr_with_colliding_branch_name_is_rejected(self):
+        """kestrel-sovereign is public. Anyone can fork it, push a branch named
+        exactly like ours, and open a PR onto main. ``gh pr list --head`` would
+        return it, and without this filter their PR would suppress our run —
+        denial-of-testing with no write access required."""
+        assert self._filter([self._pr(owner="some-fork-account")]) == []
+
+    def test_conflicting_pr_is_rejected(self):
+        """A CONFLICTING PR has no computable merge ref, so no pull_request run
+        covers the SHA and the push run is the only remaining signal."""
+        assert self._filter([self._pr(mergeable="CONFLICTING")]) == []
+
+    def test_unknown_mergeability_is_kept(self):
+        """GitHub reports UNKNOWN while it computes the merge ref. Treating that
+        as conflicting would run the duplicate every time a PR is freshly
+        pushed, which is the common case."""
+        assert self._filter([self._pr(mergeable="UNKNOWN")]) == ["main"]
+
+    def test_keeps_only_the_qualifying_pr_among_several(self):
+        prs = [
+            self._pr(base="issue-2793-x"),
+            self._pr(owner="fork-account"),
+            self._pr(mergeable="CONFLICTING"),
+            self._pr(base="main"),
+        ]
+        assert self._filter(prs) == ["issue-2793-x", "main"]
 
 
 class TestWiring:
-    """The gate is only worth testing if the expensive tiers consult it."""
+    """The producer/consumer link. Every assertion here corresponds to a mutation
+    that leaves all the decision tests above green while disarming the gate."""
+
+    def test_output_is_wired_to_the_gate_step(self):
+        """A typo here (``steps.dcide``) yields an empty output on every run."""
+        job = _jobs()[GATE_HOST_JOB]
+        assert job["outputs"][GATE_OUTPUT] == (
+            "${{ steps." + GATE_STEP_ID + ".outputs." + GATE_OUTPUT + " }}"
+        )
+
+    def test_gate_step_exists_exactly_once(self):
+        assert _gate_step()["run"].strip()
+
+    def test_gate_host_job_runs_on_every_trigger(self):
+        """An ``if:`` on the host job would skip the gate — and its dependents."""
+        assert "if" not in _jobs()[GATE_HOST_JOB]
 
     def test_integration_tests_consults_the_gate(self):
-        jobs = yaml.safe_load(CI_WORKFLOW.read_text())["jobs"]
-        integration = jobs["integration-tests"]
-        assert "duplicate-run-gate" in integration["needs"]
-        assert "needs.duplicate-run-gate.outputs.run_expensive == 'true'" in integration["if"]
+        integration = _jobs()["integration-tests"]
+        assert GATE_HOST_JOB in str(integration["needs"])
+        assert f"needs.{GATE_HOST_JOB}.outputs.{GATE_OUTPUT}" in integration["if"]
+
+    def test_consumer_fails_open(self):
+        """``!= 'false'`` not ``== 'true'``: if the output is ever empty, the
+        tier must still run. ``== 'true'`` would skip it everywhere, including
+        publish.yml's release gate, where skipped jobs still report success."""
+        integration = _jobs()["integration-tests"]
+        assert f"needs.{GATE_HOST_JOB}.outputs.{GATE_OUTPUT} != 'false'" in integration["if"]
+        assert f"{GATE_OUTPUT} == 'true'" not in integration["if"]
 
     def test_llm_tests_inherits_the_skip(self):
         """llm-tests is not gated directly; it depends on integration-tests, and
-        a job whose dependency is skipped is itself skipped."""
-        jobs = yaml.safe_load(CI_WORKFLOW.read_text())["jobs"]
-        assert jobs["llm-tests"]["needs"] == "integration-tests"
+        a job whose dependency is skipped is itself skipped. An ``if: always()``
+        there would break the inheritance."""
+        llm = _jobs()["llm-tests"]
+        assert "integration-tests" in str(llm["needs"])
+        assert "if" not in llm
 
-    def test_required_checks_are_never_gated(self):
+    def test_required_checks_are_not_themselves_gated(self):
         """lint-and-imports and unit-tests are required status checks. A skipped
-        job still posts a check run, so gating them would put a `skipped`
-        conclusion on the merge gate. Deliberately out of scope."""
-        jobs = yaml.safe_load(CI_WORKFLOW.read_text())["jobs"]
-        for name in ("lint-and-imports", "unit-tests"):
-            assert "duplicate-run-gate" not in str(jobs[name].get("needs", ""))
-            assert "duplicate-run-gate" not in str(jobs[name].get("if", ""))
+        job still posts a check run, so neither may be conditioned on the gate."""
+        jobs = _jobs()
+        for name in ("lint-and-imports", GATE_HOST_JOB):
+            assert GATE_OUTPUT not in str(jobs[name].get("if", ""))
