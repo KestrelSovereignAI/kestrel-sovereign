@@ -18,7 +18,7 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-07-28
+**Generated:** 2026-07-29
 **Scope:** 2237 tracked files (1480 `.py`, 344 `.md`, 413 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
@@ -548,7 +548,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/restart_coordinator/feature.py** — RestartCoordinatorFeature — durable, host-mediated restart requests.
   - `class RestartCoordinatorFeature`
 - **kestrel_sovereign/features/restart_coordinator/store.py** — Durable store helpers for ``restart_requests`` (#1512).
-  - `class RestartRequest`; `async def ensure_restart_requests_table(db)`; `async def insert_request(db)`; `async def list_requests(db)`; `async def list_requests_needing_wake(db)`; `async def mark_wake_delivered(db, request_id)`; `async def get_request(db, request_id)`; `async def record_update_log(db, request_id, update_log)`; `…`
+  - `class RestartRequest`; `async def ensure_restart_requests_table(db)`; `async def insert_request(db)`; `async def list_requests(db)`; `async def list_requests_needing_wake(db)`; `async def mark_wake_delivered(db, request_id)`; `async def mark_wake_dispatched(db, request_id)`; `async def get_request(db, request_id)`; `…`
 - **kestrel_sovereign/features/restart_coordinator/update_profiles.py** — Allowlisted update/install profiles for ``update_then_restart`` (#1539).
   - `def is_valid_target_ref(ref)`; `def repo_is_git_checkout(path)`; `def default_sovereign_repo_path()`; `class UpdateStep`; `class UpdateProfile`; `def get_update_profile(name)`
 - **kestrel_sovereign/features/save/__init__.py** — Save Feature - Persistent storage with semantic search.
@@ -3067,7 +3067,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_otel_export_isolation.py** — Regression guard for #2704: the test suite must never ship real OTLP spans.
   - `def network_export_sentinel(monkeypatch)`; `def test_autouse_fixture_disables_llm_tracing_by_default()`; `def test_llm_span_cycle_never_exports_over_network(network_export_sentinel)`; `def test_endpoint_set_run_uses_in_memory_exporter_not_network(monkeypatch, network_export_sentinel)`
 - **tests/unit/test_ownership_backfill_once.py** — Regression: #2649 ownership backfills must run once, not on every from_pool.
-  - `async def db(tmp_path)`; `async def test_first_init_records_marker(db)`; `async def test_backfills_skip_when_marker_present(db, monkeypatch)`; `async def test_backfills_rerun_if_marker_absent(db, monkeypatch)`; `async def test_document_chunk_backfill_assigns_only_single_owner_files(db)`
+  - `async def db(tmp_path)`; `async def test_first_init_records_marker(db)`; `async def test_backfills_skip_when_marker_present(db, monkeypatch)`; `async def test_backfills_rerun_if_marker_absent(db, monkeypatch)`; `async def test_document_chunk_backfill_assigns_only_single_owner_files(db)`; `async def test_migration_lock_rolls_the_whole_body_back(db)`; `async def test_migration_lock_serializes_concurrent_holders(db)`; `async def test_migration_lock_takes_the_sqlite_writer_slot_up_front(db)`; `…`
 - **tests/unit/test_path_safety.py** — Tests for path-safety primitives (#834).
   - `def test_no_traversal_rejects_dotdot()`; `def test_no_traversal_rejects_nul()`; `def test_no_traversal_allows_clean_paths()`; `def test_resolve_realpath_canonicalizes(tmp_path)`; `def test_resolve_realpath_follows_symlink(tmp_path)`; `def test_resolve_realpath_rejects_traversal(tmp_path)`; `def test_resolve_realpath_handles_nonexistent_leaf(tmp_path)`; `def test_resolve_realpath_expands_user()`; `…`
 - **tests/unit/test_paths.py** — Unit tests for :mod:`kestrel_sovereign.paths`.
