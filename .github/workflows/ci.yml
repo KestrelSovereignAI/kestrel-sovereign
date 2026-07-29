@@ -40,6 +40,69 @@ env:
   PYTHONHASHSEED: "0"
 
 jobs:
+  # A `kestrel-talon` branch is named `issue-<n>-…`, which matches the push
+  # trigger above. Once its PR is open, every commit fires TWO complete CI
+  # runs on the identical SHA — one `push`, one `pull_request` — because the
+  # two land in different `concurrency:` groups (`refs/heads/issue-…` vs
+  # `refs/pull/N/merge`) and neither supersedes the other. Measured over 100
+  # runs: 22 of 43 `issue-*` SHAs built twice. See #2800.
+  #
+  # This job decides whether the *expensive* tiers should run. Deleting the
+  # `issue-*` push trigger outright was considered and rejected: talon opens
+  # its PR 35 min to 2.7 h after the first push, so the push run is the only
+  # signal during that window, and some branches never get a PR at all.
+  #
+  # Deliberately scoped to integration-tests and llm-tests only. The
+  # required status checks (lint-and-imports, unit-tests) always run on both
+  # events. Gating those too would save ~6 more job-minutes per duplicate,
+  # but a skipped job still posts a check run — visible today, where
+  # dependency-review posts `skipped` from the push run alongside `success`
+  # from the PR run on the same SHA — and a required check reporting
+  # `skipped` is not a behavior worth risking on the merge gate to save
+  # six minutes.
+  #
+  # Fails open: any unexpected state runs the tests.
+  duplicate-run-gate:
+    runs-on: ubuntu-latest
+    outputs:
+      run_expensive: ${{ steps.decide.outputs.run_expensive }}
+    steps:
+      - id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          decide() { echo "run_expensive=$1" >> "$GITHUB_OUTPUT"; echo "run_expensive=$1 ($2)"; exit 0; }
+
+          # Only a branch push can be a duplicate; every other event is
+          # either the PR run itself or a release/dispatch gate.
+          [ "${{ github.event_name }}" = "push" ] || decide true "event is ${{ github.event_name }}, not a duplicate"
+
+          # A tag push is publish.yml's release gate calling this workflow.
+          # It must never be gated: `gh pr list --head` takes a BRANCH name,
+          # and a tag that happens to share a name with some branch would
+          # otherwise skip the integration tier inside the release gate and
+          # let a partial run report success. Anchor on refs/heads/ so only
+          # real branch pushes can ever reach the PR lookup.
+          case "${{ github.ref }}" in
+            refs/heads/*) ;;
+            *) decide true "ref ${{ github.ref }} is not a branch" ;;
+          esac
+
+          [ "${{ github.ref }}" != "refs/heads/main" ] || decide true "main push"
+
+          open_prs=$(gh pr list --repo "${{ github.repository }}" \
+                       --head "${{ github.ref_name }}" --state open \
+                       --json number --jq 'length' 2>/dev/null) || \
+            decide true "could not query PRs — failing open"
+          case "$open_prs" in
+            ''|*[!0-9]*) decide true "unparseable PR count '$open_prs' — failing open" ;;
+          esac
+
+          [ "$open_prs" -eq 0 ] || \
+            decide false "PR already open for ${{ github.ref_name }}; its pull_request run covers this SHA"
+          decide true "no open PR for ${{ github.ref_name }}"
+
   # Once the default branch is clean, reject any PR that introduces a new
   # high/critical dependency advisory. The action compares the base and head
   # dependency snapshots, so intentional lower-severity exceptions remain an
@@ -197,9 +260,10 @@ jobs:
   # would then report success on a partial run and publish to PyPI.
   integration-tests:
     runs-on: ubuntu-latest
-    needs: unit-tests
+    needs: [unit-tests, duplicate-run-gate]
     if: >-
-      github.event_name != 'push' || github.ref != 'refs/heads/main'
+      (github.event_name != 'push' || github.ref != 'refs/heads/main')
+      && needs.duplicate-run-gate.outputs.run_expensive == 'true'
     services:
       postgres:
         image: pgvector/pgvector:pg15
