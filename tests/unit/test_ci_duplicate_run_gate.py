@@ -1,10 +1,11 @@
 """Decision table for the duplicate-run gate in ``.github/workflows/ci.yml``.
 
-The gate is a step of the ``unit-tests`` job. It decides whether the expensive
-CI tiers (``integration-tests``, and ``llm-tests`` through its ``needs:``)
-should run at all. It exists because a ``kestrel-talon`` branch matches BOTH
-the ``issue-*`` push trigger and the ``pull_request`` trigger, so once its PR
-is open every commit fires two complete CI runs on the same SHA. See #2800.
+The gate is a step of the ``lint-and-imports`` job — the root of the graph, so
+every tier can read its output regardless of how the tiers are wired to each
+other. It decides whether the expensive tiers (``integration-tests`` and
+``llm-tests``) run at all. It exists because a ``kestrel-talon`` branch matches
+BOTH the ``issue-*`` push trigger and the ``pull_request`` trigger, so once its
+PR is open every commit fires two complete CI runs on the same SHA. See #2800.
 
 It is shell embedded in YAML, which nothing else type-checks or exercises, and
 an error in the *skip* direction silently stops testing real changes. Worst
@@ -45,7 +46,7 @@ import yaml
 CI_WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
 
 GATE_STEP_ID = "dedupe-gate"
-GATE_HOST_JOB = "unit-tests"
+GATE_HOST_JOB = "lint-and-imports"
 GATE_OUTPUT = "run_expensive"
 
 # ``gh`` is stubbed, so these emit what the *filtered* query would return: one
@@ -281,17 +282,56 @@ class TestWiring:
         assert f"needs.{GATE_HOST_JOB}.outputs.{GATE_OUTPUT} != 'false'" in integration["if"]
         assert f"{GATE_OUTPUT} == 'true'" not in integration["if"]
 
-    def test_llm_tests_inherits_the_skip(self):
-        """llm-tests is not gated directly; it depends on integration-tests, and
-        a job whose dependency is skipped is itself skipped. An ``if: always()``
-        there would break the inheritance."""
-        llm = _jobs()["llm-tests"]
-        assert "integration-tests" in str(llm["needs"])
-        assert "if" not in llm
+    def test_llm_tests_states_its_conditions_outright(self):
+        """llm-tests runs in parallel now, so it no longer inherits anything from
+        integration-tests. Both the main-push skip and the dedupe clause have to
+        be stated on it directly, byte-identical to integration-tests, or it
+        starts running on main pushes and ignoring the gate."""
+        jobs = _jobs()
+        llm, integration = jobs["llm-tests"], jobs["integration-tests"]
+        assert GATE_HOST_JOB in str(llm["needs"])
+        assert " ".join(llm["if"].split()) == " ".join(integration["if"].split())
 
     def test_required_checks_are_not_themselves_gated(self):
         """lint-and-imports and unit-tests are required status checks. A skipped
         job still posts a check run, so neither may be conditioned on the gate."""
         jobs = _jobs()
-        for name in ("lint-and-imports", GATE_HOST_JOB):
+        for name in ("lint-and-imports", "unit-tests"):
             assert GATE_OUTPUT not in str(jobs[name].get("if", ""))
+
+
+class TestFailFast:
+    """The tiers run in parallel, so the old `needs:` chain no longer stops the
+    12.8-minute integration tier when the unit tier goes red. A dedicated job
+    restores that, and its shape is load-bearing."""
+
+    JOB = "cancel-expensive-tiers-when-unit-fails"
+
+    def test_exists_and_triggers_on_unit_failure(self):
+        job = _jobs()[self.JOB]
+        assert job["needs"] == "unit-tests"
+        assert job["if"] == "failure()"
+
+    def test_is_one_directional(self):
+        """It must depend on unit-tests ONLY. Adding integration-tests would make
+        an integration failure cancel the still-running unit tier — throwing away
+        the result the author needs next, and 8 of 11 recent failures were
+        integration-tests itself."""
+        assert _jobs()[self.JOB]["needs"] == "unit-tests"
+
+    def test_is_a_separate_job_not_a_step_in_unit_tests(self):
+        """Cancelling from inside a still-running job marks that job `cancelled`,
+        hiding which tier broke. As its own job, unit-tests has already concluded
+        `failure` before the cancel lands."""
+        assert "cancel" not in str(_jobs()["unit-tests"]["steps"]).lower()
+
+    def test_has_the_permission_it_needs(self):
+        assert _jobs()[self.JOB]["permissions"]["actions"] == "write"
+
+    def test_no_test_tier_can_outlive_the_cancel(self):
+        """Every expensive tier must start no earlier than the gate host, so the
+        cancel can reach it. If a tier ever depended on nothing, it could finish
+        before unit-tests failed."""
+        jobs = _jobs()
+        for tier in ("integration-tests", "llm-tests"):
+            assert jobs[tier]["needs"], f"{tier} must declare a dependency"
