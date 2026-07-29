@@ -557,6 +557,12 @@ class OperatorTurnInjectionResult(NamedTuple):
                 f"stream_failed:{type(exc).__name__}"
             )
             raise
+        finally:
+            # Every exit path releases the provider stream, including the
+            # ``break``-then-``aclose()`` stop button, which unwinds through
+            # the GeneratorExit branch above and would otherwise leave the
+            # cancel token and upstream connection to the asyncgen GC hook.
+            await _aclose_quietly(stream)
         if not delivered:
             await self.batch.settle_failed("stream_closed_without_output")
 
