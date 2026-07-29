@@ -12,8 +12,10 @@ real changes, so these tests run the ACTUAL script extracted from the
 workflow — not a copy — with ``gh`` stubbed and the ``${{ }}`` expressions
 substituted the way Actions would.
 
-The invariant: the gate skips in exactly one situation — a branch push whose
-PR is already open. Everything else, including every error path, must run.
+The invariant: the gate skips in exactly one situation — a push to a branch
+that already has an open PR onto a base this workflow actually runs for
+(``main`` or ``epic/**``). Everything else must run, including a PR onto an
+uncovered base such as a stacked PR, and every error path.
 """
 
 from __future__ import annotations
@@ -29,14 +31,22 @@ import yaml
 
 CI_WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
 
-# Stubs for the one external command the gate calls.
+# Stubs for the one external command the gate calls. It asks for
+# ``--json baseRefName --jq '.[].baseRefName'``, so the stub emits one base
+# branch per line — the shape that matters, because an open PR only makes a
+# push redundant when that PR's base is one this workflow runs for.
 GH_STUBS = {
-    "no-pr": "gh() { echo 0; }",
-    "one-pr": "gh() { echo 1; }",
-    "two-pr": "gh() { echo 2; }",
+    "no-pr": "gh() { :; }",
+    "pr-onto-main": "gh() { echo main; }",
+    "pr-onto-epic": "gh() { echo 'epic/semantic-kb'; }",
+    "two-prs-onto-main": "gh() { printf 'main\\nmain\\n'; }",
+    # Stacked PR: base is another issue-* branch, which the `pull_request`
+    # trigger filter (main, epic/**) ignores — so NO pull_request run exists
+    # and this push run is the only coverage.
+    "pr-onto-issue-branch": "gh() { echo 'issue-2793-ci-unchain-jobs'; }",
+    "pr-onto-release-branch": "gh() { echo 'release/0.50'; }",
+    "mixed-stacked-and-main": "gh() { printf 'issue-2793-x\\nmain\\n'; }",
     "api-failure": "gh() { return 1; }",
-    "garbage": 'gh() { echo "not-a-number"; }',
-    "empty": 'gh() { echo ""; }',
 }
 
 
@@ -86,8 +96,10 @@ def _decide(event: str, ref: str, gh_mode: str) -> str:
 class TestSkipsOnlyTheDuplicate:
     """The single case the gate exists to suppress."""
 
-    @pytest.mark.parametrize("gh_mode", ["one-pr", "two-pr"])
-    def test_branch_push_with_open_pr_skips(self, gh_mode):
+    @pytest.mark.parametrize(
+        "gh_mode", ["pr-onto-main", "pr-onto-epic", "two-prs-onto-main", "mixed-stacked-and-main"]
+    )
+    def test_branch_push_with_covered_pr_skips(self, gh_mode):
         assert _decide("push", "refs/heads/issue-2800-dedupe", gh_mode) == "false"
 
     def test_branch_push_before_pr_exists_runs(self):
@@ -96,20 +108,35 @@ class TestSkipsOnlyTheDuplicate:
         assert _decide("push", "refs/heads/issue-2800-dedupe", "no-pr") == "true"
 
 
+class TestPrMustActuallyTriggerThisWorkflow:
+    """An open PR only makes a push redundant if that PR runs this workflow.
+
+    The ``pull_request`` trigger is filtered to base branches ``main`` and
+    ``epic/**``. A PR onto anything else produces no ``pull_request`` run, so
+    suppressing the push run would leave the commit with no integration
+    coverage at all. Stacked PRs onto another ``issue-*`` branch are the
+    realistic case.
+    """
+
+    @pytest.mark.parametrize("gh_mode", ["pr-onto-issue-branch", "pr-onto-release-branch"])
+    def test_pr_onto_uncovered_base_still_runs(self, gh_mode):
+        assert _decide("push", "refs/heads/issue-2800-dedupe", gh_mode) == "true"
+
+
 class TestEveryOtherTriggerRuns:
     """No trigger other than a duplicate branch push may be suppressed."""
 
     @pytest.mark.parametrize(
         "event,ref,gh_mode",
         [
-            ("pull_request", "refs/pull/2801/merge", "one-pr"),
-            ("push", "refs/heads/main", "one-pr"),
+            ("pull_request", "refs/pull/2801/merge", "pr-onto-main"),
+            ("push", "refs/heads/main", "pr-onto-main"),
             ("workflow_dispatch", "refs/heads/some-branch", "no-pr"),
             # publish.yml calls this workflow as its release gate. On a tag
             # push the caller's ref is the tag; a workflow_dispatch release
             # from main arrives as event=workflow_dispatch.
             ("push", "refs/tags/v0.49.5", "no-pr"),
-            ("push", "refs/tags/v0.49.5", "one-pr"),
+            ("push", "refs/tags/v0.49.5", "pr-onto-main"),
         ],
     )
     def test_runs(self, event, ref, gh_mode):
@@ -119,7 +146,7 @@ class TestEveryOtherTriggerRuns:
 class TestFailsOpen:
     """Any uncertainty must run the tests, never skip them."""
 
-    @pytest.mark.parametrize("gh_mode", ["api-failure", "garbage", "empty"])
+    @pytest.mark.parametrize("gh_mode", ["api-failure"])
     def test_unusable_pr_query_still_runs(self, gh_mode):
         assert _decide("push", "refs/heads/issue-2800-dedupe", gh_mode) == "true"
 

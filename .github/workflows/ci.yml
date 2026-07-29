@@ -91,17 +91,28 @@ jobs:
 
           [ "${{ github.ref }}" != "refs/heads/main" ] || decide true "main push"
 
-          open_prs=$(gh pr list --repo "${{ github.repository }}" \
-                       --head "${{ github.ref_name }}" --state open \
-                       --json number --jq 'length' 2>/dev/null) || \
+          # An open PR only makes this push redundant if that PR actually
+          # triggers this workflow, which the `pull_request` filter above
+          # limits to base branches `main` and `epic/**`. A PR onto any other
+          # base — a stacked PR onto another issue-* branch, say — produces
+          # NO pull_request run, so skipping here would leave the commit with
+          # no integration coverage at all. Match on the base, not the count.
+          bases=$(gh pr list --repo "${{ github.repository }}" \
+                    --head "${{ github.ref_name }}" --state open \
+                    --json baseRefName --jq '.[].baseRefName' 2>/dev/null) || \
             decide true "could not query PRs — failing open"
-          case "$open_prs" in
-            ''|*[!0-9]*) decide true "unparseable PR count '$open_prs' — failing open" ;;
-          esac
 
-          [ "$open_prs" -eq 0 ] || \
-            decide false "PR already open for ${{ github.ref_name }}; its pull_request run covers this SHA"
-          decide true "no open PR for ${{ github.ref_name }}"
+          covered=no
+          for base in $bases; do
+            case "$base" in
+              main|epic/*) covered=yes ;;
+            esac
+          done
+
+          [ "$covered" = yes ] || \
+            decide true "no open PR onto a base this workflow runs for (bases: ${bases:-none})"
+
+          decide false "PR onto a covered base already open for ${{ github.ref_name }}; its pull_request run covers this SHA"
 
   # Once the default branch is clean, reject any PR that introduces a new
   # high/critical dependency advisory. The action compares the base and head
