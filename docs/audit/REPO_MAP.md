@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-07-29
-**Scope:** 2237 tracked files (1480 `.py`, 344 `.md`, 413 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-07-30
+**Scope:** 2241 tracked files (1482 `.py`, 344 `.md`, 415 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -1141,6 +1141,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/static/js/ui-ext/panels.js** — (js asset)
 - **kestrel_sovereign/static/js/ui-ext/registry.js** — (js asset)
 - **kestrel_sovereign/static/js/ui-ext/renderers.js** — (js asset)
+- **kestrel_sovereign/static/js/ui-ext/view-state.js** — (js asset)
 - **kestrel_sovereign/static/js/ui.js** — (js asset)
 - **kestrel_sovereign/static/js/ui_state.mjs** — (mjs asset)
 - **kestrel_sovereign/static/js/upgrade-prompt.js** — (js asset)
@@ -1989,6 +1990,7 @@ Repo entry points and standard project files.
 - **tests/frontend/trash_grouping.test.mjs** — (mjs asset)
 - **tests/frontend/ui_design_tokens.test.mjs** — (mjs asset)
 - **tests/frontend/ui_ext_bus.test.mjs** — (mjs asset)
+- **tests/frontend/ui_ext_panel_view_state.test.mjs** — (mjs asset)
 - **tests/frontend/ui_ext_panels_teardown.test.mjs** — (mjs asset)
 - **tests/frontend/ui_ext_registry.test.mjs** — (mjs asset)
 - **tests/frontend/ui_state.test.mjs** — (mjs asset)
@@ -2323,7 +2325,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_agent_prefix_consolidation.py** — Regression tests for the /agent → /api/agent prefix consolidation (#871).
   - `def test_canonical_api_agent_prefix_serves_agent_routes()`; `def test_deprecated_agent_prefix_still_resolves(caplog)`; `def test_deprecation_log_dedupes_per_path_and_ua()`
 - **tests/unit/test_agent_runtime_endpoint_contracts.py** — Focused contract tests for agent runtime/status endpoints.
-  - `def test_context_status_reports_whole_window_utilization_and_warning_band()`; `def test_context_status_full_query_param_runs_rag()`; `def test_context_status_uses_context_manager_dry_plan_and_preserves_unknowns()`; `def test_context_status_full_path_wires_read_only_memory_retriever()`; `def test_context_status_full_path_uses_last_user_turn_as_rag_query()`; `def test_context_status_full_path_labels_rag_when_no_user_turn_available()`; `def test_context_status_surfaces_route_cap_when_binding(monkeypatch)`; `def test_context_status_route_cap_includes_rag_on_full_path(monkeypatch)`; `…`
+  - `def test_context_status_reports_whole_window_utilization_and_warning_band()`; `def test_context_status_full_query_param_runs_rag()`; `def test_context_status_uses_context_manager_dry_plan_and_preserves_unknowns()`; `def test_context_status_real_empty_plan_has_no_silent_prune_warning()`; `def test_context_status_full_path_wires_read_only_memory_retriever()`; `def test_context_status_full_path_uses_last_user_turn_as_rag_query()`; `def test_context_status_full_path_labels_rag_when_no_user_turn_available()`; `def test_context_status_surfaces_route_cap_when_binding(monkeypatch)`; `…`
 - **tests/unit/test_agent_service_keys_key_hash_migration.py** — Regression: agent_service_keys schema drift on legacy databases.
   - `async def legacy_db(tmp_path)`; `async def test_init_schema_backfills_missing_columns(legacy_db)`; `async def test_store_key_roundtrips_after_migration(legacy_db)`; `async def test_migration_is_idempotent(legacy_db)`; `async def test_fresh_db_already_has_columns(tmp_path)`
 - **tests/unit/test_agent_soul_resources.py** — —
@@ -2436,8 +2438,12 @@ Repo entry points and standard project files.
   - `class TestPolicyGuardCoverage`; `class TestCheckPolicyBehavior`
 - **tests/unit/test_check_task_status_surfaces_request.py** — ``check_task_status``, ``get_task_result`` and ``list_my_tasks`` must surface the SENDER'S request text — not just the (often empty) agent reply slot.
   - `async def test_check_task_status_returns_request_content_for_submitted_task()`; `async def test_check_task_status_returns_both_request_and_reply_for_completed_task()`; `async def test_list_my_tasks_includes_request_content_per_row()`; `async def test_list_my_tasks_status_filter_queries_full_table_not_pending()`; `async def test_list_my_tasks_invalid_status_rejected()`; `async def test_list_my_tasks_type_filter_overfetches_then_truncates()`; `async def test_get_task_result_includes_request_content_for_completed_task()`; `async def test_check_task_status_surfaces_sender_attached_artifacts()`
+- **tests/unit/test_ci_duplicate_run_gate.py** — Decision table for the duplicate-run gate in ``.github/workflows/ci.yml``.
+  - `class TestSkipsOnlyTheDuplicate`; `class TestPrMustActuallyTriggerThisWorkflow`; `class TestEveryOtherTriggerRuns`; `class TestFailsOpen`; `class TestPrQueryFilter`; `class TestWiring`; `class TestTierConditions`; `class TestGateQueryInvocation`; `…`
 - **tests/unit/test_ci_wait_provider.py** — Tests for the ``ci:`` Waitable provider (#2729).
   - `def test_parse_ci_handle_ok()`; `def test_parse_ci_handle_rejects_malformed(bad)`; `def test_check_verdict_none_when_no_checks()`; `def test_check_verdict_pending_on_incomplete_run()`; `def test_check_verdict_pending_on_combined_pending()`; `def test_check_verdict_success()`; `def test_check_verdict_failure_from_conclusion()`; `def test_check_verdict_failure_from_legacy_status()`; `…`
+- **tests/unit/test_ci_workflow_permissions.py** — ``publish.yml`` must grant at least what ``ci.yml`` asks for.
+  - `def test_ci_is_actually_called_by_publish()`; `def test_every_nested_workflow_is_within_its_callers_ceiling()`; `def test_every_requested_scope_is_within_the_ceiling()`; `def test_known_escalations_are_still_declared(job_name, scope, level)`; `def test_ceiling_is_declared_on_the_calling_job_not_inherited()`
 - **tests/unit/test_clean_install_verify.py** — Unit tests for scripts/ci/clean_install_verify.py.
   - `def test_wizard_artifacts_passes_on_post_wizard_tree(tmp_path, monkeypatch, capsys)`; `def test_wizard_artifacts_fails_when_env_missing(tmp_path, monkeypatch, capsys)`; `def test_wizard_artifacts_fails_when_data_key_missing(tmp_path, monkeypatch, capsys)`; `def test_wizard_artifacts_fails_when_route_priority_empty(tmp_path, monkeypatch, capsys)`; `def test_identity_passes_when_did_present(tmp_path, monkeypatch, capsys)`; `def test_identity_fails_when_db_missing(tmp_path, monkeypatch, capsys)`; `def test_identity_fails_when_no_agent_node(tmp_path, monkeypatch, capsys)`; `def test_constitution_passes_with_full_anchor(tmp_path, monkeypatch, capsys)`; `…`
 - **tests/unit/test_cleanup_models_dryrun.py** — Unit tests for cleanup_models dry-run safety (#1946).
