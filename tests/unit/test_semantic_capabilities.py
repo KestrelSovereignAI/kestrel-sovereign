@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from kestrel_sovereign.agent.sleep import SleepMixin
+from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.identity.runtime_identity import load_agent_identity
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
 from kestrel_sovereign.knowledge.capabilities import (
@@ -78,6 +79,20 @@ def test_experimental_semantic_capabilities_require_all_exact_local_pins() -> No
     }
     with pytest.raises(SemanticCapabilityConfigurationError, match="does not match"):
         semantic_capabilities_from_config(mismatched)
+
+
+def test_direct_agent_experimental_selection_enables_semantic_lifecycle(
+    tmp_path,
+) -> None:
+    """Direct construction must not require the internal configured flag."""
+    agent = KestrelAgent(
+        did="did:test:experimental-runtime",
+        storage_path=str(tmp_path / "kestrel.db"),
+        semantic_capabilities=semantic_capabilities_from_config(EXPERIMENTAL),
+    )
+
+    assert agent.semantic_capabilities_configured is True
+    assert agent._semantic_maintenance_required() is True
 
 
 @pytest.mark.asyncio

@@ -741,6 +741,12 @@ class KestrelAgent(
                 raise RuntimeError("Invalid semantic capability selection") from exc
         self.semantic_inference_configured = semantic_inference_configured
         self.semantic_maintenance_configured = semantic_maintenance_configured
+        # An explicitly injected runtime selection is itself an opt-in.  Do
+        # not require direct constructors to also know the internal lifecycle
+        # flag used by managed config/env boot paths.
+        semantic_capabilities_configured = (
+            semantic_capabilities_configured or semantic_capabilities is not None
+        )
         self.semantic_capabilities_configured = semantic_capabilities_configured
         if type(semantic_maintenance_allow_prior_verified_snapshot) is not bool:
             raise RuntimeError(
