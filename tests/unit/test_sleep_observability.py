@@ -426,7 +426,7 @@ def test_authenticated_invoke_preserves_consolidate_only_maintenance_summary() -
                 diagnostics_gate,
                 live_observation,
                 ArtifactReference(
-                    "ci://semantic-release/kite-http-diagnostics",
+                    "ci://sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "a" * 64,
                 ),
             ),

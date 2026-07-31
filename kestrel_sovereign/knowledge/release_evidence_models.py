@@ -28,9 +28,10 @@ from .registry import StandardsMaturity
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_.:-]{1,127}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{7,64}$")
-_SAFE_ARTIFACT_RE = re.compile(
-    r"^(?:ci|artifact|evidence)://[a-z0-9][a-z0-9._/-]{0,239}$"
-)
+# Artifact locations are identifiers, not URLs.  A name such as
+# ``patient-alice-hiv`` may be safe as URI syntax while still disclosing
+# sensitive semantics, so retain only an opaque digest locator.
+_SAFE_ARTIFACT_RE = re.compile(r"^(?:ci|artifact|evidence)://sha256/[0-9a-f]{64}$")
 _SAFE_OBSERVATION_KINDS = frozenset(
     {
         "positive_count",
@@ -166,6 +167,11 @@ class ArtifactReference:
             self.artifact_ref
         ):
             raise ReleaseEvidenceError("artifact reference must use a safe content-free scheme")
+        # The strict opaque form above already excludes semantic path labels,
+        # but retain an explicit traversal check so future format changes do
+        # not accidentally reintroduce it.
+        if ".." in self.artifact_ref:
+            raise ReleaseEvidenceError("artifact reference cannot contain traversal segments")
         lowered = self.artifact_ref.lower()
         if any(token in lowered for token in _ARTIFACT_FORBIDDEN_TOKENS):
             raise ReleaseEvidenceError("artifact reference contains a forbidden secret or identity token")
@@ -594,7 +600,7 @@ class EvidenceRecord:
             "environment_digest": spec.environment.digest,
             "fixture": spec.fixture.binding.to_mapping(),
             "observation": dict(safe_observation),
-            "artifact_digest": artifact.artifact_digest,
+            "artifact": artifact.to_mapping(),
             "drill": spec.correlation.to_mapping() if spec.correlation else None,
         }
         return cls(
@@ -634,7 +640,7 @@ class EvidenceRecord:
                     "environment_digest": self.environment_digest,
                     "fixture": self.fixture.to_mapping(),
                     "observation": dict(self.observation),
-                    "artifact_digest": self.artifact.artifact_digest,
+                    "artifact": self.artifact.to_mapping(),
                     "drill": self.drill.to_mapping() if self.drill else None,
                 }
             )
@@ -817,7 +823,7 @@ class PerformanceBudget:
             "headroom_fraction": headroom_fraction,
             "fixture": spec.fixture.binding.to_mapping(),
             "environment": spec.environment.to_mapping(),
-            "artifact_digest": artifact.artifact_digest,
+            "artifact": artifact.to_mapping(),
         }
         return cls(
             target=spec.performance_target,
@@ -846,7 +852,7 @@ class PerformanceBudget:
                     "headroom_fraction": self.headroom_fraction,
                     "fixture": self.fixture.to_mapping(),
                     "environment": self.environment.to_mapping(),
-                    "artifact_digest": self.artifact.artifact_digest,
+                    "artifact": self.artifact.to_mapping(),
                 }
             )
         )
@@ -880,13 +886,21 @@ class BenchmarkRun:
     """Reproducible samples for one declared performance target."""
 
     target: PerformanceTarget
-    samples: tuple[float, ...]
+    samples: tuple[float | int, ...]
     fixture: FixtureBinding
     environment: ExecutionEnvironment
 
     def __post_init__(self) -> None:
-        if len(self.samples) < 3 or any(not math.isfinite(value) or value <= 0 for value in self.samples):
+        if len(self.samples) < 3 or any(
+            type(value) is bool
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+            for value in self.samples
+        ):
             raise ReleaseEvidenceError("benchmark runs require at least three positive samples")
+        if self.target.unit == "bytes" and any(type(value) is not int for value in self.samples):
+            raise ReleaseEvidenceError("storage growth benchmark samples must be integer byte deltas")
         if not isinstance(self.fixture, FixtureBinding) or not isinstance(self.environment, ExecutionEnvironment):
             raise ReleaseEvidenceError("benchmark run requires fixture and environment")
 
@@ -900,7 +914,14 @@ class BenchmarkRun:
 
 
 class SemanticBenchmarkHarness:
-    """Repeat a declared workload; no timeout is ever treated as a benchmark."""
+    """Repeat a declared workload using the metric's actual unit.
+
+    Duration gates use elapsed milliseconds.  ``storage_growth`` is different:
+    each sample is the measured post-operation storage footprint minus the
+    pre-operation footprint in bytes.  Callers must supply a backend-specific
+    byte reader (for example a SQLite file-size reader or a Postgres relation
+    size query); wall-clock time is never relabeled as bytes.
+    """
 
     def __init__(self, *, iterations: int = 5) -> None:
         if type(iterations) is not int or iterations < 3:
@@ -911,25 +932,54 @@ class SemanticBenchmarkHarness:
         self,
         spec: GateSpec,
         operation: Callable[[], object | Awaitable[object]],
+        *,
+        storage_bytes: Callable[[], int | Awaitable[int]] | None = None,
     ) -> BenchmarkRun:
         if spec.performance_target is None or not callable(operation):
             raise ReleaseEvidenceError("benchmark requires a performance gate and callable operation")
-        samples: list[float] = []
+        is_storage_growth = spec.performance_target.metric is PerformanceMetric.STORAGE_GROWTH
+        if is_storage_growth and not callable(storage_bytes):
+            raise ReleaseEvidenceError("storage growth benchmark requires a backend-specific storage_bytes reader")
+        if not is_storage_growth and storage_bytes is not None:
+            raise ReleaseEvidenceError("storage_bytes is valid only for a storage growth benchmark")
+        samples: list[float | int] = []
         for _ in range(self.iterations):
-            started = time.perf_counter()
+            before_bytes = await self._storage_bytes(storage_bytes) if is_storage_growth else None
+            started = time.perf_counter() if not is_storage_growth else None
             result = operation()
             if inspect.isawaitable(result):
                 await result
-            elapsed = (time.perf_counter() - started) * 1_000
-            if elapsed <= 0:
-                elapsed = float.fromhex("0x1.0p-52")
-            samples.append(elapsed)
+            if is_storage_growth:
+                assert before_bytes is not None
+                after_bytes = await self._storage_bytes(storage_bytes)
+                delta_bytes = after_bytes - before_bytes
+                if delta_bytes <= 0:
+                    raise ReleaseEvidenceError("storage growth benchmark must observe a positive byte delta")
+                samples.append(delta_bytes)
+            else:
+                assert started is not None
+                elapsed = (time.perf_counter() - started) * 1_000
+                if elapsed <= 0:
+                    elapsed = float.fromhex("0x1.0p-52")
+                samples.append(elapsed)
         return BenchmarkRun(
             target=spec.performance_target,
             samples=tuple(samples),
             fixture=spec.fixture.binding,
             environment=spec.environment,
         )
+
+    @staticmethod
+    async def _storage_bytes(
+        reader: Callable[[], int | Awaitable[int]] | None,
+    ) -> int:
+        assert reader is not None
+        value = reader()
+        if inspect.isawaitable(value):
+            value = await value
+        if type(value) is not int or value < 0:
+            raise ReleaseEvidenceError("storage_bytes reader must return a non-negative integer byte count")
+        return value
 
 
 def _utc_timestamp(value: object, field_name: str) -> datetime:

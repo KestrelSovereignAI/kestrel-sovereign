@@ -49,7 +49,7 @@ from .release_evidence_models import (
 RELEASE_EVIDENCE_SCHEMA_VERSION = 2
 SEMANTIC_RELEASE_CONTRACT = "semantic-kb-v1-release-evidence-v2"
 PARAMETRIC_SELF_EVIDENCE_REPOSITORY = "KestrelSovereignAI/kestrel-feature-parametric-self"
-PARAMETRIC_SELF_EVIDENCE_REVISION = "bcbfbb2"
+PARAMETRIC_SELF_EVIDENCE_REVISION = "260ba985bcfdfab3dab1ea58da5b259057f3749f"
 _ERASURE_DRILL = DrillBinding(
     "semantic_erasure_release_drill_v1",
     _sha256("semantic-release-evidence-v2:drill:semantic_erasure_release_drill_v1"),

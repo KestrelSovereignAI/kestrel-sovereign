@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -38,6 +40,7 @@ from kestrel_sovereign.knowledge.release_evidence import (
     release_gate_specs,
     telemetry_attestation_from_mapping,
 )
+from kestrel_sovereign.knowledge.release_evidence_models import SemanticBenchmarkHarness
 
 
 def _gate(gate_id: str):
@@ -63,7 +66,11 @@ def _observation(spec) -> dict[str, object]:
 
 
 def _artifact(name: str = "result") -> ArtifactReference:
-    return ArtifactReference(f"ci://semantic-release/{name}", "a" * 64)
+    return ArtifactReference(_opaque_artifact_ref(name), "a" * 64)
+
+
+def _opaque_artifact_ref(name: str) -> str:
+    return f"ci://sha256/{hashlib.sha256(name.encode('utf-8')).hexdigest()}"
 
 
 def _record(spec):
@@ -351,11 +358,36 @@ def test_reviewer_adversarial_record_rejects_wrong_observation_schema() -> None:
         "artifact://tenant-42/semantic-result",
         "evidence://user@host/release",
         "artifact://semantic-release/credential-proof",
+        "ci://sha256/patient-alice-hiv",
+        "ci://sha256/sk-proj-credential",
+        "ci://sha256/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd..",
     ),
 )
 def test_reviewer_adversarial_artifact_references_reject_secrets_and_identity(reference: str) -> None:
     with pytest.raises(ReleaseEvidenceError, match="artifact"):
         ArtifactReference(reference, "a" * 64)
+
+
+def test_reviewer_adversarial_run_digest_binds_the_complete_opaque_artifact_reference() -> None:
+    spec = _gate("rdf11_projection_fixture")
+    record = _record(spec)
+    assert record.artifact is not None
+
+    with pytest.raises(ReleaseEvidenceError, match="run digest"):
+        GateResult(
+            spec,
+            replace(record, artifact=ArtifactReference(_opaque_artifact_ref("other"), record.artifact.artifact_digest)),
+        )
+
+    benchmark = _performance_spec(PerformanceMetric.HYBRID_RECALL, "sqlite")
+    budget = PerformanceBudget.from_observed(
+        benchmark,
+        (1.0, 2.0, 3.0),
+        headroom_fraction=0.2,
+        artifact=_artifact("benchmark-artifact"),
+    )
+    with pytest.raises(ReleaseEvidenceError, match="run digest"):
+        replace(budget, artifact=ArtifactReference(_opaque_artifact_ref("other-benchmark"), "a" * 64))
 
 
 def _performance_spec(metric: PerformanceMetric, backend: str):
@@ -420,6 +452,33 @@ def test_performance_targets_cover_each_metric_on_sqlite_and_postgres() -> None:
         assert {target.backend for target in targets if target.metric is metric} == {"sqlite", "postgres"}
 
 
+def test_storage_growth_benchmark_measures_byte_delta_not_elapsed_time() -> None:
+    spec = _performance_spec(PerformanceMetric.STORAGE_GROWTH, "sqlite")
+    footprint = {"bytes": 100}
+
+    async def grow_storage() -> None:
+        footprint["bytes"] += 37
+
+    measured = asyncio.run(
+        SemanticBenchmarkHarness(iterations=3).run(
+            spec,
+            grow_storage,
+            storage_bytes=lambda: footprint["bytes"],
+        )
+    )
+
+    assert measured.target.unit == "bytes"
+    assert measured.samples == (37, 37, 37)
+    assert all(type(sample) is int for sample in measured.samples)
+
+
+def test_storage_growth_benchmark_requires_a_real_byte_reader() -> None:
+    spec = _performance_spec(PerformanceMetric.STORAGE_GROWTH, "postgres")
+
+    with pytest.raises(ReleaseEvidenceError, match="storage_bytes"):
+        asyncio.run(SemanticBenchmarkHarness(iterations=3).run(spec, lambda: None))
+
+
 def _cli(*arguments: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
@@ -434,7 +493,8 @@ def _cli(*arguments: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _record_command(spec, output: Path, artifact_ref: str = "ci://semantic-release/record") -> list[str]:
+def _record_command(spec, output: Path, artifact_ref: str | None = None) -> list[str]:
+    artifact_ref = artifact_ref or _opaque_artifact_ref("record")
     return [
         "record",
         "--gate",
@@ -465,7 +525,7 @@ def _telemetry_command(output: Path) -> list[str]:
         "--required-consumer-count",
         "0",
         "--artifact-ref",
-        "ci://semantic-release/retirement-telemetry",
+        _opaque_artifact_ref("retirement-telemetry"),
         "--artifact-digest",
         "e" * 64,
         "--output",
@@ -560,7 +620,7 @@ def test_cli_assemble_safely_binds_retirement_and_external_adapter_attestations(
             *_record_command(
                 spec,
                 path,
-                artifact_ref=f"ci://semantic-release/{spec.gate_id}",
+                artifact_ref=_opaque_artifact_ref(spec.gate_id),
             )
         )
         assert result.returncode == 0, result.stderr
@@ -660,7 +720,7 @@ def test_cli_budget_uses_performance_gate_backend_and_mode(tmp_path: Path) -> No
         "--headroom-fraction",
         "0.2",
         "--artifact-ref",
-        "ci://semantic-release/postgres-benchmark",
+        _opaque_artifact_ref("postgres-benchmark"),
         "--artifact-digest",
         "c" * 64,
         "--output",

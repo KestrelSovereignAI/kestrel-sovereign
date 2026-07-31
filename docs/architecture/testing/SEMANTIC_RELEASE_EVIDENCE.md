@@ -69,10 +69,14 @@ uv run python -m kestrel_sovereign.knowledge.release_evidence assemble \
   --output /tmp/semantic-release-evidence.json
 ```
 
-Safe references are deliberately narrow (`ci://`, `artifact://`, or
-`evidence://` with a content-free path) and always travel with a SHA-256
-digest. URLs with query strings, identity-bearing parts, secret-like labels, or
-connection strings are rejected. A blocked gate has no fake artifact payload:
+Safe references are deliberately narrow: exactly
+`ci://sha256/<64-lowercase-hex>`, `artifact://sha256/<64-lowercase-hex>`, or
+`evidence://sha256/<64-lowercase-hex>`, alongside the artifact's SHA-256
+digest. The locator is opaque—not a path, label, subject, user, or secret—and
+both the exact locator and digest are bound into the run digest. URLs with
+query strings, identity-bearing parts, secret-like labels, traversal segments,
+or connection strings are rejected. A blocked gate has no fake artifact
+payload:
 
 ```bash
 uv run python -m kestrel_sovereign.knowledge.release_evidence block \
@@ -121,8 +125,10 @@ cannot satisfy its PostgreSQL counterpart. The artifact never stores a DSN.
 Every performance workload is also separate by backend and execution mode:
 startup; assertion write/validation; bounded inference; hybrid recall;
 changed-work and unchanged-work sleep; storage growth; and representative
-migration. Duration metrics use `ms`; storage growth uses `bytes`. No timeout
-is a performance budget.
+migration. Duration metrics use `ms`; storage growth uses the measured
+post-operation minus pre-operation backend footprint in `bytes` (a SQLite file
+size or Postgres relation-size reader), never elapsed time relabeled as bytes.
+No timeout is a performance budget.
 
 Record the performance gate's catalog observation and derive its budget from
 at least three measured samples:
