@@ -1007,6 +1007,7 @@ class SleepMixin:
         return bool(
             getattr(self, "semantic_inference_configured", False)
             or getattr(self, "semantic_maintenance_configured", False)
+            or getattr(self, "semantic_capabilities_configured", False)
             or getattr(self, "semantic_inference_profile", None) is not None
         )
 
@@ -1032,7 +1033,15 @@ class SleepMixin:
         maintenance_configured = bool(
             getattr(self, "semantic_maintenance_configured", False)
         )
-        if profile is None and not inference_configured and not maintenance_configured:
+        capabilities_configured = bool(
+            getattr(self, "semantic_capabilities_configured", False)
+        )
+        if (
+            profile is None
+            and not inference_configured
+            and not maintenance_configured
+            and not capabilities_configured
+        ):
             return True
         storage = getattr(self, "storage", None)
         if profile is None and inference_configured:

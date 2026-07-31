@@ -203,7 +203,8 @@ async def test_sleep_uses_capabilities_through_privacy_storage_facade(
         class Agent(SleepMixin):
             semantic_inference_profile = None
             semantic_inference_configured = False
-            semantic_maintenance_configured = True
+            semantic_maintenance_configured = False
+            semantic_capabilities_configured = True
             semantic_inference_limits = None
             semantic_maintenance_limits = None
             semantic_capabilities = selection
@@ -261,13 +262,26 @@ async def test_experimental_sleep_readiness_and_corpus_share_one_durable_runtime
         class Agent(SleepMixin):
             semantic_inference_profile = None
             semantic_inference_configured = False
-            semantic_maintenance_configured = True
+            semantic_maintenance_configured = False
+            semantic_capabilities_configured = True
             semantic_inference_limits = None
             semantic_maintenance_limits = None
             semantic_capabilities = selection
 
             def __init__(self) -> None:
                 self.storage = storage
+
+        before = await storage.semantic_maintenance_training_readiness(
+            None, semantic_capabilities=selection
+        )
+        assert before.ready is False
+        assert before.reason == "semantic_maintenance_state_missing"
+        before_checkpoint = await raw_storage.db.fetchone(
+            "SELECT checkpoint_generation FROM semantic_maintenance_state "
+            "WHERE tenant_id = ?",
+            (credentials.agent_did,),
+        )
+        assert before_checkpoint is None
 
         sleep = await Agent().sleep(
             skip_consolidation=True, skip_export=True, skip_reflection=True
@@ -277,6 +291,12 @@ async def test_experimental_sleep_readiness_and_corpus_share_one_durable_runtime
             None, semantic_capabilities=selection
         )
         assert readiness.ready is True
+        checkpoint = await raw_storage.db.fetchone(
+            "SELECT checkpoint_generation, status FROM semantic_maintenance_state "
+            "WHERE tenant_id = ?",
+            (credentials.agent_did,),
+        )
+        assert checkpoint == (0, "no_op")
         capability_versions = await storage.semantic_maintenance_capability_versions(
             None, semantic_capabilities=selection
         )
