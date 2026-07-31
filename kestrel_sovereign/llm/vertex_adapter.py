@@ -11,7 +11,6 @@ Adapter for Google Cloud Vertex AI using the google-genai SDK with support for:
 Uses the new google-genai SDK (not deprecated google-generativeai or google-cloud-aiplatform).
 Authentication via Application Default Credentials (ADC).
 """
-import json
 import logging
 import os
 from dataclasses import dataclass

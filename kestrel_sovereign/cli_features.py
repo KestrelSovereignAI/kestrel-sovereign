@@ -12,7 +12,6 @@ Shared, test-patched helpers (``_get_project_dir``,
 here through the ``cli`` module object at call time, so existing
 ``patch("kestrel_sovereign.cli.<helper>")`` test seams keep working unchanged.
 """
-import json
 import subprocess
 import sys
 from pathlib import Path

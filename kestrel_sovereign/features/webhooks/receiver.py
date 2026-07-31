@@ -10,7 +10,6 @@ Responsibilities:
 """
 
 import hashlib
-import json
 import logging
 import time
 import uuid
@@ -19,7 +18,7 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional
 
 from .auth import WebhookAuth, create_auth_handler
-from .models import WebhookAuthType, WebhookConfig, WebhookEvent
+from .models import WebhookConfig, WebhookEvent
 
 logger = logging.getLogger(__name__)
 

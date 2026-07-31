@@ -31,16 +31,14 @@ from kestrel_sovereign.config import (
     TRUSTED_AGENTS_DIR,
 )
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
-from typing import Optional, Dict, List, Any, TYPE_CHECKING, Union, Mapping
+from typing import Optional, Dict, List, Any, TYPE_CHECKING, Mapping
 import re
 from pathlib import Path
 from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
-from kestrel_sovereign.extensions.app_extension import AppExtension
 from kestrel_sovereign.features.privacy import PrivacyAgent
 from kestrel_sovereign.features import (
     MandatoryFeatureReadinessError,
     discover_features,
-    get_feature_by_name,
     verify_mandatory_feature_set,
 )
 from kestrel_sovereign.features.base import Feature
@@ -67,7 +65,6 @@ from kestrel_sovereign.agent.streaming import (
     resolve_turn_invocation_context,
     _snapshot_post_response_hooks,
 )
-from kestrel_sovereign.hooks.manager import _hook_is_enforcing
 from kestrel_sovereign.agent.backup import BackupMixin
 from kestrel_sovereign.agent.sleep import SleepMixin
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin, ContextStats
@@ -5908,7 +5905,7 @@ Expected Duration: {expected_duration}
         Generate an AgentCard for this agent (for A2A discovery).
         Returns agent identity, capabilities, and available skills.
         """
-        from kestrel_sovereign.a2a.agent_card import AgentCard, AgentCapabilities, AgentSkill, AgentProvider
+        from kestrel_sovereign.a2a.agent_card import AgentCard, AgentCapabilities, AgentProvider
 
         # Get agent name from storage node if available
         agent_name = "Kestrel Agent"

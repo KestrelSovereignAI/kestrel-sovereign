@@ -35,7 +35,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Optional, TYPE_CHECKING
+from typing import List, TYPE_CHECKING
 
 from kestrel_sovereign.security.agent_encryption import encrypt
 from kestrel_sovereign.security.legacy_decrypt import (

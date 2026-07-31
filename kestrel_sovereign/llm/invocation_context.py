@@ -141,12 +141,6 @@ class LLMInvocationContextState:
         while len(self._by_session) > self._MAX_TRACKED_SESSIONS:
             self._by_session.popitem(last=False)
 
-    def forget_session(self, session_id: Optional[str]) -> None:
-        """Drop the recorded identity for ``session_id`` (request teardown)."""
-
-        if session_id:
-            self._by_session.pop(session_id, None)
-
     def reset(self) -> None:
         """Clear the current task's ambient identity.
 
@@ -175,18 +169,6 @@ class LLMInvocationContextState:
             self._ambient.reset(token)
 
 
-# Preserve the short-lived module API introduced with #2510 for callers that
-# use this helper directly.  LLMService deliberately never touches this state:
-# every service supplies its own ``ambient=...`` snapshot below.
-_COMPATIBILITY_INVOCATION_CONTEXT_STATE = LLMInvocationContextState()
-
-
-def set_ambient_invocation_context(context: LLMInvocationContext) -> None:
-    """Set the standalone compatibility context for the current async task."""
-
-    _COMPATIBILITY_INVOCATION_CONTEXT_STATE.set(context)
-
-
 def _first_defined(*values: Optional[str]) -> Optional[str]:
     """Return the first value supplied, preserving explicit empty strings."""
 
@@ -207,11 +189,9 @@ def resolve_invocation_context(
     """
 
     explicit = context if context is not None else LLMInvocationContext()
-    ambient = (
-        ambient
-        if ambient is not None
-        else _COMPATIBILITY_INVOCATION_CONTEXT_STATE.get()
-    )
+    # LLMService always supplies its own ``ambient=...`` snapshot; a caller that
+    # omits one contributes no ambient identity of its own.
+    ambient = ambient if ambient is not None else _EMPTY_INVOCATION_CONTEXT
     return LLMInvocationContext(
         session_id=_first_defined(
             session_id,

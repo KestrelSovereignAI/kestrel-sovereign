@@ -24,12 +24,11 @@ from kestrel_sovereign.a2a.types import (
     TaskSendParams,
     Message,
     TextPart,
-    DataPart,
     Artifact,
     TaskStatusUpdateEvent,
     TaskArtifactUpdateEvent,
 )
-from kestrel_sovereign.a2a.agent_card import AgentCard, AgentSkill
+from kestrel_sovereign.a2a.agent_card import AgentCard
 from kestrel_sovereign.a2a.stores import (
     TaskStore,
     SessionService,
@@ -42,7 +41,6 @@ from uuid import uuid4
 
 if TYPE_CHECKING:
     from kestrel_sovereign.hooks import HooksManager
-    from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
 
 
 @runtime_checkable
@@ -395,7 +393,6 @@ class TaskManager:
             # Execute POST_TOOL_USE hooks
             if self.hooks_manager:
                 from kestrel_sdk.hooks.base import HookEvent, HookInput
-                import time
 
                 post_hook_input = HookInput(
                     session_id=session_id,

@@ -65,7 +65,7 @@ import logging
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from kestrel_sovereign.security.encryption import (
     get_agent_fernet,
@@ -491,7 +491,6 @@ def cli_run(args, *, stdout=None, stderr=None) -> int:
       * ``4`` — migration completed but rows were skipped because no
                 encryption key was configured
     """
-    import os as _os
     import sys as _sys
 
     out = stdout or _sys.stdout
@@ -670,5 +669,4 @@ def backfill_all(
 
 
 if __name__ == "__main__":
-    import sys as _sys
     raise SystemExit(cli_run(_build_arg_parser().parse_args()))

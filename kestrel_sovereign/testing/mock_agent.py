@@ -11,7 +11,7 @@ Provides stubbed versions of all services that features typically access:
 
 import logging
 from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 from kestrel_sdk.hooks.base import HookOutput
 from kestrel_sovereign.privacy import PrivacyMode

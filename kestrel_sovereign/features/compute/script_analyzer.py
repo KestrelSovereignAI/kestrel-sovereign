@@ -8,7 +8,7 @@ Identifies dangerous patterns, rewritable operations, and potential concerns.
 import logging
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .models import ComputeScript, SecurityFinding, SuggestedFix, calculate_risk_score
 
@@ -207,8 +207,7 @@ class ScriptAnalyzer:
         has_critical = False
         
         content = script.content
-        lines = content.split('\n')
-        
+
         # Check critical patterns
         for compiled, category, description in self._get_compiled(script.language, "critical"):
             for match in compiled.finditer(content):

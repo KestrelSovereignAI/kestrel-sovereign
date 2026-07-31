@@ -47,7 +47,7 @@ import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 from kestrel_sovereign._subprocess_helpers import run_streaming
 

@@ -20,7 +20,6 @@ from rdflib import Graph, Literal as RdfLiteral, RDF, URIRef
 from kestrel_sovereign.knowledge import (
     Assertion,
     AssertionQuery,
-    DerivedLineage,
     DirectLineage,
     GovernedShaclValidationService,
     ShaclValidationLimits,

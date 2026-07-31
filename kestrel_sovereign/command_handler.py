@@ -5,10 +5,9 @@ Extracts command parsing and dispatch logic from the main agent,
 making the agent class cleaner and commands easier to test.
 """
 
-import os
 import logging
 import inspect
-from typing import Optional, Dict, Any, Callable, Awaitable
+from typing import Optional, Dict, Any, Callable
 from dataclasses import dataclass
 from enum import Enum
 
@@ -158,7 +157,6 @@ class CommandHandler:
 
         # Authority gate: sovereign-only commands require API key auth
         if command in self.SOVEREIGN_COMMANDS:
-            from kestrel_sovereign.auth import CallerContext
             if caller is None or not caller.is_sovereign:
                 identity = caller.identity if caller else "unknown"
                 logging.warning(
@@ -319,7 +317,6 @@ class CommandHandler:
         - Other iterables
         """
         import json
-        from kestrel_sovereign.llm.model_metadata import ModelInfo
 
         # Handle list of ModelInfo objects
         if isinstance(result, list) and result and hasattr(result[0], 'provider'):
@@ -623,8 +620,6 @@ class CommandHandler:
             !compact --check     - Check if compaction is recommended
         """
         import re
-
-        parts = user_input.split()
 
         # Parse --keep N
         preserve_recent = 10  # default

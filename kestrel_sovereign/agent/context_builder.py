@@ -76,9 +76,11 @@ def _count_tool_schema_tokens(
 
 # extract_raw_user_content moved to kestrel_sovereign.security.input_guardrails
 # (#1402) so the storage layer can import it without cycling through the
-# agent layer. Re-exported here to keep existing consumers working.
+# agent layer. Re-exported here to keep existing consumers working — the
+# redundant alias marks it as deliberate re-export surface so an unused-import
+# sweep cannot strip it (in-tree callers plus frinz import it from here).
 from kestrel_sovereign.security.input_guardrails import (  # noqa: E402
-    extract_raw_user_content,
+    extract_raw_user_content as extract_raw_user_content,
 )
 
 
@@ -90,11 +92,15 @@ logger = logging.getLogger(__name__)
 
 # Re-export for backward compatibility.  New code should use
 # ``BootstrapLoader.DEFAULT_BOOTSTRAP_FILES`` or ``loader.file_order``.
+# The two *renamed* bindings below cannot use the redundant-alias convention
+# (the name changes), so they carry an explicit noqa: they are deliberate
+# re-export surface — tests/unit/test_bootstrap_files.py imports both from
+# here — and an unused-import sweep must not strip them.
 from kestrel_sovereign.features.bootstrap.loader import (
-    DEFAULT_BOOTSTRAP_FILES as BOOTSTRAP_FILE_ORDER,
+    DEFAULT_BOOTSTRAP_FILES as BOOTSTRAP_FILE_ORDER,  # noqa: F401
     DEFAULT_MAX_CHARS_PER_FILE,
     DEFAULT_MAX_TOTAL_CHARS,
-    truncate_content as truncate_bootstrap_content,
+    truncate_content as truncate_bootstrap_content,  # noqa: F401
     BootstrapLoader,
 )
 

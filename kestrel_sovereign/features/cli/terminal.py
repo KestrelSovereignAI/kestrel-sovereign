@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import platform
 import re
 import shutil
@@ -12,7 +11,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Awaitable, Callable
 
 
 _TOKEN_PATTERNS = [
@@ -74,9 +73,6 @@ class TerminalCommandResult:
     @property
     def ok(self) -> bool:
         return self.returncode == 0 and not self.timed_out
-
-    def json_stdout(self) -> Any:
-        return json.loads(self.stdout or "null")
 
     @property
     def redacted_stdout(self) -> str:

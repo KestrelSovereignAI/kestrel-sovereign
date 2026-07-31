@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult

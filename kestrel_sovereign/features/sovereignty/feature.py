@@ -1,8 +1,7 @@
 import asyncio
 import inspect
 import logging
-import os
-from typing import Callable, Dict, Any, Optional
+from typing import Callable, Optional
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult

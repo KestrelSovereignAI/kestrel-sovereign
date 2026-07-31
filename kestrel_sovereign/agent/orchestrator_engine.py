@@ -17,10 +17,10 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
-from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
+from kestrel_sdk.hooks.base import HookEvent, HookInput
 from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
 from kestrel_sovereign.a2a.stores.unified.observability_store import (
     ToolDispatchEntry,

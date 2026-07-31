@@ -582,11 +582,6 @@ class AgentManager:
             self._a2a_policy_generation += 1
             self._a2a_hosted_policies.pop(recipient_id, None)
 
-    async def revoke_a2a_hosted_policy(self, recipient: object) -> None:
-        """Writer-side policy revocation serialized with in-flight commits."""
-        async with self._a2a_lifecycle_lock:
-            self._revoke_a2a_hosted_policy(recipient)
-
     def a2a_sender_identity_witness(
         self,
         signing_did: str,

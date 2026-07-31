@@ -391,10 +391,6 @@ class RdfCapabilityReport:
     rdf12: ArtifactPin | None
     sparql12: ArtifactPin | None
 
-    @property
-    def experimental_enabled(self) -> bool:
-        return self.rdf12 is not None or self.sparql12 is not None
-
 
 @dataclass(frozen=True, slots=True)
 class RdfTypedQuery:

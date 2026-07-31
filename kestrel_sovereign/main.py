@@ -5,7 +5,6 @@ The main entry point for the Kestrel Agent.
 import argparse
 import asyncio
 import os
-from pathlib import Path
 from kestrel_sovereign.storage import AsyncStorage
 from kestrel_sovereign.security.encryption import DecryptionError
 from kestrel_sovereign.kestrel_agent import (
@@ -13,8 +12,6 @@ from kestrel_sovereign.kestrel_agent import (
     await_agent_shutdown_completion,
 )
 from kestrel_sovereign.llm.service import LLMService
-from kestrel_sovereign.config import load_config
-from kestrel_sovereign.filecoin_adapter import FilecoinAdapter
 import logging
 
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT

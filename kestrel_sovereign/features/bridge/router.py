@@ -42,7 +42,6 @@ from .protocol import (
     BridgeCapability,
     BridgeRequest,
     BridgeResponse,
-    BridgeSession,
     ChannelType,
 )
 

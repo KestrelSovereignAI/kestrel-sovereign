@@ -9,7 +9,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -320,12 +319,6 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
 
     def _is_legacy_agent_manifest_upload(self, upload: Dict[str, Any]) -> bool:
         return self._upload_filename(upload) == f"manifest_{self.agent_id}.json"
-
-    def _is_legacy_wal_upload(self, upload: Dict[str, Any]) -> bool:
-        filename = self._upload_filename(upload)
-        return bool(
-            re.search(r"(^|[._-])wal($|[._-])", filename)
-        ) or filename.endswith("-wal")
 
     def _extract_snapshot_content(self, content: bytes) -> bytes:
         """Return raw SQLite bytes from CAR snapshots, preserving legacy raw files."""

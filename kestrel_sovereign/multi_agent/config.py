@@ -12,7 +12,7 @@ The multi_agent.toml file defines which agents exist and how to reach them.
 
 import logging
 from pathlib import Path
-from typing import Any, List, Optional, Union, Literal
+from typing import Any, List, Optional, Union
 
 import toml
 from pydantic import BaseModel, Field, field_validator, model_validator

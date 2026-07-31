@@ -56,7 +56,7 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, Tuple, Type
+from typing import Any, ClassVar, Dict, Tuple
 
 
 # ---------------------------------------------------------------------------

@@ -28,7 +28,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 # __init__ (which imports this module) before filecoin_adapter finishes — so
 # importing FilecoinAdapter eagerly here forms a package-initialization cycle
 # (#2384). FilecoinAdapter is imported lazily inside __init__ instead.
-from kestrel_sovereign.storage.providers.base import StorageTier, StorageResult
+from kestrel_sovereign.storage.providers.base import StorageTier
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.car_builder import CARBuilder, CARReader
 

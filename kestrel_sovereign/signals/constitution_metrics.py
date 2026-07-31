@@ -31,7 +31,6 @@ kestrel-sovereign#1137 chunk 1H.
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 from kestrel_sdk.metrics import PROMETHEUS_AVAILABLE
 

@@ -1,4 +1,3 @@
-import re
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Union
 from datetime import datetime, timezone
@@ -13,7 +12,7 @@ from kestrel_sovereign.privacy import (
 )
 from kestrel_sovereign.kestrel_types.storage_types import StorageProvider
 from kestrel_sovereign.ephemeral_session import EphemeralSession
-from .pii_detector import get_pii_detector, anonymize_text
+from .pii_detector import anonymize_text
 
 
 @dataclass(frozen=True)

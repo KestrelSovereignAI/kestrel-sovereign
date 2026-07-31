@@ -6,9 +6,9 @@ recognizing worthy model constitutions as part of effective governance while mai
 Kestrel Constitution supremacy.
 """
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional
 
 try:
     import tomllib

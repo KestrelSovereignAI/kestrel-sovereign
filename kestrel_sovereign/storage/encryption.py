@@ -54,7 +54,6 @@ from kestrel_sovereign.security.encryption import (
     encrypt,
     decrypt,
     encrypt_string,
-    decrypt_string,
     # Legacy Fernet helpers
     encrypt_bytes,
     decrypt_bytes,

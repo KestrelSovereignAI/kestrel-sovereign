@@ -1,6 +1,6 @@
 """Commands discovery endpoint - exposes available commands to UI."""
 from fastapi import APIRouter, Request
-from typing import List, Dict, Any
+from typing import Dict, Any
 import logging
 
 from kestrel_sovereign.endpoints.agent_helpers import get_agent

@@ -55,7 +55,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import List, Mapping, Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 from kestrel_sovereign.identity.did_web import build_verification_methods
 from kestrel_sovereign.identity.inception_did_web import (
@@ -78,7 +78,6 @@ from kestrel_sovereign.security.crypto_suite import (
     ALG_SLH_DSA_SHA2_128S,
     Keypair,
     SLHDSASHA2128sSuite,
-    get_suite,
 )
 
 

@@ -161,7 +161,6 @@ class PgVectorBackend:
         # Imported lazily so a sovereign install that doesn't need
         # multi-tenant scoping (single-agent saved_items, etc.) doesn't
         # have to depend on kestrel_feature_entities.
-        from kestrel_feature_entities import TenantContext
 
         return _TenantScopedSession(self._sf, tenant_id)
 

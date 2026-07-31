@@ -321,7 +321,6 @@ def sync_secret(
     # ``kestrel deploy secrets sync`` to not pay the import cost just for
     # having ``deploy/secrets.py`` on disk.
     from google.api_core import exceptions as gcp_exc
-    from google.cloud import secretmanager
 
     parent = _project_path(client, project_id)
     secret_full_path = _secret_path(client, project_id, secret_name)

@@ -51,7 +51,6 @@ from .store import (
     KNOWN_STATUSES,
     KNOWN_URGENCIES,
     PENDING_STATES,
-    TERMINAL_STATES,
     ensure_restart_requests_table,
     get_request,
     insert_request,

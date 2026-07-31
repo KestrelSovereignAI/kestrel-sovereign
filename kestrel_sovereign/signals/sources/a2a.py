@@ -22,9 +22,9 @@ side (this module) rehydrates that chain whenever a completion arrives.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from kestrel_sdk.signals import (
     AttentionPolicy,

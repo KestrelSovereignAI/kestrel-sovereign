@@ -29,7 +29,6 @@ from kestrel_sovereign.kestrel_config.constants import APPROVAL_TIMEOUT_DEFAULT
 from kestrel_sovereign.security.service_key_storage import (
     ServiceKeyStorage,
     KeyNotConfiguredError,
-    KeyStorageError,
     KNOWN_PROVIDERS,
 )
 from kestrel_sovereign.security.agent_encryption import MasterKeyNotConfiguredError

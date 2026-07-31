@@ -14,7 +14,6 @@ Wave 0B section of the Quantum Hardening epic.
 
 import hashlib
 import logging
-import os
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -371,7 +370,6 @@ class ScriptSigner:
             )
             return False
 
-        import base64
         content_hash = self._content_hash(script)
         content_hash_bytes = hashlib.sha256(content_hash.encode()).digest()
 

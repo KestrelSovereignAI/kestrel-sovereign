@@ -14,10 +14,10 @@ Phase 5 of Issue #23: Substrate-Independent Agent Portability.
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional
 
-from .substrate_adapter import Capability, CapabilityMap, CapabilityGap
-from .identity_package import SubstrateType, PersonalityFingerprint
+from .substrate_adapter import Capability, CapabilityMap
+from .identity_package import PersonalityFingerprint
 
 logger = logging.getLogger(__name__)
 

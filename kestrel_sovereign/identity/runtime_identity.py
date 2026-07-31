@@ -339,16 +339,6 @@ def _loader_verified_agent_identity(
     return identity
 
 
-def _is_loader_verified_agent_identity(identity: object) -> bool:
-    """Whether ``identity`` was produced by :func:`load_agent_identity`.
-
-    This is intentionally an internal boot boundary, rather than a general
-    identity predicate.  It prevents an attribute-compatible object—or a
-    directly constructed runtime identity—from becoming storage authority.
-    """
-    return _loader_verified_identity_binding(identity) is not None
-
-
 def _validate_hybrid_key_binding(
     hybrid: HybridKeypair,
     verification_methods: list,

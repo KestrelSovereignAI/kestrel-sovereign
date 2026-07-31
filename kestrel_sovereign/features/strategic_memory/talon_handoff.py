@@ -89,7 +89,6 @@ async def pick_top_issue(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         for repo in milestone.get("repos", []):
             if repo not in repos:
                 continue
-            rd = github_data.get(repo, {})
             # Look for open issues in this milestone
             milestone_name = milestone.get("name", "")
             issues = await _fetch_milestone_issues(repo, milestone_name, token)

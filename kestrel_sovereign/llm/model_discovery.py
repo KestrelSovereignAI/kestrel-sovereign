@@ -7,11 +7,10 @@ Provides in-memory caching and disk-based cache for fast startup.
 """
 import asyncio
 import logging
-from datetime import datetime
-from typing import List, Dict, Any, Optional, Set, Tuple, TYPE_CHECKING
+from typing import List, Dict, Any, Optional, Tuple, TYPE_CHECKING
 
 from .model_metadata import ModelInfo, ModelCategory
-from .model_catalog import get_catalog_service, ModelCatalogService
+from .model_catalog import get_catalog_service
 from .model_cache import get_shared_model_cache
 
 if TYPE_CHECKING:

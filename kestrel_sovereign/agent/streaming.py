@@ -14,7 +14,6 @@ from kestrel_sovereign.hooks.manager import _hook_is_enforcing
 from kestrel_sdk.llm import ToolCallStarted
 from kestrel_sovereign.agent.parts import (
     PART_SENTINEL_PREFIX,
-    PART_SENTINEL_SUFFIX,
     build_part_sentinel,
     drain_parts,
     part_collector,
