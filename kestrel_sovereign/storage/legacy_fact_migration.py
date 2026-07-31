@@ -35,6 +35,8 @@ if TYPE_CHECKING:
 
 MIGRATION_NAME = "legacy_graph_fact_to_assertion_v1"
 MIGRATION_VERSION = "legacy-graph-fact-v1"
+_INVALIDATION_PAGE_SIZE = 500
+_MAX_INVALIDATION_PAGES = 20
 LEGACY_FACT_SHAPE = {
     "node_type": "fact",
     "required_properties": ("subject", "predicate", "value", "created_at"),
@@ -850,30 +852,48 @@ class LegacyGraphFactMigration:
                 )
 
     async def _deliver_pending_invalidations(self, db: Any, tenant_id: str) -> bool:
-        """Deliver durable projection work; only an acknowledged call is marked done."""
+        """Drain bounded projection pages; only acknowledged pages are marked done."""
         if self._index_invalidator is None:
             return False
-        rows = await db.fetchall(
-            "SELECT assertion_id FROM legacy_fact_migration_invalidations "
-            "WHERE tenant_id = ? AND migration_name = ? AND state = 'pending' "
-            "ORDER BY assertion_id ASC LIMIT 500",
+        delivered = False
+        for _page in range(_MAX_INVALIDATION_PAGES):
+            rows = await db.fetchall(
+                "SELECT assertion_id FROM legacy_fact_migration_invalidations "
+                "WHERE tenant_id = ? AND migration_name = ? AND state = 'pending' "
+                f"ORDER BY assertion_id ASC LIMIT {_INVALIDATION_PAGE_SIZE}",
+                (tenant_id, MIGRATION_NAME),
+            )
+            if not rows:
+                return delivered
+            assertion_ids = tuple(str(row[0]) for row in rows)
+            response = self._index_invalidator(tenant_id, assertion_ids)
+            if hasattr(response, "__await__"):
+                await response
+            async with db.transaction():
+                placeholders = ", ".join("?" for _ in assertion_ids)
+                await db.execute(
+                    "UPDATE legacy_fact_migration_invalidations "
+                    "SET state = 'delivered', delivered_at = ? "
+                    "WHERE tenant_id = ? AND migration_name = ? AND state = 'pending' "
+                    f"AND assertion_id IN ({placeholders})",
+                    (
+                        datetime.now(timezone.utc).isoformat(),
+                        tenant_id,
+                        MIGRATION_NAME,
+                        *assertion_ids,
+                    ),
+                )
+            delivered = True
+        residual = await db.fetchone(
+            "SELECT 1 FROM legacy_fact_migration_invalidations "
+            "WHERE tenant_id = ? AND migration_name = ? AND state = 'pending' LIMIT 1",
             (tenant_id, MIGRATION_NAME),
         )
-        if not rows:
-            return False
-        assertion_ids = tuple(str(row[0]) for row in rows)
-        response = self._index_invalidator(tenant_id, assertion_ids)
-        if hasattr(response, "__await__"):
-            await response
-        async with db.transaction():
-            placeholders = ", ".join("?" for _ in assertion_ids)
-            await db.execute(
-                "UPDATE legacy_fact_migration_invalidations SET state = 'delivered', delivered_at = ? "
-                "WHERE tenant_id = ? AND migration_name = ? AND state = 'pending' "
-                f"AND assertion_id IN ({placeholders})",
-                (datetime.now(timezone.utc).isoformat(), tenant_id, MIGRATION_NAME, *assertion_ids),
+        if residual is not None:
+            raise LegacyFactMigrationError(
+                "projection_invalidation_delivery_budget_exhausted"
             )
-        return True
+        return delivered
 
     @staticmethod
     async def _set_outcome(db: Any, tenant_id: str, node_id: str, outcome: str) -> None:

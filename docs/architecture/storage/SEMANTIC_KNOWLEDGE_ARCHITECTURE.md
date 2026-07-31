@@ -502,9 +502,12 @@ Core has no semantic-assertion vector/index projection to rebuild. A
 feature-owned projection may supply its public invalidator to the runner; it
 receives only the bound tenant and accepted assertion IDs. Accepted IDs first
 enter a durable pending-invalidation ledger, and delivery is marked complete
-only after the public invalidator returns. A failure is retried by every later
-run, including one with no remaining graph pages. Canonical rollback re-opens
-that invalidation so projections observe the withdrawal as well. The optional compatibility
+only after the public invalidator returns. Delivery drains bounded 500-ID
+pages; a residual backlog after the invocation budget is surfaced as an error
+and remains pending for retry, never silently reported complete. A failure is
+retried by every later run, including one with no remaining graph pages.
+Canonical rollback re-opens that invalidation so projections observe the
+withdrawal as well. The optional compatibility
 flag enables deterministic coverage metrics only—there is no dual-write and no
 application dual-read path. Its removal condition is zero unmigrated eligible
 rows plus operator review of every rejection class. A bounded/truncated plan

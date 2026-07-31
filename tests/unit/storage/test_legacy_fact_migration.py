@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import kestrel_sovereign.storage.legacy_fact_migration as migration_module
 from kestrel_sovereign.storage.async_assertion_store import (
     _issue_assertion_tenant_capability,
 )
@@ -198,6 +199,105 @@ async def test_feature_projection_invalidator_observes_only_accepted_assertions(
         ).rollback()
         assert rollback.index_invalidation_requested is True
         assert len(seen) == 2
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_projection_invalidation_drains_every_bounded_page(
+    tmp_path, monkeypatch
+):
+    storage = await _storage(tmp_path)
+    seen: list[tuple[str, ...]] = []
+    try:
+        monkeypatch.setattr(migration_module, "_INVALIDATION_PAGE_SIZE", 2)
+        monkeypatch.setattr(migration_module, "_MAX_INVALIDATION_PAGES", 3)
+        assert storage.db is not None
+        async with storage.db.transaction():
+            for index in range(5):
+                await storage.db.execute(
+                    "INSERT INTO legacy_fact_migration_invalidations "
+                    "(tenant_id, migration_name, assertion_id, state, created_at, delivered_at) "
+                    "VALUES (?, ?, ?, 'pending', ?, NULL)",
+                    (
+                        TENANT,
+                        migration_module.MIGRATION_NAME,
+                        f"assertion:{index}",
+                        "2026-01-01T00:00:00+00:00",
+                    ),
+                )
+
+        async def invalidate(_tenant: str, assertion_ids: tuple[str, ...]) -> None:
+            seen.append(assertion_ids)
+
+        result = await LegacyGraphFactMigration(
+            storage, index_invalidator=invalidate
+        ).run()
+        assert result.index_invalidation_requested is True
+        assert [len(page) for page in seen] == [2, 2, 1]
+        pending = await storage.db.fetchone(
+            "SELECT COUNT(*) FROM legacy_fact_migration_invalidations "
+            "WHERE tenant_id = ? AND state = 'pending'",
+            (TENANT,),
+        )
+        assert pending == (0,)
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_projection_invalidation_budget_surfaces_residual_for_retry(
+    tmp_path, monkeypatch
+):
+    storage = await _storage(tmp_path)
+    seen: list[tuple[str, ...]] = []
+    try:
+        monkeypatch.setattr(migration_module, "_INVALIDATION_PAGE_SIZE", 2)
+        monkeypatch.setattr(migration_module, "_MAX_INVALIDATION_PAGES", 2)
+        assert storage.db is not None
+        async with storage.db.transaction():
+            for index in range(5):
+                await storage.db.execute(
+                    "INSERT INTO legacy_fact_migration_invalidations "
+                    "(tenant_id, migration_name, assertion_id, state, created_at, delivered_at) "
+                    "VALUES (?, ?, ?, 'pending', ?, NULL)",
+                    (
+                        TENANT,
+                        migration_module.MIGRATION_NAME,
+                        f"assertion:{index}",
+                        "2026-01-01T00:00:00+00:00",
+                    ),
+                )
+
+        async def invalidate(_tenant: str, assertion_ids: tuple[str, ...]) -> None:
+            seen.append(assertion_ids)
+
+        migration = LegacyGraphFactMigration(
+            storage, index_invalidator=invalidate
+        )
+        with pytest.raises(
+            LegacyFactMigrationError,
+            match="projection_invalidation_delivery_budget_exhausted",
+        ):
+            await migration.run()
+        assert [len(page) for page in seen] == [2, 2]
+        pending = await storage.db.fetchone(
+            "SELECT COUNT(*) FROM legacy_fact_migration_invalidations "
+            "WHERE tenant_id = ? AND state = 'pending'",
+            (TENANT,),
+        )
+        assert pending == (1,)
+
+        monkeypatch.setattr(migration_module, "_MAX_INVALIDATION_PAGES", 3)
+        recovered = await migration.run()
+        assert recovered.index_invalidation_requested is True
+        assert [len(page) for page in seen] == [2, 2, 1]
+        pending = await storage.db.fetchone(
+            "SELECT COUNT(*) FROM legacy_fact_migration_invalidations "
+            "WHERE tenant_id = ? AND state = 'pending'",
+            (TENANT,),
+        )
+        assert pending == (0,)
     finally:
         await storage.close()
 
