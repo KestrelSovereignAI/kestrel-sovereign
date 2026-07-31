@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 _SEMANTIC_MAINTENANCE_SUMMARY_MAX_CHARS = 1_024
 _SEMANTIC_MAINTENANCE_MAX_RENDERED_NUMBER = 1_000_000_000
 _SEMANTIC_MAINTENANCE_CAPABILITY_VALUE_MAX_CHARS = 256
+_SEMANTIC_MAINTENANCE_CONTRACT_VERSION = "v3"
 _SEMANTIC_MAINTENANCE_CAPABILITY_KEYS = (
     "semantic_maintenance",
     "maintenance_budget",
@@ -42,6 +43,11 @@ _SEMANTIC_MAINTENANCE_CAPABILITY_KEYS = (
     "inference_profile",
     "rule_profile",
     "ontology",
+    "semantic_capability_mode",
+    "rdf12_capability",
+    "rdf12_version",
+    "sparql12_capability",
+    "sparql12_version",
 )
 _SEMANTIC_MAINTENANCE_STATUSES = frozenset(
     {"complete", "partial", "failed", "no_op", "disabled"}
@@ -158,6 +164,265 @@ def _semantic_maintenance_capability_summary(value: Any) -> Tuple[int, str]:
     return len(canonical), hashlib.sha256(encoded).hexdigest()[:16]
 
 
+def _semantic_maintenance_active_capabilities(value: Any) -> Tuple[str, ...]:
+    """Return registry-verified active capability/version labels.
+
+    The raw maintenance map is intentionally not trusted as a presentation
+    surface: a feature or a malformed storage result must not inject source
+    text through an operational diagnostic. Values are shown only when they
+    are the exact current maintenance contract value or resolve to an exact,
+    locally verified registry resource/capability. A version-shaped string is
+    never enough: ``v999`` and ``999.999.999`` are not evidence of an active
+    contract. Everything else remains represented by the existing digest line,
+    which is useful for comparison without disclosure.
+    """
+    if not isinstance(value, Mapping):
+        return ()
+    raw = value.get("capability_versions")
+    if not isinstance(raw, Mapping):
+        return ()
+
+    active: List[str] = []
+    maintenance = raw.get("semantic_maintenance")
+    if maintenance == _SEMANTIC_MAINTENANCE_CONTRACT_VERSION:
+        active.append(f"semantic_maintenance={maintenance}")
+
+    try:
+        from kestrel_sovereign.knowledge.registry import (
+            KnowledgeRegistryError,
+            ResourceKind,
+            get_knowledge_registry,
+        )
+
+        registry = get_knowledge_registry()
+    except (KnowledgeRegistryError, OSError):
+        active.extend(
+            (
+                "inference_profile=unavailable"
+                if "inference_profile" in raw
+                else "inference_profile=omitted",
+                "ontology=unavailable" if "ontology" in raw else "ontology=omitted",
+            )
+        )
+        return tuple(active)
+
+    resource_by_key = {resource.key: resource for resource in registry.resources}
+    capability_mode = raw.get("semantic_capability_mode")
+    allow_experimental = capability_mode == "experimental"
+    if capability_mode in {"stable", "experimental"}:
+        active.append(f"semantic_capability_mode={capability_mode}")
+    shape_set = raw.get("shape_set")
+    if (
+        isinstance(shape_set, str)
+        and (shape := resource_by_key.get(shape_set)) is not None
+        and shape.kind is ResourceKind.SHAPE_SET
+    ):
+        active.append(f"shape_set={shape_set}")
+
+    validation_profile = None
+    validation_capability = raw.get("validation_capability")
+    if isinstance(validation_capability, str):
+        try:
+            selected_validation = registry.select_capability(
+                validation_capability,
+                allow_experimental=allow_experimental,
+            )
+        except KnowledgeRegistryError:
+            selected_validation = None
+        if (
+            selected_validation is not None
+            and selected_validation.resource.kind is ResourceKind.VALIDATION_PROFILE
+        ):
+            validation_profile = selected_validation.resource
+    if validation_profile is not None:
+        active.append(f"validation_capability={validation_capability}")
+    validation_version = raw.get("validation_profile_version")
+    if validation_profile is not None and (
+        validation_version == "registry-selected"
+        or validation_version == str(validation_profile.version)
+    ):
+        active.append(f"validation_profile_version={validation_version}")
+
+    # Draft RDF/SPARQL names are only diagnostic evidence when the producer
+    # declared experimental mode *and* each exact registry pin still resolves.
+    # A report-shaped payload cannot make a disabled agent look experimental.
+    if allow_experimental:
+        for prefix, capability_key, version_key in (
+            ("rdf-profile:rdf12", "rdf12_capability", "rdf12_version"),
+            ("query-profile:sparql12", "sparql12_capability", "sparql12_version"),
+        ):
+            capability = raw.get(capability_key)
+            version = raw.get(version_key)
+            try:
+                selected = (
+                    registry.select_capability(capability, allow_experimental=True)
+                    if isinstance(capability, str) and capability.startswith(prefix)
+                    else None
+                )
+            except KnowledgeRegistryError:
+                selected = None
+            if selected is not None and version == str(selected.resource.version):
+                active.extend((f"{capability_key}={capability}", f"{version_key}={version}"))
+
+    rule_profile = raw.get("rule_profile")
+    rule_versions = _registered_rule_profile_versions(
+        rule_profile,
+        resource_by_key,
+        ResourceKind,
+    )
+    if rule_versions is not None:
+        active.append(f"rule_profile={rule_profile}")
+
+    ontology = _registered_ontology(raw.get("ontology"), registry.resources, ResourceKind)
+    if ontology is not None:
+        active.append(f"ontology={ontology.key}")
+    elif "ontology" in raw:
+        active.append("ontology=unavailable")
+    else:
+        active.append("ontology=omitted")
+
+    profile_value = raw.get("inference_profile")
+    if "inference_profile" not in raw:
+        active.append("inference_profile=omitted")
+    elif _is_registered_inference_profile(
+        profile_value,
+        ontology=ontology,
+        rule_versions=rule_versions,
+        registry_contract=registry.contract_version,
+    ):
+        active.append(f"inference_profile={profile_value}")
+    else:
+        active.append("inference_profile=unavailable")
+    return tuple(active)
+
+
+def _registered_rule_profile_versions(
+    value: Any,
+    resource_by_key: Mapping[str, Any],
+    resource_kind: Any,
+) -> Tuple[str, Optional[str]] | None:
+    """Resolve the exact compact rule-profile label emitted by the producer."""
+    if not isinstance(value, str):
+        return None
+    parts = value.split("+")
+    if len(parts) not in {1, 2}:
+        return None
+    expected_identifiers = ("rdfs-v1", "owl2rl-kestrel-v1")
+    versions: List[str] = []
+    for index, part in enumerate(parts):
+        identifier, separator, version = part.partition("@")
+        if not separator or identifier != expected_identifiers[index] or not version:
+            return None
+        resource = resource_by_key.get(f"{identifier}@{version}")
+        if (
+            resource is None
+            or resource.identifier != identifier
+            or resource.kind is not resource_kind.RULE_PROFILE
+        ):
+            return None
+        versions.append(str(resource.version))
+    canonical = f"rdfs-v1@{versions[0]}" + (
+        f"+owl2rl-kestrel-v1@{versions[1]}" if len(versions) == 2 else ""
+    )
+    if value != canonical:
+        return None
+    return versions[0], versions[1] if len(versions) == 2 else None
+
+
+def _registered_ontology(value: Any, resources: Any, resource_kind: Any):
+    """Return the local ontology behind the producer's namespace/version label."""
+    if not isinstance(value, str):
+        return None
+    matches = [
+        resource
+        for resource in resources
+        if resource.kind is resource_kind.ONTOLOGY
+        and value == f"{resource.namespace}@{resource.version}"
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _is_registered_inference_profile(
+    value: Any,
+    *,
+    ontology: Any,
+    rule_versions: Tuple[str, Optional[str]] | None,
+    registry_contract: str,
+) -> bool:
+    """Check the producer hash against exact local ontology/rule pins."""
+    if not isinstance(value, str) or ontology is None or rule_versions is None:
+        return False
+    try:
+        from kestrel_sovereign.knowledge.assertion import OntologyRef
+        from kestrel_sovereign.knowledge.inference import InferenceProfile
+
+        expected = InferenceProfile(
+            OntologyRef(
+                ontology.namespace,
+                str(ontology.version),
+                ontology.sha256,
+                registry_contract,
+            ),
+            rule_versions[0],
+            rule_versions[1],
+        ).key
+    except (TypeError, ValueError):
+        return False
+    return value == expected
+
+
+def _semantic_maintenance_repair_guidance(value: Any) -> str:
+    """Return a fixed next action for partial or unavailable maintenance.
+
+    These are action *codes*, not exception echoes.  The operator runbook maps
+    them to the bounded retry/repair commands, so a failure cannot expose an
+    assertion, SQL fragment, tenant, or source locator in an HTTP invoke reply.
+    """
+    if not isinstance(value, Mapping):
+        return "inspect_semantic_configuration"
+    status = _semantic_maintenance_status(value.get("status"))
+    reason = _semantic_maintenance_reason(value.get("reason"))
+    if status in {"complete", "no_op", "disabled"}:
+        return "none"
+    if reason == "semantic_maintenance_busy":
+        return "wait_for_active_maintenance_lease"
+    if reason in {
+        "semantic_maintenance_capability_unavailable",
+        "semantic_maintenance_capability_mismatch",
+        "semantic_maintenance_validation_capability_unavailable",
+    }:
+        return "check_semantic_profile_pins"
+    if status == "partial":
+        return "rerun_bounded_maintenance"
+    if status == "failed":
+        return "inspect_semantic_configuration"
+    return "rerun_bounded_maintenance"
+
+
+def _semantic_maintenance_diagnostics(value: Any) -> Optional[Dict[str, Any]]:
+    """Create the one content-free structured diagnostic for live maintenance."""
+    if not isinstance(value, Mapping):
+        return None
+    status = _semantic_maintenance_status(value.get("status"))
+    return {
+        "status": status,
+        "reason": _semantic_maintenance_reason(value.get("reason")),
+        "checkpoint": {
+            "source_generation": _bounded_summary_number(value.get("source_generation")),
+            "checkpoint_generation": _bounded_summary_number(
+                value.get("checkpoint_generation")
+            ),
+        },
+        "backlog": {
+            "assertions": _bounded_summary_number(value.get("backlog_assertions")),
+            "reports": _bounded_summary_number(value.get("backlog_reports")),
+        },
+        "partial": status == "partial",
+        "repair_guidance": _semantic_maintenance_repair_guidance(value),
+        "active_capabilities": list(_semantic_maintenance_active_capabilities(value)),
+    }
+
+
 def _render_semantic_maintenance_summary(value: Any) -> Optional[str]:
     """Render the fixed, content-free semantic-maintenance text block.
 
@@ -170,8 +435,11 @@ def _render_semantic_maintenance_summary(value: Any) -> Optional[str]:
     if not isinstance(value, Mapping):
         return None
 
-    status = _semantic_maintenance_status(value.get("status"))
-    reason = _semantic_maintenance_reason(value.get("reason"))
+    diagnostics = _semantic_maintenance_diagnostics(value)
+    if diagnostics is None:  # pragma: no cover - guarded immediately above.
+        return None
+    status = str(diagnostics["status"])
+    reason = str(diagnostics["reason"])
     capability_count, capability_digest = _semantic_maintenance_capability_summary(
         value.get("capability_versions")
     )
@@ -195,6 +463,13 @@ def _render_semantic_maintenance_summary(value: Any) -> Optional[str]:
         f"    duration: {_bounded_summary_number(value.get('duration_ms'))}ms",
         "    capabilities: "
         f"versions={capability_count} digest={capability_digest}",
+        "    active capabilities: "
+        + (
+            ", ".join(diagnostics["active_capabilities"])
+            if diagnostics["active_capabilities"]
+            else "unavailable"
+        ),
+        f"    repair guidance: {diagnostics['repair_guidance']}",
     ]
     # Every interpolated value above is independently bounded.  Retain this
     # final cap as a defense-in-depth contract for future edits.
@@ -462,6 +737,7 @@ class SleepReport:
             "hook_results": [result.to_dict() for result in self.hook_results],
             "semantic_inference": self.semantic_inference,
             "semantic_maintenance": self.semantic_maintenance,
+            "semantic_maintenance_diagnostics": self.semantic_maintenance_diagnostics(),
             "export": {
                 "shards_exported": self.shards_exported,
                 "total_size_bytes": self.total_size_bytes,
@@ -487,6 +763,16 @@ class SleepReport:
         capability map itself.
         """
         return _render_semantic_maintenance_summary(self.semantic_maintenance)
+
+    def semantic_maintenance_diagnostics(self) -> Optional[Dict[str, Any]]:
+        """Return the content-free operational view used by live invoke output.
+
+        The raw maintenance result is retained for trusted programmatic callers,
+        while this method is the safe presentation contract: active verified
+        profiles, checkpoint/backlog state, partial status, and fixed repair
+        guidance are visible without assertion content or identifiers.
+        """
+        return _semantic_maintenance_diagnostics(self.semantic_maintenance)
 
     def __str__(self) -> str:
         """Human-readable sleep summary with safe maintenance observability."""
@@ -721,6 +1007,7 @@ class SleepMixin:
         return bool(
             getattr(self, "semantic_inference_configured", False)
             or getattr(self, "semantic_maintenance_configured", False)
+            or getattr(self, "semantic_capabilities_configured", False)
             or getattr(self, "semantic_inference_profile", None) is not None
         )
 
@@ -746,7 +1033,15 @@ class SleepMixin:
         maintenance_configured = bool(
             getattr(self, "semantic_maintenance_configured", False)
         )
-        if profile is None and not inference_configured and not maintenance_configured:
+        capabilities_configured = bool(
+            getattr(self, "semantic_capabilities_configured", False)
+        )
+        if (
+            profile is None
+            and not inference_configured
+            and not maintenance_configured
+            and not capabilities_configured
+        ):
             return True
         storage = getattr(self, "storage", None)
         if profile is None and inference_configured:
@@ -788,10 +1083,25 @@ class SleepMixin:
         maintain = getattr(storage, "run_semantic_maintenance", None)
         if callable(maintain):
             try:
+                maintenance_kwargs = {
+                    "inference_limits": getattr(self, "semantic_inference_limits", None),
+                    "maintenance_limits": getattr(self, "semantic_maintenance_limits", None),
+                }
+                semantic_capabilities = getattr(self, "semantic_capabilities", None)
+                if semantic_capabilities is not None:
+                    maintenance_kwargs["semantic_capabilities"] = semantic_capabilities
+                    # Exercise the storage-owned RDF runtime on the real
+                    # ``!sleep`` path.  This prevents an agent config from
+                    # being represented only by maintenance diagnostics while
+                    # a different codec silently handles later graph reads.
+                    runtime_report = getattr(storage, "semantic_rdf_capability_report", None)
+                    if callable(runtime_report):
+                        active_runtime = runtime_report()
+                        if not semantic_capabilities.rdf_runtime_matches(active_runtime):
+                            raise RuntimeError("semantic_rdf_runtime_capability_mismatch")
                 result = await maintain(
                     profile,
-                    inference_limits=getattr(self, "semantic_inference_limits", None),
-                    maintenance_limits=getattr(self, "semantic_maintenance_limits", None),
+                    **maintenance_kwargs,
                 )
             except Exception:
                 report.semantic_maintenance = {

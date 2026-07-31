@@ -48,6 +48,7 @@ from kestrel_sovereign.identity.runtime_identity import (
 )
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
 from kestrel_sovereign.knowledge import InferenceProfile, OntologyRef
+from kestrel_sovereign.knowledge.capabilities import semantic_capabilities_from_config
 
 
 def _semantic_source(source_id: str):
@@ -112,6 +113,59 @@ async def _reach_current_semantic_maintenance(storage: AsyncStorage) -> None:
         if result.status.value in {"complete", "no_op"}:
             return
     raise AssertionError(f"maintenance did not converge: {result}")
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_experimental_capability_selection_is_backend_neutral_and_non_migrating(
+    db_backend,
+    tmp_path,
+):
+    """A draft selection reaches real maintenance without rewriting canonical data."""
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path,
+        "experimental-capabilities",
+    )
+    selected = semantic_capabilities_from_config(
+        {
+            "mode": "experimental",
+            "rdf12": {
+                "capability": "rdf-profile:rdf12-cr-20260407-experimental",
+                "version": "0.1.0",
+            },
+            "sparql12": {
+                "capability": "query-profile:sparql12-20260605-experimental",
+                "version": "0.1.0",
+            },
+            "shacl12": {
+                "capability": "validation-profile:shacl12-core-20260602-experimental",
+                "version": "0.1.0",
+            },
+            "shape_set": {
+                "identifier": "kestrel-assertion-shapes-shacl12-experimental",
+                "version": "0.1.0",
+            },
+        }
+    )
+    storage = await _assertion_storage_for_backend(
+        db_backend, tenant, identity, semantic_capabilities=selected
+    )
+    try:
+        before = await storage.query_assertions()
+        result = await storage.run_semantic_maintenance(
+            None,
+            semantic_capabilities=selected,
+        )
+        after = await storage.query_assertions()
+
+        assert result.status.value == "no_op"
+        assert before == after == []
+        assert result.capability_versions["semantic_capability_mode"] == "experimental"
+        assert result.capability_versions["rdf12_version"] == "0.1.0"
+        assert result.capability_versions["sparql12_version"] == "0.1.0"
+        assert result.capability_versions["validation_profile_version"] == "0.1.0"
+    finally:
+        await storage.close()
 
 
 def _explicit_fact_proposal(
@@ -210,6 +264,8 @@ async def _assertion_storage_for_backend(
     db_backend,
     tenant_id: str,
     identity: AgentIdentity,
+    *,
+    semantic_capabilities=None,
 ) -> AsyncStorage:
     """Open a boot-resolver-authorized assertion store for parity coverage."""
     capability = _resolve_authenticated_agent_assertion_capability(
@@ -221,6 +277,7 @@ async def _assertion_storage_for_backend(
             db_backend.db_path,
             agent_id=tenant_id,
             _assertion_tenant_capability=capability,
+            semantic_capabilities=semantic_capabilities,
         )
         await storage.initialize()
         return storage
@@ -232,6 +289,7 @@ async def _assertion_storage_for_backend(
         dsn=dsn,
         agent_id=tenant_id,
         _assertion_tenant_capability=capability,
+        semantic_capabilities=semantic_capabilities,
     )
     await storage.initialize()
     return storage

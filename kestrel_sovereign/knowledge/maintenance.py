@@ -28,6 +28,8 @@ from kestrel_sovereign.storage.async_assertion_store import (
 from kestrel_sovereign.storage.db.interface import TransactionError
 
 from .assertion import Assertion, AssertionQuery, AssertionStatus, DirectLineage
+from .capabilities import SemanticRuntimeCapabilities
+from .rdf_codec import RdfAssertionCodec
 from .inference import (
     BoundedInferenceService,
     ClosureStatus,
@@ -312,6 +314,8 @@ class SemanticMaintenanceService:
         ),
         validation_capability: str = "validation-profile:shacl-core-20170720",
         validation_profile_version: str | None = None,
+        semantic_capabilities: SemanticRuntimeCapabilities | None = None,
+        rdf_codec: RdfAssertionCodec | None = None,
     ) -> None:
         from kestrel_sovereign.storage.async_assertion_store import AsyncAssertionStore
 
@@ -323,6 +327,30 @@ class SemanticMaintenanceService:
             raise SemanticMaintenanceError("inference_profile must be InferenceProfile or null")
         if inference_limits is not None and not isinstance(inference_limits, InferenceLimits):
             raise SemanticMaintenanceError("inference_limits must be InferenceLimits or null")
+        if semantic_capabilities is not None and not isinstance(
+            semantic_capabilities, SemanticRuntimeCapabilities
+        ):
+            raise SemanticMaintenanceError("semantic_capabilities must be SemanticRuntimeCapabilities")
+        self.semantic_capabilities = semantic_capabilities or SemanticRuntimeCapabilities.stable()
+        try:
+            self.semantic_capabilities.validate()
+        except ValueError as exc:
+            raise SemanticMaintenanceError(
+                "semantic_maintenance_capability_unavailable"
+            ) from exc
+        if semantic_capabilities is not None:
+            # These parameters are legacy internal seams.  A runtime selection must
+            # be carried as one atomic contract, never a mixture of old/new pins.
+            shape_set = self.semantic_capabilities.shape_set
+            validation_capability = self.semantic_capabilities.validation_capability
+            validation_profile_version = self.semantic_capabilities.validation_profile_version
+        if rdf_codec is not None and not isinstance(rdf_codec, RdfAssertionCodec):
+            raise SemanticMaintenanceError("rdf_codec must be RdfAssertionCodec")
+        # The codec is a live, agent-owned runtime boundary.  Maintenance
+        # records its report from the actual instance, rather than merely
+        # echoing the configuration table that selected it.
+        self.rdf_codec = rdf_codec or self.semantic_capabilities.create_rdf_codec()
+        self._validate_rdf_runtime()
         if not isinstance(shape_set, ShapeSetReference):
             raise SemanticMaintenanceError("shape_set must be ShapeSetReference")
         if not isinstance(validation_capability, str) or not validation_capability:
@@ -335,6 +363,14 @@ class SemanticMaintenanceService:
         self.shape_set = shape_set
         self.validation_capability = validation_capability
         self.validation_profile_version = validation_profile_version
+
+    def _validate_rdf_runtime(self) -> None:
+        if not self.semantic_capabilities.rdf_runtime_matches(
+            self.rdf_codec.capability_report
+        ):
+            raise SemanticMaintenanceError(
+                "RDF/SPARQL runtime does not match the selected experimental pins"
+            )
 
     async def run(self, *, full_rebuild: bool = False) -> SemanticMaintenanceResult:
         """Advance changed semantic work; full rebuild is an explicit repair.
@@ -1522,6 +1558,7 @@ class SemanticMaintenanceService:
             "shape_set": self.shape_set,
             "validation_capability": self.validation_capability,
             "profile_version": self.validation_profile_version,
+            "allow_experimental": self.semantic_capabilities.allow_experimental,
             "limits": ShaclValidationLimits(
                 max_shapes=self.limits.max_shapes,
                 max_wall_time_seconds=max(
@@ -2135,6 +2172,29 @@ class SemanticMaintenanceService:
                 ]
             ),
         }
+        versions.update(self.semantic_capabilities.capability_versions())
+        runtime_report = self.rdf_codec.capability_report
+        versions.update(
+            {
+                "rdf11_runtime": (
+                    f"{runtime_report.rdf11.identifier}@{runtime_report.rdf11.version}"
+                ),
+                "sparql11_runtime": (
+                    f"{runtime_report.sparql11.identifier}@{runtime_report.sparql11.version}"
+                ),
+            }
+        )
+        if runtime_report.rdf12 is not None and runtime_report.sparql12 is not None:
+            versions.update(
+                {
+                    "rdf12_runtime": (
+                        f"{runtime_report.rdf12.identifier}@{runtime_report.rdf12.version}"
+                    ),
+                    "sparql12_runtime": (
+                        f"{runtime_report.sparql12.identifier}@{runtime_report.sparql12.version}"
+                    ),
+                }
+            )
         if self.inference_profile is not None:
             versions["inference_profile"] = self.inference_profile.key
             versions["rule_profile"] = self.inference_profile.rule_profile_version
@@ -2156,7 +2216,10 @@ class SemanticMaintenanceService:
 
         try:
             registry = get_knowledge_registry()
-            profile = registry.select_capability(self.validation_capability)
+            profile = registry.select_capability(
+                self.validation_capability,
+                allow_experimental=self.semantic_capabilities.allow_experimental,
+            )
             if profile.resource.kind is not ResourceKind.VALIDATION_PROFILE:
                 raise SemanticMaintenanceError(
                     "semantic_maintenance_validation_capability_unavailable"
@@ -2171,6 +2234,7 @@ class SemanticMaintenanceService:
             shapes = registry.resolve_capability(
                 self.shape_set.identifier,
                 self.shape_set.version,
+                allow_experimental=self.semantic_capabilities.allow_experimental,
             )
         except (ExperimentalCapabilityError, KnowledgeRegistryError) as error:
             raise SemanticMaintenanceError(

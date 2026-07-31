@@ -33,6 +33,8 @@ from kestrel_sovereign.multi_agent.config import (
     MultiAgentConfig,
 )
 from kestrel_sovereign.config import (
+    SEMANTIC_CAPABILITIES_CONFIGURED_ENV,
+    SEMANTIC_CAPABILITIES_CONFIG_ENV,
     SEMANTIC_INFERENCE_CONFIG_ENV,
     SEMANTIC_MAINTENANCE_CONFIG_ENV,
     SEMANTIC_MAINTENANCE_CONFIGURED_ENV,
@@ -542,6 +544,20 @@ class ProcessManager:
                     f"Agent '{name}' has a non-serializable semantic maintenance budget"
                 ) from exc
             env[SEMANTIC_MAINTENANCE_CONFIGURED_ENV] = "1"
+        if config.semantic_capabilities is None:
+            env.pop(SEMANTIC_CAPABILITIES_CONFIG_ENV, None)
+            env.pop(SEMANTIC_CAPABILITIES_CONFIGURED_ENV, None)
+        else:
+            try:
+                env[SEMANTIC_CAPABILITIES_CONFIG_ENV] = json.dumps(
+                    config.semantic_capabilities,
+                    sort_keys=True,
+                )
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Agent '{name}' has a non-serializable semantic capability selection"
+                ) from exc
+            env[SEMANTIC_CAPABILITIES_CONFIGURED_ENV] = "1"
 
         # Force child agents into single-agent mode. Without this,
         # server.py detects multi_agent.toml in the CWD and enters multi-

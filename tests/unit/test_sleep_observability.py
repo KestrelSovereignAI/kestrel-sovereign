@@ -4,9 +4,23 @@ from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
 
 from kestrel_sovereign.agent.sleep import SleepMixin, SleepReport
+from kestrel_sovereign.knowledge.assertion import OntologyRef
+from kestrel_sovereign.knowledge.inference import InferenceProfile
+from kestrel_sovereign.knowledge.registry import ResourceKind, get_knowledge_registry
+from kestrel_sovereign.knowledge.release_evidence import release_gate_specs
+from kestrel_sovereign.knowledge.release_evidence_models import (
+    ArtifactReference,
+    EvidenceRecord,
+    EvidenceState,
+    ExecutionSource,
+    GateResult,
+    TrustedExecutionPolicy,
+)
+from kestrel_sovereign.knowledge.release_evidence_execution import CatalogSigningIdentity
 
 
 def _maintenance(
@@ -53,6 +67,31 @@ def _maintenance(
             "ontology": "core@1",
         },
     }
+
+
+def _known_inference_profile_values() -> tuple[dict[str, str], InferenceProfile]:
+    registry = get_knowledge_registry()
+    ontology = next(
+        resource
+        for resource in registry.resources
+        if resource.identifier == "kestrel-vocab"
+        and str(resource.version) == "1.0.0"
+        and resource.kind is ResourceKind.ONTOLOGY
+    )
+    profile = InferenceProfile(
+        OntologyRef(
+            ontology.namespace,
+            str(ontology.version),
+            ontology.sha256,
+            registry.contract_version,
+        ),
+        "1.0.0",
+    )
+    return {
+        "inference_profile": profile.key,
+        "rule_profile": profile.rule_profile_version,
+        "ontology": f"{ontology.namespace}@{ontology.version}",
+    }, profile
 
 
 class _CommandSleepAgent(SleepMixin):
@@ -170,6 +209,7 @@ def test_sleep_report_maintenance_renderer_redacts_content_ids_and_raw_errors() 
 
     rendered = str(report)
     summary = report.semantic_maintenance_summary()
+    diagnostics = report.semantic_maintenance_diagnostics()
 
     assert rendered == str(report), "rendering must be deterministic"
     assert summary is not None
@@ -187,6 +227,95 @@ def test_sleep_report_maintenance_renderer_redacts_content_ids_and_raw_errors() 
         "raw_error",
     ):
         assert secret not in rendered
+        assert secret not in repr(diagnostics)
+
+
+def test_sleep_diagnostics_expose_verified_capabilities_and_repair_guidance() -> None:
+    profile_values, profile = _known_inference_profile_values()
+    report = SleepReport(
+        success=False,
+        semantic_maintenance=_maintenance(
+            status="partial",
+            reason="assertion_budget",
+            backlog_assertions=3,
+            backlog_reports=1,
+            capability_versions={
+                "semantic_maintenance": "v3",
+                "shape_set": "kestrel-assertion-shapes@1.0.0",
+                "validation_capability": "validation-profile:shacl-core-20170720",
+                "validation_profile_version": "registry-selected",
+                **profile_values,
+            },
+        ),
+    )
+
+    diagnostics = report.semantic_maintenance_diagnostics()
+    assert diagnostics == {
+        "status": "partial",
+        "reason": "assertion_budget",
+        "checkpoint": {
+            "source_generation": "17",
+            "checkpoint_generation": "17",
+        },
+        "backlog": {"assertions": "3", "reports": "1"},
+        "partial": True,
+        "repair_guidance": "rerun_bounded_maintenance",
+        "active_capabilities": [
+            "semantic_maintenance=v3",
+            "shape_set=kestrel-assertion-shapes@1.0.0",
+            "validation_capability=validation-profile:shacl-core-20170720",
+            "validation_profile_version=registry-selected",
+            f"rule_profile={profile.rule_profile_version}",
+            "ontology=kestrel-vocab@1.0.0",
+            f"inference_profile={profile.key}",
+        ],
+    }
+    assert "active capabilities: semantic_maintenance=v3" in str(report)
+    assert "repair guidance: rerun_bounded_maintenance" in str(report)
+    assert report.to_dict()["semantic_maintenance_diagnostics"] == diagnostics
+
+
+def test_sleep_diagnostics_reject_version_shaped_unregistered_capability_labels() -> None:
+    report = SleepReport(
+        success=False,
+        semantic_maintenance=_maintenance(
+            status="partial",
+            reason="assertion_budget",
+            capability_versions={
+                "semantic_maintenance": "v999",
+                "shape_set": "kestrel-assertion-shapes@999.999.999",
+                "validation_capability": "validation-profile:unknown",
+                "validation_profile_version": "999.999.999",
+                "inference_profile": "sha256:" + "f" * 64,
+                "rule_profile": "rdfs-v1@999.999.999",
+                "ontology": "https://kestrel.ai/vocab/@999.999.999",
+            },
+        ),
+    )
+
+    active = report.semantic_maintenance_diagnostics()["active_capabilities"]
+    rendered = " ".join(active)
+
+    assert "v999" not in rendered
+    assert "999.999.999" not in rendered
+    assert "validation-profile:unknown" not in rendered
+    assert "inference_profile=unavailable" in active
+    assert "ontology=unavailable" in active
+
+
+def test_sleep_diagnostics_marks_absent_producer_profile_and_ontology_as_omitted() -> None:
+    report = SleepReport(
+        success=True,
+        semantic_maintenance=_maintenance(
+            capability_versions={"semantic_maintenance": "v3"},
+        ),
+    )
+
+    assert report.semantic_maintenance_diagnostics()["active_capabilities"] == [
+        "semantic_maintenance=v3",
+        "ontology=omitted",
+        "inference_profile=omitted",
+    ]
 
 
 @pytest.mark.asyncio
@@ -262,6 +391,71 @@ def test_authenticated_invoke_preserves_consolidate_only_maintenance_summary() -
         assert "backlog: assertions=1 reports=0" in body["response"]
         assert "capabilities: versions=9 digest=" in body["response"]
         assert replay_assertion_id not in body["response"]
+        diagnostics_gate = next(
+            spec
+            for spec in release_gate_specs()
+            if spec.gate_id == "semantic_maintenance_diagnostics_contract"
+        )
+        assert diagnostics_gate.required_for_ready is True
+        assert {
+            field.field_id: field.kind
+            for field in diagnostics_gate.observation_schema.fields
+        } == {
+            "diagnostic_count": "positive_count",
+            "redaction_violation_count": "zero_count",
+        }
+        live_observation = {
+            "diagnostic_count": sum(
+                marker in body["response"]
+                for marker in (
+                    "status:",
+                    "reason:",
+                    "generations:",
+                    "backlog:",
+                    "active capabilities:",
+                    "repair guidance:",
+                )
+            ),
+            "redaction_violation_count": sum(
+                marker in body["response"]
+                for marker in (
+                    replay_assertion_id,
+                    "tenant_id",
+                    "raw_error",
+                )
+            ),
+        }
+        signing_identity = CatalogSigningIdentity(
+            issuer_id="sleep_test_ci",
+            key_id="diagnostics_runner",
+            private_key=Ed25519PrivateKey.from_private_bytes(b"\x04" * 32),
+            source=ExecutionSource.CATALOG_RUNNER,
+        )
+        artifact = ArtifactReference(
+            "ci://sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "a" * 64,
+        )
+        _, run_digest = EvidenceRecord._bound_run_digest(
+            diagnostics_gate,
+            live_observation,
+            artifact,
+            state=EvidenceState.PASSED,
+        )
+        GateResult(
+            diagnostics_gate,
+            EvidenceRecord._from_trusted_execution(
+                diagnostics_gate,
+                live_observation,
+                artifact,
+                state=EvidenceState.PASSED,
+                execution_attestation=signing_identity.sign(
+                    kind="evidence_record",
+                    spec=diagnostics_gate,
+                    run_digest=run_digest,
+                ),
+            ),
+            TrustedExecutionPolicy((signing_identity.trusted_key(("pytest",)),)),
+        )
         agent.process_input.assert_awaited_once()
         assert command_agent.sleep_calls == [
             {

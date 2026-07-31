@@ -1539,6 +1539,22 @@
     },
     {
       "existing_code_refs": [
+        "kestrel_sovereign/knowledge/release_evidence.py",
+        "tests/unit/test_semantic_release_evidence.py",
+        "tests/unit/test_sleep_observability.py"
+      ],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/testing/SEMANTIC_RELEASE_EVIDENCE.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "active",
+      "title": "Semantic Knowledge Release Evidence",
+      "type": "Architecture Spec"
+    },
+    {
+      "existing_code_refs": [
         "run_tests.py",
         "server.py",
         "tests/unit/test_docs_verify.py"

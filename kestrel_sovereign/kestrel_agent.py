@@ -25,6 +25,8 @@ from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.llm.adapter import LLMResponse
 from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
 from kestrel_sovereign.config import (
+    SEMANTIC_CAPABILITIES_CONFIGURED_ENV,
+    SEMANTIC_CAPABILITIES_CONFIG_ENV,
     SEMANTIC_INFERENCE_CONFIG_ENV,
     SEMANTIC_MAINTENANCE_CONFIG_ENV,
     SEMANTIC_MAINTENANCE_CONFIGURED_ENV,
@@ -537,8 +539,10 @@ class KestrelAgent(
         semantic_inference_profile: Optional["InferenceProfile"] = None,
         semantic_inference_limits: Optional["InferenceLimits"] = None,
         semantic_maintenance_limits: Optional["SemanticMaintenanceLimits"] = None,
+        semantic_capabilities: Optional["SemanticRuntimeCapabilities"] = None,
         semantic_inference_configured: bool = False,
         semantic_maintenance_configured: bool = False,
+        semantic_capabilities_configured: bool = False,
         semantic_maintenance_allow_prior_verified_snapshot: bool = False,
     ):
         """
@@ -704,6 +708,11 @@ class KestrelAgent(
             maintenance_allows_prior_verified_snapshot,
             maintenance_limits_from_config,
         )
+        from kestrel_sovereign.knowledge.capabilities import (
+            SemanticCapabilityConfigurationError,
+            SemanticRuntimeCapabilities,
+            semantic_capabilities_from_config,
+        )
 
         if semantic_inference_limits is not None and not isinstance(
             semantic_inference_limits, InferenceLimits
@@ -718,8 +727,27 @@ class KestrelAgent(
         self.semantic_maintenance_limits = (
             semantic_maintenance_limits or SemanticMaintenanceLimits()
         )
+        if semantic_capabilities is not None and not isinstance(
+            semantic_capabilities, SemanticRuntimeCapabilities
+        ):
+            raise RuntimeError("Invalid semantic capability selection")
+        self.semantic_capabilities = (
+            semantic_capabilities or SemanticRuntimeCapabilities.stable()
+        )
+        if semantic_capabilities is not None:
+            try:
+                self.semantic_capabilities.validate()
+            except SemanticCapabilityConfigurationError as exc:
+                raise RuntimeError("Invalid semantic capability selection") from exc
         self.semantic_inference_configured = semantic_inference_configured
         self.semantic_maintenance_configured = semantic_maintenance_configured
+        # An explicitly injected runtime selection is itself an opt-in.  Do
+        # not require direct constructors to also know the internal lifecycle
+        # flag used by managed config/env boot paths.
+        semantic_capabilities_configured = (
+            semantic_capabilities_configured or semantic_capabilities is not None
+        )
+        self.semantic_capabilities_configured = semantic_capabilities_configured
         if type(semantic_maintenance_allow_prior_verified_snapshot) is not bool:
             raise RuntimeError(
                 "Invalid semantic maintenance prior verified snapshot policy"
@@ -766,6 +794,35 @@ class KestrelAgent(
                     ) from exc
                 semantic_inference_configured = True
                 self.semantic_inference_configured = True
+        serialized_capabilities = os.environ.get(SEMANTIC_CAPABILITIES_CONFIG_ENV)
+        environment_capabilities_configured = os.environ.get(
+            SEMANTIC_CAPABILITIES_CONFIGURED_ENV
+        )
+        if not semantic_capabilities_configured:
+            if environment_capabilities_configured not in (None, "1"):
+                raise RuntimeError(
+                    f"Invalid {SEMANTIC_CAPABILITIES_CONFIGURED_ENV} configuration"
+                )
+            if (
+                environment_capabilities_configured == "1"
+                and serialized_capabilities is None
+            ):
+                raise RuntimeError(
+                    f"{SEMANTIC_CAPABILITIES_CONFIGURED_ENV} requires "
+                    f"{SEMANTIC_CAPABILITIES_CONFIG_ENV}"
+                )
+        if not semantic_capabilities_configured and serialized_capabilities is not None:
+            try:
+                capability_config = json.loads(serialized_capabilities)
+                self.semantic_capabilities = semantic_capabilities_from_config(
+                    capability_config
+                )
+            except (json.JSONDecodeError, SemanticCapabilityConfigurationError) as exc:
+                raise RuntimeError(
+                    f"Invalid {SEMANTIC_CAPABILITIES_CONFIG_ENV} configuration"
+                ) from exc
+            semantic_capabilities_configured = True
+            self.semantic_capabilities_configured = True
         serialized_maintenance = os.environ.get(SEMANTIC_MAINTENANCE_CONFIG_ENV)
         environment_maintenance_configured = os.environ.get(
             SEMANTIC_MAINTENANCE_CONFIGURED_ENV
@@ -876,6 +933,21 @@ class KestrelAgent(
                             ) from exc
                         semantic_maintenance_configured = True
                         self.semantic_maintenance_configured = True
+
+                    if (
+                        not semantic_capabilities_configured
+                        and "semantic_capabilities" in toml_data
+                    ):
+                        try:
+                            self.semantic_capabilities = semantic_capabilities_from_config(
+                                toml_data["semantic_capabilities"]
+                            )
+                        except SemanticCapabilityConfigurationError as exc:
+                            raise RuntimeError(
+                                f"Invalid [semantic_capabilities] configuration in {agent_toml}"
+                            ) from exc
+                        semantic_capabilities_configured = True
+                        self.semantic_capabilities_configured = True
 
                     privacy = toml_data.get("privacy", {})
                     if not isinstance(privacy, Mapping):
@@ -1712,6 +1784,7 @@ class KestrelAgent(
                     agent_id=self.did,
                     llm_service=self.llm_service,
                     _assertion_tenant_capability=assertion_tenant_capability,
+                    semantic_capabilities=self.semantic_capabilities,
                 )
                 logging.info(f"Using shared PostgreSQL pool for Kestrel storage (agent: {self.did})")
             else:
@@ -1721,6 +1794,7 @@ class KestrelAgent(
                     agent_id=self.did,
                     llm_service=self.llm_service,
                     _assertion_tenant_capability=assertion_tenant_capability,
+                    semantic_capabilities=self.semantic_capabilities,
                 )
                 logging.info(f"Using PostgreSQL backend for Kestrel storage (agent: {self.did})")
         else:
@@ -1730,6 +1804,7 @@ class KestrelAgent(
                 agent_id=self.did,
                 llm_service=self.llm_service,
                 _assertion_tenant_capability=assertion_tenant_capability,
+                semantic_capabilities=self.semantic_capabilities,
             )
             logging.info(f"Using SQLite backend for Kestrel storage: {self.storage_path}")
 

@@ -23,6 +23,12 @@ A comprehensive guide to running and writing tests for Kestrel Sovereign.
 > during implementation, independent verification during review, CI
 > before merge) and the structured result states the reviewer reports,
 > see [`TEST_EVIDENCE_GATES.md`](TEST_EVIDENCE_GATES.md).
+>
+> Semantic-KB cutovers additionally use the immutable, content-free
+> conformance, parity, erasure, benchmark, diagnostics, and Kite evidence
+> catalog in [`SEMANTIC_RELEASE_EVIDENCE.md`](SEMANTIC_RELEASE_EVIDENCE.md).
+> A generated template is deliberately non-ready until each catalog-bound
+> observation and artifact digest has been independently recorded.
 
 ## Test Pyramid Strategy
 

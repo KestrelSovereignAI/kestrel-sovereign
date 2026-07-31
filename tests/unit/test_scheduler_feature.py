@@ -1794,6 +1794,7 @@ class TestTaskExecutor:
         feature.agent.semantic_inference_profile = None
         feature.agent.semantic_inference_limits = None
         feature.agent.semantic_maintenance_limits = None
+        feature.agent.semantic_capabilities = None
         feature.agent.semantic_inference_configured = False
         feature.agent.semantic_maintenance_configured = True
         feature.agent.semantic_maintenance_allow_prior_verified_snapshot = False
@@ -1813,6 +1814,7 @@ class TestTaskExecutor:
             None,
             inference_limits=None,
             maintenance_limits=None,
+            semantic_capabilities=None,
         )
 
     @pytest.mark.asyncio

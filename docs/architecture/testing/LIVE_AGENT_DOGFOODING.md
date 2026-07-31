@@ -176,6 +176,14 @@ packages:
    run the tests yourself, merge on green, redeploy the test agent, and **re-confirm the behavior
    live** at the same bar you used to find it.
 
+For a semantic-KB release, use the dedicated HTTP checks for recall,
+contradiction, quarantine, sleep, restart, and erasure in
+[Semantic Knowledge Release Evidence](SEMANTIC_RELEASE_EVIDENCE.md). Attach
+only the catalog-bound, content-free aggregate observation and approved
+artifact reference/digest to its release report. The live invoke transcript
+stays in the isolated evidence environment; no arbitrary command line or raw
+response is a release record.
+
 ### Parallelizing
 
 - **Fixes** fan out across [kestrel-talon](https://github.com/KestrelSovereignAI/kestrel-talon)

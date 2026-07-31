@@ -142,6 +142,12 @@ the post-response memory pipeline on both response paths, so temporal
 patterns, concept-graph nodes, emotional memory metadata, and embeddings are
 never derived from the session's raw input until the user explicitly saves it.
 
+When a release changes a semantic projection, governed corpus, or optional
+learning adapter, the privacy evidence is an erasure drill from source through
+served eligibility—not a raw diagnostic dump. The required correlated,
+content-free release record and operator workflow are in
+[Semantic Knowledge Release Evidence](../testing/SEMANTIC_RELEASE_EVIDENCE.md).
+
 **Session Control Commands**:
 - `!save-session` - Make session permanent
 - `!discard-session` - Delete session without saving

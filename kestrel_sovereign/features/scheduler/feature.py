@@ -833,6 +833,7 @@ class SchedulerFeature(Feature):
         if (
             getattr(self.agent, "semantic_inference_configured", False) is True
             or getattr(self.agent, "semantic_maintenance_configured", False) is True
+            or getattr(self.agent, "semantic_capabilities_configured", False) is True
         ):
             return True
         from kestrel_sovereign.knowledge.inference import InferenceProfile
@@ -876,6 +877,9 @@ class SchedulerFeature(Feature):
                 ),
                 maintenance_limits=getattr(
                     self.agent, "semantic_maintenance_limits", None
+                ),
+                semantic_capabilities=getattr(
+                    self.agent, "semantic_capabilities", None
                 ),
             )
         except Exception as error:  # noqa: BLE001 - fail closed at the data boundary

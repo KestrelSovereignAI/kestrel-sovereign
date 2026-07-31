@@ -890,8 +890,10 @@ class AgentManager:
         semantic_inference_limits = None
         semantic_maintenance_limits = None
         semantic_maintenance_allow_prior_verified_snapshot = False
+        semantic_capabilities = None
         semantic_inference_configured = config.semantic_inference is not None
         semantic_maintenance_configured = config.semantic_maintenance is not None
+        semantic_capabilities_configured = config.semantic_capabilities is not None
         if semantic_inference_configured:
             from kestrel_sovereign.knowledge.inference import (
                 inference_limits_from_config,
@@ -921,6 +923,14 @@ class AgentManager:
                     config.semantic_maintenance
                 )
             )
+        if config.semantic_capabilities is not None:
+            from kestrel_sovereign.knowledge.capabilities import (
+                semantic_capabilities_from_config,
+            )
+
+            semantic_capabilities = semantic_capabilities_from_config(
+                config.semantic_capabilities
+            )
 
         agent: Optional[KestrelAgent] = None
         scheduler_registration: Optional[
@@ -949,8 +959,10 @@ class AgentManager:
                     semantic_inference_profile=semantic_inference_profile,
                     semantic_inference_limits=semantic_inference_limits,
                     semantic_maintenance_limits=semantic_maintenance_limits,
+                    semantic_capabilities=semantic_capabilities,
                     semantic_inference_configured=semantic_inference_configured,
                     semantic_maintenance_configured=semantic_maintenance_configured,
+                    semantic_capabilities_configured=semantic_capabilities_configured,
                     semantic_maintenance_allow_prior_verified_snapshot=(
                         semantic_maintenance_allow_prior_verified_snapshot
                     ),
@@ -965,8 +977,10 @@ class AgentManager:
                     semantic_inference_profile=semantic_inference_profile,
                     semantic_inference_limits=semantic_inference_limits,
                     semantic_maintenance_limits=semantic_maintenance_limits,
+                    semantic_capabilities=semantic_capabilities,
                     semantic_inference_configured=semantic_inference_configured,
                     semantic_maintenance_configured=semantic_maintenance_configured,
+                    semantic_capabilities_configured=semantic_capabilities_configured,
                     semantic_maintenance_allow_prior_verified_snapshot=(
                         semantic_maintenance_allow_prior_verified_snapshot
                     ),

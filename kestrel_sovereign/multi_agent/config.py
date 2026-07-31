@@ -105,6 +105,14 @@ class LocalAgentConfig(BaseModel):
             "post-consolidation semantic maintenance."
         ),
     )
+    semantic_capabilities: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Optional exact stable or all-or-nothing experimental RDF 1.2, "
+            "SPARQL 1.2, and SHACL 1.2 selection for this agent. Invalid, "
+            "partial, or unavailable draft pins fail startup."
+        ),
+    )
 
     @field_validator("data_dir", mode="before")
     @classmethod
@@ -415,6 +423,8 @@ class MultiAgentConfig(BaseModel):
                     entry["semantic_inference"] = agent.semantic_inference
                 if agent.semantic_maintenance is not None:
                     entry["semantic_maintenance"] = agent.semantic_maintenance
+                if agent.semantic_capabilities is not None:
+                    entry["semantic_capabilities"] = agent.semantic_capabilities
                 data["agents"][name] = entry
             elif isinstance(agent, RemoteAgentConfig):
                 data["agents"][name] = {
