@@ -1202,6 +1202,27 @@ class AsyncStorage:
             visibility=Visibility.PRIVATE,
         )
 
+    def legacy_graph_fact_migration(
+        self,
+        *,
+        compatibility_read_enabled: bool = False,
+        index_invalidator=None,
+    ):
+        """Return the explicit, agent-bound #2752 legacy fact migrator.
+
+        The caller cannot supply an arbitrary tenant.  The returned service
+        uses this already-authenticated storage's assertion authority and the
+        graph ownership ledger, then routes every accepted proposal through
+        :meth:`put_validated_assertion`.
+        """
+        from .legacy_fact_migration import LegacyGraphFactMigration
+
+        return LegacyGraphFactMigration(
+            self,
+            compatibility_read_enabled=compatibility_read_enabled,
+            index_invalidator=index_invalidator,
+        )
+
     async def put_assertion(self, assertion, *, source_occurrences=(), operation_id: Optional[str] = None):
         """Govern canonical ingestion and return its required SHACL report.
 

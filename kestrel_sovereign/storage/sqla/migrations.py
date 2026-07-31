@@ -2001,3 +2001,60 @@ async def migrate_canonical_session_ids(db: "AsyncDatabase") -> None:
             "from integer keys to marker UUIDs.",
             rewritten_history, remapped_titles,
         )
+
+
+async def migrate_legacy_graph_fact_migration_state(db: "AsyncDatabase") -> None:
+    """Install #2752's additive, tenant-scoped operator-run bookkeeping.
+
+    This deliberately creates no data migration and does not inspect or alter
+    ``graph_nodes``.  It is shared DDL for SQLite/PostgreSQL; the actual
+    migration remains an explicit call on agent-bound storage.
+    """
+    async with db.transaction():
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS legacy_fact_migration_records ("
+            "tenant_id TEXT NOT NULL, node_id TEXT NOT NULL, "
+            "content_hash TEXT NOT NULL, source_occurrence_id TEXT, "
+            "assertion_id TEXT, revision_id TEXT, outcome TEXT NOT NULL, "
+            "created_at TIMESTAMP NOT NULL, "
+            "PRIMARY KEY (tenant_id, node_id))",
+            (),
+        )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS legacy_fact_migration_checkpoints ("
+            "tenant_id TEXT NOT NULL, migration_name TEXT NOT NULL, "
+            "last_node_id TEXT, state TEXT NOT NULL, updated_at TIMESTAMP NOT NULL, "
+            "PRIMARY KEY (tenant_id, migration_name))",
+            (),
+        )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS legacy_fact_migration_invalidations ("
+            "tenant_id TEXT NOT NULL, migration_name TEXT NOT NULL, "
+            "assertion_id TEXT NOT NULL, state TEXT NOT NULL, "
+            "generation INTEGER NOT NULL DEFAULT 1, "
+            "created_at TIMESTAMP NOT NULL, delivered_at TIMESTAMP, "
+            "PRIMARY KEY (tenant_id, migration_name, assertion_id))",
+            (),
+        )
+        if db.backend_type == "postgres":
+            generation_column = await db.fetchone(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'legacy_fact_migration_invalidations' "
+                "AND column_name = 'generation'",
+                (),
+            )
+        else:
+            columns = await db.fetchall(
+                "PRAGMA table_info(legacy_fact_migration_invalidations)", ()
+            )
+            generation_column = next(
+                (column for column in columns if str(column[1]) == "generation"),
+                None,
+            )
+        if generation_column is None:
+            await db.execute(
+                "ALTER TABLE legacy_fact_migration_invalidations "
+                "ADD COLUMN generation INTEGER NOT NULL DEFAULT 1",
+                (),
+            )
