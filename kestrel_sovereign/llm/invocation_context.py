@@ -169,6 +169,25 @@ class LLMInvocationContextState:
             self._ambient.reset(token)
 
 
+# Preserve the short-lived module API introduced with #2510 for callers that
+# use this helper directly.  LLMService deliberately never touches this state:
+# every service supplies its own ``ambient=...`` snapshot below.
+#
+# Retained through the dead-code sweep: no caller of ``set_ambient_invocation_context``
+# exists in this tree, the sibling repos, or the installed feature/channel/llm/SDK
+# packages, so this state is empty in every observable configuration. It stays
+# because the comment above declares it public for *direct* callers and this is a
+# published library — retiring a declared-public helper is an API decision, not a
+# dead-code cleanup, and belongs in its own change.
+_COMPATIBILITY_INVOCATION_CONTEXT_STATE = LLMInvocationContextState()
+
+
+def set_ambient_invocation_context(context: LLMInvocationContext) -> None:
+    """Set the standalone compatibility context for the current async task."""
+
+    _COMPATIBILITY_INVOCATION_CONTEXT_STATE.set(context)
+
+
 def _first_defined(*values: Optional[str]) -> Optional[str]:
     """Return the first value supplied, preserving explicit empty strings."""
 
@@ -189,9 +208,11 @@ def resolve_invocation_context(
     """
 
     explicit = context if context is not None else LLMInvocationContext()
-    # LLMService always supplies its own ``ambient=...`` snapshot; a caller that
-    # omits one contributes no ambient identity of its own.
-    ambient = ambient if ambient is not None else _EMPTY_INVOCATION_CONTEXT
+    ambient = (
+        ambient
+        if ambient is not None
+        else _COMPATIBILITY_INVOCATION_CONTEXT_STATE.get()
+    )
     return LLMInvocationContext(
         session_id=_first_defined(
             session_id,
