@@ -48,17 +48,25 @@ measurement, the execution authority creates an opaque artifact reference and
 signs the exact run digest with Ed25519.
 
 Only an operator-owned public-key allowlist can verify that signature during
-`assemble`. A signed record without `--trust-policy` is rejected; a key from a
-caller-supplied report is not trusted merely because it appears in that report.
-External Parametric Self evidence is imported only as independently signed
-`external_ci` evidence. Its key may attest only the catalog's `external_ci`
-runner; it cannot substitute for a local pytest, benchmark, or Kite runner.
+`assemble`. The CLI has no trust-policy argument: its launching CI or service
+manager must set `KESTREL_SEMANTIC_RELEASE_TRUST_POLICY_PATH` to an **absolute**
+operator-controlled policy path and
+`KESTREL_SEMANTIC_RELEASE_TRUST_POLICY_SHA256` to that file's lowercase
+SHA-256. `assemble` reads the bytes once and rejects a missing or mismatched
+pin before parsing keys. These protected process settings, rather than a
+report or caller argument, are the verifier root. External Parametric Self
+evidence is imported only as independently signed `external_ci` evidence. Its
+key may attest only the catalog's `external_ci` runner; a `catalog_runner` key
+cannot attest that runner, and neither source can substitute for the other.
 
 At present, the built-in executable workload is
 `registry/stable_only_capability_selection_v1`. Other named pytest, benchmark,
 and Kite HTTP workloads remain explicitly `blocked` with
 `catalog_workload_unavailable` until their production harnesses are registered.
-They cannot become passes through artifact JSON.
+`run` writes that content-free block but exits nonzero so automation cannot
+mistake an unavailable workload for successful execution; use the explicit
+`block` command to record an independently observed block. They cannot become
+passes through artifact JSON.
 
 Start with a fresh conservative template:
 
@@ -70,7 +78,9 @@ uv run python -m kestrel_sovereign.knowledge.release_evidence template \
 For example, a protected CI signing key can run the currently registered
 stable-only registry workload. The key file contains raw 32-byte
 lowercase-hex Ed25519 private-key material and must stay in the CI/host secret
-store rather than source control or a command-line value.
+store rather than source control or a command-line value. It must be a regular
+file owned by the effective CI user, with no group or other permission bits;
+symlinks are rejected.
 
 ```bash
 uv run python -m kestrel_sovereign.knowledge.release_evidence run \
@@ -82,14 +92,20 @@ uv run python -m kestrel_sovereign.knowledge.release_evidence run \
 
 uv run python -m kestrel_sovereign.knowledge.release_evidence assemble \
   --record /tmp/stable-only-registry.json \
-  --trust-policy /secure/semantic-release-trust-policy.json \
   --output /tmp/semantic-release-evidence.json
 ```
 
 The trust policy stores public information only. Each key fixes an issuer/key
 ID, `catalog_runner` or `external_ci` source, raw Ed25519 public key, and
-allowed runner IDs. It is operator configuration, not an attachment supplied
-by a record:
+allowed runner IDs. Configure its absolute path and SHA-256 pin in the CI or
+service manager environment before invoking `assemble`; do not forward either
+value from a report-producing job. It is operator configuration, not an
+attachment supplied by a record:
+
+```text
+KESTREL_SEMANTIC_RELEASE_TRUST_POLICY_PATH=/secure/semantic-release-trust-policy.json
+KESTREL_SEMANTIC_RELEASE_TRUST_POLICY_SHA256=<sha256-of-the-exact-policy-file-bytes>
+```
 
 ```json
 {
@@ -106,11 +122,12 @@ by a record:
 Safe references are deliberately narrow: exactly
 `ci://sha256/<64-lowercase-hex>`, `artifact://sha256/<64-lowercase-hex>`, or
 `evidence://sha256/<64-lowercase-hex>`, alongside the artifact's SHA-256
-digest. The locator is opaque—not a path, label, subject, user, or secret—and
-both the exact locator and digest are bound into the run digest. URLs with
-query strings, identity-bearing parts, secret-like labels, traversal segments,
-or connection strings are rejected. A blocked gate has no fake artifact
-payload:
+digest; the SHA-256 component embedded in the locator must exactly equal
+`artifact_digest`. The locator is opaque—not a path, label, subject, user, or
+secret—and both the exact locator and digest are bound into the run digest.
+URLs with query strings, identity-bearing parts, secret-like labels, traversal
+segments, or connection strings are rejected. A blocked gate has no fake
+artifact payload:
 
 ```bash
 uv run python -m kestrel_sovereign.knowledge.release_evidence block \
@@ -183,7 +200,6 @@ uv run python -m kestrel_sovereign.knowledge.release_evidence run \
 uv run python -m kestrel_sovereign.knowledge.release_evidence assemble \
   --record /tmp/hybrid-recall-sqlite-record.json \
   --budget /tmp/hybrid-recall-sqlite-budget.json \
-  --trust-policy /secure/semantic-release-trust-policy.json \
   --output /tmp/semantic-release-evidence.json
 ```
 
@@ -225,7 +241,6 @@ uv run python -m kestrel_sovereign.knowledge.release_evidence assemble \
   --record /tmp/external-candidate-invalidated.json \
   --record /tmp/external-served-eligibility-rejected.json \
   --external-report /tmp/parametric-self-erasure-report.json \
-  --trust-policy /secure/semantic-release-trust-policy.json \
   --output /tmp/semantic-release-evidence.json
 ```
 

@@ -191,6 +191,10 @@ class ArtifactReference:
         if any(character in self.artifact_ref for character in ("?", "#", "@", "%")):
             raise ReleaseEvidenceError("artifact reference cannot contain query, fragment, userinfo, or escapes")
         _require_digest(self.artifact_digest, "artifact_digest")
+        if self.artifact_ref.rsplit("/", 1)[1] != self.artifact_digest:
+            raise ReleaseEvidenceError(
+                "artifact reference SHA-256 component must match artifact_digest"
+            )
 
     def to_mapping(self) -> dict[str, str]:
         return {

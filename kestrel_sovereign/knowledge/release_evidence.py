@@ -11,10 +11,13 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
+import hashlib
 from importlib import metadata
 import json
+import os
 from pathlib import Path
 import platform
+import re
 from typing import cast
 
 from .registry import ExperimentalCapabilityError, SemanticKnowledgeRegistry, StandardsMaturity, get_knowledge_registry
@@ -63,6 +66,9 @@ _EXTERNAL_ADAPTER_GATE_IDS = (
     "external_candidate_invalidated",
     "external_served_eligibility_rejected",
 )
+_OPERATOR_TRUST_POLICY_PATH_ENV = "KESTREL_SEMANTIC_RELEASE_TRUST_POLICY_PATH"
+_OPERATOR_TRUST_POLICY_SHA256_ENV = "KESTREL_SEMANTIC_RELEASE_TRUST_POLICY_SHA256"
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _fixture_binding(fixture_id: str) -> FixtureBinding:
@@ -758,6 +764,43 @@ def trusted_execution_policy_from_mapping(value: Mapping[str, object]) -> Truste
             )
         )
     return TrustedExecutionPolicy(tuple(keys))
+
+
+def operator_trusted_execution_policy() -> TrustedExecutionPolicy:
+    """Load the release verifier root selected by the process operator.
+
+    The public assembly CLI intentionally has no policy-file argument.  The
+    supervisor that launches it must set both the absolute policy path and a
+    SHA-256 pin in protected Kestrel configuration/environment.  Reading and
+    hashing the bytes once prevents a report author from redirecting assembly
+    to a self-authored public-key allowlist or from swapping its contents.
+    """
+    policy_path_value = os.environ.get(_OPERATOR_TRUST_POLICY_PATH_ENV)
+    expected_digest = os.environ.get(_OPERATOR_TRUST_POLICY_SHA256_ENV)
+    if not policy_path_value or not expected_digest:
+        raise ReleaseEvidenceError(
+            "operator trusted execution policy is not configured; set "
+            f"{_OPERATOR_TRUST_POLICY_PATH_ENV} and "
+            f"{_OPERATOR_TRUST_POLICY_SHA256_ENV}"
+        )
+    if not _SHA256_HEX_RE.fullmatch(expected_digest):
+        raise ReleaseEvidenceError(
+            "operator trusted execution policy SHA-256 pin must be lowercase hexadecimal"
+        )
+    policy_path = Path(policy_path_value)
+    if not policy_path.is_absolute():
+        raise ReleaseEvidenceError("operator trusted execution policy path must be absolute")
+    try:
+        policy_bytes = policy_path.read_bytes()
+    except OSError as error:
+        raise ReleaseEvidenceError("operator trusted execution policy cannot be read") from error
+    if hashlib.sha256(policy_bytes).hexdigest() != expected_digest:
+        raise ReleaseEvidenceError("operator trusted execution policy does not match its SHA-256 pin")
+    try:
+        policy_value = json.loads(policy_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReleaseEvidenceError("operator trusted execution policy is not valid UTF-8 JSON") from error
+    return trusted_execution_policy_from_mapping(_expect_mapping(policy_value, "trusted execution policy"))
 
 
 def evidence_record_from_mapping(value: Mapping[str, object]) -> EvidenceRecord:

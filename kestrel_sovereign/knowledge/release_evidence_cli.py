@@ -17,6 +17,7 @@ import sys
 
 from .release_evidence import (
     ArtifactReference,
+    EvidenceRecord,
     EvidenceState,
     ReleaseEvidenceError,
     TelemetryAttestation,
@@ -26,11 +27,11 @@ from .release_evidence import (
     apply_performance_budgets,
     evidence_record_from_mapping,
     external_capability_report_from_mapping,
+    operator_trusted_execution_policy,
     performance_budget_from_mapping,
     release_evidence_template,
     release_gate_specs,
     telemetry_attestation_from_mapping,
-    trusted_execution_policy_from_mapping,
     write_evidence_record,
     write_performance_budget,
     write_release_evidence,
@@ -123,14 +124,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     telemetry.add_argument("--output", type=Path, required=True)
     telemetry.add_argument("--overwrite", action="store_true")
 
-    assemble = subparsers.add_parser("assemble", help="apply only catalog-bound records")
+    assemble = subparsers.add_parser("assemble", help="apply only verified catalog-bound records")
     assemble.add_argument("--record", type=Path, action="append", default=[])
     assemble.add_argument("--budget", type=Path, action="append", default=[])
-    assemble.add_argument(
-        "--trust-policy",
-        type=Path,
-        help="operator-owned JSON allowlist of Ed25519 public keys for passed records/budgets",
-    )
     assemble.add_argument(
         "--retirement-telemetry",
         type=Path,
@@ -178,6 +174,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "semantic catalog workload recorded: "
                 f"{args.output} ({execution.record.gate_id}={execution.record.state.value})"
             )
+            if execution.record.state is EvidenceState.BLOCKED:
+                # The explicit ``block`` command remains available when an
+                # operator intentionally records an observed block.  ``run``
+                # instead reports an unavailable/failed catalog workload to
+                # automation through a nonzero status after preserving its
+                # content-free blocked artifact.
+                return 2 if execution.record.reason_code == "catalog_workload_unavailable" else 1
             return 0
         if args.command == "block":
             # Look up the gate so a typo cannot become a disconnected block file.
@@ -219,11 +222,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             performance_budget_from_mapping(json.loads(path.read_text(encoding="utf-8")))
             for path in args.budget
         )
-        policy = None
-        if args.trust_policy is not None:
-            policy = trusted_execution_policy_from_mapping(
-                json.loads(args.trust_policy.read_text(encoding="utf-8"))
-            )
+        policy = (
+            operator_trusted_execution_policy()
+            if budgets
+            or any(record.state in {EvidenceState.PASSED, EvidenceState.FAILED} for record in records)
+            else None
+        )
         evidence = apply_evidence_records(
             release_evidence_template(), records, trust_policy=policy
         )

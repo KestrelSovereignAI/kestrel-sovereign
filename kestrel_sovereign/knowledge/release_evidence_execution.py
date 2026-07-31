@@ -17,7 +17,9 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+import os
 from pathlib import Path
+import stat
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -110,9 +112,12 @@ class CatalogSigningIdentity:
     ) -> "CatalogSigningIdentity":
         """Load a raw 32-byte lowercase-hex Ed25519 key from a protected file."""
         try:
-            material = path.read_text(encoding="utf-8").strip()
+            material = _read_protected_private_key_file(path).decode("ascii").strip()
+        except UnicodeDecodeError as error:
+            raise ReleaseEvidenceError("signing key file must contain raw lowercase-hex Ed25519 bytes") from error
+        try:
             private_bytes = bytes.fromhex(material)
-        except (OSError, ValueError) as error:
+        except ValueError as error:
             raise ReleaseEvidenceError("signing key file must contain raw lowercase-hex Ed25519 bytes") from error
         if len(private_bytes) != 32 or material != private_bytes.hex():
             raise ReleaseEvidenceError("signing key file must contain 32 lowercase-hex Ed25519 bytes")
@@ -122,7 +127,6 @@ class CatalogSigningIdentity:
             private_key=Ed25519PrivateKey.from_private_bytes(private_bytes),
             source=source,
         )
-
     @property
     def public_key(self) -> str:
         return self.private_key.public_key().public_bytes(
@@ -162,6 +166,52 @@ class CatalogSigningIdentity:
             key_id=self.key_id,
             source=self.source,
             signature=self.private_key.sign(payload).hex(),
+        )
+
+
+def _read_protected_private_key_file(path: Path) -> bytes:
+    """Read a private key only from a regular, owner-only file.
+
+    The private key is a CI/host secret.  Checking the path with ``lstat`` and
+    the opened descriptor with ``fstat`` rejects symlinks and a replacement
+    race between validation and read.
+    """
+    try:
+        initial = path.lstat()
+    except OSError as error:
+        raise ReleaseEvidenceError("signing key file cannot be inspected") from error
+    _validate_private_key_file_stat(initial)
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ReleaseEvidenceError("signing key file cannot be securely opened") from error
+    try:
+        opened = os.fstat(descriptor)
+        _validate_private_key_file_stat(opened)
+        if (opened.st_dev, opened.st_ino) != (initial.st_dev, initial.st_ino):
+            raise ReleaseEvidenceError("signing key file changed while being opened")
+        with os.fdopen(descriptor, "rb") as key_file:
+            descriptor = -1
+            return key_file.read()
+    except OSError as error:
+        raise ReleaseEvidenceError("signing key file cannot be securely read") from error
+    finally:
+        if descriptor != -1:
+            os.close(descriptor)
+
+
+def _validate_private_key_file_stat(file_stat: os.stat_result) -> None:
+    if stat.S_ISLNK(file_stat.st_mode):
+        raise ReleaseEvidenceError("signing key file must not be a symlink")
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise ReleaseEvidenceError("signing key file must be a regular file")
+    if file_stat.st_uid != os.geteuid():
+        raise ReleaseEvidenceError("signing key file must be owned by the effective user")
+    if file_stat.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise ReleaseEvidenceError(
+            "signing key file must not grant group or other permissions"
         )
 
 

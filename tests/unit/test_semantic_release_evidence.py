@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import replace
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -72,11 +73,16 @@ def _observation(spec) -> dict[str, object]:
 
 
 def _artifact(name: str = "result") -> ArtifactReference:
-    return ArtifactReference(_opaque_artifact_ref(name), "a" * 64)
+    digest = _opaque_artifact_digest(name)
+    return ArtifactReference(f"ci://sha256/{digest}", digest)
+
+
+def _opaque_artifact_digest(name: str) -> str:
+    return hashlib.sha256(name.encode("utf-8")).hexdigest()
 
 
 def _opaque_artifact_ref(name: str) -> str:
-    return f"ci://sha256/{hashlib.sha256(name.encode('utf-8')).hexdigest()}"
+    return f"ci://sha256/{_opaque_artifact_digest(name)}"
 
 
 _CATALOG_TEST_IDENTITY = CatalogSigningIdentity(
@@ -111,10 +117,15 @@ def _test_policy() -> TrustedExecutionPolicy:
     )
 
 
-def _record(spec, *, observation: dict[str, object] | None = None):
+def _record(
+    spec,
+    *,
+    observation: dict[str, object] | None = None,
+    identity: CatalogSigningIdentity | None = None,
+):
     observed = observation or _observation(spec)
     artifact = _artifact(spec.gate_id)
-    identity = (
+    selected_identity = identity or (
         _EXTERNAL_TEST_IDENTITY
         if spec.runner.runner_id == "external_ci"
         else _CATALOG_TEST_IDENTITY
@@ -130,7 +141,7 @@ def _record(spec, *, observation: dict[str, object] | None = None):
         observed,
         artifact,
         state=EvidenceState.PASSED,
-        execution_attestation=identity.sign(
+        execution_attestation=selected_identity.sign(
             kind="evidence_record", spec=spec, run_digest=run_digest
         ),
     )
@@ -458,6 +469,11 @@ def test_reviewer_adversarial_artifact_references_reject_secrets_and_identity(re
         ArtifactReference(reference, "a" * 64)
 
 
+def test_reviewer_adversarial_artifact_reference_digest_must_match_its_locator() -> None:
+    with pytest.raises(ReleaseEvidenceError, match="must match artifact_digest"):
+        ArtifactReference(_opaque_artifact_ref("record"), _opaque_artifact_digest("other"))
+
+
 def test_reviewer_adversarial_run_digest_binds_the_complete_opaque_artifact_reference() -> None:
     spec = _gate("rdf11_projection_fixture")
     record = _record(spec)
@@ -466,13 +482,24 @@ def test_reviewer_adversarial_run_digest_binds_the_complete_opaque_artifact_refe
     with pytest.raises(ReleaseEvidenceError, match="run digest"):
         _gate_result(
             spec,
-            replace(record, artifact=ArtifactReference(_opaque_artifact_ref("other"), record.artifact.artifact_digest)),
+            replace(
+                record,
+                artifact=ArtifactReference(
+                    _opaque_artifact_ref("other"), _opaque_artifact_digest("other")
+                ),
+            ),
         )
 
     benchmark = _performance_spec(PerformanceMetric.HYBRID_RECALL, "sqlite")
     budget = _budget(benchmark)
     with pytest.raises(ReleaseEvidenceError, match="run digest"):
-        replace(budget, artifact=ArtifactReference(_opaque_artifact_ref("other-benchmark"), "a" * 64))
+        replace(
+            budget,
+            artifact=ArtifactReference(
+                _opaque_artifact_ref("other-benchmark"),
+                _opaque_artifact_digest("other-benchmark"),
+            ),
+        )
 
 
 def _performance_spec(metric: PerformanceMetric, backend: str):
@@ -592,7 +619,7 @@ def _telemetry_command(output: Path) -> list[str]:
         "--artifact-ref",
         _opaque_artifact_ref("retirement-telemetry"),
         "--artifact-digest",
-        "e" * 64,
+        _opaque_artifact_digest("retirement-telemetry"),
         "--output",
         str(output),
     ]
@@ -618,6 +645,19 @@ def _write_policy(
         json.dumps({"keys": keys}),
         encoding="utf-8",
     )
+
+
+def _configure_operator_policy(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
+    monkeypatch.setenv("KESTREL_SEMANTIC_RELEASE_TRUST_POLICY_PATH", str(path))
+    monkeypatch.setenv(
+        "KESTREL_SEMANTIC_RELEASE_TRUST_POLICY_SHA256",
+        hashlib.sha256(path.read_bytes()).hexdigest(),
+    )
+
+
+def _write_private_key(path: Path, key_bytes: bytes) -> None:
+    path.write_text(key_bytes.hex(), encoding="utf-8")
+    path.chmod(0o600)
 
 
 def test_direct_attest_and_public_record_refuse_fabricated_observations(tmp_path: Path) -> None:
@@ -659,11 +699,68 @@ def test_verified_execution_attestation_rejects_signature_tampering() -> None:
         )
 
 
-def test_cli_run_executes_an_allowlisted_registry_workload_and_assemble_verifies_it(tmp_path: Path) -> None:
+def test_trusted_execution_policy_keeps_core_and_external_runner_scopes_separate() -> None:
+    core_record = _record(
+        _gate("rdf11_projection_fixture"), identity=_EXTERNAL_TEST_IDENTITY
+    )
+    external_record = _record(
+        _gate("external_corpus_consumed"), identity=_CATALOG_TEST_IDENTITY
+    )
+
+    with pytest.raises(ReleaseEvidenceError, match="runner is not allowed"):
+        _apply_records(release_evidence_template(), (core_record,))
+    with pytest.raises(ReleaseEvidenceError, match="runner is not allowed"):
+        _apply_records(release_evidence_template(), (external_record,))
+
+
+def test_catalog_signing_key_loader_requires_a_regular_owner_only_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key_bytes = b"\x02" * 32
+    key_file = tmp_path / "signing.key"
+    _write_private_key(key_file, key_bytes)
+
+    identity = CatalogSigningIdentity.from_private_key_file(
+        key_file,
+        issuer_id="local_ci",
+        key_id="registry_runner",
+    )
+    assert identity.public_key
+
+    key_file.chmod(0o644)
+    with pytest.raises(ReleaseEvidenceError, match="group or other permissions"):
+        CatalogSigningIdentity.from_private_key_file(
+            key_file,
+            issuer_id="local_ci",
+            key_id="registry_runner",
+        )
+
+    key_file.chmod(0o600)
+    symlink = tmp_path / "signing-link.key"
+    symlink.symlink_to(key_file)
+    with pytest.raises(ReleaseEvidenceError, match="must not be a symlink"):
+        CatalogSigningIdentity.from_private_key_file(
+            symlink,
+            issuer_id="local_ci",
+            key_id="registry_runner",
+        )
+
+    monkeypatch.setattr(os, "geteuid", lambda: key_file.stat().st_uid + 1)
+    with pytest.raises(ReleaseEvidenceError, match="owned by the effective user"):
+        CatalogSigningIdentity.from_private_key_file(
+            key_file,
+            issuer_id="local_ci",
+            key_id="registry_runner",
+        )
+
+
+def test_cli_run_executes_an_allowlisted_registry_workload_and_assemble_verifies_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     spec = _gate("stable_only_capability_selection")
     key_bytes = b"\x02" * 32
     key_file = tmp_path / "signing.key"
-    key_file.write_text(key_bytes.hex(), encoding="utf-8")
+    _write_private_key(key_file, key_bytes)
     identity = CatalogSigningIdentity(
         issuer_id="local_ci",
         key_id="registry_runner",
@@ -673,6 +770,7 @@ def test_cli_run_executes_an_allowlisted_registry_workload_and_assemble_verifies
     policy = tmp_path / "policy.json"
     report = tmp_path / "report.json"
     _write_policy(policy, identity, ("registry",))
+    _configure_operator_policy(monkeypatch, policy)
 
     recorded = _cli(
         "run",
@@ -691,8 +789,6 @@ def test_cli_run_executes_an_allowlisted_registry_workload_and_assemble_verifies
         "assemble",
         "--record",
         str(record),
-        "--trust-policy",
-        str(policy),
         "--output",
         str(report),
     )
@@ -708,7 +804,7 @@ def test_cli_run_executes_an_allowlisted_registry_workload_and_assemble_verifies
 def test_cli_run_blocks_an_unregistered_catalog_workload(tmp_path: Path) -> None:
     spec = _gate("rdf11_projection_fixture")
     key_file = tmp_path / "signing.key"
-    key_file.write_text((b"\x03" * 32).hex(), encoding="utf-8")
+    _write_private_key(key_file, b"\x03" * 32)
     record = tmp_path / "record.json"
 
     result = _cli(
@@ -725,18 +821,39 @@ def test_cli_run_blocks_an_unregistered_catalog_workload(tmp_path: Path) -> None
         str(record),
     )
 
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == 2, result.stderr
     payload = json.loads(record.read_text(encoding="utf-8"))
     assert payload["state"] == "blocked"
     assert payload["reason_code"] == "catalog_workload_unavailable"
     assert payload["execution_attestation"] is None
 
 
-def test_cli_assemble_refuses_signed_record_without_operator_policy(tmp_path: Path) -> None:
+def test_cli_block_explicitly_records_an_observed_block_with_success_status(tmp_path: Path) -> None:
+    output = tmp_path / "blocked.json"
+
+    result = _cli(
+        "block",
+        "--gate",
+        "rdf11_projection_fixture",
+        "--reason-code",
+        "fixture_service_unavailable",
+        "--output",
+        str(output),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(output.read_text(encoding="utf-8"))["state"] == "blocked"
+
+
+def test_cli_assemble_refuses_signed_record_without_operator_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     spec = _gate("rdf11_projection_fixture")
     record = tmp_path / "record.json"
     output = tmp_path / "report.json"
     _write_record(record, _record(spec))
+    monkeypatch.delenv("KESTREL_SEMANTIC_RELEASE_TRUST_POLICY_PATH", raising=False)
+    monkeypatch.delenv("KESTREL_SEMANTIC_RELEASE_TRUST_POLICY_SHA256", raising=False)
 
     result = _cli("assemble", "--record", str(record), "--output", str(output))
 
@@ -745,7 +862,65 @@ def test_cli_assemble_refuses_signed_record_without_operator_policy(tmp_path: Pa
     assert "trusted execution policy" in result.stderr
 
 
-def test_cli_assemble_rejects_tampered_record_environment(tmp_path: Path) -> None:
+def test_cli_assemble_cannot_self_authorize_a_forged_policy_or_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = _gate("rdf11_projection_fixture")
+    operator_policy = tmp_path / "operator-policy.json"
+    _write_policy(operator_policy, _CATALOG_TEST_IDENTITY, ("pytest",))
+    _configure_operator_policy(monkeypatch, operator_policy)
+
+    forged_identity = CatalogSigningIdentity(
+        issuer_id="forged_ci",
+        key_id="forged_key",
+        private_key=Ed25519PrivateKey.from_private_bytes(b"\x06" * 32),
+    )
+    forged_record = tmp_path / "forged-record.json"
+    forged_policy = tmp_path / "forged-policy.json"
+    output = tmp_path / "report.json"
+    _write_record(forged_record, _record(spec, identity=forged_identity))
+    _write_policy(forged_policy, forged_identity, ("pytest",))
+
+    caller_selected_policy = _cli(
+        "assemble",
+        "--record",
+        str(forged_record),
+        "--trust-policy",
+        str(forged_policy),
+        "--output",
+        str(output),
+    )
+    assert caller_selected_policy.returncode != 0
+    assert "unrecognized arguments" in caller_selected_policy.stderr
+    assert not output.exists()
+
+    configured_root = _cli(
+        "assemble",
+        "--record",
+        str(forged_record),
+        "--output",
+        str(output),
+    )
+    assert configured_root.returncode == 1
+    assert "issuer/key is not trusted" in configured_root.stderr
+    assert not output.exists()
+
+    _write_policy(operator_policy, forged_identity, ("pytest",))
+    swapped_policy = _cli(
+        "assemble",
+        "--record",
+        str(forged_record),
+        "--output",
+        str(output),
+    )
+    assert swapped_policy.returncode == 1
+    assert "does not match its SHA-256 pin" in swapped_policy.stderr
+    assert not output.exists()
+
+
+def test_cli_assemble_rejects_tampered_record_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     spec = _gate("rdf11_projection_fixture")
     record = tmp_path / "record.json"
     tampered = tmp_path / "tampered.json"
@@ -753,6 +928,7 @@ def test_cli_assemble_rejects_tampered_record_environment(tmp_path: Path) -> Non
     output = tmp_path / "report.json"
     _write_record(record, _record(spec))
     _write_policy(policy)
+    _configure_operator_policy(monkeypatch, policy)
     payload = json.loads(record.read_text(encoding="utf-8"))
     payload["environment"]["backend"] = "postgres"
     tampered.write_text(json.dumps(payload), encoding="utf-8")
@@ -761,8 +937,6 @@ def test_cli_assemble_rejects_tampered_record_environment(tmp_path: Path) -> Non
         "assemble",
         "--record",
         str(tampered),
-        "--trust-policy",
-        str(policy),
         "--output",
         str(output),
     )
@@ -772,7 +946,9 @@ def test_cli_assemble_rejects_tampered_record_environment(tmp_path: Path) -> Non
     assert "environment" in result.stderr
 
 
-def test_cli_assemble_safely_binds_retirement_and_external_adapter_attestations(tmp_path: Path) -> None:
+def test_cli_assemble_safely_binds_retirement_and_external_adapter_attestations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     migration = _gate("legacy_fact_migration_equivalence")
     external_specs = [spec for spec in release_gate_specs() if spec.category == "external_adapter"]
     records = {spec.gate_id: _record(spec) for spec in (migration, *external_specs)}
@@ -783,6 +959,7 @@ def test_cli_assemble_safely_binds_retirement_and_external_adapter_attestations(
         record_paths.append(path)
     policy = tmp_path / "policy.json"
     _write_policy(policy)
+    _configure_operator_policy(monkeypatch, policy)
 
     telemetry_path = tmp_path / "telemetry.json"
     telemetry_result = _cli(*_telemetry_command(telemetry_path))
@@ -807,7 +984,7 @@ def test_cli_assemble_safely_binds_retirement_and_external_adapter_attestations(
     report_path.write_text(json.dumps(report.to_mapping()), encoding="utf-8")
 
     output = tmp_path / "report.json"
-    arguments = ["assemble", "--trust-policy", str(policy)]
+    arguments = ["assemble"]
     for path in record_paths:
         arguments.extend(("--record", str(path)))
     arguments.extend(
@@ -830,7 +1007,9 @@ def test_cli_assemble_safely_binds_retirement_and_external_adapter_attestations(
     assert payload["ready"] is False
 
 
-def test_cli_assemble_rejects_tampered_retirement_telemetry(tmp_path: Path) -> None:
+def test_cli_assemble_rejects_tampered_retirement_telemetry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     migration = _gate("legacy_fact_migration_equivalence")
     record = tmp_path / "migration.json"
     telemetry = tmp_path / "telemetry.json"
@@ -838,6 +1017,7 @@ def test_cli_assemble_rejects_tampered_retirement_telemetry(tmp_path: Path) -> N
     output = tmp_path / "report.json"
     _write_record(record, _record(migration))
     _write_policy(policy)
+    _configure_operator_policy(monkeypatch, policy)
     assert _cli(*_telemetry_command(telemetry)).returncode == 0
     payload = json.loads(telemetry.read_text(encoding="utf-8"))
     payload["unmigrated_eligible_rows"] = 1
@@ -847,8 +1027,6 @@ def test_cli_assemble_rejects_tampered_retirement_telemetry(tmp_path: Path) -> N
         "assemble",
         "--record",
         str(record),
-        "--trust-policy",
-        str(policy),
         "--retirement-telemetry",
         str(telemetry),
         "--output",
