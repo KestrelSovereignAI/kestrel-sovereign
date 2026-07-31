@@ -3225,6 +3225,10 @@ class PrivacyEnforcingStorage:
         self._assert_semantic_assertion_read_allowed("provenance reads")
         return await self._storage.list_assertion_revision_sources(revision_id)
 
+    async def list_assertion_revision_sources_batch(self, revision_ids):
+        self._assert_semantic_assertion_read_allowed("provenance reads")
+        return await self._storage.list_assertion_revision_sources_batch(revision_ids)
+
     async def get_source_occurrence(self, source_occurrence_id):
         self._assert_semantic_assertion_read_allowed("provenance reads")
         return await self._storage.get_source_occurrence(source_occurrence_id)
@@ -3356,7 +3360,9 @@ class PrivacyEnforcingStorage:
         return await self._storage.governed_assertion_corpus_snapshot(**kwargs)
 
     async def governed_assertion_corpus_changes_since(self, snapshot, **kwargs):
-        self._assert_semantic_assertion_read_allowed("governed learning corpus")
+        self._assert_semantic_assertion_incremental_read_allowed(
+            "governed learning corpus"
+        )
         return await self._storage.governed_assertion_corpus_changes_since(
             snapshot, **kwargs
         )

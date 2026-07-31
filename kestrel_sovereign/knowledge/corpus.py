@@ -14,14 +14,15 @@ becoming trainable data.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from enum import Enum
 import hashlib
 import json
 import math
 from time import monotonic
-from typing import Mapping, Protocol, Sequence
 from types import MappingProxyType
+from typing import Mapping, Protocol, Sequence
 
 from .assertion import (
     Assertion,
@@ -30,6 +31,7 @@ from .assertion import (
     DerivedLineage,
     DirectLineage,
     EpistemicState,
+    OntologyRef,
     SourceOccurrence,
     Visibility,
 )
@@ -63,6 +65,8 @@ class CorpusEligibilityReason(str, Enum):
     GROUNDING = "grounding_disallowed"
     SOURCE = "source_class_disallowed"
     DERIVATION = "derivation_disallowed"
+    DERIVATION_INPUT = "derivation_input_ineligible"
+    ONTOLOGY = "ontology_pin_disallowed"
     VALIDATION = "validation_not_conformant"
 
 
@@ -111,6 +115,7 @@ class GovernedCorpusLimits:
     max_assertions: int = 100
     max_serialized_bytes: int = 1_000_000
     max_wall_time_seconds: float = 10.0
+    max_derivation_depth: int = 32
 
     def __post_init__(self) -> None:
         if type(self.max_assertions) is not int or not 1 <= self.max_assertions <= 999:
@@ -126,6 +131,8 @@ class GovernedCorpusLimits:
             or self.max_wall_time_seconds <= 0
         ):
             raise GovernedCorpusError("max_wall_time_seconds must be positive and finite")
+        if type(self.max_derivation_depth) is not int or not 1 <= self.max_derivation_depth <= 128:
+            raise GovernedCorpusError("max_derivation_depth must be an integer in [1, 128]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +152,8 @@ class GovernedCorpusPolicy:
     accepted_consent_references: tuple[str, ...]
     accepted_grounding_classes: tuple[str, ...]
     accepted_source_kinds: tuple[str, ...]
+    accepted_ontology_pins: tuple[OntologyRef, ...]
+    accepted_semantic_capability_versions: tuple[tuple[str, str], ...]
     allow_inferred: bool = False
     accepted_derivation_profiles: tuple[str, ...] = ()
 
@@ -161,6 +170,32 @@ class GovernedCorpusPolicy:
             raise GovernedCorpusError("accepted_visibility must be a non-empty set")
         if type(self.allow_inferred) is not bool:
             raise GovernedCorpusError("allow_inferred must be a boolean")
+        ontology_pins = tuple(self.accepted_ontology_pins)
+        if not ontology_pins or any(
+            not isinstance(item, OntologyRef) for item in ontology_pins
+        ):
+            raise GovernedCorpusError(
+                "accepted_ontology_pins must contain OntologyRef values"
+            )
+        if len(set(ontology_pins)) != len(ontology_pins):
+            raise GovernedCorpusError("accepted_ontology_pins must not contain duplicates")
+        capability_pairs = tuple(self.accepted_semantic_capability_versions)
+        if not capability_pairs or any(
+            not isinstance(item, tuple)
+            or len(item) != 2
+            or not isinstance(item[0], str)
+            or not item[0]
+            or not isinstance(item[1], str)
+            or not item[1]
+            for item in capability_pairs
+        ):
+            raise GovernedCorpusError(
+                "accepted_semantic_capability_versions must contain non-empty string pairs"
+            )
+        if len({key for key, _ in capability_pairs}) != len(capability_pairs):
+            raise GovernedCorpusError(
+                "accepted_semantic_capability_versions must not duplicate keys"
+            )
         profiles = self.accepted_derivation_profiles
         if self.allow_inferred and not profiles:
             raise GovernedCorpusError(
@@ -192,6 +227,26 @@ class GovernedCorpusPolicy:
             self, "accepted_derivation_profiles",
             _ordered_texts(profiles, "accepted_derivation_profiles") if profiles else (),
         )
+        object.__setattr__(
+            self,
+            "accepted_ontology_pins",
+            tuple(
+                sorted(
+                    ontology_pins,
+                    key=lambda item: (
+                        item.namespace,
+                        item.version,
+                        item.content_digest,
+                        item.compatibility_profile,
+                    ),
+                )
+            ),
+        )
+        object.__setattr__(
+            self,
+            "accepted_semantic_capability_versions",
+            tuple(sorted(capability_pairs)),
+        )
 
     def to_mapping(self) -> dict[str, object]:
         return {
@@ -204,6 +259,13 @@ class GovernedCorpusPolicy:
             "accepted_consent_references": list(self.accepted_consent_references),
             "accepted_grounding_classes": list(self.accepted_grounding_classes),
             "accepted_source_kinds": list(self.accepted_source_kinds),
+            "accepted_ontology_pins": [
+                item.to_mapping() for item in self.accepted_ontology_pins
+            ],
+            "accepted_semantic_capability_versions": [
+                {"name": name, "version": version}
+                for name, version in self.accepted_semantic_capability_versions
+            ],
             "allow_inferred": self.allow_inferred,
             "accepted_derivation_profiles": list(self.accepted_derivation_profiles),
         }
@@ -331,12 +393,20 @@ class GovernedCorpusTombstone:
 class GovernedCorpusDelta:
     """Incremental additions and invalidations after an immutable snapshot."""
 
-    since_generation: int
-    checkpoint_generation: int
+    since_checkpoint: CorpusCheckpoint
+    checkpoint: CorpusCheckpoint
     additions: tuple[GovernedCorpusExample, ...]
     tombstones: tuple[GovernedCorpusTombstone, ...]
     snapshot_hash: str
     observability: GovernedCorpusObservability
+
+    @property
+    def since_generation(self) -> int:
+        return self.since_checkpoint.generation
+
+    @property
+    def checkpoint_generation(self) -> int:
+        return self.checkpoint.generation
 
 
 class GovernedCorpusStorage(Protocol):
@@ -348,7 +418,11 @@ class GovernedCorpusStorage(Protocol):
 
     async def assertion_inference_inputs(self, query: AssertionQuery | None = None) -> list[Assertion]: ...
 
+    async def get_derivation_inputs(self, revision_id: str) -> list[Assertion]: ...
+
     async def list_assertion_revision_sources(self, revision_id: str) -> list[SourceOccurrence]: ...
+
+    async def list_assertion_revision_sources_batch(self, revision_ids: Sequence[str]) -> Mapping[str, Sequence[SourceOccurrence]]: ...
 
     async def assertion_validation_statuses(self, assertion_ids: Sequence[str]) -> Mapping[str, CorpusValidationStatus]: ...
 
@@ -374,10 +448,37 @@ class GovernedAssertionCorpusService:
         prior_verified_snapshot: GovernedCorpusSnapshot | None = None,
         allow_prior_verified_snapshot: bool = False,
     ) -> GovernedCorpusSnapshot:
-        if not isinstance(policy, GovernedCorpusPolicy):
-            raise GovernedCorpusError("policy must be GovernedCorpusPolicy")
         if not isinstance(limits, GovernedCorpusLimits):
             raise GovernedCorpusError("limits must be GovernedCorpusLimits")
+        try:
+            async with asyncio.timeout(limits.max_wall_time_seconds):
+                return await self._snapshot(
+                    policy=policy,
+                    inference_profile=inference_profile,
+                    limits=limits,
+                    inference_limits=inference_limits,
+                    maintenance_limits=maintenance_limits,
+                    prior_verified_snapshot=prior_verified_snapshot,
+                    allow_prior_verified_snapshot=allow_prior_verified_snapshot,
+                )
+        except TimeoutError as error:
+            raise GovernedCorpusBudgetExceeded(
+                "max_wall_time_seconds exhausted"
+            ) from error
+
+    async def _snapshot(
+        self,
+        *,
+        policy: GovernedCorpusPolicy,
+        inference_profile,
+        limits: GovernedCorpusLimits,
+        inference_limits=None,
+        maintenance_limits=None,
+        prior_verified_snapshot: GovernedCorpusSnapshot | None = None,
+        allow_prior_verified_snapshot: bool = False,
+    ) -> GovernedCorpusSnapshot:
+        if not isinstance(policy, GovernedCorpusPolicy):
+            raise GovernedCorpusError("policy must be GovernedCorpusPolicy")
         if type(allow_prior_verified_snapshot) is not bool:
             raise GovernedCorpusError("allow_prior_verified_snapshot must be a boolean")
         if prior_verified_snapshot is not None and not isinstance(
@@ -397,6 +498,12 @@ class GovernedAssertionCorpusService:
             inference_limits=inference_limits,
             maintenance_limits=maintenance_limits,
         ))
+        if capability_versions != dict(
+            policy.accepted_semantic_capability_versions
+        ):
+            raise GovernedCorpusUnavailable(
+                "semantic_capability_versions_mismatch"
+            )
         if not readiness.ready:
             # A caller-held dataclass is not host-verifiable durable evidence.
             # Do not turn an untrusted object (even one with matching hashes)
@@ -442,6 +549,33 @@ class GovernedAssertionCorpusService:
         inference_limits=None,
         maintenance_limits=None,
     ) -> GovernedCorpusDelta:
+        if not isinstance(limits, GovernedCorpusLimits):
+            raise GovernedCorpusError("limits must be GovernedCorpusLimits")
+        try:
+            async with asyncio.timeout(limits.max_wall_time_seconds):
+                return await self._changes_since(
+                    snapshot,
+                    policy=policy,
+                    inference_profile=inference_profile,
+                    limits=limits,
+                    inference_limits=inference_limits,
+                    maintenance_limits=maintenance_limits,
+                )
+        except TimeoutError as error:
+            raise GovernedCorpusBudgetExceeded(
+                "max_wall_time_seconds exhausted"
+            ) from error
+
+    async def _changes_since(
+        self,
+        snapshot: GovernedCorpusSnapshot,
+        *,
+        policy: GovernedCorpusPolicy,
+        inference_profile,
+        limits: GovernedCorpusLimits,
+        inference_limits=None,
+        maintenance_limits=None,
+    ) -> GovernedCorpusDelta:
         if not isinstance(snapshot, GovernedCorpusSnapshot):
             raise GovernedCorpusError("snapshot must be GovernedCorpusSnapshot")
         if snapshot.policy.digest != policy.digest:
@@ -461,13 +595,29 @@ class GovernedAssertionCorpusService:
         ))
         if dict(snapshot.capability_versions) != capability_versions:
             raise GovernedCorpusUnavailable("semantic_capability_versions_mismatch")
+        if capability_versions != dict(
+            policy.accepted_semantic_capability_versions
+        ):
+            raise GovernedCorpusUnavailable(
+                "semantic_capability_versions_mismatch"
+            )
+        head = await self._storage.assertion_checkpoint()
         changes = await self._storage.assertion_changes_after(
             snapshot.checkpoint,
             limit=limits.max_assertions + 1,
         )
-        current = await self._storage.assertion_checkpoint()
         if len(changes) > limits.max_assertions:
             raise GovernedCorpusBudgetExceeded("max_assertions exhausted")
+        if changes:
+            last_change = changes[-1]
+            if last_change.event_id != head.latest_event_id:
+                raise GovernedCorpusBudgetExceeded(
+                    "change page does not reach the semantic checkpoint"
+                )
+        elif not self._same_checkpoint(snapshot.checkpoint, head):
+            raise GovernedCorpusUnavailable(
+                "semantic_change_stream_did_not_reach_checkpoint"
+            )
         changed_ids = tuple(sorted({change.assertion_id for change in changes if change.eligible and change.assertion_id}))
         additions: tuple[GovernedCorpusExample, ...] = ()
         excluded: dict[str, int] = {}
@@ -484,14 +634,14 @@ class GovernedAssertionCorpusService:
                 revision_id=change.revision_id,
                 operation=change.operation,
                 generation=change.generation,
-                reason=("ineligible" if not change.eligible else "superseded"),
+                reason=self._tombstone_reason(change.operation),
             )
             for change in changes
             if not change.eligible
         )
         snapshot_hash = _digest({
             "base": snapshot.snapshot_hash,
-            "checkpoint": [current.generation, current.latest_event_id],
+            "checkpoint": [head.generation, head.latest_event_id],
             "additions": [example.content_hash for example in additions],
             "tombstones": [tombstone.__dict__ if hasattr(tombstone, "__dict__") else {
                 "event_id": tombstone.event_id, "assertion_id": tombstone.assertion_id,
@@ -502,12 +652,19 @@ class GovernedAssertionCorpusService:
         observability = GovernedCorpusObservability(
             considered=len(changes), included=len(additions), excluded=dict(sorted(excluded.items())),
             snapshot_hash=snapshot_hash, policy_digest=policy.digest,
-            checkpoint_generation=current.generation,
+            checkpoint_generation=head.generation,
         )
         final_checkpoint = await self._storage.assertion_checkpoint()
-        if not self._same_checkpoint(current, final_checkpoint):
+        if not self._same_checkpoint(head, final_checkpoint):
             raise GovernedCorpusUnavailable("semantic_checkpoint_changed_during_incremental_read")
-        return GovernedCorpusDelta(snapshot.checkpoint.generation, current.generation, additions, tombstones, snapshot_hash, observability)
+        return GovernedCorpusDelta(
+            snapshot.checkpoint,
+            CorpusCheckpoint(head.tenant_id, head.generation, head.latest_event_id),
+            additions,
+            tombstones,
+            snapshot_hash,
+            observability,
+        )
 
     async def _build_snapshot(self, *, candidates, checkpoint, capability_versions, policy, limits, started) -> GovernedCorpusSnapshot:
         examples, excluded = await self._examples(candidates, policy, limits, started)
@@ -535,18 +692,42 @@ class GovernedAssertionCorpusService:
     async def _examples(self, candidates, policy, limits, started) -> tuple[list[GovernedCorpusExample], dict[str, int]]:
         self._check_time(limits, started)
         ids = tuple(assertion.assertion_id for assertion in candidates)
-        validations = await self._storage.assertion_validation_statuses(ids)
+        validations = dict(await self._storage.assertion_validation_statuses(ids))
+        direct_revision_ids = tuple(
+            assertion.revision_id
+            for assertion in candidates
+            if isinstance(assertion.lineage, DirectLineage)
+            and self._eligibility(
+                assertion,
+                validations.get(
+                    assertion.assertion_id, CorpusValidationStatus(None, None)
+                ),
+                policy,
+            )
+            is CorpusEligibilityReason.INCLUDED
+        )
+        source_cache = await self._source_batch(direct_revision_ids)
         examples: list[GovernedCorpusExample] = []
         excluded: dict[str, int] = {}
         used_bytes = 0
+        governed_revisions: set[str] = set()
         for assertion in sorted(candidates, key=lambda item: (item.assertion_id, item.revision_id)):
             self._check_time(limits, started)
-            sources = tuple(sorted(
-                await self._storage.list_assertion_revision_sources(assertion.revision_id),
-                key=lambda item: (item.received_at.value, item.source_occurrence_id),
-            ))
-            validation = validations.get(assertion.assertion_id, CorpusValidationStatus(None, None))
-            reason = self._eligibility(assertion, sources, validation, policy)
+            validation = validations.get(
+                assertion.assertion_id, CorpusValidationStatus(None, None)
+            )
+            reason, sources = await self._govern_lineage(
+                assertion,
+                policy=policy,
+                validation=validation,
+                validation_cache=validations,
+                limits=limits,
+                started=started,
+                depth=0,
+                stack=frozenset(),
+                governed_revisions=governed_revisions,
+                source_cache=source_cache,
+            )
             if reason is not CorpusEligibilityReason.INCLUDED:
                 excluded[reason.value] = excluded.get(reason.value, 0) + 1
                 continue
@@ -565,8 +746,136 @@ class GovernedAssertionCorpusService:
             examples.append(example)
         return examples, excluded
 
+    async def _govern_lineage(
+        self,
+        assertion: Assertion,
+        *,
+        policy: GovernedCorpusPolicy,
+        validation: CorpusValidationStatus,
+        validation_cache: dict[str, CorpusValidationStatus],
+        limits: GovernedCorpusLimits,
+        started: float,
+        depth: int,
+        stack: frozenset[str],
+        governed_revisions: set[str],
+        source_cache: dict[str, tuple[SourceOccurrence, ...]],
+    ) -> tuple[CorpusEligibilityReason, tuple[SourceOccurrence, ...]]:
+        """Enforce policy recursively over exact derivation revisions."""
+        self._check_time(limits, started)
+        if depth > limits.max_derivation_depth or assertion.revision_id in stack:
+            return CorpusEligibilityReason.DERIVATION_INPUT, ()
+        governed_revisions.add(assertion.revision_id)
+        if len(governed_revisions) > limits.max_assertions:
+            raise GovernedCorpusBudgetExceeded(
+                "max_assertions exhausted by derivation traversal"
+            )
+        reason = self._eligibility(assertion, validation, policy)
+        if reason is not CorpusEligibilityReason.INCLUDED:
+            return reason, ()
+        if isinstance(assertion.lineage, DirectLineage):
+            if assertion.revision_id not in source_cache:
+                source_cache.update(await self._source_batch((assertion.revision_id,)))
+            sources = source_cache.get(assertion.revision_id, ())
+            if not sources or any(
+                source.source_kind not in policy.accepted_source_kinds
+                for source in sources
+            ):
+                return CorpusEligibilityReason.SOURCE, ()
+            return CorpusEligibilityReason.INCLUDED, sources
+
+        inputs = tuple(
+            await self._storage.get_derivation_inputs(assertion.revision_id)
+        )
+        expected_revision_ids = assertion.lineage.input_revision_ids
+        if tuple(item.revision_id for item in inputs) != expected_revision_ids:
+            return CorpusEligibilityReason.DERIVATION_INPUT, ()
+        prospective_work = governed_revisions.union(expected_revision_ids)
+        if len(prospective_work) > limits.max_assertions:
+            raise GovernedCorpusBudgetExceeded(
+                "max_assertions exhausted by derivation traversal"
+            )
+        current_inputs = await self._storage.assertion_inference_inputs(
+            AssertionQuery(
+                assertion_ids=tuple(item.assertion_id for item in inputs),
+                limit=len(inputs),
+            )
+        )
+        current_by_assertion = {
+            item.assertion_id: item.revision_id for item in current_inputs
+        }
+        if any(
+            current_by_assertion.get(item.assertion_id) != item.revision_id
+            for item in inputs
+        ):
+            return CorpusEligibilityReason.DERIVATION_INPUT, ()
+        missing_validation_ids = tuple(
+            sorted(
+                {
+                    item.assertion_id
+                    for item in inputs
+                    if item.assertion_id not in validation_cache
+                }
+            )
+        )
+        if missing_validation_ids:
+            validation_cache.update(
+                await self._storage.assertion_validation_statuses(
+                    missing_validation_ids
+                )
+            )
+        missing_direct_sources = tuple(
+            item.revision_id
+            for item in inputs
+            if isinstance(item.lineage, DirectLineage)
+            and item.revision_id not in source_cache
+            and self._eligibility(
+                item,
+                validation_cache.get(
+                    item.assertion_id, CorpusValidationStatus(None, None)
+                ),
+                policy,
+            )
+            is CorpusEligibilityReason.INCLUDED
+        )
+        if missing_direct_sources:
+            source_cache.update(await self._source_batch(missing_direct_sources))
+        transitive_sources: dict[str, SourceOccurrence] = {}
+        nested_stack = stack.union((assertion.revision_id,))
+        for item in inputs:
+            item_validation = validation_cache.get(
+                item.assertion_id, CorpusValidationStatus(None, None)
+            )
+            item_reason, item_sources = await self._govern_lineage(
+                item,
+                policy=policy,
+                validation=item_validation,
+                validation_cache=validation_cache,
+                limits=limits,
+                started=started,
+                depth=depth + 1,
+                stack=nested_stack,
+                governed_revisions=governed_revisions,
+                source_cache=source_cache,
+            )
+            if item_reason is not CorpusEligibilityReason.INCLUDED:
+                return CorpusEligibilityReason.DERIVATION_INPUT, ()
+            for source in item_sources:
+                transitive_sources[source.source_occurrence_id] = source
+        return (
+            CorpusEligibilityReason.INCLUDED,
+            tuple(
+                sorted(
+                    transitive_sources.values(),
+                    key=lambda item: (
+                        item.received_at.value,
+                        item.source_occurrence_id,
+                    ),
+                )
+            ),
+        )
+
     @staticmethod
-    def _eligibility(assertion: Assertion, sources: tuple[SourceOccurrence, ...], validation: CorpusValidationStatus, policy: GovernedCorpusPolicy) -> CorpusEligibilityReason:
+    def _eligibility(assertion: Assertion, validation: CorpusValidationStatus, policy: GovernedCorpusPolicy) -> CorpusEligibilityReason:
         if assertion.status is not AssertionStatus.ACTIVE:
             return CorpusEligibilityReason.LIFECYCLE
         if validation.state is not ValidationState.CONFORMS or validation.action not in (ValidationWriteAction.ACCEPT, ValidationWriteAction.ACCEPT_WITH_REPORT):
@@ -581,16 +890,42 @@ class GovernedAssertionCorpusService:
             return CorpusEligibilityReason.CONSENT
         if assertion.confidence_basis not in policy.accepted_grounding_classes:
             return CorpusEligibilityReason.GROUNDING
+        if assertion.ontology_version not in policy.accepted_ontology_pins:
+            return CorpusEligibilityReason.ONTOLOGY
         if isinstance(assertion.lineage, DerivedLineage):
             if not policy.allow_inferred or assertion.lineage.profile_version not in policy.accepted_derivation_profiles:
                 return CorpusEligibilityReason.DERIVATION
         elif not isinstance(assertion.lineage, DirectLineage):
             return CorpusEligibilityReason.DERIVATION
-        if not sources and isinstance(assertion.lineage, DirectLineage):
-            return CorpusEligibilityReason.SOURCE
-        if sources and any(source.source_kind not in policy.accepted_source_kinds for source in sources):
-            return CorpusEligibilityReason.SOURCE
         return CorpusEligibilityReason.INCLUDED
+
+    async def _source_batch(
+        self, revision_ids: Sequence[str]
+    ) -> dict[str, tuple[SourceOccurrence, ...]]:
+        """Load exact-revision provenance in one tenant-bound host call."""
+        if not revision_ids:
+            return {}
+        normalized = tuple(dict.fromkeys(revision_ids))
+        rows = await self._storage.list_assertion_revision_sources_batch(normalized)
+        return {
+            revision_id: tuple(
+                sorted(
+                    rows.get(revision_id, ()),
+                    key=lambda item: (
+                        item.received_at.value,
+                        item.source_occurrence_id,
+                    ),
+                )
+            )
+            for revision_id in normalized
+        }
+
+    @staticmethod
+    def _tombstone_reason(operation: str) -> str:
+        """Preserve the persisted invalidation cause without inventing one."""
+        if not isinstance(operation, str) or not operation:
+            return "unknown_invalidation"
+        return operation
 
     @staticmethod
     def _check_time(limits: GovernedCorpusLimits, started: float) -> None:

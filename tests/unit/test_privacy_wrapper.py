@@ -55,6 +55,27 @@ class TestPrivacyPolicy:
         assert policy.allow_cloud_backup is False
 
 
+@pytest.mark.asyncio
+async def test_governed_corpus_delta_uses_incremental_privacy_gate(monkeypatch):
+    storage = Mock()
+    storage.governed_assertion_corpus_changes_since = AsyncMock(
+        return_value="delta"
+    )
+    wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+    incremental_gate = Mock()
+    ordinary_gate = Mock()
+    monkeypatch.setattr(
+        wrapper,
+        "_assert_semantic_assertion_incremental_read_allowed",
+        incremental_gate,
+    )
+    monkeypatch.setattr(wrapper, "_assert_semantic_assertion_read_allowed", ordinary_gate)
+
+    assert await wrapper.governed_assertion_corpus_changes_since("snapshot") == "delta"
+    incremental_gate.assert_called_once_with("governed learning corpus")
+    ordinary_gate.assert_not_called()
+
+
 class TestEphemeralMode:
     """Tests for EPHEMERAL privacy mode enforcement."""
 

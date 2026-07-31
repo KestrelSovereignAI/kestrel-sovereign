@@ -187,6 +187,12 @@ async def test_assertion_crud_provenance_idempotency_and_checkpoint() -> None:
         assert await store.list_assertion_revision_sources(assertion.revision_id) == [
             source("source-1")
         ]
+        assert await store.list_assertion_revision_sources_batch(
+            (assertion.revision_id, "missing-revision")
+        ) == {
+            assertion.revision_id: [source("source-1")],
+            "missing-revision": [],
+        }
         validation = await store.assertion_validation_statuses([assertion.assertion_id])
         assert validation[assertion.assertion_id].state.value == "conforms"
         assert validation[assertion.assertion_id].action.value in {"accept", "accept-with-report"}

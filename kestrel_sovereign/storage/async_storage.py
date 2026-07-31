@@ -1248,6 +1248,14 @@ class AsyncStorage:
             await self.initialize()
         return await self._assertion_store().list_revision_source_occurrences(revision_id)
 
+    async def list_assertion_revision_sources_batch(self, revision_ids):
+        """Read exact revision provenance for a bounded corpus page."""
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().list_revision_source_occurrences_batch(
+            revision_ids
+        )
+
     async def get_source_occurrence(self, source_occurrence_id: str):
         if not self._initialized:
             await self.initialize()

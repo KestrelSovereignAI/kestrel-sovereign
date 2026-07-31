@@ -1094,6 +1094,38 @@ class AsyncAssertionStore:
         )
         return [SourceOccurrence.from_mapping(json.loads(row[0])) for row in rows]
 
+    async def list_revision_source_occurrences_batch(
+        self, revision_ids: Sequence[str]
+    ) -> dict[str, list[SourceOccurrence]]:
+        """Return exact provenance for several revisions with one bounded query."""
+        tenant_id, _ = self._require_scope()
+        if isinstance(revision_ids, (str, bytes)):
+            raise AssertionStoreError("revision_ids must be a sequence of strings")
+        normalized = tuple(dict.fromkeys(revision_ids))
+        if not normalized:
+            return {}
+        if len(normalized) > 999:
+            raise AssertionStoreError("revision source batch is limited to 999 revisions")
+        if any(not isinstance(item, str) or not item for item in normalized):
+            raise AssertionStoreError("revision_ids must contain non-empty strings")
+        placeholders = ",".join("?" for _ in normalized)
+        rows = await self._database.fetchall(
+            "SELECT rs.revision_id, s.source_mapping, s.received_at, "
+            "s.source_occurrence_id FROM semantic_revision_sources rs "
+            "JOIN semantic_source_occurrences s ON s.tenant_id = rs.tenant_id "
+            "AND s.source_occurrence_id = rs.source_occurrence_id "
+            f"WHERE rs.tenant_id = ? AND rs.revision_id IN ({placeholders}) "
+            "ORDER BY rs.revision_id ASC, s.received_at ASC, "
+            "s.source_occurrence_id ASC",
+            (tenant_id, *normalized),
+        )
+        result = {revision_id: [] for revision_id in normalized}
+        for revision_id, source_mapping, _received_at, _source_id in rows:
+            result[revision_id].append(
+                SourceOccurrence.from_mapping(json.loads(source_mapping))
+            )
+        return result
+
     async def get_source_occurrence(self, source_occurrence_id: str) -> SourceOccurrence | None:
         """Read one immutable provenance record in the bound tenant only."""
         tenant_id, _ = self._require_scope()
