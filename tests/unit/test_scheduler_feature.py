@@ -9,6 +9,7 @@ Tests:
 - Error handling for missing DB, invalid cron, etc.
 """
 
+import asyncio
 import json
 import logging
 import pytest
@@ -17,6 +18,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from kestrel_sdk.signals import SignalHandle, SignalMode, SignalResult, Status
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.agent.sleep import SleepMixin
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
@@ -76,7 +78,84 @@ def _make_mock_agent(db=None):
     agent.storage = MagicMock()
     agent.storage.db = mock_db
 
+    # A watcher's fingerprint checkpoint is committed by a delivery supervisor
+    # owned through ``Feature._track_owned_background_task`` → this (#2532).
+    # Start REAL tasks and record them so a test can drive a wake to its
+    # terminal state; a MagicMock tracker would silently drop the coroutine and
+    # the checkpoint assertions would prove nothing.
+    agent.tracked_tasks = []
+
+    def _track_background_task(coro, *, name=""):
+        task = asyncio.ensure_future(coro)
+        agent.tracked_tasks.append((task, name))
+        return task
+
+    agent._track_background_task = _track_background_task
     return agent
+
+
+def _watch_handle(status: Status = Status.OK, *, error=None) -> SignalHandle:
+    """A real ``SignalHandle`` resolving to a real ``SignalResult``.
+
+    ``enqueue_signal`` hands the handle back at *acceptance*; the terminal
+    status only arrives via ``await handle.wait()``. Watch tests drive the real
+    object because a truthy handle mock is unconditionally successful — it can
+    only show the happy path is reachable, never that a ``FAILED`` or dropped
+    wake leaves the fingerprint un-advanced (#2532).
+    """
+
+    async def _terminal() -> SignalResult:
+        return SignalResult(
+            signal_id="sig-watch",
+            status=status,
+            mode=SignalMode.COGNITION,
+            duration_ms=1,
+            error=error,
+        )
+
+    return SignalHandle(
+        signal_id="sig-watch", task=asyncio.ensure_future(_terminal()),
+    )
+
+
+def _cancelled_watch_handle() -> SignalHandle:
+    """A handle whose dispatch task was cancelled out from under the watcher."""
+
+    async def _never() -> SignalResult:
+        await asyncio.sleep(3600)
+        raise AssertionError("unreachable")
+
+    task = asyncio.ensure_future(_never())
+    task.cancel()
+    return SignalHandle(signal_id="sig-watch", task=task)
+
+
+def _wire_watch_dispatcher(feature, handle_factory=_watch_handle):
+    """Point the feature's dispatcher at real handles from ``handle_factory``."""
+    feature.agent.dispatcher = MagicMock()
+
+    async def _enqueue(_signal):
+        return handle_factory()
+
+    feature.agent.dispatcher.enqueue_signal = AsyncMock(side_effect=_enqueue)
+    return feature.agent.dispatcher.enqueue_signal
+
+
+async def _settle_watch_deliveries(feature):
+    """Run every watch-checkpoint supervisor this feature owns to completion.
+
+    The watchers deliberately do NOT await delivery inline (they run inside a
+    dispatcher worker holding a scheduler lease), so the checkpoint lands in a
+    supervisor task. Tests must drive that task before asserting on the
+    fingerprint — that boundary is the thing under test.
+    """
+    supervisors = [
+        task for task, name in feature.agent.tracked_tasks
+        if name.startswith("watch_checkpoint:")
+    ]
+    for task in supervisors:
+        await asyncio.wait_for(task, timeout=5)
+    return supervisors
 
 
 def _use_postgres_clock(feature, database_now, *, scheduled_row=None):
@@ -2449,8 +2528,7 @@ class TestEcosystemDiscoveryWatchHandler:
     @pytest.mark.asyncio
     async def test_clean_scan_does_not_signal(self, feature):
         feature._lookup_and_run_tool = AsyncMock(return_value=_discovery_clean())
-        feature.agent.dispatcher = MagicMock()
-        feature.agent.dispatcher.enqueue_signal = AsyncMock()
+        _wire_watch_dispatcher(feature)
 
         out = await feature._run_ecosystem_discovery_watch(
             {"tool": "scan_stale_work", "repo": "owner/name"}
@@ -2481,8 +2559,7 @@ class TestEcosystemDiscoveryWatchHandler:
         feature.agent.hooks_manager = None
         feature._load_ecosystem_discovery_state = AsyncMock(return_value=(None, None))
         feature._save_ecosystem_discovery_state = AsyncMock()
-        feature.agent.dispatcher = MagicMock()
-        feature.agent.dispatcher.enqueue_signal = AsyncMock()
+        _wire_watch_dispatcher(feature)
 
         out = await feature._run_ecosystem_discovery_watch({"repo": "owner/name"})
 
@@ -2503,8 +2580,7 @@ class TestEcosystemDiscoveryWatchHandler:
         feature._lookup_and_run_tool = AsyncMock(return_value=_discovery_clean())
         feature._load_ecosystem_discovery_state = AsyncMock(return_value=(None, None))
         feature._save_ecosystem_discovery_state = AsyncMock()
-        feature.agent.dispatcher = MagicMock()
-        feature.agent.dispatcher.enqueue_signal = AsyncMock()
+        _wire_watch_dispatcher(feature)
 
         out = await feature._run_ecosystem_discovery_watch({
             "tool": "scan_stale_work",
@@ -2530,8 +2606,7 @@ class TestEcosystemDiscoveryWatchHandler:
         feature._lookup_and_run_tool = AsyncMock(return_value=_discovery_finding())
         feature._load_ecosystem_discovery_state = AsyncMock(return_value=(None, None))
         feature._save_ecosystem_discovery_state = AsyncMock()
-        feature.agent.dispatcher = MagicMock()
-        feature.agent.dispatcher.enqueue_signal = AsyncMock()
+        _wire_watch_dispatcher(feature)
 
         out = await feature._run_ecosystem_discovery_watch(
             {"tool": "scan_stale_work", "repo": "owner/name"}
@@ -2549,6 +2624,13 @@ class TestEcosystemDiscoveryWatchHandler:
         assert findings[0]["number"] == "2281"
         assert findings[0]["severity"] == "high"
         assert findings[0]["suggested_gate"] == "verify_ci_then_dispatch_fix"
+        # Acceptance is not delivery: the fingerprint must still be un-advanced
+        # here, and the handler must say so rather than claim a checkpoint.
+        feature._save_ecosystem_discovery_state.assert_not_awaited()
+        assert data["checkpoint"] == "pending_delivery"
+
+        await _settle_watch_deliveries(feature)
+
         feature._save_ecosystem_discovery_state.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -2564,8 +2646,7 @@ class TestEcosystemDiscoveryWatchHandler:
             return_value=(state.fingerprint, json.loads(state_to_json(state)))
         )
         feature._save_ecosystem_discovery_state = AsyncMock()
-        feature.agent.dispatcher = MagicMock()
-        feature.agent.dispatcher.enqueue_signal = AsyncMock()
+        _wire_watch_dispatcher(feature)
 
         out = await feature._run_ecosystem_discovery_watch(
             {"tool": "scan_stale_work", "repo": "owner/name"}
@@ -2591,8 +2672,7 @@ class TestEcosystemDiscoveryWatchHandler:
             return_value=(previous.fingerprint, json.loads(state_to_json(previous)))
         )
         feature._save_ecosystem_discovery_state = AsyncMock()
-        feature.agent.dispatcher = MagicMock()
-        feature.agent.dispatcher.enqueue_signal = AsyncMock()
+        _wire_watch_dispatcher(feature)
 
         out = await feature._run_ecosystem_discovery_watch(
             {"tool": "scan_stale_work", "repo": "owner/name"}
@@ -2619,8 +2699,7 @@ class TestEcosystemDiscoveryWatchHandler:
             return_value=(previous.fingerprint, json.loads(state_to_json(previous)))
         )
         feature._save_ecosystem_discovery_state = AsyncMock()
-        feature.agent.dispatcher = MagicMock()
-        feature.agent.dispatcher.enqueue_signal = AsyncMock()
+        _wire_watch_dispatcher(feature)
 
         out = await feature._run_ecosystem_discovery_watch(
             {"tool": "scan_stale_work", "repo": "owner/name"}
@@ -2633,7 +2712,138 @@ class TestEcosystemDiscoveryWatchHandler:
         signal = feature.agent.dispatcher.enqueue_signal.call_args.args[0]
         previous_findings = json.loads(signal.payload["previous_findings"])
         assert previous_findings[0]["repo"] == "owner/name"
+
+        await _settle_watch_deliveries(feature)
+
         feature._save_ecosystem_discovery_state.assert_awaited_once()
+
+
+class TestEcosystemDiscoveryDeliveryGate:
+    """#2532: the fingerprint checkpoint may only advance on terminal ``OK``.
+
+    A watcher that advances on enqueue *acceptance* does not retry — the next
+    poll sees no change — so a failed or dropped wake loses the finding
+    silently and permanently. Every non-``OK`` terminal state below must leave
+    the prior fingerprint in place so the next poll re-detects and re-dispatches.
+    """
+
+    async def _run_with(self, feature, handle_factory):
+        feature._lookup_and_run_tool = AsyncMock(return_value=_discovery_finding())
+        feature._load_ecosystem_discovery_state = AsyncMock(
+            return_value=(None, None)
+        )
+        feature._save_ecosystem_discovery_state = AsyncMock()
+        _wire_watch_dispatcher(feature, handle_factory)
+
+        out = await feature._run_ecosystem_discovery_watch(
+            {"tool": "scan_stale_work", "repo": "owner/name"}
+        )
+        await _settle_watch_deliveries(feature)
+        return json.loads(out)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [
+        Status.FAILED,
+        Status.DROPPED_RATE_LIMIT,
+        Status.DROPPED_QUIET_HOURS,
+        Status.DROPPED_CYCLE,
+        Status.DROPPED_VALIDATION,
+        # COALESCED is deliberately not checkpoint-grade: the dedupe key is
+        # recorded before the turn runs, so a wake that died inside the
+        # resuming turn still coalesces a fast retry.
+        Status.COALESCED,
+    ])
+    async def test_non_ok_terminal_state_does_not_advance_fingerprint(
+        self, feature, status,
+    ):
+        await self._run_with(feature, lambda: _watch_handle(status))
+        feature._save_ecosystem_discovery_state.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_ok_terminal_state_advances_fingerprint(self, feature):
+        await self._run_with(feature, lambda: _watch_handle(Status.OK))
+        feature._save_ecosystem_discovery_state.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_dispatch_does_not_advance_fingerprint(self, feature):
+        """The dispatch task died (shutdown reaped it). Nothing was delivered,
+        and this watcher is healthy — retain the fingerprint, do not crash."""
+        await self._run_with(feature, _cancelled_watch_handle)
+        feature._save_ecosystem_discovery_state.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unobservable_handle_does_not_advance_fingerprint(self, feature):
+        """A dispatcher that hands back something with no awaitable ``wait``
+        makes delivery unobservable. Unobservable is treated exactly like
+        undelivered — never like success."""
+        await self._run_with(feature, lambda: object())
+        feature._save_ecosystem_discovery_state.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_wait_error_does_not_advance_fingerprint(self, feature):
+        """A tooling error inside ``wait()`` is not evidence of delivery."""
+
+        class _ExplodingHandle:
+            async def wait(self):
+                raise RuntimeError("dispatcher internals blew up")
+
+        await self._run_with(feature, _ExplodingHandle)
+        feature._save_ecosystem_discovery_state.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_delivery_in_flight_suppresses_duplicate_wake(self, feature):
+        """While a wake is settling the baseline still holds the PRIOR
+        fingerprint, so every tick re-detects the same change. Without an
+        in-flight guard that dispatches a duplicate wake per tick for the whole
+        length of the cognition turn — the #2738 storm shape."""
+        feature._lookup_and_run_tool = AsyncMock(return_value=_discovery_finding())
+        feature._load_ecosystem_discovery_state = AsyncMock(
+            return_value=(None, None)
+        )
+        feature._save_ecosystem_discovery_state = AsyncMock()
+
+        gate = asyncio.Event()
+
+        def _slow_handle():
+            async def _terminal():
+                await gate.wait()
+                return SignalResult(
+                    signal_id="sig-watch",
+                    status=Status.OK,
+                    mode=SignalMode.COGNITION,
+                    duration_ms=1,
+                )
+            return SignalHandle(
+                signal_id="sig-watch", task=asyncio.ensure_future(_terminal()),
+            )
+
+        enqueue = _wire_watch_dispatcher(feature, _slow_handle)
+
+        first = json.loads(await feature._run_ecosystem_discovery_watch(
+            {"tool": "scan_stale_work", "repo": "owner/name"}
+        ))
+        second = json.loads(await feature._run_ecosystem_discovery_watch(
+            {"tool": "scan_stale_work", "repo": "owner/name"}
+        ))
+
+        assert first["signaled"] is True
+        assert second["signaled"] is False
+        assert second["blocked"] == "delivery_in_flight"
+        assert enqueue.await_count == 1
+
+        gate.set()
+        await _settle_watch_deliveries(feature)
+
+        feature._save_ecosystem_discovery_state.assert_awaited_once()
+        # Settled — the guard released, so a later change can dispatch again.
+        third = json.loads(await feature._run_ecosystem_discovery_watch(
+            {"tool": "scan_stale_work", "repo": "owner/name"}
+        ))
+        assert third["signaled"] is True
+        assert enqueue.await_count == 2
+
+        gate.set()
+        await _settle_watch_deliveries(feature)
 
 
 _GH_TOKEN = (
@@ -2700,8 +2910,7 @@ class TestGitHubPRWatchHandler:
     async def test_first_observation_does_not_signal(self, feature):
         # No persisted fingerprint → first observation → no wake.
         feature._db.fetchone = AsyncMock(return_value=None)
-        feature.agent.dispatcher = MagicMock()
-        feature.agent.dispatcher.enqueue_signal = AsyncMock()
+        _wire_watch_dispatcher(feature)
         with patch(_GH_TOKEN, return_value="tok"), patch(
             _GH_FETCH, new=AsyncMock(return_value=_pr_payload())
         ):
@@ -2723,8 +2932,7 @@ class TestGitHubPRWatchHandler:
         norm = normalize_pr_state(_pr_payload())
         fp = compute_fingerprint(norm)
         feature._db.fetchone = AsyncMock(return_value=(fp, json.dumps(norm)))
-        feature.agent.dispatcher = MagicMock()
-        feature.agent.dispatcher.enqueue_signal = AsyncMock()
+        _wire_watch_dispatcher(feature)
         with patch(_GH_TOKEN, return_value="tok"), patch(
             _GH_FETCH, new=AsyncMock(return_value=_pr_payload())
         ):
@@ -2748,10 +2956,8 @@ class TestGitHubPRWatchHandler:
         feature._db.fetchone = AsyncMock(
             return_value=(prev_fp, json.dumps(prev))
         )
-        feature.agent.dispatcher = MagicMock()
-        feature.agent.dispatcher.enqueue_signal = AsyncMock(
-            return_value=MagicMock()
-        )
+        feature._save_pr_watch_state = AsyncMock()
+        _wire_watch_dispatcher(feature)
         with patch(_GH_TOKEN, return_value="tok"), patch(
             _GH_FETCH, new=AsyncMock(return_value=_pr_payload(comments=3))
         ):
@@ -2762,6 +2968,14 @@ class TestGitHubPRWatchHandler:
         assert data["signaled"] is True
         assert "comments" in data["changed"]
         feature.agent.dispatcher.enqueue_signal.assert_called_once()
+        # Accepted, not yet delivered — the baseline still holds the old
+        # fingerprint until the wake lands (#2532).
+        assert data["checkpoint"] == "pending_delivery"
+        feature._save_pr_watch_state.assert_not_awaited()
+
+        await _settle_watch_deliveries(feature)
+
+        feature._save_pr_watch_state.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_dispatch_error_does_not_advance_watch_state(self, feature):
@@ -2818,6 +3032,61 @@ class TestGitHubPRWatchHandler:
         data = json.loads(out)
         assert data["signaled"] is False
         assert data["blocked"] == "no_dispatcher"
+        feature._save_pr_watch_state.assert_not_awaited()
+
+    async def _watch_with_handle(self, feature, handle_factory):
+        """Drive one signal-worthy poll whose wake settles per the factory."""
+        from kestrel_sovereign.signals.sources.github_pr_watch import (
+            compute_fingerprint,
+            normalize_pr_state,
+        )
+
+        prev = normalize_pr_state(_pr_payload(comments=2))
+        feature._load_pr_watch_state = AsyncMock(
+            return_value=(compute_fingerprint(prev), prev)
+        )
+        feature._save_pr_watch_state = AsyncMock()
+        _wire_watch_dispatcher(feature, handle_factory)
+
+        with patch(_GH_TOKEN, return_value="tok"), patch(
+            _GH_FETCH, new=AsyncMock(return_value=_pr_payload(comments=3))
+        ):
+            out = await feature._run_github_pr_watch(
+                {"repo": "owner/name", "pr": 1614}
+            )
+        await _settle_watch_deliveries(feature)
+        return json.loads(out)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [
+        Status.FAILED,
+        Status.DROPPED_RATE_LIMIT,
+        Status.DROPPED_CYCLE,
+        Status.DROPPED_VALIDATION,
+        Status.COALESCED,
+    ])
+    async def test_non_ok_delivery_does_not_advance_watch_state(
+        self, feature, status,
+    ):
+        """#2532: the comment/merge/check delta must stay re-detectable. A
+        checkpoint advanced on a wake the dispatcher then failed or dropped
+        marks the event handled forever — the watcher never retries."""
+        await self._watch_with_handle(feature, lambda: _watch_handle(status))
+        feature._save_pr_watch_state.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_ok_delivery_advances_watch_state(self, feature):
+        await self._watch_with_handle(feature, lambda: _watch_handle(Status.OK))
+        feature._save_pr_watch_state.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_dispatch_does_not_advance_watch_state(self, feature):
+        await self._watch_with_handle(feature, _cancelled_watch_handle)
+        feature._save_pr_watch_state.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unobservable_handle_does_not_advance_watch_state(self, feature):
+        await self._watch_with_handle(feature, lambda: object())
         feature._save_pr_watch_state.assert_not_awaited()
 
     @pytest.mark.asyncio

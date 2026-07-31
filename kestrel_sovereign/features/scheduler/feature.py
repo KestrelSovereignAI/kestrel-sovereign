@@ -168,6 +168,13 @@ class SchedulerFeature(Feature):
             getattr(self.agent, "_scheduler_polling_managed_by_host", False)
             is True
         )
+        # Watch keys with a wake accepted onto the queue whose terminal
+        # delivery has not settled yet (#2532). A watcher checkpoint only
+        # advances once its wake lands, so until then the baseline still holds
+        # the PRIOR fingerprint and every tick re-detects the same change.
+        # Without this guard that would enqueue a duplicate wake per tick for
+        # the whole length of a cognition turn — the #2738 storm shape.
+        self._inflight_watch_deliveries: set = set()
 
         self._db = resolve_feature_database(self.agent)
 
@@ -1534,6 +1541,91 @@ class SchedulerFeature(Feature):
             (self._agent_id, watch_key, fingerprint, state_json, now_iso),
         )
 
+    async def _dispatch_watch_wake(
+        self,
+        signal,
+        *,
+        watch_key: str,
+        label: str,
+        commit_checkpoint,
+    ) -> Optional[dict]:
+        """Enqueue a watcher wake and gate its fingerprint checkpoint on
+        terminal delivery (#2532).
+
+        Returns ``None`` once the wake is accepted and its checkpoint handed to
+        a supervisor, or a dict of extra result fields describing why nothing
+        was dispatched. ``commit_checkpoint`` is an argument-less coroutine
+        function that advances the durable fingerprint; it runs **only** after
+        the wake reaches ``Status.OK``.
+
+        This does not await delivery inline. These watchers are cron ACTION
+        handlers running inside a dispatcher worker: blocking one for the
+        length of the COGNITION turn it just enqueued would hold a scheduler
+        lease and one of the runner's bounded concurrency slots until the
+        lease lapsed, starving every other due task and risking a duplicate
+        claim. So the wait is handed to a feature-owned supervisor, the shape
+        ``RestartCoordinatorFeature`` uses for ``restart.completed``. On any
+        non-``OK`` terminal state (or a cancelled dispatch, or a tooling
+        error) the fingerprint simply never advances, so the next poll
+        re-detects the same change and dispatches again.
+        """
+        from kestrel_sovereign.signals.delivery import supervise_terminal_delivery
+
+        dispatcher = getattr(self.agent, "dispatcher", None)
+        if dispatcher is None or not hasattr(dispatcher, "enqueue_signal"):
+            return {
+                "blocked": "no_dispatcher",
+                "reason": "agent has no signal dispatcher",
+            }
+
+        # A prior wake for this watch is still settling. The baseline still
+        # holds the old fingerprint (that is the point), so re-dispatching now
+        # would enqueue a duplicate wake every tick until the turn returns.
+        if watch_key in self._inflight_watch_deliveries:
+            return {
+                "blocked": "delivery_in_flight",
+                "reason": (
+                    "a prior wake for this watch has not reached terminal "
+                    "delivery yet"
+                ),
+            }
+
+        try:
+            enq = dispatcher.enqueue_signal(signal)
+            handle = await enq if hasattr(enq, "__await__") else enq
+        except Exception as e:
+            logger.warning("%s: enqueue_signal raised: %s", label, e)
+            return {
+                "blocked": "dispatch_error",
+                "error": f"{type(e).__name__}: {e}",
+            }
+
+        self._inflight_watch_deliveries.add(watch_key)
+        try:
+            supervise_terminal_delivery(
+                self,
+                handle,
+                label=label,
+                task_name=f"watch_checkpoint:{watch_key}",
+                on_delivered=commit_checkpoint,
+                on_settled=lambda: self._inflight_watch_deliveries.discard(
+                    watch_key
+                ),
+            )
+        except Exception as e:
+            # No supervisor means nothing will ever advance the checkpoint,
+            # and leaving the in-flight guard set would wedge this watch for
+            # the process lifetime. Release it and report honestly.
+            self._inflight_watch_deliveries.discard(watch_key)
+            logger.warning(
+                "%s: could not own the delivery supervisor: %s", label, e,
+            )
+            return {
+                "blocked": "dispatch_error",
+                "error": f"{type(e).__name__}: {e}",
+            }
+        return None
+
     async def _run_ecosystem_discovery_watch(self, args: dict) -> str:
         """Run stale-work/red-CI discovery and wake on actionable changes.
 
@@ -1610,38 +1702,30 @@ class SchedulerFeature(Feature):
             target_agent=str(target),
         )
 
-        dispatcher = getattr(self.agent, "dispatcher", None)
-        if dispatcher is None or not hasattr(dispatcher, "enqueue_signal"):
-            return json.dumps({
-                "signaled": False,
-                "blocked": "no_dispatcher",
-                "reason": "agent has no signal dispatcher",
-                "watch_key": watch_key,
-                "findings_count": len(decision.state.findings),
-            })
-
-        try:
-            enq = dispatcher.enqueue_signal(signal)
-            if hasattr(enq, "__await__"):
-                await enq
-        except Exception as e:
-            logger.warning(
-                "ecosystem_discovery_watch: enqueue_signal raised for %s: %s",
-                watch_key, e,
+        async def _commit_checkpoint() -> None:
+            await self._save_ecosystem_discovery_state(
+                watch_key, decision.state.fingerprint, state_json,
             )
+
+        blocked = await self._dispatch_watch_wake(
+            signal,
+            watch_key=f"ecosystem_discovery:{watch_key}",
+            label=f"ecosystem_discovery_watch[{watch_key}]",
+            commit_checkpoint=_commit_checkpoint,
+        )
+        if blocked is not None:
             return json.dumps({
                 "signaled": False,
-                "blocked": "dispatch_error",
-                "error": f"{type(e).__name__}: {e}",
+                **blocked,
                 "watch_key": watch_key,
                 "findings_count": len(decision.state.findings),
             })
 
-        await self._save_ecosystem_discovery_state(
-            watch_key, decision.state.fingerprint, state_json,
-        )
         return json.dumps({
             "signaled": True,
+            # Accepted onto the queue, not yet delivered. The fingerprint
+            # advances only when the wake reaches Status.OK (#2532).
+            "checkpoint": "pending_delivery",
             "reason": decision.reason,
             "watch_key": watch_key,
             "findings_count": len(decision.state.findings),
@@ -1658,7 +1742,10 @@ class SchedulerFeature(Feature):
         no-change poll so a bad token or flaky network is never silently
         read as "nothing happened". The persisted fingerprint is NOT
         advanced on a blocked poll, so the next successful poll still sees
-        the real delta.
+        the real delta. It is likewise not advanced when the wake is merely
+        accepted onto the queue — only terminal ``Status.OK`` advances it
+        (#2532), so a failed/dropped wake is re-detected next poll instead
+        of being silently checkpointed away.
 
         Args (from the scheduled task's args_json):
             repo: ``owner/name`` of the repository.
@@ -1748,9 +1835,11 @@ class SchedulerFeature(Feature):
         )
         if not decision.should_signal:
             # Advance the baseline for first observations and filtered/no-op
-            # changes. Signal-worthy changes advance only after enqueue
-            # succeeds, otherwise a transient dispatcher failure would mark
-            # the event handled and permanently drop the wake.
+            # changes — nothing was dispatched, so there is no delivery to
+            # gate on. Signal-worthy changes advance only after their wake
+            # reaches terminal Status.OK (#2532): enqueue acceptance is not
+            # delivery, and advancing on it would mark the event handled and
+            # permanently drop a wake the dispatcher went on to fail or drop.
             await self._save_pr_watch_state(
                 watch_key, decision.fingerprint, decision.normalized,
             )
@@ -1770,39 +1859,30 @@ class SchedulerFeature(Feature):
             html_url=str(raw_state.get("html_url", "")),
         )
 
-        dispatcher = getattr(self.agent, "dispatcher", None)
-        if dispatcher is None or not hasattr(dispatcher, "enqueue_signal"):
-            return json.dumps({
-                "signaled": False,
-                "blocked": "no_dispatcher",
-                "reason": "agent has no signal dispatcher",
-                "watch_key": watch_key,
-                "changed": sorted(decision.matched),
-            })
-
-        try:
-            enq = dispatcher.enqueue_signal(signal)
-            if hasattr(enq, "__await__"):
-                await enq
-        except Exception as e:
-            logger.warning(
-                "github_pr_watch: enqueue_signal raised for %s: %s",
-                watch_key, e,
+        async def _commit_checkpoint() -> None:
+            await self._save_pr_watch_state(
+                watch_key, decision.fingerprint, decision.normalized,
             )
+
+        blocked = await self._dispatch_watch_wake(
+            signal,
+            watch_key=f"github_pr:{watch_key}",
+            label=f"github_pr_watch[{watch_key}]",
+            commit_checkpoint=_commit_checkpoint,
+        )
+        if blocked is not None:
             return json.dumps({
                 "signaled": False,
-                "blocked": "dispatch_error",
-                "error": f"{type(e).__name__}: {e}",
+                **blocked,
                 "watch_key": watch_key,
                 "changed": sorted(decision.matched),
             })
-
-        await self._save_pr_watch_state(
-            watch_key, decision.fingerprint, decision.normalized,
-        )
 
         return json.dumps({
             "signaled": True,
+            # Accepted onto the queue, not yet delivered. The fingerprint
+            # advances only when the wake reaches Status.OK (#2532).
+            "checkpoint": "pending_delivery",
             "reason": decision.reason,
             "watch_key": watch_key,
             "changed": sorted(decision.matched),

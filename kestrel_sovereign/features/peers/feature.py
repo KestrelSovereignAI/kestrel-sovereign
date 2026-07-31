@@ -2278,13 +2278,43 @@ class PeersFeature(Feature):
         state: str,
         reply_text: str,
         causation_chain: Optional[list],
+        await_delivery: bool = True,
+        schedule_retry: bool = True,
     ) -> bool:
-        """Build and enqueue the local ``a2a.question_answered`` signal.
+        """Build, enqueue, and DELIVER the local ``a2a.question_answered``
+        signal, returning whether the asker was actually woken.
 
-        Factored out so the supervisor AND the future startup-replay /
+        Factored out so the supervisor AND the startup-replay /
         hourly-expiry sweeps share one fire path. Errors here are
         logged not raised — losing a resumption signal is bad but
-        crashing the dispatcher hop is worse."""
+        crashing the dispatcher hop is worse.
+
+        The caller has already retired the durable ``WAITING`` row (claim-first,
+        so a racing sweep can't double-fire), so ``True`` here is what keeps
+        that row retired. ``enqueue_signal`` only reports *acceptance onto the
+        queue*, which is not delivery — returning ``True`` on it left the row
+        terminal for a wake the dispatcher then failed or dropped, and the
+        asker was never resumed (#2532). So ``True`` now means terminal
+        ``Status.OK``.
+
+        Ownership boundary (#2532): ``await_delivery=True`` waits for that
+        terminal result inline and is correct for every FEATURE-OWNED
+        background caller — the SSE supervisor, the hourly sweep loop, the
+        restore-retry loop — which can block for the length of the resumed
+        cognition turn. ``await_delivery=False`` is for the one caller that
+        cannot: ``_replay_pending_a2a_questions`` runs inline on the boot path,
+        where awaiting a cognition turn would deadlock startup against the very
+        agent that is still initializing. That path hands the wait to a
+        feature-owned supervisor which restores the ``WAITING`` row itself on
+        any non-delivery, and returns ``True`` for "accepted, delivery
+        supervised" so the caller does not also restore it.
+        """
+        import asyncio
+
+        from kestrel_sovereign.signals.delivery import (
+            await_terminal_delivery,
+            supervise_terminal_delivery,
+        )
         from kestrel_sovereign.signals.sources.a2a_question_answered import (
             build_signal_for_question_answered,
         )
@@ -2339,8 +2369,8 @@ class PeersFeature(Feature):
                 origin_session_id=sess_id,
                 causation_chain=causation_chain,
             )
-            await dispatcher.enqueue_signal(signal)
-            return True
+            enq = dispatcher.enqueue_signal(signal)
+            handle = await enq if hasattr(enq, "__await__") else enq
         except Exception as e:
             logger.error(
                 "Failed to enqueue a2a.question_answered for task=%s "
@@ -2349,6 +2379,79 @@ class PeersFeature(Feature):
                 exc_info=True,
             )
             return False
+
+        label = f"a2a.question_answered[{recipient}:{task_id}]"
+
+        if not await_delivery:
+            # Boot path — supervise the wait instead of blocking startup.
+            async def _restore_after_failure(outcome) -> None:
+                await self._restore_pending_question_waiting(
+                    task_id,
+                    state=state,
+                    reply_text=reply_text,
+                    recipient=recipient,
+                    original_question=original_question,
+                    sess_id=sess_id,
+                    causation_chain=causation_chain,
+                    schedule_retry=schedule_retry,
+                )
+
+            try:
+                supervise_terminal_delivery(
+                    self,
+                    handle,
+                    label=label,
+                    task_name=f"a2a_question_answered_delivery:{task_id}",
+                    on_undelivered=_restore_after_failure,
+                )
+            except Exception as e:  # noqa: BLE001
+                # Nothing would ever observe this delivery, so report it as
+                # unfired and let the caller restore the row synchronously.
+                logger.error(
+                    "Could not supervise a2a.question_answered delivery for "
+                    "task=%s: %s", task_id, e, exc_info=True,
+                )
+                return False
+            return True
+
+        try:
+            outcome = await await_terminal_delivery(handle, label=label)
+        except asyncio.CancelledError:
+            # We are being torn down mid-delivery. The caller's `if not fired`
+            # restore never runs because this propagates past it, so the
+            # obligation is ours: shield the restore so the row does not stay
+            # terminal for a wake nobody observed. "Better a possible duplicate
+            # than a missed resumption" — the same posture this file already
+            # takes for a failed mark_resolved.
+            try:
+                await asyncio.shield(
+                    self._restore_pending_question_waiting(
+                        task_id,
+                        state=state,
+                        reply_text=reply_text,
+                        recipient=recipient,
+                        original_question=original_question,
+                        sess_id=sess_id,
+                        causation_chain=causation_chain,
+                        schedule_retry=False,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - shutdown is best-effort
+                logger.warning(
+                    "Could not restore pending_a2a_question task=%s to WAITING "
+                    "while cancelled mid-delivery: %s", task_id, exc,
+                )
+            raise
+
+        if not outcome.delivered:
+            logger.warning(
+                "a2a.question_answered for task=%s recipient=%s was accepted "
+                "but never delivered (%s); the pending row is restored to "
+                "WAITING so the asker is still resumable",
+                task_id, recipient, outcome.describe(),
+            )
+            return False
+        return True
 
     async def _restore_pending_question_waiting(
         self,
@@ -2661,8 +2764,13 @@ class PeersFeature(Feature):
         replayed = 0
         expired = 0
         for row in waiting:
+            # Boot path: these run inline inside feature startup, so they must
+            # NOT block on a cognition turn that cannot run until the agent
+            # finishes initializing. Delivery is supervised instead (#2532).
             if getattr(row, "retry_state", None):
-                await self._handle_retry_payload_row(store, row)
+                await self._handle_retry_payload_row(
+                    store, row, await_delivery=False,
+                )
                 replayed += 1
                 continue
             try:
@@ -2675,13 +2783,13 @@ class PeersFeature(Feature):
                     "task=%s — treating as expired.",
                     row.deadline, row.task_id,
                 )
-                await self._handle_expired_row(store, row)
+                await self._handle_expired_row(store, row, await_delivery=False)
                 expired += 1
                 continue
             if deadline.tzinfo is None:
                 deadline = deadline.replace(tzinfo=timezone.utc)
             if deadline <= now:
-                await self._handle_expired_row(store, row)
+                await self._handle_expired_row(store, row, await_delivery=False)
                 expired += 1
                 continue
             # Within deadline — spawn supervisor. Chain is not
@@ -2752,13 +2860,24 @@ class PeersFeature(Feature):
                 # then resume the normal cadence.
                 await asyncio.sleep(60)
 
-    async def _handle_expired_row(self, store, row) -> None:
+    async def _handle_expired_row(
+        self, store, row, *, await_delivery: bool = True,
+    ) -> None:
         """Mark a single WAITING row EXPIRED + fire the synthetic
         ``state='expired'`` signal. Idempotent: if the row was
         already terminal (raced the supervisor), drop silently
-        instead of double-firing."""
+        instead of double-firing.
+
+        ``await_delivery`` selects the #2532 ownership boundary and is passed
+        straight through to :meth:`_fire_question_answered_signal`: the hourly
+        sweep (a feature-owned background loop) waits for terminal delivery
+        inline, while startup replay — which runs on the boot path, where the
+        cognition turn being waited on cannot start until boot finishes —
+        hands the wait to a supervisor that restores the row itself."""
         if getattr(row, "retry_state", None):
-            await self._handle_retry_payload_row(store, row)
+            await self._handle_retry_payload_row(
+                store, row, await_delivery=await_delivery,
+            )
             return
 
         was_waiting = await store.mark_expired(row.task_id)
@@ -2772,6 +2891,7 @@ class PeersFeature(Feature):
             state="expired",
             reply_text="",
             causation_chain=None,
+            await_delivery=await_delivery,
         )
         if not fired:
             await self._restore_pending_question_waiting(
@@ -2784,8 +2904,13 @@ class PeersFeature(Feature):
                 causation_chain=None,
             )
 
-    async def _handle_retry_payload_row(self, store, row) -> None:
-        """Re-fire a previously observed terminal answer after enqueue failure."""
+    async def _handle_retry_payload_row(
+        self, store, row, *, await_delivery: bool = True,
+    ) -> None:
+        """Re-fire a previously observed terminal answer after enqueue failure.
+
+        ``await_delivery`` carries the #2532 ownership boundary through from
+        the caller — see :meth:`_fire_question_answered_signal`."""
         retry_state = getattr(row, "retry_state", None)
         if not retry_state:
             return
@@ -2805,6 +2930,7 @@ class PeersFeature(Feature):
             state=retry_state,
             reply_text=getattr(row, "retry_reply_text", None) or "",
             causation_chain=None,
+            await_delivery=await_delivery,
         )
         if not fired:
             await self._restore_pending_question_waiting(
