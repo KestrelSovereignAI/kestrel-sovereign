@@ -488,16 +488,20 @@ missing, or newly shared recorded source fails closed for operator review and
 is never silently reinterpreted. Each proposal crosses
 `put_validated_assertion(..., ValidationSource.IMPORTED)`, so the normal SHACL
 acceptance/rejection path remains authoritative. Legacy rows are retained.
-`rollback()` is separately invoked and deletes only canonical assertions whose
-migration source occurrence exactly matches the recorded provenance; it never
-removes legacy graph content or audit records.
+Two eligible legacy rows that normalize to the same assertion identity become
+one claim with two governed source occurrences: the later row uses the public
+source-append lifecycle rather than a second initial write. `rollback()`
+withdraws that shared claim only when its complete recorded source set still
+exactly matches canonical provenance (and expands a batch boundary to keep the
+set atomic); it never removes legacy graph content or audit records.
 
 Core has no semantic-assertion vector/index projection to rebuild. A
 feature-owned projection may supply its public invalidator to the runner; it
 receives only the bound tenant and accepted assertion IDs. Accepted IDs first
 enter a durable pending-invalidation ledger, and delivery is marked complete
 only after the public invalidator returns. A failure is retried by every later
-run, including one with no remaining graph pages. The optional compatibility
+run, including one with no remaining graph pages. Canonical rollback re-opens
+that invalidation so projections observe the withdrawal as well. The optional compatibility
 flag enables deterministic coverage metrics only—there is no dual-write and no
 application dual-read path. Its removal condition is zero unmigrated eligible
 rows plus operator review of every rejection class. A bounded/truncated plan

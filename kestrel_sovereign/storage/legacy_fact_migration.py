@@ -423,9 +423,17 @@ class LegacyGraphFactMigration:
                     )
                     rejected[reason] = rejected.get(reason, 0) + 1
                     continue
-                outcome, assertion_id = await self._migrate_candidate(candidate, mapping)
-                await self._record(db, tenant_id, candidate.node_id, candidate, outcome, assertion_id=assertion_id)
-                if outcome == "migrated":
+                outcome, assertion_id, revision_id = await self._migrate_candidate(candidate, mapping)
+                await self._record(
+                    db,
+                    tenant_id,
+                    candidate.node_id,
+                    candidate,
+                    outcome,
+                    assertion_id=assertion_id,
+                    revision_id=revision_id,
+                )
+                if outcome in {"migrated", "source_appended"}:
                     migrated += 1
                 elif outcome == "idempotent":
                     idempotent += 1
@@ -498,42 +506,87 @@ class LegacyGraphFactMigration:
         db, tenant_id = await self._ready()
         rows = await db.fetchall(
             "SELECT node_id, source_occurrence_id, assertion_id, revision_id FROM legacy_fact_migration_records "
-            "WHERE tenant_id = ? AND outcome IN ('migrated', 'idempotent') "
+            "WHERE tenant_id = ? AND outcome IN ('migrated', 'idempotent', 'source_appended') "
             "ORDER BY node_id ASC LIMIT ?",
             (tenant_id, batch_size),
         )
         processed = migrated = idempotent = 0
         rejected: dict[str, int] = {}
-        for node_id, source_id, assertion_id, revision_id in rows:
-            processed += 1
-            if not all(isinstance(item, str) and item for item in (source_id, assertion_id, revision_id)):
-                await self._set_outcome(db, tenant_id, node_id, "rollback_refused_invalid_record")
+        groups: dict[str, list[tuple[object, object, object]]] = {}
+        for node_id, source_id, assertion_id, _revision_id in rows:
+            if not isinstance(assertion_id, str) or not assertion_id:
+                groups.setdefault("", []).append((node_id, source_id, _revision_id))
+            else:
+                groups.setdefault(assertion_id, []).append(
+                    (node_id, source_id, _revision_id)
+                )
+        for assertion_id, group in groups.items():
+            processed += len(group)
+            if not assertion_id or any(
+                not isinstance(source_id, str) or not source_id
+                for _node_id, source_id, _revision_id in group
+            ):
+                for node_id, _source_id, _revision_id in group:
+                    await self._set_outcome(
+                        db, tenant_id, node_id, "rollback_refused_invalid_record"
+                    )
                 rejected["rollback_refused_invalid_record"] = (
-                    rejected.get("rollback_refused_invalid_record", 0) + 1
+                    rejected.get("rollback_refused_invalid_record", 0) + len(group)
                 )
                 continue
             assertion = await self._storage.get_assertion(assertion_id)
             if assertion is None:
-                idempotent += 1
-                await self._set_outcome(db, tenant_id, node_id, "rolled_back")
+                idempotent += len(group)
+                for node_id, _source_id, _revision_id in group:
+                    await self._set_outcome(db, tenant_id, node_id, "rolled_back")
                 continue
+            all_active_records = await db.fetchall(
+                "SELECT node_id, source_occurrence_id, revision_id "
+                "FROM legacy_fact_migration_records "
+                "WHERE tenant_id = ? AND assertion_id = ? "
+                "AND outcome IN ('migrated', 'idempotent', 'source_appended') "
+                "ORDER BY node_id ASC",
+                (tenant_id, assertion_id),
+            )
+            if len(all_active_records) != len(group):
+                # A semantic claim can collect several legacy source rows.
+                # Complete that claim atomically even when the requested batch
+                # boundary falls between its rows; otherwise batch_size=1
+                # would permanently wedge rollback.
+                group = [
+                    (node_id, source_id, revision_id)
+                    for node_id, source_id, revision_id in all_active_records
+                ]
+                processed += len(group) - 1
             sources = await self._storage.list_assertion_sources(assertion_id)
-            if (
-                assertion.revision_id != revision_id
-                or source_id not in {source.source_occurrence_id for source in sources}
-            ):
-                await self._set_outcome(db, tenant_id, node_id, "rollback_refused_provenance")
+            expected_source_ids = {
+                str(source_id) for _node_id, source_id, _revision_id in group
+            }
+            actual_source_ids = {
+                source.source_occurrence_id for source in sources
+            }
+            if actual_source_ids != expected_source_ids:
+                for node_id, _source_id, _revision_id in group:
+                    await self._set_outcome(
+                        db, tenant_id, node_id, "rollback_refused_provenance"
+                    )
                 rejected["rollback_refused_provenance"] = (
-                    rejected.get("rollback_refused_provenance", 0) + 1
+                    rejected.get("rollback_refused_provenance", 0) + len(group)
                 )
                 continue
             await self._storage.delete_assertion(
                 assertion_id,
-                revision_id,
-                operation_id=f"{MIGRATION_VERSION}:rollback:{hashlib.sha256(source_id.encode()).hexdigest()}",
+                assertion.revision_id,
+                operation_id=(
+                    f"{MIGRATION_VERSION}:rollback:"
+                    f"{hashlib.sha256('|'.join(sorted(expected_source_ids)).encode()).hexdigest()}"
+                ),
             )
-            await self._set_outcome(db, tenant_id, node_id, "rolled_back")
-            migrated += 1
+            for node_id, _source_id, _revision_id in group:
+                await self._set_outcome(db, tenant_id, node_id, "rolled_back")
+            await self._requeue_invalidation(db, tenant_id, assertion_id)
+            migrated += len(group)
+        invalidated = await self._deliver_pending_invalidations(db, tenant_id)
         return MigrationResult(
             tenant_id,
             processed,
@@ -542,7 +595,7 @@ class LegacyGraphFactMigration:
             rejected,
             None,
             len(rows) < batch_size,
-            False,
+            invalidated,
         )
 
     async def compatibility_metrics(self) -> dict[str, object]:
@@ -589,7 +642,7 @@ class LegacyGraphFactMigration:
                 if outcome is not None:
                     seen_record_nodes.add(node_id)
                 if int(owner_count) != 1:
-                    if outcome is not None:
+                    if outcome in {"migrated", "idempotent", "source_appended"}:
                         changed += 1
                     continue
                 try:
@@ -625,7 +678,11 @@ class LegacyGraphFactMigration:
             missing_or_unowned=missing_or_unowned,
         )
 
-    async def _migrate_candidate(self, candidate: LegacyFactCandidate, mapping: Any) -> tuple[str, str | None]:
+    async def _migrate_candidate(
+        self,
+        candidate: LegacyFactCandidate,
+        mapping: Any,
+    ) -> tuple[str, str | None, str | None]:
         binding = self._storage.semantic_assertion_binding()
         digest = candidate.content_hash.removeprefix("sha256:")
         source = SourceOccurrence(
@@ -655,6 +712,14 @@ class LegacyGraphFactMigration:
             release_policy_reference=binding.release_policy_reference,
             visibility=binding.visibility,
         )
+        existing = await self._storage.get_assertion(assertion.assertion_id)
+        if existing is not None:
+            return await self._append_duplicate_source(
+                existing,
+                assertion=assertion,
+                source=source,
+                candidate=candidate,
+            )
         result = await self._storage.put_validated_assertion(
             assertion,
             source_occurrences=(source,),
@@ -663,8 +728,67 @@ class LegacyGraphFactMigration:
             run_id=MIGRATION_NAME,
         )
         if result.write is None:
-            return f"rejected:{result.report.state.value}:{result.report.action.value}", None
-        return ("idempotent" if result.write.idempotent else "migrated", result.write.assertion.assertion_id)
+            return f"rejected:{result.report.state.value}:{result.report.action.value}", None, None
+        return (
+            "idempotent" if result.write.idempotent else "migrated",
+            result.write.assertion.assertion_id,
+            result.write.assertion.revision_id,
+        )
+
+    async def _append_duplicate_source(
+        self,
+        existing: Assertion,
+        *,
+        assertion: Assertion,
+        source: SourceOccurrence,
+        candidate: LegacyFactCandidate,
+    ) -> tuple[str, str | None, str | None]:
+        """Attach a second verified legacy occurrence through public lifecycle.
+
+        Equal assertion identities intentionally coalesce semantic claims.  A
+        different legacy graph row is still independent evidence, so it must
+        append one direct source revision—not attempt another initial write.
+        """
+        if (
+            existing.confidence_method != MIGRATION_VERSION
+            or existing.confidence_basis != "verified-legacy-graph-shape"
+            or existing.confidence != candidate.confidence
+            or not isinstance(existing.lineage, DirectLineage)
+        ):
+            return "rejected:canonical_claim_conflict", None, None
+        sources = await self._storage.list_assertion_sources(existing.assertion_id)
+        if source.source_occurrence_id in {
+            item.source_occurrence_id for item in sources
+        }:
+            return "idempotent", existing.assertion_id, existing.revision_id
+        replacement_mapping = existing.to_mapping()
+        replacement_mapping.update(
+            {
+                "revision_id": source.source_occurrence_id,
+                "asserted_at": source.received_at.to_mapping(),
+                "lineage": DirectLineage(
+                    (*existing.lineage.source_occurrence_ids, source.source_occurrence_id)
+                ).to_mapping(),
+                "supersedes_revision_id": None,
+            }
+        )
+        replacement = Assertion.from_mapping(replacement_mapping)
+        result = await self._storage.append_assertion_source(
+            existing.revision_id,
+            replacement,
+            source_occurrences=(source,),
+            operation_id=(
+                f"{MIGRATION_VERSION}:append:"
+                f"{candidate.content_hash.removeprefix('sha256:')}"
+            ),
+        )
+        if result.write is None:
+            return f"rejected:{result.report.state.value}:{result.report.action.value}", None, None
+        return (
+            "idempotent" if result.write.idempotent else "source_appended",
+            result.replacement.assertion_id,
+            result.replacement.revision_id,
+        )
 
     @staticmethod
     async def _record(
@@ -676,9 +800,10 @@ class LegacyGraphFactMigration:
         *,
         assertion_id: str | None = None,
         content_hash: str | None = None,
+        revision_id: str | None = None,
     ) -> None:
         source_id = None if candidate is None else f"source:{MIGRATION_VERSION}:{candidate.content_hash.removeprefix('sha256:')}"
-        revision_id = source_id
+        revision_id = revision_id or source_id
         content_hash = content_hash or (None if candidate is None else candidate.content_hash)
         async with db.transaction():
             await db.execute(
@@ -687,7 +812,7 @@ class LegacyGraphFactMigration:
                 "ON CONFLICT(tenant_id, node_id) DO NOTHING",
                 (tenant_id, node_id, content_hash or "", source_id, assertion_id, revision_id, outcome, datetime.now(timezone.utc).isoformat()),
             )
-            if assertion_id is not None and outcome in {"migrated", "idempotent"}:
+            if assertion_id is not None and outcome in {"migrated", "idempotent", "source_appended"}:
                 await db.execute(
                     "INSERT INTO legacy_fact_migration_invalidations "
                     "(tenant_id, migration_name, assertion_id, state, created_at, delivered_at) "
@@ -695,6 +820,19 @@ class LegacyGraphFactMigration:
                     "ON CONFLICT(tenant_id, migration_name, assertion_id) DO NOTHING",
                     (tenant_id, MIGRATION_NAME, assertion_id, datetime.now(timezone.utc).isoformat()),
                 )
+
+    @staticmethod
+    async def _requeue_invalidation(
+        db: Any, tenant_id: str, assertion_id: str
+    ) -> None:
+        """Re-open durable projection work after a canonical withdrawal."""
+        async with db.transaction():
+            await db.execute(
+                "UPDATE legacy_fact_migration_invalidations "
+                "SET state = 'pending', delivered_at = NULL "
+                "WHERE tenant_id = ? AND migration_name = ? AND assertion_id = ?",
+                (tenant_id, MIGRATION_NAME, assertion_id),
+            )
 
     async def _deliver_pending_invalidations(self, db: Any, tenant_id: str) -> bool:
         """Deliver durable projection work; only an acknowledged call is marked done."""

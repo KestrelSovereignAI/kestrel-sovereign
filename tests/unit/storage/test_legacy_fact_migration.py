@@ -168,6 +168,9 @@ async def test_rejects_malformed_unsupported_and_shared_nodes_without_promotion(
             "SELECT COUNT(*) FROM semantic_assertions WHERE tenant_id = ?", (TENANT,)
         )
         assert current[0] == 0
+        # Stable rejected shared ownership is an auditable terminal outcome,
+        # not source drift requiring an impossible reset.
+        assert (await LegacyGraphFactMigration(storage).run()).processed == 0
     finally:
         await storage.close()
 
@@ -190,6 +193,11 @@ async def test_feature_projection_invalidator_observes_only_accepted_assertions(
         assert result.index_invalidation_requested is True
         assert seen[0][0] == TENANT
         assert len(seen[0][1]) == 1
+        rollback = await LegacyGraphFactMigration(
+            storage, index_invalidator=invalidate
+        ).rollback()
+        assert rollback.index_invalidation_requested is True
+        assert len(seen) == 2
     finally:
         await storage.close()
 
@@ -396,8 +404,8 @@ async def test_poisoned_rollback_record_becomes_terminal_refusal_not_repeat_wedg
         await migration.run()
         assert storage.db is not None
         await storage.db.execute(
-            "UPDATE legacy_fact_migration_records SET revision_id = ? WHERE tenant_id = ?",
-            ("poisoned-revision", TENANT),
+            "UPDATE legacy_fact_migration_records SET source_occurrence_id = ? WHERE tenant_id = ?",
+            ("poisoned-source", TENANT),
         )
         refused = await migration.rollback()
         assert refused.rejected == {"rollback_refused_provenance": 1}
@@ -441,6 +449,82 @@ async def test_empty_tenant_is_refused_before_ontology_probe():
     storage.semantic_assertion_binding.return_value = MagicMock(tenant_id="")
     with pytest.raises(LegacyFactMigrationError, match="invalid_migration_tenant"):
         await LegacyGraphFactMigration(storage)._ready()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_claim_rows_append_distinct_provenance_and_rollback_together(tmp_path):
+    storage = await _storage(tmp_path)
+    try:
+        properties = {
+            "subject": "user",
+            "predicate": "preferred_deploy_region",
+            "value": "same-claim",
+            "created_at": "2026-01-01T00:00:00+00:00",
+        }
+        await _node(storage, "fact-duplicate-a", properties)
+        await _node(storage, "fact-duplicate-b", properties)
+        migration = LegacyGraphFactMigration(storage)
+        result = await migration.run(batch_size=2)
+        assert result.migrated == 2
+        assert storage.db is not None
+        records = await storage.db.fetchall(
+            "SELECT assertion_id, source_occurrence_id, outcome FROM legacy_fact_migration_records "
+            "WHERE tenant_id = ? ORDER BY node_id",
+            (TENANT,),
+        )
+        assert records[0][0] == records[1][0]
+        assert records[0][1] != records[1][1]
+        assert [row[2] for row in records] == ["migrated", "source_appended"]
+        sources = await storage.list_assertion_sources(records[0][0])
+        assert {source.source_occurrence_id for source in sources} == {
+            records[0][1],
+            records[1][1],
+        }
+        # The two record rows share one canonical assertion.  A one-row
+        # request must expand to the full source group, not wedge forever.
+        rollback = await migration.rollback(batch_size=1)
+        assert rollback.migrated == 2
+        assert await storage.get_assertion(records[0][0]) is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_source_record_crash_replays_without_second_append(tmp_path, monkeypatch):
+    storage = await _storage(tmp_path)
+    try:
+        properties = {
+            "subject": "user",
+            "predicate": "preferred_deploy_region",
+            "value": "same-after-crash",
+            "created_at": "2026-01-01T00:00:00+00:00",
+        }
+        await _node(storage, "fact-duplicate-crash-a", properties)
+        await _node(storage, "fact-duplicate-crash-b", properties)
+        migration = LegacyGraphFactMigration(storage)
+        original_record = migration._record
+        calls = 0
+
+        async def fail_second_record(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("crash after source append")
+            await original_record(*args, **kwargs)
+
+        monkeypatch.setattr(migration, "_record", fail_second_record)
+        with pytest.raises(RuntimeError, match="crash after source append"):
+            await migration.run(batch_size=2)
+        recovered = await LegacyGraphFactMigration(storage).run(batch_size=2)
+        assert recovered.idempotent == 2
+        assert storage.db is not None
+        assertion_id = await storage.db.fetchone(
+            "SELECT assertion_id FROM legacy_fact_migration_records WHERE tenant_id = ? LIMIT 1",
+            (TENANT,),
+        )
+        assert len(await storage.list_assertion_sources(assertion_id[0])) == 2
+    finally:
+        await storage.close()
 
 
 @pytest.mark.asyncio
