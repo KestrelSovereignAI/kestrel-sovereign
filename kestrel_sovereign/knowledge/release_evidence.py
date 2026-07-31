@@ -1,9 +1,10 @@
-"""Release-evidence catalog and report assembly for semantic knowledge.
+"""Spec-bound semantic release evidence catalog and report assembly.
 
-This module owns the one declarative gate catalog and report orchestration.
-Content-free record validation and benchmark primitives live in
-``release_evidence_models``; the CLI lives in ``release_evidence_cli``.  No
-function here changes semantic feature behavior or imports an optional feature.
+The catalog below is the one source of truth for release gates.  It does not
+record arbitrary argv, test stdout, DSNs, tenant identifiers, or unbound exit
+codes.  A ``passed`` record is accepted only when its immutable spec digest,
+runner/command digest, environment, fixture, and measured observation all
+bind to the current catalog.
 """
 
 from __future__ import annotations
@@ -14,111 +15,342 @@ from importlib import metadata
 import json
 from pathlib import Path
 import platform
-import shlex
-import subprocess
-import sys
+from typing import cast
 
-from .registry import (
-    ExperimentalCapabilityError,
-    SemanticKnowledgeRegistry,
-    StandardsMaturity,
-    get_knowledge_registry,
-)
+from .registry import ExperimentalCapabilityError, SemanticKnowledgeRegistry, StandardsMaturity, get_knowledge_registry
 from .release_evidence_models import (
+    ArtifactReference,
     CompatibilityRetirementDecision,
     EvidenceRecord,
     EvidenceState,
     ErasureStage,
+    ExecutionEnvironment,
     ExternalCapabilityReport,
+    FixtureBinding,
+    FixtureContract,
     GateResult,
     GateSpec,
+    ObservationField,
+    ObservationSchema,
     PerformanceBudget,
     PerformanceMetric,
+    PerformanceTarget,
     ReleaseEvidenceError,
+    RunnerContract,
     StandardsMatrixEntry,
     _canonical_json,
+    _require_digest,
     _require_identifier,
-    _require_reference,
+    _sha256,
     _safe_gate_name,
 )
 
 
-RELEASE_EVIDENCE_SCHEMA_VERSION = 1
-SEMANTIC_RELEASE_CONTRACT = "semantic-kb-v1-release-evidence-v1"
-PARAMETRIC_SELF_EVIDENCE_REPOSITORY = (
-    "KestrelSovereignAI/kestrel-feature-parametric-self"
-)
+RELEASE_EVIDENCE_SCHEMA_VERSION = 2
+SEMANTIC_RELEASE_CONTRACT = "semantic-kb-v1-release-evidence-v2"
+PARAMETRIC_SELF_EVIDENCE_REPOSITORY = "KestrelSovereignAI/kestrel-feature-parametric-self"
 PARAMETRIC_SELF_EVIDENCE_REVISION = "bcbfbb2"
+
+
+def _fixture_binding(fixture_id: str) -> FixtureBinding:
+    return FixtureBinding(
+        fixture_id,
+        _sha256(f"semantic-release-evidence-v2:fixture:{fixture_id}"),
+    )
+
+
+def _fixture(fixture_id: str, harness_id: str, *, official: bool = False) -> FixtureContract:
+    return FixtureContract(_fixture_binding(fixture_id), harness_id, official=official)
+
+
+def _runner(runner_id: str, command_id: str) -> RunnerContract:
+    """Pin a predeclared command pattern by digest without persisting argv."""
+    return RunnerContract(
+        runner_id,
+        command_id,
+        _sha256(f"semantic-release-evidence-v2:runner:{runner_id}:{command_id}"),
+    )
+
+
+def _schema(schema_id: str, *fields: tuple[str, str]) -> ObservationSchema:
+    return ObservationSchema(schema_id, tuple(ObservationField(*field) for field in fields))
+
+
+def _environment(backend: str, mode: str, profile: str = "stable_only") -> ExecutionEnvironment:
+    return ExecutionEnvironment(backend, mode, profile)
+
+
+_CONFORMANCE_STANDARD_IDS = {
+    "rdf11_projection_fixture": "rdf11-concepts-20140225",
+    "rdfs11_inference_fixture": "rdfs-20140225",
+    "owl2rl_inference_fixture": "owl2-profiles-20121211",
+    "shacl2017_core_fixture": "shacl-core-20170720",
+    "sparql11_readonly_fixture": "sparql11-readonly-20130321",
+}
+
+
+def performance_targets() -> tuple[PerformanceTarget, ...]:
+    """Every budget target: both databases and the relevant execution mode."""
+    targets: list[PerformanceTarget] = []
+    for metric in PerformanceMetric:
+        mode = (
+            "kite_http"
+            if metric in {PerformanceMetric.CHANGED_WORK_SLEEP, PerformanceMetric.UNCHANGED_SLEEP}
+            else "startup"
+            if metric is PerformanceMetric.STARTUP
+            else "integration"
+        )
+        unit = "bytes" if metric is PerformanceMetric.STORAGE_GROWTH else "ms"
+        for backend in ("sqlite", "postgres"):
+            targets.append(PerformanceTarget(metric, backend, mode, unit))
+    return tuple(targets)
+
+
+def _gate(
+    gate_id: str,
+    category: str,
+    scope: str,
+    *,
+    runner_id: str,
+    command_id: str,
+    environment: ExecutionEnvironment,
+    fixture: FixtureContract,
+    schema: ObservationSchema,
+    owner: str = "kestrel_core",
+    advertised: bool = True,
+    required_for_ready: bool = True,
+    performance_target: PerformanceTarget | None = None,
+) -> GateSpec:
+    return GateSpec(
+        gate_id,
+        category,
+        scope,
+        _runner(runner_id, command_id),
+        environment,
+        fixture,
+        schema,
+        owner=owner,
+        advertised=advertised,
+        required_for_ready=required_for_ready,
+        performance_target=performance_target,
+    )
+
+
+def release_gate_specs(
+    registry: SemanticKnowledgeRegistry | None = None,
+) -> tuple[GateSpec, ...]:
+    """Return the immutable release catalog; no caller may add a lookalike gate."""
+    selected = registry or get_knowledge_registry()
+    conformance = (
+        _gate(
+            "rdf11_projection_fixture", "conformance", "rdf11_projection",
+            runner_id="pytest", command_id="rdf11_projection_v1",
+            environment=_environment("sqlite", "unit"),
+            fixture=_fixture("official.rdf11_projection.v1", "rdf11_projection_harness_v1", official=True),
+            schema=_schema("rdf11_projection_result_v1", ("case_count", "positive_count"), ("assertion_count", "positive_count")),
+        ),
+        _gate(
+            "rdfs11_inference_fixture", "conformance", "rdfs11_inference",
+            runner_id="pytest", command_id="rdfs11_inference_v1",
+            environment=_environment("sqlite", "unit"),
+            fixture=_fixture("official.rdfs11_inference.v1", "rdfs11_inference_harness_v1", official=True),
+            schema=_schema("rdfs11_inference_result_v1", ("case_count", "positive_count"), ("derivation_count", "positive_count")),
+        ),
+        _gate(
+            "owl2rl_inference_fixture", "conformance", "owl2rl_inference",
+            runner_id="pytest", command_id="owl2rl_inference_v1",
+            environment=_environment("sqlite", "unit"),
+            fixture=_fixture("official.owl2rl_inference.v1", "owl2rl_inference_harness_v1", official=True),
+            schema=_schema("owl2rl_inference_result_v1", ("case_count", "positive_count"), ("derivation_count", "positive_count")),
+        ),
+        _gate(
+            "shacl2017_core_fixture", "conformance", "shacl2017_core",
+            runner_id="pytest", command_id="shacl2017_core_v1",
+            environment=_environment("sqlite", "unit"),
+            fixture=_fixture("official.shacl2017_core.v1", "shacl2017_core_harness_v1", official=True),
+            schema=_schema("shacl2017_core_result_v1", ("case_count", "positive_count"), ("report_count", "positive_count")),
+        ),
+        _gate(
+            "sparql11_readonly_fixture", "conformance", "sparql11_readonly",
+            runner_id="pytest", command_id="sparql11_readonly_v1",
+            environment=_environment("sqlite", "unit"),
+            fixture=_fixture("official.sparql11_readonly.v1", "sparql11_readonly_harness_v1", official=True),
+            schema=_schema("sparql11_readonly_result_v1", ("case_count", "positive_count"), ("query_count", "positive_count")),
+        ),
+        _gate(
+            "rdf12_triple_term_fixture", "conformance", "rdf12_triple_terms",
+            runner_id="pytest", command_id="rdf12_triple_terms_v1",
+            environment=_environment("sqlite", "unit", "experimental_enabled"),
+            fixture=_fixture("draft.rdf12_triple_terms.v1", "rdf12_harness_v1"),
+            schema=_schema("rdf12_result_v1", ("case_count", "positive_count")),
+            advertised=False, required_for_ready=False,
+        ),
+        _gate(
+            "shacl12_fixture", "conformance", "shacl12",
+            runner_id="pytest", command_id="shacl12_v1",
+            environment=_environment("sqlite", "unit", "experimental_enabled"),
+            fixture=_fixture("draft.shacl12.v1", "shacl12_harness_v1"),
+            schema=_schema("shacl12_result_v1", ("case_count", "positive_count")),
+            advertised=False, required_for_ready=False,
+        ),
+        _gate(
+            "sparql12_fixture", "conformance", "sparql12",
+            runner_id="pytest", command_id="sparql12_v1",
+            environment=_environment("sqlite", "unit", "experimental_enabled"),
+            fixture=_fixture("draft.sparql12.v1", "sparql12_harness_v1"),
+            schema=_schema("sparql12_result_v1", ("case_count", "positive_count")),
+            advertised=False, required_for_ready=False,
+        ),
+    )
+    stable_selection = (
+        _gate(
+            "stable_only_capability_selection", "capability_selection", "experimental_selection_rejected",
+            runner_id="registry", command_id="stable_only_capability_selection_v1",
+            environment=_environment("none", "registry_contract"),
+            fixture=_fixture("stable_only_selection.v1", "registry_selection_harness_v1"),
+            schema=_schema("stable_only_selection_result_v1", ("rejected_capability_count", "positive_count")),
+        ),
+    )
+    parity = tuple(
+        _gate(
+            f"{backend}_{surface}", "backend_parity", f"{backend}:{surface}",
+            runner_id="pytest", command_id=f"backend_parity_{surface}_v1",
+            environment=_environment(backend, "integration"),
+            fixture=_fixture(f"backend_parity.{surface}.v1", "storage_parity_harness_v1"),
+            schema=_schema(f"backend_parity_{surface}_result_v1", ("scenario_count", "positive_count"), ("assertion_count", "positive_count")),
+        )
+        for backend in ("sqlite", "postgres")
+        for surface in (
+            "assertion", "ownership_privacy", "validation", "inference_retraction",
+            "migration", "corpus_export", "retrieval",
+        )
+    )
+    performance = tuple(
+        _gate(
+            f"performance_{target.gate_suffix}", "performance", target.gate_suffix,
+            runner_id="semantic_benchmark", command_id=f"benchmark_{target.gate_suffix}_v1",
+            environment=_environment(target.backend, target.mode),
+            fixture=_fixture(f"benchmark.{target.gate_suffix}.v1", "semantic_benchmark_harness_v1"),
+            schema=_schema(
+                f"benchmark_{target.gate_suffix}_result_v1",
+                ("sample_count", "sample_count"),
+                (("p95_bytes" if target.unit == "bytes" else "p95_ms"), ("positive_bytes" if target.unit == "bytes" else "positive_duration_ms")),
+            ),
+            performance_target=target,
+        )
+        for target in performance_targets()
+    )
+    erasure = tuple(
+        _gate(
+            f"erasure_{stage.value}", "erasure", stage.value,
+            runner_id="kite_http", command_id=f"erasure_{stage.value}_v1",
+            environment=_environment("dual_backend", "kite_http"),
+            fixture=_fixture("erasure_drill.v1", "erasure_drill_harness_v1"),
+            schema=_schema("erasure_result_v1", ("erased_count", "positive_count"), ("remaining_count", "zero_count")),
+            owner="parametric_self" if stage is ErasureStage.SERVED_ADAPTER_ELIGIBILITY else "kestrel_core",
+        )
+        for stage in ErasureStage
+    )
+    external = tuple(
+        _gate(
+            gate_id, "external_adapter", gate_id,
+            runner_id="external_ci", command_id=f"{gate_id}_v1",
+            environment=_environment("dual_backend", "external_adapter"),
+            fixture=_fixture("parametric_self_erasure.v1", "external_adapter_harness_v1"),
+            schema=_schema("external_adapter_result_v1", ("erased_count", "positive_count"), ("remaining_count", "zero_count")),
+            owner="parametric_self",
+        )
+        for gate_id in (
+            "external_corpus_consumed", "external_candidate_invalidated", "external_served_eligibility_rejected",
+        )
+    )
+    diagnostics = (
+        _gate(
+            "semantic_maintenance_diagnostics_contract", "diagnostics", "content_free_maintenance_diagnostics",
+            runner_id="pytest", command_id="semantic_maintenance_diagnostics_v1",
+            environment=_environment("sqlite", "unit"),
+            fixture=_fixture("semantic_maintenance_diagnostics.v1", "diagnostics_harness_v1"),
+            schema=_schema("diagnostics_result_v1", ("diagnostic_count", "positive_count"), ("redaction_violation_count", "zero_count")),
+        ),
+    )
+    compatibility = (
+        _gate(
+            "legacy_fact_migration_equivalence", "compatibility_retirement", "legacy_fact_migration_compatibility",
+            runner_id="pytest", command_id="legacy_fact_migration_equivalence_v1",
+            environment=_environment("dual_backend", "integration"),
+            fixture=_fixture("legacy_fact_migration.v1", "legacy_migration_harness_v1"),
+            schema=_schema("legacy_migration_result_v1", ("scenario_count", "positive_count"), ("mismatch_count", "zero_count")),
+            required_for_ready=False,
+        ),
+    )
+    # Read the registry to retain its fail-closed initialization check.  The
+    # resulting capability list is intentionally *not* a passing record.
+    if not _experimental_capabilities(selected):
+        raise ReleaseEvidenceError("stable-only release catalog requires experimental capabilities")
+    return conformance + stable_selection + parity + performance + erasure + external + diagnostics + compatibility
 
 
 @dataclass(frozen=True, slots=True)
 class SemanticReleaseEvidence:
-    """One report assembled strictly from the declared release gates."""
+    """One report whose readiness is recomputed from the immutable catalog."""
 
     standards: tuple[StandardsMatrixEntry, ...]
     libraries: Mapping[str, str]
     profile: Mapping[str, object]
     gates: tuple[GateResult, ...]
-    performance_budgets: Mapping[PerformanceMetric, PerformanceBudget | None]
+    performance_budgets: Mapping[PerformanceTarget, PerformanceBudget | None]
     external_capabilities: tuple[ExternalCapabilityReport, ...]
     compatibility_retirement: tuple[CompatibilityRetirementDecision, ...]
     schema_version: int = RELEASE_EVIDENCE_SCHEMA_VERSION
     contract: str = SEMANTIC_RELEASE_CONTRACT
 
     def __post_init__(self) -> None:
-        if self.schema_version != RELEASE_EVIDENCE_SCHEMA_VERSION:
-            raise ReleaseEvidenceError("unsupported semantic release evidence schema")
-        if self.contract != SEMANTIC_RELEASE_CONTRACT:
+        if self.schema_version != RELEASE_EVIDENCE_SCHEMA_VERSION or self.contract != SEMANTIC_RELEASE_CONTRACT:
             raise ReleaseEvidenceError("unsupported semantic release evidence contract")
-        if not self.standards or not self.libraries or not self.profile or not self.gates:
-            raise ReleaseEvidenceError("release evidence requires matrix, libraries, profile, and gates")
-        if any(not isinstance(item, GateResult) for item in self.gates):
-            raise ReleaseEvidenceError("release evidence gates must be GateResult values")
-        gate_ids = [item.spec.gate_id for item in self.gates]
-        if len(set(gate_ids)) != len(gate_ids):
-            raise ReleaseEvidenceError("release evidence cannot repeat a gate_id")
-        if set(self.performance_budgets) != set(PerformanceMetric):
-            raise ReleaseEvidenceError("release evidence requires every performance budget slot")
-        for metric, budget in self.performance_budgets.items():
-            if not isinstance(metric, PerformanceMetric):
-                raise ReleaseEvidenceError("performance budget keys must be PerformanceMetric")
-            if budget is not None and (
-                not isinstance(budget, PerformanceBudget) or budget.metric is not metric
-            ):
-                raise ReleaseEvidenceError("performance budget must match its workload metric")
-        known = set(gate_ids)
-        declared_external = {
-            gate.spec.gate_id
+        if not self.standards or not self.profile or not self.gates:
+            raise ReleaseEvidenceError("release evidence requires matrix, profile, and gates")
+        required_libraries = {"python", "rdflib", "kestrel_sovereign"}
+        if set(self.libraries) != required_libraries:
+            raise ReleaseEvidenceError("release evidence requires the exact runtime library set")
+        if any(not isinstance(value, str) or not value or value == "unavailable" for value in self.libraries.values()):
+            raise ReleaseEvidenceError("missing library version blocks release evidence")
+        expected_specs = {spec.gate_id: spec for spec in release_gate_specs()}
+        supplied_specs = {gate.spec.gate_id: gate.spec for gate in self.gates}
+        if set(supplied_specs) != set(expected_specs) or any(
+            supplied_specs[key].digest != expected_specs[key].digest for key in expected_specs
+        ):
+            raise ReleaseEvidenceError("report gates do not match the immutable release catalog")
+        expected_targets = set(performance_targets())
+        if set(self.performance_budgets) != expected_targets:
+            raise ReleaseEvidenceError("release evidence requires every backend/mode performance target")
+        spec_by_target = {
+            gate.spec.performance_target: gate.spec
             for gate in self.gates
-            if gate.spec.category == "external_adapter"
+            if gate.spec.performance_target is not None
         }
-        reported_external: set[str] = set()
-        for external in self.external_capabilities:
-            if not isinstance(external, ExternalCapabilityReport) or not set(
-                external.gate_ids
-            ).issubset(known):
-                raise ReleaseEvidenceError("external capability report references an unknown gate")
-            reported_external.update(external.gate_ids)
-        if reported_external != declared_external:
-            raise ReleaseEvidenceError(
-                "external capability reports must cover every declared adapter gate"
-            )
+        for target, budget in self.performance_budgets.items():
+            if budget is not None:
+                budget.validate_against(spec_by_target[target])
+        if len(self.compatibility_retirement) != 1:
+            raise ReleaseEvidenceError("release evidence requires one compatibility decision")
 
     @property
     def ready(self) -> bool:
         return all(gate.ready for gate in self.gates) and all(
-            self.performance_budgets[metric] is not None for metric in PerformanceMetric
+            budget is not None for budget in self.performance_budgets.values()
         )
 
     def blocking_gate_ids(self) -> tuple[str, ...]:
         blocking = {
             gate.spec.gate_id
             for gate in self.gates
-            if gate.spec.required_for_ready and not gate.evidence.passed
+            if gate.spec.required_for_ready and not gate.ready
         }
-        for metric in PerformanceMetric:
-            if self.performance_budgets[metric] is None:
-                blocking.add(f"performance_{metric.value}")
+        blocking.update(
+            f"performance_{target.gate_suffix}"
+            for target, budget in self.performance_budgets.items()
+            if budget is None
+        )
         return tuple(sorted(blocking))
 
     def to_mapping(self) -> dict[str, object]:
@@ -130,41 +362,24 @@ class SemanticReleaseEvidence:
             "standards": [entry.to_mapping() for entry in self.standards],
             "libraries": dict(sorted(self.libraries.items())),
             "profile": dict(self.profile),
-            "gates": [
-                gate.to_mapping()
-                for gate in sorted(self.gates, key=lambda item: item.spec.gate_id)
-            ],
+            "gates": [gate.to_mapping() for gate in sorted(self.gates, key=lambda item: item.spec.gate_id)],
             "performance_budgets": [
-                {
-                    "metric": metric.value,
-                    "budget": (
-                        self.performance_budgets[metric].to_mapping()
-                        if self.performance_budgets[metric] is not None
-                        else None
-                    ),
-                }
-                for metric in PerformanceMetric
+                {"target": target.to_mapping(), "budget": budget.to_mapping() if budget else None}
+                for target, budget in sorted(self.performance_budgets.items(), key=lambda item: item[0].gate_suffix)
             ],
-            "external_capabilities": [
-                item.to_mapping()
-                for item in sorted(
-                    self.external_capabilities, key=lambda item: item.capability_id
-                )
-            ],
-            "compatibility_retirement": [
-                item.to_mapping()
-                for item in sorted(
-                    self.compatibility_retirement, key=lambda item: item.path_id
-                )
-            ],
+            "external_capabilities": [item.to_mapping() for item in self.external_capabilities],
+            "compatibility_retirement": [item.to_mapping() for item in self.compatibility_retirement],
         }
 
 
-def build_standards_matrix(
-    registry: SemanticKnowledgeRegistry | None = None,
-) -> tuple[StandardsMatrixEntry, ...]:
-    """Return every exact offline-verified semantic registry resource pin."""
+def build_standards_matrix(registry: SemanticKnowledgeRegistry | None = None) -> tuple[StandardsMatrixEntry, ...]:
+    """Return exact registry pins plus official fixture/harness metadata."""
     selected = registry or get_knowledge_registry()
+    fixture_by_standard = {
+        _CONFORMANCE_STANDARD_IDS[spec.gate_id]: spec.fixture
+        for spec in release_gate_specs(selected)
+        if spec.gate_id in _CONFORMANCE_STANDARD_IDS
+    }
     return tuple(
         StandardsMatrixEntry(
             identifier=resource.identifier,
@@ -175,185 +390,41 @@ def build_standards_matrix(
             published_date=resource.published_date,
             sha256=resource.sha256,
             capabilities=tuple(sorted(resource.capabilities)),
+            fixture=fixture_by_standard.get(resource.identifier),
         )
         for resource in selected.resources
     )
 
 
 def implementation_versions() -> dict[str, str]:
-    """Capture the runtime/library versions influencing a conformance run."""
     return {
         "python": platform.python_version(),
-        "implementation": platform.python_implementation(),
         "rdflib": _distribution_version("rdflib"),
         "kestrel_sovereign": _distribution_version("kestrel-sovereign"),
     }
 
 
-def release_gate_specs(
-    registry: SemanticKnowledgeRegistry | None = None,
-) -> tuple[GateSpec, ...]:
-    """Build every release gate from one declarative catalog.
-
-    Draft registry capabilities are discovered instead of duplicated, so adding
-    a 1.2 capability necessarily adds a stable-only rejection check.
-    """
+def inspect_stable_only_capabilities(registry: SemanticKnowledgeRegistry | None = None) -> Mapping[str, int]:
+    """Run the registry check but never silently convert it into a passed gate."""
     selected = registry or get_knowledge_registry()
-    fixtures = (
-        GateSpec("rdf11_projection_fixture", "conformance", "rdf11_projection"),
-        GateSpec("rdfs11_inference_fixture", "conformance", "rdfs11_inference"),
-        GateSpec("owl2rl_inference_fixture", "conformance", "owl2rl_inference"),
-        GateSpec("shacl2017_core_fixture", "conformance", "shacl2017_core"),
-        GateSpec("sparql11_readonly_fixture", "conformance", "sparql11_readonly"),
-        GateSpec(
-            "rdf12_triple_term_fixture",
-            "conformance",
-            "rdf12_triple_terms",
-            advertised=False,
-            required_for_ready=False,
-        ),
-        GateSpec(
-            "shacl12_fixture",
-            "conformance",
-            "shacl12",
-            advertised=False,
-            required_for_ready=False,
-        ),
-        GateSpec(
-            "sparql12_fixture",
-            "conformance",
-            "sparql12",
-            advertised=False,
-            required_for_ready=False,
-        ),
-    )
-    stable_only = tuple(
-        GateSpec(
-            f"stable_only_{_safe_gate_name(capability)}", "stable_only", capability
-        )
-        for capability in _experimental_capabilities(selected)
-    )
-    parity = tuple(
-        GateSpec(f"{backend}_{surface}", "backend_parity", f"{backend}:{surface}")
-        for backend in ("sqlite", "postgres")
-        for surface in (
-            "assertion",
-            "ownership_privacy",
-            "validation",
-            "inference_retraction",
-            "migration",
-            "corpus_export",
-            "retrieval",
-        )
-    )
-    performance = tuple(
-        GateSpec(f"performance_{metric.value}", "performance", metric.value)
-        for metric in PerformanceMetric
-    )
-    erasure = tuple(
-        GateSpec(
-            f"erasure_{stage.value}",
-            "erasure",
-            stage.value,
-            owner=(
-                "parametric_self"
-                if stage is ErasureStage.SERVED_ADAPTER_ELIGIBILITY
-                else "kestrel_core"
-            ),
-        )
-        for stage in ErasureStage
-    )
-    external = tuple(
-        GateSpec(gate_id, "external_adapter", gate_id, owner="parametric_self")
-        for gate_id in (
-            "external_corpus_consumed",
-            "external_candidate_invalidated",
-            "external_served_eligibility_rejected",
-        )
-    )
-    live_agent = (
-        GateSpec(
-            "kite_http_invoke_release_drill",
-            "live_agent",
-            "recall_provenance:contradiction:quarantine:sleep:restart:erasure",
-        ),
-    )
-    compatibility = (
-        GateSpec(
-            "legacy_fact_migration_equivalence",
-            "compatibility_retirement",
-            "legacy_fact_migration_compatibility",
-            required_for_ready=False,
-        ),
-    )
-    return (
-        fixtures
-        + stable_only
-        + parity
-        + performance
-        + erasure
-        + external
-        + live_agent
-        + compatibility
-    )
-
-
-def inspect_stable_only_capabilities(
-    registry: SemanticKnowledgeRegistry | None = None,
-) -> tuple[EvidenceRecord, ...]:
-    """Prove the default codec and registry reject every draft capability."""
-    selected = registry or get_knowledge_registry()
-    # Reading a prior report should not load the RDF implementation.
-    from .rdf_codec import RdfAssertionCodec, RdfCodecConfiguration
-
-    codec = RdfAssertionCodec(registry=selected, configuration=RdfCodecConfiguration())
-    if codec.capability_report.rdf12 is not None or codec.capability_report.sparql12 is not None:
-        raise ReleaseEvidenceError("stable-only codec unexpectedly selected a draft capability")
-    records: list[EvidenceRecord] = []
+    rejected = 0
     for capability in _experimental_capabilities(selected):
         try:
             selected.select_capability(capability)
         except ExperimentalCapabilityError:
-            records.append(
-                EvidenceRecord(
-                    gate_id=f"stable_only_{_safe_gate_name(capability)}",
-                    state=EvidenceState.PASSED,
-                    command=f"registry.select_capability({capability})",
-                    exit_code=0,
-                    artifact_ref="in-process stable-only registry selection",
-                )
-            )
+            rejected += 1
         else:
-            raise ReleaseEvidenceError(
-                f"stable-only registry unexpectedly selected experimental {capability!r}"
-            )
-    if not records:
-        raise ReleaseEvidenceError("stable-only evidence requires experimental capabilities")
-    return tuple(records)
+            raise ReleaseEvidenceError("stable-only registry selected an experimental capability")
+    if rejected == 0:
+        raise ReleaseEvidenceError("stable-only registry check found no experimental capability")
+    return {"rejected_capability_count": rejected}
 
 
-def release_evidence_template(
-    registry: SemanticKnowledgeRegistry | None = None,
-) -> SemanticReleaseEvidence:
-    """Generate a current report whose unobserved work remains explicitly blocked."""
+def release_evidence_template(registry: SemanticKnowledgeRegistry | None = None) -> SemanticReleaseEvidence:
     selected = registry or get_knowledge_registry()
-    stable_only = {record.gate_id: record for record in inspect_stable_only_capabilities(selected)}
-    gates = tuple(
-        GateResult(spec, stable_only.get(spec.gate_id, spec.initial_evidence()))
-        for spec in release_gate_specs(selected)
-    )
-    retirement = CompatibilityRetirementDecision(
-        path_id="legacy_fact_migration_compatibility",
-        observed_window_ref=None,
-        inventory_complete=False,
-        unmigrated_eligible_rows=None,
-        required_consumer_count=None,
-        migration_equivalence=next(
-            item.evidence
-            for item in gates
-            if item.spec.gate_id == "legacy_fact_migration_equivalence"
-        ),
-    )
+    specs = release_gate_specs(selected)
+    gates = tuple(GateResult(spec, spec.initial_evidence()) for spec in specs)
+    migration = next(gate.evidence for gate in gates if gate.spec.gate_id == "legacy_fact_migration_equivalence")
     return SemanticReleaseEvidence(
         standards=build_standards_matrix(selected),
         libraries=implementation_versions(),
@@ -363,28 +434,27 @@ def release_evidence_template(
             "disabled_experimental_capabilities": list(_experimental_capabilities(selected)),
         },
         gates=gates,
-        performance_budgets={metric: None for metric in PerformanceMetric},
+        performance_budgets={target: None for target in performance_targets()},
         external_capabilities=(
             ExternalCapabilityReport(
                 capability_id="parametric_self_governed_corpus",
                 repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
                 source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
-                gate_ids=(
-                    "external_corpus_consumed",
-                    "external_candidate_invalidated",
-                    "external_served_eligibility_rejected",
-                ),
+                gate_ids=("external_corpus_consumed", "external_candidate_invalidated", "external_served_eligibility_rejected"),
             ),
         ),
-        compatibility_retirement=(retirement,),
+        compatibility_retirement=(CompatibilityRetirementDecision(
+            path_id="legacy_fact_migration_compatibility",
+            observed_window_ref=None,
+            inventory_complete=False,
+            unmigrated_eligible_rows=None,
+            required_consumer_count=None,
+            migration_equivalence=migration,
+        ),),
     )
 
 
-def apply_evidence_records(
-    evidence: SemanticReleaseEvidence,
-    records: Iterable[EvidenceRecord],
-) -> SemanticReleaseEvidence:
-    """Apply only declared evidence records; unknown or duplicate gates fail closed."""
+def apply_evidence_records(evidence: SemanticReleaseEvidence, records: Iterable[EvidenceRecord]) -> SemanticReleaseEvidence:
     supplied = tuple(records)
     updates = {record.gate_id: record for record in supplied}
     if len(updates) != len(supplied):
@@ -392,170 +462,134 @@ def apply_evidence_records(
     known = {gate.spec.gate_id for gate in evidence.gates}
     unknown = sorted(set(updates) - known)
     if unknown:
-        raise ReleaseEvidenceError(
-            "evidence records do not match declared template gates: " + ", ".join(unknown)
-        )
-    gates = tuple(
-        replace(gate, evidence=updates.get(gate.spec.gate_id, gate.evidence))
-        for gate in evidence.gates
-    )
+        raise ReleaseEvidenceError("evidence records do not match declared template gates: " + ", ".join(unknown))
+    gates = tuple(replace(gate, evidence=updates.get(gate.spec.gate_id, gate.evidence)) for gate in evidence.gates)
     retirement = tuple(
-        replace(
-            decision,
-            migration_equivalence=updates.get(
-                decision.migration_equivalence.gate_id, decision.migration_equivalence
-            ),
-        )
+        replace(decision, migration_equivalence=updates.get(decision.migration_equivalence.gate_id, decision.migration_equivalence))
         for decision in evidence.compatibility_retirement
     )
     return replace(evidence, gates=gates, compatibility_retirement=retirement)
 
 
-def apply_performance_budgets(
-    evidence: SemanticReleaseEvidence,
-    budgets: Iterable[PerformanceBudget],
-) -> SemanticReleaseEvidence:
-    """Attach measured budgets only after their matching workload command passed."""
+def apply_performance_budgets(evidence: SemanticReleaseEvidence, budgets: Iterable[PerformanceBudget]) -> SemanticReleaseEvidence:
     supplied = tuple(budgets)
-    updates = {budget.metric: budget for budget in supplied}
+    updates = {budget.target: budget for budget in supplied}
     if len(updates) != len(supplied):
-        raise ReleaseEvidenceError("performance budgets must not repeat a metric")
-    gate_evidence = {item.spec.gate_id: item.evidence for item in evidence.gates}
-    for metric in updates:
-        if not gate_evidence[f"performance_{metric.value}"].passed:
-            raise ReleaseEvidenceError(
-                f"performance budget {metric.value} requires passing command evidence first"
-            )
+        raise ReleaseEvidenceError("performance budgets must not repeat a backend/mode target")
+    gate_by_id = {gate.spec.gate_id: gate for gate in evidence.gates}
+    for target, budget in updates.items():
+        gate = gate_by_id.get(budget.gate_id)
+        if gate is None or not gate.evidence.passed:
+            raise ReleaseEvidenceError("performance budget requires its spec-bound passing gate")
+        budget.validate_against(gate.spec)
     return replace(evidence, performance_budgets={**evidence.performance_budgets, **updates})
 
 
-def evidence_record_from_mapping(value: Mapping[str, object]) -> EvidenceRecord:
-    """Parse one externally produced content-free evidence record."""
+def _expect_mapping(value: object, field: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
-        raise ReleaseEvidenceError("evidence record must be a mapping")
+        raise ReleaseEvidenceError(f"{field} must be a mapping")
+    return cast(Mapping[str, object], value)
+
+
+def _strict_keys(value: Mapping[str, object], expected: set[str], field: str) -> None:
+    if set(value) != expected:
+        raise ReleaseEvidenceError(f"{field} has unknown or missing fields")
+
+
+def _environment_from_mapping(value: object) -> ExecutionEnvironment | None:
+    if value is None:
+        return None
+    mapping = _expect_mapping(value, "environment")
+    _strict_keys(mapping, {"backend", "mode", "profile"}, "environment")
+    return ExecutionEnvironment(cast(str, mapping["backend"]), cast(str, mapping["mode"]), cast(str, mapping["profile"]))
+
+
+def _fixture_from_mapping(value: object) -> FixtureBinding | None:
+    if value is None:
+        return None
+    mapping = _expect_mapping(value, "fixture")
+    _strict_keys(mapping, {"fixture_id", "fixture_digest"}, "fixture")
+    return FixtureBinding(cast(str, mapping["fixture_id"]), cast(str, mapping["fixture_digest"]))
+
+
+def _artifact_from_mapping(value: object) -> ArtifactReference | None:
+    if value is None:
+        return None
+    mapping = _expect_mapping(value, "artifact")
+    _strict_keys(mapping, {"artifact_ref", "artifact_digest"}, "artifact")
+    return ArtifactReference(cast(str, mapping["artifact_ref"]), cast(str, mapping["artifact_digest"]))
+
+
+def evidence_record_from_mapping(value: Mapping[str, object]) -> EvidenceRecord:
+    mapping = _expect_mapping(value, "evidence record")
+    expected = {
+        "gate_id", "state", "gate_spec_digest", "runner_id", "command_id", "command_digest",
+        "environment", "environment_digest", "fixture", "observation", "artifact", "run_digest",
+        "reason_code", "outside_advertised_capability",
+    }
+    _strict_keys(mapping, expected, "evidence record")
     try:
-        state = EvidenceState(value["state"])
-    except (KeyError, ValueError) as error:
+        state = EvidenceState(cast(str, mapping["state"]))
+    except ValueError as error:
         raise ReleaseEvidenceError("evidence record has an invalid state") from error
+    observation = mapping["observation"]
     return EvidenceRecord(
-        gate_id=value.get("gate_id"),
-        state=state,
-        command=value.get("command"),
-        exit_code=value.get("exit_code"),
-        artifact_ref=value.get("artifact_ref"),
-        reason_code=value.get("reason_code"),
-        outside_advertised_capability=value.get("outside_advertised_capability", False),
+        gate_id=cast(str, mapping["gate_id"]), state=state,
+        gate_spec_digest=cast(str | None, mapping["gate_spec_digest"]), runner_id=cast(str | None, mapping["runner_id"]),
+        command_id=cast(str | None, mapping["command_id"]), command_digest=cast(str | None, mapping["command_digest"]),
+        environment=_environment_from_mapping(mapping["environment"]), environment_digest=cast(str | None, mapping["environment_digest"]),
+        fixture=_fixture_from_mapping(mapping["fixture"]), observation=_expect_mapping(observation, "observation") if observation is not None else None,
+        artifact=_artifact_from_mapping(mapping["artifact"]), run_digest=cast(str | None, mapping["run_digest"]),
+        reason_code=cast(str | None, mapping["reason_code"]), outside_advertised_capability=cast(bool, mapping["outside_advertised_capability"]),
     )
 
 
 def performance_budget_from_mapping(value: Mapping[str, object]) -> PerformanceBudget:
-    """Parse a measured workload budget from a separate benchmark artifact."""
-    if not isinstance(value, Mapping):
-        raise ReleaseEvidenceError("performance budget must be a mapping")
-    try:
-        metric = PerformanceMetric(value["metric"])
-        samples = tuple(float(sample) for sample in value["samples_ms"])
-    except (KeyError, TypeError, ValueError) as error:
-        raise ReleaseEvidenceError("performance budget has invalid metric or samples") from error
-    return PerformanceBudget(
-        metric=metric,
-        samples_ms=samples,
-        p95_ms=value.get("p95_ms"),
-        budget_ms=value.get("budget_ms"),
-        headroom_fraction=value.get("headroom_fraction"),
-        fixture_digest=value.get("fixture_digest"),
-    )
+    mapping = _expect_mapping(value, "performance budget")
+    expected = {"target", "gate_id", "gate_spec_digest", "samples", "p95", "budget", "headroom_fraction", "fixture", "environment", "artifact", "run_digest"}
+    _strict_keys(mapping, expected, "performance budget")
+    target_value = _expect_mapping(mapping["target"], "performance target")
+    _strict_keys(target_value, {"metric", "backend", "mode", "unit"}, "performance target")
+    target = PerformanceTarget(PerformanceMetric(cast(str, target_value["metric"])), cast(str, target_value["backend"]), cast(str, target_value["mode"]), cast(str, target_value["unit"]))
+    samples = mapping["samples"]
+    if not isinstance(samples, list):
+        raise ReleaseEvidenceError("performance samples must be a list")
+    fixture = _fixture_from_mapping(mapping["fixture"])
+    environment = _environment_from_mapping(mapping["environment"])
+    artifact = _artifact_from_mapping(mapping["artifact"])
+    if fixture is None or environment is None or artifact is None:
+        raise ReleaseEvidenceError("performance budget requires fixture, environment, and artifact")
+    return PerformanceBudget(target, cast(str, mapping["gate_id"]), cast(str, mapping["gate_spec_digest"]), tuple(cast(list[float | int], samples)), cast(float | int, mapping["p95"]), cast(float | int, mapping["budget"]), cast(float, mapping["headroom_fraction"]), fixture, environment, artifact, cast(str, mapping["run_digest"]))
 
 
-def run_command_evidence(
-    gate_id: str,
-    command: Sequence[str],
-    *,
-    artifact_ref: str,
-    cwd: Path | None = None,
-) -> EvidenceRecord:
-    """Run one command and retain only its content-free exit result."""
-    _require_identifier(gate_id, "gate_id")
-    if not command or any(not isinstance(token, str) or not token for token in command):
-        raise ReleaseEvidenceError("evidence command must be a non-empty string sequence")
-    _require_reference(artifact_ref, "artifact_ref")
-    result = subprocess.run(tuple(command), cwd=cwd, check=False)
-    rendered = shlex.join(command)
-    if result.returncode == 0:
-        return EvidenceRecord(
-            gate_id=gate_id,
-            state=EvidenceState.PASSED,
-            command=rendered,
-            exit_code=0,
-            artifact_ref=artifact_ref,
-        )
-    return EvidenceRecord(
-        gate_id=gate_id,
-        state=EvidenceState.FAILED,
-        command=rendered,
-        exit_code=result.returncode,
-        artifact_ref=artifact_ref,
-        reason_code="command_failed",
-    )
+def run_command_evidence(*_args: object, **_kwargs: object) -> EvidenceRecord:
+    """Refuse arbitrary argv; the CLI is migrated to predeclared runners next."""
+    raise ReleaseEvidenceError("generic argv execution cannot create release-ready evidence")
 
 
-def write_release_evidence(
-    evidence: SemanticReleaseEvidence,
-    output: Path,
-    *,
-    overwrite: bool = False,
-) -> None:
-    """Write canonical JSON without silently replacing a report."""
+def write_release_evidence(evidence: SemanticReleaseEvidence, output: Path, *, overwrite: bool = False) -> None:
     _write_json(evidence.to_mapping(), output, overwrite=overwrite, kind="evidence artifact")
 
 
-def write_evidence_record(
-    record: EvidenceRecord,
-    output: Path,
-    *,
-    overwrite: bool = False,
-) -> None:
-    """Write one standalone record for local or cross-repository exchange."""
+def write_evidence_record(record: EvidenceRecord, output: Path, *, overwrite: bool = False) -> None:
     _write_json(record.to_mapping(), output, overwrite=overwrite, kind="evidence record")
 
 
-def write_performance_budget(
-    budget: PerformanceBudget,
-    output: Path,
-    *,
-    overwrite: bool = False,
-) -> None:
-    """Write a measured budget separately from command-result evidence."""
+def write_performance_budget(budget: PerformanceBudget, output: Path, *, overwrite: bool = False) -> None:
     _write_json(budget.to_mapping(), output, overwrite=overwrite, kind="performance budget")
 
 
 def _experimental_capabilities(registry: SemanticKnowledgeRegistry) -> tuple[str, ...]:
-    return tuple(
-        sorted(
-            capability
-            for resource in registry.resources
-            if resource.maturity is StandardsMaturity.EXPERIMENTAL
-            for capability in resource.capabilities
-        )
-    )
+    return tuple(sorted(capability for resource in registry.resources if resource.maturity is StandardsMaturity.EXPERIMENTAL for capability in resource.capabilities))
 
 
 def _stable_capabilities(registry: SemanticKnowledgeRegistry) -> tuple[str, ...]:
-    return tuple(
-        sorted(
-            capability
-            for resource in registry.resources
-            if resource.maturity is StandardsMaturity.STABLE
-            for capability in resource.capabilities
-        )
-    )
+    return tuple(sorted(capability for resource in registry.resources if resource.maturity is StandardsMaturity.STABLE for capability in resource.capabilities))
 
 
 def _write_json(value: Mapping[str, object], output: Path, *, overwrite: bool, kind: str) -> None:
     if output.exists() and not overwrite:
-        raise ReleaseEvidenceError(
-            f"refusing to replace existing {kind} {output}; pass --overwrite"
-        )
+        raise ReleaseEvidenceError(f"refusing to replace existing {kind} {output}; pass --overwrite")
     if not output.parent.exists():
         raise ReleaseEvidenceError(f"{kind} output parent does not exist: {output.parent}")
     output.write_text(_canonical_json(value) + "\n", encoding="utf-8")
@@ -569,11 +603,9 @@ def _distribution_version(distribution: str) -> str:
 
 
 def _main(argv: Sequence[str] | None = None) -> int:
-    """Compatibility wrapper for ``python -m ...release_evidence``."""
     from .release_evidence_cli import main
-
     return main(argv)
 
 
-if __name__ == "__main__":  # pragma: no cover - subprocess tests cover the CLI.
+if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(_main())

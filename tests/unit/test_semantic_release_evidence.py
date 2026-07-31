@@ -1,384 +1,204 @@
-"""Contracts for the semantic release-evidence runner (#2753)."""
+"""Adversarial contracts for spec-bound semantic release evidence."""
 
 from __future__ import annotations
 
-import asyncio
-import json
-from pathlib import Path
-import subprocess
-import sys
+from dataclasses import replace
 
 import pytest
 
 from kestrel_sovereign.knowledge.release_evidence import (
+    ArtifactReference,
     EvidenceRecord,
     EvidenceState,
+    ExecutionEnvironment,
     GateResult,
-    GateSpec,
     PerformanceBudget,
     PerformanceMetric,
+    PerformanceTarget,
     ReleaseEvidenceError,
     apply_evidence_records,
     apply_performance_budgets,
     build_standards_matrix,
     evidence_record_from_mapping,
     inspect_stable_only_capabilities,
+    performance_targets,
     release_evidence_template,
     release_gate_specs,
 )
-from kestrel_sovereign.knowledge.release_evidence_models import SemanticBenchmarkHarness
 
 
-def _passed(gate_id: str) -> EvidenceRecord:
-    return EvidenceRecord(
-        gate_id=gate_id,
-        state=EvidenceState.PASSED,
-        command="uv run pytest tests/unit/test_semantic_release_evidence.py -q",
-        exit_code=0,
-        artifact_ref="docs/architecture/testing/SEMANTIC_RELEASE_EVIDENCE.md",
-    )
+def _gate(gate_id: str):
+    return next(spec for spec in release_gate_specs() if spec.gate_id == gate_id)
 
 
-def _gate(template, gate_id: str) -> GateResult:
-    return next(item for item in template.gates if item.spec.gate_id == gate_id)
+def _observation(spec) -> dict[str, object]:
+    """Produce a schema-valid content-free result for structural tests only."""
+    values: dict[str, object] = {}
+    for field in spec.observation_schema.fields:
+        values[field.field_id] = (
+            3
+            if field.kind == "sample_count"
+            else 0
+            if field.kind == "zero_count"
+            else True
+            if field.kind == "boolean"
+            else "a" * 64
+            if field.kind == "digest"
+            else 1
+        )
+    return values
 
 
-def test_matrix_records_exact_verified_registry_pins_and_runtime_versions() -> None:
-    evidence = release_evidence_template()
-
-    matrix = {entry.identifier: entry for entry in build_standards_matrix()}
-    assert matrix["rdf11-concepts-20140225"].version == "1.0.0"
-    assert matrix["rdf11-concepts-20140225"].maturity == "stable"
-    assert matrix["shacl-core-20170720"].kind == "validation-profile"
-    assert matrix["rdf12-cr-20260407"].maturity == "experimental"
-    assert evidence.libraries["rdflib"] != ""
-    assert evidence.libraries["python"] != ""
-    assert "rdf-profile:rdf11" in evidence.profile[
-        "advertised_stable_capabilities"
-    ]
+def _artifact(name: str = "result") -> ArtifactReference:
+    return ArtifactReference(f"ci://semantic-release/{name}", "a" * 64)
 
 
-def test_catalog_declares_every_required_surface_once() -> None:
+def _record(spec):
+    return EvidenceRecord.attest(spec, _observation(spec), _artifact(spec.gate_id))
+
+
+def test_catalog_has_single_immutable_contract_for_every_release_gate() -> None:
     specs = release_gate_specs()
-    assert {
-        spec.scope for spec in specs if spec.category == "conformance" and spec.advertised
-    } == {
-        "rdf11_projection",
-        "rdfs11_inference",
-        "owl2rl_inference",
-        "shacl2017_core",
-        "sparql11_readonly",
-    }
-    backend_scopes = {
-        spec.scope for spec in specs if spec.category == "backend_parity"
-    }
-    assert backend_scopes == {
-        f"{backend}:{surface}"
-        for backend in ("sqlite", "postgres")
-        for surface in (
-            "assertion",
-            "ownership_privacy",
-            "validation",
-            "inference_retraction",
-            "migration",
-            "corpus_export",
-            "retrieval",
-        )
-    }
-    assert {spec.scope for spec in specs if spec.category == "erasure"} == {
-        "active_assertions",
-        "derivations",
-        "vector_index",
-        "recall_candidates",
-        "export_snapshots",
-        "governed_corpus",
-        "future_corpus",
-        "projection_candidates",
-        "served_adapter_eligibility",
-    }
-    external = [spec.gate_id for spec in specs if spec.category == "external_adapter"]
-    assert external == [
-        "external_corpus_consumed",
-        "external_candidate_invalidated",
-        "external_served_eligibility_rejected",
-    ]
+
+    assert len({spec.gate_id for spec in specs}) == len(specs)
+    assert all(len(spec.digest) == 64 for spec in specs)
+    assert all(spec.runner.runner_id and len(spec.runner.command_digest) == 64 for spec in specs)
+    assert all(spec.environment.backend and spec.environment.mode for spec in specs)
+    assert all(spec.fixture.binding.fixture_id and len(spec.fixture.binding.fixture_digest) == 64 for spec in specs)
+    assert all(spec.observation_schema.fields for spec in specs)
 
 
-def test_template_is_conservative_about_unobserved_release_gates() -> None:
-    evidence = release_evidence_template()
+def test_standards_matrix_records_official_fixture_digest_and_harness() -> None:
+    matrix = {entry.identifier: entry for entry in build_standards_matrix()}
 
-    assert evidence.ready is False
-    assert "rdf11_projection_fixture" in evidence.blocking_gate_ids()
-    assert "postgres_assertion" in evidence.blocking_gate_ids()
-    assert "performance_hybrid_recall" in evidence.blocking_gate_ids()
-    assert "erasure_served_adapter_eligibility" in evidence.blocking_gate_ids()
-    assert "external_served_eligibility_rejected" in evidence.blocking_gate_ids()
-    assert "kite_http_invoke_release_drill" in evidence.blocking_gate_ids()
-    assert "legacy_fact_migration_equivalence" not in evidence.blocking_gate_ids()
-    retirement = evidence.compatibility_retirement[0]
-    assert retirement.decision == "retain"
-    assert retirement.reason_code == "telemetry_not_observed"
-    assert _gate(evidence, "rdf12_triple_term_fixture").evidence.state is EvidenceState.SKIPPED
+    rdf = matrix["rdf11-concepts-20140225"]
+    assert rdf.fixture is not None
+    assert rdf.fixture.official is True
+    assert rdf.fixture.harness_id == "rdf11_projection_harness_v1"
+    assert len(rdf.fixture.binding.fixture_digest) == 64
 
 
-def test_only_declared_gates_can_be_updated_from_local_or_external_evidence() -> None:
+def test_template_never_auto_passes_registry_selection_or_missing_evidence() -> None:
     template = release_evidence_template()
-    updated = apply_evidence_records(template, (_passed("rdf11_projection_fixture"),))
 
-    assert _gate(updated, "rdf11_projection_fixture").evidence.passed
-    assert updated.ready is False
-    with pytest.raises(ReleaseEvidenceError, match="do not match"):
-        apply_evidence_records(template, (_passed("made_up_release_gate"),))
+    assert template.ready is False
+    assert "stable_only_capability_selection" in template.blocking_gate_ids()
+    assert "postgres_assertion" in template.blocking_gate_ids()
+    assert "performance_hybrid_recall_postgres_integration" in template.blocking_gate_ids()
+    assert all(gate.evidence.state is not EvidenceState.PASSED for gate in template.gates)
+    assert inspect_stable_only_capabilities()["rejected_capability_count"] > 0
 
 
-def test_advertised_gate_cannot_be_skipped() -> None:
-    with pytest.raises(ReleaseEvidenceError, match="advertised release gate"):
+def test_reviewer_adversarial_record_cannot_spoof_a_gate_with_exit_zero() -> None:
+    """A raw generic command is neither persisted nor accepted as a record."""
+    spec = _gate("rdf11_projection_fixture")
+    record = _record(spec)
+    payload = record.to_mapping()
+    payload["command"] = "python -c pass"
+
+    with pytest.raises(ReleaseEvidenceError, match="unknown or missing"):
+        evidence_record_from_mapping(payload)
+
+
+def test_reviewer_adversarial_record_rejects_spec_environment_and_fixture_mismatch() -> None:
+    spec = _gate("rdf11_projection_fixture")
+    record = _record(spec)
+    bad_environment = ExecutionEnvironment("postgres", "integration", "stable_only")
+
+    with pytest.raises(ReleaseEvidenceError, match="environment"):
         GateResult(
-            GateSpec("rdf11_fixture", "conformance", "rdf11"),
-            EvidenceRecord(
-                gate_id="rdf11_fixture",
-                state=EvidenceState.SKIPPED,
-                reason_code="outside_advertised_capability",
-                outside_advertised_capability=True,
-            ),
+            spec,
+            replace(record, environment=bad_environment, environment_digest=bad_environment.digest),
         )
-
-
-def test_evidence_record_parser_rejects_unstructured_or_overstated_records() -> None:
-    parsed = evidence_record_from_mapping(_passed("rdf11_projection_fixture").to_mapping())
-    assert parsed.passed
-    with pytest.raises(ReleaseEvidenceError, match="passed evidence requires"):
-        evidence_record_from_mapping(
-            {
-                "gate_id": "rdf11_projection_fixture",
-                "state": "passed",
-                "command": "pytest",
-                "exit_code": 0,
-            }
+    with pytest.raises(ReleaseEvidenceError, match="fixture"):
+        GateResult(
+            spec,
+            replace(record, fixture=replace(record.fixture, fixture_id="other.fixture.v1")),
         )
+    with pytest.raises(ReleaseEvidenceError, match="spec digest"):
+        GateResult(spec, replace(record, gate_spec_digest="b" * 64))
 
 
-def test_stable_only_check_rejects_every_draft_capability_without_migration() -> None:
-    records = inspect_stable_only_capabilities()
+def test_reviewer_adversarial_record_rejects_wrong_observation_schema() -> None:
+    spec = _gate("rdf11_projection_fixture")
+    record = _record(spec)
 
-    assert [record.gate_id for record in records] == [
-        "stable_only_query_profile_sparql12_20260605_experimental",
-        "stable_only_rdf_profile_rdf12_cr_20260407_experimental",
-        "stable_only_serialization_rdf12_ntriples_wd_20260515_experimental",
-        "stable_only_validation_profile_shacl12_core_20260602_experimental",
-        "stable_only_validation_profile_shacl12_sparql_20260130_experimental",
-    ]
-    assert all(record.state is EvidenceState.PASSED for record in records)
-    assert all(record.exit_code == 0 for record in records)
+    with pytest.raises(ReleaseEvidenceError, match="observation"):
+        GateResult(spec, replace(record, observation={"case_count": 1}))
 
 
-@pytest.mark.asyncio
-async def test_benchmark_harness_is_reproducible_and_budget_is_observed_not_timeout() -> None:
-    calls = 0
+@pytest.mark.parametrize(
+    "reference",
+    (
+        "postgresql://user:password@db.example/kestrel",
+        "ci://semantic-release/123?token=secret",
+        "artifact://tenant-42/semantic-result",
+        "evidence://user@host/release",
+        "artifact://semantic-release/credential-proof",
+    ),
+)
+def test_reviewer_adversarial_artifact_references_reject_secrets_and_identity(reference: str) -> None:
+    with pytest.raises(ReleaseEvidenceError, match="artifact"):
+        ArtifactReference(reference, "a" * 64)
 
-    async def operation() -> None:
-        nonlocal calls
-        calls += 1
-        await asyncio.sleep(0)
 
-    fixture = {
-        "backend": "sqlite",
-        "seed": "semantic-release-evidence-v1",
-        "workload": "hybrid_recall",
-    }
-    run = await SemanticBenchmarkHarness(iterations=3).run(
-        PerformanceMetric.HYBRID_RECALL,
-        operation,
-        fixture_description=fixture,
-    )
-    budget = PerformanceBudget.from_observed(
-        run.metric,
-        run.samples_ms,
-        headroom_fraction=0.25,
-        fixture_description=fixture,
+def _performance_spec(metric: PerformanceMetric, backend: str):
+    return next(
+        spec
+        for spec in release_gate_specs()
+        if spec.performance_target
+        and spec.performance_target.metric is metric
+        and spec.performance_target.backend == backend
     )
 
-    assert calls == 3
-    assert run.fixture_digest == budget.fixture_digest
-    assert budget.budget_ms >= budget.p95_ms
-    assert budget.evaluate(budget.budget_ms) is EvidenceState.PASSED
-    assert budget.evaluate(budget.budget_ms + 0.001) is EvidenceState.FAILED
+
+def test_reviewer_adversarial_performance_rejects_short_zero_invalid_and_unit_mismatch() -> None:
+    postgres = _performance_spec(PerformanceMetric.HYBRID_RECALL, "postgres")
+    artifact = _artifact("benchmark")
+
+    with pytest.raises(ReleaseEvidenceError, match="sample_count"):
+        PerformanceBudget.from_observed(postgres, (1.0, 2.0), headroom_fraction=0.2, artifact=artifact)
+    with pytest.raises(ReleaseEvidenceError, match="positive"):
+        PerformanceBudget.from_observed(postgres, (0.0, 1.0, 2.0), headroom_fraction=0.2, artifact=artifact)
+    with pytest.raises(ReleaseEvidenceError, match="duration metrics"):
+        PerformanceTarget(PerformanceMetric.HYBRID_RECALL, "postgres", "integration", "bytes")
+    with pytest.raises(ReleaseEvidenceError, match="storage growth"):
+        PerformanceTarget(PerformanceMetric.STORAGE_GROWTH, "postgres", "integration", "ms")
 
 
-def test_performance_pass_needs_measured_budget_in_addition_to_command_evidence() -> None:
+def test_sqlite_only_budget_cannot_satisfy_postgres_or_release_readiness() -> None:
     template = release_evidence_template()
-    metric = PerformanceMetric.HYBRID_RECALL
-    budget = PerformanceBudget.from_observed(
-        metric,
+    sqlite = _performance_spec(PerformanceMetric.HYBRID_RECALL, "sqlite")
+    sqlite_record = _record(sqlite)
+    with_record = apply_evidence_records(template, (sqlite_record,))
+    sqlite_budget = PerformanceBudget.from_observed(
+        sqlite,
         (1.0, 2.0, 3.0),
         headroom_fraction=0.2,
-        fixture_description={"backend": "sqlite", "workload": metric.value},
+        artifact=_artifact("sqlite-benchmark"),
     )
-    with pytest.raises(ReleaseEvidenceError, match="requires passing command evidence"):
-        apply_performance_budgets(template, (budget,))
+    updated = apply_performance_budgets(with_record, (sqlite_budget,))
 
-    observed = apply_evidence_records(template, (_passed(f"performance_{metric.value}"),))
-    updated = apply_performance_budgets(observed, (budget,))
-    assert updated.performance_budgets[metric] == budget
+    assert updated.performance_budgets[sqlite.performance_target] == sqlite_budget
+    assert any(
+        target.metric is PerformanceMetric.HYBRID_RECALL
+        and target.backend == "postgres"
+        and budget is None
+        for target, budget in updated.performance_budgets.items()
+    )
     assert updated.ready is False
 
 
-def test_cli_writes_a_schema_valid_non_ready_template(tmp_path: Path) -> None:
-    output = tmp_path / "semantic-release-evidence.json"
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "kestrel_sovereign.knowledge.release_evidence",
-            "template",
-            "--output",
-            str(output),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+def test_missing_runtime_library_version_is_a_release_block_not_a_pass() -> None:
+    template = release_evidence_template()
 
-    assert result.returncode == 0, result.stderr
-    payload = json.loads(output.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 1
-    assert payload["ready"] is False
-    assert any(
-        gate["scope"] == "served_adapter_eligibility" for gate in payload["gates"]
-    )
+    with pytest.raises(ReleaseEvidenceError, match="missing library version"):
+        replace(template, libraries={**template.libraries, "rdflib": "unavailable"})
 
 
-def test_cli_records_budget_and_assembles_an_observed_result(tmp_path: Path) -> None:
-    record = tmp_path / "rdf11.json"
-    performance_record = tmp_path / "hybrid-recall.json"
-    fixture = tmp_path / "benchmark-fixture.json"
-    budget = tmp_path / "benchmark-budget.json"
-    artifact = tmp_path / "release.json"
-    fixture.write_text(
-        json.dumps({"backend": "sqlite", "workload": "hybrid_recall"}),
-        encoding="utf-8",
-    )
-    recorded = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "kestrel_sovereign.knowledge.release_evidence",
-            "record",
-            "--gate",
-            "rdf11_projection_fixture",
-            "--artifact-ref",
-            "local-test-log",
-            "--output",
-            str(record),
-            "--",
-            sys.executable,
-            "-c",
-            "pass",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    budget_result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "kestrel_sovereign.knowledge.release_evidence",
-            "budget",
-            "--metric",
-            "hybrid_recall",
-            "--samples-ms",
-            "1",
-            "2",
-            "3",
-            "--headroom-fraction",
-            "0.2",
-            "--fixture",
-            str(fixture),
-            "--output",
-            str(budget),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    performance_recorded = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "kestrel_sovereign.knowledge.release_evidence",
-            "record",
-            "--gate",
-            "performance_hybrid_recall",
-            "--artifact-ref",
-            "local-benchmark-log",
-            "--output",
-            str(performance_record),
-            "--",
-            sys.executable,
-            "-c",
-            "pass",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assembled = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "kestrel_sovereign.knowledge.release_evidence",
-            "assemble",
-            "--record",
-            str(record),
-            "--record",
-            str(performance_record),
-            "--budget",
-            str(budget),
-            "--output",
-            str(artifact),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+def test_performance_targets_cover_each_metric_on_sqlite_and_postgres() -> None:
+    targets = performance_targets()
 
-    assert recorded.returncode == 0, recorded.stderr
-    assert budget_result.returncode == 0, budget_result.stderr
-    assert performance_recorded.returncode == 0, performance_recorded.stderr
-    assert assembled.returncode == 0, assembled.stderr
-    payload = json.loads(artifact.read_text(encoding="utf-8"))
-    assert payload["ready"] is False
-    assert next(
-        item["budget"]
-        for item in payload["performance_budgets"]
-        if item["metric"] == "hybrid_recall"
-    ) is not None
-
-
-def test_cli_can_record_an_explicit_block_without_claiming_success(tmp_path: Path) -> None:
-    output = tmp_path / "postgres-blocked.json"
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "kestrel_sovereign.knowledge.release_evidence",
-            "block",
-            "--gate",
-            "postgres_assertion",
-            "--reason-code",
-            "postgres_service_unavailable",
-            "--artifact-ref",
-            "local-environment-check",
-            "--output",
-            str(output),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-    assert result.returncode == 0, result.stderr
-    payload = json.loads(output.read_text(encoding="utf-8"))
-    assert payload["state"] == "blocked"
-    assert payload["reason_code"] == "postgres_service_unavailable"
+    assert len(targets) == len(PerformanceMetric) * 2
+    for metric in PerformanceMetric:
+        assert {target.backend for target in targets if target.metric is metric} == {"sqlite", "postgres"}
