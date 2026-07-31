@@ -100,9 +100,13 @@ async def run_backlog_hygiene(data: Dict[str, Any], fix: str = "no") -> str:
                 missing_milestone.append(entry)
 
             # Check: missing status label
+            # BUG #2812: has_status is the predicate this check describes, but
+            # the branch below tests has_any_label, so an entry carrying only a
+            # non-status label (e.g. type:bug) is never reported. Left in place
+            # as evidence — fix the branch, don't delete the unused local.
             status_labels = {"status:blocked", "status:in-progress",
                              "status:ready", "status:done", "status:backlog"}
-            has_status = any(l.lower() in status_labels or
+            has_status = any(l.lower() in status_labels or  # noqa: F841 - see #2812
                             l.lower().startswith("status:") for l in labels)
             has_any_label = len(labels) > 0
             if not has_any_label:

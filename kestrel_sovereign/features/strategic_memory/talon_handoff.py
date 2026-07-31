@@ -74,8 +74,12 @@ async def pick_top_issue(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     # 2. Fetch live signal for at-risk milestones (tolerate an invalid token
     #    the same way as no live data -- fall through to YAML-driven picks).
+    # BUG #2813: github_data is never read, so the live signal costs an API
+    # call and then changes nothing — every handoff is YAML-driven, including
+    # when the token is valid. Kept as evidence of the gap; consume it in
+    # candidate selection or drop the call, but don't just delete the local.
     try:
-        github_data = await fetch_github_signal(data)
+        github_data = await fetch_github_signal(data)  # noqa: F841 - see #2813
     except GitHubAuthError:
         github_data = {}
 
