@@ -147,7 +147,12 @@ def _record(
     )
 
 
-def _budget(spec, samples: tuple[float | int, ...] = (1.0, 2.0, 3.0)) -> PerformanceBudget:
+def _budget(
+    spec,
+    samples: tuple[float | int, ...] = (1.0, 2.0, 3.0),
+    *,
+    identity: CatalogSigningIdentity | None = None,
+) -> PerformanceBudget:
     artifact = _artifact(f"{spec.gate_id}-budget")
     _, _, _, run_digest = PerformanceBudget._bound_run_digest(
         spec,
@@ -160,7 +165,7 @@ def _budget(spec, samples: tuple[float | int, ...] = (1.0, 2.0, 3.0)) -> Perform
         samples,
         headroom_fraction=0.2,
         artifact=artifact,
-        execution_attestation=_CATALOG_TEST_IDENTITY.sign(
+        execution_attestation=(identity or _CATALOG_TEST_IDENTITY).sign(
             kind="performance_budget", spec=spec, run_digest=run_digest
         ),
     )
@@ -629,35 +634,80 @@ def _write_record(path: Path, record: EvidenceRecord) -> None:
     path.write_text(json.dumps(record.to_mapping()), encoding="utf-8")
 
 
-def _write_policy(
-    path: Path,
-    identity: CatalogSigningIdentity | None = None,
-    runner_ids: tuple[str, ...] | None = None,
-) -> None:
-    if identity is not None:
-        selected_runner_ids = runner_ids or tuple(
-            sorted({spec.runner.runner_id for spec in release_gate_specs()})
-        )
-        keys = [identity.trusted_key(selected_runner_ids).to_mapping()]
-    else:
-        keys = [key.to_mapping() for key in _test_policy().keys]
-    path.write_text(
-        json.dumps({"keys": keys}),
-        encoding="utf-8",
-    )
-
-
-def _configure_operator_policy(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
-    monkeypatch.setenv("KESTREL_SEMANTIC_RELEASE_TRUST_POLICY_PATH", str(path))
-    monkeypatch.setenv(
-        "KESTREL_SEMANTIC_RELEASE_TRUST_POLICY_SHA256",
-        hashlib.sha256(path.read_bytes()).hexdigest(),
-    )
-
-
 def _write_private_key(path: Path, key_bytes: bytes) -> None:
     path.write_text(key_bytes.hex(), encoding="utf-8")
     path.chmod(0o600)
+
+
+def _write_structurally_complete_submission(
+    tmp_path: Path,
+    *,
+    core_identity: CatalogSigningIdentity,
+    external_identity: CatalogSigningIdentity,
+) -> tuple[list[Path], list[Path], Path, Path]:
+    records: dict[str, EvidenceRecord] = {}
+    record_paths: list[Path] = []
+    for spec in release_gate_specs():
+        if not spec.advertised:
+            continue
+        identity = (
+            external_identity
+            if spec.runner.runner_id == "external_ci"
+            else core_identity
+        )
+        record = _record(spec, identity=identity)
+        records[spec.gate_id] = record
+        path = tmp_path / f"submitted-{spec.gate_id}.json"
+        _write_record(path, record)
+        record_paths.append(path)
+
+    budget_paths: list[Path] = []
+    for spec in release_gate_specs():
+        if spec.performance_target is None:
+            continue
+        samples: tuple[float | int, ...] = (
+            (1, 2, 3)
+            if spec.performance_target.unit == "bytes"
+            else (1.0, 2.0, 3.0)
+        )
+        budget = _budget(spec, samples, identity=core_identity)
+        path = tmp_path / f"submitted-{spec.gate_id}-budget.json"
+        path.write_text(json.dumps(budget.to_mapping()), encoding="utf-8")
+        budget_paths.append(path)
+
+    telemetry_path = tmp_path / "submitted-telemetry.json"
+    telemetry_path.write_text(
+        json.dumps(_retirement_telemetry().to_mapping()), encoding="utf-8"
+    )
+    external_specs = [
+        spec for spec in release_gate_specs() if spec.category == "external_adapter"
+    ]
+    external_attestations: list[ExternalGateAttestation] = []
+    for spec in external_specs:
+        record = records[spec.gate_id]
+        assert record.run_digest is not None
+        assert record.artifact is not None
+        assert record.drill is not None
+        external_attestations.append(
+            ExternalGateAttestation(
+                gate_id=spec.gate_id,
+                gate_spec_digest=spec.digest,
+                result_digest=record.run_digest,
+                artifact=record.artifact,
+                drill=record.drill,
+            )
+        )
+    external_report = ExternalCapabilityReport.attest(
+        capability_id="parametric_self_governed_corpus",
+        repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
+        source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
+        attestations=tuple(external_attestations),
+    )
+    external_report_path = tmp_path / "submitted-external-report.json"
+    external_report_path.write_text(
+        json.dumps(external_report.to_mapping()), encoding="utf-8"
+    )
+    return record_paths, budget_paths, telemetry_path, external_report_path
 
 
 def test_direct_attest_and_public_record_refuse_fabricated_observations(tmp_path: Path) -> None:
@@ -754,8 +804,8 @@ def test_catalog_signing_key_loader_requires_a_regular_owner_only_file(
         )
 
 
-def test_cli_run_executes_an_allowlisted_registry_workload_and_assemble_verifies_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_cli_run_executes_an_allowlisted_registry_workload_and_assemble_marks_it_unverified(
+    tmp_path: Path,
 ) -> None:
     spec = _gate("stable_only_capability_selection")
     key_bytes = b"\x02" * 32
@@ -767,10 +817,7 @@ def test_cli_run_executes_an_allowlisted_registry_workload_and_assemble_verifies
         private_key=Ed25519PrivateKey.from_private_bytes(key_bytes),
     )
     record = tmp_path / "record.json"
-    policy = tmp_path / "policy.json"
     report = tmp_path / "report.json"
-    _write_policy(policy, identity, ("registry",))
-    _configure_operator_policy(monkeypatch, policy)
 
     recorded = _cli(
         "run",
@@ -798,7 +845,10 @@ def test_cli_run_executes_an_allowlisted_registry_workload_and_assemble_verifies
     payload = json.loads(record.read_text(encoding="utf-8"))
     assert payload["state"] == "passed"
     assert payload["execution_attestation"]["source"] == "catalog_runner"
-    assert json.loads(report.read_text(encoding="utf-8"))["ready"] is False
+    report_payload = json.loads(report.read_text(encoding="utf-8"))
+    assert report_payload["ready"] is False
+    assert report_payload["trust_status"] == "unverified"
+    assert report_payload["structurally_complete"] is False
 
 
 def test_cli_run_blocks_an_unregistered_catalog_workload(tmp_path: Path) -> None:
@@ -845,90 +895,96 @@ def test_cli_block_explicitly_records_an_observed_block_with_success_status(tmp_
     assert json.loads(output.read_text(encoding="utf-8"))["state"] == "blocked"
 
 
-def test_cli_assemble_refuses_signed_record_without_operator_policy(
+def test_verifier_api_requires_an_explicit_trusted_execution_policy() -> None:
+    spec = _gate("rdf11_projection_fixture")
+    with pytest.raises(ReleaseEvidenceError, match="explicit TrustedExecutionPolicy"):
+        apply_evidence_records(
+            release_evidence_template(),
+            (_record(spec),),
+            trust_policy=None,  # type: ignore[arg-type]
+        )
+
+
+def test_cli_assemble_cannot_self_authorize_a_structurally_complete_forgery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    spec = _gate("rdf11_projection_fixture")
-    record = tmp_path / "record.json"
-    output = tmp_path / "report.json"
-    _write_record(record, _record(spec))
-    monkeypatch.delenv("KESTREL_SEMANTIC_RELEASE_TRUST_POLICY_PATH", raising=False)
-    monkeypatch.delenv("KESTREL_SEMANTIC_RELEASE_TRUST_POLICY_SHA256", raising=False)
-
-    result = _cli("assemble", "--record", str(record), "--output", str(output))
-
-    assert result.returncode == 1
-    assert not output.exists()
-    assert "trusted execution policy" in result.stderr
-
-
-def test_cli_assemble_cannot_self_authorize_a_forged_policy_or_record(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    spec = _gate("rdf11_projection_fixture")
-    operator_policy = tmp_path / "operator-policy.json"
-    _write_policy(operator_policy, _CATALOG_TEST_IDENTITY, ("pytest",))
-    _configure_operator_policy(monkeypatch, operator_policy)
-
-    forged_identity = CatalogSigningIdentity(
+    forged_core_identity = CatalogSigningIdentity(
         issuer_id="forged_ci",
-        key_id="forged_key",
+        key_id="forged_core_key",
         private_key=Ed25519PrivateKey.from_private_bytes(b"\x06" * 32),
     )
-    forged_record = tmp_path / "forged-record.json"
+    forged_external_identity = CatalogSigningIdentity(
+        issuer_id="forged_external_ci",
+        key_id="forged_external_key",
+        private_key=Ed25519PrivateKey.from_private_bytes(b"\x07" * 32),
+        source=ExecutionSource.EXTERNAL_CI,
+    )
     forged_policy = tmp_path / "forged-policy.json"
+    core_runner_ids = tuple(
+        sorted(
+            {
+                spec.runner.runner_id
+                for spec in release_gate_specs()
+                if spec.runner.runner_id != "external_ci"
+            }
+        )
+    )
+    forged_policy.write_text(
+        json.dumps(
+            {
+                "keys": [
+                    forged_core_identity.trusted_key(core_runner_ids).to_mapping(),
+                    forged_external_identity.trusted_key(("external_ci",)).to_mapping(),
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("KESTREL_SEMANTIC_RELEASE_TRUST_POLICY_PATH", str(forged_policy))
+    monkeypatch.setenv(
+        "KESTREL_SEMANTIC_RELEASE_TRUST_POLICY_SHA256",
+        hashlib.sha256(forged_policy.read_bytes()).hexdigest(),
+    )
+    record_paths, budget_paths, telemetry_path, external_report_path = (
+        _write_structurally_complete_submission(
+            tmp_path,
+            core_identity=forged_core_identity,
+            external_identity=forged_external_identity,
+        )
+    )
     output = tmp_path / "report.json"
-    _write_record(forged_record, _record(spec, identity=forged_identity))
-    _write_policy(forged_policy, forged_identity, ("pytest",))
 
-    caller_selected_policy = _cli(
-        "assemble",
-        "--record",
-        str(forged_record),
-        "--trust-policy",
-        str(forged_policy),
-        "--output",
-        str(output),
+    arguments = ["assemble"]
+    for path in record_paths:
+        arguments.extend(("--record", str(path)))
+    for path in budget_paths:
+        arguments.extend(("--budget", str(path)))
+    arguments.extend(
+        (
+            "--retirement-telemetry",
+            str(telemetry_path),
+            "--external-report",
+            str(external_report_path),
+            "--output",
+            str(output),
+        )
     )
-    assert caller_selected_policy.returncode != 0
-    assert "unrecognized arguments" in caller_selected_policy.stderr
-    assert not output.exists()
+    result = _cli(*arguments)
 
-    configured_root = _cli(
-        "assemble",
-        "--record",
-        str(forged_record),
-        "--output",
-        str(output),
-    )
-    assert configured_root.returncode == 1
-    assert "issuer/key is not trusted" in configured_root.stderr
-    assert not output.exists()
-
-    _write_policy(operator_policy, forged_identity, ("pytest",))
-    swapped_policy = _cli(
-        "assemble",
-        "--record",
-        str(forged_record),
-        "--output",
-        str(output),
-    )
-    assert swapped_policy.returncode == 1
-    assert "does not match its SHA-256 pin" in swapped_policy.stderr
-    assert not output.exists()
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["structurally_complete"] is True
+    assert payload["trust_status"] == "unverified"
+    assert payload["ready"] is False
+    assert "trust_verification_required" in payload["blocking_gate_ids"]
 
 
-def test_cli_assemble_rejects_tampered_record_environment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_cli_assemble_rejects_tampered_record_environment(tmp_path: Path) -> None:
     spec = _gate("rdf11_projection_fixture")
     record = tmp_path / "record.json"
     tampered = tmp_path / "tampered.json"
-    policy = tmp_path / "policy.json"
     output = tmp_path / "report.json"
     _write_record(record, _record(spec))
-    _write_policy(policy)
-    _configure_operator_policy(monkeypatch, policy)
     payload = json.loads(record.read_text(encoding="utf-8"))
     payload["environment"]["backend"] = "postgres"
     tampered.write_text(json.dumps(payload), encoding="utf-8")
@@ -947,7 +1003,7 @@ def test_cli_assemble_rejects_tampered_record_environment(
 
 
 def test_cli_assemble_safely_binds_retirement_and_external_adapter_attestations(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     migration = _gate("legacy_fact_migration_equivalence")
     external_specs = [spec for spec in release_gate_specs() if spec.category == "external_adapter"]
@@ -957,10 +1013,6 @@ def test_cli_assemble_safely_binds_retirement_and_external_adapter_attestations(
         path = tmp_path / f"{gate_id}.json"
         _write_record(path, record)
         record_paths.append(path)
-    policy = tmp_path / "policy.json"
-    _write_policy(policy)
-    _configure_operator_policy(monkeypatch, policy)
-
     telemetry_path = tmp_path / "telemetry.json"
     telemetry_result = _cli(*_telemetry_command(telemetry_path))
     assert telemetry_result.returncode == 0, telemetry_result.stderr
@@ -1005,19 +1057,15 @@ def test_cli_assemble_safely_binds_retirement_and_external_adapter_attestations(
     assert payload["external_capabilities"][0]["repository"] == PARAMETRIC_SELF_EVIDENCE_REPOSITORY
     assert "external_adapter_attestation" not in payload["blocking_gate_ids"]
     assert payload["ready"] is False
+    assert payload["trust_status"] == "unverified"
 
 
-def test_cli_assemble_rejects_tampered_retirement_telemetry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_cli_assemble_rejects_tampered_retirement_telemetry(tmp_path: Path) -> None:
     migration = _gate("legacy_fact_migration_equivalence")
     record = tmp_path / "migration.json"
     telemetry = tmp_path / "telemetry.json"
-    policy = tmp_path / "policy.json"
     output = tmp_path / "report.json"
     _write_record(record, _record(migration))
-    _write_policy(policy)
-    _configure_operator_policy(monkeypatch, policy)
     assert _cli(*_telemetry_command(telemetry)).returncode == 0
     payload = json.loads(telemetry.read_text(encoding="utf-8"))
     payload["unmigrated_eligible_rows"] = 1

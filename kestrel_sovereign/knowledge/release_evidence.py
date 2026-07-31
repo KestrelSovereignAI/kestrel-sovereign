@@ -11,13 +11,10 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
-import hashlib
 from importlib import metadata
 import json
-import os
 from pathlib import Path
 import platform
-import re
 from typing import cast
 
 from .registry import ExperimentalCapabilityError, SemanticKnowledgeRegistry, StandardsMaturity, get_knowledge_registry
@@ -45,6 +42,7 @@ from .release_evidence_models import (
     ReleaseEvidenceError,
     RunnerContract,
     StandardsMatrixEntry,
+    StructuralGateResult,
     TelemetryAttestation,
     TrustedExecutionKey,
     TrustedExecutionPolicy,
@@ -55,6 +53,8 @@ from .release_evidence_models import (
 
 RELEASE_EVIDENCE_SCHEMA_VERSION = 3
 SEMANTIC_RELEASE_CONTRACT = "semantic-kb-v1-release-evidence-v3"
+STRUCTURAL_RELEASE_EVIDENCE_SCHEMA_VERSION = 1
+STRUCTURAL_RELEASE_CONTRACT = "semantic-kb-v1-release-evidence-structural-v1"
 PARAMETRIC_SELF_EVIDENCE_REPOSITORY = "KestrelSovereignAI/kestrel-feature-parametric-self"
 PARAMETRIC_SELF_EVIDENCE_REVISION = "260ba985bcfdfab3dab1ea58da5b259057f3749f"
 _ERASURE_DRILL = DrillBinding(
@@ -66,9 +66,6 @@ _EXTERNAL_ADAPTER_GATE_IDS = (
     "external_candidate_invalidated",
     "external_served_eligibility_rejected",
 )
-_OPERATOR_TRUST_POLICY_PATH_ENV = "KESTREL_SEMANTIC_RELEASE_TRUST_POLICY_PATH"
-_OPERATOR_TRUST_POLICY_SHA256_ENV = "KESTREL_SEMANTIC_RELEASE_TRUST_POLICY_SHA256"
-_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _fixture_binding(fixture_id: str) -> FixtureBinding:
@@ -351,35 +348,17 @@ class SemanticReleaseEvidence:
     def __post_init__(self) -> None:
         if self.schema_version != RELEASE_EVIDENCE_SCHEMA_VERSION or self.contract != SEMANTIC_RELEASE_CONTRACT:
             raise ReleaseEvidenceError("unsupported semantic release evidence contract")
-        if not self.standards or not self.profile or not self.gates:
-            raise ReleaseEvidenceError("release evidence requires matrix, profile, and gates")
-        required_libraries = {"python", "rdflib", "kestrel_sovereign"}
-        if set(self.libraries) != required_libraries:
-            raise ReleaseEvidenceError("release evidence requires the exact runtime library set")
-        if any(not isinstance(value, str) or not value or value == "unavailable" for value in self.libraries.values()):
-            raise ReleaseEvidenceError("missing library version blocks release evidence")
-        expected_specs = {spec.gate_id: spec for spec in release_gate_specs()}
-        supplied_specs = {gate.spec.gate_id: gate.spec for gate in self.gates}
-        if set(supplied_specs) != set(expected_specs) or any(
-            supplied_specs[key].digest != expected_specs[key].digest for key in expected_specs
-        ):
-            raise ReleaseEvidenceError("report gates do not match the immutable release catalog")
-        expected_targets = set(performance_targets())
-        if set(self.performance_budgets) != expected_targets:
-            raise ReleaseEvidenceError("release evidence requires every backend/mode performance target")
-        spec_by_target = {
-            gate.spec.performance_target: gate.spec
-            for gate in self.gates
-            if gate.spec.performance_target is not None
-        }
-        for target, budget in self.performance_budgets.items():
-            if budget is not None:
-                budget.validate_against(spec_by_target[target])
-        if len(self.compatibility_retirement) != 1:
-            raise ReleaseEvidenceError("release evidence requires one compatibility decision")
-        _validate_retirement_decision(self.compatibility_retirement[0], self.gates)
-        if self.external_capabilities:
-            _validate_external_capability_reports(self.external_capabilities, self.gates)
+        if any(not isinstance(gate, GateResult) for gate in self.gates):
+            raise ReleaseEvidenceError("verified release evidence requires verified gate results")
+        _validate_release_evidence_envelope(
+            standards=self.standards,
+            libraries=self.libraries,
+            profile=self.profile,
+            gates=self.gates,
+            performance_budgets=self.performance_budgets,
+            external_capabilities=self.external_capabilities,
+            compatibility_retirement=self.compatibility_retirement,
+        )
 
     @property
     def ready(self) -> bool:
@@ -390,19 +369,11 @@ class SemanticReleaseEvidence:
         )
 
     def blocking_gate_ids(self) -> tuple[str, ...]:
-        blocking = {
-            gate.spec.gate_id
-            for gate in self.gates
-            if gate.spec.required_for_ready and not gate.ready
-        }
-        blocking.update(
-            f"performance_{target.gate_suffix}"
-            for target, budget in self.performance_budgets.items()
-            if budget is None
+        return _structural_blocking_gate_ids(
+            self.gates,
+            self.performance_budgets,
+            self.external_capabilities,
         )
-        if not _external_capabilities_ready(self.external_capabilities, self.gates):
-            blocking.add("external_adapter_attestation")
-        return tuple(sorted(blocking))
 
     def to_mapping(self) -> dict[str, object]:
         return {
@@ -423,7 +394,159 @@ class SemanticReleaseEvidence:
         }
 
 
-def _legacy_migration_gate(gates: tuple[GateResult, ...]) -> GateResult:
+@dataclass(frozen=True, slots=True)
+class StructuralReleaseEvidence:
+    """Inspectable catalog evidence without a verifier-issued trust verdict.
+
+    This is the only report shape emitted by the public CLI.  Its fixed
+    ``ready: false`` and ``trust_status: unverified`` prevent a report author
+    from converting arbitrary records, keys, or process environment into a
+    release claim.  An independent verifier may later consume the same records
+    through the explicit :func:`apply_evidence_records` API.
+    """
+
+    standards: tuple[StandardsMatrixEntry, ...]
+    libraries: Mapping[str, str]
+    profile: Mapping[str, object]
+    gates: tuple[StructuralGateResult, ...]
+    performance_budgets: Mapping[PerformanceTarget, PerformanceBudget | None]
+    external_capabilities: tuple[ExternalCapabilityReport, ...]
+    compatibility_retirement: tuple[CompatibilityRetirementDecision, ...]
+    schema_version: int = STRUCTURAL_RELEASE_EVIDENCE_SCHEMA_VERSION
+    contract: str = STRUCTURAL_RELEASE_CONTRACT
+
+    def __post_init__(self) -> None:
+        if (
+            self.schema_version != STRUCTURAL_RELEASE_EVIDENCE_SCHEMA_VERSION
+            or self.contract != STRUCTURAL_RELEASE_CONTRACT
+        ):
+            raise ReleaseEvidenceError("unsupported structural release evidence contract")
+        if any(not isinstance(gate, StructuralGateResult) for gate in self.gates):
+            raise ReleaseEvidenceError("structural release evidence requires structural gate results")
+        _validate_release_evidence_envelope(
+            standards=self.standards,
+            libraries=self.libraries,
+            profile=self.profile,
+            gates=self.gates,
+            performance_budgets=self.performance_budgets,
+            external_capabilities=self.external_capabilities,
+            compatibility_retirement=self.compatibility_retirement,
+        )
+
+    @property
+    def trust_status(self) -> str:
+        return "unverified"
+
+    @property
+    def ready(self) -> bool:
+        return False
+
+    @property
+    def structurally_complete(self) -> bool:
+        return (
+            all(gate.structurally_ready for gate in self.gates)
+            and all(budget is not None for budget in self.performance_budgets.values())
+            and _external_capabilities_ready(self.external_capabilities, self.gates)
+        )
+
+    def blocking_gate_ids(self) -> tuple[str, ...]:
+        blocking = set(
+            _structural_blocking_gate_ids(
+                self.gates,
+                self.performance_budgets,
+                self.external_capabilities,
+            )
+        )
+        blocking.add("trust_verification_required")
+        return tuple(sorted(blocking))
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "contract": self.contract,
+            "trust_status": self.trust_status,
+            "ready": False,
+            "structurally_complete": self.structurally_complete,
+            "blocking_gate_ids": list(self.blocking_gate_ids()),
+            "standards": [entry.to_mapping() for entry in self.standards],
+            "libraries": dict(sorted(self.libraries.items())),
+            "profile": dict(self.profile),
+            "gates": [gate.to_mapping() for gate in sorted(self.gates, key=lambda item: item.spec.gate_id)],
+            "performance_budgets": [
+                {"target": target.to_mapping(), "budget": budget.to_mapping() if budget else None}
+                for target, budget in sorted(
+                    self.performance_budgets.items(), key=lambda item: item[0].gate_suffix
+                )
+            ],
+            "external_capabilities": [item.to_mapping() for item in self.external_capabilities],
+            "compatibility_retirement": [item.to_mapping() for item in self.compatibility_retirement],
+        }
+
+
+def _validate_release_evidence_envelope(
+    *,
+    standards: tuple[StandardsMatrixEntry, ...],
+    libraries: Mapping[str, str],
+    profile: Mapping[str, object],
+    gates: tuple[GateResult | StructuralGateResult, ...],
+    performance_budgets: Mapping[PerformanceTarget, PerformanceBudget | None],
+    external_capabilities: tuple[ExternalCapabilityReport, ...],
+    compatibility_retirement: tuple[CompatibilityRetirementDecision, ...],
+) -> None:
+    if not standards or not profile or not gates:
+        raise ReleaseEvidenceError("release evidence requires matrix, profile, and gates")
+    required_libraries = {"python", "rdflib", "kestrel_sovereign"}
+    if set(libraries) != required_libraries:
+        raise ReleaseEvidenceError("release evidence requires the exact runtime library set")
+    if any(not isinstance(value, str) or not value or value == "unavailable" for value in libraries.values()):
+        raise ReleaseEvidenceError("missing library version blocks release evidence")
+    expected_specs = {spec.gate_id: spec for spec in release_gate_specs()}
+    supplied_specs = {gate.spec.gate_id: gate.spec for gate in gates}
+    if set(supplied_specs) != set(expected_specs) or any(
+        supplied_specs[key].digest != expected_specs[key].digest for key in expected_specs
+    ):
+        raise ReleaseEvidenceError("report gates do not match the immutable release catalog")
+    expected_targets = set(performance_targets())
+    if set(performance_budgets) != expected_targets:
+        raise ReleaseEvidenceError("release evidence requires every backend/mode performance target")
+    spec_by_target = {
+        gate.spec.performance_target: gate.spec
+        for gate in gates
+        if gate.spec.performance_target is not None
+    }
+    for target, budget in performance_budgets.items():
+        if budget is not None:
+            budget.validate_against(spec_by_target[target])
+    if len(compatibility_retirement) != 1:
+        raise ReleaseEvidenceError("release evidence requires one compatibility decision")
+    _validate_retirement_decision(compatibility_retirement[0], gates)
+    if external_capabilities:
+        _validate_external_capability_reports(external_capabilities, gates)
+
+
+def _structural_blocking_gate_ids(
+    gates: tuple[GateResult | StructuralGateResult, ...],
+    performance_budgets: Mapping[PerformanceTarget, PerformanceBudget | None],
+    external_capabilities: tuple[ExternalCapabilityReport, ...],
+) -> tuple[str, ...]:
+    blocking = {
+        gate.spec.gate_id
+        for gate in gates
+        if gate.spec.required_for_ready and not gate.evidence.passed
+    }
+    blocking.update(
+        f"performance_{target.gate_suffix}"
+        for target, budget in performance_budgets.items()
+        if budget is None
+    )
+    if not _external_capabilities_ready(external_capabilities, gates):
+        blocking.add("external_adapter_attestation")
+    return tuple(sorted(blocking))
+
+
+def _legacy_migration_gate(
+    gates: tuple[GateResult | StructuralGateResult, ...],
+) -> GateResult | StructuralGateResult:
     try:
         return next(gate for gate in gates if gate.spec.gate_id == "legacy_fact_migration_equivalence")
     except StopIteration as error:  # pragma: no cover - catalog check catches this first.
@@ -432,7 +555,7 @@ def _legacy_migration_gate(gates: tuple[GateResult, ...]) -> GateResult:
 
 def _validate_retirement_decision(
     decision: CompatibilityRetirementDecision,
-    gates: tuple[GateResult, ...],
+    gates: tuple[GateResult | StructuralGateResult, ...],
 ) -> None:
     """Bind retirement only to the exact declared migration-equivalence result."""
     if decision.path_id != "legacy_fact_migration_compatibility":
@@ -450,7 +573,9 @@ def _validate_retirement_decision(
         raise ReleaseEvidenceError("retirement cannot be safe without bound migration equivalence")
 
 
-def _external_gate_results(gates: tuple[GateResult, ...]) -> dict[str, GateResult]:
+def _external_gate_results(
+    gates: tuple[GateResult | StructuralGateResult, ...],
+) -> dict[str, GateResult | StructuralGateResult]:
     return {
         gate.spec.gate_id: gate
         for gate in gates
@@ -460,7 +585,7 @@ def _external_gate_results(gates: tuple[GateResult, ...]) -> dict[str, GateResul
 
 def _validate_external_capability_reports(
     reports: tuple[ExternalCapabilityReport, ...],
-    gates: tuple[GateResult, ...],
+    gates: tuple[GateResult | StructuralGateResult, ...],
 ) -> None:
     """Require exact repo/revision and hashed result/artifact bindings from Pself."""
     if len(reports) != 1:
@@ -495,7 +620,7 @@ def _validate_external_capability_reports(
 
 def _external_capabilities_ready(
     reports: tuple[ExternalCapabilityReport, ...],
-    gates: tuple[GateResult, ...],
+    gates: tuple[GateResult | StructuralGateResult, ...],
 ) -> bool:
     if not reports:
         return False
@@ -589,31 +714,56 @@ def release_evidence_template(registry: SemanticKnowledgeRegistry | None = None)
     )
 
 
+def structural_release_evidence_template(
+    registry: SemanticKnowledgeRegistry | None = None,
+) -> StructuralReleaseEvidence:
+    """Create the public CLI's unverified structural evidence template."""
+    verified_template = release_evidence_template(registry)
+    return StructuralReleaseEvidence(
+        standards=verified_template.standards,
+        libraries=verified_template.libraries,
+        profile=verified_template.profile,
+        gates=tuple(
+            StructuralGateResult(gate.spec, gate.evidence)
+            for gate in verified_template.gates
+        ),
+        performance_budgets=verified_template.performance_budgets,
+        external_capabilities=verified_template.external_capabilities,
+        compatibility_retirement=verified_template.compatibility_retirement,
+    )
+
+
 def apply_evidence_records(
     evidence: SemanticReleaseEvidence,
     records: Iterable[EvidenceRecord],
     *,
-    trust_policy: TrustedExecutionPolicy | None = None,
+    trust_policy: TrustedExecutionPolicy,
 ) -> SemanticReleaseEvidence:
-    """Apply only catalog-bound records verified by an operator public key."""
-    supplied = tuple(records)
-    updates = {record.gate_id: record for record in supplied}
-    if len(updates) != len(supplied):
-        raise ReleaseEvidenceError("evidence records must not repeat a gate_id")
-    known = {gate.spec.gate_id for gate in evidence.gates}
-    unknown = sorted(set(updates) - known)
-    if unknown:
-        raise ReleaseEvidenceError("evidence records do not match declared template gates: " + ", ".join(unknown))
+    """Verify catalog-bound records against an independently supplied policy."""
+    if not isinstance(trust_policy, TrustedExecutionPolicy):
+        raise ReleaseEvidenceError("evidence verification requires an explicit TrustedExecutionPolicy")
+    updates = _record_updates_for_declared_gates(evidence.gates, records)
     gates = tuple(
         GateResult(
             gate.spec,
             updates.get(gate.spec.gate_id, gate.evidence),
-            (
-                trust_policy
-                if updates.get(gate.spec.gate_id, gate.evidence).state
-                in {EvidenceState.PASSED, EvidenceState.FAILED}
-                else gate.trust_policy
-            ),
+            trust_policy,
+        )
+        for gate in evidence.gates
+    )
+    return replace(evidence, gates=gates)
+
+
+def apply_structural_evidence_records(
+    evidence: StructuralReleaseEvidence,
+    records: Iterable[EvidenceRecord],
+) -> StructuralReleaseEvidence:
+    """Attach structurally valid records without claiming their signers are trusted."""
+    updates = _record_updates_for_declared_gates(evidence.gates, records)
+    gates = tuple(
+        StructuralGateResult(
+            gate.spec,
+            updates.get(gate.spec.gate_id, gate.evidence),
         )
         for gate in evidence.gates
     )
@@ -624,24 +774,59 @@ def apply_performance_budgets(
     evidence: SemanticReleaseEvidence,
     budgets: Iterable[PerformanceBudget],
     *,
-    trust_policy: TrustedExecutionPolicy | None = None,
+    trust_policy: TrustedExecutionPolicy,
 ) -> SemanticReleaseEvidence:
-    """Apply only budget samples signed by the executing benchmark authority."""
+    """Verify benchmark budgets against an independently supplied policy."""
+    if not isinstance(trust_policy, TrustedExecutionPolicy):
+        raise ReleaseEvidenceError("budget verification requires an explicit TrustedExecutionPolicy")
+    updates = _performance_budget_updates_for_declared_gates(evidence.gates, budgets)
+    gate_by_id = {gate.spec.gate_id: gate for gate in evidence.gates}
+    for budget in updates.values():
+        trust_policy.verify_budget(gate_by_id[budget.gate_id].spec, budget)
+    return replace(evidence, performance_budgets={**evidence.performance_budgets, **updates})
+
+
+def apply_structural_performance_budgets(
+    evidence: StructuralReleaseEvidence,
+    budgets: Iterable[PerformanceBudget],
+) -> StructuralReleaseEvidence:
+    """Attach structurally valid budgets without a signer trust verdict."""
+    updates = _performance_budget_updates_for_declared_gates(evidence.gates, budgets)
+    return replace(evidence, performance_budgets={**evidence.performance_budgets, **updates})
+
+
+def _record_updates_for_declared_gates(
+    gates: tuple[GateResult | StructuralGateResult, ...],
+    records: Iterable[EvidenceRecord],
+) -> dict[str, EvidenceRecord]:
+    supplied = tuple(records)
+    updates = {record.gate_id: record for record in supplied}
+    if len(updates) != len(supplied):
+        raise ReleaseEvidenceError("evidence records must not repeat a gate_id")
+    known = {gate.spec.gate_id for gate in gates}
+    unknown = sorted(set(updates) - known)
+    if unknown:
+        raise ReleaseEvidenceError(
+            "evidence records do not match declared template gates: " + ", ".join(unknown)
+        )
+    return updates
+
+
+def _performance_budget_updates_for_declared_gates(
+    gates: tuple[GateResult | StructuralGateResult, ...],
+    budgets: Iterable[PerformanceBudget],
+) -> dict[PerformanceTarget, PerformanceBudget]:
     supplied = tuple(budgets)
     updates = {budget.target: budget for budget in supplied}
     if len(updates) != len(supplied):
         raise ReleaseEvidenceError("performance budgets must not repeat a backend/mode target")
-    gate_by_id = {gate.spec.gate_id: gate for gate in evidence.gates}
-    for target, budget in updates.items():
+    gate_by_id = {gate.spec.gate_id: gate for gate in gates}
+    for budget in updates.values():
         gate = gate_by_id.get(budget.gate_id)
         if gate is None or not gate.evidence.passed:
             raise ReleaseEvidenceError("performance budget requires its spec-bound passing gate")
         budget.validate_against(gate.spec)
-        policy = trust_policy or gate.trust_policy
-        if not isinstance(policy, TrustedExecutionPolicy):
-            raise ReleaseEvidenceError("performance budget requires an operator trusted execution policy")
-        policy.verify_budget(gate.spec, budget)
-    return replace(evidence, performance_budgets={**evidence.performance_budgets, **updates})
+    return updates
 
 
 def attach_retirement_telemetry(
@@ -662,11 +847,39 @@ def attach_retirement_telemetry(
     return replace(evidence, compatibility_retirement=(decision,))
 
 
+def attach_structural_retirement_telemetry(
+    evidence: StructuralReleaseEvidence,
+    telemetry: TelemetryAttestation,
+) -> StructuralReleaseEvidence:
+    """Attach a structurally valid telemetry window without a trust verdict."""
+    if not isinstance(telemetry, TelemetryAttestation):
+        raise ReleaseEvidenceError("retirement telemetry must be TelemetryAttestation")
+    migration = _legacy_migration_gate(evidence.gates)
+    decision = CompatibilityRetirementDecision(
+        path_id="legacy_fact_migration_compatibility",
+        migration_gate_id=migration.spec.gate_id,
+        migration_spec_digest=migration.spec.digest,
+        migration_run_digest=migration.evidence.run_digest if migration.evidence.passed else None,
+        telemetry=telemetry,
+    )
+    return replace(evidence, compatibility_retirement=(decision,))
+
+
 def attach_external_capability_report(
     evidence: SemanticReleaseEvidence,
     report: ExternalCapabilityReport,
 ) -> SemanticReleaseEvidence:
     """Attach only a fully hash-bound report from the declared external consumer."""
+    if not isinstance(report, ExternalCapabilityReport):
+        raise ReleaseEvidenceError("external adapter report must be ExternalCapabilityReport")
+    return replace(evidence, external_capabilities=(report,))
+
+
+def attach_structural_external_capability_report(
+    evidence: StructuralReleaseEvidence,
+    report: ExternalCapabilityReport,
+) -> StructuralReleaseEvidence:
+    """Attach a structurally bound external report without a trust verdict."""
     if not isinstance(report, ExternalCapabilityReport):
         raise ReleaseEvidenceError("external adapter report must be ExternalCapabilityReport")
     return replace(evidence, external_capabilities=(report,))
@@ -764,43 +977,6 @@ def trusted_execution_policy_from_mapping(value: Mapping[str, object]) -> Truste
             )
         )
     return TrustedExecutionPolicy(tuple(keys))
-
-
-def operator_trusted_execution_policy() -> TrustedExecutionPolicy:
-    """Load the release verifier root selected by the process operator.
-
-    The public assembly CLI intentionally has no policy-file argument.  The
-    supervisor that launches it must set both the absolute policy path and a
-    SHA-256 pin in protected Kestrel configuration/environment.  Reading and
-    hashing the bytes once prevents a report author from redirecting assembly
-    to a self-authored public-key allowlist or from swapping its contents.
-    """
-    policy_path_value = os.environ.get(_OPERATOR_TRUST_POLICY_PATH_ENV)
-    expected_digest = os.environ.get(_OPERATOR_TRUST_POLICY_SHA256_ENV)
-    if not policy_path_value or not expected_digest:
-        raise ReleaseEvidenceError(
-            "operator trusted execution policy is not configured; set "
-            f"{_OPERATOR_TRUST_POLICY_PATH_ENV} and "
-            f"{_OPERATOR_TRUST_POLICY_SHA256_ENV}"
-        )
-    if not _SHA256_HEX_RE.fullmatch(expected_digest):
-        raise ReleaseEvidenceError(
-            "operator trusted execution policy SHA-256 pin must be lowercase hexadecimal"
-        )
-    policy_path = Path(policy_path_value)
-    if not policy_path.is_absolute():
-        raise ReleaseEvidenceError("operator trusted execution policy path must be absolute")
-    try:
-        policy_bytes = policy_path.read_bytes()
-    except OSError as error:
-        raise ReleaseEvidenceError("operator trusted execution policy cannot be read") from error
-    if hashlib.sha256(policy_bytes).hexdigest() != expected_digest:
-        raise ReleaseEvidenceError("operator trusted execution policy does not match its SHA-256 pin")
-    try:
-        policy_value = json.loads(policy_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ReleaseEvidenceError("operator trusted execution policy is not valid UTF-8 JSON") from error
-    return trusted_execution_policy_from_mapping(_expect_mapping(policy_value, "trusted execution policy"))
 
 
 def evidence_record_from_mapping(value: Mapping[str, object]) -> EvidenceRecord:
@@ -939,7 +1115,12 @@ def run_command_evidence(*_args: object, **_kwargs: object) -> EvidenceRecord:
     raise ReleaseEvidenceError("generic argv execution cannot create release-ready evidence")
 
 
-def write_release_evidence(evidence: SemanticReleaseEvidence, output: Path, *, overwrite: bool = False) -> None:
+def write_release_evidence(
+    evidence: SemanticReleaseEvidence | StructuralReleaseEvidence,
+    output: Path,
+    *,
+    overwrite: bool = False,
+) -> None:
     _write_json(evidence.to_mapping(), output, overwrite=overwrite, kind="evidence artifact")
 
 

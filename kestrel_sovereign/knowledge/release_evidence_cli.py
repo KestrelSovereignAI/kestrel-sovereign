@@ -1,9 +1,9 @@
-"""CLI for trusted, content-free semantic release attestations.
+"""CLI for content-free semantic release evidence.
 
 The public CLI never accepts an observation JSON object or benchmark samples
-to create passed evidence.  ``run`` invokes only an immutable catalog workload
-and signs the emitted result; ``assemble`` imports signed records only after
-an operator-owned public-key policy verifies them.
+to create passed evidence. ``run`` invokes only an immutable catalog workload
+and signs the emitted result; ``assemble`` preserves structurally valid
+submissions without making a signer-trust or release-readiness claim.
 """
 
 from __future__ import annotations
@@ -21,16 +21,15 @@ from .release_evidence import (
     EvidenceState,
     ReleaseEvidenceError,
     TelemetryAttestation,
-    attach_external_capability_report,
-    attach_retirement_telemetry,
-    apply_evidence_records,
-    apply_performance_budgets,
+    attach_structural_external_capability_report,
+    attach_structural_retirement_telemetry,
+    apply_structural_evidence_records,
+    apply_structural_performance_budgets,
     evidence_record_from_mapping,
     external_capability_report_from_mapping,
-    operator_trusted_execution_policy,
     performance_budget_from_mapping,
-    release_evidence_template,
     release_gate_specs,
+    structural_release_evidence_template,
     telemetry_attestation_from_mapping,
     write_evidence_record,
     write_performance_budget,
@@ -62,7 +61,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    template = subparsers.add_parser("template", help="write a non-ready release template")
+    template = subparsers.add_parser("template", help="write an unverified non-ready release template")
     template.add_argument("--output", type=Path, required=True)
     template.add_argument("--overwrite", action="store_true")
 
@@ -124,7 +123,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     telemetry.add_argument("--output", type=Path, required=True)
     telemetry.add_argument("--overwrite", action="store_true")
 
-    assemble = subparsers.add_parser("assemble", help="apply only verified catalog-bound records")
+    assemble = subparsers.add_parser(
+        "assemble",
+        help="inspect structurally valid catalog-bound records without a trust verdict",
+    )
     assemble.add_argument("--record", type=Path, action="append", default=[])
     assemble.add_argument("--budget", type=Path, action="append", default=[])
     assemble.add_argument(
@@ -143,9 +145,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "template":
-            evidence = release_evidence_template()
+            evidence = structural_release_evidence_template()
             write_release_evidence(evidence, args.output, overwrite=args.overwrite)
-            print(f"semantic release evidence template written: {args.output} (ready=false)")
+            print(
+                "semantic release evidence template written: "
+                f"{args.output} (ready=false, trust_status=unverified)"
+            )
             return 0
         if args.command == "record":
             raise ReleaseEvidenceError(
@@ -222,32 +227,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             performance_budget_from_mapping(json.loads(path.read_text(encoding="utf-8")))
             for path in args.budget
         )
-        policy = (
-            operator_trusted_execution_policy()
-            if budgets
-            or any(record.state in {EvidenceState.PASSED, EvidenceState.FAILED} for record in records)
-            else None
+        evidence = apply_structural_evidence_records(
+            structural_release_evidence_template(), records
         )
-        evidence = apply_evidence_records(
-            release_evidence_template(), records, trust_policy=policy
-        )
-        evidence = apply_performance_budgets(evidence, budgets, trust_policy=policy)
+        evidence = apply_structural_performance_budgets(evidence, budgets)
         if args.retirement_telemetry is not None:
             telemetry_mapping = json.loads(args.retirement_telemetry.read_text(encoding="utf-8"))
-            evidence = attach_retirement_telemetry(
+            evidence = attach_structural_retirement_telemetry(
                 evidence,
                 telemetry_attestation_from_mapping(telemetry_mapping),
             )
         if args.external_report is not None:
             report_mapping = json.loads(args.external_report.read_text(encoding="utf-8"))
-            evidence = attach_external_capability_report(
+            evidence = attach_structural_external_capability_report(
                 evidence,
                 external_capability_report_from_mapping(report_mapping),
             )
         write_release_evidence(evidence, args.output, overwrite=args.overwrite)
         print(
             "semantic release evidence assembled: "
-            f"{args.output} (ready={str(evidence.ready).lower()})"
+            f"{args.output} (ready=false, trust_status=unverified, "
+            f"structurally_complete={str(evidence.structurally_complete).lower()})"
         )
         return 0
     except (ReleaseEvidenceError, OSError, ValueError) as error:

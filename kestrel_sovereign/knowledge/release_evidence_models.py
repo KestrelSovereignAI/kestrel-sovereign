@@ -932,27 +932,54 @@ class EvidenceRecord:
         }
 
 
+def _validate_gate_evidence_binding(spec: GateSpec, evidence: EvidenceRecord) -> None:
+    """Validate catalog binding without deciding whether a signer is trusted."""
+    if not isinstance(spec, GateSpec) or not isinstance(evidence, EvidenceRecord):
+        raise ReleaseEvidenceError("gate result requires a GateSpec and EvidenceRecord")
+    if spec.gate_id != evidence.gate_id:
+        raise ReleaseEvidenceError("gate result evidence must match its declared gate_id")
+    if spec.advertised and evidence.state is EvidenceState.SKIPPED:
+        raise ReleaseEvidenceError("an advertised release gate cannot be skipped")
+    if not spec.advertised and (
+        evidence.state is not EvidenceState.SKIPPED
+        or not evidence.outside_advertised_capability
+    ):
+        raise ReleaseEvidenceError("an unadvertised gate must remain explicitly skipped")
+    spec.validate_attestation(evidence)
+
+
+@dataclass(frozen=True, slots=True)
+class StructuralGateResult:
+    """Catalog-bound evidence submitted for inspection without a trust verdict.
+
+    This preserves the exact content and digest binding of a submitted result,
+    while deliberately making no claim that the listed signing key is trusted.
+    """
+
+    spec: GateSpec
+    evidence: EvidenceRecord
+
+    def __post_init__(self) -> None:
+        _validate_gate_evidence_binding(self.spec, self.evidence)
+
+    @property
+    def structurally_ready(self) -> bool:
+        return not self.spec.required_for_ready or self.evidence.passed
+
+    def to_mapping(self) -> dict[str, object]:
+        return {**self.spec.to_mapping(), "evidence": self.evidence.to_mapping()}
+
+
 @dataclass(frozen=True, slots=True)
 class GateResult:
-    """A declared gate and the only evidence that may satisfy it."""
+    """A declared gate whose signer was verified by an explicit trust policy."""
 
     spec: GateSpec
     evidence: EvidenceRecord
     trust_policy: TrustedExecutionPolicy | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.spec, GateSpec) or not isinstance(self.evidence, EvidenceRecord):
-            raise ReleaseEvidenceError("gate result requires a GateSpec and EvidenceRecord")
-        if self.spec.gate_id != self.evidence.gate_id:
-            raise ReleaseEvidenceError("gate result evidence must match its declared gate_id")
-        if self.spec.advertised and self.evidence.state is EvidenceState.SKIPPED:
-            raise ReleaseEvidenceError("an advertised release gate cannot be skipped")
-        if not self.spec.advertised and (
-            self.evidence.state is not EvidenceState.SKIPPED
-            or not self.evidence.outside_advertised_capability
-        ):
-            raise ReleaseEvidenceError("an unadvertised gate must remain explicitly skipped")
-        self.spec.validate_attestation(self.evidence)
+        _validate_gate_evidence_binding(self.spec, self.evidence)
         if self.evidence.state in {EvidenceState.PASSED, EvidenceState.FAILED}:
             if not isinstance(self.trust_policy, TrustedExecutionPolicy):
                 raise ReleaseEvidenceError(

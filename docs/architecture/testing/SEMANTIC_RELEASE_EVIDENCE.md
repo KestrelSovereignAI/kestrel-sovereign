@@ -36,7 +36,7 @@ aggregate counts, booleans, and safe opaque references. It never stores test
 stdout, assertions, prompts, tenant IDs, source locators, DSNs, credentials, or
 arbitrary command lines.
 
-## Catalog-bound trusted execution, not caller-entered observations
+## Catalog-bound execution and unverified structural assembly
 
 The public CLI has no `record -- <argv>` escape hatch and does **not** accept
 an observation JSON object or benchmark samples to create a passed result.
@@ -47,17 +47,25 @@ observation fields. After the workload returns a schema-valid content-free
 measurement, the execution authority creates an opaque artifact reference and
 signs the exact run digest with Ed25519.
 
-Only an operator-owned public-key allowlist can verify that signature during
-`assemble`. The CLI has no trust-policy argument: its launching CI or service
-manager must set `KESTREL_SEMANTIC_RELEASE_TRUST_POLICY_PATH` to an **absolute**
-operator-controlled policy path and
-`KESTREL_SEMANTIC_RELEASE_TRUST_POLICY_SHA256` to that file's lowercase
-SHA-256. `assemble` reads the bytes once and rejects a missing or mismatched
-pin before parsing keys. These protected process settings, rather than a
-report or caller argument, are the verifier root. External Parametric Self
-evidence is imported only as independently signed `external_ci` evidence. Its
-key may attest only the catalog's `external_ci` runner; a `catalog_runner` key
-cannot attest that runner, and neither source can substitute for the other.
+The public `assemble` command is deliberately **not** a signature-verification
+or release-verdict surface. It reads no trust policy from CLI inputs or process
+environment. It validates catalog, schema, digest, artifact, budget, drill,
+and correlation bindings, then emits the separate structural contract
+`semantic-kb-v1-release-evidence-structural-v1` with fixed
+`"ready": false` and `"trust_status": "unverified"`. A
+`"structurally_complete": true` result means only that every submitted field
+fits the catalog; it is never proof that the signers are trusted or that a
+release is ready.
+
+Signature verification remains an explicit in-process verifier API:
+`apply_evidence_records` and `apply_performance_budgets` require a
+`TrustedExecutionPolicy`. That policy and any signed verification receipt must
+be supplied by an independent Talon/CI verifier, not by a report author or the
+public CLI. Until such a verifier issues a receipt, #2753 remains open and no
+assembled artifact is a release claim. Within that verifier policy,
+`external_ci` keys may attest only the catalog's `external_ci` runner;
+`catalog_runner` keys cannot attest that runner, and neither source can
+substitute for the other.
 
 At present, the built-in executable workload is
 `registry/stable_only_capability_selection_v1`. Other named pytest, benchmark,
@@ -95,17 +103,10 @@ uv run python -m kestrel_sovereign.knowledge.release_evidence assemble \
   --output /tmp/semantic-release-evidence.json
 ```
 
-The trust policy stores public information only. Each key fixes an issuer/key
-ID, `catalog_runner` or `external_ci` source, raw Ed25519 public key, and
-allowed runner IDs. Configure its absolute path and SHA-256 pin in the CI or
-service manager environment before invoking `assemble`; do not forward either
-value from a report-producing job. It is operator configuration, not an
-attachment supplied by a record:
-
-```text
-KESTREL_SEMANTIC_RELEASE_TRUST_POLICY_PATH=/secure/semantic-release-trust-policy.json
-KESTREL_SEMANTIC_RELEASE_TRUST_POLICY_SHA256=<sha256-of-the-exact-policy-file-bytes>
-```
+An independent verifier's trust policy stores public information only. Each
+key fixes an issuer/key ID, `catalog_runner` or `external_ci` source, raw
+Ed25519 public key, and allowed runner IDs. It is verifier-owned configuration,
+not an attachment supplied by a record or an input to `assemble`:
 
 ```json
 {
@@ -137,9 +138,11 @@ uv run python -m kestrel_sovereign.knowledge.release_evidence block \
 ```
 
 `assemble` starts from the current catalog, rejects unknown or duplicate gate
-records, recomputes `ready`, and preserves missing work as `not_run` or
-`blocked`. JSON fields named `ready` are output only; they cannot make an
-incomplete report ready.
+records, preserves missing work as `not_run` or `blocked`, and reports
+structural completeness for inspection. It always emits `ready: false` and
+includes `trust_verification_required` as a blocker. JSON fields named
+`ready`, supplied keys, and environment variables cannot make the structural
+artifact ready.
 
 ## Standards matrix and stable capability boundary
 
@@ -233,7 +236,8 @@ For this contract the pinned source is
 non-evidence even if its result fields look similar.
 
 An external report is supplied as safe structured JSON—never as pre-populated
-metadata—and is checked against the locally assembled stage records:
+metadata—and is structurally checked against the locally assembled stage
+records:
 
 ```bash
 uv run python -m kestrel_sovereign.knowledge.release_evidence assemble \
@@ -304,16 +308,17 @@ uv run python -m kestrel_sovereign.knowledge.release_evidence assemble \
 ```
 
 Only a complete inventory with zero eligible rows, zero required consumers,
-and the exact passing equivalence result yields `eligible_for_review`. It is
-not an automatic deletion; operator review and the migration/rollback policy
-remain required. Any absent, mismatched, or incomplete component leaves the
-path at `retain`.
+and the exact passing equivalence result can make the **structural** decision
+read `eligible_for_review`. That is not a trusted removal verdict: an
+independent verifier must validate the signed evidence before operator review
+and the migration/rollback policy may proceed. Any absent, mismatched, or
+incomplete component leaves the path at `retain`.
 
 ## Verification order
 
-The artifact is implementation-side evidence, not a substitute for independent
-review or CI. Run the focused contract tests first, then actual backend and
-live-agent evidence when those environments are available:
+The structural artifact is implementation-side evidence, not a substitute for
+independent review or CI. Run the focused contract tests first, then actual
+backend and live-agent evidence when those environments are available:
 
 ```bash
 uv run pytest tests/unit/test_semantic_release_evidence.py \
@@ -322,5 +327,7 @@ uv run pytest tests/unit/test_semantic_release_evidence.py \
 
 Then follow the test pyramid in [Testing Guide](TESTING_GUIDE.md): targeted
 backend integration, isolated Kite HTTP dogfooding, independent
-`talon_verify`, and CI. If a review changes live wiring, rerun the affected
-catalog records and re-dogfood before describing the release as observed.
+`talon_verify`, and CI. The independent verifier—not `assemble`—must emit any
+signed verification receipt and own its trust policy. If a review changes live
+wiring, rerun the affected catalog records and re-dogfood before describing the
+release as observed.
