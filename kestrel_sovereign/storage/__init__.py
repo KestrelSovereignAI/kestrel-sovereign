@@ -67,6 +67,7 @@ from .legacy_fact_migration import (
     LegacyGraphFactMigration,
     MigrationPlan as LegacyFactMigrationPlan,
     MigrationResult as LegacyFactMigrationResult,
+    MigrationSourceReview as LegacyFactMigrationSourceReview,
 )
 from .agent_resource_store import (
     AgentResourceStore,
@@ -167,6 +168,7 @@ __all__ = [
     "LegacyGraphFactMigration",
     "LegacyFactMigrationPlan",
     "LegacyFactMigrationResult",
+    "LegacyFactMigrationSourceReview",
     # Privacy
     "PrivacyEnforcingStorage",
     "PrivacyViolationError",

@@ -474,22 +474,31 @@ JSON, missing time, invalid confidence, and shared/unowned rows are recorded
 as content-safe rejected outcomes. No label, edge, arbitrary JSON key, action,
 todo, identity, avatar, constitution, or feature-private node is converted.
 
-`plan()` provides a bounded dry-run inventory by tenant/status and only emits
-SHA-256 content hashes, never values. `run()` uses node-ID keyset pages and
-durable checkpoint records; a process failure before a checkpoint replays the
-same deterministic source occurrence and governed operation safely. Each
-proposal crosses `put_validated_assertion(..., ValidationSource.IMPORTED)`, so
-the normal SHACL acceptance/rejection path remains authoritative. Legacy rows
-are retained. `rollback()` is separately invoked and deletes only canonical
-assertions whose migration source occurrence exactly matches the recorded
-provenance; it never removes legacy graph content or audit records.
+`plan()` provides a bounded dry-run inventory by tenant/source/status and only
+emits SHA-256 content hashes, never values. Rejection diagnostics are a fixed
+code whitelist; legacy predicate/value text is neither logged nor returned.
+`run()` uses node-ID keyset pages and durable checkpoint records; a process
+failure before a checkpoint replays the same deterministic source occurrence
+and governed operation safely. Before every resume it performs a paged,
+content-hash source-set review. A newly discovered node below an existing
+cursor requires the explicit `reset_checkpoint_after_review()` path; a changed,
+missing, or newly shared recorded source fails closed for operator review and
+is never silently reinterpreted. Each proposal crosses
+`put_validated_assertion(..., ValidationSource.IMPORTED)`, so the normal SHACL
+acceptance/rejection path remains authoritative. Legacy rows are retained.
+`rollback()` is separately invoked and deletes only canonical assertions whose
+migration source occurrence exactly matches the recorded provenance; it never
+removes legacy graph content or audit records.
 
 Core has no semantic-assertion vector/index projection to rebuild. A
 feature-owned projection may supply its public invalidator to the runner; it
-receives only the bound tenant and accepted assertion IDs. The optional
-compatibility flag enables deterministic coverage metrics only—there is no
-dual-write and no application dual-read path. Its removal condition is zero
-unmigrated eligible rows plus operator review of every rejection class.
+receives only the bound tenant and accepted assertion IDs. Accepted IDs first
+enter a durable pending-invalidation ledger, and delivery is marked complete
+only after the public invalidator returns. A failure is retried by every later
+run, including one with no remaining graph pages. The optional compatibility
+flag enables deterministic coverage metrics only—there is no dual-write and no
+application dual-read path. Its removal condition is zero unmigrated eligible
+rows plus operator review of every rejection class.
 
 An assertion can be knowledge only when it has passed the canonical writer's
 tenant/privacy/normalization checks, recorded source or derivation lineage,

@@ -2019,3 +2019,11 @@ async def migrate_legacy_graph_fact_migration_state(db: "AsyncDatabase") -> None
             "PRIMARY KEY (tenant_id, migration_name))",
             (),
         )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS legacy_fact_migration_invalidations ("
+            "tenant_id TEXT NOT NULL, migration_name TEXT NOT NULL, "
+            "assertion_id TEXT NOT NULL, state TEXT NOT NULL, "
+            "created_at TIMESTAMP NOT NULL, delivered_at TIMESTAMP, "
+            "PRIMARY KEY (tenant_id, migration_name, assertion_id))",
+            (),
+        )

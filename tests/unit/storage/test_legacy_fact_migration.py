@@ -13,6 +13,7 @@ from kestrel_sovereign.storage.async_assertion_store import (
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 from kestrel_sovereign.storage.legacy_fact_migration import (
     LegacyGraphFactMigration,
+    LegacyFactMigrationError,
 )
 from kestrel_sovereign.storage.sqla.migrations import (
     migrate_legacy_graph_fact_migration_state,
@@ -39,6 +40,7 @@ async def test_bookkeeping_schema_is_common_transactional_ddl_for_postgres():
     statements = [call.args[0] for call in db.execute.await_args_list]
     assert any("legacy_fact_migration_records" in statement for statement in statements)
     assert any("legacy_fact_migration_checkpoints" in statement for statement in statements)
+    assert any("legacy_fact_migration_invalidations" in statement for statement in statements)
     db.transaction.assert_called_once_with()
 
 
@@ -159,7 +161,7 @@ async def test_rejects_malformed_unsupported_and_shared_nodes_without_promotion(
         assert result.migrated == 0
         assert result.rejected["malformed_properties"] == 1
         assert result.rejected["shared_or_ambiguous_ownership"] == 1
-        assert result.rejected["unsupported predicate 'unmapped'; supported predicates: preferred_deploy_region"] == 1
+        assert result.rejected["unsupported_semantic_mapping"] == 1
         current = await storage.db.fetchone(
             "SELECT COUNT(*) FROM semantic_assertions WHERE tenant_id = ?", (TENANT,)
         )
@@ -186,6 +188,156 @@ async def test_feature_projection_invalidator_observes_only_accepted_assertions(
         assert result.index_invalidation_requested is True
         assert seen[0][0] == TENANT
         assert len(seen[0][1]) == 1
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_rejected_plan_never_echoes_legacy_predicate_or_value(tmp_path):
+    storage = await _storage(tmp_path)
+    try:
+        private_predicate = "private-predicate-8e101"
+        private_value = "private-value-a438c"
+        await _node(
+            storage,
+            "unmappable",
+            {
+                "subject": "user",
+                "predicate": private_predicate,
+                "value": private_value,
+                "created_at": "2026-01-01T00:00:00+00:00",
+            },
+        )
+        plan = await LegacyGraphFactMigration(storage).plan()
+        rendered = repr(plan.to_mapping())
+        assert plan.rejected == {"unsupported_semantic_mapping": 1}
+        assert private_predicate not in rendered
+        assert private_value not in rendered
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_projection_invalidation_is_durable_and_retried_after_failure(tmp_path):
+    storage = await _storage(tmp_path)
+    calls: list[tuple[str, tuple[str, ...]]] = []
+    try:
+        await _node(
+            storage,
+            "fact-pending-index",
+            {"subject": "user", "predicate": "preferred_deploy_region", "value": "retry-index", "created_at": "2026-01-01T00:00:00+00:00"},
+        )
+
+        async def fail_once(tenant: str, assertion_ids: tuple[str, ...]) -> None:
+            calls.append((tenant, assertion_ids))
+            if len(calls) == 1:
+                raise RuntimeError("projection unavailable")
+
+        migration = LegacyGraphFactMigration(storage, index_invalidator=fail_once)
+        with pytest.raises(RuntimeError, match="projection unavailable"):
+            await migration.run(batch_size=1)
+
+        # The completed canonical page is checkpointed, but the external
+        # projection receipt stays pending and is delivered on a later run.
+        recovered = await migration.run(batch_size=1)
+        assert recovered.processed == 0
+        assert recovered.index_invalidation_requested is True
+        assert len(calls) == 2
+        assert storage.db is not None
+        state = await storage.db.fetchone(
+            "SELECT state FROM legacy_fact_migration_invalidations WHERE tenant_id = ?",
+            (TENANT,),
+        )
+        assert state[0] == "delivered"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_lone_surrogate_is_rejected_with_fixed_code(tmp_path):
+    storage = await _storage(tmp_path)
+    try:
+        # json.dumps escapes this for SQLite; json.loads recreates the lone
+        # surrogate, which must not escape as an exception or diagnostic.
+        await _node(
+            storage,
+            "bad-unicode",
+            {"subject": "user", "predicate": "preferred_deploy_region", "value": "\ud800", "created_at": "2026-01-01T00:00:00+00:00"},
+        )
+        plan = await LegacyGraphFactMigration(storage).plan()
+        assert plan.rejected == {"invalid_unicode": 1}
+        result = await LegacyGraphFactMigration(storage).run()
+        assert result.rejected == {"invalid_unicode": 1}
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_late_lower_node_requires_review_then_safe_reset(tmp_path):
+    storage = await _storage(tmp_path)
+    try:
+        await _node(
+            storage,
+            "migrated-middle",
+            {"subject": "user", "predicate": "preferred_deploy_region", "value": "first", "created_at": "2026-01-01T00:00:00+00:00"},
+        )
+        migration = LegacyGraphFactMigration(storage)
+        assert (await migration.run(batch_size=1)).complete
+        await _node(
+            storage,
+            "added-before-cursor",
+            {"subject": "user", "predicate": "preferred_deploy_region", "value": "late", "created_at": "2026-01-02T00:00:00+00:00"},
+        )
+        with pytest.raises(LegacyFactMigrationError, match="checkpoint_reset_required"):
+            await migration.run(batch_size=1)
+        review = await migration.reset_checkpoint_after_review()
+        assert review.late_added_before_checkpoint == 1
+        result = await migration.run(batch_size=2)
+        assert result.migrated == 1
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_corrected_recorded_source_requires_operator_review_not_rewrite(tmp_path):
+    storage = await _storage(tmp_path)
+    try:
+        node_id = "fact-corrected"
+        await _node(
+            storage,
+            node_id,
+            {"subject": "user", "predicate": "preferred_deploy_region", "value": "before", "created_at": "2026-01-01T00:00:00+00:00"},
+        )
+        migration = LegacyGraphFactMigration(storage)
+        await migration.run()
+        assert storage.db is not None
+        await storage.db.execute(
+            "UPDATE graph_nodes SET properties = ? WHERE node_id = ?",
+            (json.dumps({"subject": "user", "predicate": "preferred_deploy_region", "value": "after", "created_at": "2026-01-01T00:00:00+00:00"}), node_id),
+        )
+        review = await migration.review_source_set()
+        assert review.changed == 1
+        with pytest.raises(LegacyFactMigrationError, match="source_review_required"):
+            await migration.run()
+        with pytest.raises(LegacyFactMigrationError, match="source_review_required"):
+            await migration.reset_checkpoint_after_review()
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_bound_tenant_never_inventories_foreign_owner_rows(tmp_path):
+    storage = await _storage(tmp_path)
+    try:
+        await _node(
+            storage,
+            "foreign-fact",
+            {"subject": "user", "predicate": "preferred_deploy_region", "value": "foreign", "created_at": "2026-01-01T00:00:00+00:00"},
+            owner="did:example:foreign",
+        )
+        migration = LegacyGraphFactMigration(storage)
+        assert (await migration.plan()).scanned == 0
+        assert (await migration.run()).migrated == 0
     finally:
         await storage.close()
 

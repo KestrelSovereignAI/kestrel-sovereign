@@ -44,6 +44,17 @@ LEGACY_FACT_SHAPE = {
     "required_properties": ("subject", "predicate", "value", "created_at"),
     "ownership": "exactly one graph_node_owners ledger row matching the bound tenant",
 }
+_SAFE_REJECTION_CODES = frozenset(
+    {
+        "invalid_node_id",
+        "malformed_properties",
+        "missing_or_invalid_fact_fields",
+        "missing_or_invalid_created_at",
+        "invalid_confidence",
+        "invalid_unicode",
+        "shared_or_ambiguous_ownership",
+    }
+)
 
 
 class LegacyFactMigrationError(ValueError):
@@ -114,10 +125,49 @@ class MigrationResult:
     index_invalidation_requested: bool
 
 
+@dataclass(frozen=True, slots=True)
+class MigrationSourceReview:
+    """Content-safe source-set drift audit required before checkpoint resume."""
+
+    reviewed: int
+    late_added_before_checkpoint: int
+    changed: int
+    missing_or_unowned: int
+
+    @property
+    def requires_reset(self) -> bool:
+        return self.late_added_before_checkpoint > 0
+
+    @property
+    def requires_operator_review(self) -> bool:
+        return self.changed > 0 or self.missing_or_unowned > 0
+
+
 def _canonical_hash(value: object) -> str:
     encoded = json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _safe_rejection_code(error: Exception) -> str:
+    """Convert legacy/parser errors to stable diagnostics without echoing data."""
+    if isinstance(error, FactMappingError):
+        return "unsupported_semantic_mapping"
+    if isinstance(error, LegacyFactMigrationError):
+        candidate = str(error)
+        if candidate in _SAFE_REJECTION_CODES:
+            return candidate
+    return "invalid_legacy_fact"
+
+
+def _raw_properties_hash(node_id: object, raw_properties: object) -> str:
+    """Hash malformed/rejected source bytes without rendering their content."""
+    if not isinstance(node_id, str) or not isinstance(raw_properties, str):
+        return "sha256:" + hashlib.sha256(b"non-string-legacy-source").hexdigest()
+    encoded = node_id.encode("utf-8", "surrogatepass") + b"\0" + raw_properties.encode(
+        "utf-8", "surrogatepass"
+    )
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
@@ -148,6 +198,12 @@ def _legacy_candidate(node_id: object, raw_properties: object) -> LegacyFactCand
     values = {key: properties.get(key) for key in ("subject", "predicate", "value")}
     if any(not isinstance(value, str) or not value for value in values.values()):
         raise LegacyFactMigrationError("missing_or_invalid_fact_fields")
+    try:
+        node_id.encode("utf-8")
+        for value in values.values():
+            value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise LegacyFactMigrationError("invalid_unicode") from error
     created_at = _utc_timestamp(properties.get("created_at"))
     raw_confidence = properties.get("confidence", "1")
     if isinstance(raw_confidence, bool):
@@ -223,12 +279,14 @@ class LegacyGraphFactMigration:
             "(SELECT COUNT(*) FROM graph_node_owners all_owners "
             " WHERE all_owners.node_id = graph_nodes.node_id) AS owner_count, "
             "(SELECT records.outcome FROM legacy_fact_migration_records records "
-            " WHERE records.tenant_id = ? AND records.node_id = graph_nodes.node_id) AS recorded_outcome "
+            " WHERE records.tenant_id = ? AND records.node_id = graph_nodes.node_id) AS recorded_outcome, "
+            "(SELECT records.content_hash FROM legacy_fact_migration_records records "
+            " WHERE records.tenant_id = ? AND records.node_id = graph_nodes.node_id) AS recorded_hash "
             "FROM graph_nodes JOIN graph_node_owners owner "
             " ON owner.node_id = graph_nodes.node_id AND owner.agent_id = ? "
             "WHERE graph_nodes.node_type = 'fact' AND " + predicate + " "
             "ORDER BY graph_nodes.node_id ASC LIMIT ?",
-            ((tenant_id,) + parameters),
+            ((tenant_id, tenant_id) + parameters),
         )
 
     async def plan(self, *, scan_limit: int = 500) -> MigrationPlan:
@@ -236,8 +294,8 @@ class LegacyGraphFactMigration:
         if scan_limit < 1 or scan_limit > 5_000:
             raise LegacyFactMigrationError("scan_limit must be in [1, 5000]")
         db, tenant_id = await self._ready()
-        # _ready only creates bookkeeping.  A plan must never create migration
-        # records or checkpoints, and it never writes a legacy/canonical row.
+        # A plan never creates migration records/checkpoints and never writes
+        # a legacy or canonical row.
         rows = await self._rows_after(db, tenant_id, None, min(scan_limit + 1, 500))
         # Larger plans use bounded pages rather than a single unbounded scan.
         while len(rows) < scan_limit + 1 and rows and len(rows) % 500 == 0:
@@ -250,7 +308,7 @@ class LegacyGraphFactMigration:
         hashes: list[str] = []
         eligible = recorded = 0
         recorded_by_outcome: dict[str, int] = {}
-        for node_id, properties, owner_count, recorded_outcome in visible:
+        for node_id, properties, owner_count, recorded_outcome, _recorded_hash in visible:
             if int(owner_count) != 1:
                 rejected["shared_or_ambiguous_ownership"] = rejected.get("shared_or_ambiguous_ownership", 0) + 1
                 continue
@@ -258,7 +316,7 @@ class LegacyGraphFactMigration:
                 candidate = _legacy_candidate(node_id, properties)
                 map_legacy_fact(candidate.subject, candidate.predicate, candidate.value, tenant_id=tenant_id)
             except (LegacyFactMigrationError, FactMappingError) as error:
-                reason = str(error)
+                reason = _safe_rejection_code(error)
                 rejected[reason] = rejected.get(reason, 0) + 1
                 continue
             hashes.append(candidate.content_hash)
@@ -297,39 +355,48 @@ class LegacyGraphFactMigration:
             (tenant_id, MIGRATION_NAME),
         )
         cursor = str(row[0]) if row and row[0] is not None else None
+        review = await self._review_source_set(db, tenant_id, cursor)
+        if review.requires_operator_review:
+            raise LegacyFactMigrationError("legacy_fact_source_review_required")
+        if review.requires_reset:
+            raise LegacyFactMigrationError("legacy_fact_checkpoint_reset_required")
         processed = migrated = idempotent = 0
         rejected: dict[str, int] = {}
-        migrated_ids: list[str] = []
         complete = False
         for _ in range(max_batches):
             rows = await self._rows_after(db, tenant_id, cursor, batch_size)
             if not rows:
                 complete = True
                 break
-            for node_id, properties, owner_count, recorded_outcome in rows:
+            for node_id, properties, owner_count, recorded_outcome, _recorded_hash in rows:
                 processed += 1
                 cursor = str(node_id)
                 if recorded_outcome is not None:
                     idempotent += 1
                     continue
                 if int(owner_count) != 1:
-                    await self._record(db, tenant_id, str(node_id), None, "rejected:shared_or_ambiguous_ownership")
+                    await self._record(
+                        db, tenant_id, str(node_id), None,
+                        "rejected:shared_or_ambiguous_ownership",
+                        content_hash=_raw_properties_hash(node_id, properties),
+                    )
                     rejected["shared_or_ambiguous_ownership"] = rejected.get("shared_or_ambiguous_ownership", 0) + 1
                     continue
                 try:
                     candidate = _legacy_candidate(node_id, properties)
                     mapping = map_legacy_fact(candidate.subject, candidate.predicate, candidate.value, tenant_id=tenant_id)
                 except (LegacyFactMigrationError, FactMappingError) as error:
-                    reason = str(error)
-                    await self._record(db, tenant_id, str(node_id), None, f"rejected:{reason}")
+                    reason = _safe_rejection_code(error)
+                    await self._record(
+                        db, tenant_id, str(node_id), None, f"rejected:{reason}",
+                        content_hash=_raw_properties_hash(node_id, properties),
+                    )
                     rejected[reason] = rejected.get(reason, 0) + 1
                     continue
                 outcome, assertion_id = await self._migrate_candidate(candidate, mapping)
                 await self._record(db, tenant_id, candidate.node_id, candidate, outcome, assertion_id=assertion_id)
                 if outcome == "migrated":
                     migrated += 1
-                    if assertion_id:
-                        migrated_ids.append(assertion_id)
                 elif outcome == "idempotent":
                     idempotent += 1
                 else:
@@ -347,16 +414,48 @@ class LegacyGraphFactMigration:
                 break
         if complete:
             await self._checkpoint(db, tenant_id, cursor, "complete")
-        invalidated = False
-        if migrated_ids and self._index_invalidator is not None:
-            response = self._index_invalidator(tenant_id, tuple(migrated_ids))
-            if hasattr(response, "__await__"):
-                await response
-            invalidated = True
+        invalidated = await self._deliver_pending_invalidations(db, tenant_id)
         # There is no assertion vector/search index in core today.  A caller
         # with a feature-owned projection must provide its public invalidator;
         # silently guessing a private feature table would violate the boundary.
         return MigrationResult(tenant_id, processed, migrated, idempotent, rejected, cursor, complete, invalidated)
+
+    async def review_source_set(self) -> MigrationSourceReview:
+        """Inspect the entire source set before an explicit checkpoint reset.
+
+        The audit is intentionally read-only and paged.  It prevents a
+        completed keyset cursor from silently missing a later low-ID insert or
+        accepting a corrected legacy source as though it were its old value.
+        """
+        db, tenant_id = await self._ready()
+        row = await db.fetchone(
+            "SELECT last_node_id FROM legacy_fact_migration_checkpoints "
+            "WHERE tenant_id = ? AND migration_name = ?",
+            (tenant_id, MIGRATION_NAME),
+        )
+        cursor = str(row[0]) if row and row[0] is not None else None
+        return await self._review_source_set(db, tenant_id, cursor)
+
+    async def reset_checkpoint_after_review(self) -> MigrationSourceReview:
+        """Safely replay a source set only when it gained unrecorded low IDs.
+
+        A changed or disappeared source needs operator adjudication (normally
+        rollback plus a fresh governed assertion), never an automatic rewrite.
+        Records remain in place, so reset replays only unrecorded nodes.
+        """
+        db, tenant_id = await self._ready()
+        row = await db.fetchone(
+            "SELECT last_node_id FROM legacy_fact_migration_checkpoints "
+            "WHERE tenant_id = ? AND migration_name = ?",
+            (tenant_id, MIGRATION_NAME),
+        )
+        cursor = str(row[0]) if row and row[0] is not None else None
+        review = await self._review_source_set(db, tenant_id, cursor)
+        if review.requires_operator_review:
+            raise LegacyFactMigrationError("legacy_fact_source_review_required")
+        if review.requires_reset:
+            await self._checkpoint(db, tenant_id, None, "reset_after_review")
+        return review
 
     async def rollback(self, *, batch_size: int = 100) -> MigrationResult:
         """Withdraw only assertions proven to be created by this migration.
@@ -409,6 +508,62 @@ class LegacyGraphFactMigration:
             "removal_condition": "unmigrated == 0 and rejected counts reviewed by an operator",
         }
 
+    async def _review_source_set(
+        self,
+        db: Any,
+        tenant_id: str,
+        cursor: str | None,
+    ) -> MigrationSourceReview:
+        """Compare all currently owned fact rows with durable migration receipts."""
+        after: str | None = None
+        reviewed = late_added = changed = 0
+        seen_record_nodes: set[str] = set()
+        while True:
+            rows = await self._rows_after(db, tenant_id, after, 500)
+            if not rows:
+                break
+            for node_id, properties, owner_count, outcome, recorded_hash in rows:
+                node_id = str(node_id)
+                after = node_id
+                if outcome is not None:
+                    seen_record_nodes.add(node_id)
+                if int(owner_count) != 1:
+                    if outcome is not None:
+                        changed += 1
+                    continue
+                try:
+                    candidate = _legacy_candidate(node_id, properties)
+                    map_legacy_fact(
+                        candidate.subject,
+                        candidate.predicate,
+                        candidate.value,
+                        tenant_id=tenant_id,
+                    )
+                    current_hash = candidate.content_hash
+                except (LegacyFactMigrationError, FactMappingError):
+                    current_hash = _raw_properties_hash(node_id, properties)
+                reviewed += 1
+                if outcome is None:
+                    if cursor is not None and node_id <= cursor:
+                        late_added += 1
+                elif str(recorded_hash) != current_hash:
+                    changed += 1
+            if len(rows) < 500:
+                break
+        records = await db.fetchall(
+            "SELECT node_id FROM legacy_fact_migration_records WHERE tenant_id = ?",
+            (tenant_id,),
+        )
+        missing_or_unowned = sum(
+            1 for record in records if str(record[0]) not in seen_record_nodes
+        )
+        return MigrationSourceReview(
+            reviewed=reviewed,
+            late_added_before_checkpoint=late_added,
+            changed=changed,
+            missing_or_unowned=missing_or_unowned,
+        )
+
     async def _migrate_candidate(self, candidate: LegacyFactCandidate, mapping: Any) -> tuple[str, str | None]:
         binding = self._storage.semantic_assertion_binding()
         digest = candidate.content_hash.removeprefix("sha256:")
@@ -451,16 +606,60 @@ class LegacyGraphFactMigration:
         return ("idempotent" if result.write.idempotent else "migrated", result.write.assertion.assertion_id)
 
     @staticmethod
-    async def _record(db: Any, tenant_id: str, node_id: str, candidate: LegacyFactCandidate | None, outcome: str, *, assertion_id: str | None = None) -> None:
+    async def _record(
+        db: Any,
+        tenant_id: str,
+        node_id: str,
+        candidate: LegacyFactCandidate | None,
+        outcome: str,
+        *,
+        assertion_id: str | None = None,
+        content_hash: str | None = None,
+    ) -> None:
         source_id = None if candidate is None else f"source:{MIGRATION_VERSION}:{candidate.content_hash.removeprefix('sha256:')}"
         revision_id = source_id
-        content_hash = None if candidate is None else candidate.content_hash
-        await db.execute(
-            "INSERT INTO legacy_fact_migration_records (tenant_id, node_id, content_hash, source_occurrence_id, assertion_id, revision_id, outcome, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(tenant_id, node_id) DO NOTHING",
-            (tenant_id, node_id, content_hash or "", source_id, assertion_id, revision_id, outcome, datetime.now(timezone.utc).isoformat()),
+        content_hash = content_hash or (None if candidate is None else candidate.content_hash)
+        async with db.transaction():
+            await db.execute(
+                "INSERT INTO legacy_fact_migration_records (tenant_id, node_id, content_hash, source_occurrence_id, assertion_id, revision_id, outcome, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(tenant_id, node_id) DO NOTHING",
+                (tenant_id, node_id, content_hash or "", source_id, assertion_id, revision_id, outcome, datetime.now(timezone.utc).isoformat()),
+            )
+            if assertion_id is not None and outcome in {"migrated", "idempotent"}:
+                await db.execute(
+                    "INSERT INTO legacy_fact_migration_invalidations "
+                    "(tenant_id, migration_name, assertion_id, state, created_at, delivered_at) "
+                    "VALUES (?, ?, ?, 'pending', ?, NULL) "
+                    "ON CONFLICT(tenant_id, migration_name, assertion_id) DO NOTHING",
+                    (tenant_id, MIGRATION_NAME, assertion_id, datetime.now(timezone.utc).isoformat()),
+                )
+
+    async def _deliver_pending_invalidations(self, db: Any, tenant_id: str) -> bool:
+        """Deliver durable projection work; only an acknowledged call is marked done."""
+        if self._index_invalidator is None:
+            return False
+        rows = await db.fetchall(
+            "SELECT assertion_id FROM legacy_fact_migration_invalidations "
+            "WHERE tenant_id = ? AND migration_name = ? AND state = 'pending' "
+            "ORDER BY assertion_id ASC LIMIT 500",
+            (tenant_id, MIGRATION_NAME),
         )
+        if not rows:
+            return False
+        assertion_ids = tuple(str(row[0]) for row in rows)
+        response = self._index_invalidator(tenant_id, assertion_ids)
+        if hasattr(response, "__await__"):
+            await response
+        async with db.transaction():
+            placeholders = ", ".join("?" for _ in assertion_ids)
+            await db.execute(
+                "UPDATE legacy_fact_migration_invalidations SET state = 'delivered', delivered_at = ? "
+                "WHERE tenant_id = ? AND migration_name = ? AND state = 'pending' "
+                f"AND assertion_id IN ({placeholders})",
+                (datetime.now(timezone.utc).isoformat(), tenant_id, MIGRATION_NAME, *assertion_ids),
+            )
+        return True
 
     @staticmethod
     async def _set_outcome(db: Any, tenant_id: str, node_id: str, outcome: str) -> None:
