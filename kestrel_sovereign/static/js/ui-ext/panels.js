@@ -16,7 +16,8 @@
 //   registerPanel({
 //     panelId,            // stable id; the panel DOM is `#panel-<panelId>`
 //     label, labelKey,    // nav tab text (labelKey drives i18n re-hydration)
-//     icon,               // optional icon class for the nav tab
+//     icon,               // icon class for the nav tab; omitted falls back to
+//                         // DEFAULT_TAB_ICON so no contribution renders bare
 //     before,             // optional: insert the tab before this panelId's tab
 //     gate?(ctx),         // capability gate; an ungated-false panel shows no tab
 //     render?(bodyEl, ctx),// lazily invoked ONCE on first activation
@@ -64,13 +65,9 @@ function _safe(fn, ...args) {
     }
 }
 
-function _escapeAttr(s) {
-    return String(s == null ? '' : s)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
-}
+// `_escapeAttr` retired with the innerHTML tab builder (#2822): `_reconcileTab`
+// composes tabs through DOM APIs (className / textContent / setAttribute), so a
+// descriptor's label or icon can no longer reach an HTML parser at all.
 
 function _cssEscape(s) {
     if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') return CSS.escape(s);
@@ -145,6 +142,94 @@ function _ensureUnloadHook() {
     }
 }
 
+// ---- Nav tab chrome (#2821, #2822) -----------------------------------------
+//
+// The descriptor is the single source of truth for a tab's icon and label. Both
+// tab paths — a registry-BUILT tab and an in-place tab declared in `index.html`
+// that the registry ADOPTS — run through `_reconcileTab`, so one edit to a
+// descriptor reaches the standalone console and every embed alike. Before this,
+// adoption only stamped the gating flag and never looked at the descriptor's
+// chrome, so the two surfaces silently diverged (the reason the `ki-check` typo
+// had to be fixed in two files).
+
+/**
+ * Icon for a contribution that declares none. Without a default, an
+ * out-of-tree panel (Observability today; any future feature panel) renders as
+ * bare text in an otherwise iconed strip — the ragged nav #2821 set out to fix,
+ * reintroduced from outside the repo. `puzzle` already reads as "extension"
+ * here (it is the Features tab's own icon).
+ *
+ * An embedder contributing `hostTabs` should declare a meaningful `icon`;
+ * this is the floor, not a recommendation.
+ */
+const DEFAULT_TAB_ICON = 'ki ki-puzzle';
+
+function _iconFor(def) {
+    return (def && def.icon) || DEFAULT_TAB_ICON;
+}
+
+/** Direct text-node content of an element, ignoring child elements (badges). */
+function _ownText(el) {
+    return Array.from(el.childNodes)
+        .filter((n) => n.nodeType === 3)
+        .map((n) => n.textContent)
+        .join('')
+        .trim();
+}
+
+/**
+ * Bring a tab's children in line with its descriptor: an icon span, a label
+ * span, then whatever else the tab already carried. Idempotent — it is the
+ * shared body of both the build and the adopt path.
+ *
+ * Two things it must not break:
+ *
+ *   - Badge elements (`#tasks-badge`, `#security-pending-badge`,
+ *     `#approvals-pending-badge`) live inside the button and are re-queried by
+ *     id from tasks.js / security.js / approvals.js. They are preserved BY
+ *     NODE, not re-created, so a count rendered before the first nav sync
+ *     survives.
+ *   - An already-hydrated (translated) label. The descriptor's `label` is the
+ *     English fallback; when a tab already carries label text, that text wins.
+ *     Only a tab with no label at all falls back to the descriptor.
+ */
+function _reconcileTab(tab, def) {
+    const labelKey = def.labelKey || '';
+
+    // `span.ki` / `span[data-label-key]` match the pre-#2821 in-place markup
+    // shape; the `nav-tab-*` classes match anything this function has already
+    // produced. A badge span has neither, so it is never mistaken for a label.
+    let icon = tab.querySelector('.nav-tab-icon, span.ki');
+    let label = tab.querySelector('.nav-tab-label, span[data-label-key]');
+    const preserved = Array.from(tab.children).filter((el) => el !== icon && el !== label);
+
+    if (!icon) icon = document.createElement('span');
+    // `nav-tab-icon` / `nav-tab-label` are the stable hooks the display-mode
+    // preference (#2823) toggles visibility on. They are structural, not
+    // cosmetic — the icon class itself is what carries the glyph.
+    icon.className = `nav-tab-icon ${_iconFor(def)}`;
+    // Decorative: the label span alongside it is the button's accessible name.
+    icon.setAttribute('aria-hidden', 'true');
+
+    if (!label) {
+        label = document.createElement('span');
+        // The plainest in-place shape is `<button data-label-key="tab_x">X</button>`
+        // — text directly on the button. Adopt that text so a locale already
+        // hydrated onto the button is not reverted to the English descriptor.
+        label.textContent = _ownText(tab) || def.label || def.panelId;
+    }
+    label.classList.add('nav-tab-label');
+    if (labelKey) label.setAttribute('data-label-key', labelKey);
+
+    // A `data-label-key` on the BUTTON is load-bearing damage once a tab has
+    // children: KestrelTheme._hydrate() assigns `el.textContent` for every
+    // `[data-label-key]`, which on a button replaces its whole subtree — icon
+    // and badge included. The key belongs on the label span alone.
+    tab.removeAttribute('data-label-key');
+
+    tab.replaceChildren(icon, document.createTextNode(' '), label, ...preserved);
+}
+
 function _buildTab(def) {
     const btn = document.createElement('button');
     btn.className = 'nav-tab';
@@ -152,11 +237,7 @@ function _buildTab(def) {
     // Mark registry-owned tabs so core's PANEL_CAPABILITIES re-gate
     // (reconcileNavigationCapabilities) leaves them to the registry's own gate.
     btn.dataset.panelRegistry = 'true';
-    const labelKey = def.labelKey || '';
-    const iconHtml = def.icon ? `<span class="${_escapeAttr(def.icon)}"></span> ` : '';
-    const keyAttr = labelKey ? ` data-label-key="${_escapeAttr(labelKey)}"` : '';
-    btn.innerHTML = `${iconHtml}<span${keyAttr}>${_escapeAttr(def.label || def.panelId)}</span>`;
-    if (labelKey) btn.dataset.labelKey = labelKey;
+    _reconcileTab(btn, def);
     return btn;
 }
 
@@ -235,6 +316,11 @@ function _syncNav() {
             // (reconcileNavigationCapabilities) leaves gating to this registry's
             // own `gate` — a single gating mechanism per tab (#2145).
             tab.dataset.panelRegistry = 'true';
+            // ...and bring its chrome in line with the descriptor (#2822), so
+            // adoption covers icon/label the way it already covers gating. A
+            // descriptor-only icon change previously reached embeds and not the
+            // standalone console, with nothing failing to say so.
+            _reconcileTab(tab, def);
         }
         _ensurePanelContainer(def);
     }
