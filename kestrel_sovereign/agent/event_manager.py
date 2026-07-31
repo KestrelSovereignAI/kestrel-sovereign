@@ -229,6 +229,9 @@ class EventManagerMixin:
             return
 
         try:
+            from kestrel_sovereign.signals.delivery import (
+                harvest_detached_delivery,
+            )
             from kestrel_sovereign.signals.sources.a2a import (
                 build_signal_for_completed_task,
             )
@@ -237,16 +240,21 @@ class EventManagerMixin:
                 task=task, target_agent=self.did
             )
 
-            # enqueue_signal is async (returns SignalHandle). We're in a
-            # sync callback (TaskManager._notify_status_update calls us
-            # synchronously). Wrap the await in a tracked coroutine \u2014
-            # the agent's background task tracker supervises the work
-            # so exceptions land in logs and shutdown drains it cleanly.
-            async def _enqueue():
-                await dispatcher.enqueue_signal(signal)
-
-            self._track_background_task(
-                _enqueue(), name=f"a2a_complete:{task_id[:8]}",
+            # enqueue_signal is async and returns a SignalHandle at
+            # *acceptance*; the terminal result only arrives via
+            # handle.wait(). We're in a sync callback (TaskManager
+            # ._notify_status_update calls us synchronously), and nothing
+            # durable advances on delivery here \u2014 the task row is already
+            # persisted, this signal is only the wake. So this is
+            # intentional detached dispatch (#2532): the agent's tracker
+            # owns the task so shutdown drains it, and the terminal result
+            # is harvested so a wake that silently failed shows up in the
+            # log instead of vanishing.
+            harvest_detached_delivery(
+                self._track_background_task,
+                lambda: dispatcher.enqueue_signal(signal),
+                label=f"a2a.task_complete[{task_id}]",
+                task_name=f"a2a_complete:{task_id[:8]}",
             )
         except Exception as e:
             # Never let a dispatcher failure break the SSE notification
@@ -289,6 +297,9 @@ class EventManagerMixin:
 
         task_id = getattr(task, "id", "<unknown>")
         try:
+            from kestrel_sovereign.signals.delivery import (
+                harvest_detached_delivery,
+            )
             from kestrel_sovereign.signals.sources.a2a_task_submitted import (
                 build_signal_for_submitted_task,
             )
@@ -307,11 +318,16 @@ class EventManagerMixin:
                 sender=sender,
             )
 
-            async def _enqueue():
-                await dispatcher.enqueue_signal(signal)
-
-            self._track_background_task(
-                _enqueue(), name=f"a2a_submitted:{str(task_id)[:8]}",
+            # Detached dispatch, same posture as task_complete above
+            # (#2532): the TaskStore row is already persisted, so nothing
+            # durable rides on this wake and retrying is not this
+            # callback's job — but the task is owned and its terminal
+            # result harvested so a failed wake is observable.
+            harvest_detached_delivery(
+                self._track_background_task,
+                lambda: dispatcher.enqueue_signal(signal),
+                label=f"a2a.task_submitted[{task_id}]",
+                task_name=f"a2a_submitted:{str(task_id)[:8]}",
             )
         except Exception as e:
             # Same posture as task_complete: never let a dispatcher
