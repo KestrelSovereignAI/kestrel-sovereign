@@ -19,6 +19,7 @@ from kestrel_sovereign.knowledge import (
     Assertion,
     AssertionQuery,
     AssertionStatus,
+    CorpusCheckpoint,
     DerivedLineage,
     DirectLineage,
     EpistemicState,
@@ -183,10 +184,22 @@ async def test_assertion_crud_provenance_idempotency_and_checkpoint() -> None:
         assert await store.get_assertion(assertion.assertion_id) == assertion
         assert await store.query_assertions(AssertionQuery(subject=SUBJECT)) == [assertion]
         assert await store.list_assertion_sources(assertion.assertion_id) == [source("source-1")]
+        assert await store.list_assertion_revision_sources(assertion.revision_id) == [
+            source("source-1")
+        ]
+        validation = await store.assertion_validation_statuses([assertion.assertion_id])
+        assert validation[assertion.assertion_id].state.value == "conforms"
+        assert validation[assertion.assertion_id].action.value in {"accept", "accept-with-report"}
         checkpoint = await store.assertion_checkpoint()
         assert checkpoint.generation == 1
         assert checkpoint.latest_event_id == written.event_id
         assert [change.revision_id for change in await store.assertion_changes_since(0)] == [assertion.revision_id]
+        assert [
+            change.revision_id
+            for change in await store.assertion_changes_after(
+                CorpusCheckpoint(TENANT, 0, None)
+            )
+        ] == [assertion.revision_id]
     finally:
         await storage.close()
 

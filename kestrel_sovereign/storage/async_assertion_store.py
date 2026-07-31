@@ -1073,6 +1073,27 @@ class AsyncAssertionStore:
         )
         return [SourceOccurrence.from_mapping(json.loads(row[0])) for row in rows]
 
+    async def list_revision_source_occurrences(
+        self, revision_id: str
+    ) -> list[SourceOccurrence]:
+        """Return only the exact source occurrences bound to one revision.
+
+        Assertion-wide provenance intentionally spans historical revisions for
+        audit. Corpus exports instead need the current revision's exact source
+        lineage so a superseded source cannot leak into a new example.
+        """
+        tenant_id, _ = self._require_scope()
+        rows = await self._database.fetchall(
+            "SELECT s.source_mapping, s.received_at, s.source_occurrence_id "
+            "FROM semantic_revision_sources rs "
+            "JOIN semantic_source_occurrences s ON s.tenant_id = rs.tenant_id "
+            "AND s.source_occurrence_id = rs.source_occurrence_id "
+            "WHERE rs.tenant_id = ? AND rs.revision_id = ? "
+            "ORDER BY s.received_at ASC, s.source_occurrence_id ASC",
+            (tenant_id, revision_id),
+        )
+        return [SourceOccurrence.from_mapping(json.loads(row[0])) for row in rows]
+
     async def get_source_occurrence(self, source_occurrence_id: str) -> SourceOccurrence | None:
         """Read one immutable provenance record in the bound tenant only."""
         tenant_id, _ = self._require_scope()
@@ -1082,6 +1103,54 @@ class AsyncAssertionStore:
             (tenant_id, source_occurrence_id),
         )
         return SourceOccurrence.from_mapping(json.loads(row[0])) if row else None
+
+    async def validation_statuses(
+        self,
+        assertion_ids: Sequence[str],
+    ) -> dict[str, object]:
+        """Return latest privacy-safe SHACL dispositions for bound-tenant IDs.
+
+        The public corpus contract owns the value type returned by this method;
+        importing it lazily avoids making canonical assertion persistence depend
+        on a learning-consumer module at import time.
+        """
+        if isinstance(assertion_ids, (str, bytes)) or not isinstance(assertion_ids, Sequence):
+            raise AssertionStoreError("assertion_ids must be a sequence")
+        resolved = tuple(sorted(set(assertion_ids)))
+        if not resolved:
+            return {}
+        if len(resolved) > 1000 or any(not isinstance(value, str) or not value for value in resolved):
+            raise AssertionStoreError("assertion_ids must contain at most 1000 non-empty strings")
+        tenant_id, _ = self._require_scope()
+        rows = await self._database.fetchall(
+            "SELECT a.assertion_id, r.state, r.action, r.shape_set_id, r.shape_set_version, "
+            "r.validation_profile_version "
+            "FROM semantic_validation_report_assertions a "
+            "JOIN semantic_validation_reports r ON r.tenant_id = a.tenant_id "
+            "AND r.report_id = a.report_id "
+            "WHERE a.tenant_id = ? "
+            f"AND a.assertion_id IN ({_placeholders(resolved)}) "
+            "ORDER BY a.assertion_id ASC, r.evaluated_at DESC, r.report_id DESC",
+            (tenant_id,) + resolved,
+        )
+        from kestrel_sovereign.knowledge.corpus import CorpusValidationStatus
+        from kestrel_sovereign.knowledge.shacl_validation import (
+            ValidationState,
+            ValidationWriteAction,
+        )
+
+        result: dict[str, object] = {}
+        for assertion_id, state, action, shape_id, shape_version, profile_version in rows:
+            key = str(assertion_id)
+            if key not in result:
+                result[key] = CorpusValidationStatus(
+                    ValidationState(str(state)),
+                    ValidationWriteAction(str(action)),
+                    str(shape_id),
+                    str(shape_version),
+                    str(profile_version),
+                )
+        return result
 
     async def derivation_inputs(self, revision_id: str) -> list[Assertion]:
         tenant_id, _ = self._require_scope()

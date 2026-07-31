@@ -1242,6 +1242,12 @@ class AsyncStorage:
             await self.initialize()
         return await self._assertion_store().list_source_occurrences(assertion_id)
 
+    async def list_assertion_revision_sources(self, revision_id: str):
+        """Read exact revision provenance for a governed corpus example."""
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().list_revision_source_occurrences(revision_id)
+
     async def get_source_occurrence(self, source_occurrence_id: str):
         if not self._initialized:
             await self.initialize()
@@ -1445,6 +1451,30 @@ class AsyncStorage:
             await self.initialize()
         return await self._assertion_store().changes_since(generation, limit=limit)
 
+    async def assertion_changes_after(self, checkpoint, *, limit: int = 100):
+        """Read the public governed-corpus stream after one exact cursor."""
+        if not self._initialized:
+            await self.initialize()
+        from kestrel_sovereign.knowledge.corpus import CorpusCheckpoint
+        from kestrel_sovereign.storage.async_assertion_store import AssertionCheckpoint
+
+        if not isinstance(checkpoint, CorpusCheckpoint):
+            raise TypeError("checkpoint must be CorpusCheckpoint")
+        return await self._assertion_store().changes_after(
+            AssertionCheckpoint(
+                checkpoint.tenant_id,
+                checkpoint.generation,
+                checkpoint.latest_event_id,
+            ),
+            limit=limit,
+        )
+
+    async def assertion_validation_statuses(self, assertion_ids):
+        """Read privacy-safe validation dispositions for the governed corpus."""
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().validation_statuses(assertion_ids)
+
     def semantic_validation_service(self):
         """Return the tenant-bound SHACL service for this canonical store."""
         if not self._initialized:
@@ -1608,6 +1638,82 @@ class AsyncStorage:
         )
         return await service.training_readiness(
             allow_prior_verified_snapshot=allow_prior_verified_snapshot
+        )
+
+    async def semantic_maintenance_capability_versions(
+        self,
+        inference_profile,
+        *,
+        inference_limits=None,
+        maintenance_limits=None,
+    ):
+        """Return the exact semantic capability pins used to verify a corpus."""
+        if not self._initialized:
+            await self.initialize()
+        from kestrel_sovereign.knowledge.maintenance import SemanticMaintenanceService
+
+        service = SemanticMaintenanceService(
+            self._assertion_store(),
+            inference_profile=inference_profile,
+            inference_limits=inference_limits,
+            limits=maintenance_limits,
+        )
+        return service.capability_versions()
+
+    async def governed_assertion_corpus_snapshot(
+        self,
+        *,
+        policy,
+        inference_profile,
+        limits=None,
+        inference_limits=None,
+        maintenance_limits=None,
+        prior_verified_snapshot=None,
+        allow_prior_verified_snapshot: bool = False,
+    ):
+        """Produce the public immutable learning-corpus snapshot.
+
+        This host service is intentionally the only feature-facing corpus
+        ingress; it never returns the database handle or property graph.
+        """
+        from kestrel_sovereign.knowledge.corpus import (
+            GovernedAssertionCorpusService,
+            GovernedCorpusLimits,
+        )
+
+        return await GovernedAssertionCorpusService(self).snapshot(
+            policy=policy,
+            inference_profile=inference_profile,
+            limits=limits if limits is not None else GovernedCorpusLimits(),
+            inference_limits=inference_limits,
+            maintenance_limits=maintenance_limits,
+            prior_verified_snapshot=prior_verified_snapshot,
+            allow_prior_verified_snapshot=allow_prior_verified_snapshot,
+        )
+
+    async def governed_assertion_corpus_changes_since(
+        self,
+        snapshot,
+        *,
+        policy,
+        inference_profile,
+        limits=None,
+        inference_limits=None,
+        maintenance_limits=None,
+    ):
+        """Read first-class governed additions/tombstones after a snapshot."""
+        from kestrel_sovereign.knowledge.corpus import (
+            GovernedAssertionCorpusService,
+            GovernedCorpusLimits,
+        )
+
+        return await GovernedAssertionCorpusService(self).changes_since(
+            snapshot,
+            policy=policy,
+            inference_profile=inference_profile,
+            limits=limits if limits is not None else GovernedCorpusLimits(),
+            inference_limits=inference_limits,
+            maintenance_limits=maintenance_limits,
         )
 
     async def repair_semantic_maintenance(

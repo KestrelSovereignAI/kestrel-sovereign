@@ -1253,6 +1253,15 @@ class SemanticMaintenanceService:
             reason = "semantic_maintenance_checkpoint_behind"
         return SemanticMaintenanceTrainingReadiness(False, reason)
 
+    def capability_versions(self) -> dict[str, str]:
+        """Return the exact pins/budgets that define maintenance readiness.
+
+        A governed corpus stores this content-free identity alongside its
+        checkpoint, so consumers cannot reuse a snapshot after a shape,
+        ontology, rule, or maintenance-budget change.
+        """
+        return dict(self._capability_versions())
+
     async def _current_scan_page(
         self, cursor: str | None
     ) -> tuple[tuple[Assertion, ...], int]:
