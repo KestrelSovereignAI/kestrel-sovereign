@@ -1890,7 +1890,7 @@ class PrivacyEnforcingStorage:
                     # closure so a retry cannot leave stale derivatives behind.
                     async with self.transaction():
                         await self._exclude_semantic_recall_derivatives(
-                            deletion.deleted.assertion_id
+                            revision_ids=deletion.invalidated_revision_ids,
                         )
                     return FactDeleteReceipt(
                         deleted=True,
@@ -1936,7 +1936,7 @@ class PrivacyEnforcingStorage:
                             ),
                         )
                         await self._exclude_semantic_recall_derivatives(
-                            result.deleted.assertion_id
+                            revision_ids=result.invalidated_revision_ids,
                         )
                     return FactDeleteReceipt(
                         deleted=True,
@@ -3089,11 +3089,17 @@ class PrivacyEnforcingStorage:
     ):
         """Govern replacements through full tentative-state SHACL validation."""
         self._assert_semantic_assertion_write_allowed("supersede_assertion")
-        return await self._storage.supersede_validated_assertion(
-            expected_predecessor_revision_id, replacement,
-            source_occurrences=source_occurrences,
-            **validation_options,
-        )
+        async with self.transaction():
+            result = await self._storage.supersede_validated_assertion(
+                expected_predecessor_revision_id, replacement,
+                source_occurrences=source_occurrences,
+                **validation_options,
+            )
+            if result.accepted:
+                await self._exclude_semantic_recall_derivatives(
+                    revision_ids=result.invalidated_revision_ids,
+                )
+            return result
 
     async def append_assertion_source(
         self,
@@ -3105,12 +3111,18 @@ class PrivacyEnforcingStorage:
     ):
         """Append direct provenance through the privacy-governed writer."""
         self._assert_semantic_assertion_write_allowed("append_assertion_source")
-        return await self._storage.append_assertion_source(
-            expected_predecessor_revision_id,
-            replacement,
-            source_occurrences=source_occurrences,
-            **validation_options,
-        )
+        async with self.transaction():
+            result = await self._storage.append_assertion_source(
+                expected_predecessor_revision_id,
+                replacement,
+                source_occurrences=source_occurrences,
+                **validation_options,
+            )
+            if result.accepted:
+                await self._exclude_semantic_recall_derivatives(
+                    revision_ids=result.invalidated_revision_ids,
+                )
+            return result
 
     async def _restore_explicit_fact_assertion(
         self,
@@ -3136,9 +3148,14 @@ class PrivacyEnforcingStorage:
         # Volatile sessions have no local semantic store, so returning that
         # durable content would pierce their read boundary.
         self._assert_semantic_assertion_read_allowed("retractions")
-        return await self._storage.retract_assertion(
-            assertion_id, expected_revision_id, operation_id=operation_id,
-        )
+        async with self.transaction():
+            result = await self._storage.retract_assertion(
+                assertion_id, expected_revision_id, operation_id=operation_id,
+            )
+            await self._exclude_semantic_recall_derivatives(
+                revision_ids=result.invalidated_revision_ids,
+            )
+            return result
 
     async def delete_assertion(
         self,
@@ -3149,11 +3166,16 @@ class PrivacyEnforcingStorage:
     ):
         # A deletion result likewise includes durable dependent content.
         self._assert_semantic_assertion_read_allowed("deletions")
-        return await self._storage.delete_assertion(
-            assertion_id,
-            expected_revision_id,
-            operation_id=operation_id,
-        )
+        async with self.transaction():
+            result = await self._storage.delete_assertion(
+                assertion_id,
+                expected_revision_id,
+                operation_id=operation_id,
+            )
+            await self._exclude_semantic_recall_derivatives(
+                revision_ids=result.invalidated_revision_ids,
+            )
+            return result
 
     async def _delete_explicit_fact_assertion(
         self,
@@ -3176,20 +3198,36 @@ class PrivacyEnforcingStorage:
         # The result names inferred dependents, so volatile modes must not use
         # this durable lifecycle surface to observe semantic history.
         self._assert_semantic_assertion_read_allowed("validation invalidation")
-        return await self._storage.invalidate_assertion_eligibility(
-            assertion_id, expected_revision_id, operation_id=operation_id,
-        )
+        async with self.transaction():
+            result = await self._storage.invalidate_assertion_eligibility(
+                assertion_id, expected_revision_id, operation_id=operation_id,
+            )
+            await self._exclude_semantic_recall_derivatives(
+                revision_ids=result.invalidated_revision_ids,
+            )
+            return result
 
-    async def _exclude_semantic_recall_derivatives(self, assertion_id: str) -> None:
+    async def _exclude_semantic_recall_derivatives(
+        self,
+        *,
+        assertion_ids=(),
+        revision_ids=(),
+    ) -> None:
         """Exclude exact downstream conversation/episode artifacts.
 
         This helper is intentionally private to the governed assertion
-        lifecycle.  It consumes the assertion identity returned by storage,
-        rather than a free-form content selector, so forgetting cannot touch
-        same-text but unlinked conversation history.
+        lifecycle.  It consumes canonical assertion/revision identities
+        returned by storage, rather than a free-form content selector, so a
+        lifecycle change cannot touch same-text but unlinked history.
+
+        Revisions are first-class here: a supersession withdraws an exact
+        predecessor revision but may leave the assertion identity current with
+        a new revision.  Erasure also returns a transitive closure that can
+        include historical revisions of a surviving identity.
         """
         message_ids = await self._storage._exclude_semantic_recall_dependencies(
-            assertion_id
+            assertion_ids=assertion_ids,
+            revision_ids=revision_ids,
         )
         if message_ids:
             await self._storage._exclude_memory_episodes_for_key_message_ids(
@@ -3198,14 +3236,21 @@ class PrivacyEnforcingStorage:
 
     async def erase_assertion(self, assertion_id, *, operation_id=None):
         # Physical erasure is never blocked by a privacy mode, a pin, or a
-        # derived reference.  Exclude downstream artifacts before the ledger
-        # ID is scrubbed; the transaction makes the closure all-or-nothing.
+        # derived reference.  The canonical store computes the full transitive
+        # closure under its tenant lock; consume every returned assertion and
+        # revision identity before scrubbing it from hidden derivatives.
         async with self.transaction():
-            await self._exclude_semantic_recall_derivatives(assertion_id)
             result = await self._storage.erase_assertion(
                 assertion_id, operation_id=operation_id
             )
-            await self._storage._scrub_semantic_recall_dependencies(assertion_id)
+            await self._exclude_semantic_recall_derivatives(
+                assertion_ids=result.erased_assertion_ids,
+                revision_ids=result.erased_revision_ids,
+            )
+            await self._storage._scrub_semantic_recall_dependencies(
+                assertion_ids=result.erased_assertion_ids,
+                revision_ids=result.erased_revision_ids,
+            )
             return result
 
     def _assert_semantic_assertion_read_allowed(self, operation: str) -> None:

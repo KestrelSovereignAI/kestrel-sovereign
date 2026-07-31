@@ -403,11 +403,98 @@ class AsyncStorage:
         """
         if not self._initialized:
             await self.initialize()
-        await self.conversation.add_conversation(
-            role, content, metadata, session_id,
-            rendered_content=rendered_content,
-            model=model,
-            provider=provider,
+        persisted_metadata = dict(metadata) if metadata else {}
+        dependencies = self._semantic_recall_dependencies_for_persistence(
+            persisted_metadata
+        )
+
+        async def persist() -> None:
+            await self.conversation.add_conversation(
+                role, content, persisted_metadata, session_id,
+                rendered_content=rendered_content,
+                model=model,
+                provider=provider,
+            )
+
+        # Only semantic-recall derivatives carry the lineage field.  Normal
+        # conversation writes keep their historical no-lock path.
+        if "semantic_recall_dependencies" not in persisted_metadata:
+            await persist()
+            return
+
+        if dependencies is None:
+            self._exclude_stale_semantic_recall_derivative(persisted_metadata)
+            await persist()
+            return
+
+        if not dependencies:
+            # An explicitly empty lineage is not a semantic derivative and is
+            # produced by the normal no-recall path.  Preserve that behavior.
+            await persist()
+            return
+
+        try:
+            assertions = self._assertion_store()
+        except RuntimeError:
+            # A partial/unbound storage bootstrap has no canonical authority
+            # with which to validate a claimed semantic lineage.  Persisting it
+            # visibly would let a caller create an unrevocable derivative.
+            self._exclude_stale_semantic_recall_derivative(persisted_metadata)
+            await persist()
+            return
+
+        async with assertions._semantic_recall_persistence_fence(
+            dependencies
+        ) as visible:
+            if not visible:
+                self._exclude_stale_semantic_recall_derivative(persisted_metadata)
+            await persist()
+
+    @staticmethod
+    def _semantic_recall_dependencies_for_persistence(
+        metadata: Dict[str, Any],
+    ) -> tuple[tuple[str, str], ...] | None:
+        """Return exact recalled identities or ``None`` for malformed lineage.
+
+        The marker is supplied only by the trusted context-plan projection.  A
+        malformed non-empty marker is never silently treated as ordinary
+        metadata: it would bypass the canonical liveness fence and make a
+        durable derivative unrevocable.  Empty lineage remains the normal
+        semantic-recall-disabled/no-result representation.
+        """
+        if "semantic_recall_dependencies" not in metadata:
+            return ()
+        raw = metadata.get("semantic_recall_dependencies")
+        if not isinstance(raw, list):
+            return None
+        dependencies: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for item in raw:
+            if not isinstance(item, dict):
+                return None
+            assertion_id = item.get("assertion_id")
+            revision_id = item.get("revision_id")
+            if (
+                not isinstance(assertion_id, str)
+                or not assertion_id
+                or not isinstance(revision_id, str)
+                or not revision_id
+            ):
+                return None
+            dependency = (assertion_id, revision_id)
+            if dependency not in seen:
+                seen.add(dependency)
+                dependencies.append(dependency)
+        return tuple(dependencies)
+
+    @staticmethod
+    def _exclude_stale_semantic_recall_derivative(
+        metadata: Dict[str, Any],
+    ) -> None:
+        """Make an unverifiable semantic derivative permanently non-contextual."""
+        metadata["excluded_from_context"] = True
+        metadata.setdefault(
+            "excluded_reason", "semantic_assertion_not_current"
         )
     
     async def get_conversation_history(
@@ -537,7 +624,10 @@ class AsyncStorage:
         return await self.conversation.delete_message(message_id)
 
     async def _exclude_semantic_recall_dependencies(
-        self, assertion_id: str,
+        self,
+        *,
+        assertion_ids=(),
+        revision_ids=(),
     ) -> tuple[int, ...]:
         """Exclude exact assertion-derived conversation artifacts.
 
@@ -547,15 +637,22 @@ class AsyncStorage:
         if not self._initialized:
             await self.initialize()
         return await self.conversation.exclude_semantic_recall_dependencies(
-            assertion_id
+            assertion_ids=assertion_ids,
+            revision_ids=revision_ids,
         )
 
-    async def _scrub_semantic_recall_dependencies(self, assertion_id: str) -> int:
-        """Drop a physically erased assertion ID from excluded artifacts."""
+    async def _scrub_semantic_recall_dependencies(
+        self,
+        *,
+        assertion_ids=(),
+        revision_ids=(),
+    ) -> int:
+        """Drop physically erased identities from excluded artifacts."""
         if not self._initialized:
             await self.initialize()
         return await self.conversation.scrub_semantic_recall_dependencies(
-            assertion_id
+            assertion_ids=assertion_ids,
+            revision_ids=revision_ids,
         )
 
     async def _exclude_memory_episodes_for_key_message_ids(

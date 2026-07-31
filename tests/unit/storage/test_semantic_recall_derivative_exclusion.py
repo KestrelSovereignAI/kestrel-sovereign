@@ -11,6 +11,7 @@ from kestrel_sovereign.storage.async_conversation_store import (
     AsyncConversationStore,
 )
 from kestrel_sovereign.storage.async_storage import AsyncStorage
+from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
 
 
 @pytest.fixture
@@ -37,7 +38,11 @@ async def test_exclusion_is_exact_and_scrubbing_keeps_artifact_hidden(storage):
         ]
     }
     # The identical text deliberately proves there is no content/string match.
-    await storage.add_conversation(
+    # This lower-level test exercises selector/scrub mechanics.  Production
+    # semantic derivatives enter via AsyncStorage's lifecycle fence, which
+    # deliberately refuses unbound test storage; seed the conversation store
+    # directly so the test can inspect an otherwise-visible historical row.
+    await storage.conversation.add_conversation(
         "assistant", "kite-2748-region-7f3b", metadata=linked_metadata
     )
     await storage.add_conversation("assistant", "kite-2748-region-7f3b")
@@ -65,7 +70,7 @@ async def test_exclusion_is_exact_and_scrubbing_keeps_artifact_hidden(storage):
 
     async with storage.transaction():
         message_ids = await storage._exclude_semantic_recall_dependencies(
-            "assertion-a"
+            assertion_ids=("assertion-a",)
         )
         episode_ids = await storage._exclude_memory_episodes_for_key_message_ids(
             message_ids
@@ -83,7 +88,9 @@ async def test_exclusion_is_exact_and_scrubbing_keeps_artifact_hidden(storage):
         ("episode-linked",),
     ) == (1,)
 
-    assert await storage._scrub_semantic_recall_dependencies("assertion-a") == 1
+    assert await storage._scrub_semantic_recall_dependencies(
+        assertion_ids=("assertion-a",)
+    ) == 1
     hidden = next(
         row
         for row in await storage.conversation.get_full_history_with_ids(
@@ -93,3 +100,33 @@ async def test_exclusion_is_exact_and_scrubbing_keeps_artifact_hidden(storage):
     )
     assert hidden["metadata"]["excluded_from_context"] is True
     assert hidden["metadata"]["semantic_recall_dependencies"] == []
+
+
+@pytest.mark.asyncio
+async def test_sleep_consolidation_never_recreates_episode_from_excluded_rows(storage):
+    """The sleep path treats hidden derivatives as non-existent source data."""
+    for index in range(3):
+        await storage.conversation.add_conversation(
+            "assistant",
+            f"forgotten semantic answer {index}",
+            metadata={
+                "excluded_from_context": True,
+                "semantic_recall_dependencies": [
+                    {
+                        "assertion_id": "forgotten-assertion",
+                        "revision_id": "forgotten-revision",
+                    }
+                ],
+            },
+        )
+
+    consolidator = MemoryConsolidator(storage.db, storage.agent_id)
+    report = await consolidator.run_consolidation()
+
+    assert report["episodes_created"] == 0
+    assert report["patterns_found"] == 0
+    assert await consolidator.create_session_episode(force=True) is None
+    assert await storage.db.fetchval(
+        "SELECT COUNT(*) FROM memory_episodes WHERE agent_id = ?",
+        (storage.agent_id,),
+    ) == 0

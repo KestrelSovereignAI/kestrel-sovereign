@@ -1107,6 +1107,61 @@ class AsyncAssertionStore:
             and bool(row[2])
         )
 
+    @asynccontextmanager
+    async def _semantic_recall_persistence_fence(
+        self,
+        dependencies: Sequence[tuple[str, str]],
+    ):
+        """Serialize one derived conversation write with assertion lifecycle.
+
+        A semantic-recall turn is a derivative of the exact current assertion
+        revisions rendered into its prompt.  The conversation row must be
+        committed while those revisions are still current and eligible, under
+        the same tenant lock used by delete/retract/supersede/erasure.  Without
+        this fence a deletion can scan its existing derivatives, then a slow
+        LLM response can persist a new visible derivative after the scan.
+
+        This private companion is intentionally consumed only by
+        :class:`AsyncStorage`, which owns both the assertion and conversation
+        stores.  It is not a second source of truth: it reads the canonical
+        current-revision and eligibility rows while holding their lifecycle
+        serialization boundary.
+        """
+        normalized: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for dependency in dependencies:
+            if (
+                not isinstance(dependency, tuple)
+                or len(dependency) != 2
+                or not isinstance(dependency[0], str)
+                or not dependency[0]
+                or not isinstance(dependency[1], str)
+                or not dependency[1]
+            ):
+                yield False
+                return
+            if dependency not in seen:
+                seen.add(dependency)
+                normalized.append(dependency)
+        if not normalized:
+            yield False
+            return
+
+        async with self._mutation():
+            visible = True
+            for assertion_id, revision_id in normalized:
+                current = await self._current(assertion_id)
+                if (
+                    current is None
+                    or current.revision_id != revision_id
+                    or not await self._is_current_active_eligible_revision(
+                        revision_id
+                    )
+                ):
+                    visible = False
+                    break
+            yield visible
+
     @staticmethod
     def _flat_terms(assertion: Assertion) -> tuple[str, str, str, str, str | None, str | None]:
         object_mapping = assertion.object.identity_mapping()

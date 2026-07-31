@@ -18,7 +18,7 @@ import struct
 import uuid
 from datetime import datetime, timedelta, timezone
 from time import perf_counter
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .async_database import AsyncDatabase
 from .conversation_ids import coerce_persistent_message_id
@@ -3369,18 +3369,51 @@ class AsyncConversationStore:
             return updated
 
     async def _semantic_recall_dependency_rows(
-        self, assertion_id: str
+        self,
+        *,
+        assertion_ids: Iterable[str] = (),
+        revision_ids: Iterable[str] = (),
     ) -> List[Tuple[int, Dict[str, Any]]]:
-        """Return this agent's rows linked to one canonical assertion.
+        """Return this agent's rows linked to exact canonical identities.
 
         The lookup is an exact JSON identity match, never a scan over message
         content.  It includes archived and trashed artifacts deliberately: a
         later restore must not make a forgotten fact reappear in context.
+
+        Physical erasure can remove a historical revision while preserving its
+        assertion identity with a fresh direct current revision.  Both identity
+        dimensions therefore participate in the match: assertion IDs cover a
+        fully erased assertion; revision IDs cover erased historical lineage.
         """
-        if not isinstance(assertion_id, str) or not assertion_id:
-            raise ValueError("assertion_id must be a non-empty string")
+        normalized_assertion_ids = tuple(
+            sorted({value for value in assertion_ids if isinstance(value, str) and value})
+        )
+        normalized_revision_ids = tuple(
+            sorted({value for value in revision_ids if isinstance(value, str) and value})
+        )
+        if not normalized_assertion_ids and not normalized_revision_ids:
+            return []
+
+        predicates: list[str] = []
+        params: list[Any] = [self.agent_id]
+        if normalized_assertion_ids:
+            predicates.append(
+                "dependency ->> 'assertion_id' IN ("
+                + ", ".join("?" for _ in normalized_assertion_ids)
+                + ")"
+            )
+            params.extend(normalized_assertion_ids)
+        if normalized_revision_ids:
+            predicates.append(
+                "dependency ->> 'revision_id' IN ("
+                + ", ".join("?" for _ in normalized_revision_ids)
+                + ")"
+            )
+            params.extend(normalized_revision_ids)
+        postgres_predicate = " OR ".join(predicates)
+
         if self.db.backend_type == "postgres":
-            rows = await self.db.fetchall(
+            postgres_sql = (
                 "SELECT id, metadata FROM conversation_history "
                 "WHERE agent_id = ? AND EXISTS ("
                 "SELECT 1 FROM jsonb_array_elements("
@@ -3388,13 +3421,34 @@ class AsyncConversationStore:
                 "'semantic_recall_dependencies') "
                 "WHEN 'array' THEN metadata::jsonb -> "
                 "'semantic_recall_dependencies' ELSE '[]'::jsonb END"
-                ") AS dependency "
-                "WHERE dependency ->> 'assertion_id' = ?"
-                ") ORDER BY id ASC",
-                (self.agent_id, assertion_id),
+                ") AS dependency WHERE "
+                + postgres_predicate
+                + ") ORDER BY id ASC"
+            )
+            rows = await self.db.fetchall(
+                postgres_sql,
+                tuple(params),
             )
         else:
-            rows = await self.db.fetchall(
+            sqlite_predicates: list[str] = []
+            sqlite_params: list[Any] = [self.agent_id]
+            if normalized_assertion_ids:
+                sqlite_predicates.append(
+                    "json_extract(CASE WHEN json_valid(dependency.value) "
+                    "THEN dependency.value ELSE '{}' END, '$.assertion_id') IN ("
+                    + ", ".join("?" for _ in normalized_assertion_ids)
+                    + ")"
+                )
+                sqlite_params.extend(normalized_assertion_ids)
+            if normalized_revision_ids:
+                sqlite_predicates.append(
+                    "json_extract(CASE WHEN json_valid(dependency.value) "
+                    "THEN dependency.value ELSE '{}' END, '$.revision_id') IN ("
+                    + ", ".join("?" for _ in normalized_revision_ids)
+                    + ")"
+                )
+                sqlite_params.extend(normalized_revision_ids)
+            sqlite_sql = (
                 "SELECT id, metadata FROM conversation_history "
                 "WHERE agent_id = ? AND EXISTS ("
                 "SELECT 1 FROM json_each(CASE "
@@ -3403,11 +3457,13 @@ class AsyncConversationStore:
                 "'$.semantic_recall_dependencies') = 'array' THEN json_extract("
                 "CASE WHEN json_valid(COALESCE(metadata, '{}')) THEN metadata "
                 "ELSE '{}' END, '$.semantic_recall_dependencies') "
-                "ELSE '[]' END) AS dependency "
-                "WHERE json_extract(CASE WHEN json_valid(dependency.value) "
-                "THEN dependency.value ELSE '{}' END, '$.assertion_id') = ?"
-                ") ORDER BY id ASC",
-                (self.agent_id, assertion_id),
+                "ELSE '[]' END) AS dependency WHERE "
+                + " OR ".join(sqlite_predicates)
+                + ") ORDER BY id ASC"
+            )
+            rows = await self.db.fetchall(
+                sqlite_sql,
+                tuple(sqlite_params),
             )
 
         matched: List[Tuple[int, Dict[str, Any]]] = []
@@ -3427,16 +3483,22 @@ class AsyncConversationStore:
         return matched
 
     async def exclude_semantic_recall_dependencies(
-        self, assertion_id: str,
+        self,
+        *,
+        assertion_ids: Iterable[str] = (),
+        revision_ids: Iterable[str] = (),
     ) -> Tuple[int, ...]:
-        """Exclude every conversation artifact linked to ``assertion_id``.
+        """Exclude every conversation artifact linked to an exact identity.
 
         This is intentionally a reversible context exclusion rather than a
         string-based deletion.  The privacy wrapper invokes it in the same
         transaction as canonical fact deletion; callers receive exact message
         IDs only so dependent episode summaries can be excluded too.
         """
-        rows = await self._semantic_recall_dependency_rows(assertion_id)
+        rows = await self._semantic_recall_dependency_rows(
+            assertion_ids=assertion_ids,
+            revision_ids=revision_ids,
+        )
         message_ids: list[int] = []
         for message_id, metadata in rows:
             updates: Dict[str, Any] = {"excluded_from_context": True}
@@ -3447,15 +3509,27 @@ class AsyncConversationStore:
         return tuple(message_ids)
 
     async def scrub_semantic_recall_dependencies(
-        self, assertion_id: str,
+        self,
+        *,
+        assertion_ids: Iterable[str] = (),
+        revision_ids: Iterable[str] = (),
     ) -> int:
-        """Remove erased assertion IDs from already-excluded artifacts.
+        """Remove erased assertion/revision IDs from excluded artifacts.
 
         Physical canonical erasure must not leave a durable reference to the
         erased identifier.  ``excluded_from_context`` is deliberately sticky:
         scrubbing lineage never re-admits the derivative content.
         """
-        rows = await self._semantic_recall_dependency_rows(assertion_id)
+        normalized_assertion_ids = {
+            value for value in assertion_ids if isinstance(value, str) and value
+        }
+        normalized_revision_ids = {
+            value for value in revision_ids if isinstance(value, str) and value
+        }
+        rows = await self._semantic_recall_dependency_rows(
+            assertion_ids=normalized_assertion_ids,
+            revision_ids=normalized_revision_ids,
+        )
         scrubbed = 0
         for message_id, metadata in rows:
             dependencies = metadata.get("semantic_recall_dependencies")
@@ -3466,7 +3540,10 @@ class AsyncConversationStore:
                 for dependency in dependencies
                 if not (
                     isinstance(dependency, dict)
-                    and dependency.get("assertion_id") == assertion_id
+                    and (
+                        dependency.get("assertion_id") in normalized_assertion_ids
+                        or dependency.get("revision_id") in normalized_revision_ids
+                    )
                 )
             ]
             if len(retained) == len(dependencies):

@@ -745,6 +745,309 @@ async def test_physical_erasure_scrubs_exact_semantic_recall_lineage(
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_governed_supersession_excludes_only_predecessor_derivatives(
+    db_backend, tmp_path
+):
+    """A new current revision never revives an old semantic-recall answer."""
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path, "semantic-recall-supersession"
+    )
+    raw_storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    try:
+        storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
+        first = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="superseded-region",
+            confidence=0.9,
+            invocation_id="semantic-recall-supersession-first",
+        )
+        await raw_storage.add_conversation(
+            "assistant",
+            "superseded-region",
+            metadata={
+                "semantic_recall_dependencies": [
+                    {
+                        "assertion_id": first.assertion_id,
+                        "revision_id": first.revision_id,
+                    }
+                ]
+            },
+        )
+        # The identical but unlinked text is a regression guard against
+        # content matching; only the exact old revision may be excluded.
+        await raw_storage.add_conversation("assistant", "superseded-region")
+
+        replacement = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="replacement-region",
+            confidence=0.9,
+            invocation_id="semantic-recall-supersession-replacement",
+        )
+        await raw_storage.add_conversation(
+            "assistant",
+            "replacement-region",
+            metadata={
+                "semantic_recall_dependencies": [
+                    {
+                        "assertion_id": replacement.assertion_id,
+                        "revision_id": replacement.revision_id,
+                    }
+                ]
+            },
+        )
+        # A same-value teach is a source append: it keeps the canonical
+        # assertion identity but advances its revision.  Revocation must stay
+        # revision-scoped or it would hide this new current derivative too.
+        source_append = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="replacement-region",
+            confidence=0.9,
+            invocation_id="semantic-recall-supersession-source-append",
+        )
+        assert source_append.assertion_id == replacement.assertion_id
+        assert source_append.revision_id != replacement.revision_id
+        await raw_storage.add_conversation(
+            "assistant",
+            "replacement-region-current",
+            metadata={
+                "semantic_recall_dependencies": [
+                    {
+                        "assertion_id": source_append.assertion_id,
+                        "revision_id": source_append.revision_id,
+                    }
+                ]
+            },
+        )
+
+        rows = await raw_storage.conversation.get_full_history_with_ids(
+            include_excluded=True
+        )
+        old = next(
+            row
+            for row in rows
+            if row["metadata"].get("semantic_recall_dependencies")
+            == [{"assertion_id": first.assertion_id, "revision_id": first.revision_id}]
+        )
+        prior_current = next(
+            row
+            for row in rows
+            if row["metadata"].get("semantic_recall_dependencies")
+            == [
+                {
+                    "assertion_id": replacement.assertion_id,
+                    "revision_id": replacement.revision_id,
+                }
+            ]
+        )
+        current = next(
+            row
+            for row in rows
+            if row["metadata"].get("semantic_recall_dependencies")
+            == [
+                {
+                    "assertion_id": source_append.assertion_id,
+                    "revision_id": source_append.revision_id,
+                }
+            ]
+        )
+        assert old["metadata"]["excluded_from_context"] is True
+        assert prior_current["metadata"]["excluded_from_context"] is True
+        assert current["metadata"].get("excluded_from_context") is not True
+        assert any(
+            row["content"] == "superseded-region"
+            and not row["metadata"].get("semantic_recall_dependencies")
+            and row["metadata"].get("excluded_from_context") is not True
+            for row in rows
+        )
+    finally:
+        await raw_storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("operation", ("retract_assertion", "delete_assertion"))
+async def test_generic_lifecycle_withdrawal_excludes_exact_derivative(
+    db_backend, tmp_path, operation
+):
+    """Non-adapter governed lifecycle operations share the revocation gate."""
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path, f"semantic-recall-{operation}"
+    )
+    raw_storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    try:
+        storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
+        fact = _semantic_assertion(
+            tenant,
+            f"semantic-recall-{operation}-revision",
+            value=f"{operation}-value",
+        )
+        await raw_storage.put_assertion(
+            fact,
+            source_occurrences=(_semantic_source("parity-source"),),
+        )
+        await raw_storage.add_conversation(
+            "assistant",
+            f"{operation}-value",
+            metadata={
+                "semantic_recall_dependencies": [
+                    {
+                        "assertion_id": fact.assertion_id,
+                        "revision_id": fact.revision_id,
+                    }
+                ]
+            },
+        )
+        result = await getattr(storage, operation)(
+            fact.assertion_id,
+            fact.revision_id,
+            operation_id=f"semantic-recall-{operation}",
+        )
+        assert fact.revision_id in result.invalidated_revision_ids
+        linked = next(
+            row
+            for row in await raw_storage.conversation.get_full_history_with_ids(
+                include_excluded=True
+            )
+            if row["metadata"].get("semantic_recall_dependencies")
+        )
+        assert linked["metadata"]["excluded_from_context"] is True
+    finally:
+        await raw_storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_erasure_scrubs_derivative_of_historical_surviving_identity(
+    db_backend, tmp_path
+):
+    """Erasure closure must match a revision even if its assertion survives."""
+    from kestrel_sovereign.knowledge import (
+        Assertion,
+        DirectLineage,
+        EpistemicState,
+    )
+
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path, "semantic-recall-historical-erasure"
+    )
+    raw_storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    try:
+        root = _semantic_assertion(tenant, "semantic-recall-erasure-root")
+        await raw_storage.put_assertion(
+            root, source_occurrences=(_semantic_source("parity-source"),)
+        )
+        derived = _derived_semantic_assertion(
+            tenant,
+            "semantic-recall-erasure-derived",
+            root.revision_id,
+            "semantic-recall-erasure",
+        )
+        await raw_storage.put_assertion(derived)
+        await raw_storage.add_conversation(
+            "assistant",
+            "historical-derived-answer",
+            metadata={
+                "semantic_recall_dependencies": [
+                    {
+                        "assertion_id": derived.assertion_id,
+                        "revision_id": derived.revision_id,
+                    }
+                ]
+            },
+        )
+
+        replacement_mapping = derived.to_mapping()
+        replacement_mapping["revision_id"] = "semantic-recall-erasure-direct"
+        replacement_mapping["lineage"] = DirectLineage(
+            ("semantic-recall-erasure-source",)
+        ).to_mapping()
+        replacement_mapping["epistemic_state"] = EpistemicState.REPORTED.value
+        replacement = Assertion.from_mapping(replacement_mapping)
+        await raw_storage.supersede_assertion(
+            derived.revision_id,
+            replacement,
+            source_occurrences=(
+                _semantic_source("semantic-recall-erasure-source"),
+            ),
+        )
+
+        erased = await PrivacyEnforcingStorage(
+            raw_storage, PrivacyMode.NORMAL
+        ).erase_assertion(root.assertion_id)
+        assert derived.assertion_id not in erased.erased_assertion_ids
+        assert derived.revision_id in erased.erased_revision_ids
+        linked = next(
+            row
+            for row in await raw_storage.conversation.get_full_history_with_ids(
+                include_excluded=True
+            )
+            if row["content"] == "historical-derived-answer"
+        )
+        assert linked["metadata"]["excluded_from_context"] is True
+        assert linked["metadata"]["semantic_recall_dependencies"] == []
+    finally:
+        await raw_storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_late_normal_and_streaming_derivatives_fail_closed_after_withdrawal(
+    db_backend, tmp_path
+):
+    """Persistence rechecks liveness after a slow response crosses deletion."""
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path, "semantic-recall-late-persistence"
+    )
+    raw_storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    try:
+        storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
+        fact = await storage.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="late-persistence-region",
+            confidence=0.9,
+            invocation_id="semantic-recall-late-persistence-save",
+        )
+        await storage.delete_assertion(
+            fact.assertion_id,
+            fact.revision_id,
+            operation_id="semantic-recall-late-persistence-delete",
+        )
+        metadata = {
+            "semantic_recall_dependencies": [
+                {"assertion_id": fact.assertion_id, "revision_id": fact.revision_id}
+            ]
+        }
+        # Normal invoke persists the user+assistant pair; streaming persists
+        # the same pair on its terminal path.  Both reach AsyncStorage's
+        # persistence fence, so role is deliberately varied here.
+        await storage.add_conversation("user", "late normal prompt", metadata=metadata)
+        await storage.add_conversation(
+            "assistant", "late streaming answer", metadata=metadata
+        )
+        late_rows = [
+            row
+            for row in await raw_storage.conversation.get_full_history_with_ids(
+                include_excluded=True
+            )
+            if row["content"] in {"late normal prompt", "late streaming answer"}
+        ]
+        assert len(late_rows) == 2
+        assert all(
+            row["metadata"].get("excluded_from_context") is True
+            and row["metadata"].get("excluded_reason")
+            == "semantic_assertion_not_current"
+            for row in late_rows
+        )
+    finally:
+        await raw_storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_deleted_fact_same_value_reteach_restores_fresh_validated_revision(
     db_backend,
     tmp_path,
