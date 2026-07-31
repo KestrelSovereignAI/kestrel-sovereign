@@ -195,3 +195,117 @@ class TestDetachedDeliveryIsOwnedAndHarvested:
 
         fire(agent, _task())
         await _drain(agent)  # harvest task must not raise
+
+
+# ---------------------------------------------------------------------------
+# supervise_terminal_delivery — the shape producers use when they cannot await
+# inline. Its cancellation path had no coverage, which is where codex found a
+# P1 during the #2532 review.
+# ---------------------------------------------------------------------------
+
+
+class _OwnedTaskFeature:
+    """Minimal stand-in for the Feature background-task ownership contract."""
+
+    def __init__(self):
+        self.tasks: list[asyncio.Task] = []
+
+    def _track_owned_background_task(self, coro, *, name: str):
+        task = asyncio.create_task(coro, name=name)
+        self.tasks.append(task)
+        return task
+
+
+def _handle_that_never_settles() -> SignalHandle:
+    """A dispatch that is still in flight — the state shutdown interrupts."""
+    handle = MagicMock(spec=SignalHandle)
+    handle.wait = AsyncMock(side_effect=asyncio.Event().wait)
+    return handle
+
+
+@pytest.mark.asyncio
+async def test_supervisor_cancellation_restores_optimistically_retired_state():
+    """Shutdown must not strand a durable row this producer already retired.
+
+    ``await_terminal_delivery`` re-raises caller cancellation on the reasoning
+    that a checkpoint which never advanced is already correct. That holds for
+    a producer which retains by NOT advancing (the watchers) and is false for
+    one which retires up front: A2A question completion claims its row
+    ``RESOLVED``/``EXPIRED`` before dispatching. Cancelling the supervisor —
+    feature shutdown, soft disable, boot rollback — also cancels the dispatch,
+    so the wake never lands. Without the restore the row stays terminal
+    forever and startup replay never resumes the asker.
+    """
+    from kestrel_sovereign.signals.delivery import (
+        STATUS_SUPERVISOR_CANCELLED,
+        supervise_terminal_delivery,
+    )
+
+    feature = _OwnedTaskFeature()
+    restored: list = []
+    settled: list = []
+
+    async def _restore(outcome):
+        restored.append(outcome)
+
+    task = supervise_terminal_delivery(
+        feature,
+        _handle_that_never_settles(),
+        label="a2a_question[q-1]",
+        task_name="a2a_question_delivery:q-1",
+        on_undelivered=_restore,
+        on_settled=lambda: settled.append(True),
+    )
+
+    await asyncio.sleep(0)  # let the supervisor reach its await
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(restored) == 1, (
+        "the durable row this producer retired before dispatch must be "
+        "restored when shutdown cancels the wake"
+    )
+    assert restored[0].status == STATUS_SUPERVISOR_CANCELLED
+    assert restored[0].delivered is False, (
+        "a cancelled supervisor never observed a delivery"
+    )
+    assert settled == [True], "in-flight bookkeeping still runs on every path"
+
+
+@pytest.mark.asyncio
+async def test_supervisor_advances_the_checkpoint_only_on_terminal_ok():
+    """The rule itself, through the supervisor path."""
+    from kestrel_sovereign.signals.delivery import supervise_terminal_delivery
+
+    for status, expect_advance in (
+        (Status.OK, True),
+        (Status.FAILED, False),
+        (Status.COALESCED, False),
+    ):
+        feature = _OwnedTaskFeature()
+        advanced: list = []
+        retained: list = []
+        handle = MagicMock(spec=SignalHandle)
+        handle.wait = AsyncMock(
+            return_value=SignalResult(
+                signal_id="sig-supervised",
+                status=status,
+                mode=SignalMode.COGNITION,
+                duration_ms=1,
+            )
+        )
+
+        task = supervise_terminal_delivery(
+            feature, handle,
+            label="watch", task_name="watch:1",
+            on_delivered=lambda: advanced.append(True) or asyncio.sleep(0),
+            on_undelivered=lambda outcome: retained.append(outcome) or asyncio.sleep(0),
+        )
+        await task
+
+        assert bool(advanced) is expect_advance, (
+            f"{status} must {'advance' if expect_advance else 'NOT advance'} "
+            f"the checkpoint"
+        )
+        assert bool(retained) is (not expect_advance)

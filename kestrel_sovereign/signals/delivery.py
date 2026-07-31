@@ -75,6 +75,11 @@ ACCEPTED_STATUSES: FrozenSet[str] = frozenset({"ok", "coalesced"})
 STATUS_NO_HANDLE = "no_handle"
 STATUS_DISPATCH_CANCELLED = "dispatch_cancelled"
 STATUS_TOOLING_ERROR = "tooling_error"
+# This supervisor was cancelled (feature shutdown, soft disable, boot
+# rollback) before a terminal result arrived. Distinct from
+# ``dispatch_cancelled``: there the caller is healthy and the dispatch died,
+# here the caller itself is going away.
+STATUS_SUPERVISOR_CANCELLED = "supervisor_cancelled"
 
 
 @dataclass(frozen=True)
@@ -116,8 +121,14 @@ async def await_terminal_delivery(
       handle was cancelled) — reported as ``dispatch_cancelled`` and not
       delivered. This caller is healthy and must still run its retain path.
     * **This caller is being cancelled** — re-raised. Swallowing it would
-      turn a shutdown into a silent normal return, and there is nothing to
-      retain anyway: a checkpoint that never advanced is already correct.
+      turn a shutdown into a silent normal return.
+
+      Re-raising is NOT on the grounds that there is nothing to restore. That
+      is only true for a producer which retains by *not advancing*; one which
+      optimistically *retires* durable state before dispatching (A2A question
+      completion) still has a row to put back. Callers that supervise through
+      :func:`supervise_terminal_delivery` get that restore on cancellation —
+      see its handler. A caller awaiting this directly owns its own.
 
     A handle that exposes no awaitable ``wait`` (legacy/stub dispatcher)
     yields ``no_handle``; anything else going wrong in the wait itself yields
@@ -184,8 +195,10 @@ def supervise_terminal_delivery(
     ``on_delivered`` runs only on a terminal delivered status — that is the
     *only* place a durable checkpoint may advance. ``on_undelivered`` runs for
     every other terminal state (``FAILED``, any ``DROPPED_*``, a cancelled
-    dispatch, a tooling error) and is where a producer restores durable state
-    it optimistically retired.
+    dispatch, a tooling error) **and on cancellation of this supervisor
+    itself** — that last one matters, because shutdown is exactly when a
+    producer which optimistically retired a durable row would otherwise leave
+    it retired forever.
 
     ``on_settled`` is a synchronous finalizer for in-flight bookkeeping. It
     runs on every exit path *including* cancellation of this supervisor, so a
@@ -213,6 +226,29 @@ def supervise_terminal_delivery(
             )
             if on_undelivered is not None:
                 await on_undelivered(outcome)
+        except asyncio.CancelledError:
+            # This supervisor is being cancelled — feature shutdown, soft
+            # disable, or boot rollback. Awaiting the handle cancels the
+            # dispatch with it, so the wake will never land.
+            #
+            # ``await_terminal_delivery`` re-raises on the reasoning that a
+            # checkpoint which never advanced is already correct. That holds
+            # for a producer which retains by NOT advancing (the watchers),
+            # and is false for one which optimistically RETIRES durable state
+            # before dispatching: A2A question completion claims the row
+            # ``RESOLVED``/``EXPIRED`` up front. Skipping the restore leaves
+            # that row terminal forever and startup replay never resumes the
+            # asker — the same permanent silent loss this module exists to
+            # prevent, arriving through the shutdown path instead.
+            #
+            # Restore only. No retry is scheduled: teardown is not the time to
+            # start new work, and the restored row is what makes the next boot
+            # pick this up.
+            if on_undelivered is not None:
+                await on_undelivered(
+                    _outcome(STATUS_SUPERVISOR_CANCELLED, delivered_statuses)
+                )
+            raise
         finally:
             if on_settled is not None:
                 on_settled()
