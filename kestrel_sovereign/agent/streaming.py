@@ -1348,11 +1348,9 @@ class StreamingMixin:
         lazy_hint = self._lazy_attachment_hint(attachments)
         messages.append({"role": "user", "content": prompt + lazy_hint})
 
-        operator_turn = await inject_operator_turn(
-            self, messages, context_result, session_id, effective_model, force_local_only
-        )
-
-        logging.debug(f"[CONTEXT-STREAM] Sending {len(messages)} messages to LLM")
+        # #2530: the operator notice is collected and injected LAST, right
+        # before the provider call — see the injection site below for why the
+        # turn setup between here and there must not sit inside that window.
 
         # Single streaming call with tool detection
         llm_start = time.time()
@@ -1457,19 +1455,60 @@ class StreamingMixin:
         if buffer_audit and isinstance(resolved_context, LLMInvocationContext):
             resolved_context = replace(resolved_context, redact_content=True)
 
-        async for item in self.llm_service.stream_with_tool_detection(
-            messages=messages,
-            tools=feature_tools if feature_tools else None,
-            force_local_only=force_local_only,
-            model_override=effective_model,
-            system_prompt=system_prompt,
-            session_id=session_id,
-            tool_executor=self._make_inline_tool_executor(session_id),
-            images=eager_images or None,
-            keep_trailing_system=operator_turn.keep_trailing_system,
-            cancel_token=cancel_token,
-            invocation_context=resolved_context,
-        ):
+        # #2530: collect and inject the operator notice LAST, immediately
+        # before the provider call it rides on. Collecting DRAINS the
+        # producer's pending auto-mode queue and advances its budget/governance
+        # dedupe state, so every ``await`` between that drain and the delivery
+        # boundary is a window in which a raised exception loses the notice
+        # permanently. The non-streaming path closes its window by wrapping the
+        # provider call (kestrel_agent.py). Here the turn setup that used to
+        # sit in between — tool-call logging, eager image resolution,
+        # invocation-context resolution — reads none of this, so it runs FIRST
+        # and the window is closed by construction rather than merely guarded.
+        # Keep it that way: anything added below this line and above the
+        # iteration must be settle-safe.
+        inline_tool_executor = self._make_inline_tool_executor(session_id)
+        operator_turn = await inject_operator_turn(
+            self, messages, context_result, session_id, effective_model, force_local_only
+        )
+
+        logging.debug(f"[CONTEXT-STREAM] Sending {len(messages)} messages to LLM")
+
+        # #2530: ``watch_stream`` settles the injected operator notice from
+        # this stream's own lifecycle — delivered on the first chunk (the
+        # provider accepted the request, so the model provably saw an inline
+        # notice), failed/cancelled if the stream dies or closes before one
+        # arrives. A stop-button cancel AFTER the first chunk deliberately
+        # stays delivered: the notice was carried, and requeuing it would
+        # re-report the same fact on the next turn.
+        #
+        # Constructing the stream is guarded even though nothing above it
+        # awaits today. The invariant is "an injected notice always reaches a
+        # terminal state", and an invariant that holds only because of the
+        # current statement order is one edit away from being false;
+        # ``watch_stream`` can only settle from INSIDE the iteration, so the
+        # construction needs its own guard.
+        try:
+            operator_stream = operator_turn.watch_stream(
+                self.llm_service.stream_with_tool_detection(
+                    messages=messages,
+                    tools=feature_tools if feature_tools else None,
+                    force_local_only=force_local_only,
+                    model_override=effective_model,
+                    system_prompt=system_prompt,
+                    session_id=session_id,
+                    tool_executor=inline_tool_executor,
+                    images=eager_images or None,
+                    keep_trailing_system=operator_turn.keep_trailing_system,
+                    cancel_token=cancel_token,
+                    invocation_context=resolved_context,
+                )
+            )
+        except BaseException as exc:
+            await operator_turn.settle_interrupted(exc)
+            raise
+
+        async for item in operator_stream:
             # #1256: Honor stop-button cancellation INSIDE the agent
             # loop, not just at the HTTP response layer. Before this
             # check existed, /api/agent/stop only set a flag that the
@@ -1482,6 +1521,15 @@ class StreamingMixin:
             # ``full_response`` flows through to the no-tools persist
             # path below and the cancellation marker lands in metadata.
             if request_id and self.is_request_cancelled(request_id):
+                # #2530: close the stream explicitly rather than dropping the
+                # reference and waiting on the async-generator finalizer. The
+                # provider stream holds the cancel token and the upstream
+                # connection, and ``operator_stream`` is a named local that
+                # stays alive to the end of this turn, so "stop" must release
+                # it here. This does NOT un-deliver the notice — it already
+                # settled ``delivered`` on the first chunk and the first
+                # terminal settle wins.
+                await operator_stream.aclose()
                 break
             # #1914: accumulate any part an inline tool emitted while the adapter
             # was resumed to produce THIS item. They flush right before the next

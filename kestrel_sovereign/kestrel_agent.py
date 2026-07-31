@@ -5172,47 +5172,59 @@ Expected Duration: {expected_duration}
 
         logging.debug(f"[CONTEXT] Sending {len(messages)} messages to LLM (1 system + {len(context_result.messages)} history + 1 user)")
 
-        # Generate response with full conversation context. ``session_id``
-        # threads through to stateful adapters (e.g. CodexAdapter), letting
-        # them anchor on ``previous_response_id`` and preserve encrypted
-        # reasoning across turns. #806 / #821.
-        #
-        # ``tool_executor`` is required by adapters that run an inline tool
-        # loop inside one LLM turn (the codex app-server's
-        # ``item/tool/call`` RPC is the current consumer). Without it,
-        # openai:plan hard-fails when tools are advertised. Stateless
-        # adapters (anthropic, openai:api) ignore the callable, so passing
-        # it unconditionally is safe and keeps the non-streaming path
-        # parity with the streaming path (orchestrator_engine:1836).
-        # #2614: resolve the per-request correlation identity for THIS turn.
-        # Explicit ``invocation_context`` wins; otherwise fall back to the
-        # legacy ``set_observability_context`` ambient state, with the explicit
-        # ``session_id`` filling an empty session slot. Shared helper so the
-        # streaming path agrees on precedence.
-        resolved_context = resolve_turn_invocation_context(
-            self.llm_service, invocation_context, session_id
-        )
-        # #2674 finding 3: under an enforcing (fail-closed) POST_RESPONSE audit
-        # the assistant prose is withheld pending the verdict, so the main
-        # provider call's raw prompt/response must not land in durable llm_calls
-        # telemetry or the OTel LLM span before that verdict (and, on DENY,
-        # never). Carry the content-redaction flag on the FROZEN per-turn context
-        # (never global state); it also covers the follow-up tool-synthesis calls
-        # in ``_handle_orchestrator_response`` that reuse ``resolved_context``.
-        if audit_enforcing and isinstance(resolved_context, LLMInvocationContext):
-            resolved_context = _replace_dataclass(
-                resolved_context, redact_content=True
+        # #2530: the operator notice is INJECTED but not yet delivered. An
+        # inline system notice is ephemeral by construction (#2009), so it is
+        # only beyond loss once the provider has accepted the request — i.e.
+        # once this call returns. Anything that throws between here and there
+        # loses it, so it settles failed/cancelled and the producer requeues
+        # it for the next turn instead of recording a delivery that never
+        # happened.
+        try:
+            # Generate response with full conversation context. ``session_id``
+            # threads through to stateful adapters (e.g. CodexAdapter), letting
+            # them anchor on ``previous_response_id`` and preserve encrypted
+            # reasoning across turns. #806 / #821.
+            #
+            # ``tool_executor`` is required by adapters that run an inline tool
+            # loop inside one LLM turn (the codex app-server's
+            # ``item/tool/call`` RPC is the current consumer). Without it,
+            # openai:plan hard-fails when tools are advertised. Stateless
+            # adapters (anthropic, openai:api) ignore the callable, so passing
+            # it unconditionally is safe and keeps the non-streaming path
+            # parity with the streaming path (orchestrator_engine:1836).
+            # #2614: resolve the per-request correlation identity for THIS turn.
+            # Explicit ``invocation_context`` wins; otherwise fall back to the
+            # legacy ``set_observability_context`` ambient state, with the explicit
+            # ``session_id`` filling an empty session slot. Shared helper so the
+            # streaming path agrees on precedence.
+            resolved_context = resolve_turn_invocation_context(
+                self.llm_service, invocation_context, session_id
             )
-        response = await self.llm_service.generate_with_messages(
-            messages=messages,
-            force_local_only=force_local_only,
-            model_override=effective_model,
-            tools=feature_tools if feature_tools else None,
-            session_id=session_id,
-            keep_trailing_system=operator_turn.keep_trailing_system,
-            tool_executor=self._make_inline_tool_executor(session_id or ""),
-            invocation_context=resolved_context,
-        )
+            # #2674 finding 3: under an enforcing (fail-closed) POST_RESPONSE audit
+            # the assistant prose is withheld pending the verdict, so the main
+            # provider call's raw prompt/response must not land in durable llm_calls
+            # telemetry or the OTel LLM span before that verdict (and, on DENY,
+            # never). Carry the content-redaction flag on the FROZEN per-turn context
+            # (never global state); it also covers the follow-up tool-synthesis calls
+            # in ``_handle_orchestrator_response`` that reuse ``resolved_context``.
+            if audit_enforcing and isinstance(resolved_context, LLMInvocationContext):
+                resolved_context = _replace_dataclass(
+                    resolved_context, redact_content=True
+                )
+            response = await self.llm_service.generate_with_messages(
+                messages=messages,
+                force_local_only=force_local_only,
+                model_override=effective_model,
+                tools=feature_tools if feature_tools else None,
+                session_id=session_id,
+                keep_trailing_system=operator_turn.keep_trailing_system,
+                tool_executor=self._make_inline_tool_executor(session_id or ""),
+                invocation_context=resolved_context,
+            )
+        except BaseException as exc:
+            await operator_turn.settle_interrupted(exc)
+            raise
+        await operator_turn.settle_delivered()
 
         # Log LLM response timing
         llm_duration = int((time.time() - llm_start) * 1000)

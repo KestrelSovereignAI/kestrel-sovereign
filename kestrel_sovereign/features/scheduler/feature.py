@@ -1279,6 +1279,16 @@ class SchedulerFeature(Feature):
             else {}
         )
 
+        # Operator-notice audit history (#2530) has its own per-row deadline
+        # too. Same rail, same isolation rule: its failure never blocks the
+        # conversation sweep below.
+        notices_purged = await self._purge_operator_notice_audit()
+        if notices_purged is not None:
+            durable_summary = {
+                **durable_summary,
+                "operator_notices_purged": notices_purged,
+            }
+
         storage = getattr(self.agent, "storage", None)
         if storage is None or not hasattr(storage, "purge_trash_older_than"):
             return json.dumps({
@@ -1333,6 +1343,35 @@ class SchedulerFeature(Feature):
             "max_rows": max_rows,
             **durable_summary,
         })
+
+    async def _purge_operator_notice_audit(self) -> Optional[int]:
+        """Drop this agent's expired ``operator_notice_audit`` rows (#2530).
+
+        Returns the row count, or ``None`` when the table is unreachable (no
+        storage yet) or the sweep failed — the caller reports only what it
+        observed.
+        """
+        raw_storage = getattr(self.agent, "_raw_storage", None)
+        db = getattr(raw_storage, "db", None)
+        if db is None:
+            return None
+        try:
+            from kestrel_sovereign.storage.operator_notice_store import (
+                OperatorNoticeAuditStore,
+            )
+
+            store = OperatorNoticeAuditStore(
+                db, str(getattr(self.agent, "did", "") or "")
+            )
+            return await store.purge_expired()
+        except Exception as exc:  # noqa: BLE001 - never block the sweep
+            logger.warning(
+                "[retention] operator notice audit cleanup failed for "
+                "agent=%s: %s",
+                self._agent_id,
+                exc,
+            )
+            return None
 
     # ------------------------------------------------------------------
     # wait_reconcile (Wave 2 of #1860)

@@ -624,6 +624,66 @@ CREATE TABLE IF NOT EXISTS wait_signal_state (
 );
 CREATE INDEX IF NOT EXISTS idx_wait_signal_state_pending
     ON wait_signal_state(agent_id, pending_signal_id);
+
+-- ============================================================================
+-- operator_notice_audit — lifecycle record for turn-time operator notices
+-- (#2530). One row per source event in one notice. Rows sharing a notice_id
+-- move together.
+--
+-- NOTE: _init_schema splits this file on the statement separator with no SQL
+-- parser, so a semicolon anywhere in these comments silently cuts the
+-- following CREATE in half and breaks schema init for EVERY table below it.
+-- Keep prose here semicolon-free (see
+-- test_core_schema_statements_are_executable).
+--
+-- An operator notice annotates a turn already in flight (auto-mode change,
+-- low token budget, governance delta). It never wakes the agent and never
+-- originates work, so it is NOT a signal and does not belong in signal_log —
+-- writing it there required fabricating an unregistered SourceRegistration
+-- and a hardcoded delivered:true. This table is that record's own home.
+--
+--   - state          collected -> injected -> delivered | failed | cancelled.
+--                    collected/injected are explicitly NOT delivery claims.
+--                    A row stuck there IS the negative evidence that a notice
+--                    was consumed and then lost.
+--   - durable_trace  whether the notice left something durable behind. True
+--                    only for a persisted fallback (user-role) notice. Inline
+--                    system notices are ephemeral by construction (#2009).
+--   - requeued       whether the producer's pending events and dedupe state
+--                    were rolled back so the notice retries next turn.
+--
+-- Payloads are operator facts and routing metadata only — the rendered notice
+-- prose and user content never reach this table. See
+-- kestrel_sovereign/storage/operator_notice_store.py.
+CREATE TABLE IF NOT EXISTS operator_notice_audit (
+    id TEXT PRIMARY KEY,
+    notice_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL DEFAULT '',
+    session_id TEXT,
+    source TEXT NOT NULL,
+    event_index INTEGER NOT NULL DEFAULT 0,
+    delivery_role TEXT NOT NULL,
+    fallback INTEGER NOT NULL DEFAULT 0,
+    route TEXT NOT NULL DEFAULT '',
+    payload TEXT,
+    state TEXT NOT NULL DEFAULT 'collected' CHECK (
+        state IN ('collected', 'injected', 'delivered', 'failed', 'cancelled')
+    ),
+    state_reason TEXT NOT NULL DEFAULT '',
+    durable_trace INTEGER NOT NULL DEFAULT 0,
+    requeued INTEGER NOT NULL DEFAULT 0,
+    collected_at TIMESTAMP NOT NULL,
+    injected_at TIMESTAMP,
+    settled_at TIMESTAMP,
+    retention_until TIMESTAMP NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_operator_notice_audit_notice
+    ON operator_notice_audit(agent_id, notice_id);
+CREATE INDEX IF NOT EXISTS idx_operator_notice_audit_state
+    ON operator_notice_audit(agent_id, state);
+CREATE INDEX IF NOT EXISTS idx_operator_notice_audit_retention
+    ON operator_notice_audit(retention_until);
 """
 
 # Backend-specific JSON-path indexes on graph_nodes properties.
