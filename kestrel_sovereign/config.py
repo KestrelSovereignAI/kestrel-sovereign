@@ -19,6 +19,10 @@ SEMANTIC_MAINTENANCE_CONFIG_ENV = "KESTREL_SEMANTIC_MAINTENANCE_CONFIG"
 # Carries the managed-config precedence boundary separately from the JSON
 # payload so a child process never falls back to a stale local TOML table.
 SEMANTIC_MAINTENANCE_CONFIGURED_ENV = "KESTREL_SEMANTIC_MAINTENANCE_CONFIGURED"
+# Separate immutable semantic-standard selection from inference and maintenance
+# budgets: a draft pin is never an implicit consequence of a budget change.
+SEMANTIC_CAPABILITIES_CONFIG_ENV = "KESTREL_SEMANTIC_CAPABILITIES_CONFIG"
+SEMANTIC_CAPABILITIES_CONFIGURED_ENV = "KESTREL_SEMANTIC_CAPABILITIES_CONFIGURED"
 
 
 # Default CORS origins for the console/API. Override via the comma-separated

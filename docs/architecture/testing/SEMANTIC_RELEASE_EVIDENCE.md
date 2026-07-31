@@ -169,6 +169,42 @@ All four are required gates. A registry unit check is not a substitute for the
 two HTTP invoke drills, and an experimental-enabled result is not evidence for
 stable-only operation.
 
+### Per-agent capability selection
+
+An agent without a `[semantic_capabilities]` table is stable-only. An explicit
+stable selection may contain only `mode = "stable"`. Draft mode is all or
+nothing: it must select exact registry capability/version pairs for RDF 1.2,
+SPARQL 1.2, and SHACL 1.2, plus an exact SHACL 1.2-compatible shape-set pin.
+For example, the current snapshot-pinned experiment is:
+
+```toml
+[semantic_capabilities]
+mode = "experimental"
+
+[semantic_capabilities.rdf12]
+capability = "rdf-profile:rdf12-cr-20260407-experimental"
+version = "0.1.0"
+
+[semantic_capabilities.sparql12]
+capability = "query-profile:sparql12-20260605-experimental"
+version = "0.1.0"
+
+[semantic_capabilities.shacl12]
+capability = "validation-profile:shacl12-core-20260602-experimental"
+version = "0.1.0"
+
+[semantic_capabilities.shape_set]
+identifier = "kestrel-assertion-shapes-shacl12-experimental"
+version = "0.1.0"
+```
+
+The host parses and verifies every selected local resource before publishing
+the agent. Missing, partial, unknown, mismatched, or incompatible selections
+fail closed. The selected capability map is then passed to the bounded sleep
+maintenance coordinator and appears only as content-free `!sleep` diagnostics.
+It changes no canonical assertion identity, storage schema, or migration path;
+disabling the experiment returns to the stable profile without a migration.
+
 ## Backend parity and measured budgets
 
 SQLite and PostgreSQL each require distinct results for assertion,

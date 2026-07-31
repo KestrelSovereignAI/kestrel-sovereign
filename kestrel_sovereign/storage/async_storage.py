@@ -1631,6 +1631,7 @@ class AsyncStorage:
         *,
         inference_limits=None,
         maintenance_limits=None,
+        semantic_capabilities=None,
         full_rebuild: bool = False,
     ):
         """Run the tenant's bounded incremental semantic-maintenance unit.
@@ -1648,6 +1649,7 @@ class AsyncStorage:
             inference_profile=inference_profile,
             inference_limits=inference_limits,
             limits=maintenance_limits,
+            semantic_capabilities=semantic_capabilities,
         )
         if full_rebuild:
             return await service.rebuild()

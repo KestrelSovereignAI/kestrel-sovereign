@@ -603,6 +603,30 @@ class TestMultiAgentConfigSave:
 
         assert loaded.agents["test"].semantic_inference == profile
 
+    def test_save_preserves_per_agent_semantic_capability_selection(
+        self,
+        tmp_path,
+        temp_agent_dir,
+    ):
+        selection = {
+            "mode": "stable",
+        }
+        config = MultiAgentConfig(
+            agents={
+                "test": LocalAgentConfig(
+                    data_dir=temp_agent_dir,
+                    port=8801,
+                    semantic_capabilities=selection,
+                )
+            }
+        )
+
+        config_path = tmp_path / "multi_agent.toml"
+        config.save(config_path)
+        loaded = MultiAgentConfig.from_file(config_path)
+
+        assert loaded.agents["test"].semantic_capabilities == selection
+
     def test_save_with_remote_agents(self, tmp_path):
         """Test saving config with remote agents."""
         config = MultiAgentConfig(

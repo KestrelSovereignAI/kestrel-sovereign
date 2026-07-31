@@ -401,3 +401,17 @@ description = "Pinned Kestrel assertion shape set for validation reports; shapes
 selected_terms = ["kshape:AssertionRevisionShape", "sh:minCount"]
 imports = ["kestrel-vocab@1.0.0", "shacl-core-20170720@1.0.0"]
 capabilities = ["shape-set:kestrel-assertions"]
+
+[resource.kestrel-assertion-shapes-shacl12-experimental]
+version = "0.1.0"
+namespace = "https://kestrel.ai/shapes/experimental/shacl12/"
+package_resource = "data/semantic/shapes/kestrel-assertions-1.0.0.ttl"
+sha256 = "639f9198b26d27801623a40da4101282e4f004da3b833fb899efbb826e1b6ca3"
+maturity = "experimental"
+kind = "shape-set"
+uri = "https://kestrel.ai/shapes/experimental/shacl12/0.1.0"
+published_date = "2026-07-31"
+description = "Pinned Kestrel assertion shape-set experiment bound only to the selected SHACL 1.2 Core snapshot; it does not migrate canonical assertions."
+selected_terms = ["kshape:AssertionRevisionShape", "sh:minCount"]
+imports = ["kestrel-vocab@1.0.0", "shacl12-core-20260602-experimental@0.1.0"]
+capabilities = ["shape-set:kestrel-assertions-shacl12-experimental"]

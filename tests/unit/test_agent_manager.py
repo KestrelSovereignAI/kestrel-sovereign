@@ -1640,6 +1640,55 @@ class TestLoadFromConfig:
     )
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
     @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
+    async def test_in_process_agent_receives_exact_semantic_capability_selection(
+        self,
+        mock_llm_cls,
+        mock_agent_cls,
+        mock_get_did,
+        tmp_path,
+    ):
+        mock_get_did.return_value = "did:claw"
+        mock_agent_cls.return_value = _make_mock_agent("did:claw")
+        manager = AgentManager(base_data_dir=tmp_path)
+        config = LocalAgentConfig(
+            data_dir=Path("agent_data/claw"),
+            port=8801,
+            semantic_capabilities={
+                "mode": "experimental",
+                "rdf12": {
+                    "capability": "rdf-profile:rdf12-cr-20260407-experimental",
+                    "version": "0.1.0",
+                },
+                "sparql12": {
+                    "capability": "query-profile:sparql12-20260605-experimental",
+                    "version": "0.1.0",
+                },
+                "shacl12": {
+                    "capability": "validation-profile:shacl12-core-20260602-experimental",
+                    "version": "0.1.0",
+                },
+                "shape_set": {
+                    "identifier": "kestrel-assertion-shapes-shacl12-experimental",
+                    "version": "0.1.0",
+                },
+            },
+        )
+
+        with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
+            await manager._initialize_agent("claw", config)
+
+        selected = mock_agent_cls.call_args.kwargs["semantic_capabilities"]
+        assert selected.allow_experimental is True
+        assert selected.shape_set.identifier == "kestrel-assertion-shapes-shacl12-experimental"
+        assert mock_agent_cls.call_args.kwargs["semantic_capabilities_configured"] is True
+
+    @pytest.mark.asyncio
+    @patch(
+        "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+        new_callable=AsyncMock,
+    )
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
     async def test_in_process_agent_rejects_unavailable_pinned_inference_profile(
         self,
         mock_llm_cls,

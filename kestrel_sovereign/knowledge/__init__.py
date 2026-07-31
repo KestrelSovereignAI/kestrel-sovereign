@@ -126,6 +126,12 @@ if TYPE_CHECKING:
         ValidationState,
         ValidationWriteAction,
     )
+    from .capabilities import (
+        CapabilitySelection,
+        SemanticCapabilityConfigurationError,
+        SemanticRuntimeCapabilities,
+        semantic_capabilities_from_config,
+    )
 
 __all__ = [
     "ArtifactPin",
@@ -222,6 +228,10 @@ __all__ = [
     "ShaclWritePolicy",
     "ShapeSetReference",
     "SemanticCapabilityContract",
+    "CapabilitySelection",
+    "SemanticCapabilityConfigurationError",
+    "SemanticRuntimeCapabilities",
+    "semantic_capabilities_from_config",
     "SemanticInferenceService",
     "SemanticKnowledgeRegistry",
     "SemanticResource",
@@ -355,6 +365,15 @@ _MAINTENANCE_EXPORTS = frozenset(
     }
 )
 
+_CAPABILITY_CONFIGURATION_EXPORTS = frozenset(
+    {
+        "CapabilitySelection",
+        "SemanticCapabilityConfigurationError",
+        "SemanticRuntimeCapabilities",
+        "semantic_capabilities_from_config",
+    }
+)
+
 _CORPUS_EXPORTS = frozenset(
     {
         "CORPUS_SCHEMA_VERSION",
@@ -392,6 +411,10 @@ def __getattr__(name: str):
         from . import maintenance
 
         return getattr(maintenance, name)
+    if name in _CAPABILITY_CONFIGURATION_EXPORTS:
+        from . import capabilities
+
+        return getattr(capabilities, name)
     if name in _CORPUS_EXPORTS:
         from . import corpus
 

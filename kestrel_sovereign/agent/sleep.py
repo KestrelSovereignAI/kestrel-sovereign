@@ -43,6 +43,11 @@ _SEMANTIC_MAINTENANCE_CAPABILITY_KEYS = (
     "inference_profile",
     "rule_profile",
     "ontology",
+    "semantic_capability_mode",
+    "rdf12_capability",
+    "rdf12_version",
+    "sparql12_capability",
+    "sparql12_version",
 )
 _SEMANTIC_MAINTENANCE_STATUSES = frozenset(
     {"complete", "partial", "failed", "no_op", "disabled"}
@@ -202,6 +207,10 @@ def _semantic_maintenance_active_capabilities(value: Any) -> Tuple[str, ...]:
         return tuple(active)
 
     resource_by_key = {resource.key: resource for resource in registry.resources}
+    capability_mode = raw.get("semantic_capability_mode")
+    allow_experimental = capability_mode == "experimental"
+    if capability_mode in {"stable", "experimental"}:
+        active.append(f"semantic_capability_mode={capability_mode}")
     shape_set = raw.get("shape_set")
     if (
         isinstance(shape_set, str)
@@ -214,7 +223,10 @@ def _semantic_maintenance_active_capabilities(value: Any) -> Tuple[str, ...]:
     validation_capability = raw.get("validation_capability")
     if isinstance(validation_capability, str):
         try:
-            selected_validation = registry.select_capability(validation_capability)
+            selected_validation = registry.select_capability(
+                validation_capability,
+                allow_experimental=allow_experimental,
+            )
         except KnowledgeRegistryError:
             selected_validation = None
         if (
@@ -230,6 +242,27 @@ def _semantic_maintenance_active_capabilities(value: Any) -> Tuple[str, ...]:
         or validation_version == str(validation_profile.version)
     ):
         active.append(f"validation_profile_version={validation_version}")
+
+    # Draft RDF/SPARQL names are only diagnostic evidence when the producer
+    # declared experimental mode *and* each exact registry pin still resolves.
+    # A report-shaped payload cannot make a disabled agent look experimental.
+    if allow_experimental:
+        for prefix, capability_key, version_key in (
+            ("rdf-profile:rdf12", "rdf12_capability", "rdf12_version"),
+            ("query-profile:sparql12", "sparql12_capability", "sparql12_version"),
+        ):
+            capability = raw.get(capability_key)
+            version = raw.get(version_key)
+            try:
+                selected = (
+                    registry.select_capability(capability, allow_experimental=True)
+                    if isinstance(capability, str) and capability.startswith(prefix)
+                    else None
+                )
+            except KnowledgeRegistryError:
+                selected = None
+            if selected is not None and version == str(selected.resource.version):
+                active.extend((f"{capability_key}={capability}", f"{version_key}={version}"))
 
     rule_profile = raw.get("rule_profile")
     rule_versions = _registered_rule_profile_versions(
@@ -1041,10 +1074,16 @@ class SleepMixin:
         maintain = getattr(storage, "run_semantic_maintenance", None)
         if callable(maintain):
             try:
+                maintenance_kwargs = {
+                    "inference_limits": getattr(self, "semantic_inference_limits", None),
+                    "maintenance_limits": getattr(self, "semantic_maintenance_limits", None),
+                }
+                semantic_capabilities = getattr(self, "semantic_capabilities", None)
+                if semantic_capabilities is not None:
+                    maintenance_kwargs["semantic_capabilities"] = semantic_capabilities
                 result = await maintain(
                     profile,
-                    inference_limits=getattr(self, "semantic_inference_limits", None),
-                    maintenance_limits=getattr(self, "semantic_maintenance_limits", None),
+                    **maintenance_kwargs,
                 )
             except Exception:
                 report.semantic_maintenance = {

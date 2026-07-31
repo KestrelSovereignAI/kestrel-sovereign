@@ -18,7 +18,11 @@ from kestrel_sovereign.multi_agent.config import (
     RemoteAgentConfig,
 )
 from kestrel_sovereign.multi_agent.process_manager import ProcessManager, AgentProcess
-from kestrel_sovereign.config import SEMANTIC_INFERENCE_CONFIG_ENV
+from kestrel_sovereign.config import (
+    SEMANTIC_CAPABILITIES_CONFIGURED_ENV,
+    SEMANTIC_CAPABILITIES_CONFIG_ENV,
+    SEMANTIC_INFERENCE_CONFIG_ENV,
+)
 
 
 # -----------------------------------------------------------------------
@@ -265,6 +269,32 @@ class TestStartAgent:
 
         env = mock_popen.call_args.kwargs["env"]
         assert json.loads(env[SEMANTIC_INFERENCE_CONFIG_ENV]) == cfg.semantic_inference
+
+    def test_start_agent_passes_exact_per_agent_semantic_capabilities(
+        self,
+        pm,
+        project_dir,
+    ):
+        selection = {
+            "mode": "experimental",
+            "rdf12": {"capability": "rdf-profile:rdf12-test", "version": "0.1.0"},
+            "sparql12": {"capability": "query-profile:sparql12-test", "version": "0.1.0"},
+            "shacl12": {"capability": "validation-profile:shacl12-test", "version": "0.1.0"},
+            "shape_set": {"identifier": "test-shapes", "version": "0.1.0"},
+        }
+        cfg = LocalAgentConfig(
+            data_dir=Path("agent_data/claw"),
+            port=8801,
+            semantic_capabilities=selection,
+        )
+        mock_process = MagicMock(pid=12345)
+
+        with patch("subprocess.Popen", return_value=mock_process) as mock_popen:
+            pm.start_agent("claw", cfg)
+
+        env = mock_popen.call_args.kwargs["env"]
+        assert json.loads(env[SEMANTIC_CAPABILITIES_CONFIG_ENV]) == selection
+        assert env[SEMANTIC_CAPABILITIES_CONFIGURED_ENV] == "1"
 
     def test_start_agent_resolves_explicit_export_override_below_data_dir(
         self,
