@@ -2945,6 +2945,59 @@ class TestGitHubPRWatchHandler:
         feature.agent.dispatcher.enqueue_signal.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_no_op_poll_holds_the_baseline_while_a_wake_is_in_flight(
+        self, feature
+    ):
+        """"This poll dispatched nothing" is not "no delivery is pending".
+
+        The sequence: a comment is added (signal-worthy, wake dispatched,
+        baseline correctly held pending Status.OK), then removed —
+        ``updated_at`` moves, so the next poll is a no-op change. If that
+        no-op advances the baseline and the in-flight wake then fails or is
+        dropped, the state its retry needed is already gone and the matching
+        event is lost permanently.
+
+        That is exactly the loss #2532 exists to prevent, reached through a
+        second poll instead of through the dispatch itself.
+        """
+        from kestrel_sovereign.signals.sources.github_pr_watch import (
+            compute_fingerprint,
+            normalize_pr_state,
+        )
+
+        norm = normalize_pr_state(_pr_payload(comments=2))
+        fp = compute_fingerprint(norm)
+        feature._db.fetchone = AsyncMock(return_value=(fp, json.dumps(norm)))
+        _wire_watch_dispatcher(feature)
+        # A wake dispatched by an earlier poll has not settled yet.
+        feature._inflight_watch_deliveries.add("github_pr:owner/name#1614")
+
+        saved: list = []
+        feature._save_pr_watch_state = AsyncMock(
+            side_effect=lambda *a, **kw: saved.append(a)
+        )
+
+        with patch(_GH_TOKEN, return_value="tok"), patch(
+            _GH_FETCH,
+            new=AsyncMock(
+                return_value=_pr_payload(
+                    comments=2, updated_at="2026-06-09T17:00:00Z"
+                )
+            ),
+        ):
+            out = await feature._run_github_pr_watch(
+                {"repo": "owner/name", "pr": 1614}
+            )
+
+        data = json.loads(out)
+        assert data["signaled"] is False
+        assert saved == [], (
+            "the baseline must be held while a prior wake is still in "
+            f"flight; got {saved}"
+        )
+        assert data["checkpoint"] == "held_delivery_in_flight"
+
+    @pytest.mark.asyncio
     async def test_new_comment_emits_signal(self, feature):
         from kestrel_sovereign.signals.sources.github_pr_watch import (
             compute_fingerprint,

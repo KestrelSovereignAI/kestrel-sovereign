@@ -1684,6 +1684,19 @@ class SchedulerFeature(Feature):
         state_json = state_to_json(decision.state)
 
         if not decision.should_signal:
+            # Same hold as the PR watch above: a prior poll's wake may still
+            # be in flight, and advancing the fingerprint underneath it
+            # destroys the baseline that wake would retry from (#2532).
+            if (
+                f"ecosystem_discovery:{watch_key}"
+                in self._inflight_watch_deliveries
+            ):
+                return json.dumps({
+                    "signaled": False,
+                    "reason": decision.reason,
+                    "watch_key": watch_key,
+                    "checkpoint": "held_delivery_in_flight",
+                })
             await self._save_ecosystem_discovery_state(
                 watch_key, decision.state.fingerprint, state_json,
             )
@@ -1835,11 +1848,25 @@ class SchedulerFeature(Feature):
         )
         if not decision.should_signal:
             # Advance the baseline for first observations and filtered/no-op
-            # changes — nothing was dispatched, so there is no delivery to
-            # gate on. Signal-worthy changes advance only after their wake
+            # changes. Signal-worthy changes advance only after their wake
             # reaches terminal Status.OK (#2532): enqueue acceptance is not
             # delivery, and advancing on it would mark the event handled and
             # permanently drop a wake the dispatcher went on to fail or drop.
+            #
+            # "This poll dispatched nothing" is NOT the same as "no delivery
+            # is pending". A PRIOR poll's wake can still be in flight, and
+            # overwriting the baseline underneath it destroys the state that
+            # wake would have been retried from — a comment added (signal,
+            # baseline held) then removed (no-op, updated_at moved) would
+            # silently strand the matching event. Hold the baseline until the
+            # in-flight delivery settles; the next poll advances it.
+            if f"github_pr:{watch_key}" in self._inflight_watch_deliveries:
+                return json.dumps({
+                    "signaled": False,
+                    "reason": decision.reason,
+                    "watch_key": watch_key,
+                    "checkpoint": "held_delivery_in_flight",
+                })
             await self._save_pr_watch_state(
                 watch_key, decision.fingerprint, decision.normalized,
             )
