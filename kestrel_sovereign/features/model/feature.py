@@ -348,7 +348,6 @@ class ModelAgent(Feature):
                     )
 
             # Record agent consent before applying the change
-            consent_failed = False
             consent = self.agent.features.get("ConsentFeature") if hasattr(self.agent, 'features') else None
             if consent:
                 try:
