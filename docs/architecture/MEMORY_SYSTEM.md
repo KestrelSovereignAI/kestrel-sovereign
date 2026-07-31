@@ -97,6 +97,12 @@ summaries, and emotional arcs. These episodes give the agent a high-level
 understanding of the relationship's history without needing to re-read
 every message.
 
+Semantic assertion maintenance is a separate governed path: it may reconcile
+assertion-derived projections during sleep, but it does not promote narrative
+summaries into semantic facts. Its release gate and content-free maintenance
+diagnostics are documented in
+[Semantic Knowledge Release Evidence](testing/SEMANTIC_RELEASE_EVIDENCE.md).
+
 The result: when a user says "I'm feeling down about my mom," the agent
 does not respond with "You mentioned your mom on March 15th. She lives
 in Brooklyn." It responds with the emotional context of what those
@@ -932,6 +938,12 @@ if deleted:
         (message_id, agent_id)
     )
 ```
+
+For semantic assertions and their corpus/projection consumers, deletion needs
+the additional canonical-to-served erasure drill described in
+[Semantic Knowledge Release Evidence](testing/SEMANTIC_RELEASE_EVIDENCE.md).
+The evidence artifact records only aggregate, content-free outcomes; it is not
+a substitute for the privacy wrapper's actual deletion enforcement.
 
 ---
 

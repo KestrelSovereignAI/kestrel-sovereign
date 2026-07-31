@@ -23,6 +23,10 @@ A comprehensive guide to running and writing tests for Kestrel Sovereign.
 > during implementation, independent verification during review, CI
 > before merge) and the structured result states the reviewer reports,
 > see [`TEST_EVIDENCE_GATES.md`](TEST_EVIDENCE_GATES.md).
+>
+> Semantic-KB cutovers additionally use the content-free conformance, parity,
+> erasure, benchmark, and Kite evidence artifact in
+> [`SEMANTIC_RELEASE_EVIDENCE.md`](SEMANTIC_RELEASE_EVIDENCE.md).
 
 ## Test Pyramid Strategy
 

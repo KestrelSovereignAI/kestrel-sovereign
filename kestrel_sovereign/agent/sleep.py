@@ -17,6 +17,7 @@ from collections.abc import Mapping
 import hashlib
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 import heapq
@@ -32,6 +33,8 @@ logger = logging.getLogger(__name__)
 _SEMANTIC_MAINTENANCE_SUMMARY_MAX_CHARS = 1_024
 _SEMANTIC_MAINTENANCE_MAX_RENDERED_NUMBER = 1_000_000_000
 _SEMANTIC_MAINTENANCE_CAPABILITY_VALUE_MAX_CHARS = 256
+_SEMANTIC_MAINTENANCE_VERSION_RE = re.compile(r"^v[0-9]+$")
+_SEMANTIC_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 _SEMANTIC_MAINTENANCE_CAPABILITY_KEYS = (
     "semantic_maintenance",
     "maintenance_budget",
@@ -158,6 +161,126 @@ def _semantic_maintenance_capability_summary(value: Any) -> Tuple[int, str]:
     return len(canonical), hashlib.sha256(encoded).hexdigest()[:16]
 
 
+def _semantic_maintenance_active_capabilities(value: Any) -> Tuple[str, ...]:
+    """Return registry-verified active capability/version labels.
+
+    The raw maintenance map is intentionally not trusted as a presentation
+    surface: a feature or a malformed storage result must not inject source
+    text through an operational diagnostic.  Values are shown only when they
+    match a fixed version grammar or an exact, locally verified registry
+    resource/capability.  Everything else remains represented by the existing
+    digest line, which is useful for comparison without disclosure.
+    """
+    if not isinstance(value, Mapping):
+        return ()
+    raw = value.get("capability_versions")
+    if not isinstance(raw, Mapping):
+        return ()
+
+    active: List[str] = []
+    maintenance = raw.get("semantic_maintenance")
+    if isinstance(maintenance, str) and _SEMANTIC_MAINTENANCE_VERSION_RE.fullmatch(
+        maintenance
+    ):
+        active.append(f"semantic_maintenance={maintenance}")
+
+    try:
+        from kestrel_sovereign.knowledge.registry import (
+            KnowledgeRegistryError,
+            StandardsMaturity,
+            get_knowledge_registry,
+        )
+
+        registry = get_knowledge_registry()
+    except (KnowledgeRegistryError, OSError):
+        return tuple(active)
+
+    stable_resources = tuple(
+        resource
+        for resource in registry.resources
+        if resource.maturity is StandardsMaturity.STABLE
+    )
+    stable_resource_keys = {
+        f"{resource.identifier}@{resource.version}" for resource in stable_resources
+    }
+    stable_capabilities = {
+        capability
+        for resource in stable_resources
+        for capability in resource.capabilities
+    }
+    shape_set = raw.get("shape_set")
+    if isinstance(shape_set, str) and shape_set in stable_resource_keys:
+        active.append(f"shape_set={shape_set}")
+    validation_capability = raw.get("validation_capability")
+    if (
+        isinstance(validation_capability, str)
+        and validation_capability in stable_capabilities
+    ):
+        active.append(f"validation_capability={validation_capability}")
+    validation_version = raw.get("validation_profile_version")
+    if validation_version == "registry-selected" or (
+        isinstance(validation_version, str)
+        and _SEMANTIC_VERSION_RE.fullmatch(validation_version)
+    ):
+        active.append(f"validation_profile_version={validation_version}")
+    rule_profile = raw.get("rule_profile")
+    if isinstance(rule_profile, str) and _SEMANTIC_VERSION_RE.fullmatch(rule_profile):
+        active.append(f"rule_profile={rule_profile}")
+    return tuple(active)
+
+
+def _semantic_maintenance_repair_guidance(value: Any) -> str:
+    """Return a fixed next action for partial or unavailable maintenance.
+
+    These are action *codes*, not exception echoes.  The operator runbook maps
+    them to the bounded retry/repair commands, so a failure cannot expose an
+    assertion, SQL fragment, tenant, or source locator in an HTTP invoke reply.
+    """
+    if not isinstance(value, Mapping):
+        return "inspect_semantic_configuration"
+    status = _semantic_maintenance_status(value.get("status"))
+    reason = _semantic_maintenance_reason(value.get("reason"))
+    if status in {"complete", "no_op", "disabled"}:
+        return "none"
+    if reason == "semantic_maintenance_busy":
+        return "wait_for_active_maintenance_lease"
+    if reason in {
+        "semantic_maintenance_capability_unavailable",
+        "semantic_maintenance_capability_mismatch",
+        "semantic_maintenance_validation_capability_unavailable",
+    }:
+        return "check_semantic_profile_pins"
+    if status == "partial":
+        return "rerun_bounded_maintenance"
+    if status == "failed":
+        return "inspect_semantic_configuration"
+    return "rerun_bounded_maintenance"
+
+
+def _semantic_maintenance_diagnostics(value: Any) -> Optional[Dict[str, Any]]:
+    """Create the one content-free structured diagnostic for live maintenance."""
+    if not isinstance(value, Mapping):
+        return None
+    status = _semantic_maintenance_status(value.get("status"))
+    return {
+        "status": status,
+        "reason": _semantic_maintenance_reason(value.get("reason")),
+        "checkpoint": {
+            "source_generation": _bounded_summary_number(value.get("source_generation")),
+            "checkpoint_generation": _bounded_summary_number(
+                value.get("checkpoint_generation")
+            ),
+        },
+        "backlog": {
+            "assertions": _bounded_summary_number(value.get("backlog_assertions")),
+            "reports": _bounded_summary_number(value.get("backlog_reports")),
+        },
+        "partial": status == "partial",
+        "repair_guidance": _semantic_maintenance_repair_guidance(value),
+        "active_capabilities": list(_semantic_maintenance_active_capabilities(value)),
+    }
+
+
 def _render_semantic_maintenance_summary(value: Any) -> Optional[str]:
     """Render the fixed, content-free semantic-maintenance text block.
 
@@ -170,8 +293,11 @@ def _render_semantic_maintenance_summary(value: Any) -> Optional[str]:
     if not isinstance(value, Mapping):
         return None
 
-    status = _semantic_maintenance_status(value.get("status"))
-    reason = _semantic_maintenance_reason(value.get("reason"))
+    diagnostics = _semantic_maintenance_diagnostics(value)
+    if diagnostics is None:  # pragma: no cover - guarded immediately above.
+        return None
+    status = str(diagnostics["status"])
+    reason = str(diagnostics["reason"])
     capability_count, capability_digest = _semantic_maintenance_capability_summary(
         value.get("capability_versions")
     )
@@ -195,6 +321,13 @@ def _render_semantic_maintenance_summary(value: Any) -> Optional[str]:
         f"    duration: {_bounded_summary_number(value.get('duration_ms'))}ms",
         "    capabilities: "
         f"versions={capability_count} digest={capability_digest}",
+        "    active capabilities: "
+        + (
+            ", ".join(diagnostics["active_capabilities"])
+            if diagnostics["active_capabilities"]
+            else "unavailable"
+        ),
+        f"    repair guidance: {diagnostics['repair_guidance']}",
     ]
     # Every interpolated value above is independently bounded.  Retain this
     # final cap as a defense-in-depth contract for future edits.
@@ -462,6 +595,7 @@ class SleepReport:
             "hook_results": [result.to_dict() for result in self.hook_results],
             "semantic_inference": self.semantic_inference,
             "semantic_maintenance": self.semantic_maintenance,
+            "semantic_maintenance_diagnostics": self.semantic_maintenance_diagnostics(),
             "export": {
                 "shards_exported": self.shards_exported,
                 "total_size_bytes": self.total_size_bytes,
@@ -487,6 +621,16 @@ class SleepReport:
         capability map itself.
         """
         return _render_semantic_maintenance_summary(self.semantic_maintenance)
+
+    def semantic_maintenance_diagnostics(self) -> Optional[Dict[str, Any]]:
+        """Return the content-free operational view used by live invoke output.
+
+        The raw maintenance result is retained for trusted programmatic callers,
+        while this method is the safe presentation contract: active verified
+        profiles, checkpoint/backlog state, partial status, and fixed repair
+        guidance are visible without assertion content or identifiers.
+        """
+        return _semantic_maintenance_diagnostics(self.semantic_maintenance)
 
     def __str__(self) -> str:
         """Human-readable sleep summary with safe maintenance observability."""

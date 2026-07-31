@@ -170,6 +170,7 @@ def test_sleep_report_maintenance_renderer_redacts_content_ids_and_raw_errors() 
 
     rendered = str(report)
     summary = report.semantic_maintenance_summary()
+    diagnostics = report.semantic_maintenance_diagnostics()
 
     assert rendered == str(report), "rendering must be deterministic"
     assert summary is not None
@@ -187,6 +188,49 @@ def test_sleep_report_maintenance_renderer_redacts_content_ids_and_raw_errors() 
         "raw_error",
     ):
         assert secret not in rendered
+        assert secret not in repr(diagnostics)
+
+
+def test_sleep_diagnostics_expose_verified_capabilities_and_repair_guidance() -> None:
+    report = SleepReport(
+        success=False,
+        semantic_maintenance=_maintenance(
+            status="partial",
+            reason="assertion_budget",
+            backlog_assertions=3,
+            backlog_reports=1,
+            capability_versions={
+                "semantic_maintenance": "v3",
+                "shape_set": "kestrel-assertion-shapes@1.0.0",
+                "validation_capability": "validation-profile:shacl-core-20170720",
+                "validation_profile_version": "registry-selected",
+                "rule_profile": "1.0.0",
+            },
+        ),
+    )
+
+    diagnostics = report.semantic_maintenance_diagnostics()
+    assert diagnostics == {
+        "status": "partial",
+        "reason": "assertion_budget",
+        "checkpoint": {
+            "source_generation": "17",
+            "checkpoint_generation": "17",
+        },
+        "backlog": {"assertions": "3", "reports": "1"},
+        "partial": True,
+        "repair_guidance": "rerun_bounded_maintenance",
+        "active_capabilities": [
+            "semantic_maintenance=v3",
+            "shape_set=kestrel-assertion-shapes@1.0.0",
+            "validation_capability=validation-profile:shacl-core-20170720",
+            "validation_profile_version=registry-selected",
+            "rule_profile=1.0.0",
+        ],
+    }
+    assert "active capabilities: semantic_maintenance=v3" in str(report)
+    assert "repair guidance: rerun_bounded_maintenance" in str(report)
+    assert report.to_dict()["semantic_maintenance_diagnostics"] == diagnostics
 
 
 @pytest.mark.asyncio
