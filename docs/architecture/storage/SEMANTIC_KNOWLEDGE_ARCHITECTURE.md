@@ -493,7 +493,10 @@ one claim with two governed source occurrences: the later row uses the public
 source-append lifecycle rather than a second initial write. `rollback()`
 withdraws that shared claim only when its complete recorded source set still
 exactly matches canonical provenance (and expands a batch boundary to keep the
-set atomic); it never removes legacy graph content or audit records.
+set atomic). If a process stops after canonical withdrawal, the next rollback
+reconstructs the complete source group, atomically requeues projection
+invalidation with every rollback receipt, and finishes the group. Rollback
+never removes legacy graph content or audit records.
 
 Core has no semantic-assertion vector/index projection to rebuild. A
 feature-owned projection may supply its public invalidator to the runner; it

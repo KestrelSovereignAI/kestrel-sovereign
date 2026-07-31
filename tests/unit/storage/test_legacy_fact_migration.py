@@ -463,28 +463,106 @@ async def test_duplicate_claim_rows_append_distinct_provenance_and_rollback_toge
         }
         await _node(storage, "fact-duplicate-a", properties)
         await _node(storage, "fact-duplicate-b", properties)
+        await _node(storage, "fact-duplicate-c", properties)
         migration = LegacyGraphFactMigration(storage)
-        result = await migration.run(batch_size=2)
-        assert result.migrated == 2
+        result = await migration.run(batch_size=3)
+        assert result.migrated == 3
         assert storage.db is not None
         records = await storage.db.fetchall(
             "SELECT assertion_id, source_occurrence_id, outcome FROM legacy_fact_migration_records "
             "WHERE tenant_id = ? ORDER BY node_id",
             (TENANT,),
         )
-        assert records[0][0] == records[1][0]
-        assert records[0][1] != records[1][1]
-        assert [row[2] for row in records] == ["migrated", "source_appended"]
+        assert len({row[0] for row in records}) == 1
+        assert len({row[1] for row in records}) == 3
+        assert [row[2] for row in records] == [
+            "migrated",
+            "source_appended",
+            "source_appended",
+        ]
         sources = await storage.list_assertion_sources(records[0][0])
         assert {source.source_occurrence_id for source in sources} == {
-            records[0][1],
-            records[1][1],
+            row[1] for row in records
         }
-        # The two record rows share one canonical assertion.  A one-row
-        # request must expand to the full source group, not wedge forever.
-        rollback = await migration.rollback(batch_size=1)
-        assert rollback.migrated == 2
+        # The three record rows share one canonical assertion.  A two-row
+        # request must expand to exactly the full source group.
+        rollback = await migration.rollback(batch_size=2)
+        assert rollback.processed == 3
+        assert rollback.migrated == 3
+        assert rollback.complete is True
         assert await storage.get_assertion(records[0][0]) is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_count", [1, 3])
+async def test_rollback_recovers_crash_after_canonical_withdrawal(
+    tmp_path, monkeypatch, source_count
+):
+    storage = await _storage(tmp_path)
+    seen: list[tuple[str, tuple[str, ...]]] = []
+    try:
+        properties = {
+            "subject": "user",
+            "predicate": "preferred_deploy_region",
+            "value": f"rollback-crash-{source_count}",
+            "created_at": "2026-01-01T00:00:00+00:00",
+        }
+        for index in range(source_count):
+            await _node(storage, f"fact-rollback-crash-{index}", properties)
+
+        async def invalidate(tenant: str, assertion_ids: tuple[str, ...]) -> None:
+            seen.append((tenant, assertion_ids))
+
+        migration = LegacyGraphFactMigration(
+            storage, index_invalidator=invalidate
+        )
+        await migration.run(batch_size=source_count)
+        assert len(seen) == 1
+        original_finalize = migration._finalize_rollback_group
+        crashed = False
+
+        async def crash_before_receipts(*args, **kwargs):
+            nonlocal crashed
+            if not crashed:
+                crashed = True
+                raise RuntimeError("crash after canonical withdrawal")
+            await original_finalize(*args, **kwargs)
+
+        monkeypatch.setattr(
+            migration, "_finalize_rollback_group", crash_before_receipts
+        )
+        with pytest.raises(RuntimeError, match="crash after canonical withdrawal"):
+            await migration.rollback(batch_size=1)
+
+        assert storage.db is not None
+        assertion_row = await storage.db.fetchone(
+            "SELECT assertion_id FROM legacy_fact_migration_records "
+            "WHERE tenant_id = ? LIMIT 1",
+            (TENANT,),
+        )
+        assert await storage.get_assertion(assertion_row[0]) is None
+        outcomes_before = await storage.db.fetchall(
+            "SELECT outcome FROM legacy_fact_migration_records "
+            "WHERE tenant_id = ? ORDER BY node_id",
+            (TENANT,),
+        )
+        assert all(row[0] != "rolled_back" for row in outcomes_before)
+
+        recovered = await LegacyGraphFactMigration(
+            storage, index_invalidator=invalidate
+        ).rollback(batch_size=1)
+        assert recovered.processed == source_count
+        assert recovered.idempotent == source_count
+        assert recovered.complete is True
+        assert len(seen) == 2
+        outcomes_after = await storage.db.fetchall(
+            "SELECT outcome FROM legacy_fact_migration_records "
+            "WHERE tenant_id = ? ORDER BY node_id",
+            (TENANT,),
+        )
+        assert outcomes_after == [("rolled_back",)] * source_count
     finally:
         await storage.close()
 

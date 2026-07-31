@@ -521,11 +521,11 @@ class LegacyGraphFactMigration:
                     (node_id, source_id, _revision_id)
                 )
         for assertion_id, group in groups.items():
-            processed += len(group)
             if not assertion_id or any(
                 not isinstance(source_id, str) or not source_id
                 for _node_id, source_id, _revision_id in group
             ):
+                processed += len(group)
                 for node_id, _source_id, _revision_id in group:
                     await self._set_outcome(
                         db, tenant_id, node_id, "rollback_refused_invalid_record"
@@ -534,12 +534,10 @@ class LegacyGraphFactMigration:
                     rejected.get("rollback_refused_invalid_record", 0) + len(group)
                 )
                 continue
-            assertion = await self._storage.get_assertion(assertion_id)
-            if assertion is None:
-                idempotent += len(group)
-                for node_id, _source_id, _revision_id in group:
-                    await self._set_outcome(db, tenant_id, node_id, "rolled_back")
-                continue
+            # Always reconstruct the complete active source group before
+            # looking up the canonical assertion.  This is also the recovery
+            # path when a prior process committed the canonical withdrawal but
+            # crashed before finalizing migration receipts.
             all_active_records = await db.fetchall(
                 "SELECT node_id, source_occurrence_id, revision_id "
                 "FROM legacy_fact_migration_records "
@@ -548,16 +546,18 @@ class LegacyGraphFactMigration:
                 "ORDER BY node_id ASC",
                 (tenant_id, assertion_id),
             )
-            if len(all_active_records) != len(group):
-                # A semantic claim can collect several legacy source rows.
-                # Complete that claim atomically even when the requested batch
-                # boundary falls between its rows; otherwise batch_size=1
-                # would permanently wedge rollback.
-                group = [
-                    (node_id, source_id, revision_id)
-                    for node_id, source_id, revision_id in all_active_records
-                ]
-                processed += len(group) - 1
+            group = [
+                (node_id, source_id, revision_id)
+                for node_id, source_id, revision_id in all_active_records
+            ]
+            processed += len(group)
+            assertion = await self._storage.get_assertion(assertion_id)
+            if assertion is None:
+                await self._finalize_rollback_group(
+                    db, tenant_id, assertion_id, group
+                )
+                idempotent += len(group)
+                continue
             sources = await self._storage.list_assertion_sources(assertion_id)
             expected_source_ids = {
                 str(source_id) for _node_id, source_id, _revision_id in group
@@ -582,11 +582,17 @@ class LegacyGraphFactMigration:
                     f"{hashlib.sha256('|'.join(sorted(expected_source_ids)).encode()).hexdigest()}"
                 ),
             )
-            for node_id, _source_id, _revision_id in group:
-                await self._set_outcome(db, tenant_id, node_id, "rolled_back")
-            await self._requeue_invalidation(db, tenant_id, assertion_id)
+            await self._finalize_rollback_group(
+                db, tenant_id, assertion_id, group
+            )
             migrated += len(group)
         invalidated = await self._deliver_pending_invalidations(db, tenant_id)
+        remaining = await db.fetchone(
+            "SELECT COUNT(*) FROM legacy_fact_migration_records "
+            "WHERE tenant_id = ? "
+            "AND outcome IN ('migrated', 'idempotent', 'source_appended')",
+            (tenant_id,),
+        )
         return MigrationResult(
             tenant_id,
             processed,
@@ -594,7 +600,7 @@ class LegacyGraphFactMigration:
             idempotent,
             rejected,
             None,
-            len(rows) < batch_size,
+            bool(remaining and int(remaining[0]) == 0),
             invalidated,
         )
 
@@ -822,10 +828,13 @@ class LegacyGraphFactMigration:
                 )
 
     @staticmethod
-    async def _requeue_invalidation(
-        db: Any, tenant_id: str, assertion_id: str
+    async def _finalize_rollback_group(
+        db: Any,
+        tenant_id: str,
+        assertion_id: str,
+        group: list[tuple[object, object, object]],
     ) -> None:
-        """Re-open durable projection work after a canonical withdrawal."""
+        """Atomically queue withdrawal projection work and close all receipts."""
         async with db.transaction():
             await db.execute(
                 "UPDATE legacy_fact_migration_invalidations "
@@ -833,6 +842,12 @@ class LegacyGraphFactMigration:
                 "WHERE tenant_id = ? AND migration_name = ? AND assertion_id = ?",
                 (tenant_id, MIGRATION_NAME, assertion_id),
             )
+            for node_id, _source_id, _revision_id in group:
+                await db.execute(
+                    "UPDATE legacy_fact_migration_records SET outcome = 'rolled_back' "
+                    "WHERE tenant_id = ? AND node_id = ?",
+                    (tenant_id, node_id),
+                )
 
     async def _deliver_pending_invalidations(self, db: Any, tenant_id: str) -> bool:
         """Deliver durable projection work; only an acknowledged call is marked done."""
