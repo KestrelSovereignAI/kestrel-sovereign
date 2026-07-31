@@ -126,7 +126,6 @@ async def test_experimental_capability_selection_is_backend_neutral_and_non_migr
         tmp_path,
         "experimental-capabilities",
     )
-    storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
     selected = semantic_capabilities_from_config(
         {
             "mode": "experimental",
@@ -147,6 +146,9 @@ async def test_experimental_capability_selection_is_backend_neutral_and_non_migr
                 "version": "0.1.0",
             },
         }
+    )
+    storage = await _assertion_storage_for_backend(
+        db_backend, tenant, identity, semantic_capabilities=selected
     )
     try:
         before = await storage.query_assertions()
@@ -262,6 +264,8 @@ async def _assertion_storage_for_backend(
     db_backend,
     tenant_id: str,
     identity: AgentIdentity,
+    *,
+    semantic_capabilities=None,
 ) -> AsyncStorage:
     """Open a boot-resolver-authorized assertion store for parity coverage."""
     capability = _resolve_authenticated_agent_assertion_capability(
@@ -273,6 +277,7 @@ async def _assertion_storage_for_backend(
             db_backend.db_path,
             agent_id=tenant_id,
             _assertion_tenant_capability=capability,
+            semantic_capabilities=semantic_capabilities,
         )
         await storage.initialize()
         return storage
@@ -284,6 +289,7 @@ async def _assertion_storage_for_backend(
         dsn=dsn,
         agent_id=tenant_id,
         _assertion_tenant_capability=capability,
+        semantic_capabilities=semantic_capabilities,
     )
     await storage.initialize()
     return storage

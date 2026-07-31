@@ -245,21 +245,57 @@ class SemanticRuntimeCapabilities:
                     "SHACL 1.2 profile"
                 )
             registry.verify_resources((*resolved, *shapes.import_closure))
-            # The codec is the actual RDF/SPARQL implementation boundary.  Constructing
-            # it here proves no selected draft is merely a diagnostic string.
-            RdfAssertionCodec(
-                registry=registry,
-                configuration=RdfCodecConfiguration(
-                    rdf12_capability=self.rdf12.capability,
-                    rdf12_version=self.rdf12.version,
-                    sparql12_capability=self.sparql12.capability,
-                    sparql12_version=self.sparql12.version,
-                ),
-            )
+            # Construct through the same factory owned by the live storage
+            # boundary.  This catches an RDF/SPARQL implementation mismatch at
+            # boot rather than treating draft selections as diagnostics only.
+            self.create_rdf_codec(registry=registry)
         except (KnowledgeRegistryError, UnsupportedRdfCapabilityError) as exc:
             raise SemanticCapabilityConfigurationError(
                 "experimental semantic capability is unavailable or has an invalid pin"
             ) from exc
+
+    def create_rdf_codec(
+        self, *, registry: SemanticKnowledgeRegistry | None = None
+    ) -> RdfAssertionCodec:
+        """Create the RDF/SPARQL implementation bound to this exact selection.
+
+        Callers deliberately own the returned instance for their lifetime.  A
+        runtime must not re-parse draft pins on each operation or silently
+        substitute a stable codec after boot.
+        """
+        configuration = RdfCodecConfiguration()
+        if self.allow_experimental:
+            assert self.rdf12 is not None and self.sparql12 is not None
+            configuration = RdfCodecConfiguration(
+                rdf12_capability=self.rdf12.capability,
+                rdf12_version=self.rdf12.version,
+                sparql12_capability=self.sparql12.capability,
+                sparql12_version=self.sparql12.version,
+            )
+        return RdfAssertionCodec(registry=registry, configuration=configuration)
+
+    def rdf_runtime_matches(
+        self, report, *, registry: SemanticKnowledgeRegistry | None = None
+    ) -> bool:
+        """Whether a codec report is the exact runtime selected for this agent."""
+        if report.rdf12 is None or report.sparql12 is None:
+            return not self.allow_experimental and (
+                report.rdf12 is None and report.sparql12 is None
+            )
+        if not self.allow_experimental:
+            return False
+        assert self.rdf12 is not None and self.sparql12 is not None
+        registry = registry or get_knowledge_registry()
+        try:
+            rdf12 = registry.select_capability(
+                self.rdf12.capability, allow_experimental=True
+            ).resource.pin
+            sparql12 = registry.select_capability(
+                self.sparql12.capability, allow_experimental=True
+            ).resource.pin
+        except KnowledgeRegistryError:
+            return False
+        return report.rdf12 == rdf12 and report.sparql12 == sparql12
 
     @property
     def validation_capability(self) -> str:

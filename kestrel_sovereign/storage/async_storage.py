@@ -124,6 +124,7 @@ class AsyncStorage:
         agent_id: str = "",
         llm_service: Optional[Any] = None,
         _assertion_tenant_capability: Optional[_AssertionTenantCapability] = None,
+        semantic_capabilities=None,
     ):
         """
         Initialize AsyncStorage.
@@ -140,6 +141,24 @@ class AsyncStorage:
         self.db_path: Optional[str] = None
         self.agent_id = agent_id
         self.llm_service = llm_service
+        # A semantic runtime is agent-owned, not a caller-selected option on
+        # individual maintenance/corpus requests.  Keep its RDF/SPARQL codec
+        # alive with storage so the pins used by live sleep work are the pins
+        # that were accepted during boot.
+        from kestrel_sovereign.knowledge.capabilities import SemanticRuntimeCapabilities
+
+        if semantic_capabilities is not None and not isinstance(
+            semantic_capabilities, SemanticRuntimeCapabilities
+        ):
+            raise TypeError("semantic_capabilities must be SemanticRuntimeCapabilities")
+        self.semantic_capabilities = (
+            semantic_capabilities or SemanticRuntimeCapabilities.stable()
+        )
+        try:
+            self.semantic_capabilities.validate()
+            self._semantic_rdf_codec = self.semantic_capabilities.create_rdf_codec()
+        except ValueError as exc:
+            raise ValueError("semantic runtime capability is unavailable") from exc
         # If backend is already a DatabaseBackend instance, use it directly
         if isinstance(backend, DatabaseBackend):
             self._backend = backend
@@ -1644,12 +1663,16 @@ class AsyncStorage:
             await self.initialize()
         from kestrel_sovereign.knowledge.maintenance import SemanticMaintenanceService
 
+        selected_capabilities = self._resolve_semantic_capabilities(
+            semantic_capabilities
+        )
         service = SemanticMaintenanceService(
             self._assertion_store(),
             inference_profile=inference_profile,
             inference_limits=inference_limits,
             limits=maintenance_limits,
-            semantic_capabilities=semantic_capabilities,
+            semantic_capabilities=selected_capabilities,
+            rdf_codec=self._semantic_rdf_codec,
         )
         if full_rebuild:
             return await service.rebuild()
@@ -1661,6 +1684,7 @@ class AsyncStorage:
         *,
         inference_limits=None,
         maintenance_limits=None,
+        semantic_capabilities=None,
         allow_prior_verified_snapshot: bool = False,
         expected_checkpoint=None,
     ):
@@ -1675,11 +1699,16 @@ class AsyncStorage:
             await self.initialize()
         from kestrel_sovereign.knowledge.maintenance import SemanticMaintenanceService
 
+        selected_capabilities = self._resolve_semantic_capabilities(
+            semantic_capabilities
+        )
         service = SemanticMaintenanceService(
             self._assertion_store(),
             inference_profile=inference_profile,
             inference_limits=inference_limits,
             limits=maintenance_limits,
+            semantic_capabilities=selected_capabilities,
+            rdf_codec=self._semantic_rdf_codec,
         )
         from kestrel_sovereign.storage.async_assertion_store import AssertionCheckpoint
 
@@ -1701,17 +1730,23 @@ class AsyncStorage:
         *,
         inference_limits=None,
         maintenance_limits=None,
+        semantic_capabilities=None,
     ):
         """Return the exact semantic capability pins used to verify a corpus."""
         if not self._initialized:
             await self.initialize()
         from kestrel_sovereign.knowledge.maintenance import SemanticMaintenanceService
 
+        selected_capabilities = self._resolve_semantic_capabilities(
+            semantic_capabilities
+        )
         service = SemanticMaintenanceService(
             self._assertion_store(),
             inference_profile=inference_profile,
             inference_limits=inference_limits,
             limits=maintenance_limits,
+            semantic_capabilities=selected_capabilities,
+            rdf_codec=self._semantic_rdf_codec,
         )
         return service.capability_versions()
 
@@ -1723,6 +1758,7 @@ class AsyncStorage:
         limits=None,
         inference_limits=None,
         maintenance_limits=None,
+        semantic_capabilities=None,
         prior_verified_snapshot=None,
         allow_prior_verified_snapshot: bool = False,
     ):
@@ -1742,6 +1778,9 @@ class AsyncStorage:
             limits=limits if limits is not None else GovernedCorpusLimits(),
             inference_limits=inference_limits,
             maintenance_limits=maintenance_limits,
+            semantic_capabilities=self._resolve_semantic_capabilities(
+                semantic_capabilities
+            ),
             prior_verified_snapshot=prior_verified_snapshot,
             allow_prior_verified_snapshot=allow_prior_verified_snapshot,
         )
@@ -1755,6 +1794,7 @@ class AsyncStorage:
         limits=None,
         inference_limits=None,
         maintenance_limits=None,
+        semantic_capabilities=None,
     ):
         """Read first-class governed additions/tombstones after a snapshot."""
         from kestrel_sovereign.knowledge.corpus import (
@@ -1769,6 +1809,9 @@ class AsyncStorage:
             limits=limits if limits is not None else GovernedCorpusLimits(),
             inference_limits=inference_limits,
             maintenance_limits=maintenance_limits,
+            semantic_capabilities=self._resolve_semantic_capabilities(
+                semantic_capabilities
+            ),
         )
 
     async def repair_semantic_maintenance(
@@ -1777,13 +1820,44 @@ class AsyncStorage:
         *,
         inference_limits=None,
         maintenance_limits=None,
+        semantic_capabilities=None,
     ):
         """Explicit full revalidation/rebuild using the normal maintenance service."""
         return await self.run_semantic_maintenance(
             inference_profile,
             inference_limits=inference_limits,
             maintenance_limits=maintenance_limits,
+            semantic_capabilities=semantic_capabilities,
             full_rebuild=True,
+        )
+
+    def _resolve_semantic_capabilities(self, supplied):
+        """Reject per-call semantic pin changes after agent boot.
+
+        A durable maintenance profile, training readiness, and corpus snapshot
+        must describe the exact same runtime.  Letting a feature override this
+        selection would make a draft profile appear ready under stable pins.
+        """
+        if supplied is None:
+            return self.semantic_capabilities
+        if supplied != self.semantic_capabilities:
+            raise ValueError(
+                "semantic capabilities must match the agent-bound storage runtime"
+            )
+        return supplied
+
+    def semantic_rdf_capability_report(self):
+        """Return the capabilities active in this storage-owned RDF runtime."""
+        return self._semantic_rdf_codec.capability_report
+
+    def semantic_sparql12_read_adapter(self, backend, decode_row, **kwargs):
+        """Build a draft read adapter from the agent-owned codec only.
+
+        The stable runtime fails closed inside the codec; callers cannot turn
+        on SPARQL 1.2 by attaching a query backend to a stable agent.
+        """
+        return self._semantic_rdf_codec.sparql12_read_adapter(
+            backend, decode_row, **kwargs
         )
 
     async def export_assertion_snapshot(self, query=None):

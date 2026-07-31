@@ -1081,6 +1081,15 @@ class SleepMixin:
                 semantic_capabilities = getattr(self, "semantic_capabilities", None)
                 if semantic_capabilities is not None:
                     maintenance_kwargs["semantic_capabilities"] = semantic_capabilities
+                    # Exercise the storage-owned RDF runtime on the real
+                    # ``!sleep`` path.  This prevents an agent config from
+                    # being represented only by maintenance diagnostics while
+                    # a different codec silently handles later graph reads.
+                    runtime_report = getattr(storage, "semantic_rdf_capability_report", None)
+                    if callable(runtime_report):
+                        active_runtime = runtime_report()
+                        if not semantic_capabilities.rdf_runtime_matches(active_runtime):
+                            raise RuntimeError("semantic_rdf_runtime_capability_mismatch")
                 result = await maintain(
                     profile,
                     **maintenance_kwargs,

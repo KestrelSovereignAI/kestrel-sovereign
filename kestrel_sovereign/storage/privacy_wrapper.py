@@ -1410,6 +1410,12 @@ class PrivacyEnforcingStorage:
             privacy_mode: Initial privacy mode (PrivacyMode, PrivacyConfig, or preset name)
         """
         self._storage = underlying_storage
+        # Preserve the agent-bound runtime identity for callers which need to
+        # pass it across an explicit governed boundary.  The raw storage still
+        # rejects a different per-call selection.
+        self.semantic_capabilities = getattr(
+            underlying_storage, "semantic_capabilities", None
+        )
         self._privacy_config = self._to_config(privacy_mode)
         self._policy = PrivacyPolicy.from_config(self._privacy_config)
         self._session_conversations: List[Dict] = []
@@ -3315,6 +3321,7 @@ class PrivacyEnforcingStorage:
         *,
         inference_limits=None,
         maintenance_limits=None,
+        semantic_capabilities=None,
         full_rebuild: bool = False,
     ):
         """Keep sleep maintenance behind the same durable privacy boundary."""
@@ -3324,6 +3331,7 @@ class PrivacyEnforcingStorage:
             inference_profile,
             inference_limits=inference_limits,
             maintenance_limits=maintenance_limits,
+            semantic_capabilities=semantic_capabilities,
             full_rebuild=full_rebuild,
         )
 
@@ -3333,6 +3341,7 @@ class PrivacyEnforcingStorage:
         *,
         inference_limits=None,
         maintenance_limits=None,
+        semantic_capabilities=None,
         allow_prior_verified_snapshot: bool = False,
         expected_checkpoint=None,
     ):
@@ -3342,6 +3351,7 @@ class PrivacyEnforcingStorage:
             inference_profile,
             inference_limits=inference_limits,
             maintenance_limits=maintenance_limits,
+            semantic_capabilities=semantic_capabilities,
             allow_prior_verified_snapshot=allow_prior_verified_snapshot,
             expected_checkpoint=expected_checkpoint,
         )
@@ -3352,12 +3362,26 @@ class PrivacyEnforcingStorage:
         *,
         inference_limits=None,
         maintenance_limits=None,
+        semantic_capabilities=None,
     ):
         self._assert_semantic_assertion_read_allowed("semantic maintenance status")
         return await self._storage.semantic_maintenance_capability_versions(
             inference_profile,
             inference_limits=inference_limits,
             maintenance_limits=maintenance_limits,
+            semantic_capabilities=semantic_capabilities,
+        )
+
+    def semantic_rdf_capability_report(self):
+        """Expose only the runtime's pinned RDF capability report."""
+        self._assert_semantic_assertion_read_allowed("semantic RDF runtime status")
+        return self._storage.semantic_rdf_capability_report()
+
+    def semantic_sparql12_read_adapter(self, backend, decode_row, **kwargs):
+        """Create a governed SPARQL 1.2 adapter from the bound runtime."""
+        self._assert_semantic_assertion_read_allowed("semantic SPARQL 1.2 read")
+        return self._storage.semantic_sparql12_read_adapter(
+            backend, decode_row, **kwargs
         )
 
     async def governed_assertion_corpus_snapshot(self, **kwargs):
@@ -3379,6 +3403,7 @@ class PrivacyEnforcingStorage:
         *,
         inference_limits=None,
         maintenance_limits=None,
+        semantic_capabilities=None,
     ):
         self._assert_semantic_assertion_read_allowed("semantic maintenance repair")
         self._assert_semantic_assertion_write_allowed("semantic maintenance repair")
@@ -3386,6 +3411,7 @@ class PrivacyEnforcingStorage:
             inference_profile,
             inference_limits=inference_limits,
             maintenance_limits=maintenance_limits,
+            semantic_capabilities=semantic_capabilities,
         )
 
     async def export_assertion_snapshot(self, query=None):

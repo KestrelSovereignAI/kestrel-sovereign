@@ -426,9 +426,25 @@ class GovernedCorpusStorage(Protocol):
 
     async def assertion_validation_statuses(self, assertions: Sequence[Assertion]) -> Mapping[str, CorpusValidationStatus]: ...
 
-    async def semantic_maintenance_training_readiness(self, inference_profile, *, inference_limits=None, maintenance_limits=None, allow_prior_verified_snapshot: bool = False, expected_checkpoint: CorpusCheckpoint | None = None) -> SemanticMaintenanceTrainingReadiness: ...
+    async def semantic_maintenance_training_readiness(
+        self,
+        inference_profile,
+        *,
+        inference_limits=None,
+        maintenance_limits=None,
+        semantic_capabilities=None,
+        allow_prior_verified_snapshot: bool = False,
+        expected_checkpoint: CorpusCheckpoint | None = None,
+    ) -> SemanticMaintenanceTrainingReadiness: ...
 
-    async def semantic_maintenance_capability_versions(self, inference_profile, *, inference_limits=None, maintenance_limits=None) -> Mapping[str, str]: ...
+    async def semantic_maintenance_capability_versions(
+        self,
+        inference_profile,
+        *,
+        inference_limits=None,
+        maintenance_limits=None,
+        semantic_capabilities=None,
+    ) -> Mapping[str, str]: ...
 
 
 class GovernedAssertionCorpusService:
@@ -445,6 +461,7 @@ class GovernedAssertionCorpusService:
         limits: GovernedCorpusLimits = GovernedCorpusLimits(),
         inference_limits=None,
         maintenance_limits=None,
+        semantic_capabilities=None,
         prior_verified_snapshot: GovernedCorpusSnapshot | None = None,
         allow_prior_verified_snapshot: bool = False,
     ) -> GovernedCorpusSnapshot:
@@ -458,6 +475,7 @@ class GovernedAssertionCorpusService:
                     limits=limits,
                     inference_limits=inference_limits,
                     maintenance_limits=maintenance_limits,
+                    semantic_capabilities=semantic_capabilities,
                     prior_verified_snapshot=prior_verified_snapshot,
                     allow_prior_verified_snapshot=allow_prior_verified_snapshot,
                 )
@@ -474,6 +492,7 @@ class GovernedAssertionCorpusService:
         limits: GovernedCorpusLimits,
         inference_limits=None,
         maintenance_limits=None,
+        semantic_capabilities=None,
         prior_verified_snapshot: GovernedCorpusSnapshot | None = None,
         allow_prior_verified_snapshot: bool = False,
     ) -> GovernedCorpusSnapshot:
@@ -493,12 +512,14 @@ class GovernedAssertionCorpusService:
             inference_profile,
             inference_limits=inference_limits,
             maintenance_limits=maintenance_limits,
+            semantic_capabilities=semantic_capabilities,
             expected_checkpoint=checkpoint,
         )
         capability_versions = dict(await self._storage.semantic_maintenance_capability_versions(
             inference_profile,
             inference_limits=inference_limits,
             maintenance_limits=maintenance_limits,
+            semantic_capabilities=semantic_capabilities,
         ))
         if capability_versions != dict(
             policy.accepted_semantic_capability_versions
@@ -549,6 +570,7 @@ class GovernedAssertionCorpusService:
         limits: GovernedCorpusLimits = GovernedCorpusLimits(),
         inference_limits=None,
         maintenance_limits=None,
+        semantic_capabilities=None,
     ) -> GovernedCorpusDelta:
         if not isinstance(limits, GovernedCorpusLimits):
             raise GovernedCorpusError("limits must be GovernedCorpusLimits")
@@ -561,6 +583,7 @@ class GovernedAssertionCorpusService:
                     limits=limits,
                     inference_limits=inference_limits,
                     maintenance_limits=maintenance_limits,
+                    semantic_capabilities=semantic_capabilities,
                 )
         except TimeoutError as error:
             raise GovernedCorpusBudgetExceeded(
@@ -576,6 +599,7 @@ class GovernedAssertionCorpusService:
         limits: GovernedCorpusLimits,
         inference_limits=None,
         maintenance_limits=None,
+        semantic_capabilities=None,
     ) -> GovernedCorpusDelta:
         if not isinstance(snapshot, GovernedCorpusSnapshot):
             raise GovernedCorpusError("snapshot must be GovernedCorpusSnapshot")
@@ -587,6 +611,7 @@ class GovernedAssertionCorpusService:
             inference_profile,
             inference_limits=inference_limits,
             maintenance_limits=maintenance_limits,
+            semantic_capabilities=semantic_capabilities,
             expected_checkpoint=head,
         )
         if not readiness.ready:
@@ -595,6 +620,7 @@ class GovernedAssertionCorpusService:
             inference_profile,
             inference_limits=inference_limits,
             maintenance_limits=maintenance_limits,
+            semantic_capabilities=semantic_capabilities,
         ))
         if dict(snapshot.capability_versions) != capability_versions:
             raise GovernedCorpusUnavailable("semantic_capability_versions_mismatch")
