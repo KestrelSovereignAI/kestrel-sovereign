@@ -48,6 +48,7 @@ from kestrel_sovereign.knowledge import (
 from kestrel_sovereign.knowledge.inference import ENGINE_VERSION, validate_inference_profile
 from kestrel_sovereign.storage.async_assertion_store import (
     AssertionConflictError,
+    AssertionCheckpoint,
     MaintenanceLeaseLostError,
 )
 from kestrel_sovereign.storage.semantic_validation import GovernedSemanticValidationService
@@ -1613,6 +1614,19 @@ async def test_training_readiness_rejects_historical_maintenance_without_snapsho
     service = SemanticMaintenanceService(assertion_store, inference_profile=None)
     assert (await service.run()).status is SemanticMaintenanceStatus.COMPLETE
     assert (await service.training_readiness()).ready
+    checkpoint = await assertion_store.event_checkpoint()
+    assert (
+        await service.training_readiness(expected_checkpoint=checkpoint)
+    ).ready
+    raced = await service.training_readiness(
+        expected_checkpoint=AssertionCheckpoint(
+            assertion_store.tenant_id,
+            checkpoint.generation + 1,
+            "event:concurrent-write",
+        )
+    )
+    assert not raced.ready
+    assert raced.reason == "semantic_maintenance_checkpoint_changed"
 
     await _put(
         assertion_store,

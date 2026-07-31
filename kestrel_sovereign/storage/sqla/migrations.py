@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 
 _SEMANTIC_ASSERTION_SCHEMA_VERSION = "semantic_assertion_store_v5"
-_SEMANTIC_VALIDATION_SCHEMA_VERSION = "semantic_validation_reports_v1"
+_SEMANTIC_VALIDATION_SCHEMA_VERSION = "semantic_validation_reports_v2_revision_links"
 _SEMANTIC_MAINTENANCE_SCHEMA_VERSION = "semantic_maintenance_v1"
 _SEMANTIC_MAINTENANCE_CURSOR_SCHEMA_VERSION = "semantic_maintenance_v2_cursor"
 _SEMANTIC_MAINTENANCE_REPAIR_CURSOR_SCHEMA_VERSION = "semantic_maintenance_v3_repair_cursor"
@@ -525,8 +525,16 @@ async def migrate_semantic_validation_reports(db: "AsyncDatabase") -> None:
             assertion_id TEXT NOT NULL,
             PRIMARY KEY (tenant_id, report_id, assertion_id)
         )""",
+        """CREATE TABLE IF NOT EXISTS semantic_validation_report_revisions (
+            tenant_id TEXT NOT NULL,
+            report_id TEXT NOT NULL,
+            assertion_id TEXT NOT NULL,
+            revision_id TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, report_id, assertion_id, revision_id)
+        )""",
         "CREATE INDEX IF NOT EXISTS idx_semantic_validation_report_tenant_time ON semantic_validation_reports(tenant_id, evaluated_at, report_id)",
         "CREATE INDEX IF NOT EXISTS idx_semantic_validation_report_assertion ON semantic_validation_report_assertions(tenant_id, assertion_id, report_id)",
+        "CREATE INDEX IF NOT EXISTS idx_semantic_validation_report_revision ON semantic_validation_report_revisions(tenant_id, assertion_id, revision_id, report_id)",
         "CREATE INDEX IF NOT EXISTS idx_semantic_validation_result_tenant_assertion ON semantic_validation_results(tenant_id, assertion_id, report_id)",
     )
     async with _semantic_validation_migration_transaction(db):

@@ -3221,6 +3221,14 @@ class PrivacyEnforcingStorage:
         self._assert_semantic_assertion_read_allowed("provenance reads")
         return await self._storage.list_assertion_sources(assertion_id)
 
+    async def list_assertion_revision_sources(self, revision_id):
+        self._assert_semantic_assertion_read_allowed("provenance reads")
+        return await self._storage.list_assertion_revision_sources(revision_id)
+
+    async def list_assertion_revision_sources_batch(self, revision_ids):
+        self._assert_semantic_assertion_read_allowed("provenance reads")
+        return await self._storage.list_assertion_revision_sources_batch(revision_ids)
+
     async def get_source_occurrence(self, source_occurrence_id):
         self._assert_semantic_assertion_read_allowed("provenance reads")
         return await self._storage.get_source_occurrence(source_occurrence_id)
@@ -3243,9 +3251,21 @@ class PrivacyEnforcingStorage:
         self._assert_semantic_assertion_incremental_read_allowed("checkpoint")
         return await self._storage.assertion_checkpoint()
 
+    async def assertion_event_checkpoint(self):
+        self._assert_semantic_assertion_incremental_read_allowed("event checkpoint")
+        return await self._storage.assertion_event_checkpoint()
+
     async def assertion_changes_since(self, generation, *, limit=100):
         self._assert_semantic_assertion_incremental_read_allowed("change reads")
         return await self._storage.assertion_changes_since(generation, limit=limit)
+
+    async def assertion_changes_after(self, checkpoint, *, limit=100):
+        self._assert_semantic_assertion_incremental_read_allowed("change reads")
+        return await self._storage.assertion_changes_after(checkpoint, limit=limit)
+
+    async def assertion_validation_statuses(self, assertions):
+        self._assert_semantic_assertion_read_allowed("validation status")
+        return await self._storage.assertion_validation_statuses(assertions)
 
     async def assertion_inference_inputs(self, query=None):
         self._assert_semantic_assertion_read_allowed("inference inputs")
@@ -3314,6 +3334,7 @@ class PrivacyEnforcingStorage:
         inference_limits=None,
         maintenance_limits=None,
         allow_prior_verified_snapshot: bool = False,
+        expected_checkpoint=None,
     ):
         """Read the training prerequisite without bypassing privacy policy."""
         self._assert_semantic_assertion_read_allowed("semantic maintenance status")
@@ -3322,6 +3343,34 @@ class PrivacyEnforcingStorage:
             inference_limits=inference_limits,
             maintenance_limits=maintenance_limits,
             allow_prior_verified_snapshot=allow_prior_verified_snapshot,
+            expected_checkpoint=expected_checkpoint,
+        )
+
+    async def semantic_maintenance_capability_versions(
+        self,
+        inference_profile,
+        *,
+        inference_limits=None,
+        maintenance_limits=None,
+    ):
+        self._assert_semantic_assertion_read_allowed("semantic maintenance status")
+        return await self._storage.semantic_maintenance_capability_versions(
+            inference_profile,
+            inference_limits=inference_limits,
+            maintenance_limits=maintenance_limits,
+        )
+
+    async def governed_assertion_corpus_snapshot(self, **kwargs):
+        """Expose the host corpus service through the normal privacy gate."""
+        self._assert_semantic_assertion_read_allowed("governed learning corpus")
+        return await self._storage.governed_assertion_corpus_snapshot(**kwargs)
+
+    async def governed_assertion_corpus_changes_since(self, snapshot, **kwargs):
+        self._assert_semantic_assertion_incremental_read_allowed(
+            "governed learning corpus"
+        )
+        return await self._storage.governed_assertion_corpus_changes_since(
+            snapshot, **kwargs
         )
 
     async def repair_semantic_maintenance(

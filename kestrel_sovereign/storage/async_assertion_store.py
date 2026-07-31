@@ -1073,6 +1073,59 @@ class AsyncAssertionStore:
         )
         return [SourceOccurrence.from_mapping(json.loads(row[0])) for row in rows]
 
+    async def list_revision_source_occurrences(
+        self, revision_id: str
+    ) -> list[SourceOccurrence]:
+        """Return only the exact source occurrences bound to one revision.
+
+        Assertion-wide provenance intentionally spans historical revisions for
+        audit. Corpus exports instead need the current revision's exact source
+        lineage so a superseded source cannot leak into a new example.
+        """
+        tenant_id, _ = self._require_scope()
+        rows = await self._database.fetchall(
+            "SELECT s.source_mapping, s.received_at, s.source_occurrence_id "
+            "FROM semantic_revision_sources rs "
+            "JOIN semantic_source_occurrences s ON s.tenant_id = rs.tenant_id "
+            "AND s.source_occurrence_id = rs.source_occurrence_id "
+            "WHERE rs.tenant_id = ? AND rs.revision_id = ? "
+            "ORDER BY s.received_at ASC, s.source_occurrence_id ASC",
+            (tenant_id, revision_id),
+        )
+        return [SourceOccurrence.from_mapping(json.loads(row[0])) for row in rows]
+
+    async def list_revision_source_occurrences_batch(
+        self, revision_ids: Sequence[str]
+    ) -> dict[str, list[SourceOccurrence]]:
+        """Return exact provenance for several revisions with one bounded query."""
+        tenant_id, _ = self._require_scope()
+        if isinstance(revision_ids, (str, bytes)):
+            raise AssertionStoreError("revision_ids must be a sequence of strings")
+        normalized = tuple(dict.fromkeys(revision_ids))
+        if not normalized:
+            return {}
+        if len(normalized) > 999:
+            raise AssertionStoreError("revision source batch is limited to 999 revisions")
+        if any(not isinstance(item, str) or not item for item in normalized):
+            raise AssertionStoreError("revision_ids must contain non-empty strings")
+        placeholders = ",".join("?" for _ in normalized)
+        rows = await self._database.fetchall(
+            "SELECT rs.revision_id, s.source_mapping, s.received_at, "
+            "s.source_occurrence_id FROM semantic_revision_sources rs "
+            "JOIN semantic_source_occurrences s ON s.tenant_id = rs.tenant_id "
+            "AND s.source_occurrence_id = rs.source_occurrence_id "
+            f"WHERE rs.tenant_id = ? AND rs.revision_id IN ({placeholders}) "
+            "ORDER BY rs.revision_id ASC, s.received_at ASC, "
+            "s.source_occurrence_id ASC",
+            (tenant_id, *normalized),
+        )
+        result = {revision_id: [] for revision_id in normalized}
+        for revision_id, source_mapping, _received_at, _source_id in rows:
+            result[revision_id].append(
+                SourceOccurrence.from_mapping(json.loads(source_mapping))
+            )
+        return result
+
     async def get_source_occurrence(self, source_occurrence_id: str) -> SourceOccurrence | None:
         """Read one immutable provenance record in the bound tenant only."""
         tenant_id, _ = self._require_scope()
@@ -1082,6 +1135,59 @@ class AsyncAssertionStore:
             (tenant_id, source_occurrence_id),
         )
         return SourceOccurrence.from_mapping(json.loads(row[0])) if row else None
+
+    async def validation_statuses(
+        self,
+        assertions: Sequence[Assertion],
+    ) -> dict[str, object]:
+        """Return SHACL dispositions bound to exact current revisions.
+
+        The public corpus contract owns the value type returned by this method;
+        importing it lazily avoids making canonical assertion persistence depend
+        on a learning-consumer module at import time.
+        """
+        if isinstance(assertions, (str, bytes)) or not isinstance(assertions, Sequence):
+            raise AssertionStoreError("assertions must be a sequence")
+        if any(not isinstance(item, Assertion) for item in assertions):
+            raise AssertionStoreError("assertions must contain Assertion values")
+        expected = {item.assertion_id: item.revision_id for item in assertions}
+        if len(expected) != len(assertions):
+            raise AssertionStoreError("assertions must not duplicate assertion_id")
+        resolved = tuple(sorted(expected))
+        if not resolved:
+            return {}
+        if len(resolved) > 1000 or any(not isinstance(value, str) or not value for value in resolved):
+            raise AssertionStoreError("assertion_ids must contain at most 1000 non-empty strings")
+        tenant_id, _ = self._require_scope()
+        rows = await self._database.fetchall(
+            "SELECT a.assertion_id, a.revision_id, r.state, r.action, r.shape_set_id, r.shape_set_version, "
+            "r.validation_profile_version "
+            "FROM semantic_validation_report_revisions a "
+            "JOIN semantic_validation_reports r ON r.tenant_id = a.tenant_id "
+            "AND r.report_id = a.report_id "
+            "WHERE a.tenant_id = ? "
+            f"AND a.assertion_id IN ({_placeholders(resolved)}) "
+            "ORDER BY a.assertion_id ASC, r.evaluated_at DESC, r.report_id DESC",
+            (tenant_id,) + resolved,
+        )
+        from kestrel_sovereign.knowledge.corpus import CorpusValidationStatus
+        from kestrel_sovereign.knowledge.shacl_validation import (
+            ValidationState,
+            ValidationWriteAction,
+        )
+
+        result: dict[str, object] = {}
+        for assertion_id, revision_id, state, action, shape_id, shape_version, profile_version in rows:
+            key = str(assertion_id)
+            if key not in result and expected.get(key) == str(revision_id):
+                result[key] = CorpusValidationStatus(
+                    ValidationState(str(state)),
+                    ValidationWriteAction(str(action)),
+                    str(shape_id),
+                    str(shape_version),
+                    str(profile_version),
+                )
+        return result
 
     async def derivation_inputs(self, revision_id: str) -> list[Assertion]:
         tenant_id, _ = self._require_scope()
@@ -2150,7 +2256,10 @@ class AsyncAssertionStore:
                 validation_report_id=report.report_id,
             )
             if replay is None:
-                await self._persist_validation_report_in_transaction(report)
+                await self._persist_validation_report_in_transaction(
+                    report,
+                    revision_bindings={assertion.assertion_id: assertion.revision_id},
+                )
             else:
                 await self._validation_report_from_receipt(replay)
             return written
@@ -2354,19 +2463,37 @@ class AsyncAssertionStore:
         self._validate_validation_report(report)
         return report
 
-    async def persist_validation_report(self, report: ShaclValidationReport) -> ShaclValidationReport:
+    async def persist_validation_report(
+        self,
+        report: ShaclValidationReport,
+        *,
+        expected_generation: int | None = None,
+        expected_revisions: Mapping[str, str] | None = None,
+    ) -> ShaclValidationReport:
         """Persist a tenant-bound report when no canonical write is pending."""
         self._validate_validation_report(report)
         # Validation reports are durable semantic state.  Reuse the canonical
         # mutation boundary so a maintenance-scoped revalidation verifies and
         # renews its fence in the very transaction that writes the report.
         async with self._mutation():
-            await self._persist_validation_report_in_transaction(report)
+            if (
+                expected_generation is not None
+                and await self._generation() != expected_generation
+            ):
+                raise AssertionConflictError(
+                    "validation generation changed before report persistence"
+                )
+            await self._persist_validation_report_in_transaction(
+                report,
+                revision_bindings=expected_revisions,
+            )
         return report
 
     async def _persist_validation_report_in_transaction(
         self,
         report: ShaclValidationReport,
+        *,
+        revision_bindings: Mapping[str, str] | None = None,
     ) -> None:
         """Write report rows in the caller's existing canonical transaction."""
         encoded = _json(report.to_mapping())
@@ -2405,15 +2532,42 @@ class AsyncAssertionStore:
                 encoded,
             ),
         )
-        report_assertion_ids = set(report.assertion_ids)
+        validation_targets = set(report.assertion_ids)
+        report_assertion_ids = set(validation_targets)
         for finding in report.findings:
             report_assertion_ids.update(finding.affected_assertion_ids)
+        normalized_bindings = dict(revision_bindings or {})
+        if revision_bindings is not None and not validation_targets.issubset(
+            normalized_bindings
+        ):
+            raise AssertionConflictError(
+                "validation report lacks exact revision bindings"
+            )
+        for assertion_id in validation_targets.intersection(normalized_bindings):
+            revision_id = normalized_bindings[assertion_id]
+            current = await self._current(assertion_id)
+            if current is None or current.revision_id != revision_id:
+                raise AssertionConflictError(
+                    "validation target revision changed before report persistence"
+                )
         for assertion_id in sorted(report_assertion_ids):
             await self._database.execute(
                 "INSERT INTO semantic_validation_report_assertions "
                 "(tenant_id, report_id, assertion_id) VALUES (?, ?, ?)",
                 (self.tenant_id, report.report_id, assertion_id),
             )
+            if assertion_id in normalized_bindings:
+                await self._database.execute(
+                    "INSERT INTO semantic_validation_report_revisions "
+                    "(tenant_id, report_id, assertion_id, revision_id) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        self.tenant_id,
+                        report.report_id,
+                        assertion_id,
+                        normalized_bindings[assertion_id],
+                    ),
+                )
         for ordinal, finding in enumerate(report.findings):
             await self._database.execute(
                 "INSERT INTO semantic_validation_results "
@@ -2524,7 +2678,10 @@ class AsyncAssertionStore:
 
             # This is intentionally inside the same transaction as the CAS
             # fence and transitions.  A report never outlives a failed repair.
-            await self._persist_validation_report_in_transaction(report)
+            await self._persist_validation_report_in_transaction(
+                report,
+                revision_bindings=normalized_revisions,
+            )
             roots = tuple(current_by_assertion_id[assertion_id] for assertion_id in targets)
             root_revision_ids = {item.revision_id for item in roots}
             dependents = [
@@ -2658,7 +2815,12 @@ class AsyncAssertionStore:
                 validation_report_id=report.report_id,
             )
             if replay is None:
-                await self._persist_validation_report_in_transaction(report)
+                await self._persist_validation_report_in_transaction(
+                    report,
+                    revision_bindings={
+                        replacement.assertion_id: replacement.revision_id
+                    },
+                )
             else:
                 await self._validation_report_from_receipt(replay)
             return result
@@ -2693,7 +2855,12 @@ class AsyncAssertionStore:
                 validation_report_id=report.report_id,
             )
             if replay is None:
-                await self._persist_validation_report_in_transaction(report)
+                await self._persist_validation_report_in_transaction(
+                    report,
+                    revision_bindings={
+                        replacement.assertion_id: replacement.revision_id
+                    },
+                )
             else:
                 await self._validation_report_from_receipt(replay)
             return result
@@ -4697,6 +4864,11 @@ class AsyncAssertionStore:
             (tenant_id,) + report_ids,
         )
         await self._database.execute(
+            "DELETE FROM semantic_validation_report_revisions WHERE tenant_id = ? "
+            f"AND report_id IN ({_placeholders(report_ids)})",
+            (tenant_id,) + report_ids,
+        )
+        await self._database.execute(
             "DELETE FROM semantic_validation_report_assertions WHERE tenant_id = ? "
             f"AND report_id IN ({_placeholders(report_ids)})",
             (tenant_id,) + report_ids,
@@ -5425,6 +5597,30 @@ class AsyncAssertionStore:
             (tenant_id, tenant_id),
         )
         return AssertionCheckpoint(tenant_id, generation, row[0] if row else None)
+
+    async def event_checkpoint(
+        self, checkpoint: AssertionCheckpoint | None = None
+    ) -> AssertionCheckpoint:
+        """Normalize a raw generation to an exact replayable event cursor."""
+        tenant_id, _ = self._require_scope()
+        raw = checkpoint if checkpoint is not None else await self.checkpoint()
+        if not isinstance(raw, AssertionCheckpoint):
+            raise AssertionStoreError("event checkpoint requires AssertionCheckpoint")
+        if raw.tenant_id != tenant_id:
+            raise TenantIsolationError("event checkpoint tenant does not match bound store")
+        if raw.latest_event_id is None:
+            return raw
+        row = await self._database.fetchone(
+            "SELECT generation FROM semantic_projection_outbox "
+            "WHERE tenant_id = ? AND event_id = ? "
+            "UNION ALL "
+            "SELECT generation FROM semantic_projection_erasure_outbox "
+            "WHERE tenant_id = ? AND event_id = ? LIMIT 1",
+            (tenant_id, raw.latest_event_id, tenant_id, raw.latest_event_id),
+        )
+        if row is None:
+            raise AssertionStoreError("latest assertion event is unavailable")
+        return AssertionCheckpoint(tenant_id, int(row[0]), raw.latest_event_id)
 
     async def changes_since(self, generation: int, *, limit: int = 100) -> list[AssertionChange]:
         if type(generation) is not int or generation < 0:

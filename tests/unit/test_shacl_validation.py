@@ -517,7 +517,7 @@ async def test_accepted_assertion_and_validation_report_commit_or_roll_back_toge
         )
         assertion = _candidate_assertion("atomic-report-revision")
 
-        async def fail_report_write(_store, _report) -> None:
+        async def fail_report_write(_store, _report, **_kwargs) -> None:
             raise AssertionStoreError("forced report persistence failure")
 
         monkeypatch.setattr(
@@ -866,7 +866,7 @@ async def test_concurrent_sqlite_initializers_serialize_validation_schema_migrat
         # boundary without racing SQLite connection setup itself.
         await bootstrap.db.execute(
             "DELETE FROM semantic_schema_migrations WHERE version = ?",
-            ("semantic_validation_reports_v1",),
+            ("semantic_validation_reports_v2_revision_links",),
         )
     finally:
         await bootstrap.close()
@@ -884,9 +884,9 @@ async def test_concurrent_sqlite_initializers_serialize_validation_schema_migrat
         )
         rows = await storages[0].db.fetchall(
             "SELECT version FROM semantic_schema_migrations WHERE version = ?",
-            ("semantic_validation_reports_v1",),
+            ("semantic_validation_reports_v2_revision_links",),
         )
-        assert rows == [("semantic_validation_reports_v1",)]
+        assert rows == [("semantic_validation_reports_v2_revision_links",)]
     finally:
         await asyncio.gather(*(storage.close() for storage in storages))
 
@@ -946,6 +946,62 @@ async def test_revalidation_retries_on_cas_conflict_without_quarantining_a_newer
         revisions = await storage.list_assertion_revisions(original.assertion_id)
         assert revisions[-1].status.value == "quarantined"
         assert revisions[-1].supersedes_revision_id is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_conformant_revalidation_cannot_bind_to_a_newer_revision(monkeypatch) -> None:
+    storage = AsyncStorage(
+        ":memory:",
+        agent_id="did:example:tenant",
+        _assertion_tenant_capability=_issue_assertion_tenant_capability(
+            "did:example:tenant"
+        ),
+    )
+    await storage.initialize()
+    try:
+        original = _candidate_assertion("conformant-race-original")
+        replacement = _candidate_assertion(
+            "conformant-race-replacement",
+            source_id="conformant-race-source",
+        )
+        await storage.put_assertion(
+            original, source_occurrences=(_candidate_source(),)
+        )
+        service = GovernedSemanticValidationService(
+            storage._assertion_store(),
+            validator=GovernedShaclValidationService(_registry(CORE_SHAPES)),
+        )
+        persist = service.reports.persist
+        raced = False
+
+        async def supersede_before_report_persistence(report, **kwargs):
+            nonlocal raced
+            if not raced:
+                raced = True
+                await storage.supersede_assertion(
+                    original.revision_id,
+                    replacement,
+                    source_occurrences=(
+                        _candidate_source("conformant-race-source"),
+                    ),
+                )
+            return await persist(report, **kwargs)
+
+        monkeypatch.setattr(service.reports, "persist", supersede_before_report_persistence)
+
+        with pytest.raises(
+            SemanticValidationStoreError,
+            match="generation changed before report persistence",
+        ):
+            await service.validate_current(
+                shape_set=ShapeSetReference("test-shapes", "1.0.0"),
+                validation_capability="validation-profile:test-core",
+            )
+        assert (await storage.get_assertion(original.assertion_id)).revision_id == (
+            replacement.revision_id
+        )
     finally:
         await storage.close()
 

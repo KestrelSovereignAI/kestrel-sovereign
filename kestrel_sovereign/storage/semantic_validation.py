@@ -152,13 +152,23 @@ class AsyncSemanticValidationReportStore:
     def _database(self):
         return self._assertions._database
 
-    async def persist(self, report: ShaclValidationReport) -> ShaclValidationReport:
+    async def persist(
+        self,
+        report: ShaclValidationReport,
+        *,
+        expected_generation: int | None = None,
+        expected_revisions: Mapping[str, str] | None = None,
+    ) -> ShaclValidationReport:
         if not isinstance(report, ShaclValidationReport):
             raise SemanticValidationStoreError("persist requires a SHACL validation report")
         if report.tenant_id != self.tenant_id:
             raise SemanticValidationStoreError("validation report tenant does not match the bound assertion tenant")
         try:
-            return await self._assertions.persist_validation_report(report)
+            return await self._assertions.persist_validation_report(
+                report,
+                expected_generation=expected_generation,
+                expected_revisions=expected_revisions,
+            )
         except MaintenanceLeaseLostError:
             raise
         except AssertionStoreError as error:
@@ -288,6 +298,10 @@ class GovernedSemanticValidationService:
             data_graph, focus_map, affected_nodes = _canonical_validation_graph(
                 selected if bounded_focus_only else assertions, selected
             )
+            snapshot_revisions = {
+                assertion.assertion_id: assertion.revision_id
+                for assertion in (selected if bounded_focus_only else assertions)
+            }
             report = self._validator.validate(
                 data_graph,
                 tenant_id=self._assertions.tenant_id,
@@ -311,15 +325,19 @@ class GovernedSemanticValidationService:
             # unbounded shape context. Non-local shapes therefore defer rather
             # than quarantining an assertion from an incomplete graph.
             if bounded_focus_only and report.state is ValidationState.INCOMPLETE:
-                await self._reports.persist(report)
+                await self._reports.persist(
+                    report,
+                    expected_generation=checkpoint.generation,
+                    expected_revisions=snapshot_revisions,
+                )
                 return report
             if report.action is not ValidationWriteAction.QUARANTINE:
-                await self._reports.persist(report)
+                await self._reports.persist(
+                    report,
+                    expected_generation=checkpoint.generation,
+                    expected_revisions=snapshot_revisions,
+                )
                 return report
-            snapshot_revisions = {
-                assertion.assertion_id: assertion.revision_id
-                for assertion in (selected if bounded_focus_only else assertions)
-            }
             try:
                 await self._persist_and_quarantine_failed_current_assertions(
                     report,

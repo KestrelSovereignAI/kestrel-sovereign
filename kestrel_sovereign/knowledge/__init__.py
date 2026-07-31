@@ -50,6 +50,25 @@ from .assertion import (
     normalize_iri,
 )
 if TYPE_CHECKING:
+    from .corpus import (
+        CORPUS_SCHEMA_VERSION,
+        CorpusCheckpoint,
+        CorpusEligibilityDecision,
+        CorpusEligibilityReason,
+        CorpusValidationStatus,
+        GovernedAssertionCorpusService,
+        GovernedCorpusBudgetExceeded,
+        GovernedCorpusDelta,
+        GovernedCorpusError,
+        GovernedCorpusExample,
+        GovernedCorpusLimits,
+        GovernedCorpusObservability,
+        GovernedCorpusPolicy,
+        GovernedCorpusSnapshot,
+        GovernedCorpusStorage,
+        GovernedCorpusTombstone,
+        GovernedCorpusUnavailable,
+    )
     from .rdf_codec import (
         RdfAssertionCodec,
         RdfAssertionReadAdapter,
@@ -123,8 +142,13 @@ __all__ = [
     "EpistemicState",
     "ExperimentalCapabilityError",
     "BoundedInferenceService",
+    "CORPUS_SCHEMA_VERSION",
     "ClosureState",
     "ClosureStatus",
+    "CorpusCheckpoint",
+    "CorpusEligibilityDecision",
+    "CorpusEligibilityReason",
+    "CorpusValidationStatus",
     "DerivationExplanation",
     "IDENTITY_VERSION",
     "IRI",
@@ -178,6 +202,18 @@ __all__ = [
     "ResourceRequirement",
     "DEFAULT_SHACL_WRITE_POLICY",
     "GovernedShaclValidationService",
+    "GovernedAssertionCorpusService",
+    "GovernedCorpusBudgetExceeded",
+    "GovernedCorpusDelta",
+    "GovernedCorpusError",
+    "GovernedCorpusExample",
+    "GovernedCorpusLimits",
+    "GovernedCorpusObservability",
+    "GovernedCorpusPolicy",
+    "GovernedCorpusSnapshot",
+    "GovernedCorpusStorage",
+    "GovernedCorpusTombstone",
+    "GovernedCorpusUnavailable",
     "ShaclCapabilityUnavailable",
     "ShaclSnapshotMismatch",
     "ShaclValidationError",
@@ -319,6 +355,28 @@ _MAINTENANCE_EXPORTS = frozenset(
     }
 )
 
+_CORPUS_EXPORTS = frozenset(
+    {
+        "CORPUS_SCHEMA_VERSION",
+        "CorpusCheckpoint",
+        "CorpusEligibilityDecision",
+        "CorpusEligibilityReason",
+        "CorpusValidationStatus",
+        "GovernedAssertionCorpusService",
+        "GovernedCorpusBudgetExceeded",
+        "GovernedCorpusDelta",
+        "GovernedCorpusError",
+        "GovernedCorpusExample",
+        "GovernedCorpusLimits",
+        "GovernedCorpusObservability",
+        "GovernedCorpusPolicy",
+        "GovernedCorpusSnapshot",
+        "GovernedCorpusStorage",
+        "GovernedCorpusTombstone",
+        "GovernedCorpusUnavailable",
+    }
+)
+
 
 def __getattr__(name: str):
     """Lazily expose optional boundaries so registry CLI execution stays clean."""
@@ -334,6 +392,10 @@ def __getattr__(name: str):
         from . import maintenance
 
         return getattr(maintenance, name)
+    if name in _CORPUS_EXPORTS:
+        from . import corpus
+
+        return getattr(corpus, name)
     if name in _INFERENCE_EXPORTS:
         from . import inference
 

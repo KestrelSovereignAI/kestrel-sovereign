@@ -1187,6 +1187,7 @@ class SemanticMaintenanceService:
         self,
         *,
         allow_prior_verified_snapshot: bool = False,
+        expected_checkpoint: AssertionCheckpoint | None = None,
     ) -> SemanticMaintenanceTrainingReadiness:
         """Read whether a scheduled training consumer may use semantic data.
 
@@ -1207,7 +1208,19 @@ class SemanticMaintenanceService:
                 "prior verified snapshot consumption is unavailable until a durable "
                 "governed corpus snapshot exists"
             )
-        current = await self._event_checkpoint(await self._assertions.checkpoint())
+        raw_current = await self._assertions.checkpoint()
+        current = await self._event_checkpoint(raw_current)
+        if expected_checkpoint is not None:
+            if not isinstance(expected_checkpoint, AssertionCheckpoint):
+                raise SemanticMaintenanceError(
+                    "expected_checkpoint must be AssertionCheckpoint or null"
+                )
+            normalized_expected = await self._event_checkpoint(expected_checkpoint)
+            if not self._checkpoint_matches(current, normalized_expected):
+                return SemanticMaintenanceTrainingReadiness(
+                    False,
+                    "semantic_maintenance_checkpoint_changed",
+                )
         try:
             profile_key = _digest(self._capability_versions())
         except SemanticMaintenanceError:
@@ -1252,6 +1265,15 @@ class SemanticMaintenanceService:
         else:
             reason = "semantic_maintenance_checkpoint_behind"
         return SemanticMaintenanceTrainingReadiness(False, reason)
+
+    def capability_versions(self) -> dict[str, str]:
+        """Return the exact pins/budgets that define maintenance readiness.
+
+        A governed corpus stores this content-free identity alongside its
+        checkpoint, so consumers cannot reuse a snapshot after a shape,
+        ontology, rule, or maintenance-budget change.
+        """
+        return dict(self._capability_versions())
 
     async def _current_scan_page(
         self, cursor: str | None

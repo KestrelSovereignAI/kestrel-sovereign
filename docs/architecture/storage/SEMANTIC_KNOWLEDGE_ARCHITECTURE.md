@@ -455,6 +455,47 @@ and reached the selected acceptance state. Raw files, chunks, transcripts,
 embeddings, model weights, response text, labels, tool descriptions, ontology
 documents, shapes, and validation reports are **not knowledge by themselves**.
 
+### Governed learning-corpus capability
+
+`kestrel_sovereign.knowledge.corpus` is the public, backend-neutral contract
+for optional learning consumers. A consumer calls the host storage capability
+`governed_assertion_corpus_snapshot(...)` (and
+`governed_assertion_corpus_changes_since(...)` for incremental work); it never
+opens a SQLite file, receives a database connection, or reads `graph_nodes`.
+The result is an immutable, deterministically ordered snapshot containing the
+canonical assertion/revision, direct source occurrence or derivation lineage,
+validation disposition, ontology/shape/rule capability pins, content hash,
+and stable split key. Consumer-visible assertion content is governed output;
+the accompanying observability record contains only counts, policy hash,
+checkpoint generation, and snapshot hash.
+
+Every consumer supplies a non-permissive `GovernedCorpusPolicy` naming the
+accepted source classes, consent/release references, privacy classifications,
+visibility, grounding classes, epistemic states, and (where enabled) derived
+rule-profile versions. It also pins the accepted ontology artifacts and the
+complete semantic-maintenance capability map; initial and incremental reads
+reject a host whose active pins differ. The host admits only current,
+projection-eligible, conformant assertions. Derived assertions recursively
+govern every exact input revision and aggregate only the accepted direct-source
+lineage; a restricted, stale, unvalidated, or otherwise ineligible premise
+excludes the derived example. Size, traversal-depth, time, and count budgets
+fail closed rather than returning an unlabeled prefix. Incremental reads carry
+exact, event-generation-normalized checkpoints and return explicit
+operation-derived tombstones for
+lifecycle/eligibility withdrawal as well as additions. A page that does not
+reach the captured event watermark fails instead of advertising an undelivered
+checkpoint. Maintenance readiness is evaluated against the checkpoint captured
+before the corpus read, and final checkpoint equality closes the other side of
+that read fence. Validation evidence is linked to the exact canonical revision,
+so an older conformant report cannot authorize a superseding revision; legacy
+reports without that revision proof fail closed until revalidation. A prior
+snapshot is **not** currently reusable: an object retained
+by a consumer is not durable host-verifiable evidence, so the capability
+rejects that stale escape hatch until a persisted snapshot-manifest registry
+is introduced. Any future reuse policy must be explicit and verify matching
+policy/capability hashes through that host registry. This boundary creates no
+trainer, adapter, promotion, or weight-mutation path.
+
 ### Trusted semantic access capabilities
 
 An adapter may supply evidence and a requested claim, but it is not a tenancy,
