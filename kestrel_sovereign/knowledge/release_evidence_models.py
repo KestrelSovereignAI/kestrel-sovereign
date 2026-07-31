@@ -1291,6 +1291,8 @@ class SemanticBenchmarkHarness:
         operation: Callable[[], object | Awaitable[object]],
         *,
         storage_bytes: Callable[[], int | Awaitable[int]] | None = None,
+        before_sample: Callable[[], object | Awaitable[object]] | None = None,
+        after_sample: Callable[[], object | Awaitable[object]] | None = None,
     ) -> BenchmarkRun:
         if spec.performance_target is None or not callable(operation):
             raise ReleaseEvidenceError("benchmark requires a performance gate and callable operation")
@@ -1301,6 +1303,10 @@ class SemanticBenchmarkHarness:
             raise ReleaseEvidenceError("storage_bytes is valid only for a storage growth benchmark")
         samples: list[float | int] = []
         for _ in range(self.iterations):
+            if before_sample is not None:
+                prepared = before_sample()
+                if inspect.isawaitable(prepared):
+                    await prepared
             before_bytes = await self._storage_bytes(storage_bytes) if is_storage_growth else None
             started = time.perf_counter() if not is_storage_growth else None
             result = operation()
@@ -1319,6 +1325,10 @@ class SemanticBenchmarkHarness:
                 if elapsed <= 0:
                     elapsed = float.fromhex("0x1.0p-52")
                 samples.append(elapsed)
+            if after_sample is not None:
+                finalized = after_sample()
+                if inspect.isawaitable(finalized):
+                    await finalized
         return BenchmarkRun(
             target=spec.performance_target,
             samples=tuple(samples),

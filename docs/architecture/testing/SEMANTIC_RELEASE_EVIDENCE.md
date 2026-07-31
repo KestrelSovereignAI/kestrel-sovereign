@@ -76,10 +76,23 @@ observation, or artifact input and discards raw pytest output after reducing a
 temporary JUnit report to the catalog's aggregate schema. A skipped required
 PostgreSQL case is a failed record, never evidence from SQLite.
 
-Named semantic benchmarks and Kite HTTP workloads remain explicitly `blocked`
-with `catalog_workload_unavailable` until their dedicated production harnesses
-are registered. In particular, an in-process test run is not substituted for
-the stable, experimental, persisted-data, or correlated HTTP erasure drills.
+The immutable benchmark runner resolves every declared semantic-benchmark
+command. For `startup`, assertion write/validation, bounded inference, hybrid
+recall, storage growth, and representative migration it creates three fresh,
+agent-scoped `AsyncStorage` samples for the declared backend and emits a
+signed `ms` budget. Storage growth instead reads the actual backend footprint:
+the SQLite database plus active journal/WAL sidecars, or PostgreSQL database
+size; elapsed time is never relabeled as bytes. PostgreSQL runs require both
+`KESTREL_SEMANTIC_RELEASE_ISOLATED=1` and an operator-provided
+`KESTREL_SEMANTIC_RELEASE_ISOLATED_POSTGRES_DSN`, which must name a disposable
+test database. The DSN is never emitted. If either is absent, the workload
+writes a content-free nonzero block.
+
+Changed-work and unchanged-work sleep retain their catalog `kite_http` mode.
+They block with `kite_http_benchmark_runner_required` until the dedicated Kite
+HTTP runner measures them; an in-process maintenance call is not an allowed
+substitute. The stable, experimental, persisted-data, and correlated HTTP
+erasure drills likewise remain owned by their dedicated HTTP runners.
 `run` writes that content-free block but exits nonzero so automation cannot
 mistake an unavailable workload for successful execution; use the explicit
 `block` command to record an independently observed block. They cannot become

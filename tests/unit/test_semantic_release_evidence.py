@@ -878,8 +878,8 @@ def test_cli_run_blocks_a_kite_workload_until_its_dedicated_http_harness_exists(
     assert payload["execution_attestation"] is None
 
 
-def test_default_catalog_registers_real_core_pytest_contracts_but_not_kite_or_benchmarks() -> None:
-    """Only immutable core test nodes are executable from this runner."""
+def test_default_catalog_registers_real_core_contracts_but_not_kite_http_drills() -> None:
+    """Core test/benchmark runners remain distinct from real Kite HTTP work."""
     from kestrel_sovereign.knowledge.release_evidence_execution import (
         default_catalog_workloads,
     )
@@ -895,17 +895,112 @@ def test_default_catalog_registers_real_core_pytest_contracts_but_not_kite_or_be
         "postgres_assertion",
         "semantic_maintenance_diagnostics_contract",
         "legacy_fact_migration_equivalence",
+        "performance_hybrid_recall_sqlite_integration",
+        "performance_hybrid_recall_postgres_integration",
     ):
         spec = _gate(gate_id)
         assert (spec.runner.runner_id, spec.runner.command_id) in workloads
     for gate_id in (
-        "performance_hybrid_recall_sqlite_integration",
         "kite_http_stable_only_release_drill",
         "stable_persisted_data_no_canonical_migration_drill",
         "erasure_active_assertions",
     ):
         spec = _gate(gate_id)
         assert (spec.runner.runner_id, spec.runner.command_id) not in workloads
+
+
+def test_catalog_benchmark_runs_three_real_isolated_sqlite_startup_samples() -> None:
+    from kestrel_sovereign.knowledge.release_evidence_execution import (
+        CatalogExecutionAuthority,
+        default_catalog_workloads,
+    )
+
+    execution = asyncio.run(
+        CatalogExecutionAuthority(_CATALOG_TEST_IDENTITY, default_catalog_workloads()).execute(
+            _gate("performance_startup_sqlite_startup")
+        )
+    )
+
+    assert execution.record.passed
+    assert execution.budget is not None
+    assert len(execution.budget.samples) == 3
+    assert all(sample > 0 for sample in execution.budget.samples)
+
+
+@pytest.mark.parametrize(
+    "gate_id",
+    (
+        "performance_assertion_write_validation_sqlite_integration",
+        "performance_bounded_inference_sqlite_integration",
+        "performance_hybrid_recall_sqlite_integration",
+        "performance_storage_growth_sqlite_integration",
+        "performance_representative_migration_sqlite_integration",
+    ),
+)
+def test_catalog_benchmark_runs_real_isolated_sqlite_semantic_workload(gate_id: str) -> None:
+    from kestrel_sovereign.knowledge.release_evidence_execution import (
+        CatalogExecutionAuthority,
+        default_catalog_workloads,
+    )
+
+    execution = asyncio.run(
+        CatalogExecutionAuthority(_CATALOG_TEST_IDENTITY, default_catalog_workloads()).execute(
+            _gate(gate_id)
+        )
+    )
+
+    assert execution.record.passed
+    assert execution.budget is not None
+    assert len(execution.budget.samples) == 3
+    if _gate(gate_id).performance_target.unit == "bytes":
+        assert all(type(sample) is int and sample > 0 for sample in execution.budget.samples)
+    else:
+        assert all(sample > 0 for sample in execution.budget.samples)
+
+
+def test_catalog_benchmark_blocks_postgres_without_explicit_isolated_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kestrel_sovereign.knowledge.release_evidence_execution import (
+        CatalogExecutionAuthority,
+        default_catalog_workloads,
+    )
+
+    monkeypatch.delenv("KESTREL_SEMANTIC_RELEASE_ISOLATED", raising=False)
+    monkeypatch.delenv("KESTREL_SEMANTIC_RELEASE_ISOLATED_POSTGRES_DSN", raising=False)
+    execution = asyncio.run(
+        CatalogExecutionAuthority(_CATALOG_TEST_IDENTITY, default_catalog_workloads()).execute(
+            _gate("performance_startup_postgres_startup")
+        )
+    )
+
+    assert execution.record.state is EvidenceState.BLOCKED
+    assert execution.record.reason_code == "isolated_postgres_ack_required"
+
+
+@pytest.mark.parametrize(
+    "gate_id",
+    (
+        "performance_changed_work_sleep_sqlite_kite_http",
+        "performance_changed_work_sleep_postgres_kite_http",
+        "performance_unchanged_sleep_sqlite_kite_http",
+        "performance_unchanged_sleep_postgres_kite_http",
+    ),
+)
+def test_catalog_benchmark_refuses_to_relabel_inprocess_sleep_as_kite_http(gate_id: str) -> None:
+    from kestrel_sovereign.knowledge.release_evidence_execution import (
+        CatalogExecutionAuthority,
+        default_catalog_workloads,
+    )
+
+    execution = asyncio.run(
+        CatalogExecutionAuthority(_CATALOG_TEST_IDENTITY, default_catalog_workloads()).execute(
+            _gate(gate_id)
+        )
+    )
+
+    assert execution.record.state is EvidenceState.BLOCKED
+    assert execution.record.reason_code == "kite_http_benchmark_runner_required"
 
 
 def test_cli_run_executes_a_real_rdf_fixture_workload_without_recording_test_arguments(
