@@ -1381,10 +1381,12 @@ Before calling any P4 cutover or cleanup safe, generate the machine-checkable
 [Semantic Knowledge Release Evidence](../testing/SEMANTIC_RELEASE_EVIDENCE.md)
 artifact. It records the exact registry/profile pins, independent SQLite and
 PostgreSQL results, the erasure/projection drill, measured workload budgets,
-and the isolated HTTP invoke result. A compatibility path may remain in
-`retain` status during a release; only its **removal** requires observed
-no-consumer telemetry and migration equivalence. This prevents a rollback or
-cleanup decision from being inferred from code inspection alone.
+and the isolated HTTP invoke result through immutable gate-spec and artifact
+digests. A fresh template is `ready: false`; it does not claim that any of
+those runs happened. A compatibility path may remain in `retain` status during
+a release; only its **removal** requires a digest-bound telemetry window and
+the exact migration-equivalence result. This prevents a rollback or cleanup
+decision from being inferred from code inspection alone.
 
 ## Typed interfaces for follow-on tickets
 

@@ -1540,12 +1540,8 @@
     {
       "existing_code_refs": [
         "kestrel_sovereign/knowledge/release_evidence.py",
-        "tests/integration/test_storage_backend_parity.py",
-        "tests/unit/test_knowledge_rdf_codec.py",
-        "tests/unit/test_knowledge_registry.py",
-        "tests/unit/test_semantic_assertion_recall.py",
-        "tests/unit/test_semantic_inference.py",
-        "tests/unit/test_shacl_validation.py"
+        "tests/unit/test_semantic_release_evidence.py",
+        "tests/unit/test_sleep_observability.py"
       ],
       "findings": [],
       "missing_code_refs": [],

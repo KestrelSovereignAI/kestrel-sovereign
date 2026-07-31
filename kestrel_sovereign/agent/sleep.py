@@ -17,7 +17,6 @@ from collections.abc import Mapping
 import hashlib
 import json
 import logging
-import re
 from dataclasses import dataclass, field
 from enum import Enum
 import heapq
@@ -33,8 +32,7 @@ logger = logging.getLogger(__name__)
 _SEMANTIC_MAINTENANCE_SUMMARY_MAX_CHARS = 1_024
 _SEMANTIC_MAINTENANCE_MAX_RENDERED_NUMBER = 1_000_000_000
 _SEMANTIC_MAINTENANCE_CAPABILITY_VALUE_MAX_CHARS = 256
-_SEMANTIC_MAINTENANCE_VERSION_RE = re.compile(r"^v[0-9]+$")
-_SEMANTIC_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+_SEMANTIC_MAINTENANCE_CONTRACT_VERSION = "v3"
 _SEMANTIC_MAINTENANCE_CAPABILITY_KEYS = (
     "semantic_maintenance",
     "maintenance_budget",
@@ -166,10 +164,12 @@ def _semantic_maintenance_active_capabilities(value: Any) -> Tuple[str, ...]:
 
     The raw maintenance map is intentionally not trusted as a presentation
     surface: a feature or a malformed storage result must not inject source
-    text through an operational diagnostic.  Values are shown only when they
-    match a fixed version grammar or an exact, locally verified registry
-    resource/capability.  Everything else remains represented by the existing
-    digest line, which is useful for comparison without disclosure.
+    text through an operational diagnostic. Values are shown only when they
+    are the exact current maintenance contract value or resolve to an exact,
+    locally verified registry resource/capability. A version-shaped string is
+    never enough: ``v999`` and ``999.999.999`` are not evidence of an active
+    contract. Everything else remains represented by the existing digest line,
+    which is useful for comparison without disclosure.
     """
     if not isinstance(value, Mapping):
         return ()
@@ -179,54 +179,163 @@ def _semantic_maintenance_active_capabilities(value: Any) -> Tuple[str, ...]:
 
     active: List[str] = []
     maintenance = raw.get("semantic_maintenance")
-    if isinstance(maintenance, str) and _SEMANTIC_MAINTENANCE_VERSION_RE.fullmatch(
-        maintenance
-    ):
+    if maintenance == _SEMANTIC_MAINTENANCE_CONTRACT_VERSION:
         active.append(f"semantic_maintenance={maintenance}")
 
     try:
         from kestrel_sovereign.knowledge.registry import (
             KnowledgeRegistryError,
-            StandardsMaturity,
+            ResourceKind,
             get_knowledge_registry,
         )
 
         registry = get_knowledge_registry()
     except (KnowledgeRegistryError, OSError):
+        active.extend(
+            (
+                "inference_profile=unavailable"
+                if "inference_profile" in raw
+                else "inference_profile=omitted",
+                "ontology=unavailable" if "ontology" in raw else "ontology=omitted",
+            )
+        )
         return tuple(active)
 
-    stable_resources = tuple(
-        resource
-        for resource in registry.resources
-        if resource.maturity is StandardsMaturity.STABLE
-    )
-    stable_resource_keys = {
-        f"{resource.identifier}@{resource.version}" for resource in stable_resources
-    }
-    stable_capabilities = {
-        capability
-        for resource in stable_resources
-        for capability in resource.capabilities
-    }
+    resource_by_key = {resource.key: resource for resource in registry.resources}
     shape_set = raw.get("shape_set")
-    if isinstance(shape_set, str) and shape_set in stable_resource_keys:
-        active.append(f"shape_set={shape_set}")
-    validation_capability = raw.get("validation_capability")
     if (
-        isinstance(validation_capability, str)
-        and validation_capability in stable_capabilities
+        isinstance(shape_set, str)
+        and (shape := resource_by_key.get(shape_set)) is not None
+        and shape.kind is ResourceKind.SHAPE_SET
     ):
+        active.append(f"shape_set={shape_set}")
+
+    validation_profile = None
+    validation_capability = raw.get("validation_capability")
+    if isinstance(validation_capability, str):
+        try:
+            selected_validation = registry.select_capability(validation_capability)
+        except KnowledgeRegistryError:
+            selected_validation = None
+        if (
+            selected_validation is not None
+            and selected_validation.resource.kind is ResourceKind.VALIDATION_PROFILE
+        ):
+            validation_profile = selected_validation.resource
+    if validation_profile is not None:
         active.append(f"validation_capability={validation_capability}")
     validation_version = raw.get("validation_profile_version")
-    if validation_version == "registry-selected" or (
-        isinstance(validation_version, str)
-        and _SEMANTIC_VERSION_RE.fullmatch(validation_version)
+    if validation_profile is not None and (
+        validation_version == "registry-selected"
+        or validation_version == str(validation_profile.version)
     ):
         active.append(f"validation_profile_version={validation_version}")
+
     rule_profile = raw.get("rule_profile")
-    if isinstance(rule_profile, str) and _SEMANTIC_VERSION_RE.fullmatch(rule_profile):
+    rule_versions = _registered_rule_profile_versions(
+        rule_profile,
+        resource_by_key,
+        ResourceKind,
+    )
+    if rule_versions is not None:
         active.append(f"rule_profile={rule_profile}")
+
+    ontology = _registered_ontology(raw.get("ontology"), registry.resources, ResourceKind)
+    if ontology is not None:
+        active.append(f"ontology={ontology.key}")
+    elif "ontology" in raw:
+        active.append("ontology=unavailable")
+    else:
+        active.append("ontology=omitted")
+
+    profile_value = raw.get("inference_profile")
+    if "inference_profile" not in raw:
+        active.append("inference_profile=omitted")
+    elif _is_registered_inference_profile(
+        profile_value,
+        ontology=ontology,
+        rule_versions=rule_versions,
+        registry_contract=registry.contract_version,
+    ):
+        active.append(f"inference_profile={profile_value}")
+    else:
+        active.append("inference_profile=unavailable")
     return tuple(active)
+
+
+def _registered_rule_profile_versions(
+    value: Any,
+    resource_by_key: Mapping[str, Any],
+    resource_kind: Any,
+) -> Tuple[str, Optional[str]] | None:
+    """Resolve the exact compact rule-profile label emitted by the producer."""
+    if not isinstance(value, str):
+        return None
+    parts = value.split("+")
+    if len(parts) not in {1, 2}:
+        return None
+    expected_identifiers = ("rdfs-v1", "owl2rl-kestrel-v1")
+    versions: List[str] = []
+    for index, part in enumerate(parts):
+        identifier, separator, version = part.partition("@")
+        if not separator or identifier != expected_identifiers[index] or not version:
+            return None
+        resource = resource_by_key.get(f"{identifier}@{version}")
+        if (
+            resource is None
+            or resource.identifier != identifier
+            or resource.kind is not resource_kind.RULE_PROFILE
+        ):
+            return None
+        versions.append(str(resource.version))
+    canonical = f"rdfs-v1@{versions[0]}" + (
+        f"+owl2rl-kestrel-v1@{versions[1]}" if len(versions) == 2 else ""
+    )
+    if value != canonical:
+        return None
+    return versions[0], versions[1] if len(versions) == 2 else None
+
+
+def _registered_ontology(value: Any, resources: Any, resource_kind: Any):
+    """Return the local ontology behind the producer's namespace/version label."""
+    if not isinstance(value, str):
+        return None
+    matches = [
+        resource
+        for resource in resources
+        if resource.kind is resource_kind.ONTOLOGY
+        and value == f"{resource.namespace}@{resource.version}"
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _is_registered_inference_profile(
+    value: Any,
+    *,
+    ontology: Any,
+    rule_versions: Tuple[str, Optional[str]] | None,
+    registry_contract: str,
+) -> bool:
+    """Check the producer hash against exact local ontology/rule pins."""
+    if not isinstance(value, str) or ontology is None or rule_versions is None:
+        return False
+    try:
+        from kestrel_sovereign.knowledge.assertion import OntologyRef
+        from kestrel_sovereign.knowledge.inference import InferenceProfile
+
+        expected = InferenceProfile(
+            OntologyRef(
+                ontology.namespace,
+                str(ontology.version),
+                ontology.sha256,
+                registry_contract,
+            ),
+            rule_versions[0],
+            rule_versions[1],
+        ).key
+    except (TypeError, ValueError):
+        return False
+    return value == expected
 
 
 def _semantic_maintenance_repair_guidance(value: Any) -> str:

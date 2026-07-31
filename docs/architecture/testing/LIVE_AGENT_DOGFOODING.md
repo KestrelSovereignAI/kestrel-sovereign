@@ -179,9 +179,10 @@ packages:
 For a semantic-KB release, use the dedicated HTTP checks for recall,
 contradiction, quarantine, sleep, restart, and erasure in
 [Semantic Knowledge Release Evidence](SEMANTIC_RELEASE_EVIDENCE.md). Attach
-only the content-free command result and approved artifact reference to its
-release report; the live invoke transcript stays in the isolated evidence
-environment.
+only the catalog-bound, content-free aggregate observation and approved
+artifact reference/digest to its release report. The live invoke transcript
+stays in the isolated evidence environment; no arbitrary command line or raw
+response is a release record.
 
 ### Parallelizing
 
