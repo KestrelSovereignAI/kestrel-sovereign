@@ -1993,3 +1993,29 @@ async def migrate_canonical_session_ids(db: "AsyncDatabase") -> None:
             "from integer keys to marker UUIDs.",
             rewritten_history, remapped_titles,
         )
+
+
+async def migrate_legacy_graph_fact_migration_state(db: "AsyncDatabase") -> None:
+    """Install #2752's additive, tenant-scoped operator-run bookkeeping.
+
+    This deliberately creates no data migration and does not inspect or alter
+    ``graph_nodes``.  It is shared DDL for SQLite/PostgreSQL; the actual
+    migration remains an explicit call on agent-bound storage.
+    """
+    async with db.transaction():
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS legacy_fact_migration_records ("
+            "tenant_id TEXT NOT NULL, node_id TEXT NOT NULL, "
+            "content_hash TEXT NOT NULL, source_occurrence_id TEXT, "
+            "assertion_id TEXT, revision_id TEXT, outcome TEXT NOT NULL, "
+            "created_at TIMESTAMP NOT NULL, "
+            "PRIMARY KEY (tenant_id, node_id))",
+            (),
+        )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS legacy_fact_migration_checkpoints ("
+            "tenant_id TEXT NOT NULL, migration_name TEXT NOT NULL, "
+            "last_node_id TEXT, state TEXT NOT NULL, updated_at TIMESTAMP NOT NULL, "
+            "PRIMARY KEY (tenant_id, migration_name))",
+            (),
+        )

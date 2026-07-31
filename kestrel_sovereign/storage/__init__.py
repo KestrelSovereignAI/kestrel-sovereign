@@ -59,6 +59,15 @@ from .semantic_validation import (
     GovernedSemanticValidationService,
     SemanticValidationStoreError,
 )
+from .legacy_fact_migration import (
+    LEGACY_FACT_SHAPE,
+    MIGRATION_NAME as LEGACY_FACT_MIGRATION_NAME,
+    LegacyFactCandidate,
+    LegacyFactMigrationError,
+    LegacyGraphFactMigration,
+    MigrationPlan as LegacyFactMigrationPlan,
+    MigrationResult as LegacyFactMigrationResult,
+)
 from .agent_resource_store import (
     AgentResourceStore,
     AgentResourceVersion,
@@ -151,6 +160,13 @@ __all__ = [
     "ValidationQuarantineBatchResult",
     "ValidationQuarantineResult",
     "SemanticValidationStoreError",
+    "LEGACY_FACT_SHAPE",
+    "LEGACY_FACT_MIGRATION_NAME",
+    "LegacyFactCandidate",
+    "LegacyFactMigrationError",
+    "LegacyGraphFactMigration",
+    "LegacyFactMigrationPlan",
+    "LegacyFactMigrationResult",
     # Privacy
     "PrivacyEnforcingStorage",
     "PrivacyViolationError",

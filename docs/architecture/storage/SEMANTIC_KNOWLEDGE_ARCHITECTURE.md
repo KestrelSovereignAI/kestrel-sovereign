@@ -441,13 +441,55 @@ retroactively claim that current rows already meet this contract.
 | Current surface | Present owner and behavior | Semantic-layer treatment |
 |---|---|---|
 | `GraphNode` / `Edge` | `storage/async_graph_store.py`; `graph_nodes(node_id, node_type, label, properties)` and `graph_edges(source_id, target_id, label, properties)` with ownership ledgers | A property-graph **projection/input**. Stable existing non-fact nodes remain application resources. A legacy fact-shaped node is migrated only through an explicit adapter that emits a source occurrence and canonical assertion. |
-| `learned_fact` | `features/memory_agency/feature.py::save_fact` currently creates `fact:{agent}:{subject}:{predicate}`, stores `value`, `confidence`, `source`, and `saved_at`, and can overwrite a prior value for the same subject/predicate | A migration source for user-approved/direct assertions. The old node ID is neither the future assertion ID nor a revision ID. The adapter preserves it as a source locator; new writes go through `AssertionWriter`. |
+| Explicit fact teaching | `features/memory_agency/feature.py::save_fact` maps its small local vocabulary through `semantic_facts.py` and writes a governed canonical assertion | New teaching has no graph-node write path. Historical `node_type='fact'` rows are only a bounded migration input under the #2752 rules below. |
 | Saved items | `storage/saved_items_store.py` and `saved_items` support stashes, files, excerpts, and structured items with embedding search | Evidence artifacts or user-curated notes. They become knowledge only after an explicit extraction/approval creates assertions with item spans/digests as source occurrences. |
 | RAG files/chunks | `storage/async_rag_store.py`, `document_chunks`, BM25, and vector backends | Evidence retrieval, not a truth store. RAG text may support a source occurrence; search ranking cannot assert a claim. |
 | Conversation history | `storage/async_conversation_store.py`, privacy-gated `conversation_history` | A transcript/evidence artifact, not knowledge. User/agent/LLM text is at most `reported`/`hypothesis` evidence until an authorized assertion process accepts it. |
 | Cognitive memory and sleep | `storage/memory_system.py`, `memory_retriever.py`, `memory_consolidator.py`, and `agent/sleep.py` create episodes, patterns, archival states, and graph mirrors | Cognitive artifacts. Sleep may submit new/recomputed assertions and retraction/quarantine commands only through the typed writer; projection repair begins from its committed outbox events. It may not silently promote summaries, patterns, or LLM guesses to active assertions. |
 | Privacy wrapper | `storage/privacy_wrapper.py` blocks/redirects/redacts persistence by privacy mode | The semantic writer is behind the same boundary. A trusted resolver, not an adapter, supplies its tenant, ownership authorization, and effective privacy/deidentification decision before normalization, source retention, indexing, validation, inference, and export. |
 | Parametric self | Extracted `kestrel-feature-parametric-self`, registered in `feature_registry.toml`, runs as a sleep hook and owns a per-agent nightly-finetuned local model | It is an optional consumer. Its inputs are an explicit, policy-gated corpus export; its corpus manifest and weights are projections, never assertions or source-of-truth knowledge. |
+
+### Legacy graph-fact migration (#2752)
+
+`storage/legacy_fact_migration.py::LegacyGraphFactMigration` is the only
+implemented bridge from the old property graph to canonical assertions. It is
+an **operator-invoked, agent-bound** service: the running agent's authenticated
+`AsyncStorage` capability provides both the assertion tenant and the owner.
+It does not accept an `agent_id` argument and never trusts
+`graph_nodes.properties.agent_id`.
+
+The v1 eligible shape is intentionally closed:
+
+```text
+graph_nodes.node_type == "fact"
+graph_node_owners contains exactly one row, for the bound tenant
+properties = {subject: non-empty string, predicate: non-empty string,
+              value: non-empty string, created_at: aware ISO-8601 timestamp,
+              confidence?: decimal in [0, 1]}
+```
+
+The local subject/predicate are then passed to the same exact
+`map_legacy_fact()` mapping used by `save_fact`; unsupported terms, malformed
+JSON, missing time, invalid confidence, and shared/unowned rows are recorded
+as content-safe rejected outcomes. No label, edge, arbitrary JSON key, action,
+todo, identity, avatar, constitution, or feature-private node is converted.
+
+`plan()` provides a bounded dry-run inventory by tenant/status and only emits
+SHA-256 content hashes, never values. `run()` uses node-ID keyset pages and
+durable checkpoint records; a process failure before a checkpoint replays the
+same deterministic source occurrence and governed operation safely. Each
+proposal crosses `put_validated_assertion(..., ValidationSource.IMPORTED)`, so
+the normal SHACL acceptance/rejection path remains authoritative. Legacy rows
+are retained. `rollback()` is separately invoked and deletes only canonical
+assertions whose migration source occurrence exactly matches the recorded
+provenance; it never removes legacy graph content or audit records.
+
+Core has no semantic-assertion vector/index projection to rebuild. A
+feature-owned projection may supply its public invalidator to the runner; it
+receives only the bound tenant and accepted assertion IDs. The optional
+compatibility flag enables deterministic coverage metrics only—there is no
+dual-write and no application dual-read path. Its removal condition is zero
+unmigrated eligible rows plus operator review of every rejection class.
 
 An assertion can be knowledge only when it has passed the canonical writer's
 tenant/privacy/normalization checks, recorded source or derivation lineage,
