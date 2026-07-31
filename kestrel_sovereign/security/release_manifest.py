@@ -70,7 +70,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, List, Mapping, Optional
+from typing import Any, List, Mapping, Optional
 
 from kestrel_sovereign.security.crypto_suite import (
     ALG_SLH_DSA_SHA2_128S,
@@ -80,7 +80,6 @@ from kestrel_sovereign.security.crypto_suite import (
 )
 from kestrel_sovereign.security.multikey import (
     multibase_to_public_key,
-    public_key_to_multibase,
 )
 from kestrel_sovereign.security.verify_policy import (
     PolicyResult,

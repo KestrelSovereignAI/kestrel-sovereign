@@ -332,14 +332,18 @@ class OpenRouterAdapter(OpenAIAdapter):
                 supports_tools = "tools" in supported_params or "tool_choice" in supported_params
 
                 # Parse pricing (OpenRouter uses per-token pricing)
+                # #2814: neither local is read — ModelInfo has no pricing field,
+                # so this conversion is discarded and OpenRouter cost is never
+                # surfaced. Either wire pricing onto ModelInfo or drop the block;
+                # kept for now so the unfinished intent stays visible.
                 pricing = m.get("pricing", {})
                 # OpenRouter prices are strings like "0.00001" per token
                 try:
-                    input_price = float(pricing.get("prompt", "0")) * 1_000_000  # Convert to per-million
-                    output_price = float(pricing.get("completion", "0")) * 1_000_000
+                    input_price = float(pricing.get("prompt", "0")) * 1_000_000  # noqa: F841 - see #2814
+                    output_price = float(pricing.get("completion", "0")) * 1_000_000  # noqa: F841 - see #2814
                 except (ValueError, TypeError):
-                    input_price = 0.0
-                    output_price = 0.0
+                    input_price = 0.0  # noqa: F841 - see #2814
+                    output_price = 0.0  # noqa: F841 - see #2814
 
                 # Determine category
                 category = ModelCategory.CHAT

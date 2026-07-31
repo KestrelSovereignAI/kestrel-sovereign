@@ -86,10 +86,10 @@ import secrets
 import time
 from collections import deque
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Coroutine, List, Optional, Protocol
+from typing import Any, Callable, Coroutine, List, Optional, Protocol
 from zoneinfo import ZoneInfo
 
 from kestrel_sdk.signals import (
@@ -102,7 +102,6 @@ from kestrel_sdk.signals import (
     SignalResult,
     SourceRegistration,
     Status,
-    Urgency,
     Visibility,
 )
 from kestrel_sovereign.signals.constitution_canary import (
@@ -121,7 +120,7 @@ from kestrel_sovereign.storage.privacy_wrapper import (
     optional_transition_lock,
 )
 from kestrel_sovereign.signals.lock_manager import OrderedLockManager
-from kestrel_sovereign.signals.registry import RegistrationError, SourceRegistry
+from kestrel_sovereign.signals.registry import SourceRegistry
 from kestrel_sovereign.signals.durable import (
     FAILED,
     DurableConsumerRegistration,

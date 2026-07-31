@@ -659,25 +659,6 @@ class PostgresBackend(DatabaseBackend):
                 self._txn_conn_var.reset(token)
 
     @asynccontextmanager
-    async def advisory_lock(self, namespace: int, key: int) -> AsyncIterator[None]:
-        """Hold a session-scoped PostgreSQL advisory lock on one connection.
-
-        Transaction-scoped advisory locks are ideal for short schema and row
-        transitions. Long-running work must not keep a database transaction
-        (or its row locks) open, though. This primitive leases a connection
-        from a dedicated bounded PostgreSQL pool for the caller's critical
-        section, so a waiting effect gate cannot exhaust the operational query
-        pool or create unbounded direct connections.
-
-        ``namespace`` and ``key`` are signed 32-bit values, matching
-        PostgreSQL's two-int advisory-lock form.  The caller owns the lock
-        naming scheme; this backend deliberately supplies only the safe
-        connection lifetime.
-        """
-        async with self.advisory_locks(((namespace, key),)):
-            yield
-
-    @asynccontextmanager
     async def advisory_locks(
         self, keys: Sequence[Tuple[int, int]], *, shared: bool = False
     ) -> AsyncIterator[None]:

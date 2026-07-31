@@ -7,7 +7,6 @@ Adapter for Google's Gemini API with support for:
 - Streaming responses
 - API-based model discovery
 """
-import json
 import logging
 import os
 from typing import Any, Dict, List, Optional, Union, AsyncIterator

@@ -13,9 +13,8 @@ import logging
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
-import uuid
 
-from .memory_models import TemporalPattern, MemoryMetadata
+from .memory_models import TemporalPattern
 from .async_database import AsyncDatabase
 
 logger = logging.getLogger(__name__)

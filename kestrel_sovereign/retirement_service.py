@@ -25,7 +25,7 @@ from typing import Optional
 from dataclasses import dataclass
 import asyncio
 
-from kestrel_sovereign.storage import AsyncStorage, GraphNode, Edge
+from kestrel_sovereign.storage import GraphNode
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore
 

@@ -13,12 +13,11 @@ conversation history to extract:
 
 Phase 2 of Issue #23: Substrate-Independent Agent Portability.
 """
-import json
 import logging
 import re
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Tuple, TYPE_CHECKING
 
 from kestrel_sovereign.agent.context_builder import extract_raw_user_content
 

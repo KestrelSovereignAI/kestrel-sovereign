@@ -240,18 +240,6 @@ class CliFeature(Feature):
         )
 
 
-def _command_data(result: Any) -> dict[str, Any]:
-    return {
-        "argv": result.argv,
-        "risk": CliRisk.READ_ONLY.value,
-        "returncode": result.returncode,
-        "stdout": result.redacted_stdout,
-        "stderr": result.redacted_stderr,
-        "duration_ms": result.duration_ms,
-        "timed_out": result.timed_out,
-    }
-
-
 def _approval_argv_summary(argv: list[Any]) -> list[str]:
     """Return an approval-safe argv preview without positional values."""
 

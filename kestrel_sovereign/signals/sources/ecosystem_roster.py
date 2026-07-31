@@ -27,7 +27,7 @@ coordinator's ``scan_stale_work``) is responsible for fetching that universe.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
 # Repos whose slug contains this marker are never included in an ecosystem
@@ -140,10 +140,6 @@ class RosterExpansion:
     repos: tuple[str, ...] = ()
     failures: tuple[dict[str, str], ...] = ()
     excluded: tuple[str, ...] = ()
-
-    @property
-    def has_failures(self) -> bool:
-        return bool(self.failures)
 
 
 def _org_of(slug: str) -> str:

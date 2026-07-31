@@ -25,7 +25,7 @@ import warnings
 from contextlib import asynccontextmanager, contextmanager
 
 from kestrel_sovereign.storage.session_grouping import summarize_sessions
-from typing import Dict, List, Optional, Any, Tuple, TYPE_CHECKING, Union
+from typing import Dict, List, Optional, Any, Tuple, Union
 from enum import Enum
 from dataclasses import dataclass
 

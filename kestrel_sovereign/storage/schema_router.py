@@ -23,7 +23,6 @@ skip routing entirely because the underlying storage shouldn't exist.
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import re
 import uuid

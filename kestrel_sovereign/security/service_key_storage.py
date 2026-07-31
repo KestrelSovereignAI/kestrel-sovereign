@@ -8,12 +8,11 @@ Every stored key belongs to an agent. No agent = no storage.
 """
 import base64
 import hashlib
-import json
 import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, List, Optional, TYPE_CHECKING
 
 from kestrel_sovereign.security.agent_encryption import encrypt
 from kestrel_sovereign.security.legacy_decrypt import (
@@ -21,9 +20,7 @@ from kestrel_sovereign.security.legacy_decrypt import (
 )
 from kestrel_sovereign.security.exceptions import (
     KeyStorageError,
-    KeyNotFoundError,
     KeyNotConfiguredError,
-    DecryptionError,
 )
 from kestrel_sovereign.storage.db.interface import QueryError
 

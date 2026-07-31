@@ -44,7 +44,6 @@ this helper.
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM

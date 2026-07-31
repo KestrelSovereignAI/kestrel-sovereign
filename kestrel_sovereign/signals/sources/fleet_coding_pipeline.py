@@ -94,7 +94,7 @@ re-verified), and otherwise resolves and polls the dispatched PR's head CI.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from kestrel_sdk.signals import (
     RateLimit,

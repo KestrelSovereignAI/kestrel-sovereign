@@ -18,8 +18,6 @@ For uncensored generation, download weights and use with RunPod or Vast.ai.
 """
 
 import asyncio
-import base64
-import hashlib
 import io
 import logging
 import os
@@ -46,15 +44,12 @@ from ..types import (
     ProviderCapabilities,
 )
 from ..protocol import (
-    TrainingProviderError,
     ProviderNotAvailableError,
-    TrainingSubmissionError,
     DownloadError,
 )
 from kestrel_sovereign.kestrel_config.constants import (
     HTTP_TIMEOUT_DOWNLOAD,
 )
-from kestrel_sovereign.kestrel_config.defaults import get_lighthouse_gateway_url
 
 logger = logging.getLogger(__name__)
 

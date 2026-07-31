@@ -1474,7 +1474,6 @@ class BoundedInferenceService:
             if len(page) < page_size:
                 return retracted
             cursor = next_cursor
-        return retracted
 
     async def _persist_facts(
         self,

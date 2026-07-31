@@ -1,6 +1,6 @@
 from .adapter import LLMAdapter
 from kestrel_sdk.llm import ProviderCapabilities, ToolStreamingMode
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 import logging
 
 logger = logging.getLogger(__name__)

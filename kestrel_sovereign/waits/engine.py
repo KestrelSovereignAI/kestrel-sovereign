@@ -25,7 +25,7 @@ import logging
 import time
 from typing import Dict, List, Optional, Tuple
 
-from kestrel_sdk.tools import Outcome, ToolResult, WaitStatus, Waitable
+from kestrel_sdk.tools import Outcome, ToolResult, Waitable
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +113,6 @@ async def run_wait_loop(
         )
 
     start = time.monotonic()
-    last: Optional[WaitStatus] = None
     while True:
         try:
             status = await provider.poll(handle)
@@ -123,7 +122,6 @@ async def run_wait_loop(
                 f"wait on {label} failed: {exc}",
                 data={"ref": label, "waited_seconds": int(time.monotonic() - start)},
             )
-        last = status
         elapsed = int(time.monotonic() - start)
 
         if status.outcome.is_terminal():

@@ -1,5 +1,5 @@
 """Caller context for threading authentication identity into agent operations."""
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 

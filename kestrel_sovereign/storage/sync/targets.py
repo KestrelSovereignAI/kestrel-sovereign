@@ -113,16 +113,6 @@ class SyncTarget(ABC):
         """Trust level of this target. Override in subclasses."""
         return TrustTier.EXPEDIENT
 
-    @property
-    def tier_state(self) -> TierState:
-        """Operational state of this target."""
-        return TierState.ACTIVE
-
-    @property
-    def tier_label(self) -> str:
-        """Honest operator-facing label for this target's trust tier."""
-        return TIER_LABELS.get(self.trust_tier, self.trust_tier.name.lower())
-
     @abstractmethod
     async def sync_snapshot(self, db_path: Path) -> SyncResult:
         """

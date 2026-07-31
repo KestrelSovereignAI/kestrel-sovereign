@@ -4,7 +4,7 @@ State of Mind Feature
 Provides the !state-of-mind command to inspect constitutional governance mode.
 """
 import logging
-from typing import Any, Optional
+from typing import Any
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult

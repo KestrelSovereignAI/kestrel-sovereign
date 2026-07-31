@@ -43,7 +43,7 @@ import asyncio
 import json
 import logging
 import struct
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .encryption import (

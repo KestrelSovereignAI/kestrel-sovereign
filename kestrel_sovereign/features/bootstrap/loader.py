@@ -286,7 +286,6 @@ class BootstrapLoader:
 
             for row in rows:
                 file_name = row[0]
-                file_path = row[1]
                 enabled = row[2]
 
                 if not enabled:

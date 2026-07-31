@@ -15,18 +15,24 @@ Usage:
 import asyncio
 import hashlib
 import logging
-import os
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from pathlib import Path
 from typing import Any, Coroutine, Dict, List, Optional
 
 from kestrel_sdk.security.aead import AEADCipher
 
 from kestrel_sovereign.sql_utils import safe_table_name, safe_column_name
-from kestrel_sovereign.security.encryption import DecryptionError, get_fernet, _read_key_from_file
+from kestrel_sovereign.security.encryption import (
+    # get_fernet is not called in this module's own code: it is a patch seam.
+    # tests/unit/test_key_rotation.py does
+    # ``monkeypatch.setattr(key_rotation, "get_fernet", ...)``, which needs the
+    # name bound here. The redundant alias marks it as intentional so an
+    # unused-import sweep cannot strip it.
+    get_fernet as get_fernet,
+    _read_key_from_file,
+)
 
 logger = logging.getLogger(__name__)
 

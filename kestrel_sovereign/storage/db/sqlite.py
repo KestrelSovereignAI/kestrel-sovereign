@@ -9,7 +9,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator, List, Optional, Sequence
+from typing import Any, AsyncIterator, List, Optional
 
 import aiosqlite
 

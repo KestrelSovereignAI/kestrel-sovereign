@@ -11,7 +11,7 @@ External packages register search providers via entry_points::
 """
 
 import logging
-from typing import Dict, Any, List, Optional, Type
+from typing import Dict, Any, List, Optional
 
 from kestrel_sovereign.entrypoints import discover_entry_point_classes
 from .base import SearchProvider

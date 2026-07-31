@@ -1161,12 +1161,6 @@ class AsyncStorage:
             explicit_fact_selector=explicit_fact_selector,
         )
 
-    async def _replay_delete_assertion_operation(self, operation_id: str):
-        """Read one exact canonical deletion receipt without mutating state."""
-        if not self._initialized:
-            await self.initialize()
-        return await self._assertion_store().replay_delete_operation(operation_id)
-
     async def _replay_explicit_fact_forget_operation(
         self,
         operation_id: str,

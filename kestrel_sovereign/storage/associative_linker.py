@@ -10,10 +10,10 @@ Example: "Mom" triggers "Sunday calls", "Brooklyn", "her garden"
 import re
 import logging
 from dataclasses import dataclass
-from typing import List, Literal, Set, Dict, Any, Optional
+from typing import List, Literal, Set, Dict, Any
 from datetime import datetime, timezone
 
-from .async_graph_store import AsyncGraphStore, GraphNode, Edge
+from .async_graph_store import AsyncGraphStore, GraphNode
 
 logger = logging.getLogger(__name__)
 

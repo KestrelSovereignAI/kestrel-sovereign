@@ -141,12 +141,6 @@ class LLMInvocationContextState:
         while len(self._by_session) > self._MAX_TRACKED_SESSIONS:
             self._by_session.popitem(last=False)
 
-    def forget_session(self, session_id: Optional[str]) -> None:
-        """Drop the recorded identity for ``session_id`` (request teardown)."""
-
-        if session_id:
-            self._by_session.pop(session_id, None)
-
     def reset(self) -> None:
         """Clear the current task's ambient identity.
 
@@ -178,6 +172,13 @@ class LLMInvocationContextState:
 # Preserve the short-lived module API introduced with #2510 for callers that
 # use this helper directly.  LLMService deliberately never touches this state:
 # every service supplies its own ``ambient=...`` snapshot below.
+#
+# Retained through the dead-code sweep: no caller of ``set_ambient_invocation_context``
+# exists in this tree, the sibling repos, or the installed feature/channel/llm/SDK
+# packages, so this state is empty in every observable configuration. It stays
+# because the comment above declares it public for *direct* callers and this is a
+# published library — retiring a declared-public helper is an API decision, not a
+# dead-code cleanup, and belongs in its own change.
 _COMPATIBILITY_INVOCATION_CONTEXT_STATE = LLMInvocationContextState()
 
 

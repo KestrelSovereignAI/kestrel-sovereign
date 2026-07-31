@@ -25,7 +25,7 @@ Two shapes are available:
 
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 from .token_counter import TokenCounter, get_token_counter
 
