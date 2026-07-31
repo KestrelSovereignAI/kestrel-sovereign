@@ -67,10 +67,19 @@ assembled artifact is a release claim. Within that verifier policy,
 `catalog_runner` keys cannot attest that runner, and neither source can
 substitute for the other.
 
-At present, the built-in executable workload is
-`registry/stable_only_capability_selection_v1`. Other named pytest, benchmark,
-and Kite HTTP workloads remain explicitly `blocked` with
-`catalog_workload_unavailable` until their production harnesses are registered.
+The built-in executable workloads are the stable-only registry contract plus
+the catalog-bound core pytest contracts for advertised RDF/RDFS/OWL/SHACL/
+SPARQL fixtures, both declared backend-parity cases, maintenance diagnostics,
+and legacy-fact migration equivalence. Their selectors are source-declared in
+`release_evidence_workloads.py`; the runner accepts no selector, test argument,
+observation, or artifact input and discards raw pytest output after reducing a
+temporary JUnit report to the catalog's aggregate schema. A skipped required
+PostgreSQL case is a failed record, never evidence from SQLite.
+
+Named semantic benchmarks and Kite HTTP workloads remain explicitly `blocked`
+with `catalog_workload_unavailable` until their dedicated production harnesses
+are registered. In particular, an in-process test run is not substituted for
+the stable, experimental, persisted-data, or correlated HTTP erasure drills.
 `run` writes that content-free block but exits nonzero so automation cannot
 mistake an unavailable workload for successful execution; use the explicit
 `block` command to record an independently observed block. They cannot become

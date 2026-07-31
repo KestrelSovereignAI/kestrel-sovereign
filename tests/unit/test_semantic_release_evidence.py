@@ -851,8 +851,8 @@ def test_cli_run_executes_an_allowlisted_registry_workload_and_assemble_marks_it
     assert report_payload["structurally_complete"] is False
 
 
-def test_cli_run_blocks_an_unregistered_catalog_workload(tmp_path: Path) -> None:
-    spec = _gate("rdf11_projection_fixture")
+def test_cli_run_blocks_a_kite_workload_until_its_dedicated_http_harness_exists(tmp_path: Path) -> None:
+    spec = _gate("kite_http_stable_only_release_drill")
     key_file = tmp_path / "signing.key"
     _write_private_key(key_file, b"\x03" * 32)
     record = tmp_path / "record.json"
@@ -876,6 +876,66 @@ def test_cli_run_blocks_an_unregistered_catalog_workload(tmp_path: Path) -> None
     assert payload["state"] == "blocked"
     assert payload["reason_code"] == "catalog_workload_unavailable"
     assert payload["execution_attestation"] is None
+
+
+def test_default_catalog_registers_real_core_pytest_contracts_but_not_kite_or_benchmarks() -> None:
+    """Only immutable core test nodes are executable from this runner."""
+    from kestrel_sovereign.knowledge.release_evidence_execution import (
+        default_catalog_workloads,
+    )
+
+    workloads = default_catalog_workloads()
+    for gate_id in (
+        "rdf11_projection_fixture",
+        "rdfs11_inference_fixture",
+        "owl2rl_inference_fixture",
+        "shacl2017_core_fixture",
+        "sparql11_readonly_fixture",
+        "sqlite_assertion",
+        "postgres_assertion",
+        "semantic_maintenance_diagnostics_contract",
+        "legacy_fact_migration_equivalence",
+    ):
+        spec = _gate(gate_id)
+        assert (spec.runner.runner_id, spec.runner.command_id) in workloads
+    for gate_id in (
+        "performance_hybrid_recall_sqlite_integration",
+        "kite_http_stable_only_release_drill",
+        "stable_persisted_data_no_canonical_migration_drill",
+        "erasure_active_assertions",
+    ):
+        spec = _gate(gate_id)
+        assert (spec.runner.runner_id, spec.runner.command_id) not in workloads
+
+
+def test_cli_run_executes_a_real_rdf_fixture_workload_without_recording_test_arguments(
+    tmp_path: Path,
+) -> None:
+    key_file = tmp_path / "signing.key"
+    _write_private_key(key_file, b"\x08" * 32)
+    record = tmp_path / "rdf-record.json"
+
+    result = _cli(
+        "run",
+        "--gate",
+        "rdf11_projection_fixture",
+        "--signing-key-file",
+        str(key_file),
+        "--issuer-id",
+        "local_ci",
+        "--key-id",
+        "rdf_fixture_runner",
+        "--output",
+        str(record),
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(record.read_text(encoding="utf-8"))
+    assert payload["state"] == "passed"
+    assert payload["observation"] == {"assertion_count": 6, "case_count": 6}
+    encoded = json.dumps(payload)
+    assert "test_rdf11" not in encoded
+    assert "::" not in encoded
 
 
 def test_cli_block_explicitly_records_an_observed_block_with_success_status(tmp_path: Path) -> None:

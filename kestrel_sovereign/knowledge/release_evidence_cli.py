@@ -186,6 +186,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 # automation through a nonzero status after preserving its
                 # content-free blocked artifact.
                 return 2 if execution.record.reason_code == "catalog_workload_unavailable" else 1
+            if execution.record.state is EvidenceState.FAILED:
+                return 1
             return 0
         if args.command == "block":
             # Look up the gate so a typo cannot become a disconnected block file.

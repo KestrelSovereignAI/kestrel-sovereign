@@ -375,6 +375,12 @@ def default_catalog_workloads() -> dict[tuple[str, str], CatalogWorkload]:
 
         return CatalogWorkloadResult(observation=inspect_stable_only_capabilities())
 
-    return {
+    workloads: dict[tuple[str, str], CatalogWorkload] = {
         ("registry", "stable_only_capability_selection_v1"): stable_only_capability_selection,
     }
+    # Keep the resolver's public boundary here: the test runner owns no caller
+    # argv and exposes only reviewed, immutable catalog command IDs.
+    from .release_evidence_workloads import pytest_catalog_workloads
+
+    workloads.update(pytest_catalog_workloads())
+    return workloads
