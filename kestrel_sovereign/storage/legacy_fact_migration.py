@@ -823,8 +823,8 @@ class LegacyGraphFactMigration:
             if assertion_id is not None and outcome in {"migrated", "idempotent", "source_appended"}:
                 await db.execute(
                     "INSERT INTO legacy_fact_migration_invalidations "
-                    "(tenant_id, migration_name, assertion_id, state, created_at, delivered_at) "
-                    "VALUES (?, ?, ?, 'pending', ?, NULL) "
+                    "(tenant_id, migration_name, assertion_id, state, generation, created_at, delivered_at) "
+                    "VALUES (?, ?, ?, 'pending', 1, ?, NULL) "
                     "ON CONFLICT(tenant_id, migration_name, assertion_id) DO NOTHING",
                     (tenant_id, MIGRATION_NAME, assertion_id, datetime.now(timezone.utc).isoformat()),
                 )
@@ -840,7 +840,7 @@ class LegacyGraphFactMigration:
         async with db.transaction():
             await db.execute(
                 "UPDATE legacy_fact_migration_invalidations "
-                "SET state = 'pending', delivered_at = NULL "
+                "SET state = 'pending', generation = generation + 1, delivered_at = NULL "
                 "WHERE tenant_id = ? AND migration_name = ? AND assertion_id = ?",
                 (tenant_id, MIGRATION_NAME, assertion_id),
             )
@@ -858,31 +858,35 @@ class LegacyGraphFactMigration:
         delivered = False
         for _page in range(_MAX_INVALIDATION_PAGES):
             rows = await db.fetchall(
-                "SELECT assertion_id FROM legacy_fact_migration_invalidations "
+                "SELECT assertion_id, generation FROM legacy_fact_migration_invalidations "
                 "WHERE tenant_id = ? AND migration_name = ? AND state = 'pending' "
                 f"ORDER BY assertion_id ASC LIMIT {_INVALIDATION_PAGE_SIZE}",
                 (tenant_id, MIGRATION_NAME),
             )
             if not rows:
                 return delivered
-            assertion_ids = tuple(str(row[0]) for row in rows)
+            deliveries = tuple((str(row[0]), int(row[1])) for row in rows)
+            assertion_ids = tuple(assertion_id for assertion_id, _generation in deliveries)
             response = self._index_invalidator(tenant_id, assertion_ids)
             if hasattr(response, "__await__"):
                 await response
             async with db.transaction():
-                placeholders = ", ".join("?" for _ in assertion_ids)
-                await db.execute(
-                    "UPDATE legacy_fact_migration_invalidations "
-                    "SET state = 'delivered', delivered_at = ? "
-                    "WHERE tenant_id = ? AND migration_name = ? AND state = 'pending' "
-                    f"AND assertion_id IN ({placeholders})",
-                    (
-                        datetime.now(timezone.utc).isoformat(),
-                        tenant_id,
-                        MIGRATION_NAME,
-                        *assertion_ids,
-                    ),
-                )
+                delivered_at = datetime.now(timezone.utc).isoformat()
+                for assertion_id, generation in deliveries:
+                    await db.execute(
+                        "UPDATE legacy_fact_migration_invalidations "
+                        "SET state = 'delivered', delivered_at = ? "
+                        "WHERE tenant_id = ? AND migration_name = ? "
+                        "AND assertion_id = ? AND state = 'pending' "
+                        "AND generation = ?",
+                        (
+                            delivered_at,
+                            tenant_id,
+                            MIGRATION_NAME,
+                            assertion_id,
+                            generation,
+                        ),
+                    )
             delivered = True
         residual = await db.fetchone(
             "SELECT 1 FROM legacy_fact_migration_invalidations "

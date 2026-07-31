@@ -2023,7 +2023,30 @@ async def migrate_legacy_graph_fact_migration_state(db: "AsyncDatabase") -> None
             "CREATE TABLE IF NOT EXISTS legacy_fact_migration_invalidations ("
             "tenant_id TEXT NOT NULL, migration_name TEXT NOT NULL, "
             "assertion_id TEXT NOT NULL, state TEXT NOT NULL, "
+            "generation INTEGER NOT NULL DEFAULT 1, "
             "created_at TIMESTAMP NOT NULL, delivered_at TIMESTAMP, "
             "PRIMARY KEY (tenant_id, migration_name, assertion_id))",
             (),
         )
+        if db.backend_type == "postgres":
+            generation_column = await db.fetchone(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'legacy_fact_migration_invalidations' "
+                "AND column_name = 'generation'",
+                (),
+            )
+        else:
+            columns = await db.fetchall(
+                "PRAGMA table_info(legacy_fact_migration_invalidations)", ()
+            )
+            generation_column = next(
+                (column for column in columns if str(column[1]) == "generation"),
+                None,
+            )
+        if generation_column is None:
+            await db.execute(
+                "ALTER TABLE legacy_fact_migration_invalidations "
+                "ADD COLUMN generation INTEGER NOT NULL DEFAULT 1",
+                (),
+            )

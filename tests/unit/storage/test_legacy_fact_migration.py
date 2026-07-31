@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 import sys
@@ -29,7 +30,9 @@ TENANT = "did:example:legacy-facts"
 @pytest.mark.asyncio
 async def test_bookkeeping_schema_is_common_transactional_ddl_for_postgres():
     db = MagicMock()
+    db.backend_type = "postgres"
     db.execute = AsyncMock()
+    db.fetchone = AsyncMock(return_value=(1,))
 
     class Transaction:
         async def __aenter__(self):
@@ -200,6 +203,59 @@ async def test_feature_projection_invalidator_observes_only_accepted_assertions(
         assert rollback.index_invalidation_requested is True
         assert len(seen) == 2
     finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_invalidation_callback_cannot_ack_rollback_generation(tmp_path):
+    storage = await _storage(tmp_path)
+    callback_started = asyncio.Event()
+    release_stale_callback = asyncio.Event()
+    assertion_was_present: list[bool] = []
+    try:
+        await _node(
+            storage,
+            "fact-invalidation-race",
+            {
+                "subject": "user",
+                "predicate": "preferred_deploy_region",
+                "value": "generation-race",
+                "created_at": "2026-01-01T00:00:00+00:00",
+            },
+        )
+
+        async def invalidate(_tenant: str, assertion_ids: tuple[str, ...]) -> None:
+            assertion_was_present.append(
+                await storage.get_assertion(assertion_ids[0]) is not None
+            )
+            if len(assertion_was_present) == 1:
+                callback_started.set()
+                await release_stale_callback.wait()
+
+        migration = LegacyGraphFactMigration(
+            storage, index_invalidator=invalidate
+        )
+        run_task = asyncio.create_task(migration.run())
+        await callback_started.wait()
+
+        # Withdrawal advances the durable invalidation generation while the
+        # original assertion-present callback is still in flight.
+        rollback = await LegacyGraphFactMigration(storage).rollback()
+        assert rollback.index_invalidation_requested is False
+        release_stale_callback.set()
+        result = await run_task
+
+        assert result.index_invalidation_requested is True
+        assert assertion_was_present == [True, False]
+        assert storage.db is not None
+        receipt = await storage.db.fetchone(
+            "SELECT state, generation FROM legacy_fact_migration_invalidations "
+            "WHERE tenant_id = ?",
+            (TENANT,),
+        )
+        assert receipt == ("delivered", 2)
+    finally:
+        release_stale_callback.set()
         await storage.close()
 
 

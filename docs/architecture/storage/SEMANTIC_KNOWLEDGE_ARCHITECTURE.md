@@ -507,7 +507,9 @@ pages; a residual backlog after the invocation budget is surfaced as an error
 and remains pending for retry, never silently reported complete. A failure is
 retried by every later run, including one with no remaining graph pages.
 Canonical rollback re-opens that invalidation so projections observe the
-withdrawal as well. The optional compatibility
+withdrawal as well. Each requeue advances a durable generation; callback
+acknowledgement uses that generation as a compare-and-set token, so an older
+in-flight callback cannot acknowledge a newer rollback event. The optional compatibility
 flag enables deterministic coverage metrics only—there is no dual-write and no
 application dual-read path. Its removal condition is zero unmigrated eligible
 rows plus operator review of every rejection class. A bounded/truncated plan
