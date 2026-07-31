@@ -480,10 +480,16 @@ govern every exact input revision and aggregate only the accepted direct-source
 lineage; a restricted, stale, unvalidated, or otherwise ineligible premise
 excludes the derived example. Size, traversal-depth, time, and count budgets
 fail closed rather than returning an unlabeled prefix. Incremental reads carry
-exact event checkpoints and return explicit operation-derived tombstones for
+exact, event-generation-normalized checkpoints and return explicit
+operation-derived tombstones for
 lifecycle/eligibility withdrawal as well as additions. A page that does not
 reach the captured event watermark fails instead of advertising an undelivered
-checkpoint. A prior snapshot is **not** currently reusable: an object retained
+checkpoint. Maintenance readiness is evaluated against the checkpoint captured
+before the corpus read, and final checkpoint equality closes the other side of
+that read fence. Validation evidence is linked to the exact canonical revision,
+so an older conformant report cannot authorize a superseding revision; legacy
+reports without that revision proof fail closed until revalidation. A prior
+snapshot is **not** currently reusable: an object retained
 by a consumer is not durable host-verifiable evidence, so the capability
 rejects that stale escape hatch until a persisted snapshot-manifest registry
 is introduced. Any future reuse policy must be explicit and verify matching

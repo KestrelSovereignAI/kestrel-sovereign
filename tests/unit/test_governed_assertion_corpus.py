@@ -149,7 +149,7 @@ class _CorpusHost:
             for item in assertions
         }
 
-    async def assertion_checkpoint(self):
+    async def assertion_event_checkpoint(self):
         return self.checkpoint
 
     async def assertion_changes_after(self, checkpoint, *, limit=100):
@@ -175,10 +175,19 @@ class _CorpusHost:
     async def get_derivation_inputs(self, revision_id):
         return list(self.derivation_inputs.get(revision_id, ()))
 
-    async def assertion_validation_statuses(self, assertion_ids):
-        return {item: self.validations[item] for item in assertion_ids if item in self.validations}
+    async def assertion_validation_statuses(self, assertions):
+        return {
+            item.assertion_id: self.validations[item.assertion_id]
+            for item in assertions
+            if item.assertion_id in self.validations
+        }
 
     async def semantic_maintenance_training_readiness(self, *args, **kwargs):
+        expected_checkpoint = kwargs.get("expected_checkpoint")
+        if expected_checkpoint is not None and expected_checkpoint != self.checkpoint:
+            return SemanticMaintenanceTrainingReadiness(
+                False, "semantic_maintenance_checkpoint_changed"
+            )
         return self.ready
 
     async def semantic_maintenance_capability_versions(self, *args, **kwargs):
@@ -379,7 +388,7 @@ async def test_snapshot_rejects_a_lifecycle_change_during_assembly() -> None:
             super().__init__(assertions)
             self._checkpoint_reads = 0
 
-        async def assertion_checkpoint(self):
+        async def assertion_event_checkpoint(self):
             self._checkpoint_reads += 1
             if self._checkpoint_reads > 1:
                 return CorpusCheckpoint(TENANT, 8, "event:8")
@@ -389,6 +398,48 @@ async def test_snapshot_rejects_a_lifecycle_change_during_assembly() -> None:
         await GovernedAssertionCorpusService(_RacingHost([_assertion("racing")])).snapshot(
             policy=_policy(), inference_profile=None
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("incremental", [False, True])
+async def test_readiness_is_bound_to_checkpoint_captured_before_the_gate(
+    incremental: bool,
+) -> None:
+    assertion = _assertion("readiness-race")
+    stable_host = _CorpusHost([assertion])
+    snapshot = await GovernedAssertionCorpusService(stable_host).snapshot(
+        policy=_policy(), inference_profile=None
+    )
+
+    class _ReadinessRaceHost(_CorpusHost):
+        async def semantic_maintenance_training_readiness(self, *args, **kwargs):
+            # Reproduce a canonical write after the corpus captures its head
+            # but before readiness reads the maintenance state.
+            self.checkpoint = CorpusCheckpoint(TENANT, 8, "event:8")
+            return await super().semantic_maintenance_training_readiness(
+                *args, **kwargs
+            )
+
+    service = GovernedAssertionCorpusService(_ReadinessRaceHost([assertion]))
+    with pytest.raises(GovernedCorpusUnavailable, match="checkpoint_changed"):
+        if incremental:
+            await service.changes_since(
+                snapshot, policy=_policy(), inference_profile=None
+            )
+        else:
+            await service.snapshot(policy=_policy(), inference_profile=None)
+
+
+@pytest.mark.asyncio
+async def test_event_checkpoint_backend_failure_is_a_governed_error() -> None:
+    class _BrokenCheckpointHost(_CorpusHost):
+        async def assertion_event_checkpoint(self):
+            raise RuntimeError("missing event row")
+
+    with pytest.raises(GovernedCorpusUnavailable, match="event_checkpoint_unavailable"):
+        await GovernedAssertionCorpusService(
+            _BrokenCheckpointHost([_assertion("broken-checkpoint")])
+        ).snapshot(policy=_policy(), inference_profile=None)
 
 
 def test_public_contract_is_consumable_without_storage_or_graph_imports() -> None:

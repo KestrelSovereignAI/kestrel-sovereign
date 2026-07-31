@@ -1454,6 +1454,19 @@ class AsyncStorage:
             await self.initialize()
         return await self._assertion_store().checkpoint()
 
+    async def assertion_event_checkpoint(self):
+        """Return the exact event cursor used by governed corpus deltas."""
+        if not self._initialized:
+            await self.initialize()
+        from kestrel_sovereign.knowledge.corpus import CorpusCheckpoint
+
+        checkpoint = await self._assertion_store().event_checkpoint()
+        return CorpusCheckpoint(
+            checkpoint.tenant_id,
+            checkpoint.generation,
+            checkpoint.latest_event_id,
+        )
+
     async def assertion_changes_since(self, generation: int, *, limit: int = 100):
         if not self._initialized:
             await self.initialize()
@@ -1477,11 +1490,11 @@ class AsyncStorage:
             limit=limit,
         )
 
-    async def assertion_validation_statuses(self, assertion_ids):
+    async def assertion_validation_statuses(self, assertions):
         """Read privacy-safe validation dispositions for the governed corpus."""
         if not self._initialized:
             await self.initialize()
-        return await self._assertion_store().validation_statuses(assertion_ids)
+        return await self._assertion_store().validation_statuses(assertions)
 
     def semantic_validation_service(self):
         """Return the tenant-bound SHACL service for this canonical store."""
@@ -1626,6 +1639,7 @@ class AsyncStorage:
         inference_limits=None,
         maintenance_limits=None,
         allow_prior_verified_snapshot: bool = False,
+        expected_checkpoint=None,
     ):
         """Return the durable semantic prerequisite for scheduled training.
 
@@ -1644,8 +1658,18 @@ class AsyncStorage:
             inference_limits=inference_limits,
             limits=maintenance_limits,
         )
+        from kestrel_sovereign.storage.async_assertion_store import AssertionCheckpoint
+
+        bound_checkpoint = None
+        if expected_checkpoint is not None:
+            bound_checkpoint = AssertionCheckpoint(
+                expected_checkpoint.tenant_id,
+                expected_checkpoint.generation,
+                expected_checkpoint.latest_event_id,
+            )
         return await service.training_readiness(
-            allow_prior_verified_snapshot=allow_prior_verified_snapshot
+            allow_prior_verified_snapshot=allow_prior_verified_snapshot,
+            expected_checkpoint=bound_checkpoint,
         )
 
     async def semantic_maintenance_capability_versions(

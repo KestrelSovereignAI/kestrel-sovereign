@@ -3251,6 +3251,10 @@ class PrivacyEnforcingStorage:
         self._assert_semantic_assertion_incremental_read_allowed("checkpoint")
         return await self._storage.assertion_checkpoint()
 
+    async def assertion_event_checkpoint(self):
+        self._assert_semantic_assertion_incremental_read_allowed("event checkpoint")
+        return await self._storage.assertion_event_checkpoint()
+
     async def assertion_changes_since(self, generation, *, limit=100):
         self._assert_semantic_assertion_incremental_read_allowed("change reads")
         return await self._storage.assertion_changes_since(generation, limit=limit)
@@ -3259,9 +3263,9 @@ class PrivacyEnforcingStorage:
         self._assert_semantic_assertion_incremental_read_allowed("change reads")
         return await self._storage.assertion_changes_after(checkpoint, limit=limit)
 
-    async def assertion_validation_statuses(self, assertion_ids):
+    async def assertion_validation_statuses(self, assertions):
         self._assert_semantic_assertion_read_allowed("validation status")
-        return await self._storage.assertion_validation_statuses(assertion_ids)
+        return await self._storage.assertion_validation_statuses(assertions)
 
     async def assertion_inference_inputs(self, query=None):
         self._assert_semantic_assertion_read_allowed("inference inputs")
@@ -3330,6 +3334,7 @@ class PrivacyEnforcingStorage:
         inference_limits=None,
         maintenance_limits=None,
         allow_prior_verified_snapshot: bool = False,
+        expected_checkpoint=None,
     ):
         """Read the training prerequisite without bypassing privacy policy."""
         self._assert_semantic_assertion_read_allowed("semantic maintenance status")
@@ -3338,6 +3343,7 @@ class PrivacyEnforcingStorage:
             inference_limits=inference_limits,
             maintenance_limits=maintenance_limits,
             allow_prior_verified_snapshot=allow_prior_verified_snapshot,
+            expected_checkpoint=expected_checkpoint,
         )
 
     async def semantic_maintenance_capability_versions(

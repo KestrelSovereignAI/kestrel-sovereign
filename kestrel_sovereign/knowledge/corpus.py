@@ -412,7 +412,7 @@ class GovernedCorpusDelta:
 class GovernedCorpusStorage(Protocol):
     """Public host capability implemented by ``AsyncStorage`` and its privacy facade."""
 
-    async def assertion_checkpoint(self): ...
+    async def assertion_event_checkpoint(self) -> CorpusCheckpoint: ...
 
     async def assertion_changes_after(self, checkpoint, *, limit: int = 100): ...
 
@@ -424,9 +424,9 @@ class GovernedCorpusStorage(Protocol):
 
     async def list_assertion_revision_sources_batch(self, revision_ids: Sequence[str]) -> Mapping[str, Sequence[SourceOccurrence]]: ...
 
-    async def assertion_validation_statuses(self, assertion_ids: Sequence[str]) -> Mapping[str, CorpusValidationStatus]: ...
+    async def assertion_validation_statuses(self, assertions: Sequence[Assertion]) -> Mapping[str, CorpusValidationStatus]: ...
 
-    async def semantic_maintenance_training_readiness(self, inference_profile, *, inference_limits=None, maintenance_limits=None, allow_prior_verified_snapshot: bool = False) -> SemanticMaintenanceTrainingReadiness: ...
+    async def semantic_maintenance_training_readiness(self, inference_profile, *, inference_limits=None, maintenance_limits=None, allow_prior_verified_snapshot: bool = False, expected_checkpoint: CorpusCheckpoint | None = None) -> SemanticMaintenanceTrainingReadiness: ...
 
     async def semantic_maintenance_capability_versions(self, inference_profile, *, inference_limits=None, maintenance_limits=None) -> Mapping[str, str]: ...
 
@@ -488,10 +488,12 @@ class GovernedAssertionCorpusService:
                 "prior_verified_snapshot must be GovernedCorpusSnapshot or null"
             )
         started = monotonic()
+        checkpoint = await self._event_checkpoint()
         readiness = await self._storage.semantic_maintenance_training_readiness(
             inference_profile,
             inference_limits=inference_limits,
             maintenance_limits=maintenance_limits,
+            expected_checkpoint=checkpoint,
         )
         capability_versions = dict(await self._storage.semantic_maintenance_capability_versions(
             inference_profile,
@@ -517,7 +519,6 @@ class GovernedAssertionCorpusService:
             raise GovernedCorpusUnavailable(
                 readiness.reason or "semantic_maintenance_unverified"
             )
-        checkpoint = await self._storage.assertion_checkpoint()
         candidates = await self._storage.assertion_inference_inputs(
             AssertionQuery(limit=limits.max_assertions + 1)
         )
@@ -534,7 +535,7 @@ class GovernedAssertionCorpusService:
             limits=limits,
             started=started,
         )
-        final_checkpoint = await self._storage.assertion_checkpoint()
+        final_checkpoint = await self._event_checkpoint()
         if not self._same_checkpoint(checkpoint, final_checkpoint):
             raise GovernedCorpusUnavailable("semantic_checkpoint_changed_during_snapshot")
         return snapshot
@@ -581,10 +582,12 @@ class GovernedAssertionCorpusService:
         if snapshot.policy.digest != policy.digest:
             raise GovernedCorpusError("incremental reads require the same corpus policy")
         started = monotonic()
+        head = await self._event_checkpoint()
         readiness = await self._storage.semantic_maintenance_training_readiness(
             inference_profile,
             inference_limits=inference_limits,
             maintenance_limits=maintenance_limits,
+            expected_checkpoint=head,
         )
         if not readiness.ready:
             raise GovernedCorpusUnavailable(readiness.reason or "semantic_maintenance_unverified")
@@ -601,7 +604,6 @@ class GovernedAssertionCorpusService:
             raise GovernedCorpusUnavailable(
                 "semantic_capability_versions_mismatch"
             )
-        head = await self._storage.assertion_checkpoint()
         changes = await self._storage.assertion_changes_after(
             snapshot.checkpoint,
             limit=limits.max_assertions + 1,
@@ -654,7 +656,7 @@ class GovernedAssertionCorpusService:
             snapshot_hash=snapshot_hash, policy_digest=policy.digest,
             checkpoint_generation=head.generation,
         )
-        final_checkpoint = await self._storage.assertion_checkpoint()
+        final_checkpoint = await self._event_checkpoint()
         if not self._same_checkpoint(head, final_checkpoint):
             raise GovernedCorpusUnavailable("semantic_checkpoint_changed_during_incremental_read")
         return GovernedCorpusDelta(
@@ -691,8 +693,9 @@ class GovernedAssertionCorpusService:
 
     async def _examples(self, candidates, policy, limits, started) -> tuple[list[GovernedCorpusExample], dict[str, int]]:
         self._check_time(limits, started)
-        ids = tuple(assertion.assertion_id for assertion in candidates)
-        validations = dict(await self._storage.assertion_validation_statuses(ids))
+        validations = dict(
+            await self._storage.assertion_validation_statuses(tuple(candidates))
+        )
         direct_revision_ids = tuple(
             assertion.revision_id
             for assertion in candidates
@@ -808,19 +811,20 @@ class GovernedAssertionCorpusService:
             for item in inputs
         ):
             return CorpusEligibilityReason.DERIVATION_INPUT, ()
-        missing_validation_ids = tuple(
+        missing_validation_assertions = tuple(
             sorted(
-                {
-                    item.assertion_id
+                (
+                    item
                     for item in inputs
                     if item.assertion_id not in validation_cache
-                }
+                ),
+                key=lambda item: (item.assertion_id, item.revision_id),
             )
         )
-        if missing_validation_ids:
+        if missing_validation_assertions:
             validation_cache.update(
                 await self._storage.assertion_validation_statuses(
-                    missing_validation_ids
+                    missing_validation_assertions
                 )
             )
         missing_direct_sources = tuple(
@@ -931,6 +935,19 @@ class GovernedAssertionCorpusService:
     def _check_time(limits: GovernedCorpusLimits, started: float) -> None:
         if monotonic() - started > limits.max_wall_time_seconds:
             raise GovernedCorpusBudgetExceeded("max_wall_time_seconds exhausted")
+
+    async def _event_checkpoint(self) -> CorpusCheckpoint:
+        try:
+            checkpoint = await self._storage.assertion_event_checkpoint()
+        except Exception as error:
+            if isinstance(error, GovernedCorpusError):
+                raise
+            raise GovernedCorpusUnavailable(
+                "semantic_event_checkpoint_unavailable"
+            ) from error
+        if not isinstance(checkpoint, CorpusCheckpoint):
+            raise GovernedCorpusUnavailable("semantic_event_checkpoint_invalid")
+        return checkpoint
 
     @staticmethod
     def _same_checkpoint(left, right) -> bool:

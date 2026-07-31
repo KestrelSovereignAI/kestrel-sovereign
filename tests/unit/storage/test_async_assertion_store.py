@@ -193,12 +193,30 @@ async def test_assertion_crud_provenance_idempotency_and_checkpoint() -> None:
             assertion.revision_id: [source("source-1")],
             "missing-revision": [],
         }
-        validation = await store.assertion_validation_statuses([assertion.assertion_id])
+        validation = await store.assertion_validation_statuses([assertion])
         assert validation[assertion.assertion_id].state.value == "conforms"
         assert validation[assertion.assertion_id].action.value in {"accept", "accept-with-report"}
+        stale_report_candidate = replace(assertion, revision_id="revision-2")
+        assert await store.assertion_validation_statuses([stale_report_candidate]) == {}
+        await db.execute(
+            "DELETE FROM semantic_validation_report_revisions "
+            "WHERE tenant_id = ? AND revision_id = ?",
+            (TENANT, assertion.revision_id),
+        )
+        assert await store.assertion_validation_statuses([assertion]) == {}
         checkpoint = await store.assertion_checkpoint()
         assert checkpoint.generation == 1
         assert checkpoint.latest_event_id == written.event_id
+        await db.execute(
+            "UPDATE semantic_assertion_tenants SET generation = generation + 1 "
+            "WHERE tenant_id = ?",
+            (TENANT,),
+        )
+        raw_after_proof_advance = await store.assertion_checkpoint()
+        event_checkpoint = await store.assertion_event_checkpoint()
+        assert raw_after_proof_advance.generation == 2
+        assert event_checkpoint == CorpusCheckpoint(TENANT, 1, written.event_id)
+        assert await store.assertion_changes_after(event_checkpoint) == []
         assert [change.revision_id for change in await store.assertion_changes_since(0)] == [assertion.revision_id]
         assert [
             change.revision_id
@@ -1601,13 +1619,17 @@ async def test_inference_and_validation_schema_migrations_coexist_idempotently()
         assert await db.table_exists("semantic_inference_derivation_inputs")
         assert await db.table_exists("semantic_validation_reports")
         assert await db.table_exists("semantic_validation_results")
+        assert await db.table_exists("semantic_validation_report_revisions")
         assert await db.fetchall(
             "SELECT version FROM semantic_schema_migrations "
             "WHERE version IN (?, ?) ORDER BY version",
-            ("semantic_assertion_store_v5", "semantic_validation_reports_v1"),
+            (
+                "semantic_assertion_store_v5",
+                "semantic_validation_reports_v2_revision_links",
+            ),
         ) == [
             ("semantic_assertion_store_v5",),
-            ("semantic_validation_reports_v1",),
+            ("semantic_validation_reports_v2_revision_links",),
         ]
     finally:
         await db.close()
