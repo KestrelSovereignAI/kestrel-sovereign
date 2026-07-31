@@ -978,6 +978,57 @@ def test_catalog_benchmark_blocks_postgres_without_explicit_isolated_configurati
     assert execution.record.reason_code == "isolated_postgres_ack_required"
 
 
+def test_catalog_benchmark_blocks_postgres_without_an_isolated_admin_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kestrel_sovereign.knowledge.release_evidence_execution import (
+        CatalogExecutionAuthority,
+        default_catalog_workloads,
+    )
+
+    monkeypatch.setenv("KESTREL_SEMANTIC_RELEASE_ISOLATED", "1")
+    monkeypatch.delenv("KESTREL_SEMANTIC_RELEASE_ISOLATED_POSTGRES_ADMIN_DSN", raising=False)
+    execution = asyncio.run(
+        CatalogExecutionAuthority(_CATALOG_TEST_IDENTITY, default_catalog_workloads()).execute(
+            _gate("performance_startup_postgres_startup")
+        )
+    )
+
+    assert execution.record.state is EvidenceState.BLOCKED
+    assert execution.record.reason_code == "isolated_postgres_admin_unavailable"
+
+
+@pytest.mark.parametrize(
+    "shared_name",
+    ("postgres", "template0", "template1", "kestrel", "kestrel_test", "test"),
+)
+def test_disposable_postgres_identity_rejects_common_or_shared_database_names(
+    shared_name: str,
+) -> None:
+    from kestrel_sovereign.knowledge.release_evidence_postgres import _quoted_identifier
+
+    with pytest.raises(ReleaseEvidenceError, match="generated disposable"):
+        _quoted_identifier(shared_name)
+
+
+def test_parity_child_environment_never_inherits_an_ambient_postgres_dsn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from kestrel_sovereign.knowledge.release_evidence_workloads import _isolated_test_environment
+
+    monkeypatch.setenv("TEST_POSTGRES_URL", "postgresql://ambient-shared-db/kestrel")
+    ambient_free = _isolated_test_environment(str(tmp_path))
+    generated = _isolated_test_environment(
+        str(tmp_path),
+        postgres_dsn="postgresql://isolated-runner/kestrel_semantic_release_0123456789abcdef0123456789abcdef",
+    )
+
+    assert "TEST_POSTGRES_URL" not in ambient_free
+    assert generated["TEST_POSTGRES_URL"] != "postgresql://ambient-shared-db/kestrel"
+    assert "kestrel_semantic_release_" in generated["TEST_POSTGRES_URL"]
+
+
 @pytest.mark.parametrize(
     "gate_id",
     (

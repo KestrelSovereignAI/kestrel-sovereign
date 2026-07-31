@@ -12,7 +12,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import math
-import os
 from tempfile import TemporaryDirectory
 from typing import Final
 from uuid import uuid4
@@ -35,11 +34,10 @@ from .release_evidence_models import (
     ReleaseEvidenceError,
     SemanticBenchmarkHarness,
 )
+from .release_evidence_postgres import DisposablePostgresDatabase
 
 
 _BENCHMARK_ITERATIONS: Final = 3
-_ISOLATED_POSTGRES_DSN_ENV: Final = "KESTREL_SEMANTIC_RELEASE_ISOLATED_POSTGRES_DSN"
-_ISOLATED_POSTGRES_ACK_ENV: Final = "KESTREL_SEMANTIC_RELEASE_ISOLATED"
 _BENCHMARK_VALUE_BYTES: Final = 1_048_576
 
 
@@ -53,27 +51,18 @@ class _IsolatedStorageFactory:
     """Create a fresh agent-scoped storage sample for each measurement.
 
     SQLite samples use a distinct temporary database.  PostgreSQL samples use
-    distinct tenant scopes on an explicitly acknowledged disposable database;
-    relying on a generic application ``DATABASE_URL`` is intentionally
-    forbidden.
+    distinct tenant scopes within the caller-created disposable database.
     """
 
-    def __init__(self, backend: str) -> None:
+    def __init__(self, backend: str, *, postgres_dsn: str | None = None) -> None:
         if backend not in {"sqlite", "postgres"}:
             raise ReleaseEvidenceError("semantic benchmark backend must be sqlite or postgres")
         self._backend = backend
         self._temporary_directory = TemporaryDirectory(prefix="kestrel-semantic-benchmark-")
         self._root = Path(self._temporary_directory.name)
-        self._postgres_dsn = self._isolated_postgres_dsn() if backend == "postgres" else None
-
-    @staticmethod
-    def _isolated_postgres_dsn() -> str:
-        if os.environ.get(_ISOLATED_POSTGRES_ACK_ENV) != "1":
-            raise CatalogWorkloadUnavailable("isolated_postgres_ack_required")
-        dsn = os.environ.get(_ISOLATED_POSTGRES_DSN_ENV)
-        if not dsn:
-            raise CatalogWorkloadUnavailable("isolated_postgres_unavailable")
-        return dsn
+        if backend == "postgres" and not postgres_dsn:
+            raise ReleaseEvidenceError("postgres benchmark requires a generated disposable database")
+        self._postgres_dsn = postgres_dsn
 
     async def open(self) -> _StorageSample:
         tenant = f"did:kestrel:semantic-evidence:{uuid4().hex}"
@@ -232,7 +221,13 @@ async def _run_benchmark(spec: GateSpec) -> CatalogWorkloadResult:
         # Catalog mode is kite_http.  The real HTTP drill owns these metrics;
         # invoking maintenance directly would misrepresent the mode.
         raise CatalogWorkloadUnavailable("kite_http_benchmark_runner_required")
-    factory = _IsolatedStorageFactory(target.backend)
+    disposable_database: DisposablePostgresDatabase | None = None
+    if target.backend == "postgres":
+        disposable_database = await DisposablePostgresDatabase.create()
+    factory = _IsolatedStorageFactory(
+        target.backend,
+        postgres_dsn=disposable_database.dsn if disposable_database else None,
+    )
     current: _StorageSample | None = None
     sequence = 0
 
@@ -300,6 +295,8 @@ async def _run_benchmark(spec: GateSpec) -> CatalogWorkloadResult:
     finally:
         await factory.close(current)
         factory.dispose()
+        if disposable_database is not None:
+            await disposable_database.close()
 
 
 def _benchmark_result(spec: GateSpec, run: BenchmarkRun) -> CatalogWorkloadResult:

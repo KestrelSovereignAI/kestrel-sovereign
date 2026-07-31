@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import asyncio
 import os
 from pathlib import Path
 import subprocess
@@ -26,6 +27,7 @@ from xml.etree import ElementTree
 
 from .release_evidence_execution import CatalogWorkload, CatalogWorkloadResult
 from .release_evidence_models import EvidenceState, GateSpec, ReleaseEvidenceError
+from .release_evidence_postgres import DisposablePostgresDatabase
 
 
 _REPOSITORY_ROOT: Final = Path(__file__).resolve().parents[2]
@@ -36,7 +38,6 @@ _TEST_ENV_ALLOWLIST: Final = (
     "LC_ALL",
     "PATH",
     "SYSTEMROOT",
-    "TEST_POSTGRES_URL",
     "TMPDIR",
     "TEMP",
     "TMP",
@@ -56,7 +57,7 @@ class _PytestSummary:
         return self.case_count > 0 and self.failed_count == 0 and self.skipped_count == 0
 
 
-def _isolated_test_environment(tempdir: str) -> dict[str, str]:
+def _isolated_test_environment(tempdir: str, *, postgres_dsn: str | None = None) -> dict[str, str]:
     """Return a minimal runner environment without operator pytest arguments."""
     environment = {
         key: value
@@ -67,6 +68,11 @@ def _isolated_test_environment(tempdir: str) -> dict[str, str]:
     environment["PYTHONNOUSERSITE"] = "1"
     environment["KESTREL_HOME"] = str(Path(tempdir) / "kestrel-home")
     environment["KESTREL_DB_PATH"] = str(Path(tempdir) / "kestrel-db")
+    if postgres_dsn is not None:
+        # This exact generated disposable database is the only PostgreSQL DSN
+        # a child parity test may receive.  Ambient TEST_POSTGRES_URL is never
+        # inherited into the release runner.
+        environment["TEST_POSTGRES_URL"] = postgres_dsn
     return environment
 
 
@@ -87,7 +93,7 @@ def _read_junit_summary(path: Path) -> _PytestSummary:
     return _PytestSummary(len(cases), failures, skipped)
 
 
-def _run_fixed_pytest(*selectors: str) -> _PytestSummary:
+def _run_fixed_pytest(*selectors: str, postgres_dsn: str | None = None) -> _PytestSummary:
     """Execute fixed, source-declared selectors and discard raw test output."""
     if not selectors or any(not selector.startswith("tests/") for selector in selectors):
         raise ReleaseEvidenceError("catalog pytest selectors must be reviewed repository test nodes")
@@ -106,7 +112,7 @@ def _run_fixed_pytest(*selectors: str) -> _PytestSummary:
             completed = subprocess.run(
                 command,
                 cwd=_REPOSITORY_ROOT,
-                env=_isolated_test_environment(tempdir),
+                env=_isolated_test_environment(tempdir, postgres_dsn=postgres_dsn),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -123,8 +129,13 @@ def _run_fixed_pytest(*selectors: str) -> _PytestSummary:
         return summary
 
 
-def _result_for(spec: GateSpec, selectors: tuple[str, ...]) -> CatalogWorkloadResult:
-    summary = _run_fixed_pytest(*selectors)
+def _result_for(
+    spec: GateSpec,
+    selectors: tuple[str, ...],
+    *,
+    postgres_dsn: str | None = None,
+) -> CatalogWorkloadResult:
+    summary = _run_fixed_pytest(*selectors, postgres_dsn=postgres_dsn)
     fields = {field.field_id for field in spec.observation_schema.fields}
     if fields == {"diagnostic_count", "redaction_violation_count"}:
         observation: dict[str, object] = {
@@ -235,13 +246,21 @@ def _selector_workload(selectors: tuple[str, ...]) -> CatalogWorkload:
 
 
 def _backend_workload(selectors: tuple[str, ...]) -> CatalogWorkload:
-    def workload(spec: GateSpec) -> CatalogWorkloadResult:
+    async def workload(spec: GateSpec) -> CatalogWorkloadResult:
         backend = spec.environment.backend
         if backend not in {"sqlite", "postgres"}:
             raise ReleaseEvidenceError("backend parity workload requires sqlite or postgres")
         if spec.environment.backend != backend:
             raise ReleaseEvidenceError("backend parity workload does not match its catalog environment")
         selected = tuple(f"{selector}[{backend}]" for selector in selectors)
-        return _result_for(spec, selected)
+        if backend == "sqlite":
+            return await asyncio.to_thread(_result_for, spec, selected)
+        async with await DisposablePostgresDatabase.create() as database:
+            return await asyncio.to_thread(
+                _result_for,
+                spec,
+                selected,
+                postgres_dsn=database.dsn,
+            )
 
     return workload

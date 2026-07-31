@@ -84,8 +84,13 @@ signed `ms` budget. Storage growth instead reads the actual backend footprint:
 the SQLite database plus active journal/WAL sidecars, or PostgreSQL database
 size; elapsed time is never relabeled as bytes. PostgreSQL runs require both
 `KESTREL_SEMANTIC_RELEASE_ISOLATED=1` and an operator-provided
-`KESTREL_SEMANTIC_RELEASE_ISOLATED_POSTGRES_DSN`, which must name a disposable
-test database. The DSN is never emitted. If either is absent, the workload
+`KESTREL_SEMANTIC_RELEASE_ISOLATED_POSTGRES_ADMIN_DSN`. The runner creates a
+random database named `kestrel_semantic_release_<32 hex>` beneath that admin
+connection, passes only the generated DSN to parity/benchmark work, terminates
+its sessions, drops it, and verifies removal. It never inherits
+`TEST_POSTGRES_URL`, `DATABASE_URL`, or an app database. The admin and generated
+DSNs are never emitted. If either authorization/configuration step is absent or
+the disposable database cannot be created or verified removed, the workload
 writes a content-free nonzero block.
 
 Changed-work and unchanged-work sleep retain their catalog `kite_http` mode.
