@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
+from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -202,3 +206,139 @@ def test_performance_targets_cover_each_metric_on_sqlite_and_postgres() -> None:
     assert len(targets) == len(PerformanceMetric) * 2
     for metric in PerformanceMetric:
         assert {target.backend for target in targets if target.metric is metric} == {"sqlite", "postgres"}
+
+
+def _cli(*arguments: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "kestrel_sovereign.knowledge.release_evidence",
+            *arguments,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _record_command(spec, output: Path, artifact_ref: str = "ci://semantic-release/record") -> list[str]:
+    return [
+        "record",
+        "--gate",
+        spec.gate_id,
+        "--artifact-ref",
+        artifact_ref,
+        "--artifact-digest",
+        "b" * 64,
+        "--observation-json",
+        json.dumps(_observation(spec)),
+        "--output",
+        str(output),
+    ]
+
+
+def test_cli_record_and_assemble_use_the_catalog_not_raw_argv(tmp_path: Path) -> None:
+    spec = _gate("rdf11_projection_fixture")
+    record = tmp_path / "record.json"
+    report = tmp_path / "report.json"
+
+    recorded = _cli(*_record_command(spec, record))
+    assembled = _cli("assemble", "--record", str(record), "--output", str(report))
+
+    assert recorded.returncode == 0, recorded.stderr
+    assert assembled.returncode == 0, assembled.stderr
+    payload = json.loads(record.read_text(encoding="utf-8"))
+    assert "command" not in payload
+    assert payload["runner_id"] == spec.runner.runner_id
+    assert payload["command_digest"] == spec.runner.command_digest
+    assert payload["environment"] == spec.environment.to_mapping()
+    assert json.loads(report.read_text(encoding="utf-8"))["ready"] is False
+
+
+def test_cli_record_refuses_arbitrary_true_argv(tmp_path: Path) -> None:
+    spec = _gate("rdf11_projection_fixture")
+    output = tmp_path / "record.json"
+
+    result = _cli(*_record_command(spec, output), "--", "true")
+
+    assert result.returncode != 0
+    assert not output.exists()
+    assert "unrecognized arguments" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "reference",
+    (
+        "postgresql://user:password@db.example/kestrel",
+        "ci://semantic-release/42?token=secret",
+        "artifact://tenant-42/result",
+        "evidence://user@host/result",
+    ),
+)
+def test_cli_record_refuses_sensitive_artifact_reference(tmp_path: Path, reference: str) -> None:
+    spec = _gate("rdf11_projection_fixture")
+    output = tmp_path / "record.json"
+
+    result = _cli(*_record_command(spec, output, reference))
+
+    assert result.returncode == 1
+    assert not output.exists()
+    assert "artifact" in result.stderr
+
+
+def test_cli_record_refuses_environment_backend_mode_overrides(tmp_path: Path) -> None:
+    spec = _gate("rdf11_projection_fixture")
+    output = tmp_path / "record.json"
+
+    result = _cli(*_record_command(spec, output), "--backend", "postgres", "--mode", "integration")
+
+    assert result.returncode != 0
+    assert not output.exists()
+    assert "unrecognized arguments" in result.stderr
+
+
+def test_cli_assemble_rejects_tampered_record_environment(tmp_path: Path) -> None:
+    spec = _gate("rdf11_projection_fixture")
+    record = tmp_path / "record.json"
+    tampered = tmp_path / "tampered.json"
+    output = tmp_path / "report.json"
+    assert _cli(*_record_command(spec, record)).returncode == 0
+    payload = json.loads(record.read_text(encoding="utf-8"))
+    payload["environment"]["backend"] = "postgres"
+    tampered.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = _cli("assemble", "--record", str(tampered), "--output", str(output))
+
+    assert result.returncode == 1
+    assert not output.exists()
+    assert "environment" in result.stderr
+
+
+def test_cli_budget_uses_performance_gate_backend_and_mode(tmp_path: Path) -> None:
+    spec = _performance_spec(PerformanceMetric.HYBRID_RECALL, "postgres")
+    output = tmp_path / "budget.json"
+
+    result = _cli(
+        "budget",
+        "--gate",
+        spec.gate_id,
+        "--samples",
+        "1",
+        "2",
+        "3",
+        "--headroom-fraction",
+        "0.2",
+        "--artifact-ref",
+        "ci://semantic-release/postgres-benchmark",
+        "--artifact-digest",
+        "c" * 64,
+        "--output",
+        str(output),
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["target"]["backend"] == "postgres"
+    assert payload["target"]["mode"] == "integration"
+    assert payload["target"]["unit"] == "ms"
