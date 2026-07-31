@@ -228,7 +228,8 @@ CREATE TABLE IF NOT EXISTS memory_episodes (
     importance REAL DEFAULT 0.5,
     access_count INTEGER DEFAULT 0,
     embedding_vec BLOB,
-    embedding_profile_id TEXT
+    embedding_profile_id TEXT,
+    excluded_from_context INTEGER DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_episodes_agent ON memory_episodes(agent_id);
@@ -969,6 +970,13 @@ class AsyncDatabase:
         )
         await self._migrate_add_column(
             "memory_episodes", "embedding_profile_id", "TEXT DEFAULT NULL"
+        )
+        # An episode is a derivative of its key conversation artifacts.  When
+        # governed fact erasure excludes one of those artifacts, retain the
+        # episode for audit/recovery but keep it permanently out of prompt
+        # retrieval.  Legacy episodes remain visible by default.
+        await self._migrate_add_column(
+            "memory_episodes", "excluded_from_context", "INTEGER DEFAULT 0"
         )
         # Managed service-key storage: agent_service_keys gained key_hash +
         # quota columns after its initial release, but the table is created

@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import time
+import re
+from collections.abc import Awaitable, Callable
 from typing import Iterable, Mapping, Sequence
 from uuid import uuid4
 
@@ -164,6 +166,10 @@ class _AssertionStoreScope:
 
 class AssertionStoreError(ValueError):
     """A canonical assertion mutation cannot be accepted."""
+
+
+class SemanticRecallUnavailableError(AssertionStoreError):
+    """Semantic recall cannot safely observe a current maintenance snapshot."""
 
 
 class MaintenanceLeaseLostError(AssertionStoreError):
@@ -351,6 +357,28 @@ class AssertionCheckpoint:
     tenant_id: str
     generation: int
     latest_event_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class AssertionRecallCandidate:
+    """One privacy-governed, current assertion with authoritative provenance."""
+
+    assertion: Assertion
+    source_occurrences: tuple[SourceOccurrence, ...]
+    inference_complete: bool
+
+
+@dataclass(frozen=True, slots=True)
+class AssertionRecallResult:
+    """Bounded tenant-local recall candidates and content-free checkpoint metadata."""
+
+    candidates: tuple[AssertionRecallCandidate, ...]
+    checkpoint_generation: int
+    capability_versions: Mapping[str, str]
+    discovery_count: int
+
+
+_RECALL_WORD_RE = re.compile(r"[\w]+", re.UNICODE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -681,7 +709,11 @@ class AsyncAssertionStore:
     :class:`AsyncStorage` facade.
     """
 
-    __slots__ = ("__scope", "_erasure_jobs")
+    __slots__ = (
+        "__scope",
+        "_erasure_jobs",
+        "_semantic_recall_derivative_revoker",
+    )
 
     def __init__(self, scope: _AssertionStoreScope, /) -> None:
         if type(scope) is not _AssertionStoreScope:
@@ -694,6 +726,14 @@ class AsyncAssertionStore:
         # while a durable receipt after restart proves only that the erasure
         # completed and where incremental consumers must resume.
         self._erasure_jobs: dict[str, tuple[float, str, ErasureResult]] = {}
+        # AsyncStorage binds this private companion after it has constructed
+        # the conversation store.  The assertion store retains no reference
+        # to a higher-level facade or retrieval implementation; it merely
+        # invokes the storage-owned callback while its canonical mutation is
+        # still atomic.  Standalone assertion stores deliberately leave it
+        # unset so their canonical-only contract remains usable in tests and
+        # migrations.
+        self._semantic_recall_derivative_revoker: Callable[..., Awaitable[None]] | None = None
 
     @property
     def tenant_id(self) -> str:
@@ -712,6 +752,59 @@ class AsyncAssertionStore:
 
     def _require_scope(self) -> tuple[str, str]:
         return self.tenant_id, self.owning_agent_id
+
+    def _bind_semantic_recall_derivative_revoker(
+        self,
+        revoker: Callable[..., Awaitable[None]],
+    ) -> None:
+        """Bind the owning storage's exact derivative-withdrawal companion.
+
+        This is an internal composition seam, not a public assertion-store
+        extension point.  The lower-level canonical authority intentionally
+        does not import AsyncStorage, conversation memory, or retrieval code;
+        the already agent-bound AsyncStorage facade injects its companion once
+        during initialization.  Rebinding a live store to a different owner
+        would make lifecycle effects ambiguous, so fail closed.
+        """
+        if not callable(revoker):
+            raise TypeError("semantic recall derivative revoker must be callable")
+        current = self._semantic_recall_derivative_revoker
+        if current is not None and current != revoker:
+            raise AssertionStoreError(
+                "semantic recall derivative revoker is already bound to this store"
+            )
+        self._semantic_recall_derivative_revoker = revoker
+
+    async def _withdraw_semantic_recall_derivatives(
+        self,
+        *,
+        assertion_ids: Iterable[str] = (),
+        revision_ids: Iterable[str] = (),
+        physically_erased: bool = False,
+    ) -> None:
+        """Atomically revoke conversation artifacts tied to withdrawn facts.
+
+        The callback receives only exact canonical identities, never content
+        or a user-controlled selector.  It executes *inside* the current
+        canonical mutation, so either the lifecycle transition and every
+        linked context/episode exclusion commit together or all roll back.
+        """
+        revoker = self._semantic_recall_derivative_revoker
+        if revoker is None:
+            return
+        normalized_assertion_ids = tuple(
+            sorted({value for value in assertion_ids if isinstance(value, str) and value})
+        )
+        normalized_revision_ids = tuple(
+            sorted({value for value in revision_ids if isinstance(value, str) and value})
+        )
+        if not normalized_assertion_ids and not normalized_revision_ids:
+            return
+        await revoker(
+            assertion_ids=normalized_assertion_ids,
+            revision_ids=normalized_revision_ids,
+            physically_erased=physically_erased,
+        )
 
     def _check_assertion_scope(self, assertion: Assertion) -> None:
         tenant_id, owner = self._require_scope()
@@ -1079,6 +1172,61 @@ class AsyncAssertionStore:
             and bool(row[1])
             and bool(row[2])
         )
+
+    @asynccontextmanager
+    async def _semantic_recall_persistence_fence(
+        self,
+        dependencies: Sequence[tuple[str, str]],
+    ):
+        """Serialize one derived conversation write with assertion lifecycle.
+
+        A semantic-recall turn is a derivative of the exact current assertion
+        revisions rendered into its prompt.  The conversation row must be
+        committed while those revisions are still current and eligible, under
+        the same tenant lock used by delete/retract/supersede/erasure.  Without
+        this fence a deletion can scan its existing derivatives, then a slow
+        LLM response can persist a new visible derivative after the scan.
+
+        This private companion is intentionally consumed only by
+        :class:`AsyncStorage`, which owns both the assertion and conversation
+        stores.  It is not a second source of truth: it reads the canonical
+        current-revision and eligibility rows while holding their lifecycle
+        serialization boundary.
+        """
+        normalized: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for dependency in dependencies:
+            if (
+                not isinstance(dependency, tuple)
+                or len(dependency) != 2
+                or not isinstance(dependency[0], str)
+                or not dependency[0]
+                or not isinstance(dependency[1], str)
+                or not dependency[1]
+            ):
+                yield False
+                return
+            if dependency not in seen:
+                seen.add(dependency)
+                normalized.append(dependency)
+        if not normalized:
+            yield False
+            return
+
+        async with self._mutation():
+            visible = True
+            for assertion_id, revision_id in normalized:
+                current = await self._current(assertion_id)
+                if (
+                    current is None
+                    or current.revision_id != revision_id
+                    or not await self._is_current_active_eligible_revision(
+                        revision_id
+                    )
+                ):
+                    visible = False
+                    break
+            yield visible
 
     @staticmethod
     def _flat_terms(assertion: Assertion) -> tuple[str, str, str, str, str | None, str | None]:
@@ -2441,6 +2589,9 @@ class AsyncAssertionStore:
                 [item.assertion_id for item in (*quarantined, *invalidated)],
                 [item.revision_id for item in (*quarantined, *invalidated)],
             )
+            await self._withdraw_semantic_recall_derivatives(
+                revision_ids=invalidated_revision_ids,
+            )
             return ValidationQuarantineBatchResult(
                 tuple(quarantined),
                 tuple(invalidated),
@@ -3316,6 +3467,9 @@ class AsyncAssertionStore:
             [predecessor.assertion_id, replacement_state.assertion_id, *[item.assertion_id for item in dependent_states]],
             [predecessor_state.revision_id, replacement_state.revision_id, *[item.revision_id for item in dependent_states]],
         )
+        await self._withdraw_semantic_recall_derivatives(
+            revision_ids=invalidated_revision_ids,
+        )
         return (
             SupersessionResult(
                 predecessor_state, replacement_state, generation,
@@ -3618,6 +3772,9 @@ class AsyncAssertionStore:
             generation = await self._advance_generation()
             for assertion in retracted:
                 await self._event(assertion, "retracted", generation)
+            await self._withdraw_semantic_recall_derivatives(
+                revision_ids=old_revision_ids,
+            )
             return InferenceRevocationResult(
                 len(retracted), len(all_deactivated_ids), generation
             )
@@ -3728,6 +3885,9 @@ class AsyncAssertionStore:
                 {"revision_ids": [item.revision_id for item in retracted], "invalidated_revision_ids": invalidated, "generation": generation},
                 [item.assertion_id for item in retracted], [item.revision_id for item in retracted],
             )
+            await self._withdraw_semantic_recall_derivatives(
+                revision_ids=invalidated,
+            )
             return RetractionResult(tuple(retracted), tuple(invalidated), generation)
 
     async def quarantine_for_validation(
@@ -3819,6 +3979,9 @@ class AsyncAssertionStore:
                 },
                 [quarantined.assertion_id, *[item.assertion_id for item in invalidated]],
                 [quarantined.revision_id, *[item.revision_id for item in invalidated]],
+            )
+            await self._withdraw_semantic_recall_derivatives(
+                revision_ids=invalidated_revision_ids,
             )
             return ValidationQuarantineResult(
                 quarantined,
@@ -3926,6 +4089,9 @@ class AsyncAssertionStore:
                 },
                 [deleted.assertion_id, *[item.assertion_id for item in invalidated]],
                 [deleted.revision_id, *[item.revision_id for item in invalidated]],
+            )
+            await self._withdraw_semantic_recall_derivatives(
+                revision_ids=invalidated_revision_ids,
             )
             return DeletionResult(deleted, tuple(invalidated), tuple(invalidated_revision_ids), generation)
 
@@ -4243,6 +4409,9 @@ class AsyncAssertionStore:
                 },
                 [current.assertion_id, *[item.assertion_id for item in retracted]],
                 [current.revision_id, *[item.revision_id for item in retracted]],
+            )
+            await self._withdraw_semantic_recall_derivatives(
+                revision_ids=invalidated_revision_ids,
             )
             return RetractionResult(
                 tuple(retracted), tuple(invalidated_revision_ids), generation
@@ -4823,6 +4992,16 @@ class AsyncAssertionStore:
             )
             revision_tuple = tuple(sorted(revision_ids))
             assertion_tuple = tuple(sorted(assertion_ids))
+            # The complete erased closure is still present while the owning
+            # tenant mutation is open.  Exclude and scrub every exact linked
+            # derivative before removing canonical identities, so a callback
+            # failure rolls back both sides rather than leaving visible recall
+            # content or an ID-bearing erasure residue.
+            await self._withdraw_semantic_recall_derivatives(
+                assertion_ids=assertion_tuple,
+                revision_ids=revision_tuple,
+                physically_erased=True,
+            )
             await self._sanitize_surviving_references_after_erasure(
                 revision_tuple,
             )
@@ -5014,6 +5193,141 @@ class AsyncAssertionStore:
         if not isinstance(query, AssertionQuery):
             raise AssertionStoreError("inference_inputs requires AssertionQuery")
         return await self._query_current(query, eligible_only=True)
+
+    async def recall_candidates(
+        self,
+        *,
+        query: str,
+        candidate_scan_limit: int,
+        inference_profile,
+        inference_limits=None,
+        maintenance_limits=None,
+    ) -> AssertionRecallResult:
+        """Return recallable assertions only from a complete current checkpoint.
+
+        This is intentionally the host-owned semantic/privacy seam: callers
+        cannot supply a tenant, lifecycle flags, source IDs, or a claimed
+        maintenance status.  The ledger query enforces current ACTIVE and
+        projection eligibility before provenance is hydrated in one batch.
+        """
+        if type(candidate_scan_limit) is not int or not 1 <= candidate_scan_limit <= 10_000:
+            raise AssertionStoreError("semantic recall candidate_scan_limit must be in [1, 10000]")
+        if not isinstance(query, str):
+            raise AssertionStoreError("semantic recall query must be text")
+        if inference_profile is None:
+            raise SemanticRecallUnavailableError("semantic_maintenance_capability_unavailable")
+        from kestrel_sovereign.knowledge.maintenance import SemanticMaintenanceService
+
+        service = SemanticMaintenanceService(
+            self, inference_profile=inference_profile,
+            inference_limits=inference_limits, limits=maintenance_limits,
+        )
+        readiness = await service.training_readiness()
+        if not readiness.ready:
+            raise SemanticRecallUnavailableError(readiness.reason or "semantic_maintenance_unavailable")
+        # Page the complete configured discovery window with a storage-owned
+        # clock.  If it overflows, fail visibly rather than calling an
+        # arbitrary revision-id prefix "semantic" recall.
+        now = datetime.now(timezone.utc)
+        assertions: list[Assertion] = []
+        cursor: str | None = None
+        while len(assertions) < candidate_scan_limit:
+            page = await self._query_current(
+                AssertionQuery(
+                    limit=min(1000, candidate_scan_limit - len(assertions)),
+                    cursor=cursor,
+                    valid_at=now,
+                ),
+                eligible_only=True,
+            )
+            assertions.extend(page)
+            if len(page) < min(1000, candidate_scan_limit - (len(assertions) - len(page))):
+                break
+            cursor = page[-1].revision_id
+        if len(assertions) == candidate_scan_limit:
+            overflow = await self._query_current(
+                AssertionQuery(limit=1, cursor=assertions[-1].revision_id, valid_at=now),
+                eligible_only=True,
+            )
+            if overflow:
+                raise SemanticRecallUnavailableError("semantic_recall_candidate_window_exceeded")
+        return AssertionRecallResult(
+            candidates=tuple(
+                AssertionRecallCandidate(
+                    assertion=item,
+                    source_occurrences=(),
+                    inference_complete=True,
+                )
+                for item in assertions
+            ),
+            checkpoint_generation=(await self.checkpoint()).generation,
+            capability_versions=service._capability_versions(),
+            discovery_count=len(assertions),
+        )
+
+    async def hydrate_recall_candidates(
+        self, assertion_ids: Sequence[str], *, expected_checkpoint_generation: int,
+        inference_profile, inference_limits=None, maintenance_limits=None,
+    ) -> tuple[AssertionRecallCandidate, ...]:
+        """Fence final publication after async scoring, then hydrate in one batch."""
+        if not assertion_ids:
+            return ()
+        if inference_profile is None:
+            raise SemanticRecallUnavailableError("semantic_maintenance_capability_unavailable")
+        from kestrel_sovereign.knowledge.maintenance import SemanticMaintenanceService
+        readiness = await SemanticMaintenanceService(
+            self, inference_profile=inference_profile,
+            inference_limits=inference_limits, limits=maintenance_limits,
+        ).training_readiness()
+        if not readiness.ready:
+            raise SemanticRecallUnavailableError(readiness.reason or "semantic_maintenance_unavailable")
+        checkpoint = await self.checkpoint()
+        if checkpoint.generation != expected_checkpoint_generation:
+            raise SemanticRecallUnavailableError("semantic_recall_checkpoint_changed")
+        selected = await self._query_current(
+            AssertionQuery(
+                assertion_ids=tuple(assertion_ids), limit=len(assertion_ids),
+                valid_at=datetime.now(timezone.utc),
+            ), eligible_only=True,
+        )
+        sources = await self._sources_for_assertions(selected)
+        # Repeat both maintenance and generation fences after provenance I/O;
+        # maintenance status can change without an assertion generation bump.
+        final_readiness = await SemanticMaintenanceService(
+            self, inference_profile=inference_profile,
+            inference_limits=inference_limits, limits=maintenance_limits,
+        ).training_readiness()
+        if not final_readiness.ready:
+            raise SemanticRecallUnavailableError(final_readiness.reason or "semantic_maintenance_unavailable")
+        if (await self.checkpoint()).generation != expected_checkpoint_generation:
+            raise SemanticRecallUnavailableError("semantic_recall_checkpoint_changed")
+        return tuple(AssertionRecallCandidate(item, sources.get(item.assertion_id, ()), True) for item in selected)
+
+    async def _sources_for_assertions(
+        self, assertions: Sequence[Assertion],
+    ) -> dict[str, tuple[SourceOccurrence, ...]]:
+        """Hydrate all selected provenance in one tenant-bound query (no N+1)."""
+        if not assertions:
+            return {}
+        tenant_id, _ = self._require_scope()
+        revision_ids = tuple(item.revision_id for item in assertions)
+        rows = await self._database.fetchall(
+            "SELECT rs.revision_id, s.source_mapping FROM semantic_revision_sources rs "
+            "JOIN semantic_source_occurrences s ON s.tenant_id = rs.tenant_id "
+            "AND s.source_occurrence_id = rs.source_occurrence_id "
+            f"WHERE rs.tenant_id = ? AND rs.revision_id IN ({_placeholders(revision_ids)}) "
+            "ORDER BY rs.revision_id, rs.ordinal, s.source_occurrence_id",
+            (tenant_id,) + revision_ids,
+        )
+        by_revision: dict[str, list[SourceOccurrence]] = {}
+        for revision_id, mapping in rows:
+            by_revision.setdefault(str(revision_id), []).append(
+                SourceOccurrence.from_mapping(json.loads(mapping))
+            )
+        return {
+            item.assertion_id: tuple(by_revision.get(item.revision_id, ()))
+            for item in assertions
+        }
 
     async def inference_inputs_page(
         self,

@@ -16,9 +16,10 @@ import os
 import re
 import struct
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from time import perf_counter
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .async_database import AsyncDatabase
 from .conversation_ids import coerce_persistent_message_id
@@ -68,6 +69,30 @@ class ConversationLexicalSchemaError(RuntimeError):
 
 class ConversationSessionTimestampError(RuntimeError):
     """Exact session membership cannot be proven from stored chronology."""
+
+
+@dataclass(slots=True)
+class _PreparedConversationWrite:
+    """Precomputed, not-yet-visible conversation row material.
+
+    Semantic recall persistence must acquire the assertion lifecycle fence only
+    for its final liveness check and INSERT.  Provider embedding and lexical
+    token indexing are intentionally prepared before that narrow critical
+    section; the lexical token handle remains available for cleanup if the
+    final fenced write cannot be admitted.
+    """
+
+    role: str
+    content: str
+    rendered_content: Optional[str]
+    metadata: Dict[str, Any]
+    embedding: Optional[List[float]]
+    embedding_profile_id: Optional[str]
+    embedding_service: Optional[Any]
+    model: Optional[str]
+    provider: Optional[str]
+    lexical_index_id: Optional[str]
+    lexical_index_version: Optional[str]
 
 
 def _escape_like_session_value(session_id: str) -> str:
@@ -1218,26 +1243,34 @@ class AsyncConversationStore:
                                rendered_content: Optional[str] = None,
                                model: Optional[str] = None,
                                provider: Optional[str] = None) -> None:
-        """Add a conversation message with per-agent encryption.
+        """Prepare and persist a conversation message with per-agent encryption."""
+        prepared = await self._prepare_conversation_write(
+            role,
+            content,
+            metadata,
+            session_id,
+            rendered_content,
+            model,
+            provider,
+        )
+        await self._persist_prepared_conversation(prepared)
 
-        Args:
-            role: Message role (user, assistant, system)
-            content: Canonical message content. For user turns this is the
-                raw user speech (typically ``wrap_user_input(raw)``) — never
-                the rendered-with-retrieval transport form.
-            metadata: Optional metadata dict
-            session_id: If provided, link this message to a specific session.
-                       This allows resuming old conversations beyond the 30-min gap.
-                       If not provided, an implicit session_id is derived from
-                       the time-gap heuristic (30 min inactivity = new session).
-            rendered_content: Write-once transport bytes for byte-stable cache
-                replay (#1402). Carries memories + RAG baked into the user
-                template. The history-load path emits this verbatim so the
-                prefix bytes match what the LLM saw at send time. Encrypted
-                with the same per-agent key as ``content``.
-            model: Concrete model that produced this message. Intended for
-                assistant rows; nullable for user/system and legacy rows.
-            provider: Resolved provider route that produced this message.
+    async def _prepare_conversation_write(
+        self,
+        role: str,
+        content: str,
+        metadata: Optional[Dict],
+        session_id: Optional[str],
+        rendered_content: Optional[str],
+        model: Optional[str],
+        provider: Optional[str],
+    ) -> _PreparedConversationWrite:
+        """Do provider/lexical prework before any semantic lifecycle fence.
+
+        The returned object is not visible to readers.  Its final insertion is
+        intentionally separate so semantic recall can fence only the brief
+        canonical-liveness check plus INSERT, rather than a network embedding
+        request or token-index write.
         """
         meta = dict(metadata) if metadata else {}
 
@@ -1261,10 +1294,9 @@ class AsyncConversationStore:
         if session_id:
             meta['session_id'] = session_id
 
-        # Use per-agent key for new messages
+        # Use per-agent key for new messages.
         fernet_to_use = self._agent_fernet or self._global_fernet
         to_store, was_encrypted = encrypt_string(content, fernet_to_use)
-
         if was_encrypted:
             meta['enc'] = True
             meta['key_version'] = CURRENT_KEY_VERSION
@@ -1281,19 +1313,9 @@ class AsyncConversationStore:
                 meta['enc'] = True
                 meta['key_version'] = CURRENT_KEY_VERSION
 
-        # Compute the embedding from plaintext content BEFORE the
-        # INSERT so we can co-write ``embedding_vec`` in a single
-        # statement (no follow-up UPDATE → no autoincrement-id
-        # round-trip needed). The embedding service is optional;
-        # absence + per-call failure both fall back to the legacy
-        # column set with no behavioural change.
-        embedding_vec_val: Optional[List[float]] = await self._maybe_embed(content)
-
-        # #1477 — derive the active embedding profile id so the row
-        # can be filtered out of kNN reads that don't share the
-        # same semantic coordinate space. Never blocks the write —
-        # if the service can't describe itself the row's profile id
-        # stays NULL (= invisible to profile-filtered kNN, harmless).
+        # Compute the embedding from plaintext before the final INSERT so it
+        # can still be co-written without an autoincrement-id round trip.
+        embedding_vec_val = await self._maybe_embed(content)
         profile_id: Optional[str] = None
         embedding_service: Optional[Any] = None
         if embedding_vec_val is not None:
@@ -1310,14 +1332,14 @@ class AsyncConversationStore:
                     )
 
         lexical_index_id: Optional[str] = uuid.uuid4().hex
-        lexical_tokens = _tokenize_for_search(_strip_search_wrappers(content))
         lexical_index_version: Optional[str] = self._lexical_index.version
         try:
             # Completion protocol: token rows commit first, then the message
             # row and its coverage marker commit together.  A crash can leave
             # harmless orphan tokens, but never a falsely-covered message.
             await self._lexical_index.index_message(
-                lexical_index_id, lexical_tokens
+                lexical_index_id,
+                _tokenize_for_search(_strip_search_wrappers(content)),
             )
         except Exception as exc:  # noqa: BLE001 - recall falls back safely
             logger.error(
@@ -1328,35 +1350,75 @@ class AsyncConversationStore:
             lexical_index_id = None
             lexical_index_version = None
 
+        return _PreparedConversationWrite(
+            role=role,
+            content=to_store,
+            rendered_content=rendered_to_store,
+            metadata=meta,
+            embedding=embedding_vec_val,
+            embedding_profile_id=profile_id,
+            embedding_service=embedding_service,
+            model=model,
+            provider=provider,
+            lexical_index_id=lexical_index_id,
+            lexical_index_version=lexical_index_version,
+        )
+
+    async def _exclude_prepared_conversation_from_retrieval(
+        self,
+        prepared: _PreparedConversationWrite,
+    ) -> None:
+        """Drop precomputed retrieval residue before an excluded write lands."""
+        if prepared.lexical_index_id is not None:
+            await self._discard_lexical_tokens(prepared.lexical_index_id)
+            prepared.lexical_index_id = None
+            prepared.lexical_index_version = None
+        # An excluded derivative remains an auditable transcript row but must
+        # not retain a vector path while it has no retrievable lexical path.
+        prepared.embedding = None
+        prepared.embedding_profile_id = None
+        prepared.embedding_service = None
+
+    async def _persist_prepared_conversation(
+        self,
+        prepared: _PreparedConversationWrite,
+    ) -> None:
+        """Insert precomputed bytes and clean token-first work on failure."""
         try:
             lexical_columns_written = await self._insert_message(
-                role=role,
-                content=to_store,
-                rendered_content=rendered_to_store,
-                metadata=json.dumps(meta) if meta else None,
-                embedding=embedding_vec_val,
-                embedding_profile_id=profile_id,
-                model=model,
-                provider=provider,
-                lexical_index_id=lexical_index_id,
-                lexical_index_version=lexical_index_version,
+                role=prepared.role,
+                content=prepared.content,
+                rendered_content=prepared.rendered_content,
+                metadata=json.dumps(prepared.metadata) if prepared.metadata else None,
+                embedding=prepared.embedding,
+                embedding_profile_id=prepared.embedding_profile_id,
+                model=prepared.model,
+                provider=prepared.provider,
+                lexical_index_id=prepared.lexical_index_id,
+                lexical_index_version=prepared.lexical_index_version,
             )
         except Exception:
-            if lexical_index_id:
-                await self._discard_lexical_tokens(lexical_index_id)
+            if prepared.lexical_index_id:
+                await self._discard_lexical_tokens(prepared.lexical_index_id)
+                prepared.lexical_index_id = None
             raise
-        if not lexical_columns_written and lexical_index_id:
-            await self._discard_lexical_tokens(lexical_index_id)
+        if not lexical_columns_written and prepared.lexical_index_id:
+            await self._discard_lexical_tokens(prepared.lexical_index_id)
+            prepared.lexical_index_id = None
 
         # Upsert the profile descriptor into the registry table so
         # ``kestrel-sovereign embeddings audit`` can map id →
-        # human-readable fields. Best-effort: registry write must
-        # NEVER block message persistence. Cached in-process to
-        # avoid an UPSERT per turn.
-        if profile_id is not None and embedding_service is not None:
+        # human-readable fields. Best-effort: registry write must never block
+        # the already-persisted message.
+        if (
+            prepared.embedding_profile_id is not None
+            and prepared.embedding_service is not None
+        ):
             try:
                 await _upsert_embedding_profile(
-                    self.db, embedding_service, profile_id,
+                    self.db,
+                    prepared.embedding_service,
+                    prepared.embedding_profile_id,
                 )
             except Exception as exc:  # pragma: no cover - defensive
                 logger.debug(
@@ -3367,6 +3429,197 @@ class AsyncConversationStore:
             if not updated:
                 logger.warning(f"Message {message_id} not found for agent {self.agent_id}")
             return updated
+
+    async def _semantic_recall_dependency_rows(
+        self,
+        *,
+        assertion_ids: Iterable[str] = (),
+        revision_ids: Iterable[str] = (),
+    ) -> List[Tuple[int, Dict[str, Any]]]:
+        """Return this agent's rows linked to exact canonical identities.
+
+        The lookup is an exact JSON identity match, never a scan over message
+        content.  It includes archived and trashed artifacts deliberately: a
+        later restore must not make a forgotten fact reappear in context.
+
+        Physical erasure can remove a historical revision while preserving its
+        assertion identity with a fresh direct current revision.  Both identity
+        dimensions therefore participate in the match: assertion IDs cover a
+        fully erased assertion; revision IDs cover erased historical lineage.
+        """
+        normalized_assertion_ids = tuple(
+            sorted({value for value in assertion_ids if isinstance(value, str) and value})
+        )
+        normalized_revision_ids = tuple(
+            sorted({value for value in revision_ids if isinstance(value, str) and value})
+        )
+        if not normalized_assertion_ids and not normalized_revision_ids:
+            return []
+
+        predicates: list[str] = []
+        params: list[Any] = [self.agent_id]
+        if normalized_assertion_ids:
+            predicates.append(
+                "dependency ->> 'assertion_id' IN ("
+                + ", ".join("?" for _ in normalized_assertion_ids)
+                + ")"
+            )
+            params.extend(normalized_assertion_ids)
+        if normalized_revision_ids:
+            predicates.append(
+                "dependency ->> 'revision_id' IN ("
+                + ", ".join("?" for _ in normalized_revision_ids)
+                + ")"
+            )
+            params.extend(normalized_revision_ids)
+        postgres_predicate = " OR ".join(predicates)
+
+        if self.db.backend_type == "postgres":
+            postgres_sql = (
+                "SELECT id, metadata FROM conversation_history "
+                "WHERE agent_id = ? AND EXISTS ("
+                "SELECT 1 FROM jsonb_array_elements("
+                "CASE jsonb_typeof(metadata::jsonb -> "
+                "'semantic_recall_dependencies') "
+                "WHEN 'array' THEN metadata::jsonb -> "
+                "'semantic_recall_dependencies' ELSE '[]'::jsonb END"
+                ") AS dependency WHERE "
+                + postgres_predicate
+                + ") ORDER BY id ASC"
+            )
+            rows = await self.db.fetchall(
+                postgres_sql,
+                tuple(params),
+            )
+        else:
+            sqlite_predicates: list[str] = []
+            sqlite_params: list[Any] = [self.agent_id]
+            if normalized_assertion_ids:
+                sqlite_predicates.append(
+                    "json_extract(CASE WHEN json_valid(dependency.value) "
+                    "THEN dependency.value ELSE '{}' END, '$.assertion_id') IN ("
+                    + ", ".join("?" for _ in normalized_assertion_ids)
+                    + ")"
+                )
+                sqlite_params.extend(normalized_assertion_ids)
+            if normalized_revision_ids:
+                sqlite_predicates.append(
+                    "json_extract(CASE WHEN json_valid(dependency.value) "
+                    "THEN dependency.value ELSE '{}' END, '$.revision_id') IN ("
+                    + ", ".join("?" for _ in normalized_revision_ids)
+                    + ")"
+                )
+                sqlite_params.extend(normalized_revision_ids)
+            sqlite_sql = (
+                "SELECT id, metadata FROM conversation_history "
+                "WHERE agent_id = ? AND EXISTS ("
+                "SELECT 1 FROM json_each(CASE "
+                "WHEN json_type(CASE WHEN json_valid(COALESCE(metadata, '{}')) "
+                "THEN metadata ELSE '{}' END, "
+                "'$.semantic_recall_dependencies') = 'array' THEN json_extract("
+                "CASE WHEN json_valid(COALESCE(metadata, '{}')) THEN metadata "
+                "ELSE '{}' END, '$.semantic_recall_dependencies') "
+                "ELSE '[]' END) AS dependency WHERE "
+                + " OR ".join(sqlite_predicates)
+                + ") ORDER BY id ASC"
+            )
+            rows = await self.db.fetchall(
+                sqlite_sql,
+                tuple(sqlite_params),
+            )
+
+        matched: List[Tuple[int, Dict[str, Any]]] = []
+        for row_id, raw_metadata in rows:
+            try:
+                metadata = (
+                    dict(raw_metadata)
+                    if isinstance(raw_metadata, dict)
+                    else json.loads(raw_metadata) if raw_metadata else {}
+                )
+            except (TypeError, json.JSONDecodeError):
+                # The SQL predicate only admits valid JSON in SQLite; keep the
+                # defensive guard for old/manual PostgreSQL rows.
+                continue
+            if isinstance(metadata, dict):
+                matched.append((int(row_id), metadata))
+        return matched
+
+    async def exclude_semantic_recall_dependencies(
+        self,
+        *,
+        assertion_ids: Iterable[str] = (),
+        revision_ids: Iterable[str] = (),
+    ) -> Tuple[int, ...]:
+        """Exclude every conversation artifact linked to an exact identity.
+
+        This is intentionally a reversible context exclusion rather than a
+        string-based deletion.  The privacy wrapper invokes it in the same
+        transaction as canonical fact deletion; callers receive exact message
+        IDs only so dependent episode summaries can be excluded too.
+        """
+        rows = await self._semantic_recall_dependency_rows(
+            assertion_ids=assertion_ids,
+            revision_ids=revision_ids,
+        )
+        message_ids: list[int] = []
+        for message_id, metadata in rows:
+            updates: Dict[str, Any] = {"excluded_from_context": True}
+            if not metadata.get("excluded_reason"):
+                updates["excluded_reason"] = "semantic_assertion_deleted"
+            if await self.update_message_metadata(message_id, updates):
+                message_ids.append(message_id)
+        return tuple(message_ids)
+
+    async def scrub_semantic_recall_dependencies(
+        self,
+        *,
+        assertion_ids: Iterable[str] = (),
+        revision_ids: Iterable[str] = (),
+    ) -> int:
+        """Remove erased assertion/revision IDs from excluded artifacts.
+
+        Physical canonical erasure must not leave a durable reference to the
+        erased identifier.  ``excluded_from_context`` is deliberately sticky:
+        scrubbing lineage never re-admits the derivative content.
+        """
+        normalized_assertion_ids = {
+            value for value in assertion_ids if isinstance(value, str) and value
+        }
+        normalized_revision_ids = {
+            value for value in revision_ids if isinstance(value, str) and value
+        }
+        rows = await self._semantic_recall_dependency_rows(
+            assertion_ids=normalized_assertion_ids,
+            revision_ids=normalized_revision_ids,
+        )
+        scrubbed = 0
+        for message_id, metadata in rows:
+            dependencies = metadata.get("semantic_recall_dependencies")
+            if not isinstance(dependencies, list):
+                continue
+            retained = [
+                dependency
+                for dependency in dependencies
+                if not (
+                    isinstance(dependency, dict)
+                    and (
+                        dependency.get("assertion_id") in normalized_assertion_ids
+                        or dependency.get("revision_id") in normalized_revision_ids
+                    )
+                )
+            ]
+            if len(retained) == len(dependencies):
+                continue
+            updated = await self.update_message_metadata(
+                message_id,
+                {
+                    "semantic_recall_dependencies": retained,
+                    "excluded_from_context": True,
+                },
+            )
+            if updated:
+                scrubbed += 1
+        return scrubbed
 
     async def atomic_increment_metadata_counter(
         self,

@@ -36,6 +36,7 @@ from kestrel_sovereign.knowledge import (
     SemanticMaintenanceService,
     SemanticMaintenanceStatus,
     SourceOccurrence,
+    TemporalInterval,
     ValidationState,
     ValidationWriteAction,
     XSD_STRING,
@@ -138,6 +139,39 @@ async def _put(store, revision_id: str, subject: IRI, predicate: IRI, object_: I
     )
     assert result.accepted
     return assertion
+
+
+async def _link_semantic_recall_derivative(
+    store,
+    assertion: Assertion,
+    marker: str,
+) -> AsyncStorage:
+    """Seed one exact derivative through the storage-owned conversation path."""
+    storage = _GOVERNED_STORAGES[id(store)]
+    await storage.conversation.add_conversation(
+        "assistant",
+        marker,
+        metadata={
+            "semantic_recall_dependencies": [
+                {
+                    "assertion_id": assertion.assertion_id,
+                    "revision_id": assertion.revision_id,
+                }
+            ]
+        },
+    )
+    return storage
+
+
+async def _derivative_is_excluded(storage: AsyncStorage, marker: str) -> bool:
+    rows = await storage.conversation.get_full_history_with_ids(
+        include_excluded=True
+    )
+    return any(
+        row["content"] == marker
+        and row["metadata"].get("excluded_from_context") is True
+        for row in rows
+    )
 
 
 def _profile(*, owl: bool = False) -> InferenceProfile:
@@ -624,6 +658,11 @@ async def test_explicit_inference_revocation_retracts_materializations_and_ledge
         AssertionQuery(subject=subject, predicate=RDF_TYPE, object=class_b)
     )
     assert inferred
+    storage = await _link_semantic_recall_derivative(
+        assertion_store,
+        inferred[0],
+        "inference-revocation-derived-answer",
+    )
 
     result = await assertion_store.revoke_semantic_inference(ENGINE_VERSION)
 
@@ -638,6 +677,177 @@ async def test_explicit_inference_revocation_retracts_materializations_and_ledge
         (assertion_store.tenant_id,),
     )
     assert active_ledgers == 0
+    assert await _derivative_is_excluded(
+        storage,
+        "inference-revocation-derived-answer",
+    )
+
+
+@pytest.mark.asyncio
+async def test_sleep_expiry_withdraws_exact_semantic_recall_derivative(
+    assertion_store,
+) -> None:
+    """The maintenance audit uses the central lifecycle companion, not a wrapper."""
+    expired = replace(
+        _assertion(
+            assertion_store,
+            "expired-semantic-recall-revision",
+            IRI("https://example.test/expired-subject"),
+            IRI("https://example.test/expired-predicate"),
+            Literal("expired", XSD_STRING),
+        ),
+        valid_time=TemporalInterval(end="2020-01-01T00:00:00Z"),
+    )
+    written = await _GOVERNED_STORAGES[id(assertion_store)].put_assertion(
+        expired,
+        source_occurrences=(_source("source:expired-semantic-recall-revision"),),
+    )
+    assert written.accepted
+    storage = await _link_semantic_recall_derivative(
+        assertion_store,
+        expired,
+        "maintenance-expired-derived-answer",
+    )
+
+    result = await SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=None,
+    ).run()
+
+    assert result.expired_assertions == 1
+    assert await assertion_store.get_assertion(expired.assertion_id) is None
+    assert await _derivative_is_excluded(
+        storage,
+        "maintenance-expired-derived-answer",
+    )
+
+
+@pytest.mark.asyncio
+async def test_sleep_orphan_provenance_withdraws_exact_semantic_recall_derivative(
+    assertion_store,
+) -> None:
+    """Maintenance invalidation uses the same raw-store companion as expiry."""
+    orphan = await _put(
+        assertion_store,
+        "orphan-semantic-recall-revision",
+        IRI("https://example.test/orphan-subject"),
+        IRI("https://example.test/orphan-predicate"),
+        Literal("orphan", XSD_STRING),
+    )
+    storage = await _link_semantic_recall_derivative(
+        assertion_store,
+        orphan,
+        "maintenance-orphan-derived-answer",
+    )
+    await storage.db.execute(
+        "DELETE FROM semantic_revision_sources "
+        "WHERE tenant_id = ? AND revision_id = ?",
+        (assertion_store.tenant_id, orphan.revision_id),
+    )
+
+    result = await SemanticMaintenanceService(
+        assertion_store,
+        inference_profile=None,
+    ).run()
+
+    assert result.orphan_provenance == 1
+    # Eligibility loss preserves the auditable source assertion as current,
+    # but it can no longer support recall or inference.
+    assert await assertion_store.get_assertion(orphan.assertion_id) == orphan
+    assert await _derivative_is_excluded(
+        storage,
+        "maintenance-orphan-derived-answer",
+    )
+
+
+@pytest.mark.asyncio
+async def test_derivative_callback_failure_rolls_back_canonical_withdrawal(
+    assertion_store,
+) -> None:
+    """A companion failure cannot commit a visible lifecycle/recall split."""
+    fact = await _put(
+        assertion_store,
+        "callback-rollback-revision",
+        IRI("https://example.test/callback-rollback-subject"),
+        IRI("https://example.test/callback-rollback-predicate"),
+        Literal("callback-rollback", XSD_STRING),
+    )
+    storage = await _link_semantic_recall_derivative(
+        assertion_store,
+        fact,
+        "callback-rollback-derived-answer",
+    )
+
+    async def fail_derivative_withdrawal(**_kwargs) -> None:
+        raise AssertionConflictError("forced derivative withdrawal failure")
+
+    assertion_store._semantic_recall_derivative_revoker = fail_derivative_withdrawal  # noqa: SLF001 - atomic callback contract
+    with pytest.raises(AssertionConflictError, match="forced derivative withdrawal failure"):
+        await assertion_store.retract(
+            fact.assertion_id,
+            fact.revision_id,
+            operation_id="callback-rollback-retract",
+        )
+
+    assert await assertion_store.get_assertion(fact.assertion_id) == fact
+    assert not await _derivative_is_excluded(
+        storage,
+        "callback-rollback-derived-answer",
+    )
+
+
+@pytest.mark.asyncio
+async def test_fenced_derivative_insert_cleans_precomputed_tokens_after_rollback(
+    assertion_store,
+    monkeypatch,
+) -> None:
+    """A failed final INSERT cleans token-first work after the fence rolls back."""
+    fact = await _put(
+        assertion_store,
+        "fenced-insert-cleanup-revision",
+        IRI("https://example.test/fenced-insert-cleanup-subject"),
+        IRI("https://example.test/fenced-insert-cleanup-predicate"),
+        Literal("fenced-insert-cleanup", XSD_STRING),
+    )
+    storage = _GOVERNED_STORAGES[id(assertion_store)]
+    prepared_ids: list[str] = []
+    prepare = storage.conversation._prepare_conversation_write  # noqa: SLF001 - fence prework contract
+
+    async def capture_prepare(*args, **kwargs):
+        prepared = await prepare(*args, **kwargs)
+        if prepared.lexical_index_id is not None:
+            prepared_ids.append(prepared.lexical_index_id)
+        return prepared
+
+    async def fail_insert(**_kwargs):
+        raise RuntimeError("forced fenced insert failure")
+
+    monkeypatch.setattr(
+        storage.conversation,
+        "_prepare_conversation_write",
+        capture_prepare,
+    )
+    monkeypatch.setattr(storage.conversation, "_insert_message", fail_insert)
+    with pytest.raises(TransactionError, match="forced fenced insert failure"):
+        await storage.add_conversation(
+            "assistant",
+            "fenced insertion must not leak tokens",
+            metadata={
+                "semantic_recall_dependencies": [
+                    {
+                        "assertion_id": fact.assertion_id,
+                        "revision_id": fact.revision_id,
+                    }
+                ]
+            },
+        )
+
+    for lexical_index_id in prepared_ids:
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM conversation_lexical_tokens "
+            "WHERE agent_id = ? AND lexical_index_id = ?",
+            (storage.agent_id, lexical_index_id),
+        ) == 0
 
 
 @pytest.mark.asyncio
@@ -3119,7 +3329,15 @@ async def test_ontology_version_change_invalidates_prior_materialization(asserti
     await _put(assertion_store, "subject-a", subject, RDF_TYPE, class_a)
     first = BoundedInferenceService(assertion_store, _profile())
     assert (await first.materialize_incremental()).complete
-    assert await assertion_store.query(AssertionQuery(subject=subject, predicate=RDF_TYPE, object=class_b))
+    inferred = await assertion_store.query(
+        AssertionQuery(subject=subject, predicate=RDF_TYPE, object=class_b)
+    )
+    assert inferred
+    storage = await _link_semantic_recall_derivative(
+        assertion_store,
+        inferred[0],
+        "stale-inference-derived-answer",
+    )
 
     newer_ontology = OntologyRef(
         "https://kestrel.ai/vocab/",
@@ -3130,6 +3348,10 @@ async def test_ontology_version_change_invalidates_prior_materialization(asserti
     newer_profile = InferenceProfile(newer_ontology, "1.0.0")
     assert (await BoundedInferenceService(assertion_store, newer_profile).materialize_incremental()).complete
     assert await assertion_store.query(AssertionQuery(subject=subject, predicate=RDF_TYPE, object=class_b)) == []
+    assert await _derivative_is_excluded(
+        storage,
+        "stale-inference-derived-answer",
+    )
 
 
 @pytest.mark.asyncio
@@ -3148,8 +3370,14 @@ async def test_profile_change_reconciles_obsolete_proofs_before_maintenance_comp
             assertion_store, _profile(owl=True)
         ).materialize_incremental()
     ).complete
-    assert await assertion_store.query(
+    inferred = await assertion_store.query(
         AssertionQuery(subject=subject, predicate=RDF_TYPE, object=class_b)
+    )
+    assert inferred
+    storage = await _link_semantic_recall_derivative(
+        assertion_store,
+        inferred[0],
+        "profile-reconciliation-derived-answer",
     )
 
     maintenance = SemanticMaintenanceService(
@@ -3170,6 +3398,10 @@ async def test_profile_change_reconciles_obsolete_proofs_before_maintenance_comp
         assert follow_up.status is SemanticMaintenanceStatus.PARTIAL
     else:
         pytest.fail("obsolete profile conclusion remained active after reconciliation pages")
+    assert await _derivative_is_excluded(
+        storage,
+        "profile-reconciliation-derived-answer",
+    )
     for _ in range(10):
         final = await maintenance.run()
         if final.status in (

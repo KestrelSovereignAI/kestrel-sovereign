@@ -561,6 +561,18 @@ async def test_current_graph_validation_is_revalidation_and_quarantines_the_snap
     try:
         assertion = _candidate_assertion("current-validation-revision")
         await storage.put_assertion(assertion, source_occurrences=(_candidate_source(),))
+        await storage.conversation.add_conversation(
+            "assistant",
+            "shacl-quarantined-semantic-answer",
+            metadata={
+                "semantic_recall_dependencies": [
+                    {
+                        "assertion_id": assertion.assertion_id,
+                        "revision_id": assertion.revision_id,
+                    }
+                ]
+            },
+        )
         service = GovernedSemanticValidationService(
             storage._assertion_store(),
             validator=GovernedShaclValidationService(_registry(_REJECT_CURRENT_REVISION_SHAPES)),
@@ -574,6 +586,14 @@ async def test_current_graph_validation_is_revalidation_and_quarantines_the_snap
         assert report.source is ValidationSource.REVALIDATION
         assert report.action is ValidationWriteAction.QUARANTINE
         assert await storage.get_assertion(assertion.assertion_id) is None
+        derivative = next(
+            row
+            for row in await storage.conversation.get_full_history_with_ids(
+                include_excluded=True
+            )
+            if row["content"] == "shacl-quarantined-semantic-answer"
+        )
+        assert derivative["metadata"]["excluded_from_context"] is True
     finally:
         await storage.close()
 

@@ -126,6 +126,10 @@ class ContextBuilder:
         llm_service=None,
         db=None,
         agent_id: Optional[str] = None,
+        semantic_inference_profile=None,
+        semantic_inference_limits=None,
+        semantic_maintenance_limits=None,
+        semantic_answerability_gate=None,
     ):
         """
         Initialize the context builder.
@@ -149,6 +153,13 @@ class ContextBuilder:
         self._counter = None
         self._counter_model = None
         self.consolidator = consolidator
+        self._semantic_inference_profile = semantic_inference_profile
+        self._semantic_inference_limits = semantic_inference_limits
+        self._semantic_maintenance_limits = semantic_maintenance_limits
+        # Reuse the agent-owned, privacy-aware memory judge.  Assertion
+        # recall must never create a second LLM client or bypass that lane.
+        self._semantic_answerability_gate = semantic_answerability_gate
+        self.last_semantic_recall_metadata: Dict[str, Any] = {"status": "disabled"}
         self.agent_data_path = Path(agent_data_path) if agent_data_path else None
 
         # Load bootstrap config from kestrel.toml
@@ -311,7 +322,7 @@ class ContextBuilder:
         return True
 
     async def retrieve_context(
-        self, query: str, min_score: Optional[float] = None
+        self, query: str, min_score: Optional[float] = None, max_tokens: Optional[int] = None
     ) -> str:
         """
         Retrieves relevant documents and knowledge graph context for a query.
@@ -338,30 +349,198 @@ class ContextBuilder:
             if min_score is not None:
                 search_kwargs["min_score"] = min_score
             rag_results = await self.storage.search_chunks(query, **search_kwargs)
-            context_parts = []
-            for res in rag_results:
-                doc_name = res.get('document_name') or res.get('file_hash', 'unknown')
-                content = res.get('content', '')
-                # Include timestamp if available for temporal awareness
-                created_at = res.get('created_at', '')
-                timestamp_note = f" (indexed: {created_at})" if created_at else ""
-                context_parts.append(
-                    f"Source: {doc_name}{timestamp_note}\nContent: {content}"
-                )
         except Exception as e:
             logger.error(f"Error during RAG search: {e}")
-            context_parts = ["Error retrieving document context."]
+            return "Error retrieving document context."
 
-        # 2. Search knowledge graph (Conceptual)
-        # In a real implementation, we would parse the query for entities
-        # and query the graph for related nodes.
-        # kg_results = self.storage.query_graph(...)
-        # context_parts.append(f"Knowledge Graph Context: {kg_results}")
-
-        if not context_parts:
+        # The semantic boundary is opt-in. Disabled and empty results preserve
+        # the legacy RAG bytes exactly, including ordering and cache behavior.
+        from kestrel_sovereign.agent.semantic_recall import coerce_config, render_hybrid_context
+        try:
+            from kestrel_sovereign.config import load_section
+            recall_values = load_section("retrieval") or {}
+            if "semantic_recall_enabled" not in recall_values:
+                recall_values = {**recall_values, "semantic_recall_enabled": False}
+            recall_config = coerce_config(recall_values)
+        except Exception as exc:
+            logger.warning("Semantic recall configuration unavailable: %s", exc)
+            recall_config = coerce_config({"semantic_recall_enabled": False})
+        if recall_config.enabled:
+            self.last_semantic_recall_metadata = {"status": "enabled"}
+            reader = getattr(self.storage, "semantic_recall_candidates", None)
+            if reader is None:
+                logger.warning("Semantic recall capability unavailable: storage seam missing")
+            else:
+                try:
+                    recalled = await reader(
+                        query=query,
+                        candidate_scan_limit=recall_config.candidate_scan_limit,
+                        inference_profile=self._semantic_inference_profile,
+                        inference_limits=self._semantic_inference_limits,
+                        maintenance_limits=self._semantic_maintenance_limits,
+                    )
+                    semantic_scores = await self._semantic_scores(
+                        query, recalled.candidates,
+                        max_claim_characters=recall_config.max_claim_characters,
+                        batch_size=recall_config.embedding_batch_size,
+                    )
+                    ordered = sorted(
+                        (item for item in recalled.candidates if item.assertion.assertion_id in semantic_scores),
+                        key=lambda item: (-semantic_scores[item.assertion.assertion_id], item.assertion.assertion_id),
+                    )
+                    selected = tuple(ordered[:recall_config.candidate_limit])
+                    # Empty discovery/ranking is a normal governed result.
+                    # Do not ask the provenance capability to hydrate an empty
+                    # set: that would convert byte-identical legacy RAG into a
+                    # spurious unavailable state.
+                    if not selected:
+                        hybrid = render_hybrid_context(
+                            query=query,
+                            rag_results=rag_results,
+                            assertion_candidates=(),
+                            config=recall_config,
+                            count_tokens=self.counter.count,
+                            semantic_scores=semantic_scores,
+                            max_tokens=max_tokens,
+                        )
+                        self.last_semantic_recall_metadata = {
+                            "status": "empty",
+                            "checkpoint_generation": recalled.checkpoint_generation,
+                            "capability_versions": dict(recalled.capability_versions),
+                            "discovery_count": recalled.discovery_count,
+                            "assertions": hybrid.metadata,
+                        }
+                        return hybrid.context
+                    hydrator = getattr(self.storage, "hydrate_semantic_recall_candidates", None)
+                    if hydrator is None:
+                        raise RuntimeError("semantic_recall_provenance_capability_unavailable")
+                    hydrated = await hydrator(
+                        [item.assertion.assertion_id for item in selected],
+                        expected_checkpoint_generation=recalled.checkpoint_generation,
+                        inference_profile=self._semantic_inference_profile,
+                        inference_limits=self._semantic_inference_limits,
+                        maintenance_limits=self._semantic_maintenance_limits,
+                    )
+                    by_id = {item.assertion.assertion_id: item for item in hydrated}
+                    candidates = tuple(by_id[item.assertion.assertion_id] for item in selected if item.assertion.assertion_id in by_id)
+                    hybrid = render_hybrid_context(
+                        query=query, rag_results=rag_results,
+                        assertion_candidates=candidates,
+                        config=recall_config, count_tokens=self.counter.count,
+                        semantic_scores=semantic_scores, max_tokens=max_tokens,
+                    )
+                    self.last_semantic_recall_metadata = {
+                        "status": "used" if hybrid.assertion_count else "empty",
+                        "checkpoint_generation": recalled.checkpoint_generation,
+                        "capability_versions": dict(recalled.capability_versions),
+                        "discovery_count": recalled.discovery_count,
+                        "assertions": hybrid.metadata,
+                    }
+                    return hybrid.context
+                except Exception as exc:
+                    # Capability failures are observable and never fabricate a
+                    # graph result; retain the established RAG path.
+                    reason = self._semantic_failure_reason(exc)
+                    logger.warning(
+                        "Semantic recall unavailable reason=%s error_class=%s",
+                        reason, type(exc).__name__,
+                    )
+                    self.last_semantic_recall_metadata = {
+                        "status": "unavailable", "reason": self._semantic_failure_reason(exc),
+                    }
+        else:
+            self.last_semantic_recall_metadata = {"status": "disabled"}
+        if not rag_results:
             return "No relevant documents or knowledge found in memory."
+        return "\n\n".join(
+            f"Source: {res.get('document_name') or res.get('file_hash', 'unknown')}"
+            f"{' (indexed: ' + str(res.get('created_at')) + ')' if res.get('created_at') else ''}\n"
+            f"Content: {res.get('content', '')}"
+            for res in rag_results
+        )
 
-        return "\n\n".join(context_parts)
+    async def _semantic_scores(self, query: str, candidates, *, max_claim_characters: int, batch_size: int) -> Dict[str, float]:
+        """Score already-authorized candidates in one embedding batch.
+
+        Assertions never get a second persisted vector index. The existing
+        embedding service is only a candidate ranker; a capability failure
+        aborts semantic recall rather than silently pretending lexical recall
+        was semantic.
+        """
+        if not candidates:
+            return {}
+        from kestrel_sovereign.agent.semantic_recall import _claim_text
+        from kestrel_sovereign.llm.embedding_service import aembed_retrieval_query, cosine_similarity, get_provider_embedding_service
+        service = get_provider_embedding_service(self._llm_service)
+        if service is None:
+            raise RuntimeError("semantic_embedding_capability_unavailable")
+        requires_gate = getattr(service, "requires_answerability_gate", None)
+        gate_required = callable(requires_gate) and requires_gate()
+        floor_getter = getattr(service, "retrieval_similarity_floor", None)
+        floor = float(floor_getter()) if callable(floor_getter) else 0.0
+        query_embedding = await aembed_retrieval_query(service, query)
+        if query_embedding is None:
+            raise RuntimeError("semantic_embedding_capability_unavailable")
+        scores: Dict[str, float] = {}
+        for start in range(0, len(candidates), batch_size):
+            batch = candidates[start:start + batch_size]
+            embeddings = await service.aembed_batch([
+                _claim_text(item.assertion, max_claim_characters) for item in batch
+            ])
+            if len(embeddings) != len(batch) or any(value is None for value in embeddings):
+                raise RuntimeError("semantic_embedding_capability_unavailable")
+            scores.update({
+                item.assertion.assertion_id: score
+                for item, embedding in zip(batch, embeddings)
+                if (score := cosine_similarity(query_embedding, embedding)) >= floor
+            })
+        if gate_required:
+            gate = self._semantic_answerability_gate
+            if gate is None or not callable(getattr(gate, "filter", None)):
+                raise RuntimeError("semantic_answerability_gate_unavailable")
+            # The judge sees only the bounded, already-ranked top-K projection.
+            # It runs before provenance hydration, so rejected or failed claims
+            # cannot be published through a later storage read.
+            from kestrel_sovereign.storage.memory_answerability import AnswerabilityCandidate
+            ranked = sorted(
+                (item for item in candidates if item.assertion.assertion_id in scores),
+                key=lambda item: (-scores[item.assertion.assertion_id], item.assertion.assertion_id),
+            )[:8]
+            decision = await gate.filter(
+                query,
+                [
+                    AnswerabilityCandidate(
+                        memory_id=item.assertion.assertion_id,
+                        content=_claim_text(item.assertion, max_claim_characters),
+                    )
+                    for item in ranked
+                ],
+            )
+            if not getattr(decision, "completed", False):
+                raise RuntimeError("semantic_answerability_gate_unavailable")
+            allowed = frozenset(getattr(decision, "answerable_ids", ()))
+            scores = {
+                assertion_id: score
+                for assertion_id, score in scores.items()
+                if assertion_id in allowed
+            }
+        return scores
+
+    @staticmethod
+    def _semantic_failure_reason(error: Exception) -> str:
+        """Never serialize provider exception text into retrieval metadata."""
+        known = {
+            "semantic_embedding_capability_unavailable",
+            "semantic_recall_candidate_window_exceeded",
+            "semantic_maintenance_capability_unavailable",
+            "semantic_maintenance_checkpoint_behind",
+            "semantic_maintenance_state_missing",
+            "semantic_maintenance_partial",
+            "semantic_recall_checkpoint_changed",
+            "semantic_answerability_gate_unavailable",
+        }
+        value = str(error)
+        return value if value in known else "semantic_recall_capability_unavailable"
 
     def get_session_briefing(self) -> str:
         """

@@ -276,6 +276,13 @@ class MemoryConsolidator:
                 except (json.JSONDecodeError, TypeError):
                     metadata = {}
 
+            # Excluded conversation artifacts are provenance-tainted
+            # derivatives.  They must never seed a fresh visible episode after
+            # a fact lifecycle action, even if the original episode had been
+            # excluded before this nightly pass.
+            if metadata.get("excluded_from_context"):
+                continue
+
             # Parse date from created_at
             try:
                 if isinstance(created_at, str):
@@ -413,7 +420,7 @@ class MemoryConsolidator:
         """
         rows = await self._db.fetchall(
             """SELECT key_message_ids FROM memory_episodes
-               WHERE agent_id = ?""",
+               WHERE agent_id = ? AND COALESCE(excluded_from_context, 0) = 0""",
             (self.agent_id,),
         )
         covered: set = set()
@@ -841,6 +848,7 @@ class MemoryConsolidator:
             rows = await self._db.fetchall(
                 """SELECT id, title, summary FROM memory_episodes
                    WHERE agent_id = ? AND embedding_vec IS NULL
+                     AND COALESCE(excluded_from_context, 0) = 0
                    ORDER BY created_at DESC
                    LIMIT ?""",
                 (self.agent_id, limit),
@@ -979,7 +987,10 @@ class MemoryConsolidator:
             from kestrel_sovereign.storage.vector import get_vector_backend
 
             spec = build_episode_spec(dimension=len(query_embedding))
-            filter_kwargs: Dict[str, Any] = {"agent_id": self.agent_id}
+            filter_kwargs: Dict[str, Any] = {
+                "agent_id": self.agent_id,
+                "excluded_from_context": 0,
+            }
             if hasattr(service, "current_profile_id"):
                 try:
                     pid = service.current_profile_id()
@@ -1045,6 +1056,7 @@ class MemoryConsolidator:
                            ({score_clause}) AS token_match_count
                     FROM memory_episodes
                     WHERE agent_id = ?
+                      AND COALESCE(excluded_from_context, 0) = 0
                       AND ({token_clause})
                     {exclude_clause}
                     ORDER BY token_match_count DESC, created_at DESC
@@ -1075,7 +1087,8 @@ class MemoryConsolidator:
                        key_message_ids, emotional_arc, created_at, importance,
                        access_count
                 FROM memory_episodes
-                WHERE agent_id = ? AND id IN ({placeholders})""",
+                WHERE agent_id = ? AND id IN ({placeholders})
+                  AND COALESCE(excluded_from_context, 0) = 0""",
             (self.agent_id, *ids),
         )
         by_id = {r[0]: MemoryEpisode.from_row(r) for r in rows or []}
@@ -1110,6 +1123,11 @@ class MemoryConsolidator:
                     metadata = json.loads(metadata)
                 except (json.JSONDecodeError, TypeError):
                     metadata = {}
+            # Temporal patterns are durable derived memory too.  Do not allow
+            # a hidden semantic-recall artifact to re-enter context through a
+            # newly detected pattern on the next sleep cycle.
+            if metadata.get("excluded_from_context"):
+                continue
             messages.append({
                 "content": content,
                 "metadata": metadata,
@@ -1157,6 +1175,12 @@ class MemoryConsolidator:
                     metadata = json.loads(metadata)
                 except (json.JSONDecodeError, TypeError):
                     metadata = {}
+
+            # Keep the exclusion barrier sticky.  Decay processing is not a
+            # context producer, but must not normalize an excluded row into a
+            # legacy archive representation that other paths could restore.
+            if metadata.get("excluded_from_context"):
+                continue
 
             # Migrate the legacy dual-state representation. Older releases
             # wrote metadata.archived without the dedicated column, making
@@ -1316,10 +1340,6 @@ class MemoryConsolidator:
         if not rows:
             return None
 
-        # Check minimum message count
-        if len(rows) < self.MIN_EPISODE_MESSAGES and not force:
-            return None
-
         # Convert rows to message dicts
         messages = []
         for row in rows:
@@ -1331,6 +1351,12 @@ class MemoryConsolidator:
                 except (json.JSONDecodeError, TypeError):
                     metadata = {}
 
+            # Session episodes use a separate source query from nightly
+            # consolidation.  Apply the same barrier here or sleep/restart can
+            # recreate visible episode text from an excluded derivative.
+            if metadata.get("excluded_from_context"):
+                continue
+
             messages.append({
                 "id": msg_id,
                 "content": content,
@@ -1338,6 +1364,14 @@ class MemoryConsolidator:
                 "created_at": created_at,
                 "role": role,
             })
+
+        # The threshold is intentionally evaluated after exclusion.  Hidden
+        # artifacts must neither produce an episode nor count toward forcing
+        # a visible episode from the remaining unrelated messages.
+        if len(messages) < self.MIN_EPISODE_MESSAGES and not force:
+            return None
+        if not messages:
+            return None
 
         # Calculate emotional intensity for episode worthiness
         intensities = [
@@ -1435,7 +1469,7 @@ class MemoryConsolidator:
                       key_message_ids, emotional_arc, created_at, importance,
                       access_count
                FROM memory_episodes
-               WHERE agent_id = ?
+               WHERE agent_id = ? AND COALESCE(excluded_from_context, 0) = 0
                ORDER BY created_at DESC
                LIMIT ? OFFSET ?""",
             (self.agent_id, limit, offset)

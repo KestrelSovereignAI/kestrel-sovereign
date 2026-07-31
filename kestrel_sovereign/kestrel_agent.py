@@ -2610,6 +2610,10 @@ class KestrelAgent(
             agent_data_path=agent_data_dir,
             db=self._raw_storage.db,
             agent_id=self.agent_id,
+            semantic_inference_profile=self.semantic_inference_profile,
+            semantic_inference_limits=self.semantic_inference_limits,
+            semantic_maintenance_limits=self.semantic_maintenance_limits,
+            semantic_answerability_gate=self.memory_system.retriever.answerability_gate,
         )
         # Merge DB-backed bootstrap config (bootstrap_add / bootstrap_remove
         # persistence) into the loader before the first system-prompt
@@ -4708,6 +4712,7 @@ Expected Duration: {expected_duration}
         content: str,
         *,
         session_id: Optional[str] = None,
+        metadata: Optional[dict] = None,
         response=None,
         model: Optional[str] = None,
         provider: Optional[str] = None,
@@ -4719,6 +4724,8 @@ Expected Duration: {expected_duration}
             use_last_identity=use_last_identity or response is not None,
         )
         kwargs = {"session_id": session_id}
+        if metadata:
+            kwargs["metadata"] = metadata
         resolved_model = model or identity.get("model")
         resolved_provider = provider or identity.get("provider")
         if resolved_model is not None:
@@ -5018,6 +5025,13 @@ Expected Duration: {expected_duration}
             anchored_doctrine=anchored_doctrine,
             tools=feature_tools,
         )
+        from kestrel_sovereign.agent.semantic_recall import (
+            persistence_dependency_metadata,
+        )
+
+        semantic_recall_metadata = persistence_dependency_metadata(
+            getattr(context_result, "semantic_recall_dependencies", ())
+        )
 
         # B / #1309 + C / #1311: degraded-mode fail-closed.
         # ``build_context`` returns ``degraded_mode=True`` when (1) the
@@ -5094,7 +5108,7 @@ Expected Duration: {expected_duration}
         # internal instruction block — matching the live path, which shows only
         # the wake's response bubble and never the prompt. rendered_content is
         # untouched, so LLM replay + cache stability are unaffected.
-        user_meta = {"sent_form": True}
+        user_meta = {"sent_form": True, **semantic_recall_metadata}
         if signal_wake:
             user_meta["signal_wake"] = signal_wake
         try:
@@ -5377,7 +5391,10 @@ Expected Duration: {expected_duration}
 
         # Store agent response (linked to session for resumed conversations)
         await self._persist_assistant_conversation(
-            response_text, session_id=session_id, response=response,
+            response_text,
+            session_id=session_id,
+            metadata=semantic_recall_metadata,
+            response=response,
         )
 
         # Post-response memory pipeline:

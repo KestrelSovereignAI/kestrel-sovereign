@@ -176,6 +176,8 @@ class SectionResult:
     warning: Optional[str] = None
     #: Set by the coordinator when the section's bytes were committed.
     committed: bool = False
+    #: Content-free producer observability carried into the context plan.
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

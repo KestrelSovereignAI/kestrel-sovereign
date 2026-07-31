@@ -1925,7 +1925,7 @@ class PrivacyEnforcingStorage:
                         explicit_fact_selector=(
                             mapping.subject,
                             mapping.predicate,
-                        ),
+                        )
                     )
                     return FactDeleteReceipt(
                         deleted=True,
@@ -3079,7 +3079,8 @@ class PrivacyEnforcingStorage:
         """Govern replacements through full tentative-state SHACL validation."""
         self._assert_semantic_assertion_write_allowed("supersede_assertion")
         return await self._storage.supersede_validated_assertion(
-            expected_predecessor_revision_id, replacement,
+            expected_predecessor_revision_id,
+            replacement,
             source_occurrences=source_occurrences,
             **validation_options,
         )
@@ -3126,7 +3127,9 @@ class PrivacyEnforcingStorage:
         # durable content would pierce their read boundary.
         self._assert_semantic_assertion_read_allowed("retractions")
         return await self._storage.retract_assertion(
-            assertion_id, expected_revision_id, operation_id=operation_id,
+            assertion_id,
+            expected_revision_id,
+            operation_id=operation_id,
         )
 
     async def delete_assertion(
@@ -3166,13 +3169,20 @@ class PrivacyEnforcingStorage:
         # this durable lifecycle surface to observe semantic history.
         self._assert_semantic_assertion_read_allowed("validation invalidation")
         return await self._storage.invalidate_assertion_eligibility(
-            assertion_id, expected_revision_id, operation_id=operation_id,
+            assertion_id,
+            expected_revision_id,
+            operation_id=operation_id,
         )
 
     async def erase_assertion(self, assertion_id, *, operation_id=None):
         # Physical erasure is never blocked by a privacy mode, a pin, or a
-        # derived reference.  The normalized store computes its full closure.
-        return await self._storage.erase_assertion(assertion_id, operation_id=operation_id)
+        # derived reference.  The canonical store computes the full transitive
+        # closure under its tenant lock and invokes its bound derivative
+        # companion before canonical identities can be erased.
+        return await self._storage.erase_assertion(
+            assertion_id,
+            operation_id=operation_id,
+        )
 
     def _assert_semantic_assertion_read_allowed(self, operation: str) -> None:
         """Keep volatile sessions from observing durable semantic knowledge.
@@ -3240,6 +3250,21 @@ class PrivacyEnforcingStorage:
     async def assertion_inference_inputs(self, query=None):
         self._assert_semantic_assertion_read_allowed("inference inputs")
         return await self._storage.assertion_inference_inputs(query)
+
+    async def semantic_recall_candidates(
+        self, *, query, candidate_scan_limit, inference_profile, inference_limits=None, maintenance_limits=None,
+    ):
+        self._assert_semantic_assertion_read_allowed("semantic recall")
+        return await self._storage.semantic_recall_candidates(
+            query=query, candidate_scan_limit=candidate_scan_limit,
+            inference_profile=inference_profile,
+            inference_limits=inference_limits,
+            maintenance_limits=maintenance_limits,
+        )
+
+    async def hydrate_semantic_recall_candidates(self, assertion_ids, **kwargs):
+        self._assert_semantic_assertion_read_allowed("semantic recall provenance")
+        return await self._storage.hydrate_semantic_recall_candidates(assertion_ids, **kwargs)
 
     async def semantic_inference_state(self, profile):
         self._assert_semantic_assertion_read_allowed("inference status")

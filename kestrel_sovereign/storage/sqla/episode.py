@@ -20,7 +20,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Optional
 
-from sqlalchemy import String, Text
+from sqlalchemy import Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ..vector import VectorTableSpec
@@ -61,6 +61,9 @@ class MemoryEpisodeRow(SovereignBase):
     embedding_profile_id: Mapped[Optional[str]] = mapped_column(
         Text, nullable=True
     )
+    excluded_from_context: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
 
     created_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
 
@@ -90,5 +93,6 @@ def build_episode_spec(dimension: int) -> VectorTableSpec:
         filter_columns={
             "agent_id": MemoryEpisodeRow.agent_id,
             "embedding_profile_id": MemoryEpisodeRow.embedding_profile_id,
+            "excluded_from_context": MemoryEpisodeRow.excluded_from_context,
         },
     )

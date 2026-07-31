@@ -9,6 +9,7 @@ environment variable KESTREL_DB_BACKEND.
 """
 import asyncio
 import io
+import json
 import os
 import logging
 import tarfile
@@ -20,7 +21,7 @@ from typing import Dict, Optional, List, Any, Union
 
 from .async_database import AsyncDatabase
 from .async_file_store import AsyncFileStore
-from .async_conversation_store import AsyncConversationStore
+from .async_conversation_store import AsyncConversationStore, _rows_affected
 from .destructive_audit import DestructiveAuditLog, audit_db_path_for
 from .async_graph_store import AsyncGraphStore, GraphNode, Edge, NodeSwapResult
 from .async_assertion_store import (
@@ -299,6 +300,9 @@ class AsyncStorage:
                     self.db,
                     tenant_capability=self._assertion_tenant_capability,
                 )
+                self._assertions._bind_semantic_recall_derivative_revoker(  # noqa: SLF001 - storage composition seam
+                    self._withdraw_semantic_recall_derivatives
+                )
             self.rag = AsyncRAGStore(
                 self.db,
                 llm_service=self.llm_service,
@@ -402,11 +406,125 @@ class AsyncStorage:
         """
         if not self._initialized:
             await self.initialize()
-        await self.conversation.add_conversation(
-            role, content, metadata, session_id,
-            rendered_content=rendered_content,
-            model=model,
-            provider=provider,
+        persisted_metadata = dict(metadata) if metadata else {}
+        dependencies = self._semantic_recall_dependencies_for_persistence(
+            persisted_metadata
+        )
+        # Provider embedding and lexical indexing may perform slow I/O.  Do
+        # that work before the assertion lifecycle fence; only the exact
+        # liveness check and final INSERT may hold tenant serialization.
+        prepared = await self.conversation._prepare_conversation_write(  # noqa: SLF001 - coordinated persistence seam
+            role,
+            content,
+            persisted_metadata,
+            session_id,
+            rendered_content,
+            model,
+            provider,
+        )
+        # Token-first lexical work happens before the canonical fence.  Keep
+        # its exact handle even if the prepared object later clears it: an
+        # INSERT exception inside the fence rolls back in-fence cleanup, so
+        # the caller must retry cleanup after the transaction has exited.
+        prepared_lexical_index_id = prepared.lexical_index_id
+
+        async def persist() -> None:
+            await self.conversation._persist_prepared_conversation(  # noqa: SLF001 - coordinated persistence seam
+                prepared
+            )
+
+        async def exclude_and_persist() -> None:
+            self._exclude_stale_semantic_recall_derivative(prepared.metadata)
+            await self.conversation._exclude_prepared_conversation_from_retrieval(  # noqa: SLF001 - coordinated persistence seam
+                prepared
+            )
+            await persist()
+
+        # Only semantic-recall derivatives carry the lineage field.  Normal
+        # conversation writes keep their historical no-lock path.
+        if "semantic_recall_dependencies" not in persisted_metadata:
+            await persist()
+            return
+
+        if dependencies is None:
+            await exclude_and_persist()
+            return
+
+        if not dependencies:
+            # An explicitly empty lineage is not a semantic derivative and is
+            # produced by the normal no-recall path.  Preserve that behavior.
+            await persist()
+            return
+
+        try:
+            assertions = self._assertion_store()
+        except RuntimeError:
+            # A partial/unbound storage bootstrap has no canonical authority
+            # with which to validate a claimed semantic lineage.  Persisting it
+            # visibly would let a caller create an unrevocable derivative.
+            await exclude_and_persist()
+            return
+
+        try:
+            async with assertions._semantic_recall_persistence_fence(
+                dependencies
+            ) as visible:
+                if not visible:
+                    await exclude_and_persist()
+                    return
+                await persist()
+        except Exception:
+            if prepared_lexical_index_id is not None:
+                await self.conversation._discard_lexical_tokens(  # noqa: SLF001 - post-rollback token cleanup
+                    prepared_lexical_index_id
+                )
+            raise
+
+    @staticmethod
+    def _semantic_recall_dependencies_for_persistence(
+        metadata: Dict[str, Any],
+    ) -> tuple[tuple[str, str], ...] | None:
+        """Return exact recalled identities or ``None`` for malformed lineage.
+
+        The marker is supplied only by the trusted context-plan projection.  A
+        malformed non-empty marker is never silently treated as ordinary
+        metadata: it would bypass the canonical liveness fence and make a
+        durable derivative unrevocable.  Empty lineage remains the normal
+        semantic-recall-disabled/no-result representation.
+        """
+        if "semantic_recall_dependencies" not in metadata:
+            return ()
+        raw = metadata.get("semantic_recall_dependencies")
+        if not isinstance(raw, list):
+            return None
+        dependencies: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for item in raw:
+            if not isinstance(item, dict):
+                return None
+            assertion_id = item.get("assertion_id")
+            revision_id = item.get("revision_id")
+            if (
+                not isinstance(assertion_id, str)
+                or not assertion_id
+                or not isinstance(revision_id, str)
+                or not revision_id
+            ):
+                return None
+            dependency = (assertion_id, revision_id)
+            if dependency not in seen:
+                seen.add(dependency)
+                dependencies.append(dependency)
+        return tuple(dependencies)
+
+    @staticmethod
+    def _exclude_stale_semantic_recall_derivative(
+        metadata: Dict[str, Any],
+    ) -> None:
+        """Make an unverifiable semantic derivative permanently non-contextual."""
+        metadata["excluded_from_context"] = True
+        metadata.setdefault(
+            "excluded_reason", "semantic_assertion_not_current"
         )
     
     async def get_conversation_history(
@@ -534,6 +652,104 @@ class AsyncStorage:
         if not self._initialized:
             await self.initialize()
         return await self.conversation.delete_message(message_id)
+
+    async def _exclude_semantic_recall_dependencies(
+        self,
+        *,
+        assertion_ids=(),
+        revision_ids=(),
+    ) -> tuple[int, ...]:
+        """Exclude exact assertion-derived conversation artifacts.
+
+        Private on purpose: only the governed assertion lifecycle may call
+        this companion operation, never an arbitrary user-supplied selector.
+        """
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.exclude_semantic_recall_dependencies(
+            assertion_ids=assertion_ids,
+            revision_ids=revision_ids,
+        )
+
+    async def _scrub_semantic_recall_dependencies(
+        self,
+        *,
+        assertion_ids=(),
+        revision_ids=(),
+    ) -> int:
+        """Drop physically erased identities from excluded artifacts."""
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.scrub_semantic_recall_dependencies(
+            assertion_ids=assertion_ids,
+            revision_ids=revision_ids,
+        )
+
+    async def _exclude_memory_episodes_for_key_message_ids(
+        self, message_ids: tuple[int, ...],
+    ) -> tuple[str, ...]:
+        """Exclude episodes whose exact key-message identity intersects IDs.
+
+        Episode summaries are derivatives of conversation artifacts.  They
+        cannot remain prompt-visible once an input artifact is excluded, even
+        if the summary happens not to repeat the fact verbatim.
+        """
+        if not self._initialized:
+            await self.initialize()
+        requested_ids = {str(message_id) for message_id in message_ids}
+        if not requested_ids:
+            return ()
+        rows = await self.db.fetchall(
+            "SELECT id, key_message_ids FROM memory_episodes "
+            "WHERE agent_id = ? AND COALESCE(excluded_from_context, 0) = 0",
+            (self.agent_id,),
+        )
+        excluded: list[str] = []
+        for episode_id, raw_key_ids in rows:
+            try:
+                key_ids = json.loads(raw_key_ids) if isinstance(raw_key_ids, str) else raw_key_ids
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(key_ids, list) or not requested_ids.intersection(
+                str(key_id) for key_id in key_ids
+            ):
+                continue
+            result = await self.db.execute_commit(
+                "UPDATE memory_episodes SET excluded_from_context = 1 "
+                "WHERE id = ? AND agent_id = ? "
+                "AND COALESCE(excluded_from_context, 0) = 0",
+                (episode_id, self.agent_id),
+            )
+            if _rows_affected(result) > 0:
+                excluded.append(str(episode_id))
+        return tuple(excluded)
+
+    async def _withdraw_semantic_recall_derivatives(
+        self,
+        *,
+        assertion_ids=(),
+        revision_ids=(),
+        physically_erased: bool,
+    ) -> None:
+        """Apply one canonical lifecycle withdrawal to exact context artifacts.
+
+        ``AsyncAssertionStore`` calls this private companion while its tenant
+        mutation remains open.  The conversation/episode updates therefore
+        share that transaction on both SQLite and PostgreSQL.  Assertion
+        lifecycle code passes only canonical IDs; this facade deliberately
+        never interprets message content as a deletion selector.
+        """
+        message_ids = await self._exclude_semantic_recall_dependencies(
+            assertion_ids=assertion_ids,
+            revision_ids=revision_ids,
+        )
+        if message_ids:
+            await self._exclude_memory_episodes_for_key_message_ids(message_ids)
+        if physically_erased:
+            await self._scrub_semantic_recall_dependencies(
+                assertion_ids=assertion_ids,
+                revision_ids=revision_ids,
+            )
 
     async def restore_message(self, message_id: int) -> bool:
         """Restore a soft-deleted message — facade delegator (#763)."""
@@ -1281,6 +1497,24 @@ class AsyncStorage:
         if not self._initialized:
             await self.initialize()
         return await self._assertion_store().inference_inputs(query)
+
+    async def semantic_recall_candidates(
+        self, *, query, candidate_scan_limit, inference_profile, inference_limits=None, maintenance_limits=None,
+    ):
+        """Read bounded recall candidates through the canonical ledger seam."""
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().recall_candidates(
+            query=query, candidate_scan_limit=candidate_scan_limit,
+            inference_profile=inference_profile,
+            inference_limits=inference_limits,
+            maintenance_limits=maintenance_limits,
+        )
+
+    async def hydrate_semantic_recall_candidates(self, assertion_ids, **kwargs):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().hydrate_recall_candidates(assertion_ids, **kwargs)
 
     async def semantic_inference_state(self, profile):
         """Read the durable complete/incomplete status for one exact profile."""
