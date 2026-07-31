@@ -22,6 +22,9 @@ import re
 import time
 from types import MappingProxyType
 
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
 from .registry import StandardsMaturity
 
 
@@ -32,6 +35,9 @@ _COMMIT_RE = re.compile(r"^[0-9a-f]{7,64}$")
 # ``patient-alice-hiv`` may be safe as URI syntax while still disclosing
 # sensitive semantics, so retain only an opaque digest locator.
 _SAFE_ARTIFACT_RE = re.compile(r"^(?:ci|artifact|evidence)://sha256/[0-9a-f]{64}$")
+_ED25519_PUBLIC_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
+_ED25519_SIGNATURE_RE = re.compile(r"^[0-9a-f]{128}$")
+_EXECUTION_ATTESTATION_VERSION = "semantic-release-execution-attestation-v1"
 _SAFE_OBSERVATION_KINDS = frozenset(
     {
         "positive_count",
@@ -66,6 +72,13 @@ class EvidenceState(str, Enum):
     BLOCKED = "blocked"
     NOT_RUN = "not_run"
     SKIPPED = "skipped"
+
+
+class ExecutionSource(str, Enum):
+    """The independently verifiable source that produced a result."""
+
+    CATALOG_RUNNER = "catalog_runner"
+    EXTERNAL_CI = "external_ci"
 
 
 class PerformanceMetric(str, Enum):
@@ -184,6 +197,197 @@ class ArtifactReference:
             "artifact_ref": self.artifact_ref,
             "artifact_digest": self.artifact_digest,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionAttestation:
+    """An Ed25519 proof that a trusted runner emitted a bound result.
+
+    The signature covers the record/budget run digest plus its immutable gate
+    and runner contract.  A report author cannot turn it into evidence: a
+    separate operator-owned :class:`TrustedExecutionPolicy` must verify it.
+    """
+
+    issuer_id: str
+    key_id: str
+    source: ExecutionSource
+    signature: str
+
+    def __post_init__(self) -> None:
+        _require_identifier(self.issuer_id, "execution attestation issuer_id")
+        _require_identifier(self.key_id, "execution attestation key_id")
+        if not isinstance(self.source, ExecutionSource):
+            raise ReleaseEvidenceError("execution attestation source is unknown")
+        if not isinstance(self.signature, str) or not _ED25519_SIGNATURE_RE.fullmatch(self.signature):
+            raise ReleaseEvidenceError("execution attestation must contain an Ed25519 signature")
+
+    def to_mapping(self) -> dict[str, str]:
+        return {
+            "issuer_id": self.issuer_id,
+            "key_id": self.key_id,
+            "source": self.source.value,
+            "signature": self.signature,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class TrustedExecutionKey:
+    """One operator-configured public key and the runners it may attest."""
+
+    issuer_id: str
+    key_id: str
+    source: ExecutionSource
+    public_key: str
+    runner_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _require_identifier(self.issuer_id, "trusted execution issuer_id")
+        _require_identifier(self.key_id, "trusted execution key_id")
+        if not isinstance(self.source, ExecutionSource):
+            raise ReleaseEvidenceError("trusted execution source is unknown")
+        if not isinstance(self.public_key, str) or not _ED25519_PUBLIC_KEY_RE.fullmatch(self.public_key):
+            raise ReleaseEvidenceError("trusted execution public_key must be an Ed25519 public key")
+        if not self.runner_ids or len(set(self.runner_ids)) != len(self.runner_ids):
+            raise ReleaseEvidenceError("trusted execution runner_ids must be non-empty and unique")
+        for runner_id in self.runner_ids:
+            _require_identifier(runner_id, "trusted execution runner_id")
+        if self.source is ExecutionSource.EXTERNAL_CI and set(self.runner_ids) != {"external_ci"}:
+            raise ReleaseEvidenceError(
+                "external_ci keys may attest only the declared external_ci catalog runner"
+            )
+        if self.source is ExecutionSource.CATALOG_RUNNER and "external_ci" in self.runner_ids:
+            raise ReleaseEvidenceError(
+                "catalog_runner keys cannot attest the independently external_ci runner"
+            )
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "issuer_id": self.issuer_id,
+            "key_id": self.key_id,
+            "source": self.source.value,
+            "public_key": self.public_key,
+            "runner_ids": list(self.runner_ids),
+        }
+
+
+def execution_attestation_payload(
+    *,
+    kind: str,
+    issuer_id: str,
+    key_id: str,
+    source: ExecutionSource,
+    gate_id: str,
+    gate_spec_digest: str,
+    runner_id: str,
+    run_digest: str,
+) -> bytes:
+    """Return the exact content-free bytes signed by an execution authority."""
+    _require_identifier(kind, "execution attestation kind")
+    _require_identifier(issuer_id, "execution attestation issuer_id")
+    _require_identifier(key_id, "execution attestation key_id")
+    if not isinstance(source, ExecutionSource):
+        raise ReleaseEvidenceError("execution attestation source is unknown")
+    _require_identifier(gate_id, "execution attestation gate_id")
+    _require_digest(gate_spec_digest, "execution attestation gate_spec_digest")
+    _require_identifier(runner_id, "execution attestation runner_id")
+    _require_digest(run_digest, "execution attestation run_digest")
+    return _canonical_json(
+        {
+            "version": _EXECUTION_ATTESTATION_VERSION,
+            "kind": kind,
+            "issuer_id": issuer_id,
+            "key_id": key_id,
+            "source": source.value,
+            "gate_id": gate_id,
+            "gate_spec_digest": gate_spec_digest,
+            "runner_id": runner_id,
+            "run_digest": run_digest,
+        }
+    ).encode("utf-8")
+
+
+@dataclass(frozen=True, slots=True)
+class TrustedExecutionPolicy:
+    """Fail-closed public-key allowlist for release evidence ingestion."""
+
+    keys: tuple[TrustedExecutionKey, ...]
+
+    def __post_init__(self) -> None:
+        if not self.keys:
+            raise ReleaseEvidenceError("trusted execution policy requires at least one public key")
+        if any(not isinstance(key, TrustedExecutionKey) for key in self.keys):
+            raise ReleaseEvidenceError("trusted execution policy contains an invalid public key")
+        identities = {(key.issuer_id, key.key_id) for key in self.keys}
+        if len(identities) != len(self.keys):
+            raise ReleaseEvidenceError("trusted execution policy repeats an issuer/key identity")
+
+    def _key_for(self, attestation: ExecutionAttestation, runner_id: str) -> TrustedExecutionKey:
+        if not isinstance(attestation, ExecutionAttestation):
+            raise ReleaseEvidenceError("release evidence requires an execution attestation")
+        for key in self.keys:
+            if key.issuer_id == attestation.issuer_id and key.key_id == attestation.key_id:
+                if key.source is not attestation.source:
+                    raise ReleaseEvidenceError("execution attestation source does not match trusted key")
+                if runner_id not in key.runner_ids:
+                    raise ReleaseEvidenceError("execution attestation runner is not allowed for trusted key")
+                return key
+        raise ReleaseEvidenceError("execution attestation issuer/key is not trusted")
+
+    def _verify(
+        self,
+        *,
+        kind: str,
+        attestation: ExecutionAttestation,
+        gate_id: str,
+        gate_spec_digest: str,
+        runner_id: str,
+        run_digest: str,
+    ) -> None:
+        key = self._key_for(attestation, runner_id)
+        payload = execution_attestation_payload(
+            kind=kind,
+            issuer_id=attestation.issuer_id,
+            key_id=attestation.key_id,
+            source=attestation.source,
+            gate_id=gate_id,
+            gate_spec_digest=gate_spec_digest,
+            runner_id=runner_id,
+            run_digest=run_digest,
+        )
+        try:
+            Ed25519PublicKey.from_public_bytes(bytes.fromhex(key.public_key)).verify(
+                bytes.fromhex(attestation.signature), payload
+            )
+        except (InvalidSignature, ValueError) as error:
+            raise ReleaseEvidenceError("execution attestation signature verification failed") from error
+
+    def verify_evidence(self, spec: "GateSpec", evidence: "EvidenceRecord") -> None:
+        if (
+            evidence.execution_attestation is None
+            or evidence.gate_spec_digest is None
+            or evidence.run_digest is None
+        ):
+            raise ReleaseEvidenceError("release evidence requires a verified execution attestation")
+        self._verify(
+            kind="evidence_record",
+            attestation=evidence.execution_attestation,
+            gate_id=evidence.gate_id,
+            gate_spec_digest=evidence.gate_spec_digest,
+            runner_id=spec.runner.runner_id,
+            run_digest=evidence.run_digest,
+        )
+
+    def verify_budget(self, spec: "GateSpec", budget: "PerformanceBudget") -> None:
+        if budget.execution_attestation is None:
+            raise ReleaseEvidenceError("performance budget requires a verified execution attestation")
+        self._verify(
+            kind="performance_budget",
+            attestation=budget.execution_attestation,
+            gate_id=budget.gate_id,
+            gate_spec_digest=budget.gate_spec_digest,
+            runner_id=spec.runner.runner_id,
+            run_digest=budget.run_digest,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -512,6 +716,7 @@ class EvidenceRecord:
     observation: Mapping[str, object] | None = None
     artifact: ArtifactReference | None = None
     run_digest: str | None = None
+    execution_attestation: ExecutionAttestation | None = None
     drill: DrillBinding | None = None
     reason_code: str | None = None
     outside_advertised_capability: bool = False
@@ -537,6 +742,7 @@ class EvidenceRecord:
             self.observation,
             self.artifact,
             self.run_digest,
+            self.execution_attestation,
         )
         if self.state in {EvidenceState.PASSED, EvidenceState.FAILED}:
             if any(value is None for value in technical):
@@ -558,6 +764,8 @@ class EvidenceRecord:
                 raise ReleaseEvidenceError("evidence observation must be a mapping")
             object.__setattr__(self, "observation", _safe_observation_mapping(self.observation))
             _require_digest(self.run_digest, "run_digest")
+            if not isinstance(self.execution_attestation, ExecutionAttestation):
+                raise ReleaseEvidenceError("release-ready evidence requires an execution attestation")
             if self.state is EvidenceState.PASSED and self.reason_code is not None:
                 raise ReleaseEvidenceError("passed evidence cannot have a reason_code")
             if self.state is EvidenceState.FAILED and self.reason_code is None:
@@ -585,9 +793,25 @@ class EvidenceRecord:
         state: EvidenceState = EvidenceState.PASSED,
         reason_code: str | None = None,
     ) -> "EvidenceRecord":
-        """Create one bound record from the immutable catalog, never raw argv."""
+        """Refuse direct record minting outside the trusted execution boundary."""
+        raise ReleaseEvidenceError(
+            "EvidenceRecord.attest cannot mint release-ready evidence; "
+            "use an allowlisted CatalogExecutionAuthority or verified external CI"
+        )
+
+    @classmethod
+    def _bound_run_digest(
+        cls,
+        spec: GateSpec,
+        observation: Mapping[str, object],
+        artifact: ArtifactReference,
+        *,
+        state: EvidenceState,
+        reason_code: str | None = None,
+    ) -> tuple[Mapping[str, object], str]:
+        """Build content-free bound fields before an authority signs them."""
         if state not in {EvidenceState.PASSED, EvidenceState.FAILED}:
-            raise ReleaseEvidenceError("attest supports only passed or failed release results")
+            raise ReleaseEvidenceError("trusted execution supports only passed or failed release results")
         safe_observation = _safe_observation_mapping(observation)
         payload = {
             "gate_id": spec.gate_id,
@@ -602,7 +826,36 @@ class EvidenceRecord:
             "observation": dict(safe_observation),
             "artifact": artifact.to_mapping(),
             "drill": spec.correlation.to_mapping() if spec.correlation else None,
+            "reason_code": reason_code,
         }
+        return safe_observation, _sha256(_canonical_json(payload))
+
+    @classmethod
+    def _from_trusted_execution(
+        cls,
+        spec: GateSpec,
+        observation: Mapping[str, object],
+        artifact: ArtifactReference,
+        *,
+        state: EvidenceState,
+        execution_attestation: ExecutionAttestation,
+        reason_code: str | None = None,
+    ) -> "EvidenceRecord":
+        """Construct a signed record for an execution authority only.
+
+        This underscore API intentionally has no public CLI call path.  The
+        caller must first obtain a valid signature over the deterministic run
+        digest from an authority that actually executed an allowlisted
+        workload; :class:`GateResult` later verifies it against an independent
+        public-key policy.
+        """
+        safe_observation, run_digest = cls._bound_run_digest(
+            spec,
+            observation,
+            artifact,
+            state=state,
+            reason_code=reason_code,
+        )
         return cls(
             gate_id=spec.gate_id,
             state=state,
@@ -615,7 +868,8 @@ class EvidenceRecord:
             fixture=spec.fixture.binding,
             observation=safe_observation,
             artifact=artifact,
-            run_digest=_sha256(_canonical_json(payload)),
+            run_digest=run_digest,
+            execution_attestation=execution_attestation,
             drill=spec.correlation,
             reason_code=reason_code,
         )
@@ -642,6 +896,7 @@ class EvidenceRecord:
                     "observation": dict(self.observation),
                     "artifact": self.artifact.to_mapping(),
                     "drill": self.drill.to_mapping() if self.drill else None,
+                    "reason_code": self.reason_code,
                 }
             )
         )
@@ -664,6 +919,9 @@ class EvidenceRecord:
             "observation": dict(self.observation) if self.observation else None,
             "artifact": self.artifact.to_mapping() if self.artifact else None,
             "run_digest": self.run_digest,
+            "execution_attestation": (
+                self.execution_attestation.to_mapping() if self.execution_attestation else None
+            ),
             "drill": self.drill.to_mapping() if self.drill else None,
             "reason_code": self.reason_code,
             "outside_advertised_capability": self.outside_advertised_capability,
@@ -676,6 +934,7 @@ class GateResult:
 
     spec: GateSpec
     evidence: EvidenceRecord
+    trust_policy: TrustedExecutionPolicy | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.spec, GateSpec) or not isinstance(self.evidence, EvidenceRecord):
@@ -690,6 +949,14 @@ class GateResult:
         ):
             raise ReleaseEvidenceError("an unadvertised gate must remain explicitly skipped")
         self.spec.validate_attestation(self.evidence)
+        if self.evidence.state in {EvidenceState.PASSED, EvidenceState.FAILED}:
+            if not isinstance(self.trust_policy, TrustedExecutionPolicy):
+                raise ReleaseEvidenceError(
+                    "release-ready evidence requires an operator trusted execution policy"
+                )
+            self.trust_policy.verify_evidence(self.spec, self.evidence)
+        elif self.trust_policy is not None and not isinstance(self.trust_policy, TrustedExecutionPolicy):
+            raise ReleaseEvidenceError("gate trust_policy must be TrustedExecutionPolicy or null")
 
     @property
     def ready(self) -> bool:
@@ -760,6 +1027,7 @@ class PerformanceBudget:
     environment: ExecutionEnvironment
     artifact: ArtifactReference
     run_digest: str
+    execution_attestation: ExecutionAttestation
 
     def __post_init__(self) -> None:
         if not isinstance(self.target, PerformanceTarget):
@@ -776,6 +1044,8 @@ class PerformanceBudget:
             for sample in self.samples
         ):
             raise ReleaseEvidenceError("performance samples must be finite and positive")
+        if self.target.unit == "bytes" and any(type(sample) is not int for sample in self.samples):
+            raise ReleaseEvidenceError("storage growth performance samples must be integer byte deltas")
         for name, value in (("p95", self.p95), ("budget", self.budget), ("headroom_fraction", self.headroom_fraction)):
             if type(value) is bool or not isinstance(value, (int, float)) or not math.isfinite(value):
                 raise ReleaseEvidenceError(f"performance {name} must be finite")
@@ -796,6 +1066,8 @@ class PerformanceBudget:
         if not isinstance(self.artifact, ArtifactReference):
             raise ReleaseEvidenceError("performance budget requires an artifact")
         _require_digest(self.run_digest, "performance run_digest")
+        if not isinstance(self.execution_attestation, ExecutionAttestation):
+            raise ReleaseEvidenceError("performance budget requires an execution attestation")
         if self.run_digest != self.calculated_run_digest():
             raise ReleaseEvidenceError("performance run digest does not bind samples and artifact")
 
@@ -808,9 +1080,43 @@ class PerformanceBudget:
         headroom_fraction: float,
         artifact: ArtifactReference,
     ) -> "PerformanceBudget":
+        """Refuse caller-provided samples outside trusted benchmark execution."""
+        raise ReleaseEvidenceError(
+            "PerformanceBudget.from_observed cannot mint a release budget; "
+            "use an allowlisted CatalogExecutionAuthority"
+        )
+
+    @classmethod
+    def _bound_run_digest(
+        cls,
+        spec: GateSpec,
+        samples: Iterable[float | int],
+        *,
+        headroom_fraction: float,
+        artifact: ArtifactReference,
+    ) -> tuple[tuple[float | int, ...], float | int, float | int, str]:
         if spec.performance_target is None:
             raise ReleaseEvidenceError("performance budget requires a performance gate spec")
         values = tuple(samples)
+        if len(values) < 3 or any(
+            type(sample) is bool
+            or not isinstance(sample, (int, float))
+            or not math.isfinite(sample)
+            or sample <= 0
+            for sample in values
+        ):
+            raise ReleaseEvidenceError("performance samples must be finite and positive with sample_count >= 3")
+        if spec.performance_target.unit == "bytes" and any(type(sample) is not int for sample in values):
+            raise ReleaseEvidenceError("storage growth performance samples must be integer byte deltas")
+        if (
+            type(headroom_fraction) is bool
+            or not isinstance(headroom_fraction, (int, float))
+            or not math.isfinite(headroom_fraction)
+            or not 0 < headroom_fraction <= 10
+        ):
+            raise ReleaseEvidenceError("performance headroom_fraction must be positive")
+        if not isinstance(artifact, ArtifactReference):
+            raise ReleaseEvidenceError("performance budget requires an artifact")
         p95 = sorted(values)[math.ceil(len(values) * 0.95) - 1] if values else 0
         budget = p95 * (1 + headroom_fraction)
         payload = {
@@ -825,6 +1131,24 @@ class PerformanceBudget:
             "environment": spec.environment.to_mapping(),
             "artifact": artifact.to_mapping(),
         }
+        return values, p95, budget, _sha256(_canonical_json(payload))
+
+    @classmethod
+    def _from_trusted_execution(
+        cls,
+        spec: GateSpec,
+        samples: Iterable[float | int],
+        *,
+        headroom_fraction: float,
+        artifact: ArtifactReference,
+        execution_attestation: ExecutionAttestation,
+    ) -> "PerformanceBudget":
+        values, p95, budget, run_digest = cls._bound_run_digest(
+            spec,
+            samples,
+            headroom_fraction=headroom_fraction,
+            artifact=artifact,
+        )
         return cls(
             target=spec.performance_target,
             gate_id=spec.gate_id,
@@ -836,7 +1160,8 @@ class PerformanceBudget:
             fixture=spec.fixture.binding,
             environment=spec.environment,
             artifact=artifact,
-            run_digest=_sha256(_canonical_json(payload)),
+            run_digest=run_digest,
+            execution_attestation=execution_attestation,
         )
 
     def calculated_run_digest(self) -> str:
@@ -878,6 +1203,7 @@ class PerformanceBudget:
             "environment": self.environment.to_mapping(),
             "artifact": self.artifact.to_mapping(),
             "run_digest": self.run_digest,
+            "execution_attestation": self.execution_attestation.to_mapping(),
         }
 
 

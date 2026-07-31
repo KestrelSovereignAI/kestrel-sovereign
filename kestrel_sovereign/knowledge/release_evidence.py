@@ -25,7 +25,9 @@ from .release_evidence_models import (
     EvidenceRecord,
     EvidenceState,
     ErasureStage,
+    ExecutionAttestation,
     ExecutionEnvironment,
+    ExecutionSource,
     ExternalCapabilityReport,
     ExternalGateAttestation,
     FixtureBinding,
@@ -41,18 +43,20 @@ from .release_evidence_models import (
     RunnerContract,
     StandardsMatrixEntry,
     TelemetryAttestation,
+    TrustedExecutionKey,
+    TrustedExecutionPolicy,
     _canonical_json,
     _sha256,
 )
 
 
-RELEASE_EVIDENCE_SCHEMA_VERSION = 2
-SEMANTIC_RELEASE_CONTRACT = "semantic-kb-v1-release-evidence-v2"
+RELEASE_EVIDENCE_SCHEMA_VERSION = 3
+SEMANTIC_RELEASE_CONTRACT = "semantic-kb-v1-release-evidence-v3"
 PARAMETRIC_SELF_EVIDENCE_REPOSITORY = "KestrelSovereignAI/kestrel-feature-parametric-self"
 PARAMETRIC_SELF_EVIDENCE_REVISION = "260ba985bcfdfab3dab1ea58da5b259057f3749f"
 _ERASURE_DRILL = DrillBinding(
     "semantic_erasure_release_drill_v1",
-    _sha256("semantic-release-evidence-v2:drill:semantic_erasure_release_drill_v1"),
+    _sha256("semantic-release-evidence-v3:drill:semantic_erasure_release_drill_v1"),
 )
 _EXTERNAL_ADAPTER_GATE_IDS = (
     "external_corpus_consumed",
@@ -64,7 +68,7 @@ _EXTERNAL_ADAPTER_GATE_IDS = (
 def _fixture_binding(fixture_id: str) -> FixtureBinding:
     return FixtureBinding(
         fixture_id,
-        _sha256(f"semantic-release-evidence-v2:fixture:{fixture_id}"),
+        _sha256(f"semantic-release-evidence-v3:fixture:{fixture_id}"),
     )
 
 
@@ -77,7 +81,7 @@ def _runner(runner_id: str, command_id: str) -> RunnerContract:
     return RunnerContract(
         runner_id,
         command_id,
-        _sha256(f"semantic-release-evidence-v2:runner:{runner_id}:{command_id}"),
+        _sha256(f"semantic-release-evidence-v3:runner:{runner_id}:{command_id}"),
     )
 
 
@@ -579,7 +583,13 @@ def release_evidence_template(registry: SemanticKnowledgeRegistry | None = None)
     )
 
 
-def apply_evidence_records(evidence: SemanticReleaseEvidence, records: Iterable[EvidenceRecord]) -> SemanticReleaseEvidence:
+def apply_evidence_records(
+    evidence: SemanticReleaseEvidence,
+    records: Iterable[EvidenceRecord],
+    *,
+    trust_policy: TrustedExecutionPolicy | None = None,
+) -> SemanticReleaseEvidence:
+    """Apply only catalog-bound records verified by an operator public key."""
     supplied = tuple(records)
     updates = {record.gate_id: record for record in supplied}
     if len(updates) != len(supplied):
@@ -588,11 +598,29 @@ def apply_evidence_records(evidence: SemanticReleaseEvidence, records: Iterable[
     unknown = sorted(set(updates) - known)
     if unknown:
         raise ReleaseEvidenceError("evidence records do not match declared template gates: " + ", ".join(unknown))
-    gates = tuple(replace(gate, evidence=updates.get(gate.spec.gate_id, gate.evidence)) for gate in evidence.gates)
+    gates = tuple(
+        GateResult(
+            gate.spec,
+            updates.get(gate.spec.gate_id, gate.evidence),
+            (
+                trust_policy
+                if updates.get(gate.spec.gate_id, gate.evidence).state
+                in {EvidenceState.PASSED, EvidenceState.FAILED}
+                else gate.trust_policy
+            ),
+        )
+        for gate in evidence.gates
+    )
     return replace(evidence, gates=gates)
 
 
-def apply_performance_budgets(evidence: SemanticReleaseEvidence, budgets: Iterable[PerformanceBudget]) -> SemanticReleaseEvidence:
+def apply_performance_budgets(
+    evidence: SemanticReleaseEvidence,
+    budgets: Iterable[PerformanceBudget],
+    *,
+    trust_policy: TrustedExecutionPolicy | None = None,
+) -> SemanticReleaseEvidence:
+    """Apply only budget samples signed by the executing benchmark authority."""
     supplied = tuple(budgets)
     updates = {budget.target: budget for budget in supplied}
     if len(updates) != len(supplied):
@@ -603,6 +631,10 @@ def apply_performance_budgets(evidence: SemanticReleaseEvidence, budgets: Iterab
         if gate is None or not gate.evidence.passed:
             raise ReleaseEvidenceError("performance budget requires its spec-bound passing gate")
         budget.validate_against(gate.spec)
+        policy = trust_policy or gate.trust_policy
+        if not isinstance(policy, TrustedExecutionPolicy):
+            raise ReleaseEvidenceError("performance budget requires an operator trusted execution policy")
+        policy.verify_budget(gate.spec, budget)
     return replace(evidence, performance_budgets={**evidence.performance_budgets, **updates})
 
 
@@ -677,11 +709,63 @@ def _drill_from_mapping(value: object) -> DrillBinding | None:
     return DrillBinding(cast(str, mapping["drill_id"]), cast(str, mapping["drill_digest"]))
 
 
+def _execution_attestation_from_mapping(value: object) -> ExecutionAttestation | None:
+    if value is None:
+        return None
+    mapping = _expect_mapping(value, "execution_attestation")
+    _strict_keys(mapping, {"issuer_id", "key_id", "source", "signature"}, "execution_attestation")
+    try:
+        source = ExecutionSource(cast(str, mapping["source"]))
+    except ValueError as error:
+        raise ReleaseEvidenceError("execution_attestation has an invalid source") from error
+    return ExecutionAttestation(
+        issuer_id=cast(str, mapping["issuer_id"]),
+        key_id=cast(str, mapping["key_id"]),
+        source=source,
+        signature=cast(str, mapping["signature"]),
+    )
+
+
+def trusted_execution_policy_from_mapping(value: Mapping[str, object]) -> TrustedExecutionPolicy:
+    """Parse an operator-owned public-key policy, never a private key."""
+    mapping = _expect_mapping(value, "trusted execution policy")
+    _strict_keys(mapping, {"keys"}, "trusted execution policy")
+    raw_keys = mapping["keys"]
+    if not isinstance(raw_keys, list):
+        raise ReleaseEvidenceError("trusted execution policy keys must be a list")
+    keys: list[TrustedExecutionKey] = []
+    for raw_key in raw_keys:
+        key = _expect_mapping(raw_key, "trusted execution key")
+        _strict_keys(
+            key,
+            {"issuer_id", "key_id", "source", "public_key", "runner_ids"},
+            "trusted execution key",
+        )
+        raw_runner_ids = key["runner_ids"]
+        if not isinstance(raw_runner_ids, list) or not all(isinstance(value, str) for value in raw_runner_ids):
+            raise ReleaseEvidenceError("trusted execution key runner_ids must be a string list")
+        try:
+            source = ExecutionSource(cast(str, key["source"]))
+        except ValueError as error:
+            raise ReleaseEvidenceError("trusted execution key has an invalid source") from error
+        keys.append(
+            TrustedExecutionKey(
+                issuer_id=cast(str, key["issuer_id"]),
+                key_id=cast(str, key["key_id"]),
+                source=source,
+                public_key=cast(str, key["public_key"]),
+                runner_ids=tuple(cast(list[str], raw_runner_ids)),
+            )
+        )
+    return TrustedExecutionPolicy(tuple(keys))
+
+
 def evidence_record_from_mapping(value: Mapping[str, object]) -> EvidenceRecord:
     mapping = _expect_mapping(value, "evidence record")
     expected = {
         "gate_id", "state", "gate_spec_digest", "runner_id", "command_id", "command_digest",
-        "environment", "environment_digest", "fixture", "observation", "artifact", "run_digest", "drill",
+        "environment", "environment_digest", "fixture", "observation", "artifact", "run_digest",
+        "execution_attestation", "drill",
         "reason_code", "outside_advertised_capability",
     }
     _strict_keys(mapping, expected, "evidence record")
@@ -697,6 +781,7 @@ def evidence_record_from_mapping(value: Mapping[str, object]) -> EvidenceRecord:
         environment=_environment_from_mapping(mapping["environment"]), environment_digest=cast(str | None, mapping["environment_digest"]),
         fixture=_fixture_from_mapping(mapping["fixture"]), observation=_expect_mapping(observation, "observation") if observation is not None else None,
         artifact=_artifact_from_mapping(mapping["artifact"]), run_digest=cast(str | None, mapping["run_digest"]),
+        execution_attestation=_execution_attestation_from_mapping(mapping["execution_attestation"]),
         drill=_drill_from_mapping(mapping["drill"]),
         reason_code=cast(str | None, mapping["reason_code"]), outside_advertised_capability=cast(bool, mapping["outside_advertised_capability"]),
     )
@@ -704,7 +789,10 @@ def evidence_record_from_mapping(value: Mapping[str, object]) -> EvidenceRecord:
 
 def performance_budget_from_mapping(value: Mapping[str, object]) -> PerformanceBudget:
     mapping = _expect_mapping(value, "performance budget")
-    expected = {"target", "gate_id", "gate_spec_digest", "samples", "p95", "budget", "headroom_fraction", "fixture", "environment", "artifact", "run_digest"}
+    expected = {
+        "target", "gate_id", "gate_spec_digest", "samples", "p95", "budget", "headroom_fraction",
+        "fixture", "environment", "artifact", "run_digest", "execution_attestation",
+    }
     _strict_keys(mapping, expected, "performance budget")
     target_value = _expect_mapping(mapping["target"], "performance target")
     _strict_keys(target_value, {"metric", "backend", "mode", "unit"}, "performance target")
@@ -717,7 +805,23 @@ def performance_budget_from_mapping(value: Mapping[str, object]) -> PerformanceB
     artifact = _artifact_from_mapping(mapping["artifact"])
     if fixture is None or environment is None or artifact is None:
         raise ReleaseEvidenceError("performance budget requires fixture, environment, and artifact")
-    return PerformanceBudget(target, cast(str, mapping["gate_id"]), cast(str, mapping["gate_spec_digest"]), tuple(cast(list[float | int], samples)), cast(float | int, mapping["p95"]), cast(float | int, mapping["budget"]), cast(float, mapping["headroom_fraction"]), fixture, environment, artifact, cast(str, mapping["run_digest"]))
+    execution_attestation = _execution_attestation_from_mapping(mapping["execution_attestation"])
+    if execution_attestation is None:
+        raise ReleaseEvidenceError("performance budget requires an execution_attestation")
+    return PerformanceBudget(
+        target,
+        cast(str, mapping["gate_id"]),
+        cast(str, mapping["gate_spec_digest"]),
+        tuple(cast(list[float | int], samples)),
+        cast(float | int, mapping["p95"]),
+        cast(float | int, mapping["budget"]),
+        cast(float, mapping["headroom_fraction"]),
+        fixture,
+        environment,
+        artifact,
+        cast(str, mapping["run_digest"]),
+        execution_attestation,
+    )
 
 
 def telemetry_attestation_from_mapping(value: Mapping[str, object]) -> TelemetryAttestation:

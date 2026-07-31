@@ -1,25 +1,23 @@
-"""CLI for spec-bound, content-free semantic release attestations.
+"""CLI for trusted, content-free semantic release attestations.
 
-There is intentionally no ``record -- <arbitrary argv>`` escape hatch.  The
-gate catalog supplies the runner identity, command-pattern digest, execution
-environment, fixture binding, and observation schema.  This command accepts
-only an opaque safe artifact reference/digest and the schema's content-free
-numeric/boolean/digest observation values.
+The public CLI never accepts an observation JSON object or benchmark samples
+to create passed evidence.  ``run`` invokes only an immutable catalog workload
+and signs the emitted result; ``assemble`` imports signed records only after
+an operator-owned public-key policy verifies them.
 """
 
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping, Sequence
+import asyncio
+from collections.abc import Sequence
 import json
 from pathlib import Path
 import sys
 
 from .release_evidence import (
     ArtifactReference,
-    EvidenceRecord,
     EvidenceState,
-    PerformanceBudget,
     ReleaseEvidenceError,
     TelemetryAttestation,
     attach_external_capability_report,
@@ -32,10 +30,16 @@ from .release_evidence import (
     release_evidence_template,
     release_gate_specs,
     telemetry_attestation_from_mapping,
+    trusted_execution_policy_from_mapping,
     write_evidence_record,
     write_performance_budget,
     write_release_evidence,
     write_telemetry_attestation,
+)
+from .release_evidence_execution import (
+    CatalogExecutionAuthority,
+    CatalogSigningIdentity,
+    default_catalog_workloads,
 )
 
 
@@ -44,16 +48,6 @@ def _gate_spec(gate_id: str):
         if spec.gate_id == gate_id:
             return spec
     raise ReleaseEvidenceError(f"unknown release gate: {gate_id}")
-
-
-def _observation(value: str) -> Mapping[str, object]:
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError as error:
-        raise ReleaseEvidenceError("observation_json must be valid JSON") from error
-    if not isinstance(parsed, dict):
-        raise ReleaseEvidenceError("observation_json must be a JSON object")
-    return parsed
 
 
 def _artifact(args: argparse.Namespace) -> ArtifactReference:
@@ -71,15 +65,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     template.add_argument("--output", type=Path, required=True)
     template.add_argument("--overwrite", action="store_true")
 
+    run = subparsers.add_parser(
+        "run",
+        help="execute one allowlisted catalog workload and write its signed result",
+    )
+    run.add_argument("--gate", required=True)
+    run.add_argument("--signing-key-file", type=Path, required=True)
+    run.add_argument("--issuer-id", required=True)
+    run.add_argument("--key-id", required=True)
+    run.add_argument("--output", type=Path, required=True)
+    run.add_argument("--budget-output", type=Path)
+    run.add_argument("--overwrite", action="store_true")
+
+    # Keep the former spelling as an explicit fail-closed migration error;
+    # accepting its old observation/sample inputs would reintroduce forgery.
     record = subparsers.add_parser(
         "record",
-        help="write a result bound to the declared runner/spec; arbitrary argv is not accepted",
+        help="disabled: use run for an allowlisted workload or assemble verified CI evidence",
     )
-    record.add_argument("--gate", required=True)
-    record.add_argument("--artifact-ref", required=True)
-    record.add_argument("--artifact-digest", required=True)
-    record.add_argument("--observation-json", required=True)
-    record.add_argument("--output", type=Path, required=True)
+    record.add_argument("--gate")
+    record.add_argument("--artifact-ref")
+    record.add_argument("--artifact-digest")
+    record.add_argument("--observation-json")
+    record.add_argument("--output", type=Path)
     record.add_argument("--overwrite", action="store_true")
 
     block = subparsers.add_parser("block", help="write a content-free blocked result")
@@ -89,14 +97,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     block.add_argument("--overwrite", action="store_true")
 
     budget = subparsers.add_parser(
-        "budget", help="derive a backend/mode-specific measured budget from a performance gate"
+        "budget",
+        help="disabled: a budget is emitted only by an allowlisted benchmark workload",
     )
-    budget.add_argument("--gate", required=True)
-    budget.add_argument("--samples", type=float, nargs="+", required=True)
-    budget.add_argument("--headroom-fraction", type=float, required=True)
-    budget.add_argument("--artifact-ref", required=True)
-    budget.add_argument("--artifact-digest", required=True)
-    budget.add_argument("--output", type=Path, required=True)
+    budget.add_argument("--gate")
+    budget.add_argument("--samples", type=float, nargs="+")
+    budget.add_argument("--headroom-fraction", type=float)
+    budget.add_argument("--artifact-ref")
+    budget.add_argument("--artifact-digest")
+    budget.add_argument("--output", type=Path)
     budget.add_argument("--overwrite", action="store_true")
 
     telemetry = subparsers.add_parser(
@@ -118,6 +127,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     assemble.add_argument("--record", type=Path, action="append", default=[])
     assemble.add_argument("--budget", type=Path, action="append", default=[])
     assemble.add_argument(
+        "--trust-policy",
+        type=Path,
+        help="operator-owned JSON allowlist of Ed25519 public keys for passed records/budgets",
+    )
+    assemble.add_argument(
         "--retirement-telemetry",
         type=Path,
         help="one digest-bound telemetry artifact; it is bound only to the catalog migration gate",
@@ -138,21 +152,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"semantic release evidence template written: {args.output} (ready=false)")
             return 0
         if args.command == "record":
-            spec = _gate_spec(args.gate)
-            attestation = EvidenceRecord.attest(
-                spec,
-                _observation(args.observation_json),
-                _artifact(args),
+            raise ReleaseEvidenceError(
+                "record is disabled because caller-supplied observations cannot create passed evidence; "
+                "use run or assemble a verified external CI record"
             )
-            # GateResult exercises the same binding validation used by assemble
-            # before writing a standalone record.
-            from .release_evidence_models import GateResult
-
-            GateResult(spec, attestation)
-            write_evidence_record(attestation, args.output, overwrite=args.overwrite)
+        if args.command == "run":
+            spec = _gate_spec(args.gate)
+            if spec.performance_target is not None and args.budget_output is None:
+                raise ReleaseEvidenceError("performance workload run requires --budget-output")
+            if spec.performance_target is None and args.budget_output is not None:
+                raise ReleaseEvidenceError("--budget-output is valid only for a performance workload")
+            identity = CatalogSigningIdentity.from_private_key_file(
+                args.signing_key_file,
+                issuer_id=args.issuer_id,
+                key_id=args.key_id,
+            )
+            execution = asyncio.run(
+                CatalogExecutionAuthority(identity, default_catalog_workloads()).execute(spec)
+            )
+            write_evidence_record(execution.record, args.output, overwrite=args.overwrite)
+            if execution.budget is not None:
+                assert args.budget_output is not None
+                write_performance_budget(execution.budget, args.budget_output, overwrite=args.overwrite)
             print(
-                "semantic release evidence record written: "
-                f"{args.output} ({attestation.gate_id}={attestation.state.value})"
+                "semantic catalog workload recorded: "
+                f"{args.output} ({execution.record.gate_id}={execution.record.state.value})"
             )
             return 0
         if args.command == "block":
@@ -170,19 +194,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 0
         if args.command == "budget":
-            spec = _gate_spec(args.gate)
-            measured = PerformanceBudget.from_observed(
-                spec,
-                args.samples,
-                headroom_fraction=args.headroom_fraction,
-                artifact=_artifact(args),
+            raise ReleaseEvidenceError(
+                "budget is disabled because caller-supplied samples cannot create a release budget; "
+                "use run for an allowlisted benchmark workload"
             )
-            write_performance_budget(measured, args.output, overwrite=args.overwrite)
-            print(
-                "semantic performance budget written: "
-                f"{args.output} ({spec.gate_id})"
-            )
-            return 0
         if args.command == "telemetry":
             attestation = TelemetryAttestation.attest(
                 window_started_at=args.window_started_at,
@@ -204,8 +219,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             performance_budget_from_mapping(json.loads(path.read_text(encoding="utf-8")))
             for path in args.budget
         )
-        evidence = apply_evidence_records(release_evidence_template(), records)
-        evidence = apply_performance_budgets(evidence, budgets)
+        policy = None
+        if args.trust_policy is not None:
+            policy = trusted_execution_policy_from_mapping(
+                json.loads(args.trust_policy.read_text(encoding="utf-8"))
+            )
+        evidence = apply_evidence_records(
+            release_evidence_template(), records, trust_policy=policy
+        )
+        evidence = apply_performance_budgets(evidence, budgets, trust_policy=policy)
         if args.retirement_telemetry is not None:
             telemetry_mapping = json.loads(args.retirement_telemetry.read_text(encoding="utf-8"))
             evidence = attach_retirement_telemetry(

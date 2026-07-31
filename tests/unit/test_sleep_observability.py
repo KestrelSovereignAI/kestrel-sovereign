@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
 
 from kestrel_sovereign.agent.sleep import SleepMixin, SleepReport
@@ -14,8 +15,12 @@ from kestrel_sovereign.knowledge.release_evidence import release_gate_specs
 from kestrel_sovereign.knowledge.release_evidence_models import (
     ArtifactReference,
     EvidenceRecord,
+    EvidenceState,
+    ExecutionSource,
     GateResult,
+    TrustedExecutionPolicy,
 )
+from kestrel_sovereign.knowledge.release_evidence_execution import CatalogSigningIdentity
 
 
 def _maintenance(
@@ -420,16 +425,36 @@ def test_authenticated_invoke_preserves_consolidate_only_maintenance_summary() -
                 )
             ),
         }
+        signing_identity = CatalogSigningIdentity(
+            issuer_id="sleep_test_ci",
+            key_id="diagnostics_runner",
+            private_key=Ed25519PrivateKey.from_private_bytes(b"\x04" * 32),
+            source=ExecutionSource.CATALOG_RUNNER,
+        )
+        artifact = ArtifactReference(
+            "ci://sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "a" * 64,
+        )
+        _, run_digest = EvidenceRecord._bound_run_digest(
+            diagnostics_gate,
+            live_observation,
+            artifact,
+            state=EvidenceState.PASSED,
+        )
         GateResult(
             diagnostics_gate,
-            EvidenceRecord.attest(
+            EvidenceRecord._from_trusted_execution(
                 diagnostics_gate,
                 live_observation,
-                ArtifactReference(
-                    "ci://sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "a" * 64,
+                artifact,
+                state=EvidenceState.PASSED,
+                execution_attestation=signing_identity.sign(
+                    kind="evidence_record",
+                    spec=diagnostics_gate,
+                    run_digest=run_digest,
                 ),
             ),
+            TrustedExecutionPolicy((signing_identity.trusted_key(("pytest",)),)),
         )
         agent.process_input.assert_awaited_once()
         assert command_agent.sleep_calls == [

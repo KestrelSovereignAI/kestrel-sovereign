@@ -36,14 +36,29 @@ aggregate counts, booleans, and safe opaque references. It never stores test
 stdout, assertions, prompts, tenant IDs, source locators, DSNs, credentials, or
 arbitrary command lines.
 
-## Catalog-bound evidence, not command execution
+## Catalog-bound trusted execution, not caller-entered observations
 
-The CLI does **not** execute a supplied command and has no `record -- <argv>`
-escape hatch. A declared runner executes the review-approved workload outside
-the artifact, then its result is entered using the catalog gate and its exact
-content-free observation schema. `record` derives the spec, runner, command
-digest, environment, fixture, and drill binding from the catalog; callers
-cannot override them.
+The public CLI has no `record -- <argv>` escape hatch and does **not** accept
+an observation JSON object or benchmark samples to create a passed result.
+`record` and `budget` are retained only as fail-closed migration errors.
+`run` resolves a pre-registered, immutable `(runner_id, command_id)` workload
+from the current catalog; it has no caller argv, artifact reference, or
+observation fields. After the workload returns a schema-valid content-free
+measurement, the execution authority creates an opaque artifact reference and
+signs the exact run digest with Ed25519.
+
+Only an operator-owned public-key allowlist can verify that signature during
+`assemble`. A signed record without `--trust-policy` is rejected; a key from a
+caller-supplied report is not trusted merely because it appears in that report.
+External Parametric Self evidence is imported only as independently signed
+`external_ci` evidence. Its key may attest only the catalog's `external_ci`
+runner; it cannot substitute for a local pytest, benchmark, or Kite runner.
+
+At present, the built-in executable workload is
+`registry/stable_only_capability_selection_v1`. Other named pytest, benchmark,
+and Kite HTTP workloads remain explicitly `blocked` with
+`catalog_workload_unavailable` until their production harnesses are registered.
+They cannot become passes through artifact JSON.
 
 Start with a fresh conservative template:
 
@@ -52,21 +67,40 @@ uv run python -m kestrel_sovereign.knowledge.release_evidence template \
   --output /tmp/semantic-release-template.json
 ```
 
-For example, an RDF 1.1 fixture runner can attach a measured aggregate result
-and an approved artifact digest. Replace `SHA256_OF_APPROVED_ARTIFACT` with the
-actual lowercase SHA-256 of the referenced CI/evidence artifact.
+For example, a protected CI signing key can run the currently registered
+stable-only registry workload. The key file contains raw 32-byte
+lowercase-hex Ed25519 private-key material and must stay in the CI/host secret
+store rather than source control or a command-line value.
 
 ```bash
-uv run python -m kestrel_sovereign.knowledge.release_evidence record \
-  --gate rdf11_projection_fixture \
-  --artifact-ref ci://semantic-release/rdf11-projection \
-  --artifact-digest SHA256_OF_APPROVED_ARTIFACT \
-  --observation-json '{"case_count":42,"assertion_count":97}' \
-  --output /tmp/rdf11-projection.json
+uv run python -m kestrel_sovereign.knowledge.release_evidence run \
+  --gate stable_only_capability_selection \
+  --signing-key-file /secure/semantic-release.ed25519 \
+  --issuer-id kestrel_ci \
+  --key-id release_runner \
+  --output /tmp/stable-only-registry.json
 
 uv run python -m kestrel_sovereign.knowledge.release_evidence assemble \
-  --record /tmp/rdf11-projection.json \
+  --record /tmp/stable-only-registry.json \
+  --trust-policy /secure/semantic-release-trust-policy.json \
   --output /tmp/semantic-release-evidence.json
+```
+
+The trust policy stores public information only. Each key fixes an issuer/key
+ID, `catalog_runner` or `external_ci` source, raw Ed25519 public key, and
+allowed runner IDs. It is operator configuration, not an attachment supplied
+by a record:
+
+```json
+{
+  "keys": [{
+    "issuer_id": "kestrel_ci",
+    "key_id": "release_runner",
+    "source": "catalog_runner",
+    "public_key": "<64-lowercase-hex-ed25519-public-key>",
+    "runner_ids": ["registry", "pytest", "semantic_benchmark", "kite_http"]
+  }]
+}
 ```
 
 Safe references are deliberately narrow: exactly
@@ -130,28 +164,26 @@ post-operation minus pre-operation backend footprint in `bytes` (a SQLite file
 size or Postgres relation-size reader), never elapsed time relabeled as bytes.
 No timeout is a performance budget.
 
-Record the performance gate's catalog observation and derive its budget from
-at least three measured samples:
+An allowlisted production benchmark workload must measure at least three
+samples, emit the matching catalog observation, and write the signed record
+and signed budget together. The public CLI intentionally has no
+`--observation-json` or `--samples` route for this. Until a named benchmark
+workload is registered, `run` records a block and the target remains a release
+blocker. A registered workload is invoked in this shape:
 
 ```bash
-uv run python -m kestrel_sovereign.knowledge.release_evidence record \
+uv run python -m kestrel_sovereign.knowledge.release_evidence run \
   --gate performance_hybrid_recall_sqlite_integration \
-  --artifact-ref ci://semantic-release/hybrid-recall-sqlite \
-  --artifact-digest SHA256_OF_BENCHMARK_RESULT \
-  --observation-json '{"sample_count":3,"p95_ms":13}' \
-  --output /tmp/hybrid-recall-sqlite-record.json
-
-uv run python -m kestrel_sovereign.knowledge.release_evidence budget \
-  --gate performance_hybrid_recall_sqlite_integration \
-  --samples 12.1 12.6 13.0 \
-  --headroom-fraction 0.20 \
-  --artifact-ref ci://semantic-release/hybrid-recall-sqlite-budget \
-  --artifact-digest SHA256_OF_BENCHMARK_BUDGET_ARTIFACT \
-  --output /tmp/hybrid-recall-sqlite-budget.json
+  --signing-key-file /secure/semantic-release.ed25519 \
+  --issuer-id kestrel_ci \
+  --key-id benchmark_runner \
+  --output /tmp/hybrid-recall-sqlite-record.json \
+  --budget-output /tmp/hybrid-recall-sqlite-budget.json
 
 uv run python -m kestrel_sovereign.knowledge.release_evidence assemble \
   --record /tmp/hybrid-recall-sqlite-record.json \
   --budget /tmp/hybrid-recall-sqlite-budget.json \
+  --trust-policy /secure/semantic-release-trust-policy.json \
   --output /tmp/semantic-release-evidence.json
 ```
 
@@ -179,6 +211,11 @@ template and therefore remains a readiness blocker until it contains all of:
   reference/digest, and common drill binding; and
 - a report digest over those fields.
 
+For this contract the pinned source is
+`KestrelSovereignAI/kestrel-feature-parametric-self` at
+`260ba985bcfdfab3dab1ea58da5b259057f3749f`; another revision remains
+non-evidence even if its result fields look similar.
+
 An external report is supplied as safe structured JSON—never as pre-populated
 metadata—and is checked against the locally assembled stage records:
 
@@ -188,6 +225,7 @@ uv run python -m kestrel_sovereign.knowledge.release_evidence assemble \
   --record /tmp/external-candidate-invalidated.json \
   --record /tmp/external-served-eligibility-rejected.json \
   --external-report /tmp/parametric-self-erasure-report.json \
+  --trust-policy /secure/semantic-release-trust-policy.json \
   --output /tmp/semantic-release-evidence.json
 ```
 
@@ -240,7 +278,7 @@ uv run python -m kestrel_sovereign.knowledge.release_evidence telemetry \
   --inventory-complete \
   --unmigrated-eligible-rows 0 \
   --required-consumer-count 0 \
-  --artifact-ref ci://semantic-release/legacy-fact-retirement-window \
+  --artifact-ref ci://sha256/SHA256_OF_TELEMETRY_ARTIFACT \
   --artifact-digest SHA256_OF_TELEMETRY_ARTIFACT \
   --output /tmp/legacy-fact-retirement-telemetry.json
 

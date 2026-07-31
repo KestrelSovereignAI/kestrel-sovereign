@@ -11,6 +11,7 @@ import subprocess
 import sys
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from kestrel_sovereign.knowledge.release_evidence import (
     ArtifactReference,
@@ -28,6 +29,7 @@ from kestrel_sovereign.knowledge.release_evidence import (
     PerformanceTarget,
     ReleaseEvidenceError,
     TelemetryAttestation,
+    TrustedExecutionPolicy,
     attach_external_capability_report,
     attach_retirement_telemetry,
     apply_evidence_records,
@@ -40,7 +42,11 @@ from kestrel_sovereign.knowledge.release_evidence import (
     release_gate_specs,
     telemetry_attestation_from_mapping,
 )
-from kestrel_sovereign.knowledge.release_evidence_models import SemanticBenchmarkHarness
+from kestrel_sovereign.knowledge.release_evidence_execution import CatalogSigningIdentity
+from kestrel_sovereign.knowledge.release_evidence_models import (
+    ExecutionSource,
+    SemanticBenchmarkHarness,
+)
 
 
 def _gate(gate_id: str):
@@ -73,8 +79,92 @@ def _opaque_artifact_ref(name: str) -> str:
     return f"ci://sha256/{hashlib.sha256(name.encode('utf-8')).hexdigest()}"
 
 
-def _record(spec):
-    return EvidenceRecord.attest(spec, _observation(spec), _artifact(spec.gate_id))
+_CATALOG_TEST_IDENTITY = CatalogSigningIdentity(
+    issuer_id="test_ci",
+    key_id="release_test_key",
+    private_key=Ed25519PrivateKey.from_private_bytes(b"\x01" * 32),
+)
+_EXTERNAL_TEST_IDENTITY = CatalogSigningIdentity(
+    issuer_id="parametric_ci",
+    key_id="external_release_key",
+    private_key=Ed25519PrivateKey.from_private_bytes(b"\x05" * 32),
+    source=ExecutionSource.EXTERNAL_CI,
+)
+
+
+def _test_policy() -> TrustedExecutionPolicy:
+    return TrustedExecutionPolicy(
+        (
+            _CATALOG_TEST_IDENTITY.trusted_key(
+                tuple(
+                    sorted(
+                        {
+                            spec.runner.runner_id
+                            for spec in release_gate_specs()
+                            if spec.runner.runner_id != "external_ci"
+                        }
+                    )
+                )
+            ),
+            _EXTERNAL_TEST_IDENTITY.trusted_key(("external_ci",)),
+        )
+    )
+
+
+def _record(spec, *, observation: dict[str, object] | None = None):
+    observed = observation or _observation(spec)
+    artifact = _artifact(spec.gate_id)
+    identity = (
+        _EXTERNAL_TEST_IDENTITY
+        if spec.runner.runner_id == "external_ci"
+        else _CATALOG_TEST_IDENTITY
+    )
+    _, run_digest = EvidenceRecord._bound_run_digest(
+        spec,
+        observed,
+        artifact,
+        state=EvidenceState.PASSED,
+    )
+    return EvidenceRecord._from_trusted_execution(
+        spec,
+        observed,
+        artifact,
+        state=EvidenceState.PASSED,
+        execution_attestation=identity.sign(
+            kind="evidence_record", spec=spec, run_digest=run_digest
+        ),
+    )
+
+
+def _budget(spec, samples: tuple[float | int, ...] = (1.0, 2.0, 3.0)) -> PerformanceBudget:
+    artifact = _artifact(f"{spec.gate_id}-budget")
+    _, _, _, run_digest = PerformanceBudget._bound_run_digest(
+        spec,
+        samples,
+        headroom_fraction=0.2,
+        artifact=artifact,
+    )
+    return PerformanceBudget._from_trusted_execution(
+        spec,
+        samples,
+        headroom_fraction=0.2,
+        artifact=artifact,
+        execution_attestation=_CATALOG_TEST_IDENTITY.sign(
+            kind="performance_budget", spec=spec, run_digest=run_digest
+        ),
+    )
+
+
+def _gate_result(spec, record):
+    return GateResult(spec, record, _test_policy())
+
+
+def _apply_records(template, records):
+    return apply_evidence_records(template, records, trust_policy=_test_policy())
+
+
+def _apply_budgets(template, budgets):
+    return apply_performance_budgets(template, budgets, trust_policy=_test_policy())
 
 
 def _retirement_telemetry() -> TelemetryAttestation:
@@ -206,16 +296,16 @@ def test_reviewer_adversarial_erasure_drill_rejects_mismatched_or_missing_correl
         assert record.drill == spec.correlation
         assert record.drill is not None
         with pytest.raises(ReleaseEvidenceError, match="drill correlation"):
-            GateResult(spec, replace(record, drill=replace(record.drill, drill_digest="b" * 64)))
+            _gate_result(spec, replace(record, drill=replace(record.drill, drill_digest="b" * 64)))
         with pytest.raises(ReleaseEvidenceError, match="drill correlation"):
-            GateResult(spec, replace(record, drill=None))
+            _gate_result(spec, replace(record, drill=None))
 
 
 def test_reviewer_adversarial_retirement_rejects_unrelated_gate_or_result_reference() -> None:
     template = release_evidence_template()
     migration = _gate("legacy_fact_migration_equivalence")
     unrelated = _record(_gate("rdf11_projection_fixture"))
-    with_unrelated = apply_evidence_records(template, (unrelated,))
+    with_unrelated = _apply_records(template, (unrelated,))
     telemetry = _retirement_telemetry()
 
     wrong_gate = CompatibilityRetirementDecision(
@@ -255,7 +345,7 @@ def test_retirement_telemetry_requires_its_digest_and_bound_equivalence_record()
         telemetry_attestation_from_mapping(payload)
 
     updated = attach_retirement_telemetry(
-        apply_evidence_records(template, (migration_record,)),
+        _apply_records(template, (migration_record,)),
         telemetry,
     )
     decision = updated.compatibility_retirement[0]
@@ -269,7 +359,7 @@ def test_retirement_telemetry_requires_its_digest_and_bound_equivalence_record()
 def test_reviewer_adversarial_external_report_requires_exact_stages_repo_revision_and_artifacts() -> None:
     template = release_evidence_template()
     external_specs = [spec for spec in release_gate_specs() if spec.category == "external_adapter"]
-    evidence = apply_evidence_records(template, tuple(_record(spec) for spec in external_specs))
+    evidence = _apply_records(template, tuple(_record(spec) for spec in external_specs))
     report = _external_report(evidence)
 
     assert set(report.gate_ids) == {
@@ -329,17 +419,17 @@ def test_reviewer_adversarial_record_rejects_spec_environment_and_fixture_mismat
     bad_environment = ExecutionEnvironment("postgres", "integration", "stable_only")
 
     with pytest.raises(ReleaseEvidenceError, match="environment"):
-        GateResult(
+        _gate_result(
             spec,
             replace(record, environment=bad_environment, environment_digest=bad_environment.digest),
         )
     with pytest.raises(ReleaseEvidenceError, match="fixture"):
-        GateResult(
+        _gate_result(
             spec,
             replace(record, fixture=replace(record.fixture, fixture_id="other.fixture.v1")),
         )
     with pytest.raises(ReleaseEvidenceError, match="spec digest"):
-        GateResult(spec, replace(record, gate_spec_digest="b" * 64))
+        _gate_result(spec, replace(record, gate_spec_digest="b" * 64))
 
 
 def test_reviewer_adversarial_record_rejects_wrong_observation_schema() -> None:
@@ -347,7 +437,7 @@ def test_reviewer_adversarial_record_rejects_wrong_observation_schema() -> None:
     record = _record(spec)
 
     with pytest.raises(ReleaseEvidenceError, match="observation"):
-        GateResult(spec, replace(record, observation={"case_count": 1}))
+        _gate_result(spec, replace(record, observation={"case_count": 1}))
 
 
 @pytest.mark.parametrize(
@@ -374,18 +464,13 @@ def test_reviewer_adversarial_run_digest_binds_the_complete_opaque_artifact_refe
     assert record.artifact is not None
 
     with pytest.raises(ReleaseEvidenceError, match="run digest"):
-        GateResult(
+        _gate_result(
             spec,
             replace(record, artifact=ArtifactReference(_opaque_artifact_ref("other"), record.artifact.artifact_digest)),
         )
 
     benchmark = _performance_spec(PerformanceMetric.HYBRID_RECALL, "sqlite")
-    budget = PerformanceBudget.from_observed(
-        benchmark,
-        (1.0, 2.0, 3.0),
-        headroom_fraction=0.2,
-        artifact=_artifact("benchmark-artifact"),
-    )
+    budget = _budget(benchmark)
     with pytest.raises(ReleaseEvidenceError, match="run digest"):
         replace(budget, artifact=ArtifactReference(_opaque_artifact_ref("other-benchmark"), "a" * 64))
 
@@ -404,10 +489,12 @@ def test_reviewer_adversarial_performance_rejects_short_zero_invalid_and_unit_mi
     postgres = _performance_spec(PerformanceMetric.HYBRID_RECALL, "postgres")
     artifact = _artifact("benchmark")
 
-    with pytest.raises(ReleaseEvidenceError, match="sample_count"):
+    with pytest.raises(ReleaseEvidenceError, match="cannot mint"):
         PerformanceBudget.from_observed(postgres, (1.0, 2.0), headroom_fraction=0.2, artifact=artifact)
     with pytest.raises(ReleaseEvidenceError, match="positive"):
-        PerformanceBudget.from_observed(postgres, (0.0, 1.0, 2.0), headroom_fraction=0.2, artifact=artifact)
+        PerformanceBudget._bound_run_digest(
+            postgres, (0.0, 1.0, 2.0), headroom_fraction=0.2, artifact=artifact
+        )
     with pytest.raises(ReleaseEvidenceError, match="duration metrics"):
         PerformanceTarget(PerformanceMetric.HYBRID_RECALL, "postgres", "integration", "bytes")
     with pytest.raises(ReleaseEvidenceError, match="storage growth"):
@@ -418,14 +505,9 @@ def test_sqlite_only_budget_cannot_satisfy_postgres_or_release_readiness() -> No
     template = release_evidence_template()
     sqlite = _performance_spec(PerformanceMetric.HYBRID_RECALL, "sqlite")
     sqlite_record = _record(sqlite)
-    with_record = apply_evidence_records(template, (sqlite_record,))
-    sqlite_budget = PerformanceBudget.from_observed(
-        sqlite,
-        (1.0, 2.0, 3.0),
-        headroom_fraction=0.2,
-        artifact=_artifact("sqlite-benchmark"),
-    )
-    updated = apply_performance_budgets(with_record, (sqlite_budget,))
+    with_record = _apply_records(template, (sqlite_record,))
+    sqlite_budget = _budget(sqlite)
+    updated = _apply_budgets(with_record, (sqlite_budget,))
 
     assert updated.performance_budgets[sqlite.performance_target] == sqlite_budget
     assert any(
@@ -493,23 +575,6 @@ def _cli(*arguments: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _record_command(spec, output: Path, artifact_ref: str | None = None) -> list[str]:
-    artifact_ref = artifact_ref or _opaque_artifact_ref("record")
-    return [
-        "record",
-        "--gate",
-        spec.gate_id,
-        "--artifact-ref",
-        artifact_ref,
-        "--artifact-digest",
-        "b" * 64,
-        "--observation-json",
-        json.dumps(_observation(spec)),
-        "--output",
-        str(output),
-    ]
-
-
 def _telemetry_command(output: Path) -> list[str]:
     return [
         "telemetry",
@@ -533,77 +598,174 @@ def _telemetry_command(output: Path) -> list[str]:
     ]
 
 
-def test_cli_record_and_assemble_use_the_catalog_not_raw_argv(tmp_path: Path) -> None:
-    spec = _gate("rdf11_projection_fixture")
-    record = tmp_path / "record.json"
-    report = tmp_path / "report.json"
+def _write_record(path: Path, record: EvidenceRecord) -> None:
+    path.write_text(json.dumps(record.to_mapping()), encoding="utf-8")
 
-    recorded = _cli(*_record_command(spec, record))
-    assembled = _cli("assemble", "--record", str(record), "--output", str(report))
+
+def _write_policy(
+    path: Path,
+    identity: CatalogSigningIdentity | None = None,
+    runner_ids: tuple[str, ...] | None = None,
+) -> None:
+    if identity is not None:
+        selected_runner_ids = runner_ids or tuple(
+            sorted({spec.runner.runner_id for spec in release_gate_specs()})
+        )
+        keys = [identity.trusted_key(selected_runner_ids).to_mapping()]
+    else:
+        keys = [key.to_mapping() for key in _test_policy().keys]
+    path.write_text(
+        json.dumps({"keys": keys}),
+        encoding="utf-8",
+    )
+
+
+def test_direct_attest_and_public_record_refuse_fabricated_observations(tmp_path: Path) -> None:
+    spec = _gate("rdf11_projection_fixture")
+    output = tmp_path / "record.json"
+
+    with pytest.raises(ReleaseEvidenceError, match="cannot mint"):
+        EvidenceRecord.attest(spec, _observation(spec), _artifact("fabricated"))
+
+    result = _cli(
+        "record",
+        "--gate",
+        spec.gate_id,
+        "--observation-json",
+        json.dumps(_observation(spec)),
+        "--output",
+        str(output),
+    )
+
+    assert result.returncode != 0
+    assert not output.exists()
+    assert "disabled" in result.stderr
+
+
+def test_verified_execution_attestation_rejects_signature_tampering() -> None:
+    spec = _gate("rdf11_projection_fixture")
+    record = _record(spec)
+    assert record.execution_attestation is not None
+
+    with pytest.raises(ReleaseEvidenceError, match="signature verification failed"):
+        _apply_records(
+            release_evidence_template(),
+            (
+                replace(
+                    record,
+                    execution_attestation=replace(record.execution_attestation, signature="0" * 128),
+                ),
+            ),
+        )
+
+
+def test_cli_run_executes_an_allowlisted_registry_workload_and_assemble_verifies_it(tmp_path: Path) -> None:
+    spec = _gate("stable_only_capability_selection")
+    key_bytes = b"\x02" * 32
+    key_file = tmp_path / "signing.key"
+    key_file.write_text(key_bytes.hex(), encoding="utf-8")
+    identity = CatalogSigningIdentity(
+        issuer_id="local_ci",
+        key_id="registry_runner",
+        private_key=Ed25519PrivateKey.from_private_bytes(key_bytes),
+    )
+    record = tmp_path / "record.json"
+    policy = tmp_path / "policy.json"
+    report = tmp_path / "report.json"
+    _write_policy(policy, identity, ("registry",))
+
+    recorded = _cli(
+        "run",
+        "--gate",
+        spec.gate_id,
+        "--signing-key-file",
+        str(key_file),
+        "--issuer-id",
+        identity.issuer_id,
+        "--key-id",
+        identity.key_id,
+        "--output",
+        str(record),
+    )
+    assembled = _cli(
+        "assemble",
+        "--record",
+        str(record),
+        "--trust-policy",
+        str(policy),
+        "--output",
+        str(report),
+    )
 
     assert recorded.returncode == 0, recorded.stderr
     assert assembled.returncode == 0, assembled.stderr
     payload = json.loads(record.read_text(encoding="utf-8"))
-    assert "command" not in payload
-    assert payload["runner_id"] == spec.runner.runner_id
-    assert payload["command_digest"] == spec.runner.command_digest
-    assert payload["environment"] == spec.environment.to_mapping()
+    assert payload["state"] == "passed"
+    assert payload["execution_attestation"]["source"] == "catalog_runner"
     assert json.loads(report.read_text(encoding="utf-8"))["ready"] is False
 
 
-def test_cli_record_refuses_arbitrary_true_argv(tmp_path: Path) -> None:
+def test_cli_run_blocks_an_unregistered_catalog_workload(tmp_path: Path) -> None:
     spec = _gate("rdf11_projection_fixture")
-    output = tmp_path / "record.json"
+    key_file = tmp_path / "signing.key"
+    key_file.write_text((b"\x03" * 32).hex(), encoding="utf-8")
+    record = tmp_path / "record.json"
 
-    result = _cli(*_record_command(spec, output), "--", "true")
+    result = _cli(
+        "run",
+        "--gate",
+        spec.gate_id,
+        "--signing-key-file",
+        str(key_file),
+        "--issuer-id",
+        "local_ci",
+        "--key-id",
+        "pytest_runner",
+        "--output",
+        str(record),
+    )
 
-    assert result.returncode != 0
-    assert not output.exists()
-    assert "unrecognized arguments" in result.stderr
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(record.read_text(encoding="utf-8"))
+    assert payload["state"] == "blocked"
+    assert payload["reason_code"] == "catalog_workload_unavailable"
+    assert payload["execution_attestation"] is None
 
 
-@pytest.mark.parametrize(
-    "reference",
-    (
-        "postgresql://user:password@db.example/kestrel",
-        "ci://semantic-release/42?token=secret",
-        "artifact://tenant-42/result",
-        "evidence://user@host/result",
-    ),
-)
-def test_cli_record_refuses_sensitive_artifact_reference(tmp_path: Path, reference: str) -> None:
+def test_cli_assemble_refuses_signed_record_without_operator_policy(tmp_path: Path) -> None:
     spec = _gate("rdf11_projection_fixture")
-    output = tmp_path / "record.json"
+    record = tmp_path / "record.json"
+    output = tmp_path / "report.json"
+    _write_record(record, _record(spec))
 
-    result = _cli(*_record_command(spec, output, reference))
+    result = _cli("assemble", "--record", str(record), "--output", str(output))
 
     assert result.returncode == 1
     assert not output.exists()
-    assert "artifact" in result.stderr
-
-
-def test_cli_record_refuses_environment_backend_mode_overrides(tmp_path: Path) -> None:
-    spec = _gate("rdf11_projection_fixture")
-    output = tmp_path / "record.json"
-
-    result = _cli(*_record_command(spec, output), "--backend", "postgres", "--mode", "integration")
-
-    assert result.returncode != 0
-    assert not output.exists()
-    assert "unrecognized arguments" in result.stderr
+    assert "trusted execution policy" in result.stderr
 
 
 def test_cli_assemble_rejects_tampered_record_environment(tmp_path: Path) -> None:
     spec = _gate("rdf11_projection_fixture")
     record = tmp_path / "record.json"
     tampered = tmp_path / "tampered.json"
+    policy = tmp_path / "policy.json"
     output = tmp_path / "report.json"
-    assert _cli(*_record_command(spec, record)).returncode == 0
+    _write_record(record, _record(spec))
+    _write_policy(policy)
     payload = json.loads(record.read_text(encoding="utf-8"))
     payload["environment"]["backend"] = "postgres"
     tampered.write_text(json.dumps(payload), encoding="utf-8")
 
-    result = _cli("assemble", "--record", str(tampered), "--output", str(output))
+    result = _cli(
+        "assemble",
+        "--record",
+        str(tampered),
+        "--trust-policy",
+        str(policy),
+        "--output",
+        str(output),
+    )
 
     assert result.returncode == 1
     assert not output.exists()
@@ -613,30 +775,19 @@ def test_cli_assemble_rejects_tampered_record_environment(tmp_path: Path) -> Non
 def test_cli_assemble_safely_binds_retirement_and_external_adapter_attestations(tmp_path: Path) -> None:
     migration = _gate("legacy_fact_migration_equivalence")
     external_specs = [spec for spec in release_gate_specs() if spec.category == "external_adapter"]
+    records = {spec.gate_id: _record(spec) for spec in (migration, *external_specs)}
     record_paths: list[Path] = []
-    for spec in (migration, *external_specs):
-        path = tmp_path / f"{spec.gate_id}.json"
-        result = _cli(
-            *_record_command(
-                spec,
-                path,
-                artifact_ref=_opaque_artifact_ref(spec.gate_id),
-            )
-        )
-        assert result.returncode == 0, result.stderr
+    for gate_id, record in records.items():
+        path = tmp_path / f"{gate_id}.json"
+        _write_record(path, record)
         record_paths.append(path)
+    policy = tmp_path / "policy.json"
+    _write_policy(policy)
 
     telemetry_path = tmp_path / "telemetry.json"
     telemetry_result = _cli(*_telemetry_command(telemetry_path))
     assert telemetry_result.returncode == 0, telemetry_result.stderr
 
-    records = {
-        record.gate_id: record
-        for record in (
-            evidence_record_from_mapping(json.loads(path.read_text(encoding="utf-8")))
-            for path in record_paths
-        )
-    }
     report = ExternalCapabilityReport.attest(
         capability_id="parametric_self_governed_corpus",
         repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
@@ -656,7 +807,7 @@ def test_cli_assemble_safely_binds_retirement_and_external_adapter_attestations(
     report_path.write_text(json.dumps(report.to_mapping()), encoding="utf-8")
 
     output = tmp_path / "report.json"
-    arguments = ["assemble"]
+    arguments = ["assemble", "--trust-policy", str(policy)]
     for path in record_paths:
         arguments.extend(("--record", str(path)))
     arguments.extend(
@@ -683,8 +834,10 @@ def test_cli_assemble_rejects_tampered_retirement_telemetry(tmp_path: Path) -> N
     migration = _gate("legacy_fact_migration_equivalence")
     record = tmp_path / "migration.json"
     telemetry = tmp_path / "telemetry.json"
+    policy = tmp_path / "policy.json"
     output = tmp_path / "report.json"
-    assert _cli(*_record_command(migration, record)).returncode == 0
+    _write_record(record, _record(migration))
+    _write_policy(policy)
     assert _cli(*_telemetry_command(telemetry)).returncode == 0
     payload = json.loads(telemetry.read_text(encoding="utf-8"))
     payload["unmigrated_eligible_rows"] = 1
@@ -694,6 +847,8 @@ def test_cli_assemble_rejects_tampered_retirement_telemetry(tmp_path: Path) -> N
         "assemble",
         "--record",
         str(record),
+        "--trust-policy",
+        str(policy),
         "--retirement-telemetry",
         str(telemetry),
         "--output",
@@ -705,30 +860,11 @@ def test_cli_assemble_rejects_tampered_retirement_telemetry(tmp_path: Path) -> N
     assert "telemetry digest" in result.stderr
 
 
-def test_cli_budget_uses_performance_gate_backend_and_mode(tmp_path: Path) -> None:
-    spec = _performance_spec(PerformanceMetric.HYBRID_RECALL, "postgres")
+def test_cli_budget_refuses_caller_supplied_samples(tmp_path: Path) -> None:
     output = tmp_path / "budget.json"
 
-    result = _cli(
-        "budget",
-        "--gate",
-        spec.gate_id,
-        "--samples",
-        "1",
-        "2",
-        "3",
-        "--headroom-fraction",
-        "0.2",
-        "--artifact-ref",
-        _opaque_artifact_ref("postgres-benchmark"),
-        "--artifact-digest",
-        "c" * 64,
-        "--output",
-        str(output),
-    )
+    result = _cli("budget", "--samples", "1", "2", "3", "--output", str(output))
 
-    assert result.returncode == 0, result.stderr
-    payload = json.loads(output.read_text(encoding="utf-8"))
-    assert payload["target"]["backend"] == "postgres"
-    assert payload["target"]["mode"] == "integration"
-    assert payload["target"]["unit"] == "ms"
+    assert result.returncode != 0
+    assert not output.exists()
+    assert "disabled" in result.stderr
