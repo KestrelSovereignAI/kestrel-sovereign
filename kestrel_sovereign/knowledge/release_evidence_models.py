@@ -11,14 +11,13 @@ schema.  Only opaque, content-free artifact references are retained.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Iterable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 import hashlib
 import inspect
 import json
 import math
-import platform
 import re
 import time
 from types import MappingProxyType
@@ -218,6 +217,21 @@ class FixtureBinding:
 
 
 @dataclass(frozen=True, slots=True)
+class DrillBinding:
+    """Opaque correlation identity shared by every stage of one erasure drill."""
+
+    drill_id: str
+    drill_digest: str
+
+    def __post_init__(self) -> None:
+        _require_identifier(self.drill_id, "drill_id")
+        _require_digest(self.drill_digest, "drill_digest")
+
+    def to_mapping(self) -> dict[str, str]:
+        return {"drill_id": self.drill_id, "drill_digest": self.drill_digest}
+
+
+@dataclass(frozen=True, slots=True)
 class FixtureContract:
     """Fixture binding plus the expected harness identity."""
 
@@ -376,6 +390,7 @@ class GateSpec:
     advertised: bool = True
     required_for_ready: bool = True
     performance_target: PerformanceTarget | None = None
+    correlation: DrillBinding | None = None
 
     def __post_init__(self) -> None:
         _require_identifier(self.gate_id, "gate_id")
@@ -398,6 +413,12 @@ class GateSpec:
             raise ReleaseEvidenceError("performance gate requires a PerformanceTarget")
         if self.category != "performance" and self.performance_target is not None:
             raise ReleaseEvidenceError("only performance gates may carry a PerformanceTarget")
+        if self.correlation is not None and not isinstance(self.correlation, DrillBinding):
+            raise ReleaseEvidenceError("gate correlation must be DrillBinding or null")
+        if self.category in {"erasure", "external_adapter"} and self.correlation is None:
+            raise ReleaseEvidenceError("erasure and external adapter gates require drill correlation")
+        if self.category not in {"erasure", "external_adapter"} and self.correlation is not None:
+            raise ReleaseEvidenceError("only erasure and external adapter gates may carry drill correlation")
 
     @property
     def digest(self) -> str:
@@ -418,6 +439,7 @@ class GateSpec:
             "performance_target": (
                 self.performance_target.to_mapping() if self.performance_target else None
             ),
+            "correlation": self.correlation.to_mapping() if self.correlation else None,
         }
 
     def initial_evidence(self) -> "EvidenceRecord":
@@ -456,6 +478,8 @@ class GateSpec:
             raise ReleaseEvidenceError("evidence environment does not match immutable catalog")
         if evidence.fixture != self.fixture.binding:
             raise ReleaseEvidenceError("evidence fixture does not match immutable catalog")
+        if evidence.drill != self.correlation:
+            raise ReleaseEvidenceError("evidence drill correlation does not match immutable catalog")
         if evidence.observation is None:
             raise ReleaseEvidenceError("release-ready evidence requires a measured observation")
         self.observation_schema.validate(evidence.observation)
@@ -482,6 +506,7 @@ class EvidenceRecord:
     observation: Mapping[str, object] | None = None
     artifact: ArtifactReference | None = None
     run_digest: str | None = None
+    drill: DrillBinding | None = None
     reason_code: str | None = None
     outside_advertised_capability: bool = False
 
@@ -493,6 +518,8 @@ class EvidenceRecord:
             _require_identifier(self.reason_code, "reason_code")
         if type(self.outside_advertised_capability) is not bool:
             raise ReleaseEvidenceError("outside_advertised_capability must be a boolean")
+        if self.drill is not None and not isinstance(self.drill, DrillBinding):
+            raise ReleaseEvidenceError("evidence drill must be DrillBinding or null")
         technical = (
             self.gate_spec_digest,
             self.runner_id,
@@ -568,6 +595,7 @@ class EvidenceRecord:
             "fixture": spec.fixture.binding.to_mapping(),
             "observation": dict(safe_observation),
             "artifact_digest": artifact.artifact_digest,
+            "drill": spec.correlation.to_mapping() if spec.correlation else None,
         }
         return cls(
             gate_id=spec.gate_id,
@@ -582,6 +610,7 @@ class EvidenceRecord:
             observation=safe_observation,
             artifact=artifact,
             run_digest=_sha256(_canonical_json(payload)),
+            drill=spec.correlation,
             reason_code=reason_code,
         )
 
@@ -606,6 +635,7 @@ class EvidenceRecord:
                     "fixture": self.fixture.to_mapping(),
                     "observation": dict(self.observation),
                     "artifact_digest": self.artifact.artifact_digest,
+                    "drill": self.drill.to_mapping() if self.drill else None,
                 }
             )
         )
@@ -628,6 +658,7 @@ class EvidenceRecord:
             "observation": dict(self.observation) if self.observation else None,
             "artifact": self.artifact.to_mapping() if self.artifact else None,
             "run_digest": self.run_digest,
+            "drill": self.drill.to_mapping() if self.drill else None,
             "reason_code": self.reason_code,
             "outside_advertised_capability": self.outside_advertised_capability,
         }
@@ -675,6 +706,7 @@ class StandardsMatrixEntry:
     sha256: str
     capabilities: tuple[str, ...]
     fixture: FixtureContract | None = None
+    runner: RunnerContract | None = None
 
     def __post_init__(self) -> None:
         _require_identifier(self.identifier, "standards identifier")
@@ -689,6 +721,8 @@ class StandardsMatrixEntry:
             raise ReleaseEvidenceError("standards capabilities must be non-empty strings")
         if self.fixture is not None and not isinstance(self.fixture, FixtureContract):
             raise ReleaseEvidenceError("standards fixture must be FixtureContract")
+        if self.runner is not None and not isinstance(self.runner, RunnerContract):
+            raise ReleaseEvidenceError("standards runner must be RunnerContract")
 
     def to_mapping(self) -> dict[str, object]:
         return {
@@ -701,6 +735,7 @@ class StandardsMatrixEntry:
             "sha256": self.sha256,
             "capabilities": list(self.capabilities),
             "fixture": self.fixture.to_mapping() if self.fixture else None,
+            "runner": self.runner.to_mapping() if self.runner else None,
         }
 
 
@@ -897,77 +932,272 @@ class SemanticBenchmarkHarness:
         )
 
 
+def _utc_timestamp(value: object, field_name: str) -> datetime:
+    """Validate an explicit UTC timestamp without accepting locale-dependent text."""
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise ReleaseEvidenceError(f"{field_name} must be an ISO-8601 UTC timestamp")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as error:
+        raise ReleaseEvidenceError(f"{field_name} must be an ISO-8601 UTC timestamp") from error
+    if parsed.tzinfo is None:
+        raise ReleaseEvidenceError(f"{field_name} must include UTC timezone")
+    return parsed
+
+
+@dataclass(frozen=True, slots=True)
+class TelemetryAttestation:
+    """Content-free, digest-bound compatibility telemetry observation window."""
+
+    window_started_at: str
+    window_ended_at: str
+    inventory_digest: str
+    inventory_complete: bool
+    unmigrated_eligible_rows: int
+    required_consumer_count: int
+    artifact: ArtifactReference
+    telemetry_digest: str
+
+    def __post_init__(self) -> None:
+        started = _utc_timestamp(self.window_started_at, "window_started_at")
+        ended = _utc_timestamp(self.window_ended_at, "window_ended_at")
+        if ended <= started:
+            raise ReleaseEvidenceError("telemetry window must end after it starts")
+        _require_digest(self.inventory_digest, "inventory_digest")
+        if type(self.inventory_complete) is not bool:
+            raise ReleaseEvidenceError("inventory_complete must be a boolean")
+        for value, name in (
+            (self.unmigrated_eligible_rows, "unmigrated_eligible_rows"),
+            (self.required_consumer_count, "required_consumer_count"),
+        ):
+            if type(value) is not int or value < 0:
+                raise ReleaseEvidenceError(f"{name} must be a non-negative integer")
+        if not isinstance(self.artifact, ArtifactReference):
+            raise ReleaseEvidenceError("telemetry attestation requires an artifact")
+        _require_digest(self.telemetry_digest, "telemetry_digest")
+        if self.telemetry_digest != self.calculated_digest():
+            raise ReleaseEvidenceError("telemetry digest does not bind its window and counts")
+
+    @classmethod
+    def attest(
+        cls,
+        *,
+        window_started_at: str,
+        window_ended_at: str,
+        inventory_digest: str,
+        inventory_complete: bool,
+        unmigrated_eligible_rows: int,
+        required_consumer_count: int,
+        artifact: ArtifactReference,
+    ) -> "TelemetryAttestation":
+        payload = {
+            "window_started_at": window_started_at,
+            "window_ended_at": window_ended_at,
+            "inventory_digest": inventory_digest,
+            "inventory_complete": inventory_complete,
+            "unmigrated_eligible_rows": unmigrated_eligible_rows,
+            "required_consumer_count": required_consumer_count,
+            "artifact": artifact.to_mapping(),
+        }
+        return cls(
+            window_started_at=window_started_at,
+            window_ended_at=window_ended_at,
+            inventory_digest=inventory_digest,
+            inventory_complete=inventory_complete,
+            unmigrated_eligible_rows=unmigrated_eligible_rows,
+            required_consumer_count=required_consumer_count,
+            artifact=artifact,
+            telemetry_digest=_sha256(_canonical_json(payload)),
+        )
+
+    def calculated_digest(self) -> str:
+        return _sha256(
+            _canonical_json(
+                {
+                    "window_started_at": self.window_started_at,
+                    "window_ended_at": self.window_ended_at,
+                    "inventory_digest": self.inventory_digest,
+                    "inventory_complete": self.inventory_complete,
+                    "unmigrated_eligible_rows": self.unmigrated_eligible_rows,
+                    "required_consumer_count": self.required_consumer_count,
+                    "artifact": self.artifact.to_mapping(),
+                }
+            )
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "window_started_at": self.window_started_at,
+            "window_ended_at": self.window_ended_at,
+            "inventory_digest": self.inventory_digest,
+            "inventory_complete": self.inventory_complete,
+            "unmigrated_eligible_rows": self.unmigrated_eligible_rows,
+            "required_consumer_count": self.required_consumer_count,
+            "artifact": self.artifact.to_mapping(),
+            "telemetry_digest": self.telemetry_digest,
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class CompatibilityRetirementDecision:
-    """Retain legacy compatibility unless separately bound telemetry proves removal."""
+    """A removal decision bound to the exact legacy-migration gate and telemetry."""
 
     path_id: str
-    observed_window_ref: str | None
-    inventory_complete: bool
-    unmigrated_eligible_rows: int | None
-    required_consumer_count: int | None
-    migration_equivalence: EvidenceRecord
+    migration_gate_id: str
+    migration_spec_digest: str
+    migration_run_digest: str | None
+    telemetry: TelemetryAttestation | None
 
     def __post_init__(self) -> None:
         _require_identifier(self.path_id, "compatibility path_id")
-        if self.observed_window_ref is not None:
-            ArtifactReference(self.observed_window_ref, "0" * 64)
-        if type(self.inventory_complete) is not bool:
-            raise ReleaseEvidenceError("inventory_complete must be a boolean")
-        for value, field_name in ((self.unmigrated_eligible_rows, "unmigrated eligible rows"), (self.required_consumer_count, "required consumer count")):
-            if value is not None and (type(value) is not int or value < 0):
-                raise ReleaseEvidenceError(f"{field_name} must be a non-negative integer or null")
-        if not isinstance(self.migration_equivalence, EvidenceRecord):
-            raise ReleaseEvidenceError("migration_equivalence must be EvidenceRecord")
+        _require_identifier(self.migration_gate_id, "migration_gate_id")
+        _require_digest(self.migration_spec_digest, "migration_spec_digest")
+        if self.migration_run_digest is not None:
+            _require_digest(self.migration_run_digest, "migration_run_digest")
+        if self.telemetry is not None and not isinstance(self.telemetry, TelemetryAttestation):
+            raise ReleaseEvidenceError("telemetry must be TelemetryAttestation or null")
 
     @property
     def removal_safe(self) -> bool:
-        return False
+        return bool(
+            self.migration_run_digest
+            and self.telemetry
+            and self.telemetry.inventory_complete
+            and self.telemetry.unmigrated_eligible_rows == 0
+            and self.telemetry.required_consumer_count == 0
+        )
 
     @property
     def decision(self) -> str:
-        return "retain"
+        return "eligible_for_review" if self.removal_safe else "retain"
 
     @property
     def reason_code(self) -> str:
-        return "telemetry_binding_required"
+        if self.telemetry is None:
+            return "telemetry_not_observed"
+        if not self.telemetry.inventory_complete:
+            return "inventory_incomplete"
+        if self.telemetry.unmigrated_eligible_rows:
+            return "eligible_rows_remain"
+        if self.telemetry.required_consumer_count:
+            return "required_consumers_remain"
+        if self.migration_run_digest is None:
+            return "migration_equivalence_not_observed"
+        return "telemetry_and_equivalence_observed"
 
     def to_mapping(self) -> dict[str, object]:
         return {
             "path_id": self.path_id,
-            "observed_window_ref": self.observed_window_ref,
-            "inventory_complete": self.inventory_complete,
-            "unmigrated_eligible_rows": self.unmigrated_eligible_rows,
-            "required_consumer_count": self.required_consumer_count,
-            "migration_equivalence": self.migration_equivalence.to_mapping(),
+            "migration_gate_id": self.migration_gate_id,
+            "migration_spec_digest": self.migration_spec_digest,
+            "migration_run_digest": self.migration_run_digest,
+            "telemetry": self.telemetry.to_mapping() if self.telemetry else None,
             "decision": self.decision,
             "reason_code": self.reason_code,
         }
 
 
 @dataclass(frozen=True, slots=True)
+class ExternalGateAttestation:
+    """External CI binding for one correlated adapter erasure result/artifact."""
+
+    gate_id: str
+    gate_spec_digest: str
+    result_digest: str
+    artifact: ArtifactReference
+    drill: DrillBinding
+
+    def __post_init__(self) -> None:
+        _require_identifier(self.gate_id, "external gate_id")
+        _require_digest(self.gate_spec_digest, "external gate_spec_digest")
+        _require_digest(self.result_digest, "external result_digest")
+        if not isinstance(self.artifact, ArtifactReference):
+            raise ReleaseEvidenceError("external gate attestation requires artifact")
+        if not isinstance(self.drill, DrillBinding):
+            raise ReleaseEvidenceError("external gate attestation requires drill correlation")
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "gate_id": self.gate_id,
+            "gate_spec_digest": self.gate_spec_digest,
+            "result_digest": self.result_digest,
+            "artifact": self.artifact.to_mapping(),
+            "drill": self.drill.to_mapping(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ExternalCapabilityReport:
-    """External consumer identity; result binding is added in the next slice."""
+    """Hash-bound external adapter evidence; metadata alone is never sufficient."""
 
     capability_id: str
     repository: str
     source_revision: str
-    gate_ids: tuple[str, ...]
+    attestations: tuple[ExternalGateAttestation, ...]
+    attestation_digest: str
 
     def __post_init__(self) -> None:
         _require_identifier(self.capability_id, "external capability_id")
         if not isinstance(self.repository, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.repository):
             raise ReleaseEvidenceError("external repository must be owner/name")
         _require_commit(self.source_revision, "external source_revision")
-        if not self.gate_ids:
-            raise ReleaseEvidenceError("external capability report requires gate IDs")
-        for gate_id in self.gate_ids:
-            _require_identifier(gate_id, "external gate_id")
+        if (
+            not isinstance(self.attestations, tuple)
+            or not self.attestations
+            or any(not isinstance(item, ExternalGateAttestation) for item in self.attestations)
+        ):
+            raise ReleaseEvidenceError("external capability report requires gate attestations")
+        gate_ids = [item.gate_id for item in self.attestations]
+        if len(set(gate_ids)) != len(gate_ids):
+            raise ReleaseEvidenceError("external capability report cannot repeat a gate")
+        _require_digest(self.attestation_digest, "external attestation_digest")
+        if self.attestation_digest != self.calculated_digest():
+            raise ReleaseEvidenceError("external attestation digest does not bind result/artifact references")
+
+    @classmethod
+    def attest(
+        cls,
+        *,
+        capability_id: str,
+        repository: str,
+        source_revision: str,
+        attestations: tuple[ExternalGateAttestation, ...],
+    ) -> "ExternalCapabilityReport":
+        payload = {
+            "capability_id": capability_id,
+            "repository": repository,
+            "source_revision": source_revision,
+            "attestations": [item.to_mapping() for item in attestations],
+        }
+        return cls(
+            capability_id=capability_id,
+            repository=repository,
+            source_revision=source_revision,
+            attestations=attestations,
+            attestation_digest=_sha256(_canonical_json(payload)),
+        )
+
+    @property
+    def gate_ids(self) -> tuple[str, ...]:
+        return tuple(item.gate_id for item in self.attestations)
+
+    def calculated_digest(self) -> str:
+        return _sha256(
+            _canonical_json(
+                {
+                    "capability_id": self.capability_id,
+                    "repository": self.repository,
+                    "source_revision": self.source_revision,
+                    "attestations": [item.to_mapping() for item in self.attestations],
+                }
+            )
+        )
 
     def to_mapping(self) -> dict[str, object]:
         return {
             "capability_id": self.capability_id,
             "repository": self.repository,
             "source_revision": self.source_revision,
-            "gate_ids": list(self.gate_ids),
+            "attestations": [item.to_mapping() for item in self.attestations],
+            "attestation_digest": self.attestation_digest,
         }

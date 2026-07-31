@@ -21,11 +21,13 @@ from .registry import ExperimentalCapabilityError, SemanticKnowledgeRegistry, St
 from .release_evidence_models import (
     ArtifactReference,
     CompatibilityRetirementDecision,
+    DrillBinding,
     EvidenceRecord,
     EvidenceState,
     ErasureStage,
     ExecutionEnvironment,
     ExternalCapabilityReport,
+    ExternalGateAttestation,
     FixtureBinding,
     FixtureContract,
     GateResult,
@@ -38,11 +40,9 @@ from .release_evidence_models import (
     ReleaseEvidenceError,
     RunnerContract,
     StandardsMatrixEntry,
+    TelemetryAttestation,
     _canonical_json,
-    _require_digest,
-    _require_identifier,
     _sha256,
-    _safe_gate_name,
 )
 
 
@@ -50,6 +50,15 @@ RELEASE_EVIDENCE_SCHEMA_VERSION = 2
 SEMANTIC_RELEASE_CONTRACT = "semantic-kb-v1-release-evidence-v2"
 PARAMETRIC_SELF_EVIDENCE_REPOSITORY = "KestrelSovereignAI/kestrel-feature-parametric-self"
 PARAMETRIC_SELF_EVIDENCE_REVISION = "bcbfbb2"
+_ERASURE_DRILL = DrillBinding(
+    "semantic_erasure_release_drill_v1",
+    _sha256("semantic-release-evidence-v2:drill:semantic_erasure_release_drill_v1"),
+)
+_EXTERNAL_ADAPTER_GATE_IDS = (
+    "external_corpus_consumed",
+    "external_candidate_invalidated",
+    "external_served_eligibility_rejected",
+)
 
 
 def _fixture_binding(fixture_id: str) -> FixtureBinding:
@@ -85,7 +94,7 @@ _CONFORMANCE_STANDARD_IDS = {
     "rdfs11_inference_fixture": "rdfs-20140225",
     "owl2rl_inference_fixture": "owl2-profiles-20121211",
     "shacl2017_core_fixture": "shacl-core-20170720",
-    "sparql11_readonly_fixture": "sparql11-readonly-20130321",
+    "sparql11_readonly_fixture": "sparql11-readonly",
 }
 
 
@@ -120,6 +129,7 @@ def _gate(
     advertised: bool = True,
     required_for_ready: bool = True,
     performance_target: PerformanceTarget | None = None,
+    correlation: DrillBinding | None = None,
 ) -> GateSpec:
     return GateSpec(
         gate_id,
@@ -133,6 +143,7 @@ def _gate(
         advertised=advertised,
         required_for_ready=required_for_ready,
         performance_target=performance_target,
+        correlation=correlation,
     )
 
 
@@ -248,6 +259,7 @@ def release_gate_specs(
             fixture=_fixture("erasure_drill.v1", "erasure_drill_harness_v1"),
             schema=_schema("erasure_result_v1", ("erased_count", "positive_count"), ("remaining_count", "zero_count")),
             owner="parametric_self" if stage is ErasureStage.SERVED_ADAPTER_ELIGIBILITY else "kestrel_core",
+            correlation=_ERASURE_DRILL,
         )
         for stage in ErasureStage
     )
@@ -259,10 +271,9 @@ def release_gate_specs(
             fixture=_fixture("parametric_self_erasure.v1", "external_adapter_harness_v1"),
             schema=_schema("external_adapter_result_v1", ("erased_count", "positive_count"), ("remaining_count", "zero_count")),
             owner="parametric_self",
+            correlation=_ERASURE_DRILL,
         )
-        for gate_id in (
-            "external_corpus_consumed", "external_candidate_invalidated", "external_served_eligibility_rejected",
-        )
+        for gate_id in _EXTERNAL_ADAPTER_GATE_IDS
     )
     diagnostics = (
         _gate(
@@ -271,6 +282,29 @@ def release_gate_specs(
             environment=_environment("sqlite", "unit"),
             fixture=_fixture("semantic_maintenance_diagnostics.v1", "diagnostics_harness_v1"),
             schema=_schema("diagnostics_result_v1", ("diagnostic_count", "positive_count"), ("redaction_violation_count", "zero_count")),
+        ),
+    )
+    live_agent = (
+        _gate(
+            "kite_http_stable_only_release_drill", "live_agent", "stable_only_http_invoke",
+            runner_id="kite_http", command_id="kite_http_stable_only_release_v1",
+            environment=_environment("dual_backend", "kite_http_stable", "stable_only"),
+            fixture=_fixture("kite_http_stable_only.v1", "kite_http_release_harness_v1"),
+            schema=_schema("kite_http_stable_only_result_v1", ("invoke_count", "positive_count"), ("scenario_count", "positive_count"), ("provenance_check_count", "positive_count")),
+        ),
+        _gate(
+            "kite_http_experimental_enabled_release_drill", "live_agent", "experimental_enabled_http_invoke",
+            runner_id="kite_http", command_id="kite_http_experimental_enabled_release_v1",
+            environment=_environment("dual_backend", "kite_http_experimental", "experimental_enabled"),
+            fixture=_fixture("kite_http_experimental_enabled.v1", "kite_http_release_harness_v1"),
+            schema=_schema("kite_http_experimental_result_v1", ("invoke_count", "positive_count"), ("scenario_count", "positive_count"), ("experimental_selection_count", "positive_count")),
+        ),
+        _gate(
+            "stable_persisted_data_no_canonical_migration_drill", "live_agent", "stable_persisted_data_no_migration",
+            runner_id="kite_http", command_id="kite_http_persisted_stable_release_v1",
+            environment=_environment("dual_backend", "kite_http_persisted", "stable_only"),
+            fixture=_fixture("kite_http_persisted_stable.v1", "kite_http_release_harness_v1"),
+            schema=_schema("kite_http_persisted_result_v1", ("persisted_assertion_count", "positive_count"), ("canonical_migration_count", "zero_count")),
         ),
     )
     compatibility = (
@@ -287,7 +321,7 @@ def release_gate_specs(
     # resulting capability list is intentionally *not* a passing record.
     if not _experimental_capabilities(selected):
         raise ReleaseEvidenceError("stable-only release catalog requires experimental capabilities")
-    return conformance + stable_selection + parity + performance + erasure + external + diagnostics + compatibility
+    return conformance + stable_selection + parity + performance + erasure + external + diagnostics + live_agent + compatibility
 
 
 @dataclass(frozen=True, slots=True)
@@ -333,11 +367,16 @@ class SemanticReleaseEvidence:
                 budget.validate_against(spec_by_target[target])
         if len(self.compatibility_retirement) != 1:
             raise ReleaseEvidenceError("release evidence requires one compatibility decision")
+        _validate_retirement_decision(self.compatibility_retirement[0], self.gates)
+        if self.external_capabilities:
+            _validate_external_capability_reports(self.external_capabilities, self.gates)
 
     @property
     def ready(self) -> bool:
-        return all(gate.ready for gate in self.gates) and all(
-            budget is not None for budget in self.performance_budgets.values()
+        return (
+            all(gate.ready for gate in self.gates)
+            and all(budget is not None for budget in self.performance_budgets.values())
+            and _external_capabilities_ready(self.external_capabilities, self.gates)
         )
 
     def blocking_gate_ids(self) -> tuple[str, ...]:
@@ -351,6 +390,8 @@ class SemanticReleaseEvidence:
             for target, budget in self.performance_budgets.items()
             if budget is None
         )
+        if not _external_capabilities_ready(self.external_capabilities, self.gates):
+            blocking.add("external_adapter_attestation")
         return tuple(sorted(blocking))
 
     def to_mapping(self) -> dict[str, object]:
@@ -372,11 +413,94 @@ class SemanticReleaseEvidence:
         }
 
 
+def _legacy_migration_gate(gates: tuple[GateResult, ...]) -> GateResult:
+    try:
+        return next(gate for gate in gates if gate.spec.gate_id == "legacy_fact_migration_equivalence")
+    except StopIteration as error:  # pragma: no cover - catalog check catches this first.
+        raise ReleaseEvidenceError("immutable catalog lacks legacy migration equivalence gate") from error
+
+
+def _validate_retirement_decision(
+    decision: CompatibilityRetirementDecision,
+    gates: tuple[GateResult, ...],
+) -> None:
+    """Bind retirement only to the exact declared migration-equivalence result."""
+    if decision.path_id != "legacy_fact_migration_compatibility":
+        raise ReleaseEvidenceError("unknown compatibility retirement path")
+    migration = _legacy_migration_gate(gates)
+    if (
+        decision.migration_gate_id != migration.spec.gate_id
+        or decision.migration_spec_digest != migration.spec.digest
+    ):
+        raise ReleaseEvidenceError("retirement decision is not bound to legacy migration equivalence spec")
+    if decision.migration_run_digest is not None:
+        if not migration.evidence.passed or migration.evidence.run_digest != decision.migration_run_digest:
+            raise ReleaseEvidenceError("retirement decision references an unrelated migration result")
+    if decision.removal_safe and decision.migration_run_digest is None:
+        raise ReleaseEvidenceError("retirement cannot be safe without bound migration equivalence")
+
+
+def _external_gate_results(gates: tuple[GateResult, ...]) -> dict[str, GateResult]:
+    return {
+        gate.spec.gate_id: gate
+        for gate in gates
+        if gate.spec.category == "external_adapter"
+    }
+
+
+def _validate_external_capability_reports(
+    reports: tuple[ExternalCapabilityReport, ...],
+    gates: tuple[GateResult, ...],
+) -> None:
+    """Require exact repo/revision and hashed result/artifact bindings from Pself."""
+    if len(reports) != 1:
+        raise ReleaseEvidenceError("release evidence requires exactly one external adapter attestation")
+    report = reports[0]
+    if (
+        report.capability_id != "parametric_self_governed_corpus"
+        or report.repository != PARAMETRIC_SELF_EVIDENCE_REPOSITORY
+        or report.source_revision != PARAMETRIC_SELF_EVIDENCE_REVISION
+    ):
+        raise ReleaseEvidenceError("external adapter report repository or revision does not match contract")
+    expected = _external_gate_results(gates)
+    supplied = {item.gate_id: item for item in report.attestations}
+    if set(supplied) != set(expected) or set(supplied) != set(_EXTERNAL_ADAPTER_GATE_IDS):
+        raise ReleaseEvidenceError("external adapter report must cover corpus, candidate, and served stages")
+    for gate_id, gate in expected.items():
+        attestation = supplied[gate_id]
+        evidence = gate.evidence
+        if (
+            not evidence.passed
+            or evidence.run_digest is None
+            or evidence.artifact is None
+            or attestation.gate_spec_digest != gate.spec.digest
+            or attestation.result_digest != evidence.run_digest
+            or attestation.artifact != evidence.artifact
+            or attestation.drill != gate.spec.correlation
+        ):
+            raise ReleaseEvidenceError(
+                "external adapter attestation is not bound to its correlated gate result/artifact"
+            )
+
+
+def _external_capabilities_ready(
+    reports: tuple[ExternalCapabilityReport, ...],
+    gates: tuple[GateResult, ...],
+) -> bool:
+    if not reports:
+        return False
+    try:
+        _validate_external_capability_reports(reports, gates)
+    except ReleaseEvidenceError:
+        return False
+    return True
+
+
 def build_standards_matrix(registry: SemanticKnowledgeRegistry | None = None) -> tuple[StandardsMatrixEntry, ...]:
     """Return exact registry pins plus official fixture/harness metadata."""
     selected = registry or get_knowledge_registry()
-    fixture_by_standard = {
-        _CONFORMANCE_STANDARD_IDS[spec.gate_id]: spec.fixture
+    contract_by_standard = {
+        _CONFORMANCE_STANDARD_IDS[spec.gate_id]: spec
         for spec in release_gate_specs(selected)
         if spec.gate_id in _CONFORMANCE_STANDARD_IDS
     }
@@ -390,7 +514,16 @@ def build_standards_matrix(registry: SemanticKnowledgeRegistry | None = None) ->
             published_date=resource.published_date,
             sha256=resource.sha256,
             capabilities=tuple(sorted(resource.capabilities)),
-            fixture=fixture_by_standard.get(resource.identifier),
+            fixture=(
+                contract_by_standard[resource.identifier].fixture
+                if resource.identifier in contract_by_standard
+                else None
+            ),
+            runner=(
+                contract_by_standard[resource.identifier].runner
+                if resource.identifier in contract_by_standard
+                else None
+            ),
         )
         for resource in selected.resources
     )
@@ -424,7 +557,7 @@ def release_evidence_template(registry: SemanticKnowledgeRegistry | None = None)
     selected = registry or get_knowledge_registry()
     specs = release_gate_specs(selected)
     gates = tuple(GateResult(spec, spec.initial_evidence()) for spec in specs)
-    migration = next(gate.evidence for gate in gates if gate.spec.gate_id == "legacy_fact_migration_equivalence")
+    migration = _legacy_migration_gate(gates)
     return SemanticReleaseEvidence(
         standards=build_standards_matrix(selected),
         libraries=implementation_versions(),
@@ -435,21 +568,13 @@ def release_evidence_template(registry: SemanticKnowledgeRegistry | None = None)
         },
         gates=gates,
         performance_budgets={target: None for target in performance_targets()},
-        external_capabilities=(
-            ExternalCapabilityReport(
-                capability_id="parametric_self_governed_corpus",
-                repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
-                source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
-                gate_ids=("external_corpus_consumed", "external_candidate_invalidated", "external_served_eligibility_rejected"),
-            ),
-        ),
+        external_capabilities=(),
         compatibility_retirement=(CompatibilityRetirementDecision(
             path_id="legacy_fact_migration_compatibility",
-            observed_window_ref=None,
-            inventory_complete=False,
-            unmigrated_eligible_rows=None,
-            required_consumer_count=None,
-            migration_equivalence=migration,
+            migration_gate_id=migration.spec.gate_id,
+            migration_spec_digest=migration.spec.digest,
+            migration_run_digest=None,
+            telemetry=None,
         ),),
     )
 
@@ -464,11 +589,7 @@ def apply_evidence_records(evidence: SemanticReleaseEvidence, records: Iterable[
     if unknown:
         raise ReleaseEvidenceError("evidence records do not match declared template gates: " + ", ".join(unknown))
     gates = tuple(replace(gate, evidence=updates.get(gate.spec.gate_id, gate.evidence)) for gate in evidence.gates)
-    retirement = tuple(
-        replace(decision, migration_equivalence=updates.get(decision.migration_equivalence.gate_id, decision.migration_equivalence))
-        for decision in evidence.compatibility_retirement
-    )
-    return replace(evidence, gates=gates, compatibility_retirement=retirement)
+    return replace(evidence, gates=gates)
 
 
 def apply_performance_budgets(evidence: SemanticReleaseEvidence, budgets: Iterable[PerformanceBudget]) -> SemanticReleaseEvidence:
@@ -483,6 +604,34 @@ def apply_performance_budgets(evidence: SemanticReleaseEvidence, budgets: Iterab
             raise ReleaseEvidenceError("performance budget requires its spec-bound passing gate")
         budget.validate_against(gate.spec)
     return replace(evidence, performance_budgets={**evidence.performance_budgets, **updates})
+
+
+def attach_retirement_telemetry(
+    evidence: SemanticReleaseEvidence,
+    telemetry: TelemetryAttestation,
+) -> SemanticReleaseEvidence:
+    """Safely attach a telemetry window to the one declared migration gate."""
+    if not isinstance(telemetry, TelemetryAttestation):
+        raise ReleaseEvidenceError("retirement telemetry must be TelemetryAttestation")
+    migration = _legacy_migration_gate(evidence.gates)
+    decision = CompatibilityRetirementDecision(
+        path_id="legacy_fact_migration_compatibility",
+        migration_gate_id=migration.spec.gate_id,
+        migration_spec_digest=migration.spec.digest,
+        migration_run_digest=migration.evidence.run_digest if migration.evidence.passed else None,
+        telemetry=telemetry,
+    )
+    return replace(evidence, compatibility_retirement=(decision,))
+
+
+def attach_external_capability_report(
+    evidence: SemanticReleaseEvidence,
+    report: ExternalCapabilityReport,
+) -> SemanticReleaseEvidence:
+    """Attach only a fully hash-bound report from the declared external consumer."""
+    if not isinstance(report, ExternalCapabilityReport):
+        raise ReleaseEvidenceError("external adapter report must be ExternalCapabilityReport")
+    return replace(evidence, external_capabilities=(report,))
 
 
 def _expect_mapping(value: object, field: str) -> Mapping[str, object]:
@@ -520,11 +669,19 @@ def _artifact_from_mapping(value: object) -> ArtifactReference | None:
     return ArtifactReference(cast(str, mapping["artifact_ref"]), cast(str, mapping["artifact_digest"]))
 
 
+def _drill_from_mapping(value: object) -> DrillBinding | None:
+    if value is None:
+        return None
+    mapping = _expect_mapping(value, "drill")
+    _strict_keys(mapping, {"drill_id", "drill_digest"}, "drill")
+    return DrillBinding(cast(str, mapping["drill_id"]), cast(str, mapping["drill_digest"]))
+
+
 def evidence_record_from_mapping(value: Mapping[str, object]) -> EvidenceRecord:
     mapping = _expect_mapping(value, "evidence record")
     expected = {
         "gate_id", "state", "gate_spec_digest", "runner_id", "command_id", "command_digest",
-        "environment", "environment_digest", "fixture", "observation", "artifact", "run_digest",
+        "environment", "environment_digest", "fixture", "observation", "artifact", "run_digest", "drill",
         "reason_code", "outside_advertised_capability",
     }
     _strict_keys(mapping, expected, "evidence record")
@@ -540,6 +697,7 @@ def evidence_record_from_mapping(value: Mapping[str, object]) -> EvidenceRecord:
         environment=_environment_from_mapping(mapping["environment"]), environment_digest=cast(str | None, mapping["environment_digest"]),
         fixture=_fixture_from_mapping(mapping["fixture"]), observation=_expect_mapping(observation, "observation") if observation is not None else None,
         artifact=_artifact_from_mapping(mapping["artifact"]), run_digest=cast(str | None, mapping["run_digest"]),
+        drill=_drill_from_mapping(mapping["drill"]),
         reason_code=cast(str | None, mapping["reason_code"]), outside_advertised_capability=cast(bool, mapping["outside_advertised_capability"]),
     )
 
@@ -562,6 +720,73 @@ def performance_budget_from_mapping(value: Mapping[str, object]) -> PerformanceB
     return PerformanceBudget(target, cast(str, mapping["gate_id"]), cast(str, mapping["gate_spec_digest"]), tuple(cast(list[float | int], samples)), cast(float | int, mapping["p95"]), cast(float | int, mapping["budget"]), cast(float, mapping["headroom_fraction"]), fixture, environment, artifact, cast(str, mapping["run_digest"]))
 
 
+def telemetry_attestation_from_mapping(value: Mapping[str, object]) -> TelemetryAttestation:
+    mapping = _expect_mapping(value, "telemetry attestation")
+    _strict_keys(
+        mapping,
+        {
+            "window_started_at", "window_ended_at", "inventory_digest", "inventory_complete",
+            "unmigrated_eligible_rows", "required_consumer_count", "artifact", "telemetry_digest",
+        },
+        "telemetry attestation",
+    )
+    artifact = _artifact_from_mapping(mapping["artifact"])
+    if artifact is None:
+        raise ReleaseEvidenceError("telemetry attestation requires artifact")
+    return TelemetryAttestation(
+        window_started_at=cast(str, mapping["window_started_at"]),
+        window_ended_at=cast(str, mapping["window_ended_at"]),
+        inventory_digest=cast(str, mapping["inventory_digest"]),
+        inventory_complete=cast(bool, mapping["inventory_complete"]),
+        unmigrated_eligible_rows=cast(int, mapping["unmigrated_eligible_rows"]),
+        required_consumer_count=cast(int, mapping["required_consumer_count"]),
+        artifact=artifact,
+        telemetry_digest=cast(str, mapping["telemetry_digest"]),
+    )
+
+
+def external_capability_report_from_mapping(value: Mapping[str, object]) -> ExternalCapabilityReport:
+    mapping = _expect_mapping(value, "external adapter report")
+    _strict_keys(
+        mapping,
+        {"capability_id", "repository", "source_revision", "attestations", "attestation_digest"},
+        "external adapter report",
+    )
+    raw_attestations = mapping["attestations"]
+    if not isinstance(raw_attestations, list):
+        raise ReleaseEvidenceError("external adapter attestations must be a list")
+    attestations: list[ExternalGateAttestation] = []
+    for raw in raw_attestations:
+        item = _expect_mapping(raw, "external gate attestation")
+        _strict_keys(
+            item,
+            {"gate_id", "gate_spec_digest", "result_digest", "artifact", "drill"},
+            "external gate attestation",
+        )
+        artifact = _artifact_from_mapping(item["artifact"])
+        if artifact is None:
+            raise ReleaseEvidenceError("external gate attestation requires artifact")
+        drill = _drill_from_mapping(item["drill"])
+        if drill is None:
+            raise ReleaseEvidenceError("external gate attestation requires drill correlation")
+        attestations.append(
+            ExternalGateAttestation(
+                gate_id=cast(str, item["gate_id"]),
+                gate_spec_digest=cast(str, item["gate_spec_digest"]),
+                result_digest=cast(str, item["result_digest"]),
+                artifact=artifact,
+                drill=drill,
+            )
+        )
+    return ExternalCapabilityReport(
+        capability_id=cast(str, mapping["capability_id"]),
+        repository=cast(str, mapping["repository"]),
+        source_revision=cast(str, mapping["source_revision"]),
+        attestations=tuple(attestations),
+        attestation_digest=cast(str, mapping["attestation_digest"]),
+    )
+
+
 def run_command_evidence(*_args: object, **_kwargs: object) -> EvidenceRecord:
     """Refuse arbitrary argv; the CLI is migrated to predeclared runners next."""
     raise ReleaseEvidenceError("generic argv execution cannot create release-ready evidence")
@@ -577,6 +802,10 @@ def write_evidence_record(record: EvidenceRecord, output: Path, *, overwrite: bo
 
 def write_performance_budget(budget: PerformanceBudget, output: Path, *, overwrite: bool = False) -> None:
     _write_json(budget.to_mapping(), output, overwrite=overwrite, kind="performance budget")
+
+
+def write_telemetry_attestation(telemetry: TelemetryAttestation, output: Path, *, overwrite: bool = False) -> None:
+    _write_json(telemetry.to_mapping(), output, overwrite=overwrite, kind="telemetry attestation")
 
 
 def _experimental_capabilities(registry: SemanticKnowledgeRegistry) -> tuple[str, ...]:

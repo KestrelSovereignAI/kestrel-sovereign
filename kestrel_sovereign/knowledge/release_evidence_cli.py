@@ -21,15 +21,21 @@ from .release_evidence import (
     EvidenceState,
     PerformanceBudget,
     ReleaseEvidenceError,
+    TelemetryAttestation,
+    attach_external_capability_report,
+    attach_retirement_telemetry,
     apply_evidence_records,
     apply_performance_budgets,
     evidence_record_from_mapping,
+    external_capability_report_from_mapping,
     performance_budget_from_mapping,
     release_evidence_template,
     release_gate_specs,
+    telemetry_attestation_from_mapping,
     write_evidence_record,
     write_performance_budget,
     write_release_evidence,
+    write_telemetry_attestation,
 )
 
 
@@ -93,9 +99,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     budget.add_argument("--output", type=Path, required=True)
     budget.add_argument("--overwrite", action="store_true")
 
+    telemetry = subparsers.add_parser(
+        "telemetry",
+        help="write a content-free, digest-bound compatibility telemetry attestation",
+    )
+    telemetry.add_argument("--window-started-at", required=True)
+    telemetry.add_argument("--window-ended-at", required=True)
+    telemetry.add_argument("--inventory-digest", required=True)
+    telemetry.add_argument("--inventory-complete", action="store_true")
+    telemetry.add_argument("--unmigrated-eligible-rows", type=int, required=True)
+    telemetry.add_argument("--required-consumer-count", type=int, required=True)
+    telemetry.add_argument("--artifact-ref", required=True)
+    telemetry.add_argument("--artifact-digest", required=True)
+    telemetry.add_argument("--output", type=Path, required=True)
+    telemetry.add_argument("--overwrite", action="store_true")
+
     assemble = subparsers.add_parser("assemble", help="apply only catalog-bound records")
     assemble.add_argument("--record", type=Path, action="append", default=[])
     assemble.add_argument("--budget", type=Path, action="append", default=[])
+    assemble.add_argument(
+        "--retirement-telemetry",
+        type=Path,
+        help="one digest-bound telemetry artifact; it is bound only to the catalog migration gate",
+    )
+    assemble.add_argument(
+        "--external-report",
+        type=Path,
+        help="one Pself report with exact repository, revision, correlated results, and artifacts",
+    )
     assemble.add_argument("--output", type=Path, required=True)
     assemble.add_argument("--overwrite", action="store_true")
 
@@ -152,6 +183,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{args.output} ({spec.gate_id})"
             )
             return 0
+        if args.command == "telemetry":
+            attestation = TelemetryAttestation.attest(
+                window_started_at=args.window_started_at,
+                window_ended_at=args.window_ended_at,
+                inventory_digest=args.inventory_digest,
+                inventory_complete=args.inventory_complete,
+                unmigrated_eligible_rows=args.unmigrated_eligible_rows,
+                required_consumer_count=args.required_consumer_count,
+                artifact=_artifact(args),
+            )
+            write_telemetry_attestation(attestation, args.output, overwrite=args.overwrite)
+            print(f"semantic retirement telemetry written: {args.output}")
+            return 0
         records = tuple(
             evidence_record_from_mapping(json.loads(path.read_text(encoding="utf-8")))
             for path in args.record
@@ -162,6 +206,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         evidence = apply_evidence_records(release_evidence_template(), records)
         evidence = apply_performance_budgets(evidence, budgets)
+        if args.retirement_telemetry is not None:
+            telemetry_mapping = json.loads(args.retirement_telemetry.read_text(encoding="utf-8"))
+            evidence = attach_retirement_telemetry(
+                evidence,
+                telemetry_attestation_from_mapping(telemetry_mapping),
+            )
+        if args.external_report is not None:
+            report_mapping = json.loads(args.external_report.read_text(encoding="utf-8"))
+            evidence = attach_external_capability_report(
+                evidence,
+                external_capability_report_from_mapping(report_mapping),
+            )
         write_release_evidence(evidence, args.output, overwrite=args.overwrite)
         print(
             "semantic release evidence assembled: "
