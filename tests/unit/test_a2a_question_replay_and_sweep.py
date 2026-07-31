@@ -862,3 +862,74 @@ class TestBootReplayDeliverySupervisor:
             lambda: _signal_handle(Status.OK)
         )
         store.mark_waiting_for_retry.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# #2532 round-2: restoring the row on teardown must NOT also start a retry.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_teardown_restores_the_row_without_starting_a_retry(monkeypatch):
+    """Restore always. Retry only when the feature is still alive.
+
+    ``supervise_terminal_delivery`` calls ``on_undelivered`` on supervisor
+    cancellation so an optimistically-retired row goes back. But cancellation
+    means the feature is tearing down, and ``_cancel_owned_background_tasks``
+    has ALREADY captured its task list — so a retry started from here escapes
+    teardown entirely and can emit an A2A wake after Peers is disabled.
+
+    The restored WAITING row is the retry: the next boot's replay picks it up.
+    """
+    from kestrel_sovereign.signals import delivery as delivery_mod
+    from kestrel_sovereign.signals.delivery import (
+        STATUS_SUPERVISOR_CANCELLED,
+        DeliveryOutcome,
+    )
+
+    feat = PeersFeature.__new__(PeersFeature)
+    captured: dict = {}
+    restored: list = []
+
+    def _capture_supervisor(feature, handle, **kwargs):
+        captured["on_undelivered"] = kwargs["on_undelivered"]
+        return MagicMock()
+
+    async def _fake_restore(task_id, **kwargs):
+        restored.append(kwargs["schedule_retry"])
+
+    # The consumer imports this inside the method, so patch it at the source.
+    monkeypatch.setattr(
+        delivery_mod, "supervise_terminal_delivery", _capture_supervisor
+    )
+    monkeypatch.setattr(
+        feat, "_restore_pending_question_waiting", _fake_restore, raising=False
+    )
+    monkeypatch.setattr(
+        feat, "_build_question_answered_signal",
+        lambda **kw: MagicMock(), raising=False,
+    )
+    feat.agent = MagicMock()
+    feat.agent.dispatcher = MagicMock()
+    feat.agent.dispatcher.enqueue_signal = MagicMock(return_value=MagicMock())
+
+    await feat._fire_question_answered_signal(
+        task_id="q-1", recipient="did:peer:x", original_question="?",
+        sess_id="s", state="completed", reply_text="hi",
+        causation_chain=None, await_delivery=False, schedule_retry=True,
+    )
+
+    on_undelivered = captured.get("on_undelivered")
+    assert on_undelivered is not None, "supervisor was never armed"
+
+    # A genuine delivery failure while the feature is alive → retry is fine.
+    await on_undelivered(DeliveryOutcome(status="failed", delivered=False))
+    # Teardown → restore the row, start nothing.
+    await on_undelivered(
+        DeliveryOutcome(status=STATUS_SUPERVISOR_CANCELLED, delivered=False)
+    )
+
+    assert restored == [True, False], (
+        "a live-feature failure may schedule a retry; a cancelled supervisor "
+        f"must restore only. got {restored}"
+    )

@@ -2312,6 +2312,7 @@ class PeersFeature(Feature):
         import asyncio
 
         from kestrel_sovereign.signals.delivery import (
+            STATUS_SUPERVISOR_CANCELLED,
             await_terminal_delivery,
             supervise_terminal_delivery,
         )
@@ -2385,6 +2386,14 @@ class PeersFeature(Feature):
         if not await_delivery:
             # Boot path — supervise the wait instead of blocking startup.
             async def _restore_after_failure(outcome) -> None:
+                # Restoring the row is always right. Scheduling a retry is
+                # not: when this supervisor was cancelled the feature is
+                # tearing down, and `_cancel_owned_background_tasks` has
+                # already captured its task list — so a retry started here
+                # escapes teardown entirely and can emit an A2A wake after
+                # Peers is disabled. The restored WAITING row is what makes
+                # the next boot pick this up; that is the whole retry.
+                teardown = outcome.status == STATUS_SUPERVISOR_CANCELLED
                 await self._restore_pending_question_waiting(
                     task_id,
                     state=state,
@@ -2393,7 +2402,7 @@ class PeersFeature(Feature):
                     original_question=original_question,
                     sess_id=sess_id,
                     causation_chain=causation_chain,
-                    schedule_retry=schedule_retry,
+                    schedule_retry=schedule_retry and not teardown,
                 )
 
             try:
