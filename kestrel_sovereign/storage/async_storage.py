@@ -300,6 +300,9 @@ class AsyncStorage:
                     self.db,
                     tenant_capability=self._assertion_tenant_capability,
                 )
+                self._assertions._bind_semantic_recall_derivative_revoker(  # noqa: SLF001 - storage composition seam
+                    self._withdraw_semantic_recall_derivatives
+                )
             self.rag = AsyncRAGStore(
                 self.db,
                 llm_service=self.llm_service,
@@ -407,14 +410,35 @@ class AsyncStorage:
         dependencies = self._semantic_recall_dependencies_for_persistence(
             persisted_metadata
         )
+        # Provider embedding and lexical indexing may perform slow I/O.  Do
+        # that work before the assertion lifecycle fence; only the exact
+        # liveness check and final INSERT may hold tenant serialization.
+        prepared = await self.conversation._prepare_conversation_write(  # noqa: SLF001 - coordinated persistence seam
+            role,
+            content,
+            persisted_metadata,
+            session_id,
+            rendered_content,
+            model,
+            provider,
+        )
+        # Token-first lexical work happens before the canonical fence.  Keep
+        # its exact handle even if the prepared object later clears it: an
+        # INSERT exception inside the fence rolls back in-fence cleanup, so
+        # the caller must retry cleanup after the transaction has exited.
+        prepared_lexical_index_id = prepared.lexical_index_id
 
         async def persist() -> None:
-            await self.conversation.add_conversation(
-                role, content, persisted_metadata, session_id,
-                rendered_content=rendered_content,
-                model=model,
-                provider=provider,
+            await self.conversation._persist_prepared_conversation(  # noqa: SLF001 - coordinated persistence seam
+                prepared
             )
+
+        async def exclude_and_persist() -> None:
+            self._exclude_stale_semantic_recall_derivative(prepared.metadata)
+            await self.conversation._exclude_prepared_conversation_from_retrieval(  # noqa: SLF001 - coordinated persistence seam
+                prepared
+            )
+            await persist()
 
         # Only semantic-recall derivatives carry the lineage field.  Normal
         # conversation writes keep their historical no-lock path.
@@ -423,8 +447,7 @@ class AsyncStorage:
             return
 
         if dependencies is None:
-            self._exclude_stale_semantic_recall_derivative(persisted_metadata)
-            await persist()
+            await exclude_and_persist()
             return
 
         if not dependencies:
@@ -439,16 +462,23 @@ class AsyncStorage:
             # A partial/unbound storage bootstrap has no canonical authority
             # with which to validate a claimed semantic lineage.  Persisting it
             # visibly would let a caller create an unrevocable derivative.
-            self._exclude_stale_semantic_recall_derivative(persisted_metadata)
-            await persist()
+            await exclude_and_persist()
             return
 
-        async with assertions._semantic_recall_persistence_fence(
-            dependencies
-        ) as visible:
-            if not visible:
-                self._exclude_stale_semantic_recall_derivative(persisted_metadata)
-            await persist()
+        try:
+            async with assertions._semantic_recall_persistence_fence(
+                dependencies
+            ) as visible:
+                if not visible:
+                    await exclude_and_persist()
+                    return
+                await persist()
+        except Exception:
+            if prepared_lexical_index_id is not None:
+                await self.conversation._discard_lexical_tokens(  # noqa: SLF001 - post-rollback token cleanup
+                    prepared_lexical_index_id
+                )
+            raise
 
     @staticmethod
     def _semantic_recall_dependencies_for_persistence(
@@ -693,6 +723,33 @@ class AsyncStorage:
             if _rows_affected(result) > 0:
                 excluded.append(str(episode_id))
         return tuple(excluded)
+
+    async def _withdraw_semantic_recall_derivatives(
+        self,
+        *,
+        assertion_ids=(),
+        revision_ids=(),
+        physically_erased: bool,
+    ) -> None:
+        """Apply one canonical lifecycle withdrawal to exact context artifacts.
+
+        ``AsyncAssertionStore`` calls this private companion while its tenant
+        mutation remains open.  The conversation/episode updates therefore
+        share that transaction on both SQLite and PostgreSQL.  Assertion
+        lifecycle code passes only canonical IDs; this facade deliberately
+        never interprets message content as a deletion selector.
+        """
+        message_ids = await self._exclude_semantic_recall_dependencies(
+            assertion_ids=assertion_ids,
+            revision_ids=revision_ids,
+        )
+        if message_ids:
+            await self._exclude_memory_episodes_for_key_message_ids(message_ids)
+        if physically_erased:
+            await self._scrub_semantic_recall_dependencies(
+                assertion_ids=assertion_ids,
+                revision_ids=revision_ids,
+            )
 
     async def restore_message(self, message_id: int) -> bool:
         """Restore a soft-deleted message — facade delegator (#763)."""

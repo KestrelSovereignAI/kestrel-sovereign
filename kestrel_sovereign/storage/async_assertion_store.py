@@ -17,6 +17,7 @@ import hashlib
 import json
 import time
 import re
+from collections.abc import Awaitable, Callable
 from typing import Iterable, Mapping, Sequence
 from uuid import uuid4
 
@@ -708,7 +709,11 @@ class AsyncAssertionStore:
     :class:`AsyncStorage` facade.
     """
 
-    __slots__ = ("__scope", "_erasure_jobs")
+    __slots__ = (
+        "__scope",
+        "_erasure_jobs",
+        "_semantic_recall_derivative_revoker",
+    )
 
     def __init__(self, scope: _AssertionStoreScope, /) -> None:
         if type(scope) is not _AssertionStoreScope:
@@ -721,6 +726,14 @@ class AsyncAssertionStore:
         # while a durable receipt after restart proves only that the erasure
         # completed and where incremental consumers must resume.
         self._erasure_jobs: dict[str, tuple[float, str, ErasureResult]] = {}
+        # AsyncStorage binds this private companion after it has constructed
+        # the conversation store.  The assertion store retains no reference
+        # to a higher-level facade or retrieval implementation; it merely
+        # invokes the storage-owned callback while its canonical mutation is
+        # still atomic.  Standalone assertion stores deliberately leave it
+        # unset so their canonical-only contract remains usable in tests and
+        # migrations.
+        self._semantic_recall_derivative_revoker: Callable[..., Awaitable[None]] | None = None
 
     @property
     def tenant_id(self) -> str:
@@ -739,6 +752,59 @@ class AsyncAssertionStore:
 
     def _require_scope(self) -> tuple[str, str]:
         return self.tenant_id, self.owning_agent_id
+
+    def _bind_semantic_recall_derivative_revoker(
+        self,
+        revoker: Callable[..., Awaitable[None]],
+    ) -> None:
+        """Bind the owning storage's exact derivative-withdrawal companion.
+
+        This is an internal composition seam, not a public assertion-store
+        extension point.  The lower-level canonical authority intentionally
+        does not import AsyncStorage, conversation memory, or retrieval code;
+        the already agent-bound AsyncStorage facade injects its companion once
+        during initialization.  Rebinding a live store to a different owner
+        would make lifecycle effects ambiguous, so fail closed.
+        """
+        if not callable(revoker):
+            raise TypeError("semantic recall derivative revoker must be callable")
+        current = self._semantic_recall_derivative_revoker
+        if current is not None and current != revoker:
+            raise AssertionStoreError(
+                "semantic recall derivative revoker is already bound to this store"
+            )
+        self._semantic_recall_derivative_revoker = revoker
+
+    async def _withdraw_semantic_recall_derivatives(
+        self,
+        *,
+        assertion_ids: Iterable[str] = (),
+        revision_ids: Iterable[str] = (),
+        physically_erased: bool = False,
+    ) -> None:
+        """Atomically revoke conversation artifacts tied to withdrawn facts.
+
+        The callback receives only exact canonical identities, never content
+        or a user-controlled selector.  It executes *inside* the current
+        canonical mutation, so either the lifecycle transition and every
+        linked context/episode exclusion commit together or all roll back.
+        """
+        revoker = self._semantic_recall_derivative_revoker
+        if revoker is None:
+            return
+        normalized_assertion_ids = tuple(
+            sorted({value for value in assertion_ids if isinstance(value, str) and value})
+        )
+        normalized_revision_ids = tuple(
+            sorted({value for value in revision_ids if isinstance(value, str) and value})
+        )
+        if not normalized_assertion_ids and not normalized_revision_ids:
+            return
+        await revoker(
+            assertion_ids=normalized_assertion_ids,
+            revision_ids=normalized_revision_ids,
+            physically_erased=physically_erased,
+        )
 
     def _check_assertion_scope(self, assertion: Assertion) -> None:
         tenant_id, owner = self._require_scope()
@@ -2523,6 +2589,9 @@ class AsyncAssertionStore:
                 [item.assertion_id for item in (*quarantined, *invalidated)],
                 [item.revision_id for item in (*quarantined, *invalidated)],
             )
+            await self._withdraw_semantic_recall_derivatives(
+                revision_ids=invalidated_revision_ids,
+            )
             return ValidationQuarantineBatchResult(
                 tuple(quarantined),
                 tuple(invalidated),
@@ -3398,6 +3467,9 @@ class AsyncAssertionStore:
             [predecessor.assertion_id, replacement_state.assertion_id, *[item.assertion_id for item in dependent_states]],
             [predecessor_state.revision_id, replacement_state.revision_id, *[item.revision_id for item in dependent_states]],
         )
+        await self._withdraw_semantic_recall_derivatives(
+            revision_ids=invalidated_revision_ids,
+        )
         return (
             SupersessionResult(
                 predecessor_state, replacement_state, generation,
@@ -3700,6 +3772,9 @@ class AsyncAssertionStore:
             generation = await self._advance_generation()
             for assertion in retracted:
                 await self._event(assertion, "retracted", generation)
+            await self._withdraw_semantic_recall_derivatives(
+                revision_ids=old_revision_ids,
+            )
             return InferenceRevocationResult(
                 len(retracted), len(all_deactivated_ids), generation
             )
@@ -3810,6 +3885,9 @@ class AsyncAssertionStore:
                 {"revision_ids": [item.revision_id for item in retracted], "invalidated_revision_ids": invalidated, "generation": generation},
                 [item.assertion_id for item in retracted], [item.revision_id for item in retracted],
             )
+            await self._withdraw_semantic_recall_derivatives(
+                revision_ids=invalidated,
+            )
             return RetractionResult(tuple(retracted), tuple(invalidated), generation)
 
     async def quarantine_for_validation(
@@ -3901,6 +3979,9 @@ class AsyncAssertionStore:
                 },
                 [quarantined.assertion_id, *[item.assertion_id for item in invalidated]],
                 [quarantined.revision_id, *[item.revision_id for item in invalidated]],
+            )
+            await self._withdraw_semantic_recall_derivatives(
+                revision_ids=invalidated_revision_ids,
             )
             return ValidationQuarantineResult(
                 quarantined,
@@ -4008,6 +4089,9 @@ class AsyncAssertionStore:
                 },
                 [deleted.assertion_id, *[item.assertion_id for item in invalidated]],
                 [deleted.revision_id, *[item.revision_id for item in invalidated]],
+            )
+            await self._withdraw_semantic_recall_derivatives(
+                revision_ids=invalidated_revision_ids,
             )
             return DeletionResult(deleted, tuple(invalidated), tuple(invalidated_revision_ids), generation)
 
@@ -4325,6 +4409,9 @@ class AsyncAssertionStore:
                 },
                 [current.assertion_id, *[item.assertion_id for item in retracted]],
                 [current.revision_id, *[item.revision_id for item in retracted]],
+            )
+            await self._withdraw_semantic_recall_derivatives(
+                revision_ids=invalidated_revision_ids,
             )
             return RetractionResult(
                 tuple(retracted), tuple(invalidated_revision_ids), generation
@@ -4905,6 +4992,16 @@ class AsyncAssertionStore:
             )
             revision_tuple = tuple(sorted(revision_ids))
             assertion_tuple = tuple(sorted(assertion_ids))
+            # The complete erased closure is still present while the owning
+            # tenant mutation is open.  Exclude and scrub every exact linked
+            # derivative before removing canonical identities, so a callback
+            # failure rolls back both sides rather than leaving visible recall
+            # content or an ID-bearing erasure residue.
+            await self._withdraw_semantic_recall_derivatives(
+                assertion_ids=assertion_tuple,
+                revision_ids=revision_tuple,
+                physically_erased=True,
+            )
             await self._sanitize_surviving_references_after_erasure(
                 revision_tuple,
             )

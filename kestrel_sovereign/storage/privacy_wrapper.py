@@ -1885,13 +1885,6 @@ class PrivacyEnforcingStorage:
                     deletion = replay.deletion
                     if deletion is None:  # pragma: no cover - property contract
                         raise AssertionError("deleted replay lacks deletion receipt")
-                    # Older receipts may be replayed after this companion
-                    # exclusion was introduced. Re-apply the exact, idempotent
-                    # closure so a retry cannot leave stale derivatives behind.
-                    async with self.transaction():
-                        await self._exclude_semantic_recall_derivatives(
-                            revision_ids=deletion.invalidated_revision_ids,
-                        )
                     return FactDeleteReceipt(
                         deleted=True,
                         assertion_id=deletion.deleted.assertion_id,
@@ -1934,9 +1927,6 @@ class PrivacyEnforcingStorage:
                                 mapping.subject,
                                 mapping.predicate,
                             ),
-                        )
-                        await self._exclude_semantic_recall_derivatives(
-                            revision_ids=result.invalidated_revision_ids,
                         )
                     return FactDeleteReceipt(
                         deleted=True,
@@ -3095,10 +3085,6 @@ class PrivacyEnforcingStorage:
                 source_occurrences=source_occurrences,
                 **validation_options,
             )
-            if result.accepted:
-                await self._exclude_semantic_recall_derivatives(
-                    revision_ids=result.invalidated_revision_ids,
-                )
             return result
 
     async def append_assertion_source(
@@ -3118,10 +3104,6 @@ class PrivacyEnforcingStorage:
                 source_occurrences=source_occurrences,
                 **validation_options,
             )
-            if result.accepted:
-                await self._exclude_semantic_recall_derivatives(
-                    revision_ids=result.invalidated_revision_ids,
-                )
             return result
 
     async def _restore_explicit_fact_assertion(
@@ -3152,9 +3134,6 @@ class PrivacyEnforcingStorage:
             result = await self._storage.retract_assertion(
                 assertion_id, expected_revision_id, operation_id=operation_id,
             )
-            await self._exclude_semantic_recall_derivatives(
-                revision_ids=result.invalidated_revision_ids,
-            )
             return result
 
     async def delete_assertion(
@@ -3171,9 +3150,6 @@ class PrivacyEnforcingStorage:
                 assertion_id,
                 expected_revision_id,
                 operation_id=operation_id,
-            )
-            await self._exclude_semantic_recall_derivatives(
-                revision_ids=result.invalidated_revision_ids,
             )
             return result
 
@@ -3202,37 +3178,7 @@ class PrivacyEnforcingStorage:
             result = await self._storage.invalidate_assertion_eligibility(
                 assertion_id, expected_revision_id, operation_id=operation_id,
             )
-            await self._exclude_semantic_recall_derivatives(
-                revision_ids=result.invalidated_revision_ids,
-            )
             return result
-
-    async def _exclude_semantic_recall_derivatives(
-        self,
-        *,
-        assertion_ids=(),
-        revision_ids=(),
-    ) -> None:
-        """Exclude exact downstream conversation/episode artifacts.
-
-        This helper is intentionally private to the governed assertion
-        lifecycle.  It consumes canonical assertion/revision identities
-        returned by storage, rather than a free-form content selector, so a
-        lifecycle change cannot touch same-text but unlinked history.
-
-        Revisions are first-class here: a supersession withdraws an exact
-        predecessor revision but may leave the assertion identity current with
-        a new revision.  Erasure also returns a transitive closure that can
-        include historical revisions of a surviving identity.
-        """
-        message_ids = await self._storage._exclude_semantic_recall_dependencies(
-            assertion_ids=assertion_ids,
-            revision_ids=revision_ids,
-        )
-        if message_ids:
-            await self._storage._exclude_memory_episodes_for_key_message_ids(
-                message_ids
-            )
 
     async def erase_assertion(self, assertion_id, *, operation_id=None):
         # Physical erasure is never blocked by a privacy mode, a pin, or a
@@ -3242,14 +3188,6 @@ class PrivacyEnforcingStorage:
         async with self.transaction():
             result = await self._storage.erase_assertion(
                 assertion_id, operation_id=operation_id
-            )
-            await self._exclude_semantic_recall_derivatives(
-                assertion_ids=result.erased_assertion_ids,
-                revision_ids=result.erased_revision_ids,
-            )
-            await self._storage._scrub_semantic_recall_dependencies(
-                assertion_ids=result.erased_assertion_ids,
-                revision_ids=result.erased_revision_ids,
             )
             return result
 

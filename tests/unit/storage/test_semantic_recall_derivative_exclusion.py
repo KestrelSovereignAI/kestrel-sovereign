@@ -130,3 +130,71 @@ async def test_sleep_consolidation_never_recreates_episode_from_excluded_rows(st
         "SELECT COUNT(*) FROM memory_episodes WHERE agent_id = ?",
         (storage.agent_id,),
     ) == 0
+
+
+@pytest.mark.asyncio
+async def test_prepared_derivative_drops_retrieval_indexes_when_fence_excludes_it(storage):
+    """Pre-fence lexical work cannot linger after a stale recall is hidden."""
+    prepared = await storage.conversation._prepare_conversation_write(  # noqa: SLF001 - fence preparation contract
+        "assistant",
+        "stale semantic result",
+        {
+            "semantic_recall_dependencies": [
+                {"assertion_id": "stale", "revision_id": "stale-revision"}
+            ]
+        },
+        None,
+        None,
+        None,
+        None,
+    )
+    lexical_index_id = prepared.lexical_index_id
+
+    await storage.conversation._exclude_prepared_conversation_from_retrieval(  # noqa: SLF001 - fence preparation contract
+        prepared
+    )
+
+    assert prepared.lexical_index_id is None
+    assert prepared.embedding is None
+    if lexical_index_id is not None:
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM conversation_lexical_tokens "
+            "WHERE agent_id = ? AND lexical_index_id = ?",
+            (storage.agent_id, lexical_index_id),
+        ) == 0
+
+
+@pytest.mark.asyncio
+async def test_prepared_derivative_cleans_token_prework_when_final_insert_fails(
+    storage,
+    monkeypatch,
+):
+    """A final fenced INSERT error cannot leave token-first residue behind."""
+    prepared = await storage.conversation._prepare_conversation_write(  # noqa: SLF001 - fence preparation contract
+        "assistant",
+        "failed semantic result",
+        {
+            "semantic_recall_dependencies": [
+                {"assertion_id": "failed", "revision_id": "failed-revision"}
+            ]
+        },
+        None,
+        None,
+        None,
+        None,
+    )
+    lexical_index_id = prepared.lexical_index_id
+
+    async def fail_insert(**_kwargs):
+        raise RuntimeError("forced final insert failure")
+
+    monkeypatch.setattr(storage.conversation, "_insert_message", fail_insert)
+    with pytest.raises(RuntimeError, match="forced final insert failure"):
+        await storage.conversation._persist_prepared_conversation(prepared)  # noqa: SLF001 - fence preparation contract
+
+    if lexical_index_id is not None:
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM conversation_lexical_tokens "
+            "WHERE agent_id = ? AND lexical_index_id = ?",
+            (storage.agent_id, lexical_index_id),
+        ) == 0
