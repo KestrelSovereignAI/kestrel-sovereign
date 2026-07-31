@@ -456,7 +456,9 @@ implemented bridge from the old property graph to canonical assertions. It is
 an **operator-invoked, agent-bound** service: the running agent's authenticated
 `AsyncStorage` capability provides both the assertion tenant and the owner.
 It does not accept an `agent_id` argument and never trusts
-`graph_nodes.properties.agent_id`.
+`graph_nodes.properties.agent_id`. The storage package does not eagerly import
+the memory-agency feature: the feature-owned local vocabulary mapping is loaded
+only when this explicit migration service runs.
 
 The v1 eligible shape is intentionally closed:
 
@@ -498,7 +500,9 @@ only after the public invalidator returns. A failure is retried by every later
 run, including one with no remaining graph pages. The optional compatibility
 flag enables deterministic coverage metrics only—there is no dual-write and no
 application dual-read path. Its removal condition is zero unmigrated eligible
-rows plus operator review of every rejection class.
+rows plus operator review of every rejection class. A bounded/truncated plan
+reports `complete_inventory=false` and `removal_safe=false`; it is never proof
+that the compatibility path may be removed.
 
 An assertion can be knowledge only when it has passed the canonical writer's
 tenant/privacy/normalization checks, recorded source or derivation lineage,

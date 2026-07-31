@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -340,6 +342,105 @@ async def test_bound_tenant_never_inventories_foreign_owner_rows(tmp_path):
         assert (await migration.run()).migrated == 0
     finally:
         await storage.close()
+
+
+def test_storage_package_import_does_not_eagerly_load_memory_agency_feature():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import kestrel_sovereign.storage; "
+            "assert 'kestrel_sovereign.features.memory_agency.semantic_facts' not in sys.modules",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.asyncio
+async def test_mutated_ownership_after_migration_is_terminal_review_failure(tmp_path):
+    storage = await _storage(tmp_path)
+    try:
+        await _node(
+            storage,
+            "fact-owner-mutates",
+            {"subject": "user", "predicate": "preferred_deploy_region", "value": "owner-first", "created_at": "2026-01-01T00:00:00+00:00"},
+        )
+        migration = LegacyGraphFactMigration(storage)
+        await migration.run()
+        assert storage.db is not None
+        await storage.db.execute(
+            "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (?, ?)",
+            ("fact-owner-mutates", "did:example:new-co-owner"),
+        )
+        review = await migration.review_source_set()
+        assert review.changed == 1
+        with pytest.raises(LegacyFactMigrationError, match="source_review_required"):
+            await migration.run()
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_poisoned_rollback_record_becomes_terminal_refusal_not_repeat_wedge(tmp_path):
+    storage = await _storage(tmp_path)
+    try:
+        await _node(
+            storage,
+            "fact-poison-rollback",
+            {"subject": "user", "predicate": "preferred_deploy_region", "value": "poison", "created_at": "2026-01-01T00:00:00+00:00"},
+        )
+        migration = LegacyGraphFactMigration(storage)
+        await migration.run()
+        assert storage.db is not None
+        await storage.db.execute(
+            "UPDATE legacy_fact_migration_records SET revision_id = ? WHERE tenant_id = ?",
+            ("poisoned-revision", TENANT),
+        )
+        refused = await migration.rollback()
+        assert refused.rejected == {"rollback_refused_provenance": 1}
+        outcome = await storage.db.fetchone(
+            "SELECT outcome FROM legacy_fact_migration_records WHERE tenant_id = ?",
+            (TENANT,),
+        )
+        assert outcome[0] == "rollback_refused_provenance"
+        assert (await migration.rollback()).processed == 0
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_truncated_compatibility_metrics_never_claim_removal_safe(tmp_path):
+    storage = await _storage(tmp_path)
+    try:
+        for index in range(501):
+            await _node(
+                storage,
+                f"fact-{index:04d}",
+                {"subject": "user", "predicate": "preferred_deploy_region", "value": f"v{index}", "created_at": "2026-01-01T00:00:00+00:00"},
+            )
+        metrics = await LegacyGraphFactMigration(storage).compatibility_metrics()
+        assert metrics == {
+            "enabled": False,
+            "complete_inventory": False,
+            "removal_safe": False,
+            "reason": "inventory_truncated",
+            "scanned": 500,
+        }
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_tenant_is_refused_before_ontology_probe():
+    storage = MagicMock()
+    storage._initialized = True
+    storage.db = MagicMock()
+    storage.semantic_assertion_binding.return_value = MagicMock(tenant_id="")
+    with pytest.raises(LegacyFactMigrationError, match="invalid_migration_tenant"):
+        await LegacyGraphFactMigration(storage)._ready()
 
 
 @pytest.mark.asyncio

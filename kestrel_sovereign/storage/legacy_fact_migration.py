@@ -21,10 +21,6 @@ import hashlib
 import json
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
-from kestrel_sovereign.features.memory_agency.semantic_facts import (
-    FactMappingError,
-    map_legacy_fact,
-)
 from kestrel_sovereign.knowledge import (
     Assertion,
     DirectLineage,
@@ -53,6 +49,7 @@ _SAFE_REJECTION_CODES = frozenset(
         "invalid_confidence",
         "invalid_unicode",
         "shared_or_ambiguous_ownership",
+        "unsupported_semantic_mapping",
     }
 )
 
@@ -152,13 +149,29 @@ def _canonical_hash(value: object) -> str:
 
 def _safe_rejection_code(error: Exception) -> str:
     """Convert legacy/parser errors to stable diagnostics without echoing data."""
-    if isinstance(error, FactMappingError):
-        return "unsupported_semantic_mapping"
     if isinstance(error, LegacyFactMigrationError):
         candidate = str(error)
         if candidate in _SAFE_REJECTION_CODES:
             return candidate
     return "invalid_legacy_fact"
+
+
+def _map_verified_legacy_fact(*, subject: str, predicate: str, value: str, tenant_id: str):
+    """Load the feature-owned local vocabulary only when migration runs.
+
+    Core storage must remain importable without loading the memory-agency
+    feature.  The feature owns the closed local-term mapping; this adapter
+    translates its data-bearing error into a fixed migration diagnostic.
+    """
+    from kestrel_sovereign.features.memory_agency.semantic_facts import (
+        FactMappingError,
+        map_legacy_fact,
+    )
+
+    try:
+        return map_legacy_fact(subject, predicate, value, tenant_id=tenant_id)
+    except FactMappingError as error:
+        raise LegacyFactMigrationError("unsupported_semantic_mapping") from error
 
 
 def _raw_properties_hash(node_id: object, raw_properties: object) -> str:
@@ -264,6 +277,8 @@ class LegacyGraphFactMigration:
         db = self._storage.db
         if db is None:
             raise RuntimeError("initialized storage has no database")
+        if not isinstance(binding.tenant_id, str) or not binding.tenant_id:
+            raise LegacyFactMigrationError("invalid_migration_tenant")
         return db, binding.tenant_id
 
     async def _rows_after(self, db: Any, tenant_id: str, after: str | None, limit: int):
@@ -314,8 +329,13 @@ class LegacyGraphFactMigration:
                 continue
             try:
                 candidate = _legacy_candidate(node_id, properties)
-                map_legacy_fact(candidate.subject, candidate.predicate, candidate.value, tenant_id=tenant_id)
-            except (LegacyFactMigrationError, FactMappingError) as error:
+                _map_verified_legacy_fact(
+                    subject=candidate.subject,
+                    predicate=candidate.predicate,
+                    value=candidate.value,
+                    tenant_id=tenant_id,
+                )
+            except LegacyFactMigrationError as error:
                 reason = _safe_rejection_code(error)
                 rejected[reason] = rejected.get(reason, 0) + 1
                 continue
@@ -327,7 +347,12 @@ class LegacyGraphFactMigration:
                 )
             else:
                 eligible += 1
-        mapping = map_legacy_fact("user", "preferred_deploy_region", "plan-probe", tenant_id=tenant_id)
+        mapping = _map_verified_legacy_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="plan-probe",
+            tenant_id=tenant_id,
+        )
         return MigrationPlan(
             tenant_id=tenant_id,
             target_ontology=mapping.ontology.namespace,
@@ -384,8 +409,13 @@ class LegacyGraphFactMigration:
                     continue
                 try:
                     candidate = _legacy_candidate(node_id, properties)
-                    mapping = map_legacy_fact(candidate.subject, candidate.predicate, candidate.value, tenant_id=tenant_id)
-                except (LegacyFactMigrationError, FactMappingError) as error:
+                    mapping = _map_verified_legacy_fact(
+                        subject=candidate.subject,
+                        predicate=candidate.predicate,
+                        value=candidate.value,
+                        tenant_id=tenant_id,
+                    )
+                except LegacyFactMigrationError as error:
                     reason = _safe_rejection_code(error)
                     await self._record(
                         db, tenant_id, str(node_id), None, f"rejected:{reason}",
@@ -473,18 +503,30 @@ class LegacyGraphFactMigration:
             (tenant_id, batch_size),
         )
         processed = migrated = idempotent = 0
+        rejected: dict[str, int] = {}
         for node_id, source_id, assertion_id, revision_id in rows:
             processed += 1
             if not all(isinstance(item, str) and item for item in (source_id, assertion_id, revision_id)):
-                raise LegacyFactMigrationError("migration record lacks rollback provenance")
+                await self._set_outcome(db, tenant_id, node_id, "rollback_refused_invalid_record")
+                rejected["rollback_refused_invalid_record"] = (
+                    rejected.get("rollback_refused_invalid_record", 0) + 1
+                )
+                continue
             assertion = await self._storage.get_assertion(assertion_id)
             if assertion is None:
                 idempotent += 1
                 await self._set_outcome(db, tenant_id, node_id, "rolled_back")
                 continue
             sources = await self._storage.list_assertion_sources(assertion_id)
-            if source_id not in {source.source_occurrence_id for source in sources}:
-                raise LegacyFactMigrationError("rollback provenance does not match canonical assertion")
+            if (
+                assertion.revision_id != revision_id
+                or source_id not in {source.source_occurrence_id for source in sources}
+            ):
+                await self._set_outcome(db, tenant_id, node_id, "rollback_refused_provenance")
+                rejected["rollback_refused_provenance"] = (
+                    rejected.get("rollback_refused_provenance", 0) + 1
+                )
+                continue
             await self._storage.delete_assertion(
                 assertion_id,
                 revision_id,
@@ -492,13 +534,32 @@ class LegacyGraphFactMigration:
             )
             await self._set_outcome(db, tenant_id, node_id, "rolled_back")
             migrated += 1
-        return MigrationResult(tenant_id, processed, migrated, idempotent, {}, None, len(rows) < batch_size, False)
+        return MigrationResult(
+            tenant_id,
+            processed,
+            migrated,
+            idempotent,
+            rejected,
+            None,
+            len(rows) < batch_size,
+            False,
+        )
 
     async def compatibility_metrics(self) -> dict[str, object]:
         """Measure migration coverage without enabling a production dual read."""
         plan = await self.plan()
+        if plan.truncated:
+            return {
+                "enabled": self._compatibility_read_enabled,
+                "complete_inventory": False,
+                "removal_safe": False,
+                "reason": "inventory_truncated",
+                "scanned": plan.scanned,
+            }
         return {
             "enabled": self._compatibility_read_enabled,
+            "complete_inventory": True,
+            "removal_safe": False,
             "legacy_eligible": plan.eligible + plan.already_recorded,
             "canonical_recorded": (
                 plan.recorded_by_outcome.get("migrated", 0)
@@ -533,14 +594,14 @@ class LegacyGraphFactMigration:
                     continue
                 try:
                     candidate = _legacy_candidate(node_id, properties)
-                    map_legacy_fact(
-                        candidate.subject,
-                        candidate.predicate,
-                        candidate.value,
+                    _map_verified_legacy_fact(
+                        subject=candidate.subject,
+                        predicate=candidate.predicate,
+                        value=candidate.value,
                         tenant_id=tenant_id,
                     )
                     current_hash = candidate.content_hash
-                except (LegacyFactMigrationError, FactMappingError):
+                except LegacyFactMigrationError:
                     current_hash = _raw_properties_hash(node_id, properties)
                 reviewed += 1
                 if outcome is None:
