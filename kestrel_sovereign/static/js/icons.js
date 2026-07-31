@@ -139,27 +139,44 @@
     PATHS['privacy-public'] = PATHS['globe'];
 
     // ---- Generate CSS mask-image rules ---------------------------------
-    var css = [
-        '.ki{display:inline-block;width:1em;height:1em;vertical-align:-0.125em;',
-        'background:currentColor;',
-        '-webkit-mask:no-repeat center/contain;mask:no-repeat center/contain;',
-        '-webkit-mask-mode:alpha;mask-mode:alpha}'
-    ].join('');
 
-    var names = Object.keys(PATHS);
-    for (var i = 0; i < names.length; i++) {
-        var name = names[i];
-        // Build a standalone SVG for use as a mask (alpha channel).
+    /** Build the `url("data:image/svg+xml,…")` mask for one glyph's inner SVG. */
+    function maskUri(inner) {
         // Replace currentColor → white so strokes/fills are opaque in the mask.
-        var inner = PATHS[name].replace(/currentColor/g, 'white');
-        var svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>" + inner + '</svg>';
+        var svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>"
+            + inner.replace(/currentColor/g, 'white') + '</svg>';
         // Minimal percent-encoding for data: URI inside url("")
         var encoded = svg
             .replace(/"/g, "'")
             .replace(/#/g, '%23')
             .replace(/</g, '%3C')
             .replace(/>/g, '%3E');
-        var uri = 'url("data:image/svg+xml,' + encoded + '")';
+        return 'url("data:image/svg+xml,' + encoded + '")';
+    }
+
+    // #2821: the base rule carries the `question` glyph as its mask, so a `.ki`
+    // whose `.ki-<name>` companion does not exist renders a visible "?" instead
+    // of a solid block. Without a mask-image the base rule's
+    // `background: currentColor` paints the whole 1em box — which is how the
+    // Approvals tab's typo'd `ki-check` (no such glyph) shipped as a filled
+    // square that read as an intentional design element rather than a mistake.
+    // A `.ki-<name>` rule below always wins on specificity-tie-plus-order, so a
+    // known icon is unaffected. `window.kicon()` already had this guard; this
+    // extends it to the class-attribute markup path, which is how every
+    // hand-written and registry-built icon in the console is declared.
+    var css = [
+        '.ki{display:inline-block;width:1em;height:1em;vertical-align:-0.125em;',
+        'background:currentColor;',
+        '-webkit-mask:no-repeat center/contain;mask:no-repeat center/contain;',
+        '-webkit-mask-mode:alpha;mask-mode:alpha;',
+        '-webkit-mask-image:' + maskUri(PATHS['question']) + ';',
+        'mask-image:' + maskUri(PATHS['question']) + '}'
+    ].join('');
+
+    var names = Object.keys(PATHS);
+    for (var i = 0; i < names.length; i++) {
+        var name = names[i];
+        var uri = maskUri(PATHS[name]);
         css += '.ki-' + name + '{-webkit-mask-image:' + uri + ';mask-image:' + uri + '}';
     }
 

@@ -31,12 +31,12 @@
              hidden and is revealed by the chat-header "Advanced" toggle (shared
              reveal implementation, Panels.initReveal, wired in initNavigation). -->
         <div class="nav-tabs" style="display: none;">
-            <button class="nav-tab active" data-panel="chat" data-label-key="tab_chat">Chat</button>
-            <button class="nav-tab" data-panel="identity" data-label-key="tab_identity">Identity</button>
-            <button class="nav-tab" data-panel="constitution" data-label-key="tab_constitution">Constitution</button>
-            <button class="nav-tab" data-panel="memories" data-label-key="tab_memories">Memories</button>
+            <button class="nav-tab active" data-panel="chat"><span class="nav-tab-icon ki ki-message-square" aria-hidden="true"></span> <span class="nav-tab-label" data-label-key="tab_chat">Chat</span></button>
+            <button class="nav-tab" data-panel="identity"><span class="nav-tab-icon ki ki-fingerprint" aria-hidden="true"></span> <span class="nav-tab-label" data-label-key="tab_identity">Identity</span></button>
+            <button class="nav-tab" data-panel="constitution"><span class="nav-tab-icon ki ki-scroll" aria-hidden="true"></span> <span class="nav-tab-label" data-label-key="tab_constitution">Constitution</span></button>
+            <button class="nav-tab" data-panel="memories"><span class="nav-tab-icon ki ki-brain" aria-hidden="true"></span> <span class="nav-tab-label" data-label-key="tab_memories">Memories</span></button>
             <button class="nav-tab" data-panel="tasks">
-                <span data-label-key="tab_tasks">Tasks</span>
+                <span class="nav-tab-icon ki ki-list-checks" aria-hidden="true"></span> <span class="nav-tab-label" data-label-key="tab_tasks">Tasks</span>
                 <span id="tasks-badge" style="
                     display: none;
                     background: var(--accent-color);
@@ -48,12 +48,12 @@
                     font-weight: 600;
                 ">0</span>
             </button>
-            <button class="nav-tab" data-panel="sovereignty" data-label-key="tab_sovereignty">Sovereignty</button>
-            <button class="nav-tab" data-panel="resources" data-label-key="tab_resources">Resources</button>
-            <button class="nav-tab" data-panel="metrics" data-label-key="tab_metrics">Metrics</button>
-            <button class="nav-tab" data-panel="features" data-label-key="tab_features">Features</button>
+            <button class="nav-tab" data-panel="sovereignty"><span class="nav-tab-icon ki ki-crown" aria-hidden="true"></span> <span class="nav-tab-label" data-label-key="tab_sovereignty">Sovereignty</span></button>
+            <button class="nav-tab" data-panel="resources"><span class="nav-tab-icon ki ki-key" aria-hidden="true"></span> <span class="nav-tab-label" data-label-key="tab_resources">Resources</span></button>
+            <button class="nav-tab" data-panel="metrics"><span class="nav-tab-icon ki ki-chart-bar" aria-hidden="true"></span> <span class="nav-tab-label" data-label-key="tab_metrics">Metrics</span></button>
+            <button class="nav-tab" data-panel="features"><span class="nav-tab-icon ki ki-puzzle" aria-hidden="true"></span> <span class="nav-tab-label" data-label-key="tab_features">Features</span></button>
             <button class="nav-tab" data-panel="security">
-                <span class="ki ki-lock"></span> <span data-label-key="tab_security">Security</span>
+                <span class="nav-tab-icon ki ki-lock" aria-hidden="true"></span> <span class="nav-tab-label" data-label-key="tab_security">Security</span>
                 <span id="security-pending-badge" style="
                     display: none;
                     background: var(--error);
@@ -66,7 +66,7 @@
                 ">0</span>
             </button>
             <button class="nav-tab" data-panel="approvals">
-                <span class="ki ki-check"></span> <span data-label-key="tab_approvals">Approvals</span>
+                <span class="nav-tab-icon ki ki-check-square" aria-hidden="true"></span> <span class="nav-tab-label" data-label-key="tab_approvals">Approvals</span>
                 <span id="approvals-pending-badge" style="
                     display: none;
                     background: var(--error);

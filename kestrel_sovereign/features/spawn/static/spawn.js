@@ -170,6 +170,10 @@ registerPanel({
     panelId: 'spawn',
     label: 'Spawn',
     labelKey: 'tab_spawn',
+    // A feather — this panel hatches child agents (#2821). An out-of-tree panel
+    // that declares no icon falls back to the registry's generic extension
+    // glyph; Spawn is close enough to core to deserve its own.
+    icon: 'ki ki-feather',
     // Preserve the original nav position (between Metrics and Features).
     before: 'features',
     // Capability derived from the feature's enabled state (#2041). Re-evaluated
