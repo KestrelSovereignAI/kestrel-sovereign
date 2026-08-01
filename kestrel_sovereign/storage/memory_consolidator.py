@@ -732,9 +732,30 @@ class MemoryConsolidator:
         """
         text = "" if content is None else str(content)
         store = self._conversation_store
-        if store is not None and hasattr(store, "decrypt_stored_content"):
+        decryptor = (
+            store
+            if store is not None and hasattr(store, "decrypt_stored_content")
+            else None
+        )
+        is_encrypted = bool((metadata or {}).get("enc"))
+
+        if decryptor is None:
+            # No decryptor wired. The METADATA FLAG is authoritative here, not
+            # the envelope prefix: legacy Fernet rows are marked ``enc`` but
+            # start with ``gAAAA...``, so a prefix-only check would wave them
+            # through and tokenize Fernet ciphertext into episode titles
+            # exactly as KSAv2 did (codex review, #2850). Anything marked
+            # encrypted is unreadable without a key — skip it.
+            if is_encrypted:
+                logger.warning(
+                    "episode consolidation skipped an encrypted message: no "
+                    "conversation store wired into MemoryConsolidator "
+                    "(agent=%s)", self.agent_id,
+                )
+                return None
+        else:
             try:
-                text = store.decrypt_stored_content(text, metadata)
+                text = decryptor.decrypt_stored_content(text, metadata)
             except Exception as e:  # noqa: BLE001 - DecryptionError and friends
                 logger.warning(
                     "episode consolidation skipped a message it could not "

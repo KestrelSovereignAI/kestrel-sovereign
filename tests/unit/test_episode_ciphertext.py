@@ -88,3 +88,31 @@ class TestTopicsNeverContainCiphertext:
 def test_title_input_is_gated_before_synthesis(bad):
     """No envelope may reach title/summary/affect synthesis."""
     assert _consolidator(None)._row_plaintext(bad, {"enc": True}) is None
+
+
+# ---------------------------------------------------------------------------
+# Legacy Fernet rows (codex review, #2850)
+# ---------------------------------------------------------------------------
+# The SDK also supports pre-KSAv2 Fernet ciphertext, which starts with
+# "gAAAA..." and carries no KSAv2 envelope. Those rows are still marked
+# `enc: true`, so a prefix-only guard would wave them through and tokenize
+# Fernet ciphertext into episode titles — the same bug, different envelope.
+# The metadata flag is authoritative, not the prefix.
+
+FERNET = "gAAAAABn1QhKZ3rV9nU2mYhP0sT7cQxL4wE8dR6vN1pA"
+
+
+def test_legacy_fernet_row_is_skipped_when_no_store_is_wired():
+    assert _consolidator(None)._row_plaintext(FERNET, ENC_META) is None
+
+
+def test_legacy_fernet_row_is_decrypted_when_a_store_is_wired():
+    store = MagicMock()
+    store.decrypt_stored_content.side_effect = lambda content, meta: PLAINTEXT
+    assert _consolidator(store)._row_plaintext(FERNET, ENC_META) == PLAINTEXT
+
+
+def test_unencrypted_row_still_passes_without_a_store():
+    """The flag gates the skip — plaintext rows must not be collateral."""
+    assert _consolidator(None)._row_plaintext("plain text", {}) == "plain text"
+    assert _consolidator(None)._row_plaintext("plain text", None) == "plain text"
