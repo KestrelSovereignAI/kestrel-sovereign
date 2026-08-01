@@ -901,7 +901,7 @@ class MemoryConsolidator:
         return (persisted - plaintext) & envelope
 
     async def _repair_candidates(
-        self, limit: int
+        self, scan_limit: int
     ) -> List[Tuple[str, Optional[str], Optional[str], Optional[str]]]:
         """Cheap SQL pre-filter for episodes that may be ciphertext-derived.
 
@@ -923,7 +923,7 @@ class MemoryConsolidator:
             params.append(pattern)
         if not conditions:
             return []
-        params.append(int(limit))
+        params.append(int(scan_limit))
         rows = await self._db.fetchall(
             f"""SELECT id, title, summary, key_message_ids
                 FROM memory_episodes
@@ -1129,7 +1129,17 @@ class MemoryConsolidator:
     async def _restore_graph_node(
         self, episode_id: str, label: str, properties: Dict[str, Any]
     ) -> None:
-        """Undo a node rewrite whose row update did not land."""
+        """Undo a node rewrite whose row update did not land.
+
+        This runs only when an episode was withdrawn mid-repair, so the node
+        currently carries topics reconstructed from content nobody may read.
+        Restoring the prior label is the good outcome; if that write fails the
+        node is DELETED instead. A missing panel entry is a visible loss, an
+        exposed one is a privacy failure, and a swallowed rollback error would
+        leave the exposure in place while the caller reported the repair
+        abandoned (codex review r3 P1). Deletion is permitted in every privacy
+        mode — it takes content away rather than persisting it.
+        """
         from .async_graph_store import GraphNode
 
         try:
@@ -1141,14 +1151,29 @@ class MemoryConsolidator:
                     properties=properties,
                 )
             )
+            return
         except Exception as e:  # noqa: BLE001
             logger.error(
-                "episode repair could not restore the graph node for %s after "
-                "an abandoned write: %s", episode_id, e,
+                "episode repair could not restore the graph node for %s; "
+                "deleting it so withdrawn content is not left exposed: %s",
+                episode_id, e,
             )
 
+        try:
+            await self._graph_store.delete_node(episode_id)
+        except Exception as e:  # noqa: BLE001
+            # Nothing further can be done here, and the caller must not treat
+            # this as a clean abandon.
+            logger.critical(
+                "episode repair could NOT restore or delete graph node %s — "
+                "it may still expose topics reconstructed from withdrawn "
+                "sources: %s", episode_id, e,
+            )
+            raise
+
     async def repair_ciphertext_episodes(
-        self, *, dry_run: bool = False, limit: int = 100
+        self, *, dry_run: bool = False, limit: int = 100,
+        max_examined: int = 1000,
     ) -> Dict[str, Any]:
         """Re-synthesize episodes whose narrative was built from ciphertext.
 
@@ -1165,7 +1190,10 @@ class MemoryConsolidator:
 
         Args:
             dry_run: Report what would be repaired without writing anything.
-            limit: Maximum candidate episodes to examine in one pass.
+            limit: Maximum episodes to REPAIR in one pass. Bounding writes
+                rather than the scan is what guarantees the pass makes
+                progress — see the comment at the candidate query.
+            max_examined: Safety valve on the candidate scan itself.
         """
         report: Dict[str, Any] = {
             "scanned": 0,
@@ -1184,21 +1212,25 @@ class MemoryConsolidator:
             report["skipped_reason"] = "privacy_mode_forbids_persistence"
             return report
 
-        candidates = await self._repair_candidates(limit)
+        # The budget bounds REPAIRS, not the scan. A repaired episode leaves
+        # the pre-filter for good, but a cleared one (healthy, and genuinely
+        # about the envelope format) matches forever — so capping the SQL
+        # SELECT would let a handful of permanent false positives sit at the
+        # head of created_at order and starve every corrupt episode behind
+        # them, indefinitely and silently. Bounding writes instead guarantees
+        # progress: each pass repairs up to `limit`, and what it repairs never
+        # comes back (codex review r2/r3 P2).
+        candidates = await self._repair_candidates(max_examined)
         report["scanned"] = len(candidates)
 
-        # A repaired episode leaves the pre-filter for good, but a CLEARED one
-        # (healthy, and genuinely about the envelope format) matches forever.
-        # If enough of those ever accumulate ahead of a corrupt episode in
-        # created_at order, that episode is never reached. Say so rather than
-        # truncating quietly — a silent cap reads as "nothing left to repair"
-        # (codex review r1 P2).
-        if len(candidates) >= limit:
-            report["limit_reached"] = True
+        if len(candidates) >= max_examined:
+            # The safety valve, not the budget. Only reachable with a very
+            # large corpus of envelope-mentioning episodes.
+            report["scan_truncated"] = True
             logger.warning(
-                "episode repair examined its full budget of %d candidates for "
-                "%s; later candidates were not reached this pass",
-                limit, self.agent_id,
+                "episode repair stopped scanning at %d candidates for %s; "
+                "later rows were not examined this pass",
+                max_examined, self.agent_id,
             )
 
         for episode_id, title, summary, key_ids_json in candidates:
@@ -1263,7 +1295,21 @@ class MemoryConsolidator:
                 report["cleared"] += 1
                 continue
 
-            new_title, new_summary = self._resynthesize_narrative(sources)
+            try:
+                new_title, new_summary = self._resynthesize_narrative(sources)
+            except Exception as e:  # noqa: BLE001
+                # Malformed metadata (a null emotional_intensity, say) must
+                # cost one episode, not the pass. Outside this guard the same
+                # oldest row would abort every nightly run and starve every
+                # candidate behind it (codex review r3 P2).
+                logger.warning(
+                    "episode repair could not re-synthesize %s: %s",
+                    episode_id, e,
+                )
+                report["unrepairable"].append(
+                    {"episode_id": episode_id, "reason": "resynthesis_failed"}
+                )
+                continue
 
             try:
                 has_node = await self._episode_graph_node_exists(episode_id)
@@ -1324,6 +1370,15 @@ class MemoryConsolidator:
                 "repaired ciphertext-derived episode %s (%d source messages)",
                 episode_id, len(sources),
             )
+
+            if report["repaired"] >= limit:
+                report["limit_reached"] = True
+                logger.warning(
+                    "episode repair reached its per-pass budget of %d for %s; "
+                    "the remainder will be repaired on subsequent passes",
+                    limit, self.agent_id,
+                )
+                break
 
         return report
 

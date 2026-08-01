@@ -778,6 +778,165 @@ class TestRacesDuringRepair:
             await db.close()
 
 
+class TestRoundThreeFindings:
+    @pytest.mark.asyncio
+    async def test_failed_rollback_deletes_the_node_rather_than_exposing_it(
+        self, tmp_path
+    ):
+        """A swallowed rollback error leaves withdrawn topics on the panel.
+
+        The caller would report the repair abandoned while the node still
+        showed content reconstructed from sources nobody may read.
+        """
+        db, ids, store = await _corrupt_fixture(tmp_path)
+        graph = _RecordingGraphStore(db)
+        deleted: list = []
+
+        async def _delete(node_id):
+            deleted.append(node_id)
+            await db.execute(
+                "DELETE FROM graph_nodes WHERE node_id = ?", (node_id,)
+            )
+
+        graph.delete_node = _delete
+        original_add = graph.add_node
+        calls = {"n": 0}
+
+        async def _withdraw_then_fail_rollback(node):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                await db.execute(
+                    "UPDATE memory_episodes SET excluded_from_context = 1 "
+                    "WHERE id = ?", (node.node_id,)
+                )
+                return await original_add(node)
+            raise RuntimeError("rollback write refused")
+
+        graph.add_node = _withdraw_then_fail_rollback
+        c = _consolidator(db, store, graph)
+        try:
+            report = await c.repair_ciphertext_episodes()
+
+            assert report["repaired"] == 0
+            assert deleted == ["episode:corrupt"], (
+                "an unrestorable node must be removed, not left exposed"
+            )
+            assert await db.fetchval(
+                "SELECT COUNT(*) FROM graph_nodes WHERE node_id = ?",
+                ("episode:corrupt",)
+            ) == 0
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_cleared_candidates_never_starve_a_corrupt_one(self, tmp_path):
+        """The budget bounds repairs, not the scan.
+
+        A handful of permanent false positives at the head of created_at order
+        must not hide a corrupt episode behind them forever.
+        """
+        db = await _make_db(tmp_path)
+
+        # Three healthy envelope-format discussions, created FIRST.
+        healthy_ids = await _add_messages(
+            db, [HEALTHY_ENVELOPE, HEALTHY_ENVELOPE], encrypted=True, age_days=9
+        )
+        for n in range(3):
+            await _add_episode(
+                db, f"episode:healthy-{n}",
+                "Discussion of ksav2, base64, prefix, aead",
+                "Topics: ksav2, base64, prefix, aead.", healthy_ids,
+            )
+
+        # The corrupt one, created LAST — behind all of them.
+        corrupt_ids = await _add_messages(
+            db, [ENVELOPE, ENVELOPE, ENVELOPE], age_days=1
+        )
+        await _add_episode(db, "episode:corrupt", CORRUPT_TITLE,
+                           CORRUPT_SUMMARY, corrupt_ids)
+
+        seq = iter(PLAINTEXTS * 8)
+        healthy_seq = iter(HEALTHY_PLAINTEXTS * 8)
+        store = MagicMock()
+        store.decrypt_stored_content.side_effect = lambda content, meta: (
+            next(seq) if content == ENVELOPE
+            else next(healthy_seq) if content == HEALTHY_ENVELOPE
+            else content
+        )
+
+        c = _consolidator(db, store, _RecordingGraphStore(db))
+        try:
+            report = await c.repair_ciphertext_episodes(limit=1)
+
+            assert report["cleared"] == 3
+            assert report["repaired"] == 1, (
+                "the corrupt episode sits behind three permanent false "
+                "positives; a scan-bounded budget would never reach it"
+            )
+            assert await db.fetchval(
+                "SELECT title FROM memory_episodes WHERE id = ?",
+                ("episode:corrupt",)
+            ) != CORRUPT_TITLE
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_malformed_metadata_costs_one_episode_not_the_pass(
+        self, tmp_path
+    ):
+        db = await _make_db(tmp_path)
+
+        # A candidate whose metadata carries a null intensity, created first.
+        bad_ids = await _add_messages(db, [ENVELOPE, ENVELOPE, ENVELOPE],
+                                      age_days=9)
+        for mid in bad_ids:
+            await db.execute(
+                "UPDATE conversation_history SET metadata = ? WHERE id = ?",
+                (json.dumps({**ENC_META, "emotional_intensity": None,
+                             "emotional_valence": None}), mid),
+            )
+        await _add_episode(db, "episode:bad", CORRUPT_TITLE, CORRUPT_SUMMARY,
+                           bad_ids)
+
+        good_ids = await _add_messages(db, [ENVELOPE, ENVELOPE, ENVELOPE],
+                                       age_days=1)
+        await _add_episode(db, "episode:good", CORRUPT_TITLE, CORRUPT_SUMMARY,
+                           good_ids)
+
+        seq = iter(PLAINTEXTS * 8)
+        store = MagicMock()
+        store.decrypt_stored_content.side_effect = (
+            lambda content, meta: next(seq) if content == ENVELOPE else content
+        )
+        c = _consolidator(db, store, _RecordingGraphStore(db))
+        try:
+            report = await c.repair_ciphertext_episodes()
+
+            assert report["repaired"] == 1, (
+                "the healthy candidate behind the malformed one must still be "
+                "repaired"
+            )
+            assert await db.fetchval(
+                "SELECT title FROM memory_episodes WHERE id = ?",
+                ("episode:good",)
+            ) != CORRUPT_TITLE
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_sleep_report_carries_repair_diagnostics(self):
+        """SleepReport.to_dict is what the scheduler returns to an operator."""
+        from kestrel_sovereign.agent.sleep import SleepReport
+
+        report = SleepReport(success=True)
+        report.episodes_repaired = 3
+        report.episode_repair_limit_reached = True
+
+        consolidation = report.to_dict()["consolidation"]
+        assert consolidation["episodes_repaired"] == 3
+        assert consolidation["episode_repair_limit_reached"] is True
+
+
 class TestLockReachesTheConsolidator:
     """The lock is only useful if the real construction path delivers it.
 

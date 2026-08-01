@@ -673,6 +673,10 @@ class SleepReport:
     messages_archived: int = 0
     episodes_deleted: int = 0  # forgetting deletion tier (#1674)
     total_messages: int = 0
+    # Ciphertext-episode repair (#2856). Counts and a flag only — no titles,
+    # no IDs — so this operator surface stays content-free.
+    episodes_repaired: int = 0
+    episode_repair_limit_reached: bool = False
 
     # Export stats
     shards_exported: int = 0
@@ -727,6 +731,8 @@ class SleepReport:
                 "messages_archived": self.messages_archived,
                 "episodes_deleted": self.episodes_deleted,
                 "total_messages": self.total_messages,
+                "episodes_repaired": self.episodes_repaired,
+                "episode_repair_limit_reached": self.episode_repair_limit_reached,
                 "duration_ms": self.consolidation_ms,
             },
             "reflection": {
@@ -928,6 +934,12 @@ class SleepMixin:
                     report.messages_archived = consolidation_result.get("messages_archived", 0)
                     report.episodes_deleted = consolidation_result.get("episodes_deleted", 0)
                     report.total_messages = consolidation_result.get("total_messages_processed", 0)
+                    report.episodes_repaired = consolidation_result.get(
+                        "episodes_repaired", 0
+                    )
+                    report.episode_repair_limit_reached = bool(
+                        consolidation_result.get("episode_repair_limit_reached")
+                    )
                     consolidation_succeeded = True
                     logger.info(
                         f"Consolidation complete: {report.episodes_created} episodes, "
@@ -1929,6 +1941,10 @@ class SleepMixin:
         report.patterns_found = sleep_report.patterns_found
         report.messages_archived = sleep_report.messages_archived
         report.total_messages = sleep_report.total_messages
+        report.episodes_repaired = sleep_report.episodes_repaired
+        report.episode_repair_limit_reached = (
+            sleep_report.episode_repair_limit_reached
+        )
         report.shards_exported = sleep_report.shards_exported
         report.total_size_bytes = sleep_report.total_size_bytes
         report.storage_tier = sleep_report.storage_tier
