@@ -322,9 +322,11 @@ adapter record. It must contain all of:
 
 For this contract the immutable capability source is
 `KestrelSovereignAI/kestrel-feature-parametric-self` at
-`260ba985bcfdfab3dab1ea58da5b259057f3749f`. It describes the governed adapter
-runtime under test and is deliberately not the commit of the newer evidence
-emitter. The emitter supplies its own full 40-hex `evidence_runner_revision`:
+`7aad9bb924f61434485e5eae22e61c95d3f97187`. It describes the governed adapter
+runtime under test. Run its standalone two-phase release CLI: prepare the
+candidate/served eligibility before core physical erasure, then observe the
+same drill after erasure. The emitter supplies its own full 40-hex
+`evidence_runner_revision`:
 it must resolve a clean, verifiable VCS `HEAD` at runtime, is bound into every
 external record's signed run digest, and must equal the report field. Another
 capability revision, omitted runner revision, or runner/report mismatch

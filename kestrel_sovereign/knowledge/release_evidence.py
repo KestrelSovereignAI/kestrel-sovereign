@@ -57,7 +57,7 @@ SEMANTIC_RELEASE_CONTRACT = "semantic-kb-v1-release-evidence-v3"
 STRUCTURAL_RELEASE_EVIDENCE_SCHEMA_VERSION = 1
 STRUCTURAL_RELEASE_CONTRACT = "semantic-kb-v1-release-evidence-structural-v1"
 PARAMETRIC_SELF_EVIDENCE_REPOSITORY = "KestrelSovereignAI/kestrel-feature-parametric-self"
-PARAMETRIC_SELF_CAPABILITY_SOURCE_REVISION = "260ba985bcfdfab3dab1ea58da5b259057f3749f"
+PARAMETRIC_SELF_CAPABILITY_SOURCE_REVISION = "7aad9bb924f61434485e5eae22e61c95d3f97187"
 # Compatibility name for callers that only need the immutable capability
 # baseline. Evidence producers must also provide a separate runner revision.
 PARAMETRIC_SELF_EVIDENCE_REVISION = PARAMETRIC_SELF_CAPABILITY_SOURCE_REVISION
