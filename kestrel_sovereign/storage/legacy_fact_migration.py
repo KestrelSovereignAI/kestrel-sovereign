@@ -29,6 +29,8 @@ from kestrel_sovereign.knowledge import (
 )
 from kestrel_sovereign.knowledge.shacl_validation import ValidationSource
 
+from .timestamps import utc_timestamp_parameter
+
 if TYPE_CHECKING:
     from .async_storage import AsyncStorage
 
@@ -814,11 +816,23 @@ class LegacyGraphFactMigration:
         revision_id = revision_id or source_id
         content_hash = content_hash or (None if candidate is None else candidate.content_hash)
         async with db.transaction():
+            recorded_at = utc_timestamp_parameter(
+                db.backend_type, datetime.now(timezone.utc)
+            )
             await db.execute(
                 "INSERT INTO legacy_fact_migration_records (tenant_id, node_id, content_hash, source_occurrence_id, assertion_id, revision_id, outcome, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(tenant_id, node_id) DO NOTHING",
-                (tenant_id, node_id, content_hash or "", source_id, assertion_id, revision_id, outcome, datetime.now(timezone.utc).isoformat()),
+                (
+                    tenant_id,
+                    node_id,
+                    content_hash or "",
+                    source_id,
+                    assertion_id,
+                    revision_id,
+                    outcome,
+                    recorded_at,
+                ),
             )
             if assertion_id is not None and outcome in {"migrated", "idempotent", "source_appended"}:
                 await db.execute(
@@ -826,7 +840,7 @@ class LegacyGraphFactMigration:
                     "(tenant_id, migration_name, assertion_id, state, generation, created_at, delivered_at) "
                     "VALUES (?, ?, ?, 'pending', 1, ?, NULL) "
                     "ON CONFLICT(tenant_id, migration_name, assertion_id) DO NOTHING",
-                    (tenant_id, MIGRATION_NAME, assertion_id, datetime.now(timezone.utc).isoformat()),
+                    (tenant_id, MIGRATION_NAME, assertion_id, recorded_at),
                 )
 
     @staticmethod
@@ -871,7 +885,9 @@ class LegacyGraphFactMigration:
             if hasattr(response, "__await__"):
                 await response
             async with db.transaction():
-                delivered_at = datetime.now(timezone.utc).isoformat()
+                delivered_at = utc_timestamp_parameter(
+                    db.backend_type, datetime.now(timezone.utc)
+                )
                 for assertion_id, generation in deliveries:
                     await db.execute(
                         "UPDATE legacy_fact_migration_invalidations "
@@ -920,4 +936,13 @@ class LegacyGraphFactMigration:
                 "VALUES (?, ?, ?, ?, ?) ON CONFLICT(tenant_id, migration_name) DO UPDATE SET "
                 "last_node_id = excluded.last_node_id, state = excluded.state, updated_at = excluded.updated_at"
             )
-        await db.execute(sql, (tenant_id, MIGRATION_NAME, cursor, state, datetime.now(timezone.utc).isoformat()))
+        await db.execute(
+            sql,
+            (
+                tenant_id,
+                MIGRATION_NAME,
+                cursor,
+                state,
+                utc_timestamp_parameter(db.backend_type, datetime.now(timezone.utc)),
+            ),
+        )

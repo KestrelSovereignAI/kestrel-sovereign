@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-08-01
-**Scope:** 2281 tracked files (1519 `.py`, 345 `.md`, 417 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 2282 tracked files (1520 `.py`, 345 `.md`, 417 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -1346,6 +1346,8 @@ Repo entry points and standard project files.
   - `class TemporalAnalyzer`
 - **kestrel_sovereign/storage/tiered_manager.py** — Tiered Storage Manager
   - `def allowed_tiers_for_privacy_mode(privacy_mode)`; `def privacy_allows_remote_tiers(privacy_mode)`; `class TieredStorageManager`; `def create_default_manager(privacy_mode, lighthouse_api_key)`
+- **kestrel_sovereign/storage/timestamps.py** — Backend-neutral binding for durable UTC timestamp columns.
+  - `def utc_timestamp_parameter(backend_type, value)`
 - **kestrel_sovereign/storage/vector/__init__.py** — Generic vector-search backends for SQLAlchemy-mapped tables.
 - **kestrel_sovereign/storage/vector/exceptions.py** — Errors raised by the generic vector-search backends.
   - `class VectorSearchError`
@@ -2325,7 +2327,7 @@ Repo entry points and standard project files.
 - **tests/unit/storage/test_governed_semantic_artifacts.py** — Governed export/corpus lifecycle tests (#2831).
   - `async def storage(tmp_path)`; `async def test_registered_artifact_is_generation_fenced_and_erasure_leaves_only_blinded_revocation(storage)`; `async def test_registration_rejects_forged_stale_or_expired_lineage(storage)`; `async def test_pending_revocation_survives_restart_and_replays_only_to_its_consumer(tmp_path)`; `async def test_concurrent_registration_and_erasure_never_leaves_a_servable_artifact(storage)`; `async def test_expiry_sweep_revokes_without_a_consume_attempt(storage)`; `async def test_consume_time_expiry_commits_pending_deletion_before_rejecting(storage)`; `async def test_consume_time_expiry_revokes_only_the_exact_overlapping_artifact(storage)`; `…`
 - **tests/unit/storage/test_legacy_fact_migration.py** — Contract tests for the narrow #2752 legacy graph-fact migration.
-  - `async def test_bookkeeping_schema_is_common_transactional_ddl_for_postgres()`; `async def test_plan_is_content_safe_and_never_trusts_properties_owner(tmp_path)`; `async def test_migrates_idempotently_across_restart_and_rolls_back_without_legacy_delete(tmp_path)`; `async def test_rejects_malformed_unsupported_and_shared_nodes_without_promotion(tmp_path)`; `async def test_feature_projection_invalidator_observes_only_accepted_assertions(tmp_path)`; `async def test_stale_invalidation_callback_cannot_ack_rollback_generation(tmp_path)`; `async def test_projection_invalidation_drains_every_bounded_page(tmp_path, monkeypatch)`; `async def test_projection_invalidation_budget_surfaces_residual_for_retry(tmp_path, monkeypatch)`; `…`
+  - `def test_durable_utc_timestamp_parameter_has_an_explicit_backend_contract(backend_type, expected_type)`; `def test_durable_utc_timestamp_parameter_rejects_ambiguous_instants(value)`; `async def test_bookkeeping_schema_is_common_transactional_ddl_for_postgres()`; `async def test_migration_bookkeeping_uses_typed_timestamps_on_real_disposable_postgres()`; `async def test_plan_is_content_safe_and_never_trusts_properties_owner(tmp_path)`; `async def test_migrates_idempotently_across_restart_and_rolls_back_without_legacy_delete(tmp_path)`; `async def test_rejects_malformed_unsupported_and_shared_nodes_without_promotion(tmp_path)`; `async def test_feature_projection_invalidator_observes_only_accepted_assertions(tmp_path)`; `…`
 - **tests/unit/storage/test_semantic_recall_derivative_exclusion.py** — Exact, content-independent retraction of semantic-recall derivatives.
   - `async def storage(tmp_path, monkeypatch)`; `async def test_exclusion_is_exact_and_scrubbing_keeps_artifact_hidden(storage)`; `async def test_sleep_consolidation_never_recreates_episode_from_excluded_rows(storage)`; `async def test_prepared_derivative_drops_retrieval_indexes_when_fence_excludes_it(storage)`; `async def test_prepared_derivative_cleans_token_prework_when_final_insert_fails(storage, monkeypatch)`
 - **tests/unit/storage/test_semantic_recall_storage.py** — Direct storage contracts for governed semantic-recall discovery/hydration.
