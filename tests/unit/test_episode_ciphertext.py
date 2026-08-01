@@ -116,3 +116,17 @@ def test_unencrypted_row_still_passes_without_a_store():
     """The flag gates the skip — plaintext rows must not be collateral."""
     assert _consolidator(None)._row_plaintext("plain text", {}) == "plain text"
     assert _consolidator(None)._row_plaintext("plain text", None) == "plain text"
+
+
+def test_plaintext_beginning_with_the_marker_survives_decryption():
+    """Authenticated plaintext may legitimately start with 'KSAv2:'.
+
+    Someone discussing the envelope format, or pasting a token, must not have
+    their message silently dropped from episode synthesis (codex review r2).
+    """
+    store = MagicMock()
+    store.decrypt_stored_content.side_effect = (
+        lambda content, meta: "KSAv2: is the envelope prefix we use"
+    )
+    got = _consolidator(store)._row_plaintext(ENVELOPE, ENC_META)
+    assert got == "KSAv2: is the envelope prefix we use"

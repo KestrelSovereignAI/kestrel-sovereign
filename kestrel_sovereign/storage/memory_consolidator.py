@@ -762,7 +762,12 @@ class MemoryConsolidator:
                     "decrypt: %s", e,
                 )
                 return None
-        if text and self._looks_like_ciphertext(text):
+        # Backstop only where nothing decrypted this row. After a SUCCESSFUL
+        # decrypt the result is authenticated plaintext, and plaintext may
+        # legitimately begin with the marker — someone discussing the envelope
+        # format, or pasting a token. Vetoing that would silently drop a real
+        # message from episode synthesis (codex review r2, #2850).
+        if decryptor is None and text and self._looks_like_ciphertext(text):
             # Unreachable once the store is wired; loud rather than silent
             # because this is precisely the bug that produced episode titles
             # reading "Discussion of ksav2, <base64>".
