@@ -569,6 +569,13 @@ def test_external_freshness_ledger_rejects_insecure_parent_file_and_symlink_path
     assert ExternalFreshnessLedger(
         nested_secure_parent / "ledger.sqlite", trusted_root=secure_parent
     ).trusted_root == secure_parent
+    outside_parent = tmp_path / "outside"
+    outside_parent.mkdir(mode=0o700)
+    with pytest.raises(ReleaseEvidenceError, match="cannot contain '..'"):
+        ExternalFreshnessLedger(
+            secure_parent / ".." / "outside" / "ledger.sqlite",
+            trusted_root=secure_parent,
+        )
 
     shared_ancestor = tmp_path / "shared-ancestor"
     shared_ancestor.mkdir(mode=0o700)
@@ -586,8 +593,8 @@ def test_external_freshness_ledger_rejects_insecure_parent_file_and_symlink_path
         ExternalFreshnessLedger(insecure_file, trusted_root=secure_parent)
 
     symlink_parent = tmp_path / "symlink-parent"
-    symlink_parent.symlink_to(secure_parent, target_is_directory=True)
-    with pytest.raises(ReleaseEvidenceError, match="symlink"):
+    symlink_parent.symlink_to(outside_parent, target_is_directory=True)
+    with pytest.raises(ReleaseEvidenceError, match="symlink|escapes"):
         ExternalFreshnessLedger(symlink_parent / "ledger.sqlite", trusted_root=tmp_path)
 
     symlink_file = secure_parent / "symlink.sqlite"

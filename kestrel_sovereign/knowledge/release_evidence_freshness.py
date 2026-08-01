@@ -25,14 +25,32 @@ class ExternalFreshnessLedger:
             raise ReleaseEvidenceError("external freshness ledger path must be absolute")
         if not isinstance(trusted_root, Path) or not trusted_root.is_absolute():
             raise ReleaseEvidenceError("external freshness ledger trusted_root must be absolute")
+        if ".." in path.parts or ".." in trusted_root.parts:
+            raise ReleaseEvidenceError("external freshness ledger path and trusted_root cannot contain '..'")
         try:
-            relative_path = path.relative_to(trusted_root)
+            resolved_root = trusted_root.resolve(strict=True)
+        except OSError as exc:
+            raise ReleaseEvidenceError("external freshness ledger trusted_root must already exist") from exc
+        if trusted_root != resolved_root:
+            raise ReleaseEvidenceError("external freshness ledger trusted_root must be a resolved non-symlink path")
+        try:
+            relative_path = path.relative_to(resolved_root)
         except ValueError as exc:
-            raise ReleaseEvidenceError("external freshness ledger must live below its trusted_root") from exc
+            raise ReleaseEvidenceError("external freshness ledger path escapes its trusted_root") from exc
         if relative_path == Path("."):
-            raise ReleaseEvidenceError("external freshness ledger path must be a file below its trusted_root")
-        self._path = path
-        self._trusted_root = trusted_root
+            raise ReleaseEvidenceError("external freshness ledger path must be a strict descendant of its trusted_root")
+        self._trusted_root = resolved_root
+        self._relative_parent_parts = relative_path.parent.parts
+        lexical_parent = self._lexical_parent()
+        try:
+            resolved_parent = lexical_parent.resolve(strict=True)
+        except OSError as exc:
+            raise ReleaseEvidenceError("external freshness ledger parent must already exist") from exc
+        try:
+            resolved_parent.relative_to(resolved_root)
+        except ValueError as exc:
+            raise ReleaseEvidenceError("external freshness ledger parent escapes its trusted_root") from exc
+        self._path = resolved_parent / path.name
         self._prepare_path()
 
     @property
@@ -47,6 +65,7 @@ class ExternalFreshnessLedger:
 
     def _prepare_path(self) -> tuple[int, int]:
         """Create and validate a private regular ledger file, returning its inode."""
+        self._ensure_containment()
         self._validate_directory_components(self._path.parent)
 
         try:
@@ -61,9 +80,17 @@ class ExternalFreshnessLedger:
                 raise ReleaseEvidenceError("cannot create external freshness ledger") from exc
             try:
                 path_status = os.fstat(descriptor)
-                return self._validate_file_status(path_status)
+                created_identity = self._validate_file_status(path_status)
             finally:
                 os.close(descriptor)
+            self._ensure_containment()
+            try:
+                verified_identity = self._validate_file_status(self._path.lstat())
+            except OSError as exc:
+                raise ReleaseEvidenceError("external freshness ledger changed after creation") from exc
+            if verified_identity != created_identity:
+                raise ReleaseEvidenceError("external freshness ledger changed after creation")
+            return created_identity
         except OSError as exc:
             raise ReleaseEvidenceError("cannot inspect external freshness ledger") from exc
         return self._validate_file_status(path_status)
@@ -76,19 +103,9 @@ class ExternalFreshnessLedger:
         writable) ancestor.  The root itself must be a resolved real directory
         so that a shared ancestor cannot be substituted after this check.
         """
-        try:
-            resolved_root = self._trusted_root.resolve(strict=True)
-        except OSError as exc:
-            raise ReleaseEvidenceError("external freshness ledger trusted_root must already exist") from exc
-        if self._trusted_root != resolved_root:
-            raise ReleaseEvidenceError("external freshness ledger trusted_root must be resolved, not a symlink path")
-        try:
-            relative_parent = parent.relative_to(self._trusted_root)
-        except ValueError as exc:
-            raise ReleaseEvidenceError("external freshness ledger parent escapes its trusted_root") from exc
         components = [self._trusted_root]
         current = self._trusted_root
-        for part in relative_parent.parts:
+        for part in self._relative_parent_parts:
             current = current / part
             components.append(current)
         for component in components:
@@ -102,6 +119,35 @@ class ExternalFreshnessLedger:
                 raise ReleaseEvidenceError(
                     "external freshness ledger trusted_root and descendants must be verifier-owned with no group/other access"
                 )
+        if current != parent:
+            raise ReleaseEvidenceError("external freshness ledger parent changed while resolving its trusted_root")
+
+    def _lexical_parent(self) -> Path:
+        """Return the original non-normalized parent below the trusted root."""
+        current = self._trusted_root
+        for part in self._relative_parent_parts:
+            current = current / part
+        return current
+
+    def _ensure_containment(self) -> None:
+        """Fail closed if a root/path replacement escapes the normalized root."""
+        try:
+            resolved_root = self._trusted_root.resolve(strict=True)
+            lexical_parent = self._lexical_parent()
+            resolved_parent = lexical_parent.resolve(strict=True)
+        except OSError as exc:
+            raise ReleaseEvidenceError("external freshness ledger trusted_root and parent must already exist") from exc
+        if resolved_root != self._trusted_root:
+            raise ReleaseEvidenceError("external freshness ledger trusted_root changed or became a symlink")
+        try:
+            resolved_parent.relative_to(resolved_root)
+            relative_path = self._path.relative_to(resolved_root)
+        except ValueError as exc:
+            raise ReleaseEvidenceError("external freshness ledger path escapes its trusted_root") from exc
+        if relative_path == Path("."):
+            raise ReleaseEvidenceError("external freshness ledger path must be a strict descendant of its trusted_root")
+        if resolved_parent != self._path.parent:
+            raise ReleaseEvidenceError("external freshness ledger parent changed or traverses a symlink")
 
     @staticmethod
     def _validate_file_status(path_status: os.stat_result) -> tuple[int, int]:
