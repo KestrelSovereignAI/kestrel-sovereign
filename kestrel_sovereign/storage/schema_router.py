@@ -231,6 +231,140 @@ def _first_name_matches(first: str, label: str) -> bool:
 # =============================================================================
 
 
+# ---------------------------------------------------------------------------
+# Extraction precision guards (#2852)
+# ---------------------------------------------------------------------------
+# The capture class in every pattern above is ``[^.!?\n]+``, which stops BEFORE
+# terminal punctuation. An interrogative therefore reads exactly like a
+# commitment: "do I need a heartbeat agent or what?" captures as the action
+# item "a heartbeat agent or what". Both false positives observed in production
+# were this shape. Nothing downstream can recover the distinction, because by
+# then the "?" has been discarded — so it is checked here, against the
+# enclosing sentence rather than the captured span.
+
+_SENTENCE_BOUNDARIES = (".", "!", "?", "\n")
+
+# A negated clause is not a commitment.
+_NEGATION_RE = re.compile(
+    r"\b(?:not|never|no longer|won'?t|don'?t|doesn'?t|didn'?t|can'?t|"
+    r"cannot|shouldn'?t|wouldn'?t)\b",
+    re.IGNORECASE,
+)
+
+# Explicit task directives. These stay tasks even when phrased as questions.
+_EXPLICIT_CUE_RE = re.compile(
+    r"\bTODO:?|\bremind me to\b|\bdon'?t forget to\b", re.IGNORECASE
+)
+
+# Reminder cues that CONTAIN a negation token but are positive commitments.
+_POSITIVE_CUE_RE = re.compile(
+    r"\b(?:don'?t|never)\s+forget\s+to\b|\bremind me to\b", re.IGNORECASE
+)
+
+# Trailing filler marks the clause as musing rather than committing.
+_FILLER_TAIL_RE = re.compile(
+    r"\b(?:or\s+(?:what|something|whatever|anything)|i\s+guess|i\s+suppose|"
+    r"maybe|perhaps)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _enclosing_sentence(content: str, start: int, end: int) -> str:
+    """The sentence containing ``content[start:end]``, terminator included."""
+    left = max(content.rfind(c, 0, start) for c in _SENTENCE_BOUNDARIES)
+    rights = [i for i in (content.find(c, end) for c in _SENTENCE_BOUNDARIES) if i != -1]
+    right = min(rights) if rights else len(content) - 1
+    return content[left + 1: right + 1]
+
+
+def _sentence_offset(content: str, match, sentence: str) -> int:
+    """Index in ``content`` where ``sentence`` begins."""
+    return content.rfind(sentence, 0, match.end()) if sentence else 0
+
+
+def _is_committing_clause(
+    content: str, match, text: str, *, negative_action_ok: bool = False
+) -> bool:
+    """Whether a raw pattern hit is a real commitment worth persisting.
+
+    Rejects the three shapes that produced the observed false positives: an
+    interrogative sentence, a negated commitment, and a clause trailing off
+    into filler.
+
+    ``negative_action_ok`` distinguishes the two consumers. For an ACTION ITEM
+    a negated action is no task at all ("I should not restart"). For a
+    DECISION it is still a decision — choosing *not* to do something is an
+    explicit choice, and "We've decided not to deploy" must be recorded.
+    """
+    matched = match.group(0)
+    sentence = _enclosing_sentence(content, match.start(), match.end())
+    explicit_cue = bool(_EXPLICIT_CUE_RE.search(matched))
+
+    # Interrogation is a property of the whole sentence — but only for
+    # SPECULATIVE commitments. An explicit directive stays a task even when its
+    # action is phrased as a question: "TODO: determine why CI is failing?" and
+    # "Remind me to ask whether the deploy succeeded?" are real tasks, and the
+    # base extractor kept them (codex review r3).
+    if not explicit_cue and sentence.rstrip().endswith("?"):
+        return False
+
+    # Negation attaches to the COMMITMENT OPERATOR, not to the sentence and not
+    # to the action. Scoping it anywhere wider regresses real extractions
+    # (codex review r1/r2):
+    #   * sentence-wide  -> "I don't need to deploy, but I will restart the
+    #                       host" loses the genuine second commitment;
+    #   * whole match    -> "I need to ensure the backup never expires" is
+    #                       dropped because the ACTION contains "never", and
+    #                       "We've decided not to deploy" is dropped even
+    #                       though choosing not to do something is a decision.
+    # The operator is the matched span with the captured action removed.
+    operator = matched[: match.start(match.lastindex or 0) - match.start()] if match.lastindex else matched
+
+    # The operator alone is not enough. Two shapes slip past it (codex r3):
+    #   * "I should not restart"        -> the capture STARTS at "not", so the
+    #                                      operator is clean and "not restart"
+    #                                      would persist as an action;
+    #   * "I don't think I need to X"   -> the match begins at the INNER cue,
+    #                                      so the negator sits just before it.
+    # Widen to the leading words of the action, and to a short look-back that
+    # stops at a conjunction so an unrelated negated clause can't veto.
+    action_head = " ".join(text.split()[:2])
+    lookback = sentence[: max(0, match.start() - _sentence_offset(content, match, sentence))]
+    lookback = re.split(r"\b(?:but|and|however|though)\b|[,;]", lookback)[-1]
+
+    negated = _NEGATION_RE.search(operator) or _NEGATION_RE.search(lookback)
+    if not negative_action_ok:
+        negated = negated or _NEGATION_RE.search(action_head)
+
+    if not _POSITIVE_CUE_RE.search(operator) and negated:
+        return False
+
+    if _FILLER_TAIL_RE.search(text):
+        return False
+    return True
+
+
+# Evidence strength per claim. Confidence was previously the literal 0.7 on
+# every extracted item and decision, so the field carried no information and no
+# threshold could be tuned against it (#2852). An explicit ``TODO:`` is far
+# stronger evidence of a commitment than a bare "I'll".
+_STRONG_EVIDENCE_RE = re.compile(
+    r"\bTODO:?|\bremind me to\b|\bdon'?t forget to\b", re.IGNORECASE
+)
+STRONG_CLAIM_CONFIDENCE = 0.9
+DEFAULT_CLAIM_CONFIDENCE = 0.7
+
+
+def claim_confidence(text: str, source: str = "") -> float:
+    """Confidence for one extracted claim, derived from its evidence."""
+    probe = source or text
+    return (
+        STRONG_CLAIM_CONFIDENCE
+        if _STRONG_EVIDENCE_RE.search(probe)
+        else DEFAULT_CLAIM_CONFIDENCE
+    )
+
+
 class ActionItemExtractor:
     """Regex-based action item extraction.
 
@@ -240,18 +374,40 @@ class ActionItemExtractor:
     """
 
     def extract(self, content: str) -> List[str]:
-        items: List[str] = []
-        seen: set[str] = set()
+        return [text for text, _evidence in self.extract_with_evidence(content)]
+
+    def extract_with_evidence(self, content: str) -> List[Tuple[str, str]]:
+        """Extracted items paired with the raw span that matched.
+
+        The captured text has the cue stripped ("TODO: ship it" -> "ship it"),
+        so confidence scored from the capture alone can never see the strongest
+        evidence there is (codex review r1). Callers that persist confidence
+        must use this, not :meth:`extract`.
+        """
+        items: List[Tuple[str, str]] = []
+        seen: Dict[str, int] = {}
         for pattern in ACTION_ITEM_PATTERNS:
             for match in re.finditer(pattern, content, flags=re.IGNORECASE):
                 text = match.group(len(match.groups())).strip().strip(",;")
                 if not text or len(text) < 3:
                     continue
-                key = text.lower()
-                if key in seen:
+                if not _is_committing_clause(content, match, text):
                     continue
-                seen.add(key)
-                items.append(text)
+                key = text.lower()
+                evidence = match.group(0)
+                if key in seen:
+                    # Same action, different cue. "I will ship. TODO: ship."
+                    # matches the weak first-person pattern first, so keeping
+                    # the first sighting would persist 0.7 despite the explicit
+                    # TODO (codex review r2). Upgrade in place instead.
+                    existing = seen[key]
+                    if claim_confidence(text, evidence) > claim_confidence(
+                        text, items[existing][1]
+                    ):
+                        items[existing] = (text, evidence)
+                    continue
+                seen[key] = len(items)
+                items.append((text, evidence))
         return items
 
 
@@ -265,6 +421,11 @@ class DecisionExtractor:
             for match in re.finditer(pattern, content, flags=re.IGNORECASE):
                 text = match.group(len(match.groups())).strip().strip(",;")
                 if not text or len(text) < 3:
+                    continue
+                # Deciding NOT to do something is still a decision.
+                if not _is_committing_clause(
+                    content, match, text, negative_action_ok=True
+                ):
                     continue
                 key = text.lower()
                 if key in seen:
@@ -405,7 +566,7 @@ class SchemaRouter:
 
         # 1. Action items (graph nodes)
         try:
-            items = self.action_extractor.extract(content)
+            items = self.action_extractor.extract_with_evidence(content)
             if items:
                 await self._persist_action_items(items, message_id, epistemic)
                 summary["action_items"] = len(items)
@@ -452,7 +613,11 @@ class SchemaRouter:
         (message, text). No separate table, no separate migration.
         """
         now_iso = datetime.now(timezone.utc).isoformat()
-        for text in items:
+        for item in items:
+            # Items arrive as (text, matched-span) so confidence can see the
+            # cue that extraction stripped (codex review r1). Tolerate a bare
+            # string for any caller still on the older shape.
+            text, evidence = item if isinstance(item, tuple) else (item, "")
             node_id = _deterministic_action_node_id(self.agent_id, message_id, text)
 
             # Preserve existing status / assignee / due_date if the node
@@ -466,7 +631,7 @@ class SchemaRouter:
                 "status": existing_props.get("status", "pending"),
                 "assignee_concept_id": existing_props.get("assignee_concept_id"),
                 "due_date": existing_props.get("due_date"),
-                "confidence": 0.7,
+                "confidence": claim_confidence(text, evidence),
                 "source_message_id": message_id,
                 "agent_id": self.agent_id,
                 "created_at": existing_props.get("created_at", now_iso),
@@ -510,7 +675,7 @@ class SchemaRouter:
             properties = {
                 "text": text,
                 "source_message_id": message_id,
-                "confidence": 0.7,
+                "confidence": claim_confidence(text),
                 "created_at": now_iso,
                 "agent_id": self.agent_id,
             }
