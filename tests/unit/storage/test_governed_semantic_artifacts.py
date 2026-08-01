@@ -739,6 +739,45 @@ async def test_sleep_drives_expiry_with_storage_owned_clock(storage: AsyncStorag
 
 
 @pytest.mark.asyncio
+async def test_artifact_expiry_sweep_without_tenant_authority_is_unconfigured_noop(
+    tmp_path, monkeypatch
+) -> None:
+    unconfigured = AsyncStorage(
+        str(tmp_path / "unconfigured-artifact-sweep.db"),
+        agent_id="did:example:legacy",
+    )
+
+    async def fail_if_initialized() -> None:
+        raise AssertionError("unconfigured artifact sweep must not initialize storage")
+
+    monkeypatch.setattr(unconfigured, "initialize", fail_if_initialized)
+
+    assert await unconfigured.sweep_expired_governed_semantic_artifacts() == 0
+    assert unconfigured._initialized is False
+
+
+@pytest.mark.asyncio
+async def test_artifact_expiry_sweep_with_tenant_authority_propagates_initialize_failure(
+    storage: AsyncStorage, tmp_path, monkeypatch
+) -> None:
+    configured = AsyncStorage(
+        str(tmp_path / "configured-artifact-sweep.db"),
+        agent_id=storage.agent_id,
+        _assertion_tenant_capability=storage._assertion_tenant_capability,
+    )
+
+    async def fail_initialize() -> None:
+        raise RuntimeError("forced artifact storage initialization failure")
+
+    monkeypatch.setattr(configured, "initialize", fail_initialize)
+
+    with pytest.raises(
+        RuntimeError, match="forced artifact storage initialization failure"
+    ):
+        await configured.sweep_expired_governed_semantic_artifacts()
+
+
+@pytest.mark.asyncio
 async def test_v1_migration_quarantines_and_makes_legacy_rows_claimable(
     tmp_path, monkeypatch
 ) -> None:
