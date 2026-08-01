@@ -5666,13 +5666,16 @@ class AsyncAssertionStore:
         revision_ids: Sequence[str] = (),
         generation: int,
     ) -> int:
-        """Atomically remove affected artifact lineage and start opaque revocation.
+        """Atomically remove targeted/dependent artifacts and start opaque revocation.
 
         This helper runs under the canonical tenant mutation.  It deliberately
         deletes the artifact row (including its caller-facing handle and digest)
         before the lifecycle mutation commits.  The durable retry work retains
         only a blinded key and a fresh revocation ID, so an erased assertion can
-        never be recovered through the artifact registry after restart.
+        never be recovered through the artifact registry after restart. Exact
+        artifact IDs are selected directly so legitimate zero-lineage exports
+        remain cleanup-capable; assertion/revision targets use lineage EXISTS
+        predicates and cannot widen an exact artifact expiry.
         """
         if not artifact_ids and not assertion_ids and not revision_ids:
             return 0
@@ -5683,16 +5686,23 @@ class AsyncAssertionStore:
             clauses.append(f"a.artifact_id IN ({_placeholders(tuple(artifact_ids))})")
             params.extend(artifact_ids)
         if assertion_ids:
-            clauses.append(f"l.assertion_id IN ({_placeholders(tuple(assertion_ids))})")
+            clauses.append(
+                "EXISTS (SELECT 1 FROM semantic_governed_artifact_lineage l "
+                "WHERE l.tenant_id = a.tenant_id AND l.artifact_id = a.artifact_id "
+                f"AND l.assertion_id IN ({_placeholders(tuple(assertion_ids))}))"
+            )
             params.extend(assertion_ids)
         if revision_ids:
-            clauses.append(f"l.revision_id IN ({_placeholders(tuple(revision_ids))})")
+            clauses.append(
+                "EXISTS (SELECT 1 FROM semantic_governed_artifact_lineage l "
+                "WHERE l.tenant_id = a.tenant_id AND l.artifact_id = a.artifact_id "
+                f"AND l.revision_id IN ({_placeholders(tuple(revision_ids))}))"
+            )
             params.extend(revision_ids)
         rows = await self._database.fetchall(
             "SELECT DISTINCT a.artifact_id, a.kind, a.consumer_id, a.consumer_key_id, "
             "a.consumer_public_key, a.artifact_digest "
-            "FROM semantic_governed_artifacts a JOIN semantic_governed_artifact_lineage l "
-            "ON l.tenant_id = a.tenant_id AND l.artifact_id = a.artifact_id "
+            "FROM semantic_governed_artifacts a "
             "WHERE a.tenant_id = ? AND a.state = ? AND (" + " OR ".join(clauses) + ")",
             tuple(params[:1] + [GovernedArtifactState.ACTIVE.value] + params[1:]),
         )
@@ -5854,14 +5864,8 @@ class AsyncAssertionStore:
                     state=GovernedArtifactState.EXPIRED,
                     generation=generation,
                 )
-                lineage = await self._database.fetchall(
-                    "SELECT assertion_id, revision_id FROM semantic_governed_artifact_lineage "
-                    "WHERE tenant_id = ? AND artifact_id = ?",
-                    (tenant_id, artifact_id),
-                )
                 await self._revoke_governed_artifacts_for_lineage(
-                    assertion_ids=tuple(str(item[0]) for item in lineage),
-                    revision_ids=tuple(str(item[1]) for item in lineage),
+                    artifact_ids=(artifact_id,),
                     generation=generation,
                 )
                 # Do not raise until the mutation context exits: the expiry

@@ -78,6 +78,41 @@ async def _run(hooks, *, consolidation_result=None):
     ).sleep(skip_export=True)
 
 
+@pytest.mark.asyncio
+async def test_artifact_sweep_failure_reports_failure_but_runs_other_sleep_phases():
+    calls = []
+
+    class FailingArtifactStorage:
+        async def sweep_expired_governed_semantic_artifacts(self):
+            calls.append("artifact_sweep")
+            raise RuntimeError("private backend detail")
+
+    class SweepFailureAgent(_Agent):
+        def __init__(self):
+            super().__init__([])
+            self.storage = FailingArtifactStorage()
+
+        async def _consolidate_memories(self):
+            calls.append("consolidation")
+            return {"episodes_created": 1}
+
+        async def _export_sovereignty(self, storage_tier):
+            del storage_tier
+            calls.append("export")
+            return {"cid": "cid:sweep-failure", "shards_exported": 1}
+
+    report = await SweepFailureAgent().sleep()
+
+    assert calls == ["artifact_sweep", "consolidation", "export"]
+    assert report.episodes_created == 1
+    assert report.cid == "cid:sweep-failure"
+    assert report.shards_exported == 1
+    assert report.success is False
+    assert report.error == "semantic_artifact_expiry_sweep_failed"
+    assert str(report) == "Sleep failed: semantic_artifact_expiry_sweep_failed"
+    assert "private backend detail" not in report.to_dict()["error"]
+
+
 class _ReflectionMemory:
     def __init__(self, db):
         self.storage = type("Storage", (), {"db": db})()

@@ -400,6 +400,52 @@ async def test_consume_time_expiry_commits_pending_deletion_before_rejecting(
 
 
 @pytest.mark.asyncio
+async def test_consume_time_expiry_revokes_only_the_exact_overlapping_artifact(
+    storage: AsyncStorage,
+) -> None:
+    """Shared assertion lineage must not make one artifact's TTL contagious."""
+    private_key = Ed25519PrivateKey.generate()
+    assertion = _assertion(storage.agent_id, "overlapping-expiry-revision")
+    await storage.put_assertion(assertion, source_occurrences=(_source(),))
+    checkpoint = await storage.assertion_checkpoint()
+    expired = _registration(
+        assertion, checkpoint.generation, private_key=private_key,
+    )
+    live = _registration(
+        assertion, checkpoint.generation, private_key=private_key,
+    )
+    await storage._assertion_store().register_governed_artifact(expired)
+    await storage._assertion_store().register_governed_artifact(live)
+    await storage.db.execute(
+        "UPDATE semantic_governed_artifacts SET retention_expires_at = ? "
+        "WHERE tenant_id = ? AND artifact_id = ?",
+        (
+            (datetime.now(timezone.utc) - timedelta(seconds=1))
+            .isoformat().replace("+00:00", "Z"),
+            storage.agent_id,
+            expired.artifact_id,
+        ),
+    )
+
+    with pytest.raises(GovernedArtifactError, match="retention expiry"):
+        await storage.consume_governed_semantic_artifact(
+            expired.artifact_id, expected_generation=checkpoint.generation,
+        )
+    assert await storage.consume_governed_semantic_artifact(
+        live.artifact_id, expected_generation=checkpoint.generation,
+    )
+    assert await storage.db.fetchall(
+        "SELECT artifact_id FROM semantic_governed_artifacts WHERE tenant_id = ?",
+        (storage.agent_id,),
+    ) == [(live.artifact_id,)]
+    assert await storage.db.fetchval(
+        "SELECT COUNT(*) FROM semantic_governed_artifact_revocations "
+        "WHERE tenant_id = ? AND acknowledged_at IS NULL",
+        (storage.agent_id,),
+    ) == 1
+
+
+@pytest.mark.asyncio
 async def test_expiry_sweep_prunes_only_stale_consumer_authentication_nonces(
     storage: AsyncStorage,
 ) -> None:

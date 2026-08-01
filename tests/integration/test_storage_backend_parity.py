@@ -136,6 +136,131 @@ async def test_governed_artifact_erasure_lifecycle_has_backend_parity(
         await storage.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_empty_export_and_corpus_expiry_have_backend_parity(
+    db_backend, tmp_path,
+):
+    """Zero-lineage artifacts remain legitimate, revocable, and non-resurrectable."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from kestrel_sovereign.knowledge import (
+        EpistemicState,
+        GovernedArtifactConsumerAuthentication,
+        GovernedArtifactDeletionOwner,
+        GovernedArtifactDeletionProof,
+        GovernedArtifactError,
+        GovernedCorpusPolicy,
+        Visibility,
+    )
+
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path, "empty-artifact-parity",
+    )
+    storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw,
+    ).hex()
+    consumer = {
+        "consumer_id": "empty-artifact-consumer",
+        "consumer_key_id": "empty-artifact-key",
+        "consumer_public_key": public_key,
+        "retention_seconds": 300,
+    }
+    export_artifact_id = str(uuid4())
+    corpus_artifact_id = str(uuid4())
+    try:
+        maintenance = await storage.run_semantic_maintenance(None)
+        assert maintenance.status.value == "no_op"
+        capability_versions = await storage.semantic_maintenance_capability_versions(None)
+        policy = GovernedCorpusPolicy(
+            policy_id="empty-artifact-parity",
+            policy_version="1",
+            accepted_epistemic_states=(EpistemicState.REPORTED,),
+            accepted_visibility=(Visibility.PRIVATE,),
+            accepted_privacy_classifications=("normal",),
+            accepted_consent_references=("policy:private-v1",),
+            accepted_grounding_classes=("parity",),
+            accepted_source_kinds=("parity-test",),
+            accepted_ontology_pins=(
+                OntologyRef("parity", "1", "sha256:parity", "semantic-kb-v1"),
+            ),
+            accepted_semantic_capability_versions=tuple(capability_versions.items()),
+        )
+        export_checkpoint, exported = await storage.export_assertion_snapshot(
+            artifact_id=export_artifact_id, **consumer,
+        )
+        corpus = await storage.governed_assertion_corpus_snapshot(
+            policy=policy,
+            inference_profile=None,
+            artifact_id=corpus_artifact_id,
+            **consumer,
+        )
+        assert exported == ()
+        assert corpus.examples == ()
+        assert export_checkpoint.generation == corpus.checkpoint.generation == 0
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM semantic_governed_artifact_lineage WHERE tenant_id = ?",
+            (tenant,),
+        ) == 0
+
+        storage._artifact_clock = lambda: datetime.now(timezone.utc) + timedelta(minutes=10)
+        storage._assertion_store()._artifact_clock = storage._artifact_clock
+        assert await storage.sweep_expired_governed_semantic_artifacts() == 2
+        pending = await storage.governed_semantic_artifact_erasure_observation(
+            expected_generation=0,
+        )
+        assert (pending.export_snapshots, pending.governed_corpus) == (0, 0)
+        assert pending.pending_revocations == 2
+
+        deleted: list[str] = []
+
+        async def delete_artifact(lease):
+            deleted.append(lease.artifact_key)
+            proof = GovernedArtifactDeletionProof(
+                datetime.now(timezone.utc).isoformat(), "0" * 128,
+            )
+            return replace(
+                proof, signature=private_key.sign(proof.signable_bytes(lease)).hex(),
+            )
+
+        owner = GovernedArtifactDeletionOwner(
+            "empty-artifact-consumer", "empty-artifact-key", delete_artifact,
+        )
+        for _ in range(2):
+            authentication = GovernedArtifactConsumerAuthentication(
+                "empty-artifact-consumer", "empty-artifact-key", str(uuid4()),
+                datetime.now(timezone.utc).isoformat(), "0" * 128,
+            )
+            authentication = replace(
+                authentication,
+                signature=private_key.sign(authentication.signable_bytes(tenant)).hex(),
+            )
+            assert await storage.process_governed_semantic_artifact_revocation(
+                authentication, owner,
+            ) is not None
+        assert len(deleted) == 2
+        completed = await storage.governed_semantic_artifact_erasure_observation(
+            expected_generation=0,
+        )
+        assert (completed.pending_revocations, completed.completed_revocations) == (0, 2)
+
+        with pytest.raises(GovernedArtifactError, match="previously revoked"):
+            await storage.export_assertion_snapshot(
+                artifact_id=export_artifact_id, **consumer,
+            )
+        with pytest.raises(GovernedArtifactError, match="previously revoked"):
+            await storage.governed_assertion_corpus_snapshot(
+                policy=policy,
+                inference_profile=None,
+                artifact_id=corpus_artifact_id,
+                **consumer,
+            )
+    finally:
+        await storage.close()
+
+
 def _semantic_source(source_id: str):
     from kestrel_sovereign.knowledge import SourceOccurrence
 

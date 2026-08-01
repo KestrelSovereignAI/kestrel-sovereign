@@ -87,6 +87,7 @@ _SLEEP_FAILURE_REASONS = frozenset(
     {
         "consolidation_failed",
         "consolidation_skipped",
+        "semantic_artifact_expiry_sweep_failed",
         "semantic_inference_revocation_failed",
         "semantic_maintenance_failed",
         "semantic_storage_unavailable",
@@ -874,6 +875,7 @@ class SleepMixin:
         reflection_start = time.time()
         consolidation_succeeded = False
         export_succeeded = False
+        artifact_sweep_succeeded = True
 
         # The nightly scheduler invokes this same sleep path.  Sweep governed
         # semantic artifacts even when inference maintenance is disabled so a
@@ -889,7 +891,7 @@ class SleepMixin:
             except Exception:
                 logger.warning("Governed semantic artifact expiry sweep failed")
                 report.error = "semantic_artifact_expiry_sweep_failed"
-                return report
+                artifact_sweep_succeeded = False
 
         # Note: Privacy mode checks are handled by the storage layer.
         # - EPHEMERAL/ISOLATED: Storage will raise PrivacyViolationError on export
@@ -1007,7 +1009,7 @@ class SleepMixin:
         # and the scheduler normally skips export.
         report.success = (
             consolidation_succeeded or export_succeeded
-        ) and semantic_maintenance_succeeded
+        ) and semantic_maintenance_succeeded and artifact_sweep_succeeded
 
         # Invoke callback if set (allows platform to update latest_cid)
         if report.success and report.cid and self.on_sleep_complete:
