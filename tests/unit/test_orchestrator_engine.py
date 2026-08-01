@@ -215,6 +215,42 @@ class TestPruneShedsHistoryUnderPressure:
         assert {"role": "user", "content": "current ask"} in result
         assert result[-1]["role"] == "tool"
 
+    def test_stale_history_is_shed_before_the_live_tool_result_is_destroyed(self):
+        """Priority: lose old turns before this turn's tool output.
+
+        The synthesis call exists to report what the tool returned. Truncating
+        that result while a stale exchange would have freed the same bytes
+        leaves the answer without the lookup it was asked for.
+        """
+        history = [
+            {"role": "user", "content": f"old-{i} " + "y" * 500}
+            for i in range(6)
+        ]
+        tool_result = {
+            "role": "tool", "tool_call_id": "c1", "content": "R" * 1200,
+        }
+        messages = (
+            [{"role": "system", "content": "sys"}]
+            + history
+            + [{"role": "user", "content": "current ask"}]
+            + [{"role": "assistant", "content": "", "tool_calls": []}, tool_result]
+        )
+        prune = self._prune(agent_limit=900)
+
+        result = prune(
+            messages, [],
+            protected_prefix=1 + len(history) + 1,
+            history_len=len(history),
+        )
+
+        # The tool result the answer depends on survives intact...
+        assert result[-1]["content"] == "R" * 1200, (
+            "live tool output was truncated while stale history was still present"
+        )
+        # ...because stale history paid for it.
+        kept_history = [m for m in result if m["content"].startswith("old-")]
+        assert len(kept_history) < len(history)
+
     def test_history_is_kept_when_it_already_fits(self):
         messages = (
             [{"role": "system", "content": "sys"}]
@@ -371,6 +407,31 @@ class TestContextLimitResolution:
             service, None
         ) == get_token_counter("claude-opus-5").get_context_limit()
         service.get_active_model_id.assert_called_once()
+
+    def test_route_qualified_selection_beats_the_bare_model_id(self):
+        """A route-level cap must not be lost to the bare model id.
+
+        ``get_active_model_id()`` returns just the model, so a plan route
+        serving a smaller window than the model's own would be sized against
+        the model's full window.
+        """
+        service = MagicMock(
+            spec=["get_active_model_selection", "get_active_model_id"]
+        )
+        service.get_active_model_selection.return_value = {
+            "model": "anthropic:plan/claude-opus-5"
+        }
+        service.get_active_model_id.return_value = "claude-opus-5"
+
+        with patch(
+            "kestrel_sovereign.agent.token_counter.get_token_counter"
+        ) as counter:
+            counter.return_value.get_context_limit.return_value = 4242
+            assert OrchestratorEngineMixin._resolve_orchestrator_context_limit(
+                service, None
+            ) == 4242
+
+        counter.assert_called_once_with("anthropic:plan/claude-opus-5")
 
     def test_falls_back_only_when_the_route_is_unresolved(self):
         from kestrel_sovereign.agent.orchestrator_engine import (

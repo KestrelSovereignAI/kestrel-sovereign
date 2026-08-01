@@ -2490,18 +2490,37 @@ class OrchestratorEngineMixin:
             # every agent without a wallet, i.e. the common case. Falling
             # straight through to the default would leave most turns pruning
             # against a window nothing served (codex review r3, #2841).
-            active = getattr(llm_service, "get_active_model_id", None)
-            if callable(active):
+            # Prefer the ROUTE-QUALIFIED selection ("vendor:route/model") — the
+            # same canonical source ContextManager plans against. The bare id
+            # from get_active_model_id() loses a route-level cap (a plan route
+            # can serve a smaller window than the model's own), which would size
+            # the prune to the model's full window and let an oversized
+            # continuation through (codex review r4, #2841).
+            selection = getattr(llm_service, "get_active_model_selection", None)
+            if callable(selection):
                 try:
-                    resolved = active()
+                    qualified = (selection() or {}).get("model")
                 except Exception as exc:  # noqa: BLE001
-                    logging.warning(
-                        "[ORCHESTRATOR] Could not resolve the active model for "
-                        "continuation pruning (%s).", exc,
+                    logging.debug(
+                        "[ORCHESTRATOR] get_active_model_selection failed (%s); "
+                        "falling back to get_active_model_id.", exc,
                     )
                 else:
-                    if resolved and resolved != "auto":
-                        model = resolved
+                    if qualified and qualified != "auto":
+                        model = qualified
+            if not model:
+                active = getattr(llm_service, "get_active_model_id", None)
+                if callable(active):
+                    try:
+                        resolved = active()
+                    except Exception as exc:  # noqa: BLE001
+                        logging.warning(
+                            "[ORCHESTRATOR] Could not resolve the active model "
+                            "for continuation pruning (%s).", exc,
+                        )
+                    else:
+                        if resolved and resolved != "auto":
+                            model = resolved
         if model:
             try:
                 from kestrel_sovereign.agent.token_counter import get_token_counter
@@ -2527,10 +2546,16 @@ class OrchestratorEngineMixin:
     ) -> list:
         """Prune orchestrator messages to stay within context limits.
 
-        Strategy, in escalating order:
+        Strategy, cheapest-to-lose first:
 
-        1. Truncate oversized tool results (replacing with a summary marker).
-        2. If still over, shed the OLDEST replayed prior-turn messages.
+        1. Shed the OLDEST replayed prior-turn messages.
+        2. Only if that is not enough, truncate oversized tool results
+           (replacing them with a summary marker).
+
+        Stale history before live tool output: the synthesis call exists to
+        report what the tool returned, so destroying that result while an old
+        exchange nobody needed still occupies the same bytes would defeat the
+        turn (codex review r4).
 
         ``system`` and the current user turn are never dropped — without them
         the continuation cannot answer at all.
@@ -2584,20 +2609,15 @@ class OrchestratorEngineMixin:
         protected = messages[:protected_prefix]  # system + history + user
         middle = messages[protected_prefix:]
 
-        for i, msg in enumerate(middle):
-            if _total_chars(protected + middle) <= max_message_chars:
-                break
-            if msg.get("role") == "tool" and len(msg.get("content", "")) > 200:
-                original_len = len(msg["content"])
-                middle[i] = {
-                    "role": "tool",
-                    "tool_call_id": msg.get("tool_call_id", ""),
-                    "content": f"[Result truncated: was {original_len} chars. Tool completed successfully.]"
-                }
-
-        # Step 2 — still over after reclaiming tool bytes: shed the oldest
-        # replayed prior turns. ``system`` (index 0) and the current user turn
-        # (the tail of ``protected``) are structural and never dropped.
+        # Step 1 — shed the oldest replayed prior turns FIRST. Stale history is
+        # the cheapest thing in the payload to lose; this turn's tool output is
+        # the most expensive, since the synthesis call exists precisely to
+        # report it. Truncating the live result first (the pre-#2841 order, when
+        # history was not in the array at all) could destroy the lookup the
+        # answer depends on while an old exchange nobody needed sat untouched
+        # and would have freed the same bytes (codex review r4).
+        # ``system`` (index 0) and the current user turn (the tail of
+        # ``protected``) are structural and never dropped.
         if history_len and _total_chars(protected + middle) > max_message_chars:
             head = protected[:1]
             history = list(protected[1:1 + history_len])
@@ -2619,13 +2639,25 @@ class OrchestratorEngineMixin:
                     history.pop(0)
                     shed += 1
                 logging.warning(
-                    "[ORCHESTRATOR] Context pressure persists after tool "
-                    "truncation — dropped %d/%d oldest replayed history "
-                    "message(s) from the continuation.",
+                    "[ORCHESTRATOR] Context pressure — dropped %d/%d oldest "
+                    "replayed history message(s) from the continuation.",
                     shed,
                     history_len,
                 )
             protected = head + history + tail
+
+        # Step 2 — only if shedding every replayed turn still left the payload
+        # over: start reclaiming this turn's own tool output.
+        for i, msg in enumerate(middle):
+            if _total_chars(protected + middle) <= max_message_chars:
+                break
+            if msg.get("role") == "tool" and len(msg.get("content", "")) > 200:
+                original_len = len(msg["content"])
+                middle[i] = {
+                    "role": "tool",
+                    "tool_call_id": msg.get("tool_call_id", ""),
+                    "content": f"[Result truncated: was {original_len} chars. Tool completed successfully.]"
+                }
 
         result = protected + middle
         new_total = _total_chars(result)
