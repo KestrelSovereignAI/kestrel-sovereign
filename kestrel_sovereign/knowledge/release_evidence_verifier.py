@@ -23,13 +23,14 @@ from cryptography.exceptions import InvalidSignature
 
 from .release_evidence import (
     CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
+    _EXTERNAL_CAPABILITY_GATE_IDS,
     SemanticReleaseEvidence,
     apply_evidence_records,
     apply_performance_budgets,
-    attach_external_capability_report,
     evidence_record_from_mapping,
     external_capability_report_from_mapping,
     performance_budget_from_mapping,
+    release_gate_specs,
     release_evidence_template,
     trusted_execution_policy_from_mapping,
     validate_external_capability_attachment,
@@ -37,7 +38,10 @@ from .release_evidence import (
 from .release_evidence_freshness import ExternalFreshnessLedger
 from .release_evidence_models import (
     EvidenceRecord,
+    EvidenceState,
+    ExecutionSource,
     ExternalCapabilityReport,
+    GateSpec,
     PerformanceBudget,
     ReleaseEvidenceError,
     TrustedExecutionPolicy,
@@ -48,6 +52,7 @@ from .release_evidence_models import (
 
 VERIFICATION_RECEIPT_VERSION = "semantic-release-verification-receipt-v1"
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_.:-]{1,127}$")
+_EXTERNAL_ENVELOPE_TRUST_STATUS = "external_signature_requires_core_policy_verification"
 
 
 def _read_owner_only_file(path: Path, *, kind: str) -> bytes:
@@ -213,6 +218,101 @@ def _read_submission(path: Path, *, kind: str) -> Mapping[str, object]:
     return value
 
 
+def _external_adapter_specs() -> tuple[GateSpec, ...]:
+    """Return the catalog-declared external gates in their signed order."""
+    specs = tuple(
+        spec for spec in release_gate_specs() if spec.category == "external_adapter"
+    )
+    if not specs:
+        raise ReleaseEvidenceError("semantic release catalog has no external adapter gates")
+    return specs
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalEvidenceEnvelope:
+    """Exact parametric-self external-CI envelope accepted by the verifier.
+
+    The producer owns this transport shape, but core repeats its strict
+    validation at the trust boundary rather than accepting a producer library
+    or a loosely related collection of JSON files.  Signature verification
+    remains policy-owned and occurs when these records are applied.
+    """
+
+    core_release_evidence_contract_digest: str
+    repository: str
+    capability_source_revision: str
+    evidence_runner_revision: str
+    run_nonce: str
+    trust_status: str
+    records: tuple[EvidenceRecord, ...]
+    report: ExternalCapabilityReport
+
+    def __post_init__(self) -> None:
+        if (
+            self.core_release_evidence_contract_digest
+            != CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST
+        ):
+            raise ReleaseEvidenceError(
+                "external envelope does not bind the current core release contract"
+            )
+        if self.trust_status != _EXTERNAL_ENVELOPE_TRUST_STATUS:
+            raise ReleaseEvidenceError("external envelope has an invalid trust_status")
+        specs = _external_adapter_specs()
+        expected_gate_ids = tuple(spec.gate_id for spec in specs)
+        if tuple(record.gate_id for record in self.records) != expected_gate_ids:
+            raise ReleaseEvidenceError(
+                "external envelope records must preserve the declared external gate order"
+            )
+        for spec, record in zip(specs, self.records, strict=True):
+            spec.validate_attestation(record)
+            if (
+                record.state is not EvidenceState.PASSED
+                or record.execution_attestation is None
+                or record.execution_attestation.source is not ExecutionSource.EXTERNAL_CI
+                or record.external_run_nonce != self.run_nonce
+                or record.external_evidence_runner_revision != self.evidence_runner_revision
+            ):
+                raise ReleaseEvidenceError(
+                    "external envelope records must be externally signed passes bound to its nonce and runner revision"
+                )
+        if (
+            self.report.capability_id != "parametric_self_governed_corpus"
+            or self.report.repository != self.repository
+            or self.report.capability_source_revision != self.capability_source_revision
+            or self.report.evidence_runner_revision != self.evidence_runner_revision
+            or self.report.core_release_evidence_contract_digest
+            != self.core_release_evidence_contract_digest
+            or self.report.run_nonce != self.run_nonce
+            or self.report.gate_ids != _EXTERNAL_CAPABILITY_GATE_IDS
+        ):
+            raise ReleaseEvidenceError(
+                "external envelope report identity or capability gate order does not match its envelope"
+            )
+        capability_specs = tuple(
+            spec for spec in specs if spec.gate_id in _EXTERNAL_CAPABILITY_GATE_IDS
+        )
+        capability_records = tuple(
+            record
+            for record in self.records
+            if record.gate_id in _EXTERNAL_CAPABILITY_GATE_IDS
+        )
+        for spec, record, attestation in zip(
+            capability_specs,
+            capability_records,
+            self.report.attestations,
+            strict=True,
+        ):
+            if (
+                attestation.gate_spec_digest != spec.digest
+                or attestation.result_digest != record.run_digest
+                or attestation.artifact != record.artifact
+                or attestation.drill != spec.correlation
+            ):
+                raise ReleaseEvidenceError(
+                    "external envelope report is not bound to each signed external record"
+                )
+
+
 def load_records(paths: Iterable[Path]) -> tuple[EvidenceRecord, ...]:
     return tuple(
         evidence_record_from_mapping(_read_submission(path, kind="evidence record"))
@@ -229,6 +329,72 @@ def load_budgets(paths: Iterable[Path]) -> tuple[PerformanceBudget, ...]:
 
 def load_external_report(path: Path) -> ExternalCapabilityReport:
     return external_capability_report_from_mapping(_read_submission(path, kind="external capability report"))
+
+
+def load_external_envelope(path: Path) -> ExternalEvidenceEnvelope:
+    """Parse only the exact producer envelope schema at the verifier boundary."""
+    value = _read_submission(path, kind="external evidence envelope")
+    expected = {
+        "core_release_evidence_contract_digest",
+        "repository",
+        "capability_source_revision",
+        "evidence_runner_revision",
+        "run_nonce",
+        "trust_status",
+        "records",
+        "report",
+    }
+    if set(value) != expected:
+        raise ReleaseEvidenceError("external evidence envelope has unknown or missing fields")
+    raw_records = value["records"]
+    if not isinstance(raw_records, list):
+        raise ReleaseEvidenceError("external evidence envelope records must be a list")
+    if not isinstance(value["report"], Mapping):
+        raise ReleaseEvidenceError("external evidence envelope report must be a mapping")
+    records: list[EvidenceRecord] = []
+    for raw_record in raw_records:
+        if not isinstance(raw_record, Mapping):
+            raise ReleaseEvidenceError("external evidence envelope record must be a mapping")
+        records.append(evidence_record_from_mapping(raw_record))
+    return ExternalEvidenceEnvelope(
+        core_release_evidence_contract_digest=value["core_release_evidence_contract_digest"],
+        repository=value["repository"],
+        capability_source_revision=value["capability_source_revision"],
+        evidence_runner_revision=value["evidence_runner_revision"],
+        run_nonce=value["run_nonce"],
+        trust_status=value["trust_status"],
+        records=tuple(records),
+        report=external_capability_report_from_mapping(value["report"]),
+    )
+
+
+def combine_external_envelope_submission(
+    *,
+    records: Iterable[EvidenceRecord],
+    envelope: ExternalEvidenceEnvelope | None,
+) -> tuple[tuple[EvidenceRecord, ...], ExternalCapabilityReport]:
+    """Require an atomic external envelope beside individually supplied core work.
+
+    Core records and budgets remain individual verifier inputs. The external
+    adapter portion is atomic: accepting standalone external records or a
+    split report would make duplicate or substituted served-adapter evidence
+    ambiguous before the verifier's freshness preflight.
+    """
+    standalone_records = tuple(records)
+    if envelope is None:
+        raise ReleaseEvidenceError(
+            "verifier assembly requires exactly one --external-envelope"
+        )
+    external_gate_ids = {spec.gate_id for spec in _external_adapter_specs()}
+    duplicate_gate_ids = sorted(
+        {record.gate_id for record in standalone_records} & external_gate_ids
+    )
+    if duplicate_gate_ids:
+        raise ReleaseEvidenceError(
+            "--external-envelope cannot be combined with standalone external records: "
+            + ", ".join(duplicate_gate_ids)
+        )
+    return (*standalone_records, *envelope.records), envelope.report
 
 
 @dataclass(frozen=True, slots=True)
@@ -531,11 +697,14 @@ def finalize_verified_artifacts(
 
 __all__ = [
     "VERIFICATION_RECEIPT_VERSION",
+    "ExternalEvidenceEnvelope",
     "VerificationReceipt",
+    "combine_external_envelope_submission",
     "finalize_verified_artifacts",
     "issue_verification_receipt",
     "load_budgets",
     "load_external_report",
+    "load_external_envelope",
     "load_records",
     "prepare_trusted_evidence",
     "read_verifier_configuration",

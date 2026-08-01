@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 
@@ -55,9 +56,11 @@ from kestrel_sovereign.knowledge.release_evidence_verifier import (
     VerifierReceiptIdentity,
     finalize_verified_artifacts,
     issue_verification_receipt,
+    load_external_envelope,
     load_budgets,
     load_external_report,
     load_records,
+    combine_external_envelope_submission,
     prepare_trusted_evidence,
     read_verifier_configuration,
     verification_receipt_from_mapping,
@@ -262,7 +265,11 @@ def _external_report(
     run_nonce: str = "a" * 64,
     evidence_runner_revision: str = "b" * 40,
 ) -> ExternalCapabilityReport:
-    external_gates = [gate for gate in evidence.gates if gate.spec.category == "external_adapter"]
+    external_gates = [
+        gate
+        for gate in evidence.gates
+        if gate.spec.gate_id.startswith("external_")
+    ]
     attestations: list[ExternalGateAttestation] = []
     for gate in external_gates:
         record = gate.evidence
@@ -362,6 +369,33 @@ def test_template_never_auto_passes_registry_selection_or_missing_evidence() -> 
     assert template.external_capabilities == ()
     assert all(gate.evidence.state is not EvidenceState.PASSED for gate in template.gates)
     assert inspect_stable_only_capabilities()["rejected_capability_count"] > 0
+
+
+def test_served_adapter_erasure_gate_is_external_ci_evidence_not_a_core_kite_workload() -> None:
+    served = _gate("erasure_served_adapter_eligibility")
+    external_gate_ids = tuple(
+        spec.gate_id
+        for spec in release_gate_specs()
+        if spec.category == "external_adapter"
+    )
+
+    assert served.category == "external_adapter"
+    assert served.owner == "parametric_self"
+    assert served.runner.runner_id == "external_ci"
+    assert served.environment.mode == "external_adapter"
+    assert served.correlation is not None
+    assert external_gate_ids == (
+        "erasure_served_adapter_eligibility",
+        "external_corpus_consumed",
+        "external_candidate_invalidated",
+        "external_served_eligibility_rejected",
+    )
+    assert len(CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST) == 64
+    assert all(
+        spec.gate_id != served.gate_id
+        for spec in release_gate_specs()
+        if spec.category == "erasure"
+    )
 
 
 def test_reviewer_adversarial_erasure_drill_rejects_mismatched_or_missing_correlation() -> None:
@@ -476,10 +510,10 @@ def test_reviewer_adversarial_external_report_requires_exact_stages_repo_revisio
         capability_source_revision=report.capability_source_revision,
         evidence_runner_revision=report.evidence_runner_revision,
         core_release_evidence_contract_digest=report.core_release_evidence_contract_digest,
-        run_nonce="b" * 64,
+        run_nonce=run_nonce,
         attestations=report.attestations[:-1],
     )
-    with pytest.raises(ReleaseEvidenceError, match="cover corpus, candidate, and served stages"):
+    with pytest.raises(ReleaseEvidenceError, match="exactly the three external capability stages"):
         attach_external_capability_report(
             evidence, incomplete, freshness_ledger=ledger, expected_evidence_runner_revision="b" * 40
         )
@@ -518,7 +552,7 @@ def test_reviewer_adversarial_external_report_requires_exact_stages_repo_revisio
         capability_source_revision=report.capability_source_revision,
         evidence_runner_revision=report.evidence_runner_revision,
         core_release_evidence_contract_digest=report.core_release_evidence_contract_digest,
-        run_nonce="a" * 64,
+        run_nonce=run_nonce,
         attestations=(
             replace(report.attestations[0], artifact=_artifact("wrong-external-artifact")),
             *report.attestations[1:],
@@ -528,6 +562,124 @@ def test_reviewer_adversarial_external_report_requires_exact_stages_repo_revisio
         attach_external_capability_report(
             evidence, mismatched_artifact, freshness_ledger=ledger, expected_evidence_runner_revision="b" * 40
         )
+
+
+def test_verifier_external_envelope_requires_each_ordered_served_evidence_record_once(
+    tmp_path: Path,
+) -> None:
+    external_specs = tuple(
+        spec for spec in release_gate_specs() if spec.category == "external_adapter"
+    )
+    records = tuple(
+        _record(spec, external_run_nonce="a" * 64) for spec in external_specs
+    )
+    evidence = _apply_records(release_evidence_template(), records)
+    report = _external_report(evidence)
+    envelope_mapping = _external_envelope_mapping(records, report)
+    envelope_path = tmp_path / "external-envelope.json"
+    envelope_path.write_text(json.dumps(envelope_mapping), encoding="utf-8")
+
+    envelope = load_external_envelope(envelope_path)
+    core_record = _record(_gate("rdf11_projection_fixture"))
+    assembled_records, assembled_report = combine_external_envelope_submission(
+        records=(core_record,), envelope=envelope
+    )
+    assert assembled_records == (core_record, *records)
+    assert assembled_report == report
+
+    missing_served = json.loads(json.dumps(envelope_mapping))
+    missing_served["records"] = missing_served["records"][:-1]
+    envelope_path.write_text(json.dumps(missing_served), encoding="utf-8")
+    with pytest.raises(ReleaseEvidenceError, match="declared external gate order"):
+        load_external_envelope(envelope_path)
+
+    duplicated_served = json.loads(json.dumps(envelope_mapping))
+    duplicated_served["records"].append(duplicated_served["records"][-1])
+    envelope_path.write_text(json.dumps(duplicated_served), encoding="utf-8")
+    with pytest.raises(ReleaseEvidenceError, match="declared external gate order"):
+        load_external_envelope(envelope_path)
+
+    substituted_served = json.loads(json.dumps(envelope_mapping))
+    substituted_served["records"][-1] = {
+        **substituted_served["records"][0],
+        "gate_id": "external_served_eligibility_rejected",
+    }
+    envelope_path.write_text(json.dumps(substituted_served), encoding="utf-8")
+    with pytest.raises(ReleaseEvidenceError, match="spec digest"):
+        load_external_envelope(envelope_path)
+
+    mixed_nonce = json.loads(json.dumps(envelope_mapping))
+    mixed_nonce["records"][0] = _record(
+        external_specs[0], external_run_nonce="b" * 64
+    ).to_mapping()
+    envelope_path.write_text(json.dumps(mixed_nonce), encoding="utf-8")
+    with pytest.raises(ReleaseEvidenceError, match="nonce and runner revision"):
+        load_external_envelope(envelope_path)
+
+    mixed_revision = json.loads(json.dumps(envelope_mapping))
+    mixed_revision["records"][0] = _record(
+        external_specs[0], external_evidence_runner_revision="c" * 40
+    ).to_mapping()
+    envelope_path.write_text(json.dumps(mixed_revision), encoding="utf-8")
+    with pytest.raises(ReleaseEvidenceError, match="nonce and runner revision"):
+        load_external_envelope(envelope_path)
+
+    wrong_source = json.loads(json.dumps(envelope_mapping))
+    wrong_source["records"][0] = _record(
+        external_specs[0], identity=_CATALOG_TEST_IDENTITY
+    ).to_mapping()
+    envelope_path.write_text(json.dumps(wrong_source), encoding="utf-8")
+    with pytest.raises(ReleaseEvidenceError, match="externally signed passes"):
+        load_external_envelope(envelope_path)
+
+    served = records[0]
+    assert served.run_digest is not None and served.artifact is not None and served.drill
+    report_with_served = ExternalCapabilityReport.attest(
+        capability_id=report.capability_id,
+        repository=report.repository,
+        capability_source_revision=report.capability_source_revision,
+        evidence_runner_revision=report.evidence_runner_revision,
+        core_release_evidence_contract_digest=report.core_release_evidence_contract_digest,
+        run_nonce=report.run_nonce,
+        attestations=(
+            ExternalGateAttestation(
+                gate_id=served.gate_id,
+                gate_spec_digest=served.gate_spec_digest,
+                result_digest=served.run_digest,
+                artifact=served.artifact,
+                drill=served.drill,
+            ),
+            *report.attestations,
+        ),
+    )
+    envelope_path.write_text(
+        json.dumps(_external_envelope_mapping(records, report_with_served)),
+        encoding="utf-8",
+    )
+    with pytest.raises(ReleaseEvidenceError, match="capability gate order"):
+        load_external_envelope(envelope_path)
+
+    unexpected_field = json.loads(json.dumps(envelope_mapping))
+    unexpected_field["extra"] = "forbidden"
+    envelope_path.write_text(json.dumps(unexpected_field), encoding="utf-8")
+    with pytest.raises(ReleaseEvidenceError, match="unknown or missing"):
+        load_external_envelope(envelope_path)
+
+    with pytest.raises(ReleaseEvidenceError, match="standalone external records"):
+        combine_external_envelope_submission(
+            records=(records[-1],), envelope=envelope
+        )
+    with pytest.raises(ReleaseEvidenceError, match="requires exactly one --external-envelope"):
+        combine_external_envelope_submission(
+            records=(), envelope=None
+        )
+
+    forged_signature = json.loads(json.dumps(envelope_mapping))
+    forged_signature["records"][0]["execution_attestation"]["signature"] = "0" * 128
+    envelope_path.write_text(json.dumps(forged_signature), encoding="utf-8")
+    parsed_forgery = load_external_envelope(envelope_path)
+    with pytest.raises(ReleaseEvidenceError, match="signature verification failed"):
+        _apply_records(release_evidence_template(), parsed_forgery.records)
 
 
 def test_external_report_freshness_is_hash_bound_and_replay_protected_across_verifiers(
@@ -588,7 +740,7 @@ def test_external_report_freshness_is_hash_bound_and_replay_protected_across_ver
         run_nonce=rewrap_nonce,
         attestations=report.attestations,
     )
-    with pytest.raises(ReleaseEvidenceError, match="external run_nonce"):
+    with pytest.raises(ReleaseEvidenceError, match="served adapter evidence.*nonce"):
         attach_external_capability_report(
             evidence, rewrapped, freshness_ledger=ledger, expected_evidence_runner_revision="b" * 40
         )
@@ -1057,6 +1209,27 @@ def _write_private_key(path: Path, key_bytes: bytes) -> None:
     path.chmod(0o600)
 
 
+def _external_envelope_mapping(
+    records: tuple[EvidenceRecord, ...], report: ExternalCapabilityReport,
+) -> dict[str, object]:
+    by_gate = {record.gate_id: record for record in records}
+    external_records = [
+        by_gate[spec.gate_id].to_mapping()
+        for spec in release_gate_specs()
+        if spec.category == "external_adapter"
+    ]
+    return {
+        "core_release_evidence_contract_digest": report.core_release_evidence_contract_digest,
+        "repository": report.repository,
+        "capability_source_revision": report.capability_source_revision,
+        "evidence_runner_revision": report.evidence_runner_revision,
+        "run_nonce": report.run_nonce,
+        "trust_status": "external_signature_requires_core_policy_verification",
+        "records": external_records,
+        "report": report.to_mapping(),
+    }
+
+
 def _write_structurally_complete_submission(
     tmp_path: Path,
     *,
@@ -1103,7 +1276,7 @@ def _write_structurally_complete_submission(
         json.dumps(_retirement_telemetry().to_mapping()), encoding="utf-8"
     )
     external_specs = [
-        spec for spec in release_gate_specs() if spec.category == "external_adapter"
+        spec for spec in release_gate_specs() if spec.gate_id.startswith("external_")
     ]
     external_attestations: list[ExternalGateAttestation] = []
     for spec in external_specs:
@@ -1313,18 +1486,29 @@ def test_verifier_cli_requires_protected_config_and_consumes_one_external_challe
         tmp_path, core_identity=_CATALOG_TEST_IDENTITY, external_identity=_EXTERNAL_TEST_IDENTITY,
         external_run_nonce=nonce,
     )
+    submitted_records = load_records(records)
+    external_report = load_external_report(report)
+    envelope_path = tmp_path / "parametric-self-envelope.json"
+    envelope_path.write_text(
+        json.dumps(_external_envelope_mapping(submitted_records, external_report)),
+        encoding="utf-8",
+    )
     output, receipt = root / "verified.json", root / "receipt.json"
-    args = ["assemble", "--external-report", str(report), "--output", str(output), "--receipt-output", str(receipt)]
-    for record in records:
-        args.extend(("--record", str(record)))
+    args = ["assemble", "--external-envelope", str(envelope_path), "--output", str(output), "--receipt-output", str(receipt)]
+    external_record_path: Path | None = None
+    for record_path, submitted_record in zip(records, submitted_records, strict=True):
+        if submitted_record.runner_id == "external_ci":
+            external_record_path = record_path
+            continue
+        args.extend(("--record", str(record_path)))
     for budget in budgets:
         args.extend(("--budget", str(budget)))
+    assert external_record_path is not None
 
     configuration = read_verifier_configuration(config)
     ledger = ExternalFreshnessLedger(configuration.ledger_path, trusted_root=configuration.trusted_root)
-    external_report = load_external_report(report)
     prepared = prepare_trusted_evidence(
-        records=load_records(records), budgets=load_budgets(budgets), report=external_report,
+        records=submitted_records, budgets=load_budgets(budgets), report=external_report,
         trust_policy=configuration.trust_policy,
         expected_evidence_runner_revision=configuration.expected_external_runner_revision,
     )
@@ -1370,6 +1554,35 @@ def test_verifier_cli_requires_protected_config_and_consumes_one_external_challe
     assert not any(root.glob("wrong-evidence*"))
     assert not any(root.glob("tampered-report*"))
     assert not any(root.glob("forged*"))
+
+    for duplicate_path in (envelope_path, tmp_path / "different-envelope.json"):
+        duplicate_envelope = _verifier_cli(
+            config,
+            *args,
+            "--external-envelope",
+            str(duplicate_path),
+        )
+        assert duplicate_envelope.returncode == 2
+        assert "--external-envelope may be supplied only once" in duplicate_envelope.stderr
+    assert not output.exists()
+    assert not receipt.exists()
+    with sqlite3.connect(ledger.path) as connection:
+        assert connection.execute(
+            "SELECT state FROM external_freshness_challenges WHERE run_nonce = ?",
+            (nonce,),
+        ).fetchone() == ("pending",)
+
+    duplicated_external_record = _verifier_cli(
+        config, *args, "--record", str(external_record_path)
+    )
+    assert duplicated_external_record.returncode == 1
+    assert "standalone external records" in duplicated_external_record.stderr
+
+    split_external_report = _verifier_cli(
+        config, *args, "--external-report", str(report)
+    )
+    assert split_external_report.returncode == 2
+    assert "unrecognized arguments" in split_external_report.stderr
 
     # Output failure happens after evidence preparation but before ledger
     # finalization.  The same verifier-issued challenge must remain usable.
@@ -1924,6 +2137,7 @@ def test_cli_assemble_safely_binds_retirement_and_external_adapter_attestations(
                 drill=records[spec.gate_id].drill,
             )
             for spec in external_specs
+            if spec.gate_id.startswith("external_")
         ),
     )
     report_path = tmp_path / "external-report.json"

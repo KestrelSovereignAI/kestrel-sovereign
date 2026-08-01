@@ -66,10 +66,12 @@ _ERASURE_DRILL = DrillBinding(
     _sha256("semantic-release-evidence-v3:drill:semantic_erasure_release_drill_v1"),
 )
 _EXTERNAL_ADAPTER_GATE_IDS = (
+    "erasure_served_adapter_eligibility",
     "external_corpus_consumed",
     "external_candidate_invalidated",
     "external_served_eligibility_rejected",
 )
+_EXTERNAL_CAPABILITY_GATE_IDS = _EXTERNAL_ADAPTER_GATE_IDS[1:]
 
 
 def _fixture_binding(fixture_id: str) -> FixtureBinding:
@@ -269,10 +271,10 @@ def release_gate_specs(
             environment=_environment("dual_backend", "kite_http"),
             fixture=_fixture("erasure_drill.v1", "erasure_drill_harness_v1"),
             schema=_schema("erasure_result_v1", ("erased_count", "positive_count"), ("remaining_count", "zero_count")),
-            owner="parametric_self" if stage is ErasureStage.SERVED_ADAPTER_ELIGIBILITY else "kestrel_core",
             correlation=_ERASURE_DRILL,
         )
         for stage in ErasureStage
+        if stage is not ErasureStage.SERVED_ADAPTER_ELIGIBILITY
     )
     external = tuple(
         _gate(
@@ -636,12 +638,28 @@ def _validate_external_capability_reports(
     if report.core_release_evidence_contract_digest != CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST:
         raise ReleaseEvidenceError("external adapter report core catalog contract does not match")
     expected = _external_gate_results(gates)
+    if tuple(expected) != _EXTERNAL_ADAPTER_GATE_IDS:
+        raise ReleaseEvidenceError("external adapter evidence must preserve declared gate order")
+    served = expected["erasure_served_adapter_eligibility"].evidence
+    if (
+        not served.passed
+        or served.external_run_nonce != report.run_nonce
+        or served.external_evidence_runner_revision != report.evidence_runner_revision
+    ):
+        raise ReleaseEvidenceError(
+            "served adapter evidence must be a signed pass bound to the external nonce and runner revision"
+        )
     supplied = {item.gate_id: item for item in report.attestations}
-    if set(supplied) != set(expected) or set(supplied) != set(_EXTERNAL_ADAPTER_GATE_IDS):
-        raise ReleaseEvidenceError("external adapter report must cover corpus, candidate, and served stages")
-    if report.gate_ids != _EXTERNAL_ADAPTER_GATE_IDS or tuple(expected) != _EXTERNAL_ADAPTER_GATE_IDS:
-        raise ReleaseEvidenceError("external adapter report must preserve declared external gate order")
-    for gate_id, gate in expected.items():
+    if set(supplied) != set(_EXTERNAL_CAPABILITY_GATE_IDS):
+        raise ReleaseEvidenceError(
+            "external adapter report must attest exactly the three external capability stages"
+        )
+    if report.gate_ids != _EXTERNAL_CAPABILITY_GATE_IDS:
+        raise ReleaseEvidenceError(
+            "external adapter report must preserve declared capability gate order"
+        )
+    for gate_id in _EXTERNAL_CAPABILITY_GATE_IDS:
+        gate = expected[gate_id]
         attestation = supplied[gate_id]
         evidence = gate.evidence
         if (
