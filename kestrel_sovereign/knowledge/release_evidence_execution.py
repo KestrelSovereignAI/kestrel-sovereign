@@ -45,6 +45,16 @@ from .release_evidence_models import (
 CatalogWorkload = Callable[[GateSpec], "CatalogWorkloadResult | Awaitable[CatalogWorkloadResult]"]
 
 
+class CatalogWorkloadUnavailable(ReleaseEvidenceError):
+    """A required immutable workload cannot run in this isolated environment."""
+
+    def __init__(self, reason_code: str) -> None:
+        if not isinstance(reason_code, str) or not reason_code:
+            raise ReleaseEvidenceError("catalog workload block requires a reason code")
+        self.reason_code = reason_code
+        super().__init__(reason_code)
+
+
 @dataclass(frozen=True, slots=True)
 class CatalogWorkloadResult:
     """Content-free measurements returned by one actual catalog workload."""
@@ -262,6 +272,8 @@ class CatalogExecutionAuthority:
                 raise ReleaseEvidenceError("catalog workload returned an invalid result")
             spec.observation_schema.validate(result.observation)
             return self._emit(spec, result)
+        except CatalogWorkloadUnavailable as error:
+            return self._blocked(spec, error.reason_code)
         except ReleaseEvidenceError:
             # This is an evidence failure, not an opportunity to construct a
             # placeholder pass.  Retain only a fixed reason code.
@@ -375,6 +387,14 @@ def default_catalog_workloads() -> dict[tuple[str, str], CatalogWorkload]:
 
         return CatalogWorkloadResult(observation=inspect_stable_only_capabilities())
 
-    return {
+    workloads: dict[tuple[str, str], CatalogWorkload] = {
         ("registry", "stable_only_capability_selection_v1"): stable_only_capability_selection,
     }
+    # Keep the resolver's public boundary here: the test runner owns no caller
+    # argv and exposes only reviewed, immutable catalog command IDs.
+    from .release_evidence_workloads import pytest_catalog_workloads
+    from .release_evidence_benchmarks import semantic_benchmark_workloads
+
+    workloads.update(pytest_catalog_workloads())
+    workloads.update(semantic_benchmark_workloads())
+    return workloads

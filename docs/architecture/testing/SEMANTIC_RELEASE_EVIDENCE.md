@@ -67,10 +67,37 @@ assembled artifact is a release claim. Within that verifier policy,
 `catalog_runner` keys cannot attest that runner, and neither source can
 substitute for the other.
 
-At present, the built-in executable workload is
-`registry/stable_only_capability_selection_v1`. Other named pytest, benchmark,
-and Kite HTTP workloads remain explicitly `blocked` with
-`catalog_workload_unavailable` until their production harnesses are registered.
+The built-in executable workloads are the stable-only registry contract plus
+the catalog-bound core pytest contracts for advertised RDF/RDFS/OWL/SHACL/
+SPARQL fixtures, both declared backend-parity cases, maintenance diagnostics,
+and legacy-fact migration equivalence. Their selectors are source-declared in
+`release_evidence_workloads.py`; the runner accepts no selector, test argument,
+observation, or artifact input and discards raw pytest output after reducing a
+temporary JUnit report to the catalog's aggregate schema. A skipped required
+PostgreSQL case is a failed record, never evidence from SQLite.
+
+The immutable benchmark runner resolves every declared semantic-benchmark
+command. For `startup`, assertion write/validation, bounded inference, hybrid
+recall, storage growth, and representative migration it creates three fresh,
+agent-scoped `AsyncStorage` samples for the declared backend and emits a
+signed `ms` budget. Storage growth instead reads the actual backend footprint:
+the SQLite database plus active journal/WAL sidecars, or PostgreSQL database
+size; elapsed time is never relabeled as bytes. PostgreSQL runs require both
+`KESTREL_SEMANTIC_RELEASE_ISOLATED=1` and an operator-provided
+`KESTREL_SEMANTIC_RELEASE_ISOLATED_POSTGRES_ADMIN_DSN`. The runner creates a
+random database named `kestrel_semantic_release_<32 hex>` beneath that admin
+connection, passes only the generated DSN to parity/benchmark work, terminates
+its sessions, drops it, and verifies removal. It never inherits
+`TEST_POSTGRES_URL`, `DATABASE_URL`, or an app database. The admin and generated
+DSNs are never emitted. If either authorization/configuration step is absent or
+the disposable database cannot be created or verified removed, the workload
+writes a content-free nonzero block.
+
+Changed-work and unchanged-work sleep retain their catalog `kite_http` mode.
+They block with `kite_http_benchmark_runner_required` until the dedicated Kite
+HTTP runner measures them; an in-process maintenance call is not an allowed
+substitute. The stable, experimental, persisted-data, and correlated HTTP
+erasure drills likewise remain owned by their dedicated HTTP runners.
 `run` writes that content-free block but exits nonzero so automation cannot
 mistake an unavailable workload for successful execution; use the explicit
 `block` command to record an independently observed block. They cannot become
@@ -258,18 +285,100 @@ candidates, and served eligibility.
 dependency imported by this repository. Its report is absent from a new
 template and therefore remains a readiness blocker until it contains all of:
 
-- the exact repository and source revision required by the catalog;
+- the exact repository, immutable capability source revision, and evidence
+  runner revision;
 - an attestation for `external_corpus_consumed`,
   `external_candidate_invalidated`, and
   `external_served_eligibility_rejected`;
 - each stage's exact gate-spec digest, evidence-result digest, artifact
   reference/digest, and common drill binding; and
-- a report digest over those fields.
+- the exact core release-evidence contract digest and a new 64-hex run nonce;
+  and
+- a report digest over all of those fields.
 
-For this contract the pinned source is
+For this contract the immutable capability source is
 `KestrelSovereignAI/kestrel-feature-parametric-self` at
-`260ba985bcfdfab3dab1ea58da5b259057f3749f`; another revision remains
-non-evidence even if its result fields look similar.
+`260ba985bcfdfab3dab1ea58da5b259057f3749f`. It describes the governed adapter
+runtime under test and is deliberately not the commit of the newer evidence
+emitter. The emitter supplies its own full 40-hex `evidence_runner_revision`:
+it must resolve a clean, verifiable VCS `HEAD` at runtime, is bound into every
+external record's signed run digest, and must equal the report field. Another
+capability revision, omitted runner revision, or runner/report mismatch
+remains non-evidence even if its result fields look similar.
+
+The core contract pin is not a self-referential runtime Git SHA. It is a
+SHA-256 over canonical JSON containing the release-evidence schema version,
+the semantic release contract identifier, and the declared-order external
+`gate_id`/gate-spec-digest pairs. It changes only when that immutable contract
+changes, so a feature can use a new report field without falsely claiming to
+have executed a future core checkout. The external JSON carries that
+`core_release_evidence_contract_digest` and `run_nonce`, but never a caller
+chosen freshness receipt. Core derives the receipt as SHA-256 over canonical
+JSON containing exactly `core_release_evidence_contract_digest`, `repository`,
+`capability_source_revision`, `evidence_runner_revision`, `run_nonce`, and the
+declared-order `record_digests` list. The report digest binds both revisions,
+the contract digest, and nonce. This is deliberately content-free: it carries
+no test output, database name, tenant, or source location.
+
+The nonce is verifier-issued, not producer-chosen. Before an external run, the
+independent verifier calls `ExternalFreshnessLedger.issue_challenge()` and
+persists its one-time nonce as `pending`; it sends that challenge to external
+CI over its authenticated control plane. External CI must bind the exact nonce
+into every external `EvidenceRecord` run digest before signing it, then bind it
+in the report. Trusted ingestion verifies all three record nonces match the
+report and atomically marks the challenge `consumed` while recording the
+core-derived receipt. Unknown, reused, and merely rewrapped nonces are
+rejected, so old signed records cannot become a fresh report.
+
+Only an independent Talon/CI verifier may ingest that report through
+`attach_external_capability_report`, which requires an explicit absolute path
+for an `ExternalFreshnessLedger` and an explicit `trusted_root`. The root must
+be a resolved owner-only verifier directory; every component from it through
+the ledger parent must likewise be a real owner-only directory, and the ledger
+is an owner-only regular file. This permits a private verifier root beneath a
+system-managed ancestor while refusing `/tmp` itself as a trust root. The
+ledger is securely created and inode-checked before and after SQLite opens it.
+The verifier atomically consumes each valid receipt once and rejects a replay
+even if a later verifier process creates a new ledger object for the same path.
+A report author cannot choose, reset, or supply the ledger. The public `assemble`
+CLI uses `attach_structural_external_capability_report` instead: it may
+preserve the structural JSON for inspection, but never consumes a receipt and remains
+`trust_status: "unverified"`, `ready: false`.
+
+Trusted ingestion additionally requires the independent verifier to pass its
+expected full `evidence_runner_revision` into
+`attach_external_capability_report`; omission or mismatch fails. That policy
+input is never accepted by the public structural assembler or report author.
+
+Trusted finalization uses the separate verifier-only module
+`kestrel_sovereign.knowledge.release_evidence_verifier_cli`, never the public
+`release_evidence` CLI. Its one protected owner-only configuration is rooted
+under a verifier-owned private directory and fixes the ledger path, public-key
+policy, expected external runner revision, `semantic_release_verifier` role,
+and distinct receipt signer. The executable reads only its host-provisioned
+fixed configuration locator: it has no `--config` argument or environment
+override, so a producer cannot select its own policy, ledger, or key. Every
+directory component below the verifier root is owner-only, non-symlinked, and
+rechecked around sensitive reads and writes; the receipt signer may not also
+be an execution-policy identity, including under different issuer/key labels
+that alias the same Ed25519 public key.
+
+After every signed core record/budget and the external report validate, the
+verifier stages content-addressed evidence and receipt files beneath that
+private root. Only then does one SQLite transaction consume the pending nonce
+and bind the external report's attestation digest to the evidence, policy, and
+receipt digests. The staged files are promoted with replacement-safe writes.
+If an output failure occurs before the transaction, the nonce remains pending;
+if a process dies after it, retrying the exact digest-bound finalization
+recovers the staged files and rejects a different receipt. The Ed25519 receipt
+signs the core release-evidence contract digest as well as both revisions and
+all receipt bindings. Finalization independently verifies that signature and
+recomputes the canonical evidence digest, then compares the policy digest,
+freshness receipt, nonce, capability revision, and runner revision against the
+exact evidence/report before staging or consuming. Its final ledger binding
+also covers both serialized payload digests and their verifier-rooted target
+paths. The public `assemble` command remains structural and
+cannot issue challenges, consume a ledger, emit a receipt, or set `ready: true`.
 
 An external report is supplied as safe structured JSON—never as pre-populated
 metadata—and is structurally checked against the locally assembled stage

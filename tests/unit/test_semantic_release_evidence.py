@@ -13,6 +13,7 @@ import sys
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives import serialization
 
 from kestrel_sovereign.knowledge.release_evidence import (
     ArtifactReference,
@@ -23,6 +24,7 @@ from kestrel_sovereign.knowledge.release_evidence import (
     ExternalCapabilityReport,
     ExternalGateAttestation,
     GateResult,
+    CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
     PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
     PARAMETRIC_SELF_EVIDENCE_REVISION,
     PerformanceBudget,
@@ -32,21 +34,39 @@ from kestrel_sovereign.knowledge.release_evidence import (
     TelemetryAttestation,
     TrustedExecutionPolicy,
     attach_external_capability_report,
+    attach_structural_external_capability_report,
     attach_retirement_telemetry,
     apply_evidence_records,
     apply_performance_budgets,
+    apply_structural_evidence_records,
     build_standards_matrix,
     evidence_record_from_mapping,
+    external_capability_report_from_mapping,
     inspect_stable_only_capabilities,
     performance_targets,
     release_evidence_template,
     release_gate_specs,
+    structural_release_evidence_template,
     telemetry_attestation_from_mapping,
 )
+from kestrel_sovereign.knowledge.release_evidence_freshness import ExternalFreshnessLedger
 from kestrel_sovereign.knowledge.release_evidence_execution import CatalogSigningIdentity
+from kestrel_sovereign.knowledge.release_evidence_verifier import (
+    VerifierReceiptIdentity,
+    finalize_verified_artifacts,
+    issue_verification_receipt,
+    load_budgets,
+    load_external_report,
+    load_records,
+    prepare_trusted_evidence,
+    read_verifier_configuration,
+    verification_receipt_from_mapping,
+    verify_verification_receipt,
+)
 from kestrel_sovereign.knowledge.release_evidence_models import (
     ExecutionSource,
     SemanticBenchmarkHarness,
+    _canonical_json,
 )
 
 
@@ -117,11 +137,38 @@ def _test_policy() -> TrustedExecutionPolicy:
     )
 
 
+def test_trusted_execution_policy_rejects_public_key_aliases_across_sources_and_labels() -> None:
+    shared_private_key = Ed25519PrivateKey.from_private_bytes(b"\x09" * 32)
+    catalog = CatalogSigningIdentity(
+        issuer_id="catalog_alias", key_id="catalog_key", private_key=shared_private_key,
+    )
+    external = CatalogSigningIdentity(
+        issuer_id="external_alias", key_id="external_key", private_key=shared_private_key,
+        source=ExecutionSource.EXTERNAL_CI,
+    )
+    with pytest.raises(ReleaseEvidenceError, match="repeats an Ed25519 public key"):
+        TrustedExecutionPolicy((
+            catalog.trusted_key(("pytest",)),
+            external.trusted_key(("external_ci",)),
+        ))
+
+    relabeled_catalog = CatalogSigningIdentity(
+        issuer_id="catalog_alias_two", key_id="catalog_key_two", private_key=shared_private_key,
+    )
+    with pytest.raises(ReleaseEvidenceError, match="repeats an Ed25519 public key"):
+        TrustedExecutionPolicy((
+            catalog.trusted_key(("pytest",)),
+            relabeled_catalog.trusted_key(("semantic_benchmark",)),
+        ))
+
+
 def _record(
     spec,
     *,
     observation: dict[str, object] | None = None,
     identity: CatalogSigningIdentity | None = None,
+    external_run_nonce: str | None = None,
+    external_evidence_runner_revision: str | None = None,
 ):
     observed = observation or _observation(spec)
     artifact = _artifact(spec.gate_id)
@@ -130,11 +177,23 @@ def _record(
         if spec.runner.runner_id == "external_ci"
         else _CATALOG_TEST_IDENTITY
     )
+    external_run_nonce = (
+        external_run_nonce or "a" * 64
+        if spec.runner.runner_id == "external_ci"
+        else None
+    )
+    external_evidence_runner_revision = (
+        external_evidence_runner_revision or "b" * 40
+        if spec.runner.runner_id == "external_ci"
+        else None
+    )
     _, run_digest = EvidenceRecord._bound_run_digest(
         spec,
         observed,
         artifact,
         state=EvidenceState.PASSED,
+        external_run_nonce=external_run_nonce,
+        external_evidence_runner_revision=external_evidence_runner_revision,
     )
     return EvidenceRecord._from_trusted_execution(
         spec,
@@ -144,6 +203,8 @@ def _record(
         execution_attestation=selected_identity.sign(
             kind="evidence_record", spec=spec, run_digest=run_digest
         ),
+        external_run_nonce=external_run_nonce,
+        external_evidence_runner_revision=external_evidence_runner_revision,
     )
 
 
@@ -195,7 +256,12 @@ def _retirement_telemetry() -> TelemetryAttestation:
     )
 
 
-def _external_report(evidence) -> ExternalCapabilityReport:
+def _external_report(
+    evidence,
+    *,
+    run_nonce: str = "a" * 64,
+    evidence_runner_revision: str = "b" * 40,
+) -> ExternalCapabilityReport:
     external_gates = [gate for gate in evidence.gates if gate.spec.category == "external_adapter"]
     attestations: list[ExternalGateAttestation] = []
     for gate in external_gates:
@@ -214,7 +280,10 @@ def _external_report(evidence) -> ExternalCapabilityReport:
     return ExternalCapabilityReport.attest(
         capability_id="parametric_self_governed_corpus",
         repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
-        source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
+        capability_source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
+        evidence_runner_revision=evidence_runner_revision,
+        core_release_evidence_contract_digest=CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
+        run_nonce=run_nonce,
         attestations=tuple(attestations),
     )
 
@@ -372,50 +441,331 @@ def test_retirement_telemetry_requires_its_digest_and_bound_equivalence_record()
     assert decision.decision == "eligible_for_review"
 
 
-def test_reviewer_adversarial_external_report_requires_exact_stages_repo_revision_and_artifacts() -> None:
+def test_reviewer_adversarial_external_report_requires_exact_stages_repo_revision_and_artifacts(
+    tmp_path: Path,
+) -> None:
     template = release_evidence_template()
     external_specs = [spec for spec in release_gate_specs() if spec.category == "external_adapter"]
-    evidence = _apply_records(template, tuple(_record(spec) for spec in external_specs))
-    report = _external_report(evidence)
+    ledger = ExternalFreshnessLedger(
+        tmp_path / "verifier-freshness.sqlite", trusted_root=tmp_path
+    )
+    run_nonce = ledger.issue_challenge()
+    evidence = _apply_records(
+        template,
+        tuple(_record(spec, external_run_nonce=run_nonce) for spec in external_specs),
+    )
+    report = _external_report(evidence, run_nonce=run_nonce)
 
     assert set(report.gate_ids) == {
         "external_corpus_consumed",
         "external_candidate_invalidated",
         "external_served_eligibility_rejected",
     }
-    attached = attach_external_capability_report(evidence, report)
+    attached = attach_external_capability_report(
+        evidence,
+        report,
+        freshness_ledger=ledger,
+        expected_evidence_runner_revision="b" * 40,
+    )
     assert attached.external_capabilities == (report,)
     assert "external_adapter_attestation" not in attached.blocking_gate_ids()
 
     incomplete = ExternalCapabilityReport.attest(
         capability_id=report.capability_id,
         repository=report.repository,
-        source_revision=report.source_revision,
+        capability_source_revision=report.capability_source_revision,
+        evidence_runner_revision=report.evidence_runner_revision,
+        core_release_evidence_contract_digest=report.core_release_evidence_contract_digest,
+        run_nonce="b" * 64,
         attestations=report.attestations[:-1],
     )
     with pytest.raises(ReleaseEvidenceError, match="cover corpus, candidate, and served stages"):
-        attach_external_capability_report(evidence, incomplete)
+        attach_external_capability_report(
+            evidence, incomplete, freshness_ledger=ledger, expected_evidence_runner_revision="b" * 40
+        )
 
     wrong_repository = ExternalCapabilityReport.attest(
         capability_id=report.capability_id,
         repository="example/other-adapter",
-        source_revision=report.source_revision,
+        capability_source_revision=report.capability_source_revision,
+        evidence_runner_revision=report.evidence_runner_revision,
+        core_release_evidence_contract_digest=report.core_release_evidence_contract_digest,
+        run_nonce="c" * 64,
         attestations=report.attestations,
     )
     with pytest.raises(ReleaseEvidenceError, match="repository or revision"):
-        attach_external_capability_report(evidence, wrong_repository)
+        attach_external_capability_report(
+            evidence, wrong_repository, freshness_ledger=ledger, expected_evidence_runner_revision="b" * 40
+        )
+
+    wrong_core_contract = ExternalCapabilityReport.attest(
+        capability_id=report.capability_id,
+        repository=report.repository,
+        capability_source_revision=report.capability_source_revision,
+        evidence_runner_revision=report.evidence_runner_revision,
+        core_release_evidence_contract_digest="0" * 64,
+        run_nonce="d" * 64,
+        attestations=report.attestations,
+    )
+    with pytest.raises(ReleaseEvidenceError, match="core catalog contract"):
+        attach_external_capability_report(
+            evidence, wrong_core_contract, freshness_ledger=ledger, expected_evidence_runner_revision="b" * 40
+        )
 
     mismatched_artifact = ExternalCapabilityReport.attest(
         capability_id=report.capability_id,
         repository=report.repository,
-        source_revision=report.source_revision,
+        capability_source_revision=report.capability_source_revision,
+        evidence_runner_revision=report.evidence_runner_revision,
+        core_release_evidence_contract_digest=report.core_release_evidence_contract_digest,
+        run_nonce="a" * 64,
         attestations=(
             replace(report.attestations[0], artifact=_artifact("wrong-external-artifact")),
             *report.attestations[1:],
         ),
     )
     with pytest.raises(ReleaseEvidenceError, match="correlated gate result/artifact"):
-        attach_external_capability_report(evidence, mismatched_artifact)
+        attach_external_capability_report(
+            evidence, mismatched_artifact, freshness_ledger=ledger, expected_evidence_runner_revision="b" * 40
+        )
+
+
+def test_external_report_freshness_is_hash_bound_and_replay_protected_across_verifiers(
+    tmp_path: Path,
+) -> None:
+    template = release_evidence_template()
+    external_specs = [spec for spec in release_gate_specs() if spec.category == "external_adapter"]
+    ledger_path = tmp_path / "independent-verifier.sqlite"
+    ledger = ExternalFreshnessLedger(ledger_path, trusted_root=tmp_path)
+    run_nonce = ledger.issue_challenge()
+    evidence = _apply_records(
+        template,
+        tuple(_record(spec, external_run_nonce=run_nonce) for spec in external_specs),
+    )
+    report = _external_report(evidence, run_nonce=run_nonce)
+
+    tampered = report.to_mapping()
+    tampered["run_nonce"] = "b" * 64
+    with pytest.raises(ReleaseEvidenceError, match="attestation digest"):
+        external_capability_report_from_mapping(tampered)
+    caller_receipt = report.to_mapping()
+    caller_receipt["freshness_receipt"] = "0" * 64
+    with pytest.raises(ReleaseEvidenceError, match="unknown or missing"):
+        external_capability_report_from_mapping(caller_receipt)
+    missing_runner_revision = report.to_mapping()
+    del missing_runner_revision["evidence_runner_revision"]
+    with pytest.raises(ReleaseEvidenceError, match="unknown or missing"):
+        external_capability_report_from_mapping(missing_runner_revision)
+
+    masqueraded_runner = ExternalCapabilityReport.attest(
+        capability_id=report.capability_id,
+        repository=report.repository,
+        capability_source_revision=report.capability_source_revision,
+        evidence_runner_revision="c" * 40,
+        core_release_evidence_contract_digest=report.core_release_evidence_contract_digest,
+        run_nonce=run_nonce,
+        attestations=report.attestations,
+    )
+    with pytest.raises(ReleaseEvidenceError, match="runner revision"):
+        attach_external_capability_report(
+            evidence, masqueraded_runner, freshness_ledger=ledger, expected_evidence_runner_revision="b" * 40
+        )
+    with pytest.raises(ReleaseEvidenceError, match="runner revision does not match verifier policy"):
+        attach_external_capability_report(
+            evidence,
+            report,
+            freshness_ledger=ledger,
+            expected_evidence_runner_revision="c" * 40,
+        )
+
+    rewrap_nonce = ledger.issue_challenge()
+    rewrapped = ExternalCapabilityReport.attest(
+        capability_id=report.capability_id,
+        repository=report.repository,
+        capability_source_revision=report.capability_source_revision,
+        evidence_runner_revision=report.evidence_runner_revision,
+        core_release_evidence_contract_digest=report.core_release_evidence_contract_digest,
+        run_nonce=rewrap_nonce,
+        attestations=report.attestations,
+    )
+    with pytest.raises(ReleaseEvidenceError, match="external run_nonce"):
+        attach_external_capability_report(
+            evidence, rewrapped, freshness_ledger=ledger, expected_evidence_runner_revision="b" * 40
+        )
+
+    caller_nonce = "f" * 64
+    caller_evidence = _apply_records(
+        template,
+        tuple(_record(spec, external_run_nonce=caller_nonce) for spec in external_specs),
+    )
+    caller_report = _external_report(caller_evidence, run_nonce=caller_nonce)
+    with pytest.raises(ReleaseEvidenceError, match="not an issued pending"):
+        attach_external_capability_report(
+            caller_evidence, caller_report, freshness_ledger=ledger, expected_evidence_runner_revision="b" * 40
+        )
+
+    attached = attach_external_capability_report(
+        evidence,
+        report,
+        freshness_ledger=ledger,
+        expected_evidence_runner_revision="b" * 40,
+    )
+    assert attached.external_capabilities == (report,)
+
+    # A fresh verifier object represents a later process opening the same
+    # verifier-owned ledger; SQLite persists the receipt claim across both.
+    with pytest.raises(ReleaseEvidenceError, match="already consumed"):
+        attach_external_capability_report(
+            evidence,
+            report,
+            freshness_ledger=ExternalFreshnessLedger(ledger_path, trusted_root=tmp_path),
+            expected_evidence_runner_revision="b" * 40,
+        )
+
+
+def test_structural_external_attachment_does_not_consume_verifier_freshness(
+    tmp_path: Path,
+) -> None:
+    external_specs = [spec for spec in release_gate_specs() if spec.category == "external_adapter"]
+    ledger = ExternalFreshnessLedger(
+        tmp_path / "verifier.sqlite", trusted_root=tmp_path
+    )
+    run_nonce = ledger.issue_challenge()
+    records = tuple(
+        _record(spec, external_run_nonce=run_nonce) for spec in external_specs
+    )
+    structural = apply_structural_evidence_records(structural_release_evidence_template(), records)
+    verified = _apply_records(release_evidence_template(), records)
+    report = _external_report(verified, run_nonce=run_nonce)
+
+    structural_attached = attach_structural_external_capability_report(structural, report)
+    assert structural_attached.trust_status == "unverified"
+    trusted_attached = attach_external_capability_report(
+        verified,
+        report,
+        freshness_ledger=ledger,
+        expected_evidence_runner_revision="b" * 40,
+    )
+    assert trusted_attached.external_capabilities == (report,)
+
+
+def test_external_freshness_ledger_rejects_insecure_parent_file_and_symlink_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kestrel_sovereign.knowledge import release_evidence_freshness
+
+    insecure_parent = tmp_path / "insecure"
+    insecure_parent.mkdir(mode=0o700)
+    insecure_parent.chmod(0o755)
+    with pytest.raises(ReleaseEvidenceError, match="no group/other access"):
+        ExternalFreshnessLedger(insecure_parent / "ledger.sqlite", trusted_root=insecure_parent)
+    with pytest.raises(ReleaseEvidenceError):
+        ExternalFreshnessLedger(
+            Path("/tmp/kestrel-semantic-release-ledger.sqlite"), trusted_root=Path("/tmp")
+        )
+
+    secure_parent = tmp_path / "secure"
+    secure_parent.mkdir(mode=0o700)
+    nested_secure_parent = secure_parent / "nested"
+    nested_secure_parent.mkdir(mode=0o700)
+    assert ExternalFreshnessLedger(
+        nested_secure_parent / "ledger.sqlite", trusted_root=secure_parent
+    ).trusted_root == secure_parent
+    outside_parent = tmp_path / "outside"
+    outside_parent.mkdir(mode=0o700)
+    with pytest.raises(ReleaseEvidenceError, match="cannot contain '..'"):
+        ExternalFreshnessLedger(
+            secure_parent / ".." / "outside" / "ledger.sqlite",
+            trusted_root=secure_parent,
+        )
+
+    shared_ancestor = tmp_path / "shared-ancestor"
+    shared_ancestor.mkdir(mode=0o700)
+    shared_ancestor.chmod(0o777)
+    private_root = shared_ancestor / "private-root"
+    private_root.mkdir(mode=0o700)
+    assert ExternalFreshnessLedger(
+        private_root / "ledger.sqlite", trusted_root=private_root
+    ).path == private_root / "ledger.sqlite"
+
+    insecure_file = secure_parent / "insecure.sqlite"
+    insecure_file.touch()
+    insecure_file.chmod(0o644)
+    with pytest.raises(ReleaseEvidenceError, match="owner-only access"):
+        ExternalFreshnessLedger(insecure_file, trusted_root=secure_parent)
+
+    symlink_parent = tmp_path / "symlink-parent"
+    symlink_parent.symlink_to(outside_parent, target_is_directory=True)
+    with pytest.raises(ReleaseEvidenceError, match="symlink|escapes"):
+        ExternalFreshnessLedger(symlink_parent / "ledger.sqlite", trusted_root=tmp_path)
+
+    symlink_file = secure_parent / "symlink.sqlite"
+    symlink_file.symlink_to(insecure_file)
+    with pytest.raises(ReleaseEvidenceError, match="non-symlink"):
+        ExternalFreshnessLedger(symlink_file, trusted_root=secure_parent)
+
+    owner_only_file = secure_parent / "owner.sqlite"
+    owner_only_file.touch(mode=0o600)
+    current_euid = os.geteuid()
+    monkeypatch.setattr(release_evidence_freshness.os, "geteuid", lambda: current_euid + 1)
+    with pytest.raises(ReleaseEvidenceError, match="verifier-owned"):
+        ExternalFreshnessLedger(owner_only_file, trusted_root=secure_parent)
+
+
+def test_external_freshness_ledger_fails_closed_if_path_replaced_while_opening(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kestrel_sovereign.knowledge import release_evidence_freshness
+
+    external_specs = [spec for spec in release_gate_specs() if spec.category == "external_adapter"]
+    evidence = _apply_records(
+        release_evidence_template(),
+        tuple(_record(spec) for spec in external_specs),
+    )
+    report = _external_report(evidence)
+    secure_parent = tmp_path / "secure"
+    secure_parent.mkdir(mode=0o700)
+    ledger_path = secure_parent / "ledger.sqlite"
+    replacement = secure_parent / "replacement.sqlite"
+    replacement.touch(mode=0o600)
+    ledger = ExternalFreshnessLedger(ledger_path, trusted_root=secure_parent)
+    original_connect = release_evidence_freshness.sqlite3.connect
+
+    def replace_then_connect(*args: object, **kwargs: object):
+        ledger_path.replace(secure_parent / "original.sqlite")
+        replacement.replace(ledger_path)
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(release_evidence_freshness.sqlite3, "connect", replace_then_connect)
+    with pytest.raises(ReleaseEvidenceError, match="changed while opening"):
+        ledger.consume(report)
+
+
+def test_external_freshness_ledger_fails_closed_if_trusted_root_is_replaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kestrel_sovereign.knowledge import release_evidence_freshness
+
+    trusted_root = tmp_path / "trusted-root"
+    trusted_root.mkdir(mode=0o700)
+    ledger_path = trusted_root / "ledger.sqlite"
+    ledger = ExternalFreshnessLedger(ledger_path, trusted_root=trusted_root)
+    original_connect = release_evidence_freshness.sqlite3.connect
+
+    def replace_root_then_connect(*args: object, **kwargs: object):
+        trusted_root.replace(tmp_path / "original-trusted-root")
+        replacement_root = tmp_path / "replacement-root"
+        replacement_root.mkdir(mode=0o700)
+        (replacement_root / "ledger.sqlite").touch(mode=0o600)
+        replacement_root.replace(trusted_root)
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(release_evidence_freshness.sqlite3, "connect", replace_root_then_connect)
+    with pytest.raises(ReleaseEvidenceError, match="changed while opening"):
+        ledger.issue_challenge()
 
 
 def test_reviewer_adversarial_record_cannot_spoof_a_gate_with_exit_zero() -> None:
@@ -593,12 +943,80 @@ def test_storage_growth_benchmark_requires_a_real_byte_reader() -> None:
         asyncio.run(SemanticBenchmarkHarness(iterations=3).run(spec, lambda: None))
 
 
+def test_duration_benchmark_excludes_prepared_sample_setup_from_the_timer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-startup benchmark callers may prepare an isolated sample untimed."""
+    from kestrel_sovereign.knowledge import release_evidence_models
+
+    spec = _performance_spec(PerformanceMetric.HYBRID_RECALL, "sqlite")
+    events: list[str] = []
+    timestamps = iter((10.0, 10.002, 20.0, 20.002, 30.0, 30.002))
+
+    def perf_counter() -> float:
+        events.append("timer")
+        return next(timestamps)
+
+    async def prepare() -> None:
+        events.append("setup")
+
+    async def operation() -> None:
+        events.append("operation")
+
+    async def close() -> None:
+        events.append("teardown")
+
+    monkeypatch.setattr(release_evidence_models.time, "perf_counter", perf_counter)
+    measured = asyncio.run(
+        SemanticBenchmarkHarness(iterations=3).run(
+            spec,
+            operation,
+            before_sample=prepare,
+            after_sample=close,
+        )
+    )
+
+    assert measured.samples == pytest.approx((2.0, 2.0, 2.0))
+    assert events == [
+        "setup", "timer", "operation", "timer", "teardown",
+        "setup", "timer", "operation", "timer", "teardown",
+        "setup", "timer", "operation", "timer", "teardown",
+    ]
+
+
 def _cli(*arguments: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
             sys.executable,
             "-m",
             "kestrel_sovereign.knowledge.release_evidence",
+            *arguments,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _verifier_cli(config: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    """Exercise the fixed-locator executable with a test-process patch only.
+
+    Production's ``python -m`` entry point has no config option or environment
+    override.  Tests patch its module constant before calling ``main`` so they
+    never need to create or modify the real host administrator's ``/etc``
+    authority file.
+    """
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; from pathlib import Path; "
+                "from kestrel_sovereign.knowledge import release_evidence_verifier_cli as cli; "
+                "cli.HOST_VERIFIER_CONFIGURATION = Path(sys.argv[1]); "
+                "raise SystemExit(cli.main(sys.argv[2:]))"
+            ),
+            str(config),
             *arguments,
         ],
         check=False,
@@ -644,6 +1062,7 @@ def _write_structurally_complete_submission(
     *,
     core_identity: CatalogSigningIdentity,
     external_identity: CatalogSigningIdentity,
+    external_run_nonce: str = "a" * 64,
 ) -> tuple[list[Path], list[Path], Path, Path]:
     records: dict[str, EvidenceRecord] = {}
     record_paths: list[Path] = []
@@ -655,7 +1074,11 @@ def _write_structurally_complete_submission(
             if spec.runner.runner_id == "external_ci"
             else core_identity
         )
-        record = _record(spec, identity=identity)
+        record = _record(
+            spec,
+            identity=identity,
+            external_run_nonce=external_run_nonce,
+        )
         records[spec.gate_id] = record
         path = tmp_path / f"submitted-{spec.gate_id}.json"
         _write_record(path, record)
@@ -700,7 +1123,10 @@ def _write_structurally_complete_submission(
     external_report = ExternalCapabilityReport.attest(
         capability_id="parametric_self_governed_corpus",
         repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
-        source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
+        capability_source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
+        evidence_runner_revision="b" * 40,
+        core_release_evidence_contract_digest=CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
+        run_nonce=external_run_nonce,
         attestations=tuple(external_attestations),
     )
     external_report_path = tmp_path / "submitted-external-report.json"
@@ -851,8 +1277,184 @@ def test_cli_run_executes_an_allowlisted_registry_workload_and_assemble_marks_it
     assert report_payload["structurally_complete"] is False
 
 
-def test_cli_run_blocks_an_unregistered_catalog_workload(tmp_path: Path) -> None:
-    spec = _gate("rdf11_projection_fixture")
+def test_verifier_cli_requires_protected_config_and_consumes_one_external_challenge(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "verifier"
+    root.mkdir(mode=0o700)
+    receipt_key = root / "receipt.key"
+    receipt_bytes = b"\x07" * 32
+    _write_private_key(receipt_key, receipt_bytes)
+    receipt_public = Ed25519PrivateKey.from_private_bytes(receipt_bytes).public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    ).hex()
+    policy = {
+        "keys": [
+            _CATALOG_TEST_IDENTITY.trusted_key(
+                tuple(sorted({spec.runner.runner_id for spec in release_gate_specs() if spec.runner.runner_id != "external_ci"}))
+            ).to_mapping(),
+            _EXTERNAL_TEST_IDENTITY.trusted_key(("external_ci",)).to_mapping(),
+        ]
+    }
+    config = root / "verifier.json"
+    config_mapping = {
+        "trusted_root": str(root), "ledger_path": str(root / "ledger.sqlite"),
+        "trust_policy": policy, "expected_external_runner_revision": "b" * 40,
+        "receipt_key_file": str(receipt_key), "receipt_issuer_id": "verifier_ci",
+        "receipt_key_id": "semantic_release", "receipt_public_key": receipt_public,
+        "verifier_role": "semantic_release_verifier",
+    }
+    config.write_text(json.dumps(config_mapping), encoding="utf-8")
+    config.chmod(0o600)
+    challenge = _verifier_cli(config, "issue-challenge")
+    assert challenge.returncode == 0, challenge.stderr
+    nonce = challenge.stdout.strip()
+    records, budgets, _, report = _write_structurally_complete_submission(
+        tmp_path, core_identity=_CATALOG_TEST_IDENTITY, external_identity=_EXTERNAL_TEST_IDENTITY,
+        external_run_nonce=nonce,
+    )
+    output, receipt = root / "verified.json", root / "receipt.json"
+    args = ["assemble", "--external-report", str(report), "--output", str(output), "--receipt-output", str(receipt)]
+    for record in records:
+        args.extend(("--record", str(record)))
+    for budget in budgets:
+        args.extend(("--budget", str(budget)))
+
+    configuration = read_verifier_configuration(config)
+    ledger = ExternalFreshnessLedger(configuration.ledger_path, trusted_root=configuration.trusted_root)
+    external_report = load_external_report(report)
+    prepared = prepare_trusted_evidence(
+        records=load_records(records), budgets=load_budgets(budgets), report=external_report,
+        trust_policy=configuration.trust_policy,
+        expected_evidence_runner_revision=configuration.expected_external_runner_revision,
+    )
+    receipt_identity = VerifierReceiptIdentity.from_configuration(configuration)
+    valid_receipt = issue_verification_receipt(
+        prepared, policy_digest=configuration.policy_digest, identity=receipt_identity,
+    )
+    other_evidence = attach_retirement_telemetry(prepared, _retirement_telemetry())
+    receipt_for_other_evidence = issue_verification_receipt(
+        other_evidence, policy_digest=configuration.policy_digest, identity=receipt_identity,
+    )
+    with pytest.raises(ReleaseEvidenceError, match="not bound to the exact evidence"):
+        finalize_verified_artifacts(
+            prepared, receipt_for_other_evidence,
+            evidence_output=root / "wrong-evidence.json",
+            receipt_output=root / "wrong-evidence-receipt.json",
+            configuration=configuration, freshness_ledger=ledger,
+        )
+
+    tampered_report_receipt = replace(
+        valid_receipt, capability_source_revision="c" * 40, signature="0" * 128,
+    )
+    tampered_report_receipt = replace(
+        tampered_report_receipt,
+        signature=receipt_identity.private_key.sign(
+            _canonical_json(tampered_report_receipt.signed_payload()).encode("utf-8")
+        ).hex(),
+    )
+    with pytest.raises(ReleaseEvidenceError, match="not bound to the exact evidence"):
+        finalize_verified_artifacts(
+            prepared, tampered_report_receipt,
+            evidence_output=root / "tampered-report.json",
+            receipt_output=root / "tampered-report-receipt.json",
+            configuration=configuration, freshness_ledger=ledger,
+        )
+
+    with pytest.raises(ReleaseEvidenceError, match="signature verification failed"):
+        finalize_verified_artifacts(
+            prepared, replace(valid_receipt, signature="0" * 128),
+            evidence_output=root / "forged.json", receipt_output=root / "forged-receipt.json",
+            configuration=configuration, freshness_ledger=ledger,
+        )
+    assert not any(root.glob("wrong-evidence*"))
+    assert not any(root.glob("tampered-report*"))
+    assert not any(root.glob("forged*"))
+
+    # Output failure happens after evidence preparation but before ledger
+    # finalization.  The same verifier-issued challenge must remain usable.
+    receipt.write_text("impostor\n", encoding="utf-8")
+    receipt.chmod(0o600)
+    failed_output = _verifier_cli(config, *args)
+    assert failed_output.returncode == 1
+    assert not output.exists()
+    assert (root / ".verified.json.semantic-release-pending").exists()
+    receipt.unlink()
+    assembled = _verifier_cli(config, *args)
+    assert assembled.returncode == 0, assembled.stderr
+    assert json.loads(output.read_text())["ready"] is True
+    receipt_mapping = json.loads(receipt.read_text())
+    assert receipt_mapping["evidence_runner_revision"] == "b" * 40
+    assert receipt.stat().st_mode & 0o777 == 0o600
+    issued_receipt = verification_receipt_from_mapping(receipt_mapping)
+    verify_verification_receipt(issued_receipt, read_verifier_configuration(config))
+    tampered_contract = {**receipt_mapping, "core_release_evidence_contract_digest": "0" * 64}
+    with pytest.raises(ReleaseEvidenceError, match="unknown or missing"):
+        verification_receipt_from_mapping(tampered_contract)
+    replay_args = [*args]
+    replay_args[replay_args.index(str(output))] = str(root / "replay.json")
+    replay_args[replay_args.index(str(receipt))] = str(root / "replay-receipt.json")
+    replay = _verifier_cli(config, *replay_args)
+    assert replay.returncode == 1
+    assert "different verifier evidence" in replay.stderr
+
+    dangling_output = root / "dangling.json"
+    dangling_output.symlink_to(root / "missing.json")
+    dangling_args = [*args]
+    dangling_args[dangling_args.index(str(output))] = str(dangling_output)
+    dangling = _verifier_cli(config, *dangling_args)
+    assert dangling.returncode == 1
+    assert "owner-only regular non-symlink" in dangling.stderr
+
+    # The public executable itself has no caller-selectable configuration
+    # boundary; the test-only helper above patches its module constant only in
+    # the disposable child process.
+    public_config_override = subprocess.run(
+        [
+            sys.executable, "-m",
+            "kestrel_sovereign.knowledge.release_evidence_verifier_cli",
+            "--config", str(config), "issue-challenge",
+        ],
+        check=False, capture_output=True, text=True,
+    )
+    assert public_config_override.returncode == 2
+    assert "invalid choice" in public_config_override.stderr
+
+    wrong_role_mapping = json.loads(config.read_text(encoding="utf-8"))
+    wrong_role_mapping["verifier_role"] = "catalog_runner"
+    wrong_role = root / "wrong-role.json"
+    wrong_role.write_text(json.dumps(wrong_role_mapping), encoding="utf-8")
+    wrong_role.chmod(0o600)
+    rejected_role = _verifier_cli(wrong_role, "issue-challenge")
+    assert rejected_role.returncode == 1
+    assert "semantic_release_verifier role" in rejected_role.stderr
+
+    aliased_key_mapping = {**config_mapping, "receipt_public_key": policy["keys"][0]["public_key"]}
+    aliased_key = root / "aliased-key.json"
+    aliased_key.write_text(json.dumps(aliased_key_mapping), encoding="utf-8")
+    aliased_key.chmod(0o600)
+    rejected_alias = _verifier_cli(aliased_key, "issue-challenge")
+    assert rejected_alias.returncode == 1
+    assert "public key must be distinct" in rejected_alias.stderr
+
+    nested = root / "nested"
+    nested.mkdir(mode=0o700)
+    nested_config = nested / "verifier.json"
+    config.replace(nested_config)
+    symlinked_config_parent = root / "config-link"
+    symlinked_config_parent.symlink_to(nested, target_is_directory=True)
+    escaped = _verifier_cli(symlinked_config_parent / "verifier.json", "issue-challenge")
+    assert escaped.returncode == 1
+    assert "private non-symlink" in escaped.stderr
+
+    nested_config.chmod(0o644)
+    denied = _verifier_cli(nested_config, "issue-challenge")
+    assert denied.returncode == 1
+    assert "owner-only" in denied.stderr
+
+
+def test_cli_run_blocks_a_kite_workload_until_its_dedicated_http_harness_exists(tmp_path: Path) -> None:
+    spec = _gate("kite_http_stable_only_release_drill")
     key_file = tmp_path / "signing.key"
     _write_private_key(key_file, b"\x03" * 32)
     record = tmp_path / "record.json"
@@ -876,6 +1478,295 @@ def test_cli_run_blocks_an_unregistered_catalog_workload(tmp_path: Path) -> None
     assert payload["state"] == "blocked"
     assert payload["reason_code"] == "catalog_workload_unavailable"
     assert payload["execution_attestation"] is None
+
+
+def test_default_catalog_registers_real_core_contracts_but_not_kite_http_drills() -> None:
+    """Core test/benchmark runners remain distinct from real Kite HTTP work."""
+    from kestrel_sovereign.knowledge.release_evidence_execution import (
+        default_catalog_workloads,
+    )
+
+    workloads = default_catalog_workloads()
+    for gate_id in (
+        "rdf11_projection_fixture",
+        "rdfs11_inference_fixture",
+        "owl2rl_inference_fixture",
+        "shacl2017_core_fixture",
+        "sparql11_readonly_fixture",
+        "sqlite_assertion",
+        "postgres_assertion",
+        "semantic_maintenance_diagnostics_contract",
+        "legacy_fact_migration_equivalence",
+        "performance_hybrid_recall_sqlite_integration",
+        "performance_hybrid_recall_postgres_integration",
+    ):
+        spec = _gate(gate_id)
+        assert (spec.runner.runner_id, spec.runner.command_id) in workloads
+    for gate_id in (
+        "kite_http_stable_only_release_drill",
+        "stable_persisted_data_no_canonical_migration_drill",
+        "erasure_active_assertions",
+    ):
+        spec = _gate(gate_id)
+        assert (spec.runner.runner_id, spec.runner.command_id) not in workloads
+
+
+def test_catalog_benchmark_runs_three_real_isolated_sqlite_startup_samples() -> None:
+    from kestrel_sovereign.knowledge.release_evidence_execution import (
+        CatalogExecutionAuthority,
+        default_catalog_workloads,
+    )
+
+    execution = asyncio.run(
+        CatalogExecutionAuthority(_CATALOG_TEST_IDENTITY, default_catalog_workloads()).execute(
+            _gate("performance_startup_sqlite_startup")
+        )
+    )
+
+    assert execution.record.passed
+    assert execution.budget is not None
+    assert len(execution.budget.samples) == 3
+    assert all(sample > 0 for sample in execution.budget.samples)
+
+
+@pytest.mark.parametrize(
+    "gate_id",
+    (
+        "performance_assertion_write_validation_sqlite_integration",
+        "performance_bounded_inference_sqlite_integration",
+        "performance_hybrid_recall_sqlite_integration",
+        "performance_storage_growth_sqlite_integration",
+        "performance_representative_migration_sqlite_integration",
+    ),
+)
+def test_catalog_benchmark_runs_real_isolated_sqlite_semantic_workload(gate_id: str) -> None:
+    from kestrel_sovereign.knowledge.release_evidence_execution import (
+        CatalogExecutionAuthority,
+        default_catalog_workloads,
+    )
+
+    execution = asyncio.run(
+        CatalogExecutionAuthority(_CATALOG_TEST_IDENTITY, default_catalog_workloads()).execute(
+            _gate(gate_id)
+        )
+    )
+
+    assert execution.record.passed
+    assert execution.budget is not None
+    assert len(execution.budget.samples) == 3
+    if _gate(gate_id).performance_target.unit == "bytes":
+        assert all(type(sample) is int and sample > 0 for sample in execution.budget.samples)
+    else:
+        assert all(sample > 0 for sample in execution.budget.samples)
+
+
+def test_catalog_benchmark_blocks_postgres_without_explicit_isolated_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kestrel_sovereign.knowledge.release_evidence_execution import (
+        CatalogExecutionAuthority,
+        default_catalog_workloads,
+    )
+
+    monkeypatch.delenv("KESTREL_SEMANTIC_RELEASE_ISOLATED", raising=False)
+    monkeypatch.delenv("KESTREL_SEMANTIC_RELEASE_ISOLATED_POSTGRES_ADMIN_DSN", raising=False)
+    execution = asyncio.run(
+        CatalogExecutionAuthority(_CATALOG_TEST_IDENTITY, default_catalog_workloads()).execute(
+            _gate("performance_startup_postgres_startup")
+        )
+    )
+
+    assert execution.record.state is EvidenceState.BLOCKED
+    assert execution.record.reason_code == "isolated_postgres_ack_required"
+
+
+def test_catalog_benchmark_blocks_postgres_without_an_isolated_admin_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kestrel_sovereign.knowledge.release_evidence_execution import (
+        CatalogExecutionAuthority,
+        default_catalog_workloads,
+    )
+
+    monkeypatch.setenv("KESTREL_SEMANTIC_RELEASE_ISOLATED", "1")
+    monkeypatch.delenv("KESTREL_SEMANTIC_RELEASE_ISOLATED_POSTGRES_ADMIN_DSN", raising=False)
+    execution = asyncio.run(
+        CatalogExecutionAuthority(_CATALOG_TEST_IDENTITY, default_catalog_workloads()).execute(
+            _gate("performance_startup_postgres_startup")
+        )
+    )
+
+    assert execution.record.state is EvidenceState.BLOCKED
+    assert execution.record.reason_code == "isolated_postgres_admin_unavailable"
+
+
+@pytest.mark.parametrize("failure_point", ("fetchval", "create_database"))
+def test_disposable_postgres_closes_admin_connection_when_creation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    from types import SimpleNamespace
+
+    from kestrel_sovereign.knowledge.release_evidence_execution import CatalogWorkloadUnavailable
+    from kestrel_sovereign.knowledge.release_evidence_postgres import DisposablePostgresDatabase
+
+    class FailingConnection:
+        closed = False
+
+        async def fetchval(self, _query: str):
+            if failure_point == "fetchval":
+                raise RuntimeError("admin fetch failed")
+            return "postgres"
+
+        async def execute(self, _query: str):
+            if failure_point == "create_database":
+                raise RuntimeError("create failed")
+
+        async def close(self) -> None:
+            self.closed = True
+
+    connection = FailingConnection()
+
+    async def connect(_dsn: str) -> FailingConnection:
+        return connection
+
+    monkeypatch.setenv("KESTREL_SEMANTIC_RELEASE_ISOLATED", "1")
+    monkeypatch.setenv(
+        "KESTREL_SEMANTIC_RELEASE_ISOLATED_POSTGRES_ADMIN_DSN",
+        "postgresql://admin@localhost/postgres",
+    )
+    monkeypatch.setitem(sys.modules, "asyncpg", SimpleNamespace(connect=connect))
+
+    with pytest.raises(CatalogWorkloadUnavailable, match="isolated_postgres_database_create_failed"):
+        asyncio.run(DisposablePostgresDatabase.create())
+    assert connection.closed is True
+
+
+@pytest.mark.parametrize("failure_point", ("factory", "temporary_directory"))
+def test_postgres_benchmark_closes_disposable_database_when_setup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    """A setup failure after DB creation must still drop the isolated DB."""
+    from kestrel_sovereign.knowledge import release_evidence_benchmarks as benchmarks
+
+    class DisposableDatabase:
+        dsn = "postgresql://isolated/kestrel_semantic_release_0123456789abcdef0123456789abcdef"
+        closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    database = DisposableDatabase()
+
+    async def create() -> DisposableDatabase:
+        return database
+
+    monkeypatch.setattr(
+        benchmarks.DisposablePostgresDatabase,
+        "create",
+        staticmethod(create),
+    )
+    if failure_point == "factory":
+        def fail_factory(*_args, **_kwargs):
+            raise RuntimeError("factory failed")
+
+        monkeypatch.setattr(benchmarks, "_IsolatedStorageFactory", fail_factory)
+    else:
+        def fail_temporary_directory(*_args, **_kwargs):
+            raise OSError("temporary directory failed")
+
+        monkeypatch.setattr(benchmarks, "TemporaryDirectory", fail_temporary_directory)
+
+    with pytest.raises((RuntimeError, OSError), match="failed"):
+        asyncio.run(benchmarks._run_benchmark(_gate("performance_startup_postgres_startup")))
+    assert database.closed is True
+
+
+@pytest.mark.parametrize(
+    "shared_name",
+    ("postgres", "template0", "template1", "kestrel", "kestrel_test", "test"),
+)
+def test_disposable_postgres_identity_rejects_common_or_shared_database_names(
+    shared_name: str,
+) -> None:
+    from kestrel_sovereign.knowledge.release_evidence_postgres import _quoted_identifier
+
+    with pytest.raises(ReleaseEvidenceError, match="generated disposable"):
+        _quoted_identifier(shared_name)
+
+
+def test_parity_child_environment_never_inherits_an_ambient_postgres_dsn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from kestrel_sovereign.knowledge.release_evidence_workloads import _isolated_test_environment
+
+    monkeypatch.setenv("TEST_POSTGRES_URL", "postgresql://ambient-shared-db/kestrel")
+    ambient_free = _isolated_test_environment(str(tmp_path))
+    generated = _isolated_test_environment(
+        str(tmp_path),
+        postgres_dsn="postgresql://isolated-runner/kestrel_semantic_release_0123456789abcdef0123456789abcdef",
+    )
+
+    assert "TEST_POSTGRES_URL" not in ambient_free
+    assert generated["TEST_POSTGRES_URL"] != "postgresql://ambient-shared-db/kestrel"
+    assert "kestrel_semantic_release_" in generated["TEST_POSTGRES_URL"]
+
+
+@pytest.mark.parametrize(
+    "gate_id",
+    (
+        "performance_changed_work_sleep_sqlite_kite_http",
+        "performance_changed_work_sleep_postgres_kite_http",
+        "performance_unchanged_sleep_sqlite_kite_http",
+        "performance_unchanged_sleep_postgres_kite_http",
+    ),
+)
+def test_catalog_benchmark_refuses_to_relabel_inprocess_sleep_as_kite_http(gate_id: str) -> None:
+    from kestrel_sovereign.knowledge.release_evidence_execution import (
+        CatalogExecutionAuthority,
+        default_catalog_workloads,
+    )
+
+    execution = asyncio.run(
+        CatalogExecutionAuthority(_CATALOG_TEST_IDENTITY, default_catalog_workloads()).execute(
+            _gate(gate_id)
+        )
+    )
+
+    assert execution.record.state is EvidenceState.BLOCKED
+    assert execution.record.reason_code == "kite_http_benchmark_runner_required"
+
+
+def test_cli_run_executes_a_real_rdf_fixture_workload_without_recording_test_arguments(
+    tmp_path: Path,
+) -> None:
+    key_file = tmp_path / "signing.key"
+    _write_private_key(key_file, b"\x08" * 32)
+    record = tmp_path / "rdf-record.json"
+
+    result = _cli(
+        "run",
+        "--gate",
+        "rdf11_projection_fixture",
+        "--signing-key-file",
+        str(key_file),
+        "--issuer-id",
+        "local_ci",
+        "--key-id",
+        "rdf_fixture_runner",
+        "--output",
+        str(record),
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(record.read_text(encoding="utf-8"))
+    assert payload["state"] == "passed"
+    assert payload["observation"] == {"assertion_count": 6, "case_count": 6}
+    encoded = json.dumps(payload)
+    assert "test_rdf11" not in encoded
+    assert "::" not in encoded
 
 
 def test_cli_block_explicitly_records_an_observed_block_with_success_status(tmp_path: Path) -> None:
@@ -1020,7 +1911,10 @@ def test_cli_assemble_safely_binds_retirement_and_external_adapter_attestations(
     report = ExternalCapabilityReport.attest(
         capability_id="parametric_self_governed_corpus",
         repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
-        source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
+        capability_source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
+        evidence_runner_revision="b" * 40,
+        core_release_evidence_contract_digest=CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
+        run_nonce="a" * 64,
         attestations=tuple(
             ExternalGateAttestation(
                 gate_id=spec.gate_id,

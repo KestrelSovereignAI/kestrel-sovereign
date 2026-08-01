@@ -49,6 +49,7 @@ from .release_evidence_models import (
     _canonical_json,
     _sha256,
 )
+from .release_evidence_freshness import ExternalFreshnessLedger
 
 
 RELEASE_EVIDENCE_SCHEMA_VERSION = 3
@@ -56,7 +57,10 @@ SEMANTIC_RELEASE_CONTRACT = "semantic-kb-v1-release-evidence-v3"
 STRUCTURAL_RELEASE_EVIDENCE_SCHEMA_VERSION = 1
 STRUCTURAL_RELEASE_CONTRACT = "semantic-kb-v1-release-evidence-structural-v1"
 PARAMETRIC_SELF_EVIDENCE_REPOSITORY = "KestrelSovereignAI/kestrel-feature-parametric-self"
-PARAMETRIC_SELF_EVIDENCE_REVISION = "260ba985bcfdfab3dab1ea58da5b259057f3749f"
+PARAMETRIC_SELF_CAPABILITY_SOURCE_REVISION = "260ba985bcfdfab3dab1ea58da5b259057f3749f"
+# Compatibility name for callers that only need the immutable capability
+# baseline. Evidence producers must also provide a separate runner revision.
+PARAMETRIC_SELF_EVIDENCE_REVISION = PARAMETRIC_SELF_CAPABILITY_SOURCE_REVISION
 _ERASURE_DRILL = DrillBinding(
     "semantic_erasure_release_drill_v1",
     _sha256("semantic-release-evidence-v3:drill:semantic_erasure_release_drill_v1"),
@@ -331,6 +335,27 @@ def release_gate_specs(
     return conformance + stable_selection + parity + performance + erasure + external + diagnostics + live_agent + compatibility
 
 
+def _external_adapter_contract_digest() -> str:
+    """Hash the immutable external-facing catalog contract, not a runtime SHA."""
+    external_specs = tuple(
+        spec for spec in release_gate_specs() if spec.category == "external_adapter"
+    )
+    if tuple(spec.gate_id for spec in external_specs) != _EXTERNAL_ADAPTER_GATE_IDS:
+        raise ReleaseEvidenceError("external adapter catalog does not preserve its declared gate order")
+    return _sha256(
+        _canonical_json(
+            {
+                "release_evidence_schema_version": RELEASE_EVIDENCE_SCHEMA_VERSION,
+                "semantic_release_contract": SEMANTIC_RELEASE_CONTRACT,
+                "external_adapter_gates": [
+                    {"gate_id": spec.gate_id, "gate_spec_digest": spec.digest}
+                    for spec in external_specs
+                ],
+            }
+        )
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class SemanticReleaseEvidence:
     """One report whose readiness is recomputed from the immutable catalog."""
@@ -586,6 +611,8 @@ def _external_gate_results(
 def _validate_external_capability_reports(
     reports: tuple[ExternalCapabilityReport, ...],
     gates: tuple[GateResult | StructuralGateResult, ...],
+    *,
+    expected_evidence_runner_revision: str | None = None,
 ) -> None:
     """Require exact repo/revision and hashed result/artifact bindings from Pself."""
     if len(reports) != 1:
@@ -594,13 +621,26 @@ def _validate_external_capability_reports(
     if (
         report.capability_id != "parametric_self_governed_corpus"
         or report.repository != PARAMETRIC_SELF_EVIDENCE_REPOSITORY
-        or report.source_revision != PARAMETRIC_SELF_EVIDENCE_REVISION
+        or report.capability_source_revision != PARAMETRIC_SELF_CAPABILITY_SOURCE_REVISION
     ):
         raise ReleaseEvidenceError("external adapter report repository or revision does not match contract")
+    if expected_evidence_runner_revision is not None:
+        if (
+            not isinstance(expected_evidence_runner_revision, str)
+            or len(expected_evidence_runner_revision) != 40
+            or any(character not in "0123456789abcdef" for character in expected_evidence_runner_revision)
+        ):
+            raise ReleaseEvidenceError("expected external evidence runner revision must be a full lowercase commit SHA")
+        if report.evidence_runner_revision != expected_evidence_runner_revision:
+            raise ReleaseEvidenceError("external adapter report runner revision does not match verifier policy")
+    if report.core_release_evidence_contract_digest != CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST:
+        raise ReleaseEvidenceError("external adapter report core catalog contract does not match")
     expected = _external_gate_results(gates)
     supplied = {item.gate_id: item for item in report.attestations}
     if set(supplied) != set(expected) or set(supplied) != set(_EXTERNAL_ADAPTER_GATE_IDS):
         raise ReleaseEvidenceError("external adapter report must cover corpus, candidate, and served stages")
+    if report.gate_ids != _EXTERNAL_ADAPTER_GATE_IDS or tuple(expected) != _EXTERNAL_ADAPTER_GATE_IDS:
+        raise ReleaseEvidenceError("external adapter report must preserve declared external gate order")
     for gate_id, gate in expected.items():
         attestation = supplied[gate_id]
         evidence = gate.evidence
@@ -612,9 +652,11 @@ def _validate_external_capability_reports(
             or attestation.result_digest != evidence.run_digest
             or attestation.artifact != evidence.artifact
             or attestation.drill != gate.spec.correlation
+            or evidence.external_run_nonce != report.run_nonce
+            or evidence.external_evidence_runner_revision != report.evidence_runner_revision
         ):
             raise ReleaseEvidenceError(
-                "external adapter attestation is not bound to its correlated gate result/artifact"
+                "external adapter attestation is not bound to its runner revision, external run_nonce, or correlated gate result/artifact"
             )
 
 
@@ -868,11 +910,51 @@ def attach_structural_retirement_telemetry(
 def attach_external_capability_report(
     evidence: SemanticReleaseEvidence,
     report: ExternalCapabilityReport,
+    *,
+    freshness_ledger: ExternalFreshnessLedger,
+    expected_evidence_runner_revision: str,
 ) -> SemanticReleaseEvidence:
-    """Attach only a fully hash-bound report from the declared external consumer."""
+    """Attach and durably consume a fully bound report from external CI.
+
+    This is verifier-only ingestion.  It deliberately requires a ledger owned
+    by that verifier, so the public structural assembler cannot mark an
+    external bundle fresh or reuse a report author's transient state.
+    """
     if not isinstance(report, ExternalCapabilityReport):
         raise ReleaseEvidenceError("external adapter report must be ExternalCapabilityReport")
-    return replace(evidence, external_capabilities=(report,))
+    if not isinstance(freshness_ledger, ExternalFreshnessLedger):
+        raise ReleaseEvidenceError("trusted external adapter ingestion requires verifier-owned freshness ledger")
+    attached = validate_external_capability_attachment(
+        evidence, report,
+        expected_evidence_runner_revision=expected_evidence_runner_revision,
+    )
+    freshness_ledger.consume(report)
+    return attached
+
+
+def validate_external_capability_attachment(
+    evidence: SemanticReleaseEvidence,
+    report: ExternalCapabilityReport,
+    *,
+    expected_evidence_runner_revision: str,
+) -> SemanticReleaseEvidence:
+    """Validate an external report without consuming its verifier challenge.
+
+    Only the private verifier uses this preflight step.  It exists so that a
+    verifier can safely stage its signed outputs *before* atomically consuming
+    the one-time challenge.  Callers must still use
+    :func:`attach_external_capability_report` for normal trusted ingestion;
+    the public structural assembler never receives a freshness ledger.
+    """
+    if not isinstance(report, ExternalCapabilityReport):
+        raise ReleaseEvidenceError("external adapter report must be ExternalCapabilityReport")
+    attached = replace(evidence, external_capabilities=(report,))
+    _validate_external_capability_reports(
+        attached.external_capabilities,
+        attached.gates,
+        expected_evidence_runner_revision=expected_evidence_runner_revision,
+    )
+    return attached
 
 
 def attach_structural_external_capability_report(
@@ -984,6 +1066,7 @@ def evidence_record_from_mapping(value: Mapping[str, object]) -> EvidenceRecord:
     expected = {
         "gate_id", "state", "gate_spec_digest", "runner_id", "command_id", "command_digest",
         "environment", "environment_digest", "fixture", "observation", "artifact", "run_digest",
+        "external_run_nonce", "external_evidence_runner_revision",
         "execution_attestation", "drill",
         "reason_code", "outside_advertised_capability",
     }
@@ -1000,6 +1083,8 @@ def evidence_record_from_mapping(value: Mapping[str, object]) -> EvidenceRecord:
         environment=_environment_from_mapping(mapping["environment"]), environment_digest=cast(str | None, mapping["environment_digest"]),
         fixture=_fixture_from_mapping(mapping["fixture"]), observation=_expect_mapping(observation, "observation") if observation is not None else None,
         artifact=_artifact_from_mapping(mapping["artifact"]), run_digest=cast(str | None, mapping["run_digest"]),
+        external_run_nonce=cast(str | None, mapping["external_run_nonce"]),
+        external_evidence_runner_revision=cast(str | None, mapping["external_evidence_runner_revision"]),
         execution_attestation=_execution_attestation_from_mapping(mapping["execution_attestation"]),
         drill=_drill_from_mapping(mapping["drill"]),
         reason_code=cast(str | None, mapping["reason_code"]), outside_advertised_capability=cast(bool, mapping["outside_advertised_capability"]),
@@ -1072,7 +1157,16 @@ def external_capability_report_from_mapping(value: Mapping[str, object]) -> Exte
     mapping = _expect_mapping(value, "external adapter report")
     _strict_keys(
         mapping,
-        {"capability_id", "repository", "source_revision", "attestations", "attestation_digest"},
+        {
+            "capability_id",
+            "repository",
+            "capability_source_revision",
+            "evidence_runner_revision",
+            "core_release_evidence_contract_digest",
+            "run_nonce",
+            "attestations",
+            "attestation_digest",
+        },
         "external adapter report",
     )
     raw_attestations = mapping["attestations"]
@@ -1104,7 +1198,10 @@ def external_capability_report_from_mapping(value: Mapping[str, object]) -> Exte
     return ExternalCapabilityReport(
         capability_id=cast(str, mapping["capability_id"]),
         repository=cast(str, mapping["repository"]),
-        source_revision=cast(str, mapping["source_revision"]),
+        capability_source_revision=cast(str, mapping["capability_source_revision"]),
+        evidence_runner_revision=cast(str, mapping["evidence_runner_revision"]),
+        core_release_evidence_contract_digest=cast(str, mapping["core_release_evidence_contract_digest"]),
+        run_nonce=cast(str, mapping["run_nonce"]),
         attestations=tuple(attestations),
         attestation_digest=cast(str, mapping["attestation_digest"]),
     )
@@ -1142,6 +1239,11 @@ def _experimental_capabilities(registry: SemanticKnowledgeRegistry) -> tuple[str
 
 def _stable_capabilities(registry: SemanticKnowledgeRegistry) -> tuple[str, ...]:
     return tuple(sorted(capability for resource in registry.resources if resource.maturity is StandardsMaturity.STABLE for capability in resource.capabilities))
+
+
+# This pin can be produced by a feature using the new report API: it changes
+# only when the immutable evidence schema, contract, or external gate specs do.
+CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST = _external_adapter_contract_digest()
 
 
 def _write_json(value: Mapping[str, object], output: Path, *, overwrite: bool, kind: str) -> None:

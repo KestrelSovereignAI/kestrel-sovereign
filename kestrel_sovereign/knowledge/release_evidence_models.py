@@ -324,6 +324,11 @@ class TrustedExecutionPolicy:
         identities = {(key.issuer_id, key.key_id) for key in self.keys}
         if len(identities) != len(self.keys):
             raise ReleaseEvidenceError("trusted execution policy repeats an issuer/key identity")
+        public_keys = {key.public_key for key in self.keys}
+        if len(public_keys) != len(self.keys):
+            raise ReleaseEvidenceError(
+                "trusted execution policy repeats an Ed25519 public key under multiple identities"
+            )
 
     def _key_for(self, attestation: ExecutionAttestation, runner_id: str) -> TrustedExecutionKey:
         if not isinstance(attestation, ExecutionAttestation):
@@ -720,6 +725,8 @@ class EvidenceRecord:
     observation: Mapping[str, object] | None = None
     artifact: ArtifactReference | None = None
     run_digest: str | None = None
+    external_run_nonce: str | None = None
+    external_evidence_runner_revision: str | None = None
     execution_attestation: ExecutionAttestation | None = None
     drill: DrillBinding | None = None
     reason_code: str | None = None
@@ -735,6 +742,13 @@ class EvidenceRecord:
             raise ReleaseEvidenceError("outside_advertised_capability must be a boolean")
         if self.drill is not None and not isinstance(self.drill, DrillBinding):
             raise ReleaseEvidenceError("evidence drill must be DrillBinding or null")
+        if self.external_run_nonce is not None:
+            _require_digest(self.external_run_nonce, "external evidence run_nonce")
+        if self.external_evidence_runner_revision is not None:
+            _require_commit(
+                self.external_evidence_runner_revision,
+                "external evidence runner_revision",
+            )
         technical = (
             self.gate_spec_digest,
             self.runner_id,
@@ -770,6 +784,21 @@ class EvidenceRecord:
             _require_digest(self.run_digest, "run_digest")
             if not isinstance(self.execution_attestation, ExecutionAttestation):
                 raise ReleaseEvidenceError("release-ready evidence requires an execution attestation")
+            is_external = self.runner_id == "external_ci"
+            if is_external and (
+                self.external_run_nonce is None
+                or self.external_evidence_runner_revision is None
+            ):
+                raise ReleaseEvidenceError(
+                    "external CI evidence requires signed run_nonce and runner_revision"
+                )
+            if not is_external and (
+                self.external_run_nonce is not None
+                or self.external_evidence_runner_revision is not None
+            ):
+                raise ReleaseEvidenceError(
+                    "only external CI evidence may carry external provenance"
+                )
             if self.state is EvidenceState.PASSED and self.reason_code is not None:
                 raise ReleaseEvidenceError("passed evidence cannot have a reason_code")
             if self.state is EvidenceState.FAILED and self.reason_code is None:
@@ -779,11 +808,19 @@ class EvidenceRecord:
                 raise ReleaseEvidenceError(f"{self.state.value} evidence requires a reason_code")
             if any(value is not None for value in technical):
                 raise ReleaseEvidenceError("blocked/not_run evidence cannot carry an unbound result")
+            if self.external_run_nonce is not None:
+                raise ReleaseEvidenceError("blocked/not_run evidence cannot carry an external run_nonce")
+            if self.external_evidence_runner_revision is not None:
+                raise ReleaseEvidenceError("blocked/not_run evidence cannot carry an external runner_revision")
         elif self.state is EvidenceState.SKIPPED:
             if not self.outside_advertised_capability or self.reason_code is None:
                 raise ReleaseEvidenceError("skipped evidence is permitted only outside advertised capability")
             if any(value is not None for value in technical):
                 raise ReleaseEvidenceError("skipped evidence cannot carry an unbound result")
+            if self.external_run_nonce is not None:
+                raise ReleaseEvidenceError("skipped evidence cannot carry an external run_nonce")
+            if self.external_evidence_runner_revision is not None:
+                raise ReleaseEvidenceError("skipped evidence cannot carry an external runner_revision")
         if self.outside_advertised_capability and self.state is not EvidenceState.SKIPPED:
             raise ReleaseEvidenceError("outside_advertised_capability is valid only for skipped evidence")
 
@@ -812,6 +849,8 @@ class EvidenceRecord:
         *,
         state: EvidenceState,
         reason_code: str | None = None,
+        external_run_nonce: str | None = None,
+        external_evidence_runner_revision: str | None = None,
     ) -> tuple[Mapping[str, object], str]:
         """Build content-free bound fields before an authority signs them."""
         if state not in {EvidenceState.PASSED, EvidenceState.FAILED}:
@@ -829,6 +868,8 @@ class EvidenceRecord:
             "fixture": spec.fixture.binding.to_mapping(),
             "observation": dict(safe_observation),
             "artifact": artifact.to_mapping(),
+            "external_run_nonce": external_run_nonce,
+            "external_evidence_runner_revision": external_evidence_runner_revision,
             "drill": spec.correlation.to_mapping() if spec.correlation else None,
             "reason_code": reason_code,
         }
@@ -844,6 +885,8 @@ class EvidenceRecord:
         state: EvidenceState,
         execution_attestation: ExecutionAttestation,
         reason_code: str | None = None,
+        external_run_nonce: str | None = None,
+        external_evidence_runner_revision: str | None = None,
     ) -> "EvidenceRecord":
         """Construct a signed record for an execution authority only.
 
@@ -859,6 +902,8 @@ class EvidenceRecord:
             artifact,
             state=state,
             reason_code=reason_code,
+            external_run_nonce=external_run_nonce,
+            external_evidence_runner_revision=external_evidence_runner_revision,
         )
         return cls(
             gate_id=spec.gate_id,
@@ -873,6 +918,8 @@ class EvidenceRecord:
             observation=safe_observation,
             artifact=artifact,
             run_digest=run_digest,
+            external_run_nonce=external_run_nonce,
+            external_evidence_runner_revision=external_evidence_runner_revision,
             execution_attestation=execution_attestation,
             drill=spec.correlation,
             reason_code=reason_code,
@@ -899,6 +946,8 @@ class EvidenceRecord:
                     "fixture": self.fixture.to_mapping(),
                     "observation": dict(self.observation),
                     "artifact": self.artifact.to_mapping(),
+                    "external_run_nonce": self.external_run_nonce,
+                    "external_evidence_runner_revision": self.external_evidence_runner_revision,
                     "drill": self.drill.to_mapping() if self.drill else None,
                     "reason_code": self.reason_code,
                 }
@@ -923,6 +972,8 @@ class EvidenceRecord:
             "observation": dict(self.observation) if self.observation else None,
             "artifact": self.artifact.to_mapping() if self.artifact else None,
             "run_digest": self.run_digest,
+            "external_run_nonce": self.external_run_nonce,
+            "external_evidence_runner_revision": self.external_evidence_runner_revision,
             "execution_attestation": (
                 self.execution_attestation.to_mapping() if self.execution_attestation else None
             ),
@@ -1291,6 +1342,8 @@ class SemanticBenchmarkHarness:
         operation: Callable[[], object | Awaitable[object]],
         *,
         storage_bytes: Callable[[], int | Awaitable[int]] | None = None,
+        before_sample: Callable[[], object | Awaitable[object]] | None = None,
+        after_sample: Callable[[], object | Awaitable[object]] | None = None,
     ) -> BenchmarkRun:
         if spec.performance_target is None or not callable(operation):
             raise ReleaseEvidenceError("benchmark requires a performance gate and callable operation")
@@ -1301,6 +1354,10 @@ class SemanticBenchmarkHarness:
             raise ReleaseEvidenceError("storage_bytes is valid only for a storage growth benchmark")
         samples: list[float | int] = []
         for _ in range(self.iterations):
+            if before_sample is not None:
+                prepared = before_sample()
+                if inspect.isawaitable(prepared):
+                    await prepared
             before_bytes = await self._storage_bytes(storage_bytes) if is_storage_growth else None
             started = time.perf_counter() if not is_storage_growth else None
             result = operation()
@@ -1319,6 +1376,10 @@ class SemanticBenchmarkHarness:
                 if elapsed <= 0:
                     elapsed = float.fromhex("0x1.0p-52")
                 samples.append(elapsed)
+            if after_sample is not None:
+                finalized = after_sample()
+                if inspect.isawaitable(finalized):
+                    await finalized
         return BenchmarkRun(
             target=spec.performance_target,
             samples=tuple(samples),
@@ -1539,7 +1600,10 @@ class ExternalCapabilityReport:
 
     capability_id: str
     repository: str
-    source_revision: str
+    capability_source_revision: str
+    evidence_runner_revision: str
+    core_release_evidence_contract_digest: str
+    run_nonce: str
     attestations: tuple[ExternalGateAttestation, ...]
     attestation_digest: str
 
@@ -1547,7 +1611,10 @@ class ExternalCapabilityReport:
         _require_identifier(self.capability_id, "external capability_id")
         if not isinstance(self.repository, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.repository):
             raise ReleaseEvidenceError("external repository must be owner/name")
-        _require_commit(self.source_revision, "external source_revision")
+        _require_commit(self.capability_source_revision, "external capability_source_revision")
+        _require_commit(self.evidence_runner_revision, "external evidence_runner_revision")
+        _require_digest(self.core_release_evidence_contract_digest, "external core_release_evidence_contract_digest")
+        _require_digest(self.run_nonce, "external run_nonce")
         if (
             not isinstance(self.attestations, tuple)
             or not self.attestations
@@ -1559,7 +1626,7 @@ class ExternalCapabilityReport:
             raise ReleaseEvidenceError("external capability report cannot repeat a gate")
         _require_digest(self.attestation_digest, "external attestation_digest")
         if self.attestation_digest != self.calculated_digest():
-            raise ReleaseEvidenceError("external attestation digest does not bind result/artifact references")
+            raise ReleaseEvidenceError("external attestation digest does not bind nonce/result/artifact references")
 
     @classmethod
     def attest(
@@ -1567,19 +1634,28 @@ class ExternalCapabilityReport:
         *,
         capability_id: str,
         repository: str,
-        source_revision: str,
+        capability_source_revision: str,
+        evidence_runner_revision: str,
+        core_release_evidence_contract_digest: str,
+        run_nonce: str,
         attestations: tuple[ExternalGateAttestation, ...],
     ) -> "ExternalCapabilityReport":
         payload = {
             "capability_id": capability_id,
             "repository": repository,
-            "source_revision": source_revision,
+            "capability_source_revision": capability_source_revision,
+            "evidence_runner_revision": evidence_runner_revision,
+            "core_release_evidence_contract_digest": core_release_evidence_contract_digest,
+            "run_nonce": run_nonce,
             "attestations": [item.to_mapping() for item in attestations],
         }
         return cls(
             capability_id=capability_id,
             repository=repository,
-            source_revision=source_revision,
+            capability_source_revision=capability_source_revision,
+            evidence_runner_revision=evidence_runner_revision,
+            core_release_evidence_contract_digest=core_release_evidence_contract_digest,
+            run_nonce=run_nonce,
             attestations=attestations,
             attestation_digest=_sha256(_canonical_json(payload)),
         )
@@ -1588,13 +1664,33 @@ class ExternalCapabilityReport:
     def gate_ids(self) -> tuple[str, ...]:
         return tuple(item.gate_id for item in self.attestations)
 
+    @property
+    def freshness_receipt(self) -> str:
+        """Derive the content-free replay key for the independent verifier.
+
+        The result-digest sequence is intentionally ordered.  The core
+        catalog validates that order against its immutable external gates
+        before a verifier consumes this core-derived receipt.
+        """
+        return calculate_external_freshness_receipt(
+            core_release_evidence_contract_digest=self.core_release_evidence_contract_digest,
+            repository=self.repository,
+            capability_source_revision=self.capability_source_revision,
+            evidence_runner_revision=self.evidence_runner_revision,
+            run_nonce=self.run_nonce,
+            record_digests=tuple(item.result_digest for item in self.attestations),
+        )
+
     def calculated_digest(self) -> str:
         return _sha256(
             _canonical_json(
                 {
                     "capability_id": self.capability_id,
                     "repository": self.repository,
-                    "source_revision": self.source_revision,
+                    "capability_source_revision": self.capability_source_revision,
+                    "evidence_runner_revision": self.evidence_runner_revision,
+                    "core_release_evidence_contract_digest": self.core_release_evidence_contract_digest,
+                    "run_nonce": self.run_nonce,
                     "attestations": [item.to_mapping() for item in self.attestations],
                 }
             )
@@ -1604,7 +1700,34 @@ class ExternalCapabilityReport:
         return {
             "capability_id": self.capability_id,
             "repository": self.repository,
-            "source_revision": self.source_revision,
+            "capability_source_revision": self.capability_source_revision,
+            "evidence_runner_revision": self.evidence_runner_revision,
+            "core_release_evidence_contract_digest": self.core_release_evidence_contract_digest,
+            "run_nonce": self.run_nonce,
             "attestations": [item.to_mapping() for item in self.attestations],
             "attestation_digest": self.attestation_digest,
         }
+
+
+def calculate_external_freshness_receipt(
+    *,
+    core_release_evidence_contract_digest: str,
+    repository: str,
+    capability_source_revision: str,
+    evidence_runner_revision: str,
+    run_nonce: str,
+    record_digests: tuple[str, ...],
+) -> str:
+    """Calculate the portable, content-free receipt an independent verifier consumes."""
+    return _sha256(
+        _canonical_json(
+            {
+                "core_release_evidence_contract_digest": core_release_evidence_contract_digest,
+                "repository": repository,
+                "capability_source_revision": capability_source_revision,
+                "evidence_runner_revision": evidence_runner_revision,
+                "run_nonce": run_nonce,
+                "record_digests": list(record_digests),
+            }
+        )
+    )
