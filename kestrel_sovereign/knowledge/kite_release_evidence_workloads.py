@@ -1,9 +1,11 @@
 """Executable, explicitly provisioned Kite HTTP release workloads.
 
-These workloads are intentionally not added to ``default_catalog_workloads``:
-the caller must provide a factory for a fresh, loopback-only ``KiteHttpHarness``
-with its explicit SQLite or disposable-PostgreSQL storage configuration.  This
-keeps public CLI execution from selecting a listener, home, port, or database.
+The core erasure runner is registered only because this module owns *both*
+isolated storage backends.  It creates PostgreSQL through the acknowledged
+disposable-database authority, runs a distinct loopback Kite process against
+SQLite and that exact generated database, and emits an aggregate only after
+both observations pass.  The public CLI still cannot select a listener, home,
+port, DSN, or observation.
 """
 
 from __future__ import annotations
@@ -19,14 +21,20 @@ from .kite_release_evidence import (
     KiteGate,
     KiteHttpHarness,
     KiteIsolationConfig,
+    KiteStorageConfig,
 )
+from .release_evidence_execution import (
+    CatalogWorkload,
+    CatalogWorkloadResult,
+    CatalogWorkloadUnavailable,
+)
+from .release_evidence_postgres import DisposablePostgresDatabase
 from .release_evidence import release_gate_specs
-from .release_evidence_execution import CatalogWorkload, CatalogWorkloadResult
 from .release_evidence_models import GateSpec, PerformanceMetric, ReleaseEvidenceError
 from .release_evidence_models import ErasureStage
 
 
-KiteHarnessFactory = Callable[[KiteGate, str], KiteHttpHarness]
+KiteHarnessFactory = Callable[[KiteGate, KiteStorageConfig], KiteHttpHarness]
 
 _LIVE_GATE_BY_ID = {
     "kite_http_stable_only_release_drill": KiteGate.STABLE_ONLY,
@@ -45,11 +53,27 @@ def _run_with_owned_harness(harness: KiteHttpHarness, callback):
         harness.stop()
 
 
+async def _run_with_owned_postgres_harness(harness: KiteHttpHarness, callback):
+    """Seed the fresh test identity before starting an owned PostgreSQL host."""
+    harness.prepare()
+    try:
+        seed_identity = getattr(harness, "seed_disposable_postgres_test_identity", None)
+        if not callable(seed_identity):
+            raise ReleaseEvidenceError("Kite PostgreSQL harness lacks the isolated identity seed")
+        await seed_identity()
+        harness.start()
+        return callback(harness)
+    finally:
+        harness.stop()
+
+
 def _live_workload(spec: GateSpec, factory: KiteHarnessFactory) -> CatalogWorkloadResult:
     gate = _LIVE_GATE_BY_ID.get(spec.gate_id)
     if gate is None:
         raise ReleaseEvidenceError("Kite live workload is not in the immutable catalog")
-    observation = _run_with_owned_harness(factory(gate, "sqlite"), lambda harness: harness.run_release_gate())
+    observation = _run_with_owned_harness(
+        factory(gate, KiteStorageConfig()), lambda harness: harness.run_release_gate()
+    )
     return CatalogWorkloadResult(observation=observation.to_mapping())
 
 
@@ -61,8 +85,12 @@ def _sleep_workload(spec: GateSpec, factory: KiteHarnessFactory) -> CatalogWorkl
         or target.mode != "kite_http"
     ):
         raise ReleaseEvidenceError("Kite sleep workload must match its immutable performance target")
+    if target.backend != "sqlite":
+        # A performance runner has no database authority.  Do not let a
+        # caller smuggle a PostgreSQL DSN through the old backend label.
+        raise CatalogWorkloadUnavailable("kite_postgres_disposable_authority_required")
     samples = _run_with_owned_harness(
-        factory(KiteGate.STABLE_ONLY, target.backend),
+        factory(KiteGate.STABLE_ONLY, KiteStorageConfig()),
         lambda harness: harness.measure_sleep(
             changed=target.metric is PerformanceMetric.CHANGED_WORK_SLEEP,
         ),
@@ -74,8 +102,16 @@ def _sleep_workload(spec: GateSpec, factory: KiteHarnessFactory) -> CatalogWorkl
     )
 
 
-def _core_erasure_workload(spec: GateSpec, factory: KiteHarnessFactory) -> CatalogWorkloadResult:
-    """Drive a fixed core stage through an owned, isolated Kite process."""
+async def _core_erasure_workload(
+    spec: GateSpec, factory: KiteHarnessFactory
+) -> CatalogWorkloadResult:
+    """Drive a fixed core stage through separately owned SQLite and PostgreSQL.
+
+    There is intentionally no SQLite-only path for this catalog gate: its
+    immutable environment promises ``dual_backend``.  Database acquisition is
+    first, so a missing acknowledgement, driver, admin endpoint, create, or
+    drop failure produces a blocked/failed record rather than an SQLite pass.
+    """
     prefix = "erasure_"
     if not spec.gate_id.startswith(prefix):
         raise ReleaseEvidenceError("Kite erasure workload requires an erasure gate")
@@ -85,11 +121,36 @@ def _core_erasure_workload(spec: GateSpec, factory: KiteHarnessFactory) -> Catal
         raise ReleaseEvidenceError("Kite erasure workload has an unknown stage") from error
     if stage is ErasureStage.SERVED_ADAPTER_ELIGIBILITY:
         raise ReleaseEvidenceError("served-adapter evidence belongs to parametric-self")
-    observation = _run_with_owned_harness(
-        factory(KiteGate.STABLE_ONLY, "sqlite"),
-        lambda harness: harness.core_erasure_stage(stage),
+    if spec.environment.backend != "dual_backend" or spec.environment.mode != "kite_http":
+        raise ReleaseEvidenceError(
+            "core Kite erasure workload requires the immutable dual-backend HTTP spec"
+        )
+
+    # ``create`` is the sole PostgreSQL entry point.  It rejects ambient DSNs
+    # and an unacknowledged admin channel before a harness receives any config.
+    database = await DisposablePostgresDatabase.create()
+    async with database:
+        sqlite_observation = _run_with_owned_harness(
+            factory(KiteGate.STABLE_ONLY, KiteStorageConfig()),
+            lambda harness: harness.core_erasure_stage(stage),
+        )
+        postgres_observation = await _run_with_owned_postgres_harness(
+            factory(
+                KiteGate.STABLE_ONLY,
+                KiteStorageConfig(backend="postgres", disposable_postgres=database),
+            ),
+            lambda harness: harness.core_erasure_stage(stage),
+        )
+
+    # SurfaceErasureObservation validates each backend independently.  Keep
+    # the public record content-free: only the aggregate schema fields escape.
+    erased_count = sqlite_observation.erased_count + postgres_observation.erased_count
+    remaining_count = sqlite_observation.remaining_count + postgres_observation.remaining_count
+    if erased_count <= 0 or remaining_count != 0:
+        raise CatalogWorkloadUnavailable("kite_dual_backend_erasure_invalid")
+    return CatalogWorkloadResult(
+        observation={"erased_count": erased_count, "remaining_count": remaining_count}
     )
-    return CatalogWorkloadResult(observation=observation.to_mapping())
 
 
 def kite_http_workloads(factory: KiteHarnessFactory) -> dict[tuple[str, str], CatalogWorkload]:
@@ -126,17 +187,16 @@ def kite_http_workloads(factory: KiteHarnessFactory) -> dict[tuple[str, str], Ca
     return workloads
 
 
-def _owned_catalog_harness(gate: KiteGate, backend: str) -> KiteHttpHarness:
+def _owned_catalog_harness(gate: KiteGate, storage: KiteStorageConfig) -> KiteHttpHarness:
     """Create the one local-only harness accepted by the immutable catalog.
 
     This deliberately derives its worktree, fresh home, and loopback port in
     package code.  The public CLI receives no listener, storage, observation,
-    or arbitrary command configuration.  PostgreSQL stays fail-closed here:
-    the separately reviewed disposable authority must create it before a
-    future registered PostgreSQL Kite runner is introduced.
+    or arbitrary command configuration.  PostgreSQL must arrive as the live
+    authority-created object, never a caller-provided DSN.
     """
-    if backend != "sqlite":
-        raise KiteEvidenceError("catalog Kite PostgreSQL requires a disposable authority")
+    if not isinstance(storage, KiteStorageConfig):
+        raise KiteEvidenceError("catalog Kite harness requires a typed storage configuration")
     worktree = Path(__file__).resolve().parents[2]
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
         reservation.bind(("127.0.0.1", 0))
@@ -145,7 +205,9 @@ def _owned_catalog_harness(gate: KiteGate, backend: str) -> KiteHttpHarness:
     # reused agent state.  Keep a separate private parent for later forensic
     # inspection of the owned process's content-free log and marker.
     home = Path(tempfile.mkdtemp(prefix="kestrel-kite-release-")) / "home"
-    return KiteHttpHarness(KiteIsolationConfig(worktree=worktree, home=home, port=port, gate=gate))
+    return KiteHttpHarness(
+        KiteIsolationConfig(worktree=worktree, home=home, port=port, gate=gate, storage=storage)
+    )
 
 
 def owned_kite_http_workloads() -> dict[tuple[str, str], CatalogWorkload]:

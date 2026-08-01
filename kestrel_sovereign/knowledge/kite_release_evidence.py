@@ -338,6 +338,49 @@ class KiteHttpHarness:
             # prepare() requires freshness.
             raise
 
+    async def seed_disposable_postgres_test_identity(self) -> None:
+        """Copy only the freshly incepted test identity into the empty PG run.
+
+        ``kestrel create --test`` deliberately keeps its inception identity in
+        the fresh local agent directory.  A disposable PostgreSQL runtime is
+        a separate, initially empty storage plane, so it needs that one agent
+        node before the server can prove that its typed evidence endpoint is
+        serving a test instance.  This is not a semantic import: no facts,
+        assertions, vectors, corpus artifacts, or caller data cross here.
+        """
+        storage = self.config.storage
+        if storage.backend != "postgres" or storage.disposable_postgres is None:
+            raise KiteEvidenceError("PostgreSQL identity seed requires a disposable authority")
+        local_path = self.config.home / "agent_data" / self.config.agent_name / "kestrel_prime.db"
+        if not local_path.is_file():
+            raise KiteEvidenceError("Kite test inception did not create its local identity store")
+
+        from kestrel_sovereign.storage.async_storage import AsyncStorage
+
+        local_storage = AsyncStorage(db_path=str(local_path), backend="sqlite")
+        postgres_storage: AsyncStorage | None = None
+        try:
+            await local_storage.initialize()
+            nodes = await local_storage.get_nodes_by_type("agent")
+            if len(nodes) != 1 or not bool(
+                nodes[0].properties.get("is_test_instance", False)
+            ):
+                raise KiteEvidenceError("Kite PostgreSQL seed requires exactly one incepted test identity")
+            identity = nodes[0]
+            postgres_storage = AsyncStorage(
+                backend="postgres",
+                dsn=storage.disposable_postgres.dsn,
+                agent_id=identity.node_id,
+            )
+            await postgres_storage.initialize()
+            if await postgres_storage.get_node(identity.node_id) is not None:
+                raise KiteEvidenceError("Kite disposable PostgreSQL identity was unexpectedly pre-populated")
+            await postgres_storage.add_node(identity)
+        finally:
+            if postgres_storage is not None:
+                await postgres_storage.close()
+            await local_storage.close()
+
     def _write_profile_config(self) -> None:
         try:
             import toml
