@@ -1845,10 +1845,17 @@ def test_default_catalog_registers_real_core_contracts_but_not_kite_http_drills(
     for gate_id in (
         "kite_http_stable_only_release_drill",
         "stable_persisted_data_no_canonical_migration_drill",
-        "erasure_active_assertions",
     ):
         spec = _gate(gate_id)
         assert (spec.runner.runner_id, spec.runner.command_id) not in workloads
+    for gate_id in (
+        "erasure_active_assertions",
+        "erasure_vector_index",
+        "erasure_governed_corpus",
+        "erasure_future_corpus",
+    ):
+        spec = _gate(gate_id)
+        assert (spec.runner.runner_id, spec.runner.command_id) in workloads
 
 
 def test_catalog_benchmark_runs_three_real_isolated_sqlite_startup_samples() -> None:

@@ -10,11 +10,20 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import math
+from pathlib import Path
+import socket
+import tempfile
 
-from .kite_release_evidence import KiteGate, KiteHttpHarness
+from .kite_release_evidence import (
+    KiteEvidenceError,
+    KiteGate,
+    KiteHttpHarness,
+    KiteIsolationConfig,
+)
 from .release_evidence import release_gate_specs
 from .release_evidence_execution import CatalogWorkload, CatalogWorkloadResult
 from .release_evidence_models import GateSpec, PerformanceMetric, ReleaseEvidenceError
+from .release_evidence_models import ErasureStage
 
 
 KiteHarnessFactory = Callable[[KiteGate, str], KiteHttpHarness]
@@ -65,13 +74,30 @@ def _sleep_workload(spec: GateSpec, factory: KiteHarnessFactory) -> CatalogWorkl
     )
 
 
+def _core_erasure_workload(spec: GateSpec, factory: KiteHarnessFactory) -> CatalogWorkloadResult:
+    """Drive a fixed core stage through an owned, isolated Kite process."""
+    prefix = "erasure_"
+    if not spec.gate_id.startswith(prefix):
+        raise ReleaseEvidenceError("Kite erasure workload requires an erasure gate")
+    try:
+        stage = ErasureStage(spec.gate_id[len(prefix):])
+    except ValueError as error:
+        raise ReleaseEvidenceError("Kite erasure workload has an unknown stage") from error
+    if stage is ErasureStage.SERVED_ADAPTER_ELIGIBILITY:
+        raise ReleaseEvidenceError("served-adapter evidence belongs to parametric-self")
+    observation = _run_with_owned_harness(
+        factory(KiteGate.STABLE_ONLY, "sqlite"),
+        lambda harness: harness.core_erasure_stage(stage),
+    )
+    return CatalogWorkloadResult(observation=observation.to_mapping())
+
+
 def kite_http_workloads(factory: KiteHarnessFactory) -> dict[tuple[str, str], CatalogWorkload]:
     """Return only real Kite HTTP operations for an explicitly provisioned run.
 
-    Correlated erasure and external-adapter gates deliberately stay absent: a
-    concrete core-surface probe plus independently operated external adapter is
-    required before those claims can execute.  Their absence emits the normal
-    content-free ``catalog_workload_unavailable`` block rather than a mock pass.
+    Core erasure stages execute only through the server-owned typed drill.  The
+    serving-adapter stage remains absent because core may not import or imitate
+    the optional parametric-self feature's independent evidence.
     """
     if not callable(factory):
         raise ReleaseEvidenceError("Kite workloads require an explicit harness factory")
@@ -89,7 +115,49 @@ def kite_http_workloads(factory: KiteHarnessFactory) -> dict[tuple[str, str], Ca
             workloads[(spec.runner.runner_id, spec.runner.command_id)] = (
                 lambda candidate, bound_factory=factory: _sleep_workload(candidate, bound_factory)
             )
+        elif (
+            spec.category == "erasure"
+            and spec.owner == "kestrel_core"
+            and spec.runner.runner_id == "kite_http"
+        ):
+            workloads[(spec.runner.runner_id, spec.runner.command_id)] = (
+                lambda candidate, bound_factory=factory: _core_erasure_workload(candidate, bound_factory)
+            )
     return workloads
 
 
-__all__ = ["KiteHarnessFactory", "kite_http_workloads"]
+def _owned_catalog_harness(gate: KiteGate, backend: str) -> KiteHttpHarness:
+    """Create the one local-only harness accepted by the immutable catalog.
+
+    This deliberately derives its worktree, fresh home, and loopback port in
+    package code.  The public CLI receives no listener, storage, observation,
+    or arbitrary command configuration.  PostgreSQL stays fail-closed here:
+    the separately reviewed disposable authority must create it before a
+    future registered PostgreSQL Kite runner is introduced.
+    """
+    if backend != "sqlite":
+        raise KiteEvidenceError("catalog Kite PostgreSQL requires a disposable authority")
+    worktree = Path(__file__).resolve().parents[2]
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        port = int(reservation.getsockname()[1])
+    home = Path(tempfile.mkdtemp(prefix="kestrel-kite-release-"))
+    return KiteHttpHarness(KiteIsolationConfig(worktree=worktree, home=home, port=port, gate=gate))
+
+
+def owned_kite_http_workloads() -> dict[tuple[str, str], CatalogWorkload]:
+    """Return only the core erasure work owned by the no-config catalog.
+
+    The earlier live-recall/sleep runners remain deliberately unregistered
+    pending their separate HTTP readiness review.  This prevents a catalog
+    expansion from silently promoting an unrelated old scaffold to release
+    evidence merely because the erasure authority is now available.
+    """
+    return {
+        key: workload
+        for key, workload in kite_http_workloads(_owned_catalog_harness).items()
+        if key[1].startswith("erasure_")
+    }
+
+
+__all__ = ["KiteHarnessFactory", "kite_http_workloads", "owned_kite_http_workloads"]

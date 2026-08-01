@@ -74,6 +74,11 @@ _EXTERNAL_ADAPTER_GATE_IDS = (
 _EXTERNAL_CAPABILITY_GATE_IDS = _EXTERNAL_ADAPTER_GATE_IDS[1:]
 
 
+def erasure_drill_binding() -> DrillBinding:
+    """Return the immutable shared binding for every erasure-stage record."""
+    return _ERASURE_DRILL
+
+
 def _fixture_binding(fixture_id: str) -> FixtureBinding:
     return FixtureBinding(
         fixture_id,

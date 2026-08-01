@@ -394,7 +394,9 @@ def default_catalog_workloads() -> dict[tuple[str, str], CatalogWorkload]:
     # argv and exposes only reviewed, immutable catalog command IDs.
     from .release_evidence_workloads import pytest_catalog_workloads
     from .release_evidence_benchmarks import semantic_benchmark_workloads
+    from .kite_release_evidence_workloads import owned_kite_http_workloads
 
     workloads.update(pytest_catalog_workloads())
     workloads.update(semantic_benchmark_workloads())
+    workloads.update(owned_kite_http_workloads())
     return workloads

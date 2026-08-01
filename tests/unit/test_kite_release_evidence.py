@@ -272,7 +272,7 @@ def _diagnostics(
         "capability_mode": capabilities.mode,
         "active_capability_pins": [
             f"{key}={value}"
-            for key, value in sorted(capabilities.release_evidence_pins().items())
+            for key, value in sorted(capabilities.capability_versions().items())
         ],
         "canonical_migration_count": migrations,
         "explicit_fact_provenance_present_count": provenance,
@@ -836,11 +836,30 @@ def test_kite_sleep_measurement_times_only_typed_http_sleep(
     assert operations == ["save", "sleep_changed", "save", "sleep_changed", "save", "sleep_changed"]
 
 
-def test_kite_workload_registration_excludes_unproven_erasure_and_external_adapter() -> None:
+def test_kite_workload_registration_has_only_core_owned_erasure_stages() -> None:
     from kestrel_sovereign.knowledge.kite_release_evidence_workloads import kite_http_workloads
 
     workloads = kite_http_workloads(lambda _gate, _backend: None)  # type: ignore[arg-type]
     commands = {command_id for _runner_id, command_id in workloads}
-    assert "erasure_active_assertions_v1" not in commands
+    assert "erasure_active_assertions_v1" in commands
+    assert "erasure_vector_index_v1" in commands
     assert "external_corpus_consumed_v1" not in commands
+    assert "erasure_served_adapter_eligibility_v1" not in commands
     assert "benchmark_changed_work_sleep_sqlite_kite_http_v1" in commands
+
+
+def test_core_erasure_stage_rejects_missing_or_mismatched_aggregate_surface(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = KiteHttpHarness(_config(tmp_path), run=_fake_create)
+    harness._process = _Process(100)  # type: ignore[assignment]
+    harness._api_key = "test-key"
+    harness._evidence_public_key = _TEST_SIGNING_PUBLIC_KEY
+    monkeypatch.setattr(
+        KiteHttpHarness,
+        "_evidence",
+        lambda _self, operation: {"active_assertions": {"erased_count": 1, "remaining_count": 0}}
+        if operation == "erasure_core_snapshot" else {},
+    )
+    with pytest.raises(KiteEvidenceError, match="unexpected stage set"):
+        harness.core_erasure_stage(ErasureStage.ACTIVE_ASSERTIONS)

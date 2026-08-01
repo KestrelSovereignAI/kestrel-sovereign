@@ -564,6 +564,31 @@ class KiteHttpHarness:
             raise KiteEvidenceError("correlated erasure probe returned a mismatched drill binding")
         return tuple(sorted(observed, key=lambda item: item.stage.value))
 
+    def core_erasure_stage(self, stage: ErasureStage) -> SurfaceErasureObservation:
+        """Read one server-owned, correlated core erasure drill result.
+
+        The HTTP client cannot name an assertion, revision, tenant, artifact,
+        vector profile, policy, or consumer.  Those bindings are created and
+        checked by the production storage owner before it emits this aggregate.
+        The optional serving-adapter stage is deliberately absent: it belongs
+        to the separately installed parametric-self feature.
+        """
+        if stage is ErasureStage.SERVED_ADAPTER_ELIGIBILITY:
+            raise KiteEvidenceError("served-adapter eligibility is external evidence")
+        snapshot = self._evidence("erasure_core_snapshot")
+        expected = {item.value for item in ErasureStage if item is not ErasureStage.SERVED_ADAPTER_ELIGIBILITY}
+        if set(snapshot) != expected:
+            raise KiteEvidenceError("core erasure drill has an unexpected stage set")
+        result = snapshot.get(stage.value)
+        if not isinstance(result, dict) or set(result) != {"erased_count", "remaining_count"}:
+            raise KiteEvidenceError("core erasure drill stage is malformed")
+        erased_count, remaining_count = result["erased_count"], result["remaining_count"]
+        if type(erased_count) is not int or type(remaining_count) is not int:
+            raise KiteEvidenceError("core erasure drill must return integer aggregates")
+        from .release_evidence import erasure_drill_binding
+
+        return SurfaceErasureObservation(stage, erased_count, remaining_count, erasure_drill_binding())
+
     def write_content_free_artifact(self, observation: KiteAggregateObservation, destination: Path) -> str:
         """Write only aggregate counts and an integrity digest, never transcript data."""
         if observation.gate_id != self.config.gate.value:
@@ -660,7 +685,7 @@ class KiteHttpHarness:
         expected_pins = [
             f"{key}={value}"
             for key, value in sorted(
-                expected_capabilities.release_evidence_pins().items()
+                expected_capabilities.capability_versions().items()
             )
         ]
         if pins != expected_pins:
