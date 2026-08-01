@@ -7,9 +7,9 @@ report is reduced immediately to content-free aggregate counts and deleted.
 Neither selector text, process output, paths, nor database configuration can
 cross into a release-evidence record.
 
-PostgreSQL cases use the existing ``db_backend`` fixture and therefore require
-the operator-owned isolated test database configuration.  A skipped required
-case is a failure, never an implicit SQLite substitution.
+PostgreSQL cases use only a generated ``DisposablePostgresDatabase`` created
+by the release isolation authority.  A skipped required case is a failure,
+never an implicit SQLite substitution.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ from .release_evidence_postgres import DisposablePostgresDatabase
 
 _REPOSITORY_ROOT: Final = Path(__file__).resolve().parents[2]
 _PYTEST_TIMEOUT_SECONDS: Final = 180
+_CATALOG_POSTGRES_AUTHORITY_ENV: Final = "KESTREL_SEMANTIC_RELEASE_CATALOG_POSTGRES"
 _TEST_ENV_ALLOWLIST: Final = (
     "HOME",
     "LANG",
@@ -73,6 +74,7 @@ def _isolated_test_environment(tempdir: str, *, postgres_dsn: str | None = None)
         # a child parity test may receive.  Ambient TEST_POSTGRES_URL is never
         # inherited into the release runner.
         environment["TEST_POSTGRES_URL"] = postgres_dsn
+        environment[_CATALOG_POSTGRES_AUTHORITY_ENV] = "1"
     return environment
 
 
@@ -168,6 +170,15 @@ def _result_for(
     )
 
 
+_LEGACY_FACT_MIGRATION_SQLITE_SELECTORS: Final = (
+    "tests/unit/storage/test_legacy_fact_migration.py::test_migrates_idempotently_across_restart_and_rolls_back_without_legacy_delete",
+    "tests/unit/storage/test_legacy_fact_migration.py::test_rejects_malformed_unsupported_and_shared_nodes_without_promotion",
+)
+_LEGACY_FACT_MIGRATION_POSTGRES_SELECTORS: Final = (
+    "tests/unit/storage/test_legacy_fact_migration.py::test_migration_bookkeeping_uses_typed_timestamps_on_real_disposable_postgres",
+)
+
+
 _PYTEST_SELECTORS: Final[Mapping[str, tuple[str, ...]]] = {
     # Standards fixtures: all use real offline fixture/registry contracts.
     "rdf11_projection_v1": (
@@ -218,10 +229,6 @@ _PYTEST_SELECTORS: Final[Mapping[str, tuple[str, ...]]] = {
         "tests/unit/test_sleep_observability.py::test_sleep_diagnostics_reject_version_shaped_unregistered_capability_labels",
         "tests/unit/test_sleep_observability.py::test_sleep_diagnostics_marks_absent_producer_profile_and_ontology_as_omitted",
     ),
-    "legacy_fact_migration_equivalence_v1": (
-        "tests/unit/storage/test_legacy_fact_migration.py::test_migrates_idempotently_across_restart_and_rolls_back_without_legacy_delete",
-        "tests/unit/storage/test_legacy_fact_migration.py::test_rejects_malformed_unsupported_and_shared_nodes_without_promotion",
-    ),
 }
 
 
@@ -239,6 +246,12 @@ def pytest_catalog_workloads() -> dict[tuple[str, str], CatalogWorkload]:
             workloads[("pytest", command_id)] = _backend_workload(selectors)
         else:
             workloads[("pytest", command_id)] = _selector_workload(selectors)
+    workloads[("pytest", "legacy_fact_migration_equivalence_v1")] = (
+        _legacy_fact_migration_dual_backend_workload(
+            _LEGACY_FACT_MIGRATION_SQLITE_SELECTORS,
+            _LEGACY_FACT_MIGRATION_POSTGRES_SELECTORS,
+        )
+    )
     return workloads
 
 
@@ -264,5 +277,54 @@ def _backend_workload(selectors: tuple[str, ...]) -> CatalogWorkload:
                 selected,
                 postgres_dsn=database.dsn,
             )
+
+    return workload
+
+
+def _legacy_fact_migration_dual_backend_workload(
+    sqlite_selectors: tuple[str, ...],
+    postgres_selectors: tuple[str, ...],
+) -> CatalogWorkload:
+    """Run the compatibility claim on SQLite and a generated PostgreSQL DB.
+
+    The catalog labels this gate ``dual_backend``.  Its PostgreSQL half is not
+    a parametrized fixture selected from ambient configuration: this workload
+    creates exactly one release-isolated database and gives its generated DSN
+    only to the fixed child selector.  A skipped child is returned as a failed
+    gate by :func:`_result_for`, so SQLite can never stand in for PostgreSQL.
+    """
+
+    async def workload(spec: GateSpec) -> CatalogWorkloadResult:
+        if spec.environment.backend != "dual_backend":
+            raise ReleaseEvidenceError(
+                "legacy migration equivalence workload requires dual_backend"
+            )
+        async with await DisposablePostgresDatabase.create() as database:
+            sqlite = await asyncio.to_thread(_result_for, spec, sqlite_selectors)
+            postgres = await asyncio.to_thread(
+                _result_for,
+                spec,
+                postgres_selectors,
+                postgres_dsn=database.dsn,
+            )
+        results = (sqlite, postgres)
+        scenarios = sum(
+            int(result.observation["scenario_count"])
+            for result in results
+        )
+        if all(result.state is EvidenceState.PASSED for result in results):
+            return CatalogWorkloadResult(
+                observation={"scenario_count": scenarios, "mismatch_count": 0}
+            )
+        reason = (
+            "pytest_required_case_skipped"
+            if any(result.reason_code == "pytest_required_case_skipped" for result in results)
+            else "pytest_contract_failed"
+        )
+        return CatalogWorkloadResult(
+            observation={"scenario_count": scenarios, "mismatch_count": 0},
+            state=EvidenceState.FAILED,
+            reason_code=reason,
+        )
 
     return workload

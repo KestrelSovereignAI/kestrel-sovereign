@@ -102,19 +102,8 @@ async def _node(storage: AsyncStorage, node_id: str, properties: object, *, owne
     )
 
 
-@pytest.mark.asyncio
-async def test_migration_bookkeeping_uses_typed_timestamps_on_real_disposable_postgres():
-    """The migration stays restart-safe on asyncpg, not only on SQLite."""
-    if (
-        os.environ.get("KESTREL_SEMANTIC_RELEASE_ISOLATED") != "1"
-        or not os.environ.get("KESTREL_SEMANTIC_RELEASE_ISOLATED_POSTGRES_ADMIN_DSN")
-    ):
-        pytest.skip("isolated PostgreSQL release-evidence environment is required")
-
-    from kestrel_sovereign.knowledge.release_evidence_postgres import (
-        DisposablePostgresDatabase,
-    )
-
+async def _assert_real_postgres_migration_contract(dsn: str) -> None:
+    """Exercise the migration against an authority-provided PostgreSQL DSN."""
     tenant = "did:example:legacy-facts-postgres"
     original = {
         "subject": "user",
@@ -123,74 +112,97 @@ async def test_migration_bookkeeping_uses_typed_timestamps_on_real_disposable_po
         "created_at": "2026-01-01T00:00:00+00:00",
     }
     storage = None
-    async with await DisposablePostgresDatabase.create() as database:
-        try:
-            storage = AsyncStorage(
-                backend="postgres",
-                dsn=database.dsn,
-                agent_id=tenant,
-                _assertion_tenant_capability=_issue_assertion_tenant_capability(tenant),
-            )
-            await storage.initialize()
-            await _node(storage, "fact-postgres", original, owner=tenant)
+    try:
+        storage = AsyncStorage(
+            backend="postgres",
+            dsn=dsn,
+            agent_id=tenant,
+            _assertion_tenant_capability=_issue_assertion_tenant_capability(tenant),
+        )
+        await storage.initialize()
+        await _node(storage, "fact-postgres", original, owner=tenant)
 
-            assert storage.db is not None
-            assert await storage.db.fetchval(
-                "SELECT COUNT(*) FROM graph_nodes WHERE node_id = ?",
-                ("fact-postgres",),
-            ) == 1
-            assert await storage.db.fetchval(
-                "SELECT COUNT(*) FROM graph_node_owners WHERE node_id = ?",
-                ("fact-postgres",),
-            ) == 1
-            assert await storage.db.fetchval(
-                "SELECT agent_id FROM graph_node_owners WHERE node_id = ?",
-                ("fact-postgres",),
-            ) == tenant
-            migration = storage.legacy_graph_fact_migration()
-            assert len(await migration._rows_after(storage.db, tenant, None, 1)) == 1
+        assert storage.db is not None
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM graph_nodes WHERE node_id = ?",
+            ("fact-postgres",),
+        ) == 1
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM graph_node_owners WHERE node_id = ?",
+            ("fact-postgres",),
+        ) == 1
+        assert await storage.db.fetchval(
+            "SELECT agent_id FROM graph_node_owners WHERE node_id = ?",
+            ("fact-postgres",),
+        ) == tenant
+        migration = storage.legacy_graph_fact_migration()
+        assert len(await migration._rows_after(storage.db, tenant, None, 1)) == 1
 
-            first = await migration.run(batch_size=1)
-            assert first.migrated == 1
-            assert first.complete is True
+        first = await migration.run(batch_size=1)
+        assert first.migrated == 1
+        assert first.complete is True
 
-            recorded_at = await storage.db.fetchval(
-                "SELECT created_at FROM legacy_fact_migration_records "
-                "WHERE tenant_id = ? AND node_id = ?",
-                (tenant, "fact-postgres"),
-            )
-            checkpoint_at = await storage.db.fetchval(
-                "SELECT updated_at FROM legacy_fact_migration_checkpoints "
-                "WHERE tenant_id = ? AND migration_name = ?",
-                (tenant, migration_module.MIGRATION_NAME),
-            )
-            assert isinstance(recorded_at, datetime)
-            assert recorded_at.tzinfo is None
-            assert isinstance(checkpoint_at, datetime)
-            assert checkpoint_at.tzinfo is None
+        recorded_at = await storage.db.fetchval(
+            "SELECT created_at FROM legacy_fact_migration_records "
+            "WHERE tenant_id = ? AND node_id = ?",
+            (tenant, "fact-postgres"),
+        )
+        checkpoint_at = await storage.db.fetchval(
+            "SELECT updated_at FROM legacy_fact_migration_checkpoints "
+            "WHERE tenant_id = ? AND migration_name = ?",
+            (tenant, migration_module.MIGRATION_NAME),
+        )
+        assert isinstance(recorded_at, datetime)
+        assert recorded_at.tzinfo is None
+        assert isinstance(checkpoint_at, datetime)
+        assert checkpoint_at.tzinfo is None
 
+        await storage.close()
+        storage = AsyncStorage(
+            backend="postgres",
+            dsn=dsn,
+            agent_id=tenant,
+            _assertion_tenant_capability=_issue_assertion_tenant_capability(tenant),
+        )
+        await storage.initialize()
+        restarted = await storage.legacy_graph_fact_migration().run(batch_size=1)
+        assert restarted.processed == 0
+        assert restarted.migrated == 0
+        rollback = await storage.legacy_graph_fact_migration().rollback()
+        assert rollback.migrated == 1
+        legacy = await storage.db.fetchone(
+            "SELECT properties FROM graph_nodes WHERE node_id = ?",
+            ("fact-postgres",),
+        )
+        assert legacy is not None
+        assert json.loads(legacy[0]) == original
+    finally:
+        if storage is not None:
             await storage.close()
-            storage = AsyncStorage(
-                backend="postgres",
-                dsn=database.dsn,
-                agent_id=tenant,
-                _assertion_tenant_capability=_issue_assertion_tenant_capability(tenant),
-            )
-            await storage.initialize()
-            restarted = await storage.legacy_graph_fact_migration().run(batch_size=1)
-            assert restarted.processed == 0
-            assert restarted.migrated == 0
-            rollback = await storage.legacy_graph_fact_migration().rollback()
-            assert rollback.migrated == 1
-            legacy = await storage.db.fetchone(
-                "SELECT properties FROM graph_nodes WHERE node_id = ?",
-                ("fact-postgres",),
-            )
-            assert legacy is not None
-            assert json.loads(legacy[0]) == original
-        finally:
-            if storage is not None:
-                await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_migration_bookkeeping_uses_typed_timestamps_on_real_disposable_postgres():
+    """The migration stays restart-safe on asyncpg, not only on SQLite."""
+    catalog_dsn = (
+        os.environ.get("TEST_POSTGRES_URL")
+        if os.environ.get("KESTREL_SEMANTIC_RELEASE_CATALOG_POSTGRES") == "1"
+        else None
+    )
+    if catalog_dsn:
+        await _assert_real_postgres_migration_contract(catalog_dsn)
+        return
+    if (
+        os.environ.get("KESTREL_SEMANTIC_RELEASE_ISOLATED") != "1"
+        or not os.environ.get("KESTREL_SEMANTIC_RELEASE_ISOLATED_POSTGRES_ADMIN_DSN")
+    ):
+        pytest.skip("isolated PostgreSQL release-evidence environment is required")
+    from kestrel_sovereign.knowledge.release_evidence_postgres import (
+        DisposablePostgresDatabase,
+    )
+
+    async with await DisposablePostgresDatabase.create() as database:
+        await _assert_real_postgres_migration_contract(database.dsn)
 
 
 @pytest.mark.asyncio

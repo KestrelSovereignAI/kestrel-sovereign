@@ -1886,6 +1886,106 @@ def test_default_catalog_registers_real_core_contracts_and_kite_http_drills() ->
         assert (spec.runner.runner_id, spec.runner.command_id) in workloads
 
 
+def test_legacy_migration_catalog_workload_runs_the_fixed_sqlite_and_postgres_cases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dual-backend compatibility attestation cannot silently become SQLite-only."""
+    from kestrel_sovereign.knowledge import release_evidence_workloads as workloads
+
+    class DisposableDatabase:
+        dsn = (
+            "postgresql://isolated/"
+            "kestrel_semantic_release_0123456789abcdef0123456789abcdef"
+        )
+        closed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, _exc_type, _exc, _traceback) -> bool:
+            self.closed = True
+            return False
+
+    database = DisposableDatabase()
+
+    async def create() -> DisposableDatabase:
+        return database
+
+    calls: list[tuple[tuple[str, ...], str | None]] = []
+
+    def run_fixed_pytest(
+        *selectors: str, postgres_dsn: str | None = None,
+    ) -> workloads._PytestSummary:
+        calls.append((selectors, postgres_dsn))
+        return workloads._PytestSummary(len(selectors), 0, 0)
+
+    monkeypatch.setattr(
+        workloads.DisposablePostgresDatabase, "create", staticmethod(create)
+    )
+    monkeypatch.setattr(workloads, "_run_fixed_pytest", run_fixed_pytest)
+
+    workload = workloads.pytest_catalog_workloads()[
+        ("pytest", "legacy_fact_migration_equivalence_v1")
+    ]
+    result = asyncio.run(workload(_gate("legacy_fact_migration_equivalence")))
+
+    assert result.state is EvidenceState.PASSED
+    assert result.observation == {"scenario_count": 3, "mismatch_count": 0}
+    assert calls[0][1] is None
+    assert calls[1] == (
+        (
+            "tests/unit/storage/test_legacy_fact_migration.py::"
+            "test_migration_bookkeeping_uses_typed_timestamps_on_real_disposable_postgres",
+        ),
+        database.dsn,
+    )
+    assert database.closed is True
+
+
+def test_legacy_migration_catalog_workload_closes_postgres_after_child_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kestrel_sovereign.knowledge import release_evidence_workloads as workloads
+
+    class DisposableDatabase:
+        dsn = (
+            "postgresql://isolated/"
+            "kestrel_semantic_release_0123456789abcdef0123456789abcdef"
+        )
+        closed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, _exc_type, _exc, _traceback) -> bool:
+            self.closed = True
+            return False
+
+    database = DisposableDatabase()
+
+    async def create() -> DisposableDatabase:
+        return database
+
+    def run_fixed_pytest(
+        *_selectors: str, postgres_dsn: str | None = None,
+    ) -> workloads._PytestSummary:
+        if postgres_dsn is not None:
+            raise ReleaseEvidenceError("postgres child failed")
+        return workloads._PytestSummary(2, 0, 0)
+
+    monkeypatch.setattr(
+        workloads.DisposablePostgresDatabase, "create", staticmethod(create)
+    )
+    monkeypatch.setattr(workloads, "_run_fixed_pytest", run_fixed_pytest)
+
+    workload = workloads.pytest_catalog_workloads()[
+        ("pytest", "legacy_fact_migration_equivalence_v1")
+    ]
+    with pytest.raises(ReleaseEvidenceError, match="postgres child failed"):
+        asyncio.run(workload(_gate("legacy_fact_migration_equivalence")))
+    assert database.closed is True
+
+
 def test_catalog_benchmark_runs_three_real_isolated_sqlite_startup_samples() -> None:
     from kestrel_sovereign.knowledge.release_evidence_execution import (
         CatalogExecutionAuthority,
@@ -2085,8 +2185,10 @@ def test_parity_child_environment_never_inherits_an_ambient_postgres_dsn(
     )
 
     assert "TEST_POSTGRES_URL" not in ambient_free
+    assert "KESTREL_SEMANTIC_RELEASE_CATALOG_POSTGRES" not in ambient_free
     assert generated["TEST_POSTGRES_URL"] != "postgresql://ambient-shared-db/kestrel"
     assert "kestrel_semantic_release_" in generated["TEST_POSTGRES_URL"]
+    assert generated["KESTREL_SEMANTIC_RELEASE_CATALOG_POSTGRES"] == "1"
 
 
 @pytest.mark.parametrize(
