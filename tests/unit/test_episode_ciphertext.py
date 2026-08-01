@@ -130,3 +130,103 @@ def test_plaintext_beginning_with_the_marker_survives_decryption():
     )
     got = _consolidator(store)._row_plaintext(ENVELOPE, ENC_META)
     assert got == "KSAv2: is the envelope prefix we use"
+
+
+# ---------------------------------------------------------------------------
+# codex review r3 — existing corrupt episodes, and a real-decrypt gate
+# ---------------------------------------------------------------------------
+
+class TestExistingCorruptEpisodesAreInvalidated:
+    """Forward-only would leave the 8 damaged episodes served forever.
+
+    `_covered_message_ids` treats them as covering their source messages, so
+    consolidation skips those messages as already-consolidated and the
+    ciphertext title, summary, arc and embedding keep being served.
+    """
+
+    def test_ciphertext_derived_title_is_detected(self):
+        c = _consolidator(None)
+        assert c._is_ciphertext_derived(
+            "Discussion of ksav2, aykk3eiacyxxkmq-lkng1jamqa20vlijz, oa-gadalxj", None
+        )
+
+    def test_ciphertext_derived_summary_is_detected(self):
+        c = _consolidator(None)
+        assert c._is_ciphertext_derived("A conversation", "Topics: ksav2, adlb.")
+
+    def test_healthy_episode_is_not_flagged(self):
+        c = _consolidator(None)
+        assert not c._is_ciphertext_derived(
+            "Discussion of scheduler, leases, migration",
+            "A conversation with 12 messages. Topics: scheduler, leases.",
+        )
+
+    def test_prose_mentioning_the_format_in_passing_is_not_a_topic_term(self):
+        """The signature is the magic surviving as a TOPIC, not any mention."""
+        c = _consolidator(None)
+        assert not c._is_ciphertext_derived("Discussion of encryption, storage", None)
+
+
+class TestBackstopRequiresARealDecrypt:
+    def test_wired_store_does_not_exempt_a_row_with_no_enc_flag(self):
+        """A no-op decrypt must not disable the backstop."""
+        store = MagicMock()
+        store.decrypt_stored_content.side_effect = lambda content, meta: content
+        # metadata lost / malformed -> decrypt is a no-op, envelope survives
+        assert _consolidator(store)._row_plaintext(ENVELOPE, {}) is None
+
+    def test_authenticated_decrypt_still_exempts_marker_prefixed_plaintext(self):
+        store = MagicMock()
+        store.decrypt_stored_content.side_effect = (
+            lambda content, meta: "KSAv2: is the prefix we use"
+        )
+        assert (
+            _consolidator(store)._row_plaintext(ENVELOPE, ENC_META)
+            == "KSAv2: is the prefix we use"
+        )
+
+
+@pytest.mark.asyncio
+class TestCoveredIdsReleasesAndPurges:
+    """Drive `_covered_message_ids`, not just the detector.
+
+    A mutation proved the detector tests alone are insufficient: disabling the
+    invalidation branch left them all green while corrupt episodes kept
+    claiming their source messages.
+    """
+
+    def _consolidator_with_rows(self, rows):
+        from unittest.mock import AsyncMock
+
+        c = _consolidator(None)
+        c._db = MagicMock()
+        c._db.fetchall = AsyncMock(return_value=rows)
+        c._db.execute = AsyncMock()
+        return c
+
+    async def test_corrupt_episode_does_not_cover_its_messages(self):
+        c = self._consolidator_with_rows([
+            ('["11","12"]', "ep-corrupt", "Discussion of ksav2, adlb, fldy9", None),
+            ('["21"]', "ep-healthy", "Discussion of scheduler, leases", None),
+        ])
+        covered = await c._covered_message_ids()
+        assert covered == {"21"}, covered
+        assert "11" not in covered, "corrupt episode still claims its messages"
+
+    async def test_corrupt_episode_is_deleted_so_it_can_be_rebuilt(self):
+        c = self._consolidator_with_rows([
+            ('["11"]', "ep-corrupt", "Discussion of ksav2, adlb", None),
+        ])
+        await c._covered_message_ids()
+        c._db.execute.assert_awaited()
+        sql, params = c._db.execute.await_args.args
+        assert "DELETE FROM memory_episodes" in sql
+        assert "ep-corrupt" in params
+
+    async def test_healthy_episodes_are_never_deleted(self):
+        c = self._consolidator_with_rows([
+            ('["21"]', "ep-healthy", "Discussion of scheduler, leases", None),
+        ])
+        covered = await c._covered_message_ids()
+        assert covered == {"21"}
+        c._db.execute.assert_not_awaited()
