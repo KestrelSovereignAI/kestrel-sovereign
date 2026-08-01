@@ -181,6 +181,16 @@ class ExternalFreshnessLedger:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS verified_external_release_receipts (
+                freshness_receipt TEXT PRIMARY KEY,
+                evidence_digest TEXT NOT NULL,
+                policy_digest TEXT NOT NULL,
+                receipt_digest TEXT NOT NULL
+            )
+            """
+        )
 
     def issue_challenge(self) -> str:
         """Persist and return the verifier's one-time nonce for an external run."""
@@ -250,3 +260,50 @@ class ExternalFreshnessLedger:
             raise
         except sqlite3.Error as exc:
             raise ReleaseEvidenceError("external freshness ledger cannot durably consume receipt") from exc
+
+    def record_verified_receipt(
+        self,
+        report: ExternalCapabilityReport,
+        *,
+        evidence_digest: str,
+        policy_digest: str,
+        receipt_digest: str,
+    ) -> None:
+        """Durably bind the verifier's final receipt to a consumed challenge."""
+        if not isinstance(report, ExternalCapabilityReport) or any(
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in (evidence_digest, policy_digest, receipt_digest)
+        ):
+            raise ReleaseEvidenceError("verified receipt binding requires content-free digests")
+        expected_identity = self._prepare_path()
+        try:
+            with sqlite3.connect(f"{self._path.as_uri()}?mode=rw", uri=True, isolation_level=None) as connection:
+                self._initialize_connection(connection, expected_identity)
+                connection.execute("BEGIN IMMEDIATE")
+                consumed = connection.execute(
+                    "SELECT 1 FROM consumed_external_freshness WHERE freshness_receipt = ?",
+                    (report.freshness_receipt,),
+                ).fetchone()
+                if consumed is None:
+                    connection.execute("ROLLBACK")
+                    raise ReleaseEvidenceError("verified receipt requires a consumed verifier challenge")
+                try:
+                    connection.execute(
+                        "INSERT INTO verified_external_release_receipts "
+                        "(freshness_receipt, evidence_digest, policy_digest, receipt_digest) "
+                        "VALUES (?, ?, ?, ?)",
+                        (report.freshness_receipt, evidence_digest, policy_digest, receipt_digest),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    connection.execute("ROLLBACK")
+                    raise ReleaseEvidenceError("verified receipt was already recorded for this challenge") from exc
+                if self._prepare_path() != expected_identity:
+                    connection.execute("ROLLBACK")
+                    raise ReleaseEvidenceError("external freshness ledger changed while recording verified receipt")
+                connection.execute("COMMIT")
+        except ReleaseEvidenceError:
+            raise
+        except sqlite3.Error as exc:
+            raise ReleaseEvidenceError("external freshness ledger cannot record verified receipt") from exc

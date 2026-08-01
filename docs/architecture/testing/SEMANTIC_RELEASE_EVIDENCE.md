@@ -350,6 +350,17 @@ expected full `evidence_runner_revision` into
 `attach_external_capability_report`; omission or mismatch fails. That policy
 input is never accepted by the public structural assembler or report author.
 
+Trusted finalization uses the separate verifier-only module
+`kestrel_sovereign.knowledge.release_evidence_verifier_cli`, never the public
+`release_evidence` CLI. Its one protected owner-only configuration is rooted
+under a verifier-owned private directory and fixes the ledger path, public-key
+policy, expected external runner revision, and distinct receipt signer. It can
+issue a nonce and, only after every signed core record/budget and the external
+report verify, write one owner-only final artifact and an Ed25519 receipt. The
+ledger also records the evidence, policy, and receipt digests against the
+consumed challenge. The public `assemble` command remains structural and
+cannot issue challenges, consume a ledger, or emit `ready: true`.
+
 An external report is supplied as safe structured JSON—never as pre-populated
 metadata—and is structurally checked against the locally assembled stage
 records:

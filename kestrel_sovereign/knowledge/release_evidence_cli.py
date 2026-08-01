@@ -142,6 +142,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     assemble.add_argument("--output", type=Path, required=True)
     assemble.add_argument("--overwrite", action="store_true")
 
+
     args = parser.parse_args(argv)
     try:
         if args.command == "template":

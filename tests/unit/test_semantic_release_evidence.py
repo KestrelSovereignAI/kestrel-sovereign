@@ -13,6 +13,7 @@ import sys
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives import serialization
 
 from kestrel_sovereign.knowledge.release_evidence import (
     ArtifactReference,
@@ -959,6 +960,20 @@ def _cli(*arguments: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _verifier_cli(*arguments: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "kestrel_sovereign.knowledge.release_evidence_verifier_cli",
+            *arguments,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
 def _telemetry_command(output: Path) -> list[str]:
     return [
         "telemetry",
@@ -996,6 +1011,7 @@ def _write_structurally_complete_submission(
     *,
     core_identity: CatalogSigningIdentity,
     external_identity: CatalogSigningIdentity,
+    external_run_nonce: str = "a" * 64,
 ) -> tuple[list[Path], list[Path], Path, Path]:
     records: dict[str, EvidenceRecord] = {}
     record_paths: list[Path] = []
@@ -1007,7 +1023,11 @@ def _write_structurally_complete_submission(
             if spec.runner.runner_id == "external_ci"
             else core_identity
         )
-        record = _record(spec, identity=identity)
+        record = _record(
+            spec,
+            identity=identity,
+            external_run_nonce=external_run_nonce,
+        )
         records[spec.gate_id] = record
         path = tmp_path / f"submitted-{spec.gate_id}.json"
         _write_record(path, record)
@@ -1055,7 +1075,7 @@ def _write_structurally_complete_submission(
         capability_source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
         evidence_runner_revision="b" * 40,
         core_release_evidence_contract_digest=CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
-        run_nonce="a" * 64,
+        run_nonce=external_run_nonce,
         attestations=tuple(external_attestations),
     )
     external_report_path = tmp_path / "submitted-external-report.json"
@@ -1204,6 +1224,62 @@ def test_cli_run_executes_an_allowlisted_registry_workload_and_assemble_marks_it
     assert report_payload["ready"] is False
     assert report_payload["trust_status"] == "unverified"
     assert report_payload["structurally_complete"] is False
+
+
+def test_verifier_cli_requires_protected_config_and_consumes_one_external_challenge(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "verifier"
+    root.mkdir(mode=0o700)
+    receipt_key = root / "receipt.key"
+    receipt_bytes = b"\x07" * 32
+    _write_private_key(receipt_key, receipt_bytes)
+    receipt_public = Ed25519PrivateKey.from_private_bytes(receipt_bytes).public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    ).hex()
+    policy = {
+        "keys": [
+            _CATALOG_TEST_IDENTITY.trusted_key(
+                tuple(sorted({spec.runner.runner_id for spec in release_gate_specs() if spec.runner.runner_id != "external_ci"}))
+            ).to_mapping(),
+            _EXTERNAL_TEST_IDENTITY.trusted_key(("external_ci",)).to_mapping(),
+        ]
+    }
+    config = root / "verifier.json"
+    config.write_text(json.dumps({
+        "trusted_root": str(root), "ledger_path": str(root / "ledger.sqlite"),
+        "trust_policy": policy, "expected_external_runner_revision": "b" * 40,
+        "receipt_key_file": str(receipt_key), "receipt_issuer_id": "verifier_ci",
+        "receipt_key_id": "semantic_release", "receipt_public_key": receipt_public,
+    }), encoding="utf-8")
+    config.chmod(0o600)
+    challenge = _verifier_cli("--config", str(config), "issue-challenge")
+    assert challenge.returncode == 0, challenge.stderr
+    nonce = challenge.stdout.strip()
+    records, budgets, _, report = _write_structurally_complete_submission(
+        tmp_path, core_identity=_CATALOG_TEST_IDENTITY, external_identity=_EXTERNAL_TEST_IDENTITY,
+        external_run_nonce=nonce,
+    )
+    output, receipt = tmp_path / "verified.json", tmp_path / "receipt.json"
+    args = ["--config", str(config), "assemble", "--external-report", str(report), "--output", str(output), "--receipt-output", str(receipt)]
+    for record in records:
+        args.extend(("--record", str(record)))
+    for budget in budgets:
+        args.extend(("--budget", str(budget)))
+    assembled = _verifier_cli(*args)
+    assert assembled.returncode == 0, assembled.stderr
+    assert json.loads(output.read_text())["ready"] is True
+    assert json.loads(receipt.read_text())["evidence_runner_revision"] == "b" * 40
+    assert receipt.stat().st_mode & 0o777 == 0o600
+    replay_args = [*args]
+    replay_args[replay_args.index(str(output))] = str(tmp_path / "replay.json")
+    replay_args[replay_args.index(str(receipt))] = str(tmp_path / "replay-receipt.json")
+    assert _verifier_cli(*replay_args).returncode == 1
+
+    config.chmod(0o644)
+    denied = _verifier_cli("--config", str(config), "issue-challenge")
+    assert denied.returncode == 1
+    assert "owner-only" in denied.stderr
 
 
 def test_cli_run_blocks_a_kite_workload_until_its_dedicated_http_harness_exists(tmp_path: Path) -> None:
