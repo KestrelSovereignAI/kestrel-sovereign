@@ -723,6 +723,150 @@ async def test_assertion_vector_projection_cursor_and_lineage_have_backend_parit
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_vector_export_erasure_lifecycle_has_backend_parity(db_backend, tmp_path):
+    """One physical erase fences vector recall and external artifact serving."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from kestrel_sovereign.knowledge import (
+        GovernedArtifactConsumerAuthentication,
+        GovernedArtifactDeletionOwner,
+        GovernedArtifactDeletionProof,
+        GovernedArtifactError,
+    )
+    from kestrel_sovereign.storage.semantic_vector_projection import (
+        SemanticVectorProfile,
+        SemanticVectorProjectionError,
+    )
+
+    async def embed(text: str):
+        return [float(len(text)), 1.0]
+
+    profile = SemanticVectorProfile(
+        "vector-artifact-erasure-v1", "d" * 64,
+        provider="parity-provider", model="parity-model", dimension=2,
+    )
+
+    class EmbeddingService:
+        def describe(self):
+            return SimpleNamespace(
+                provider=profile.provider, model=profile.model,
+                dim=profile.dimension, profile_id=profile.profile_id,
+            )
+
+        def semantic_vector_destination(self):
+            return profile.embedding_destination
+
+        async def aembed(self, text):
+            return await embed(text)
+
+    tenant, identity = await _incepted_assertion_identity(
+        tmp_path, "vector-artifact-erasure",
+    )
+    storage = await _assertion_storage_for_backend(
+        db_backend, tenant, identity,
+        llm_service=SimpleNamespace(
+            get_embedding_service=lambda: EmbeddingService(),
+        ),
+    )
+    private_key = Ed25519PrivateKey.generate()
+    try:
+        unique = uuid4().hex
+        assertion = _semantic_assertion(
+            tenant, f"vector-artifact-erasure-{unique}",
+            value=f"vector-artifact-erasure-{unique}",
+            source_id=f"vector-artifact-erasure-source-{unique}",
+        )
+        await storage.put_assertion(
+            assertion,
+            source_occurrences=(
+                _semantic_source(f"vector-artifact-erasure-source-{unique}"),
+            ),
+        )
+        projection = storage.semantic_assertion_vector_projection(profile)
+        checkpoint = await projection.sync()
+        artifact_id = str(uuid4())
+        _, exported = await storage.export_assertion_snapshot(
+            artifact_id=artifact_id,
+            consumer_id="vector-artifact-parity-consumer",
+            consumer_key_id="vector-artifact-parity-key",
+            consumer_public_key=private_key.public_key().public_bytes(
+                serialization.Encoding.Raw, serialization.PublicFormat.Raw,
+            ).hex(),
+            retention_seconds=300,
+        )
+        assert [item.revision_id for item in exported] == [assertion.revision_id]
+        await storage.consume_governed_semantic_artifact(
+            artifact_id, expected_generation=checkpoint.generation,
+        )
+
+        erased = await storage.erase_assertion(
+            assertion.assertion_id, operation_id=f"vector-artifact-erase-{unique}",
+        )
+        with pytest.raises(GovernedArtifactError, match="not registered or has been revoked"):
+            await storage.consume_governed_semantic_artifact(
+                artifact_id, expected_generation=erased.generation,
+            )
+        pending = await storage.governed_semantic_artifact_erasure_observation(
+            expected_generation=erased.generation,
+        )
+        assert (pending.export_snapshots, pending.governed_corpus, pending.future_corpus) == (0, 0, 0)
+        assert (pending.pending_revocations, pending.completed_revocations) == (1, 0)
+        with pytest.raises(SemanticVectorProjectionError, match="checkpoint_stale"):
+            await projection.recall([1.0, 1.0])
+
+        # The opaque canonical erasure event forces a complete survivor
+        # rebuild before the vector projection can become recall-ready again.
+        await projection.sync()
+        assert await projection.recall([1.0, 1.0]) == ()
+        assert (await projection.erasure_observation()).candidate_count == 0
+
+        authentication = GovernedArtifactConsumerAuthentication(
+            "vector-artifact-parity-consumer", "vector-artifact-parity-key",
+            str(uuid4()), datetime.now(timezone.utc).isoformat(), "0" * 128,
+        )
+        authentication = replace(
+            authentication,
+            signature=private_key.sign(authentication.signable_bytes(tenant)).hex(),
+        )
+
+        async def delete_artifact(lease):
+            proof = GovernedArtifactDeletionProof(
+                datetime.now(timezone.utc).isoformat(), "0" * 128,
+            )
+            return replace(
+                proof, signature=private_key.sign(proof.signable_bytes(lease)).hex(),
+            )
+
+        receipt = await storage.process_governed_semantic_artifact_revocation(
+            authentication,
+            GovernedArtifactDeletionOwner(
+                "vector-artifact-parity-consumer", "vector-artifact-parity-key",
+                delete_artifact,
+            ),
+        )
+        assert receipt is not None
+        completed = await storage.governed_semantic_artifact_erasure_observation(
+            expected_generation=erased.generation,
+        )
+        assert (completed.export_snapshots, completed.governed_corpus, completed.future_corpus) == (0, 0, 0)
+        assert (completed.pending_revocations, completed.completed_revocations) == (0, 1)
+        assert await storage.db.fetchall(
+            "SELECT artifact_id FROM semantic_governed_artifacts WHERE tenant_id = ? "
+            "UNION ALL SELECT artifact_id FROM semantic_governed_artifact_lineage WHERE tenant_id = ?",
+            (tenant, tenant),
+        ) == []
+        # The remaining acknowledgement record is content-free retry evidence.
+        assert await storage.db.fetchall(
+            "SELECT artifact_digest, consumer_public_key "
+            "FROM semantic_governed_artifact_revocations WHERE tenant_id = ?",
+            (tenant,),
+        ) == [(None, "")]
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_save_fact_adapter_has_canonical_create_retry_supersede_delete_restart_parity(
     db_backend,
     tmp_path,

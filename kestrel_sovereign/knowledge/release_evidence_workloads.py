@@ -205,9 +205,11 @@ _PYTEST_SELECTORS: Final[Mapping[str, tuple[str, ...]]] = {
     ),
     "backend_parity_corpus_export_v1": (
         "tests/integration/test_storage_backend_parity.py::test_governed_semantic_recall_storage_seam_has_backend_parity",
+        "tests/integration/test_storage_backend_parity.py::test_governed_artifact_erasure_lifecycle_has_backend_parity",
     ),
     "backend_parity_retrieval_v1": (
         "tests/integration/test_storage_backend_parity.py::test_canonical_assertion_iri_object_query_has_backend_parity",
+        "tests/integration/test_storage_backend_parity.py::test_assertion_vector_projection_cursor_and_lineage_have_backend_parity",
     ),
     "semantic_maintenance_diagnostics_v1": (
         "tests/unit/test_sleep_observability.py::test_sleep_diagnostics_expose_verified_capabilities_and_repair_guidance",
