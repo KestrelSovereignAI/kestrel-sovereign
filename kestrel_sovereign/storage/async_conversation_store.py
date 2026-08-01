@@ -24,10 +24,13 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Seq
 from .async_database import AsyncDatabase
 from .conversation_ids import coerce_persistent_message_id
 from .session_grouping import (
+    canonical_timestamp_sql,
     coerce_session_timestamp,
     coalesce_sessions_by_session_id,
     group_messages_into_sessions,
     summarize_sessions,
+    timestamp_predicate,
+    timestamp_query_param,
 )
 from .destructive_audit import DestructiveAuditEvent, DestructiveAuditLog, hash_rows
 from .sqla.embedding_profile import upsert_embedding_profile as _upsert_embedding_profile
@@ -859,37 +862,16 @@ class AsyncConversationStore:
         return "datetime('now')"
 
     def _timestamp_query_param(self, value: Any) -> Any:
-        """Adapt the public ISO-string timestamp contract for PostgreSQL.
-
-        SQLite's query expressions normalize its mixed timestamp text with
-        ``julianday`` and accept the public ``*_iso`` argument directly.
-        asyncpg instead binds a ``TIMESTAMP`` predicate as a Python
-        :class:`datetime`, so pass the equivalent naive UTC value on
-        PostgreSQL. Invalid values remain unchanged: PostgreSQL rejects them,
-        while SQLite's ``julianday`` produces NULL and the destructive
-        predicate safely matches no rows.
-        """
-        if self.db.backend_type != "postgres":
-            return value
-        parsed = coerce_session_timestamp(value)
-        return value if parsed is None else parsed
+        """Adapt public timestamps through the shared backend boundary."""
+        return timestamp_query_param(self.db.backend_type, value)
 
     def _canonical_timestamp_sql(self, expression: str) -> str:
         """Normalize one timestamp SQL expression for the active backend."""
-        if self.db.backend_type == "sqlite":
-            # SQLite history contains both ``YYYY-MM-DD HH:MM:SS`` and public
-            # ISO-8601 ``T``/``Z`` representations.  Comparing or ordering the
-            # raw TEXT puts a space before ``T`` and misorders same-day values.
-            return f"julianday({expression})"
-        return expression
+        return canonical_timestamp_sql(self.db.backend_type, expression)
 
     def _timestamp_predicate(self, column: str, operator: str) -> str:
         """Compare timestamps canonically across supported storage formats."""
-        if operator not in {"<", ">="}:
-            raise ValueError(f"Unsupported timestamp comparison: {operator}")
-        left = self._canonical_timestamp_sql(column)
-        right = self._canonical_timestamp_sql("?")
-        return f"{left} {operator} {right}"
+        return timestamp_predicate(self.db.backend_type, column, operator)
 
     @property
     def encryption_enabled(self) -> bool:

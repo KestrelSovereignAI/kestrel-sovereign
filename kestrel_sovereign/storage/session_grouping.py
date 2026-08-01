@@ -63,6 +63,41 @@ def coerce_session_timestamp(created_at: Any) -> Optional[datetime]:
     return parsed
 
 
+def timestamp_query_param(backend_type: str, value: Any) -> Any:
+    """Bind a timestamp without relying on SQLite's implicit adapters.
+
+    Conversation history contains historical SQL-style text and public ISO
+    forms. SQLite compares those values through ``julianday`` and must receive
+    an explicit ISO string; binding an aware ``datetime`` would otherwise use
+    Python's deprecated implicit SQLite adapter. PostgreSQL binds timestamp
+    predicates as naive UTC ``datetime`` objects for asyncpg.
+    """
+    if backend_type == "postgres":
+        parsed = coerce_session_timestamp(value)
+        return value if parsed is None else parsed
+    if backend_type == "sqlite" and isinstance(value, datetime):
+        if value.tzinfo is not None:
+            value = value.astimezone(timezone.utc)
+        return value.isoformat()
+    return value
+
+
+def canonical_timestamp_sql(backend_type: str, expression: str) -> str:
+    """Normalize a timestamp SQL expression for the active backend."""
+    if backend_type == "sqlite":
+        return f"julianday({expression})"
+    return expression
+
+
+def timestamp_predicate(backend_type: str, column: str, operator: str) -> str:
+    """Compare timestamp columns and parameters across supported backends."""
+    if operator not in {"<", ">", ">="}:
+        raise ValueError(f"Unsupported timestamp comparison: {operator}")
+    left = canonical_timestamp_sql(backend_type, column)
+    right = canonical_timestamp_sql(backend_type, "?")
+    return f"{left} {operator} {right}"
+
+
 def group_messages_into_sessions(
     messages: Iterable[Dict[str, Any]],
     gap_minutes: float = SESSION_GAP_MINUTES,

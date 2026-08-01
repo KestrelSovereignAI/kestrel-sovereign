@@ -27,6 +27,7 @@ from .async_conversation_store import (
     _token_match_score,
     _tokenize_for_search,
 )
+from .session_grouping import timestamp_predicate, timestamp_query_param
 from kestrel_sovereign.security.input_guardrails import extract_raw_user_content
 
 # ``SalvageState`` lives in ``kestrel_sovereign.agent.salvage``;
@@ -246,14 +247,17 @@ class MemoryConsolidator:
 
         # Get messages from last 30 days
         cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        created_at_predicate = timestamp_predicate(
+            self._db.backend_type, "created_at", ">"
+        )
 
         rows = await self._db.fetchall(
-            """SELECT id, content, metadata, created_at, role
+            f"""SELECT id, content, metadata, created_at, role
                FROM conversation_history
-               WHERE agent_id = ? AND created_at > ?
+               WHERE agent_id = ? AND {created_at_predicate}
                  AND deleted_at IS NULL AND archived_at IS NULL
                ORDER BY created_at""",
-            (self.agent_id, cutoff)
+            (self.agent_id, timestamp_query_param(self._db.backend_type, cutoff))
         )
 
         if not rows:
@@ -1105,14 +1109,17 @@ class MemoryConsolidator:
 
         # Get messages from last 90 days for pattern detection
         cutoff = datetime.now(timezone.utc) - timedelta(days=90)
+        created_at_predicate = timestamp_predicate(
+            self._db.backend_type, "created_at", ">"
+        )
 
         rows = await self._db.fetchall(
-            """SELECT content, metadata, created_at
+            f"""SELECT content, metadata, created_at
                FROM conversation_history
-               WHERE agent_id = ? AND created_at > ?
+               WHERE agent_id = ? AND {created_at_predicate}
                  AND deleted_at IS NULL AND archived_at IS NULL
                ORDER BY created_at""",
-            (self.agent_id, cutoff)
+            (self.agent_id, timestamp_query_param(self._db.backend_type, cutoff))
         )
 
         messages = []
@@ -1315,26 +1322,38 @@ class MemoryConsolidator:
 
         # Build query for recent messages
         if cutoff:
+            created_at_predicate = timestamp_predicate(
+                self._db.backend_type, "created_at", ">"
+            )
             rows = await self._db.fetchall(
-                """SELECT id, content, metadata, created_at, role
+                f"""SELECT id, content, metadata, created_at, role
                    FROM conversation_history
-                   WHERE agent_id = ? AND created_at > ?
+                   WHERE agent_id = ? AND {created_at_predicate}
                      AND deleted_at IS NULL AND archived_at IS NULL
                    ORDER BY created_at""",
-                (self.agent_id, cutoff)
+                (
+                    self.agent_id,
+                    timestamp_query_param(self._db.backend_type, cutoff),
+                )
             )
         else:
             # Get messages from last 24 hours if no previous episode
             cutoff_time = datetime.now(timezone.utc) - timedelta(
                 hours=self.MAX_EPISODE_HOURS
             )
+            created_at_predicate = timestamp_predicate(
+                self._db.backend_type, "created_at", ">"
+            )
             rows = await self._db.fetchall(
-                """SELECT id, content, metadata, created_at, role
+                f"""SELECT id, content, metadata, created_at, role
                    FROM conversation_history
-                   WHERE agent_id = ? AND created_at > ?
+                   WHERE agent_id = ? AND {created_at_predicate}
                      AND deleted_at IS NULL AND archived_at IS NULL
                    ORDER BY created_at""",
-                (self.agent_id, cutoff_time)
+                (
+                    self.agent_id,
+                    timestamp_query_param(self._db.backend_type, cutoff_time),
+                )
             )
 
         if not rows:
