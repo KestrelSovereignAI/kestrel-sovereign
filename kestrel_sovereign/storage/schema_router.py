@@ -286,16 +286,18 @@ def _is_committing_clause(content: str, match, text: str) -> bool:
     if sentence.rstrip().endswith("?"):
         return False
 
-    # Negation is a property of THIS commitment, not the sentence. Two things
-    # go wrong with a sentence-wide veto (codex review r1):
-    #   * "Don't forget to submit the report" — the reminder cue contains its
-    #     own "don't", so the guard would veto the very pattern written to
-    #     catch it;
-    #   * "I don't need to deploy, but I will restart the host" — an unrelated
-    #     negated clause would drop a genuine commitment.
-    # Positive reminder cues are exempt outright; everything else is checked
-    # against the matched span only.
-    if not _POSITIVE_CUE_RE.search(matched) and _NEGATION_RE.search(matched):
+    # Negation attaches to the COMMITMENT OPERATOR, not to the sentence and not
+    # to the action. Scoping it anywhere wider regresses real extractions
+    # (codex review r1/r2):
+    #   * sentence-wide  -> "I don't need to deploy, but I will restart the
+    #                       host" loses the genuine second commitment;
+    #   * whole match    -> "I need to ensure the backup never expires" is
+    #                       dropped because the ACTION contains "never", and
+    #                       "We've decided not to deploy" is dropped even
+    #                       though choosing not to do something is a decision.
+    # The operator is the matched span with the captured action removed.
+    operator = matched[: match.start(match.lastindex or 0) - match.start()] if match.lastindex else matched
+    if not _POSITIVE_CUE_RE.search(operator) and _NEGATION_RE.search(operator):
         return False
 
     if _FILLER_TAIL_RE.search(text):
@@ -344,7 +346,7 @@ class ActionItemExtractor:
         must use this, not :meth:`extract`.
         """
         items: List[Tuple[str, str]] = []
-        seen: set[str] = set()
+        seen: Dict[str, int] = {}
         for pattern in ACTION_ITEM_PATTERNS:
             for match in re.finditer(pattern, content, flags=re.IGNORECASE):
                 text = match.group(len(match.groups())).strip().strip(",;")
@@ -353,10 +355,20 @@ class ActionItemExtractor:
                 if not _is_committing_clause(content, match, text):
                     continue
                 key = text.lower()
+                evidence = match.group(0)
                 if key in seen:
+                    # Same action, different cue. "I will ship. TODO: ship."
+                    # matches the weak first-person pattern first, so keeping
+                    # the first sighting would persist 0.7 despite the explicit
+                    # TODO (codex review r2). Upgrade in place instead.
+                    existing = seen[key]
+                    if claim_confidence(text, evidence) > claim_confidence(
+                        text, items[existing][1]
+                    ):
+                        items[existing] = (text, evidence)
                     continue
-                seen.add(key)
-                items.append((text, match.group(0)))
+                seen[key] = len(items)
+                items.append((text, evidence))
         return items
 
 

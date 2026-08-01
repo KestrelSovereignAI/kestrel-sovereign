@@ -212,3 +212,35 @@ class TestPersistedConfidenceIsReal:
         assert (
             strong.properties["confidence"] != weak.properties["confidence"]
         ), "persisted confidence carries no information"
+
+
+# ---------------------------------------------------------------------------
+# codex review r2 — negation belongs to the operator, not the action
+# ---------------------------------------------------------------------------
+
+class TestNegationInTheActionIsNotNegationOfTheCommitment:
+    def test_negative_condition_inside_a_real_action_survives(self):
+        items = _items("I need to ensure the backup never expires.")
+        assert any("backup never expires" in i for i in items), items
+
+    def test_negated_operator_is_still_rejected(self):
+        assert not any("deploy" in i for i in _items("I don't need to deploy."))
+
+    def test_negative_decision_is_still_a_decision(self):
+        """Choosing NOT to do something is an explicit decision."""
+        assert DecisionExtractor().extract("We've decided not to deploy.") == [
+            "not to deploy"
+        ]
+
+
+class TestDedupKeepsStrongestEvidence:
+    def test_later_todo_upgrades_an_earlier_weak_match(self):
+        pairs = ActionItemExtractor().extract_with_evidence("I will ship. TODO: ship.")
+        by_text = {t: e for t, e in pairs}
+        assert "ship" in by_text, by_text
+        assert claim_confidence("ship", by_text["ship"]) == STRONG_CLAIM_CONFIDENCE
+
+    def test_weak_only_stays_weak(self):
+        pairs = ActionItemExtractor().extract_with_evidence("I will ship.")
+        text, evidence = pairs[0]
+        assert claim_confidence(text, evidence) == DEFAULT_CLAIM_CONFIDENCE
