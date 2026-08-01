@@ -78,7 +78,8 @@ class MemoryConsolidator:
         return _GAP
 
     def __init__(self, db: AsyncDatabase, agent_id: str, graph_store=None,
-                 llm_service=None, persist_policy=None, conversation_store=None):
+                 llm_service=None, persist_policy=None, conversation_store=None,
+                 transition_lock=None):
         """
         Initialize consolidator.
 
@@ -109,6 +110,13 @@ class MemoryConsolidator:
                 while the agent is in a volatile privacy mode (#2672). ``None``
                 (raw storage, tests) imposes no gate — durable persistence
                 proceeds, preserving prior behaviour.
+            transition_lock: The agent's privacy-transition mutex
+                (``KestrelAgent._get_privacy_transition_lock()``). Episode
+                repair checks the privacy mode and THEN awaits decryption and
+                several writes, so without this a transition to EPHEMERAL /
+                ISOLATED can land in the await gap and the write persists
+                anyway (#2672 review P1, applied to repair in #2856). ``None``
+                (raw storage, offline CLI, tests) runs unguarded.
         """
         self._db = db
         self.agent_id = agent_id
@@ -116,6 +124,7 @@ class MemoryConsolidator:
         self._llm_service = llm_service
         self._persist_policy = persist_policy
         self._conversation_store = conversation_store
+        self._transition_lock = transition_lock
         # Lazily-built SQLAlchemy session factory for the shared vector
         # backend (mirrors SavedItemsStore). None when unavailable.
         self._sqla_factory = None
@@ -236,6 +245,11 @@ class MemoryConsolidator:
                 report["episodes_repaired"] = repair.get("repaired", 0)
                 if repair.get("unrepairable"):
                     report["episodes_unrepairable"] = repair["unrepairable"]
+                if repair.get("limit_reached"):
+                    # This is the only production caller, so dropping the
+                    # marker here means nothing ever reports that later corrupt
+                    # episodes went unexamined (codex review r2 P2).
+                    report["episode_repair_limit_reached"] = True
             except Exception as e:  # noqa: BLE001
                 logger.warning("episode repair pass failed: %s", e)
                 report["episodes_repaired"] = 0
@@ -1015,7 +1029,7 @@ class MemoryConsolidator:
 
     async def _apply_episode_repair(
         self, episode_id: str, title: str, summary: str, has_node: bool
-    ) -> None:
+    ) -> bool:
         """Persist a rebuilt narrative: graph node first, then row, then vector.
 
         Ordering is the requirement, not an implementation detail. The KG node
@@ -1026,40 +1040,112 @@ class MemoryConsolidator:
         never runs, and the episode stays wholly corrupt and wholly repairable
         on the next pass; the reverse order could leave a clean row behind a
         poisoned panel with nothing left to re-detect from.
-        """
-        if has_node:
-            from .async_graph_store import GraphNode
 
-            existing = await self._graph_store.get_node(episode_id)
-            properties = dict(getattr(existing, "properties", None) or {})
-            properties["summary"] = summary
-            properties["repaired_from_ciphertext"] = True
+        Both the lifecycle re-check and the durable writes happen under the
+        agent's privacy-transition lock. Candidate selection and decryption are
+        long awaits; without the lock a transition to EPHEMERAL / ISOLATED can
+        land in that gap and this raw ``memory_episodes`` update — which no
+        graph proxy governs — persists anyway (codex review r2 P1).
+
+        Returns True when the repair was applied, False when it was abandoned
+        because the episode was withdrawn or persistence became forbidden.
+        """
+        from .privacy_wrapper import optional_transition_lock
+
+        async with optional_transition_lock(self._transition_lock):
+            # Re-check under the lock, not once per pass. Between candidate
+            # selection and here the mode may have flipped.
+            if not self._durable_writes_allowed():
+                return False
+
+            # And the assertion lifecycle may have withdrawn the episode. Its
+            # sources are then content nobody may read, so a plaintext-derived
+            # narrative must not reach the panel (codex review r2 P1).
+            if await self._episode_is_withdrawn(episode_id):
+                return False
+
+            restore: Optional[Tuple[str, Dict[str, Any]]] = None
+            if has_node:
+                from .async_graph_store import GraphNode
+
+                existing = await self._graph_store.get_node(episode_id)
+                properties = dict(getattr(existing, "properties", None) or {})
+                restore = (
+                    getattr(existing, "label", None) or "",
+                    dict(properties),
+                )
+                properties["summary"] = summary
+                properties["repaired_from_ciphertext"] = True
+                await self._graph_store.add_node(
+                    GraphNode(
+                        node_id=episode_id,
+                        node_type="episode",
+                        label=title,
+                        properties=properties,
+                    )
+                )
+
+            # The stored vector was computed from the base64 title+summary, so
+            # it poisons the shared embedding space until it is re-derived.
+            # Clearing it in the SAME write that fixes the narrative is what
+            # makes the repair safe to leave half-done: `_embed_episode` is
+            # best-effort and returns silently when no provider is configured,
+            # and by then the title no longer matches the pre-filter, so the
+            # episode would never be selected again — stranding a base64
+            # vector in the shared space forever. NULL degrades to keyword
+            # recall, which is the documented fallback (codex review r1 P2).
+            #
+            # The exclusion predicate makes this write lose cleanly to a
+            # concurrent withdrawal rather than overwriting it.
+            changed = await self._db.execute(
+                "UPDATE memory_episodes SET title = ?, summary = ?, "
+                "embedding_vec = NULL, embedding_profile_id = NULL "
+                "WHERE id = ? AND agent_id = ? "
+                "AND COALESCE(excluded_from_context, 0) = 0",
+                (title, summary, episode_id, self.agent_id),
+            )
+
+            if not changed:
+                # Lost the race after the node was rewritten. Put the node
+                # back: a withdrawn episode showing reconstructed topics is
+                # the leak this whole branch exists to prevent.
+                if restore is not None:
+                    await self._restore_graph_node(episode_id, *restore)
+                return False
+
+            await self._embed_episode(episode_id, title, summary)
+            return True
+
+    async def _episode_is_withdrawn(self, episode_id: str) -> bool:
+        """Whether the assertion lifecycle has excluded this episode."""
+        return bool(
+            await self._db.fetchval(
+                "SELECT 1 FROM memory_episodes WHERE id = ? AND agent_id = ? "
+                "AND COALESCE(excluded_from_context, 0) = 1",
+                (episode_id, self.agent_id),
+            )
+        )
+
+    async def _restore_graph_node(
+        self, episode_id: str, label: str, properties: Dict[str, Any]
+    ) -> None:
+        """Undo a node rewrite whose row update did not land."""
+        from .async_graph_store import GraphNode
+
+        try:
             await self._graph_store.add_node(
                 GraphNode(
                     node_id=episode_id,
                     node_type="episode",
-                    label=title,
+                    label=label,
                     properties=properties,
                 )
             )
-
-        # The stored vector was computed from the base64 title+summary, so it
-        # poisons the shared embedding space until it is re-derived. Clearing
-        # it in the SAME write that fixes the narrative is what makes the
-        # repair safe to leave half-done: `_embed_episode` is best-effort and
-        # returns silently when no provider is configured, and by then the
-        # title no longer matches the pre-filter, so the episode would never be
-        # selected again — stranding a base64 vector in the shared space
-        # forever. NULL degrades to keyword recall, which is the documented
-        # fallback (codex review r1 P2).
-        await self._db.execute(
-            "UPDATE memory_episodes SET title = ?, summary = ?, "
-            "embedding_vec = NULL, embedding_profile_id = NULL "
-            "WHERE id = ? AND agent_id = ?",
-            (title, summary, episode_id, self.agent_id),
-        )
-
-        await self._embed_episode(episode_id, title, summary)
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                "episode repair could not restore the graph node for %s after "
+                "an abandoned write: %s", episode_id, e,
+            )
 
     async def repair_ciphertext_episodes(
         self, *, dry_run: bool = False, limit: int = 100
@@ -1212,13 +1298,21 @@ class MemoryConsolidator:
                 continue
 
             try:
-                await self._apply_episode_repair(
+                applied = await self._apply_episode_repair(
                     episode_id, new_title, new_summary, has_node
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning("episode repair failed for %s: %s", episode_id, e)
                 report["unrepairable"].append(
                     {"episode_id": episode_id, "reason": "write_failed"}
+                )
+                continue
+
+            if not applied:
+                # Withdrawn, or persistence became forbidden, while this
+                # episode was being decrypted. Nothing was persisted.
+                report["unrepairable"].append(
+                    {"episode_id": episode_id, "reason": "abandoned_mid_repair"}
                 )
                 continue
 

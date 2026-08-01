@@ -151,6 +151,7 @@ class _RecordingGraphStore:
         if not row:
             return None
         node = MagicMock()
+        node.label = row[0][2]
         node.properties = json.loads(row[0][3] or "{}")
         return node
 
@@ -643,8 +644,170 @@ class TestReviewFindings:
         finally:
             await db.close()
 
+    @pytest.mark.asyncio
+    async def test_exhausted_budget_reaches_the_consolidation_report(self, tmp_path):
+        """run_consolidation is the only production caller — the marker dies
+        there or it is never seen at all."""
+        db, ids, store = await _corrupt_fixture(tmp_path)
+        c = _consolidator(db, store, _RecordingGraphStore(db))
+        original = c.repair_ciphertext_episodes
+
+        async def _capped(**kwargs):
+            return await original(limit=1)
+
+        c.repair_ciphertext_episodes = _capped
+        try:
+            report = await c.run_consolidation()
+            assert report["episode_repair_limit_reached"] is True
+        finally:
+            await db.close()
+
+
+class TestRacesDuringRepair:
+    """codex review r2: repair checks state, then awaits, then writes."""
+
+    @pytest.mark.asyncio
+    async def test_withdrawal_mid_repair_does_not_persist(self, tmp_path):
+        """The lifecycle withdraws the episode while its sources decrypt.
+
+        The row update must lose the race rather than overwrite it, and the
+        graph node must be put back — a withdrawn episode showing
+        reconstructed topics in the Memories panel is the exact leak the
+        exclusion exists to prevent.
+        """
+        db, ids, store = await _corrupt_fixture(tmp_path)
+        graph = _RecordingGraphStore(db)
+
+        # Withdraw at the moment the node is rewritten: after selection and
+        # decryption, before the row update.
+        original_add = graph.add_node
+
+        async def _withdraw_then_write(node):
+            await db.execute(
+                "UPDATE memory_episodes SET excluded_from_context = 1 "
+                "WHERE id = ?", (node.node_id,)
+            )
+            graph.add_node = original_add  # only race the first write
+            return await original_add(node)
+
+        graph.add_node = _withdraw_then_write
+        c = _consolidator(db, store, graph)
+        try:
+            report = await c.repair_ciphertext_episodes()
+
+            assert report["repaired"] == 0
+            assert [u["reason"] for u in report["unrepairable"]] == [
+                "abandoned_mid_repair"
+            ]
+            assert await db.fetchval(
+                "SELECT title FROM memory_episodes WHERE id = ?",
+                ("episode:corrupt",)
+            ) == CORRUPT_TITLE
+            assert await db.fetchval(
+                "SELECT label FROM graph_nodes WHERE node_id = ?",
+                ("episode:corrupt",)
+            ) == CORRUPT_TITLE, "the node rewrite must have been rolled back"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_privacy_flip_mid_repair_does_not_persist(self, tmp_path):
+        """A transition to a volatile mode lands during decryption.
+
+        The raw memory_episodes write is governed by no graph proxy, so only
+        a re-check under the transition lock stops it.
+        """
+        db, ids, store = await _corrupt_fixture(tmp_path, with_node=False)
+        policy = MagicMock()
+        # Allowed at the start of the pass, forbidden by the time we write.
+        policy.allows_persistent_writes.side_effect = [True, False, False, False]
+        c = MemoryConsolidator(
+            db=db, agent_id=AGENT, graph_store=None,
+            conversation_store=store, persist_policy=policy,
+        )
+        try:
+            report = await c.repair_ciphertext_episodes()
+
+            assert report["repaired"] == 0
+            assert [u["reason"] for u in report["unrepairable"]] == [
+                "abandoned_mid_repair"
+            ]
+            assert await db.fetchval(
+                "SELECT title FROM memory_episodes WHERE id = ?",
+                ("episode:corrupt",)
+            ) == CORRUPT_TITLE
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_transition_lock_is_held_across_the_writes(self, tmp_path):
+        db, ids, store = await _corrupt_fixture(tmp_path)
+        held = {"during_write": False}
+
+        class _Lock:
+            def __init__(self):
+                self.depth = 0
+
+            async def __aenter__(self):
+                self.depth += 1
+
+            async def __aexit__(self, *exc):
+                self.depth -= 1
+
+        lock = _Lock()
+        graph = _RecordingGraphStore(db)
+        original_add = graph.add_node
+
+        async def _observe(node):
+            held["during_write"] = lock.depth > 0
+            return await original_add(node)
+
+        graph.add_node = _observe
+        c = MemoryConsolidator(
+            db=db, agent_id=AGENT, graph_store=graph,
+            conversation_store=store, transition_lock=lock,
+        )
+        try:
+            report = await c.repair_ciphertext_episodes()
+            assert report["repaired"] == 1
+            assert held["during_write"], (
+                "durable writes must happen inside the privacy-transition lock"
+            )
+            assert lock.depth == 0, "the lock must be released"
+        finally:
+            await db.close()
+
+
+class TestLockReachesTheConsolidator:
+    """The lock is only useful if the real construction path delivers it.
+
+    MemorySystem builds the consolidator in initialize(), not __init__, so a
+    lock accepted by the constructor and never stored never arrives. Tests that
+    build MemoryConsolidator directly cannot see that.
+    """
+
+    @pytest.mark.asyncio
+    async def test_memory_system_forwards_the_lock_to_the_consolidator(
+        self, tmp_path
+    ):
+        from kestrel_sovereign.storage.async_storage import AsyncStorage
+        from kestrel_sovereign.storage.memory_system import MemorySystem
+
+        sentinel = object()
+        storage = AsyncStorage(db_path=str(tmp_path / "ms.db"), agent_id=AGENT)
+        await storage.initialize()
+        ms = MemorySystem(
+            storage=storage, agent_id=AGENT, transition_lock=sentinel
+        )
+        try:
+            await ms.initialize()
+            assert ms.consolidator._transition_lock is sentinel
+        finally:
+            await storage.close()
+
 
 class TestWiredIntoConsolidation:
+    """Repair that nothing calls is repair that never happens."""
     """Repair that nothing calls is repair that never happens."""
 
     @pytest.mark.asyncio
