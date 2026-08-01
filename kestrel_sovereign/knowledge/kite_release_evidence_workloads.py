@@ -1,11 +1,12 @@
 """Executable, explicitly provisioned Kite HTTP release workloads.
 
-The core erasure runner is registered only because this module owns *both*
-isolated storage backends.  It creates PostgreSQL through the acknowledged
-disposable-database authority, runs a distinct loopback Kite process against
-SQLite and that exact generated database, and emits an aggregate only after
-both observations pass.  The public CLI still cannot select a listener, home,
-port, DSN, or observation.
+The core live and erasure runners are registered only because this module owns
+*both* isolated storage backends. It creates PostgreSQL through the
+acknowledged disposable-database authority, runs a distinct loopback Kite
+process against SQLite and that exact generated database, and emits an
+aggregate only after both observations pass. Sleep runs the exact backend
+named by its immutable target. The public CLI still cannot select a listener,
+home, port, DSN, or observation.
 """
 
 from __future__ import annotations
@@ -67,17 +68,74 @@ async def _run_with_owned_postgres_harness(harness: KiteHttpHarness, callback):
         harness.stop()
 
 
-def _live_workload(spec: GateSpec, factory: KiteHarnessFactory) -> CatalogWorkloadResult:
+async def _dual_backend_observations(
+    factory: KiteHarnessFactory,
+    gate: KiteGate,
+    callback,
+):
+    """Run distinct SQLite and authority-created PostgreSQL Kite processes."""
+    database = await DisposablePostgresDatabase.create()
+    async with database:
+        sqlite_observation = _run_with_owned_harness(
+            factory(gate, KiteStorageConfig()), callback
+        )
+        postgres_observation = await _run_with_owned_postgres_harness(
+            factory(
+                gate,
+                KiteStorageConfig(backend="postgres", disposable_postgres=database),
+            ),
+            callback,
+        )
+    return sqlite_observation, postgres_observation
+
+
+def _aggregate_backend_mappings(
+    sqlite_observation: dict[str, int], postgres_observation: dict[str, int]
+) -> dict[str, int]:
+    """Emit only schema fields after both backend observations agree exactly."""
+    if set(sqlite_observation) != set(postgres_observation):
+        raise ReleaseEvidenceError("Kite backend observations exposed different aggregate fields")
+    aggregate: dict[str, int] = {}
+    for key in sqlite_observation:
+        left, right = sqlite_observation[key], postgres_observation[key]
+        if type(left) is not int or type(right) is not int or left < 0 or right < 0:
+            raise ReleaseEvidenceError(
+                "Kite backend observation must contain non-negative integer counts"
+            )
+        aggregate[key] = left + right
+    return aggregate
+
+
+async def _live_workload(
+    spec: GateSpec, factory: KiteHarnessFactory
+) -> CatalogWorkloadResult:
     gate = _LIVE_GATE_BY_ID.get(spec.gate_id)
     if gate is None:
         raise ReleaseEvidenceError("Kite live workload is not in the immutable catalog")
-    observation = _run_with_owned_harness(
-        factory(gate, KiteStorageConfig()), lambda harness: harness.run_release_gate()
+    expected_mode = {
+        KiteGate.STABLE_ONLY: "kite_http_stable",
+        KiteGate.EXPERIMENTAL_ENABLED: "kite_http_experimental",
+        KiteGate.PERSISTED_STABLE: "kite_http_persisted",
+    }[gate]
+    if spec.environment.backend != "dual_backend" or spec.environment.mode != expected_mode:
+        raise ReleaseEvidenceError(
+            "Kite live workload requires its immutable dual-backend catalog contract"
+        )
+    sqlite_observation, postgres_observation = await _dual_backend_observations(
+        factory,
+        gate,
+        lambda harness: harness.run_release_gate(),
     )
-    return CatalogWorkloadResult(observation=observation.to_mapping())
+    return CatalogWorkloadResult(
+        observation=_aggregate_backend_mappings(
+            sqlite_observation.to_mapping(), postgres_observation.to_mapping()
+        )
+    )
 
 
-def _sleep_workload(spec: GateSpec, factory: KiteHarnessFactory) -> CatalogWorkloadResult:
+async def _sleep_workload(
+    spec: GateSpec, factory: KiteHarnessFactory
+) -> CatalogWorkloadResult:
     target = spec.performance_target
     if (
         target is None
@@ -85,16 +143,25 @@ def _sleep_workload(spec: GateSpec, factory: KiteHarnessFactory) -> CatalogWorkl
         or target.mode != "kite_http"
     ):
         raise ReleaseEvidenceError("Kite sleep workload must match its immutable performance target")
-    if target.backend != "sqlite":
-        # A performance runner has no database authority.  Do not let a
-        # caller smuggle a PostgreSQL DSN through the old backend label.
-        raise CatalogWorkloadUnavailable("kite_postgres_disposable_authority_required")
-    samples = _run_with_owned_harness(
-        factory(KiteGate.STABLE_ONLY, KiteStorageConfig()),
-        lambda harness: harness.measure_sleep(
-            changed=target.metric is PerformanceMetric.CHANGED_WORK_SLEEP,
-        ),
+    callback = lambda harness: harness.measure_sleep(
+        changed=target.metric is PerformanceMetric.CHANGED_WORK_SLEEP,
     )
+    if target.backend == "sqlite":
+        samples = _run_with_owned_harness(
+            factory(KiteGate.STABLE_ONLY, KiteStorageConfig()), callback
+        )
+    elif target.backend == "postgres":
+        database = await DisposablePostgresDatabase.create()
+        async with database:
+            samples = await _run_with_owned_postgres_harness(
+                factory(
+                    KiteGate.STABLE_ONLY,
+                    KiteStorageConfig(backend="postgres", disposable_postgres=database),
+                ),
+                callback,
+            )
+    else:
+        raise ReleaseEvidenceError("Kite sleep workload has an unsupported catalog backend")
     p95 = sorted(samples)[math.ceil(len(samples) * 0.95) - 1]
     return CatalogWorkloadResult(
         observation={"sample_count": len(samples), "p95_ms": p95},
@@ -128,19 +195,11 @@ async def _core_erasure_workload(
 
     # ``create`` is the sole PostgreSQL entry point.  It rejects ambient DSNs
     # and an unacknowledged admin channel before a harness receives any config.
-    database = await DisposablePostgresDatabase.create()
-    async with database:
-        sqlite_observation = _run_with_owned_harness(
-            factory(KiteGate.STABLE_ONLY, KiteStorageConfig()),
-            lambda harness: harness.core_erasure_stage(stage),
-        )
-        postgres_observation = await _run_with_owned_postgres_harness(
-            factory(
-                KiteGate.STABLE_ONLY,
-                KiteStorageConfig(backend="postgres", disposable_postgres=database),
-            ),
-            lambda harness: harness.core_erasure_stage(stage),
-        )
+    sqlite_observation, postgres_observation = await _dual_backend_observations(
+        factory,
+        KiteGate.STABLE_ONLY,
+        lambda harness: harness.core_erasure_stage(stage),
+    )
 
     # SurfaceErasureObservation validates each backend independently.  Keep
     # the public record content-free: only the aggregate schema fields escape.
@@ -211,18 +270,13 @@ def _owned_catalog_harness(gate: KiteGate, storage: KiteStorageConfig) -> KiteHt
 
 
 def owned_kite_http_workloads() -> dict[tuple[str, str], CatalogWorkload]:
-    """Return only the core erasure work owned by the no-config catalog.
+    """Register every core-owned, no-config Kite catalog workload.
 
-    The earlier live-recall/sleep runners remain deliberately unregistered
-    pending their separate HTTP readiness review.  This prevents a catalog
-    expansion from silently promoting an unrelated old scaffold to release
-    evidence merely because the erasure authority is now available.
+    The immutable catalog chooses the gate/backend.  This factory supplies
+    only fresh loopback process state and a core-created disposable database;
+    no CLI argument can turn a live/sleep/erasure record into a synthetic pass.
     """
-    return {
-        key: workload
-        for key, workload in kite_http_workloads(_owned_catalog_harness).items()
-        if key[1].startswith("erasure_")
-    }
+    return kite_http_workloads(_owned_catalog_harness)
 
 
 __all__ = ["KiteHarnessFactory", "kite_http_workloads", "owned_kite_http_workloads"]

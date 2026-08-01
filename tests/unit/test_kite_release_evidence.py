@@ -509,8 +509,8 @@ def test_correlated_erasure_requires_every_stage_and_one_drill(tmp_path: Path, m
     assert len(observations) == len(ErasureStage)
 
 
-def test_semantic_diagnostics_command_is_authenticated_before_agent_dispatch() -> None:
-    """The normal invoke guard protects release diagnostics as it protects all tools."""
+def test_regular_memory_command_is_authenticated_before_agent_dispatch() -> None:
+    """The normal invoke guard protects memory tools before agent dispatch."""
     from server import app
 
     @asynccontextmanager
@@ -532,7 +532,7 @@ def test_semantic_diagnostics_command_is_authenticated_before_agent_dispatch() -
             with TestClient(app) as client:
                 response = client.post(
                     "/api/agent/invoke",
-                    json={"input": "!memory-semantic-evidence"},
+                    json={"input": "!memory-save-fact user preferred_deploy_region us-central"},
                 )
         assert response.status_code == 401
         agent.process_input.assert_not_awaited()
@@ -557,13 +557,8 @@ def test_kite_invoke_returns_signed_runtime_observation_without_assistant_dispat
     agent.register_active_request = MagicMock()
     agent._cleanup_cancelled_request = MagicMock()
     agent.process_input = AsyncMock(return_value="forged assistant response")
-    agent.task_manager.execute_command = AsyncMock(
-        return_value={
-            "status": "ok",
-            "confirmation": "runtime diagnostics complete",
-            "data": {"semantic_evidence": diagnostics},
-        }
-    )
+    agent.task_manager.execute_command = AsyncMock()
+    agent.storage.semantic_release_kite_diagnostics = AsyncMock(return_value=diagnostics)
     original_lifespan = app.router.lifespan_context
     original_agent = getattr(app.state, "agent", None)
     original_manager = getattr(app.state, "agent_manager", None)
@@ -655,9 +650,10 @@ def test_kite_invoke_returns_signed_runtime_observation_without_assistant_dispat
             ).encode("utf-8"),
         )
         agent.process_input.assert_not_awaited()
-        agent.task_manager.execute_command.assert_awaited_once_with(
-            "!memory-semantic-evidence"
+        agent.storage.semantic_release_kite_diagnostics.assert_awaited_once_with(
+            operation_id=f"kite-diagnostics-{nonce}"
         )
+        agent.task_manager.execute_command.assert_not_awaited()
     finally:
         app.router.lifespan_context = original_lifespan
         app.state.agent = original_agent

@@ -1793,7 +1793,7 @@ def test_verifier_cli_requires_protected_config_and_consumes_one_external_challe
     assert "owner-only" in denied.stderr
 
 
-def test_cli_run_blocks_a_kite_workload_until_its_dedicated_http_harness_exists(tmp_path: Path) -> None:
+def test_cli_run_blocks_registered_kite_workload_without_postgres_authority(tmp_path: Path) -> None:
     spec = _gate("kite_http_stable_only_release_drill")
     key_file = tmp_path / "signing.key"
     _write_private_key(key_file, b"\x03" * 32)
@@ -1813,15 +1813,15 @@ def test_cli_run_blocks_a_kite_workload_until_its_dedicated_http_harness_exists(
         str(record),
     )
 
-    assert result.returncode == 2, result.stderr
+    assert result.returncode == 1, result.stderr
     payload = json.loads(record.read_text(encoding="utf-8"))
     assert payload["state"] == "blocked"
-    assert payload["reason_code"] == "catalog_workload_unavailable"
+    assert payload["reason_code"] == "isolated_postgres_ack_required"
     assert payload["execution_attestation"] is None
 
 
-def test_default_catalog_registers_real_core_contracts_but_not_kite_http_drills() -> None:
-    """Core test/benchmark runners remain distinct from real Kite HTTP work."""
+def test_default_catalog_registers_real_core_contracts_and_kite_http_drills() -> None:
+    """The no-config catalog owns every real core Kite workload."""
     from kestrel_sovereign.knowledge.release_evidence_execution import (
         default_catalog_workloads,
     )
@@ -1844,10 +1844,15 @@ def test_default_catalog_registers_real_core_contracts_but_not_kite_http_drills(
         assert (spec.runner.runner_id, spec.runner.command_id) in workloads
     for gate_id in (
         "kite_http_stable_only_release_drill",
+        "kite_http_experimental_enabled_release_drill",
         "stable_persisted_data_no_canonical_migration_drill",
+        "performance_changed_work_sleep_sqlite_kite_http",
+        "performance_changed_work_sleep_postgres_kite_http",
+        "performance_unchanged_sleep_sqlite_kite_http",
+        "performance_unchanged_sleep_postgres_kite_http",
     ):
         spec = _gate(gate_id)
-        assert (spec.runner.runner_id, spec.runner.command_id) not in workloads
+        assert (spec.runner.runner_id, spec.runner.command_id) in workloads
     for gate_id in (
         "erasure_active_assertions",
         "erasure_vector_index",
@@ -2064,13 +2069,11 @@ def test_parity_child_environment_never_inherits_an_ambient_postgres_dsn(
 @pytest.mark.parametrize(
     "gate_id",
     (
-        "performance_changed_work_sleep_sqlite_kite_http",
         "performance_changed_work_sleep_postgres_kite_http",
-        "performance_unchanged_sleep_sqlite_kite_http",
         "performance_unchanged_sleep_postgres_kite_http",
     ),
 )
-def test_catalog_benchmark_refuses_to_relabel_inprocess_sleep_as_kite_http(gate_id: str) -> None:
+def test_catalog_sleep_blocks_without_explicit_postgres_authority(gate_id: str) -> None:
     from kestrel_sovereign.knowledge.release_evidence_execution import (
         CatalogExecutionAuthority,
         default_catalog_workloads,
@@ -2083,7 +2086,7 @@ def test_catalog_benchmark_refuses_to_relabel_inprocess_sleep_as_kite_http(gate_
     )
 
     assert execution.record.state is EvidenceState.BLOCKED
-    assert execution.record.reason_code == "kite_http_benchmark_runner_required"
+    assert execution.record.reason_code == "isolated_postgres_ack_required"
 
 
 def test_cli_run_executes_a_real_rdf_fixture_workload_without_recording_test_arguments(

@@ -3128,6 +3128,152 @@ class PrivacyEnforcingStorage:
             invocation_id=invocation_id,
         )
 
+    @staticmethod
+    def _require_kite_release_operation(operation_id: str, *, prefix: str) -> None:
+        """Accept only one server-derived, nonce-bound Kite operation name."""
+        import os
+        import re
+
+        if os.environ.get("KESTREL_KITE_RELEASE_EVIDENCE", "").strip().lower() not in {
+            "1", "true", "yes", "on",
+        }:
+            raise PrivacyViolationError("Kite release evidence is unavailable")
+        if not isinstance(operation_id, str) or not re.fullmatch(
+            rf"{re.escape(prefix)}[0-9a-f]{{64}}", operation_id
+        ):
+            raise PrivacyViolationError("Kite release evidence operation is invalid")
+
+    async def semantic_release_kite_diagnostics(self, *, operation_id: str) -> dict[str, object]:
+        """Return fixed, content-free diagnostics from real semantic owners.
+
+        The endpoint owns the operation identity and exposes only the returned
+        aggregate.  This is deliberately not a general diagnostic query: it
+        cannot select a tenant, source, assertion, migration, or capability.
+        """
+        self._require_kite_release_operation(
+            operation_id, prefix="kite-diagnostics-"
+        )
+        self._assert_semantic_assertion_read_allowed("Kite release diagnostics")
+        from kestrel_sovereign.features.memory_agency.semantic_facts import (
+            _is_adapter_source,
+            map_legacy_fact,
+        )
+        from kestrel_sovereign.knowledge import AssertionQuery
+
+        binding = self._storage.semantic_assertion_binding()
+        mapping = map_legacy_fact(
+            "user",
+            "preferred_deploy_region",
+            "kite-release-diagnostic",
+            tenant_id=binding.tenant_id,
+        )
+        assertions = await self.query_assertions(
+            AssertionQuery(subject=mapping.subject, predicate=mapping.predicate, limit=10)
+        )
+        provenance_count = 0
+        for assertion in assertions:
+            sources = await self.list_assertion_sources(assertion.assertion_id)
+            provenance_count += sum(1 for source in sources if _is_adapter_source(source))
+        migration = await self._storage.legacy_graph_fact_migration().compatibility_metrics()
+        migration_count = migration.get("canonical_recorded")
+        if type(migration_count) is not int or migration_count < 0:
+            raise RuntimeError("Kite migration diagnostics did not return a bounded count")
+        capabilities = self._storage.semantic_capabilities
+        return {
+            "capability_mode": capabilities.mode,
+            "active_capability_pins": [
+                f"{key}={value}"
+                for key, value in sorted(capabilities.capability_versions().items())
+            ],
+            "canonical_migration_count": migration_count,
+            "explicit_fact_provenance_present_count": provenance_count,
+        }
+
+    async def semantic_release_kite_invalid_import_quarantine(
+        self, *, operation_id: str
+    ) -> dict[str, int]:
+        """Drive one fixed invalid imported candidate through the real validator.
+
+        A server-owned one-triple budget makes the complete candidate graph
+        nonconformant/incomplete before canonical admission.  The production
+        imported-source policy persists a tenant-private quarantine report and
+        deliberately retains neither canonical assertion nor its identity.
+        """
+        self._require_kite_release_operation(
+            operation_id, prefix="kite-import-quarantine-"
+        )
+        self._assert_semantic_assertion_write_allowed("Kite invalid import quarantine")
+        import hashlib
+
+        from kestrel_sovereign.features.memory_agency.semantic_facts import map_legacy_fact
+        from kestrel_sovereign.knowledge import (
+            Assertion,
+            DirectLineage,
+            EpistemicState,
+            SourceOccurrence,
+            XSD_STRING,
+        )
+        from kestrel_sovereign.knowledge.assertion import Literal
+        from kestrel_sovereign.knowledge.shacl_validation import (
+            ShaclValidationLimits,
+            ValidationSource,
+            ValidationWriteAction,
+        )
+
+        binding = self._storage.semantic_assertion_binding()
+        mapping = map_legacy_fact(
+            "user",
+            "preferred_deploy_region",
+            "kite-release-invalid-import",
+            tenant_id=binding.tenant_id,
+        )
+        digest = hashlib.sha256(operation_id.encode("ascii")).hexdigest()
+        source_id = f"source:kite-release-invalid-import:{digest}"
+        candidate = Assertion(
+            tenant_id=binding.tenant_id,
+            owning_agent_id=binding.owning_agent_id,
+            subject=mapping.subject,
+            predicate=mapping.predicate,
+            object=Literal("kite-release-invalid-import", XSD_STRING),
+            revision_id=f"kite-import-{digest[:24]}",
+            confidence="1.0",
+            confidence_method="kite-release-import-probe",
+            confidence_basis="server-owned-fixed-candidate",
+            epistemic_state=EpistemicState.REPORTED,
+            asserted_at="2026-07-31T00:00:00Z",
+            ontology_version=mapping.ontology,
+            lineage=DirectLineage((source_id,)),
+            privacy_classification=binding.privacy_classification,
+            release_policy_reference=binding.release_policy_reference,
+            visibility=binding.visibility,
+        )
+        source = SourceOccurrence(
+            source_occurrence_id=source_id,
+            source_kind="kite_release_import_probe",
+            locator="internal:kite-release-invalid-import",
+            received_at="2026-07-31T00:00:00Z",
+            content_digest=f"sha256:{digest}",
+            actor=binding.owning_agent_id,
+            selector="fixed-server-probe",
+        )
+        result = await self.semantic_validation_service().put_assertion(
+            candidate,
+            source_occurrences=(source,),
+            source=ValidationSource.IMPORTED,
+            limits=ShaclValidationLimits(max_graph_triples=1),
+            operation_id=operation_id,
+            run_id=f"kite-import-{digest[:24]}",
+        )
+        if (
+            result.accepted
+            or result.report.source is not ValidationSource.IMPORTED
+            or result.report.action is not ValidationWriteAction.QUARANTINE
+            or result.report.assertion_ids
+            or await self.get_assertion(candidate.assertion_id) is not None
+        ):
+            raise RuntimeError("Kite invalid import did not stay in the quarantine boundary")
+        return {"invalid_import_quarantine_count": 1}
+
     async def semantic_release_erasure_drill(self, *, operation_id: str) -> dict[str, dict[str, int]]:
         """Run the fixed, isolated Kite physical-erasure drill.
 

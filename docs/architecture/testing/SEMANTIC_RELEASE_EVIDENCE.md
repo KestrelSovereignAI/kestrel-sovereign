@@ -449,6 +449,14 @@ restart persistence, and post-delete non-recall. The release artifact records
 only the catalog-bound aggregate observation and approved artifact reference;
 the transcript remains in the isolated evidence environment.
 
+Kite has no public semantic-evidence command. Its fixed diagnostics and
+invalid-import probes are server-owned typed operations, available only to
+the loopback isolated test instance after bootstrap authentication, nonce
+consumption, and signed-response verification. They derive tenant scope,
+capability pins, active explicit-fact provenance, migration receipts, and the
+fixed validation budget in production storage code; callers supply none of
+those inputs and receive only aggregate counts.
+
 ## Compatibility retirement is an observed decision
 
 `legacy_fact_migration_equivalence` is a dedicated non-readiness gate used only

@@ -100,11 +100,11 @@ async def _kite_runtime_observation(
     elif operation == "diagnostics":
         if value is not None:
             raise _kite_evidence_error("Invalid Kite evidence request.")
-        command = "!memory-semantic-evidence"
+        command = None
     elif operation == "quarantine":
         if value is not None:
             raise _kite_evidence_error("Invalid Kite evidence request.")
-        command = "!memory-semantic-evidence-quarantine"
+        command = None
     elif operation in {"sleep", "sleep_changed", "sleep_unchanged", "paraphrase_recall", "erasure_core_snapshot"}:
         if value is not None:
             raise _kite_evidence_error("Invalid Kite evidence request.")
@@ -154,6 +154,20 @@ async def _kite_runtime_observation(
             if not isinstance(observation, dict):
                 raise RuntimeError("Kite core erasure drill is unavailable")
             return operation, observation
+        if operation == "diagnostics":
+            observation = await agent.storage.semantic_release_kite_diagnostics(
+                operation_id=f"kite-diagnostics-{nonce}"
+            )
+            if not isinstance(observation, dict):
+                raise RuntimeError("Kite semantic diagnostics are unavailable")
+            return operation, observation
+        if operation == "quarantine":
+            observation = await agent.storage.semantic_release_kite_invalid_import_quarantine(
+                operation_id=f"kite-import-quarantine-{nonce}"
+            )
+            if observation != {"invalid_import_quarantine_count": 1}:
+                raise RuntimeError("Kite invalid import probe did not complete")
+            return operation, observation
 
         task_manager = getattr(agent, "task_manager", None)
         if task_manager is None:
@@ -171,14 +185,7 @@ async def _kite_runtime_observation(
         if data.get("deleted") is not True:
             raise RuntimeError("Kite runtime fact deletion did not complete")
         return operation, {"fact_delete_count": 1}
-    semantic = data.get("semantic_evidence")
-    if not isinstance(semantic, dict):
-        raise RuntimeError("Kite runtime semantic evidence is unavailable")
-    if operation == "diagnostics":
-        return operation, dict(semantic)
-    if semantic != {"invalid_import_quarantine_count": 1}:
-        raise RuntimeError("Kite invalid import probe did not complete")
-    return operation, dict(semantic)
+    raise RuntimeError("Kite runtime command operation was not recognized")
 
 
 def _privacy_transition_conflict() -> HTTPException:

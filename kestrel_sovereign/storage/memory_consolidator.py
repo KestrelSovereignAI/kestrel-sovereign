@@ -245,7 +245,7 @@ class MemoryConsolidator:
         report_skipped: List[Tuple[str, int, str]] = []
 
         # Get messages from last 30 days
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
 
         rows = await self._db.fetchall(
             """SELECT id, content, metadata, created_at, role
@@ -1104,7 +1104,7 @@ class MemoryConsolidator:
         from .temporal_analyzer import TemporalAnalyzer
 
         # Get messages from last 90 days for pattern detection
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+        cutoff = datetime.now(timezone.utc) - timedelta(days=90)
 
         rows = await self._db.fetchall(
             """SELECT content, metadata, created_at
@@ -1325,9 +1325,9 @@ class MemoryConsolidator:
             )
         else:
             # Get messages from last 24 hours if no previous episode
-            cutoff_time = (
-                datetime.now(timezone.utc) - timedelta(hours=self.MAX_EPISODE_HOURS)
-            ).isoformat()
+            cutoff_time = datetime.now(timezone.utc) - timedelta(
+                hours=self.MAX_EPISODE_HOURS
+            )
             rows = await self._db.fetchall(
                 """SELECT id, content, metadata, created_at, role
                    FROM conversation_history

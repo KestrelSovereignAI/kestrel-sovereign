@@ -12,6 +12,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from kestrel_sovereign.knowledge import kite_release_evidence_workloads as workloads
 from kestrel_sovereign.knowledge.kite_release_evidence import (
     KiteEvidenceError,
+    KiteAggregateObservation,
     KiteGate,
     KiteIsolationConfig,
     KiteStorageConfig,
@@ -65,8 +66,17 @@ def _database() -> tuple[DisposablePostgresDatabase, _AdminConnection]:
 
 
 class _Harness:
-    def __init__(self, stage: ErasureStage, calls: list[str], backend: str, *, fail: bool = False) -> None:
+    def __init__(
+        self,
+        stage: ErasureStage,
+        gate: KiteGate,
+        calls: list[str],
+        backend: str,
+        *,
+        fail: bool = False,
+    ) -> None:
         self._stage = stage
+        self._gate = gate
         self._calls = calls
         self._backend = backend
         self._fail = fail
@@ -91,6 +101,33 @@ class _Harness:
             raise KiteEvidenceError("postgres harness failed")
         return SurfaceErasureObservation(stage, 1, 0, erasure_drill_binding())
 
+    def run_release_gate(self) -> KiteAggregateObservation:
+        self._calls.append(f"live:{self._backend}")
+        if self._gate is KiteGate.PERSISTED_STABLE:
+            return KiteAggregateObservation(
+                gate_id=self._gate.value,
+                invoke_count=1,
+                scenario_count=1,
+                persisted_assertion_count=1,
+            )
+        if self._gate is KiteGate.EXPERIMENTAL_ENABLED:
+            return KiteAggregateObservation(
+                gate_id=self._gate.value,
+                invoke_count=1,
+                scenario_count=1,
+                experimental_selection_count=1,
+            )
+        return KiteAggregateObservation(
+            gate_id=self._gate.value,
+            invoke_count=1,
+            scenario_count=1,
+            provenance_check_count=1,
+        )
+
+    def measure_sleep(self, *, changed: bool) -> tuple[float, ...]:
+        self._calls.append(f"sleep:{self._backend}:{changed}")
+        return (1.0, 2.0, 3.0)
+
 
 def test_core_erasure_runs_both_owned_backends_and_closes_database(
     monkeypatch: pytest.MonkeyPatch,
@@ -105,9 +142,9 @@ def test_core_erasure_runs_both_owned_backends_and_closes_database(
     calls: list[str] = []
     spec = _gate("erasure_active_assertions")
 
-    def factory(_gate: KiteGate, storage: KiteStorageConfig) -> _Harness:
+    def factory(gate: KiteGate, storage: KiteStorageConfig) -> _Harness:
         received.append(storage)
-        return _Harness(ErasureStage.ACTIVE_ASSERTIONS, calls, storage.backend)
+        return _Harness(ErasureStage.ACTIVE_ASSERTIONS, gate, calls, storage.backend)
 
     result = asyncio.run(workloads._core_erasure_workload(spec, factory))
 
@@ -134,9 +171,10 @@ def test_core_erasure_closes_disposable_database_when_postgres_harness_fails(
     monkeypatch.setattr(DisposablePostgresDatabase, "create", staticmethod(create))
     calls: list[str] = []
 
-    def factory(_gate: KiteGate, storage: KiteStorageConfig) -> _Harness:
+    def factory(gate: KiteGate, storage: KiteStorageConfig) -> _Harness:
         return _Harness(
             ErasureStage.ACTIVE_ASSERTIONS,
+            gate,
             calls,
             storage.backend,
             fail=storage.backend == "postgres",
@@ -182,6 +220,93 @@ def test_core_erasure_requires_postgres_before_starting_sqlite(
     assert execution.record.state is EvidenceState.BLOCKED
     assert execution.record.reason_code == "isolated_postgres_admin_unavailable"
     assert factory_called is False
+
+
+def test_live_workload_requires_and_aggregates_both_backends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, connection = _database()
+
+    async def create() -> DisposablePostgresDatabase:
+        return database
+
+    monkeypatch.setattr(DisposablePostgresDatabase, "create", staticmethod(create))
+    received: list[KiteStorageConfig] = []
+    calls: list[str] = []
+
+    def factory(gate: KiteGate, storage: KiteStorageConfig) -> _Harness:
+        received.append(storage)
+        return _Harness(ErasureStage.ACTIVE_ASSERTIONS, gate, calls, storage.backend)
+
+    result = asyncio.run(
+        workloads._live_workload(_gate("kite_http_stable_only_release_drill"), factory)
+    )
+
+    assert result.observation == {
+        "invoke_count": 2,
+        "scenario_count": 2,
+        "provenance_check_count": 2,
+    }
+    assert [storage.backend for storage in received] == ["sqlite", "postgres"]
+    assert calls == [
+        "prepare:sqlite", "start:sqlite", "live:sqlite", "stop:sqlite",
+        "prepare:postgres", "seed:postgres", "start:postgres", "live:postgres", "stop:postgres",
+    ]
+    assert database._closed is True
+    assert connection.closed is True
+
+
+def test_postgres_sleep_uses_only_the_disposable_authority_and_closes_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, connection = _database()
+
+    async def create() -> DisposablePostgresDatabase:
+        return database
+
+    monkeypatch.setattr(DisposablePostgresDatabase, "create", staticmethod(create))
+    received: list[KiteStorageConfig] = []
+    calls: list[str] = []
+
+    def factory(gate: KiteGate, storage: KiteStorageConfig) -> _Harness:
+        received.append(storage)
+        return _Harness(ErasureStage.ACTIVE_ASSERTIONS, gate, calls, storage.backend)
+
+    result = asyncio.run(
+        workloads._sleep_workload(_gate("performance_changed_work_sleep_postgres_kite_http"), factory)
+    )
+
+    assert result.observation == {"sample_count": 3, "p95_ms": 3.0}
+    assert [storage.backend for storage in received] == ["postgres"]
+    assert received[0].disposable_postgres is database
+    assert calls == [
+        "prepare:postgres", "seed:postgres", "start:postgres", "sleep:postgres:True", "stop:postgres",
+    ]
+    assert database._closed is True
+    assert connection.closed is True
+
+
+def test_sqlite_sleep_never_acquires_postgres_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def unexpected_create() -> DisposablePostgresDatabase:
+        raise AssertionError("sqlite sleep must not acquire PostgreSQL")
+
+    monkeypatch.setattr(DisposablePostgresDatabase, "create", staticmethod(unexpected_create))
+    received: list[KiteStorageConfig] = []
+    calls: list[str] = []
+
+    def factory(gate: KiteGate, storage: KiteStorageConfig) -> _Harness:
+        received.append(storage)
+        return _Harness(ErasureStage.ACTIVE_ASSERTIONS, gate, calls, storage.backend)
+
+    result = asyncio.run(
+        workloads._sleep_workload(_gate("performance_unchanged_sleep_sqlite_kite_http"), factory)
+    )
+
+    assert result.observation == {"sample_count": 3, "p95_ms": 3.0}
+    assert [storage.backend for storage in received] == ["sqlite"]
+    assert calls == ["prepare:sqlite", "start:sqlite", "sleep:sqlite:False", "stop:sqlite"]
 
 
 def test_core_erasure_rejects_a_non_dual_backend_catalog_contract() -> None:
