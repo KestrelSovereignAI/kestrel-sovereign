@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 from collections.abc import Sequence
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,7 +26,8 @@ from kestrel_sovereign.storage.privacy_wrapper import (
 )
 from kestrel_sovereign.storage.semantic_vector_projection import (
     SemanticVectorProfile, SemanticVectorProjectionError,
-    _issue_semantic_vector_embedding_provider,
+    SemanticVectorEmbeddingProvider,
+    _resolve_host_semantic_vector_embedding_provider,
 )
 
 
@@ -38,6 +41,35 @@ PROFILE = SemanticVectorProfile(
 )
 
 
+class _EmbeddingService:
+    def __init__(self, profile, embedder):
+        self.configure(profile, embedder)
+
+    def configure(self, profile, embedder):
+        self.profile = profile
+        self.embedder = embedder
+
+    def describe(self):
+        return SimpleNamespace(
+            provider=self.profile.provider, model=self.profile.model,
+            dim=self.profile.dimension, profile_id=self.profile.profile_id,
+        )
+
+    def semantic_vector_destination(self):
+        return self.profile.embedding_destination
+
+    async def aembed(self, text):
+        return await self.embedder(text)
+
+
+class _HostLLM:
+    def __init__(self, service):
+        self.service = service
+
+    def get_embedding_service(self):
+        return self.service
+
+
 async def _storage(tmp_path, label: str) -> AsyncStorage:
     identity_dir = tmp_path / f"identity-{label}"
     credentials = await create_kestrel_identity_async(
@@ -45,12 +77,15 @@ async def _storage(tmp_path, label: str) -> AsyncStorage:
     )
     key_id = f"kestrel_{credentials.agent_did.rsplit(':', 1)[-1]}"
     identity = load_agent_identity(key_id, identity_dir)
+    service = _EmbeddingService(PROFILE, _embed)
     storage = AsyncStorage(
         str(tmp_path / f"{label}.db"), agent_id=credentials.agent_did,
+        llm_service=_HostLLM(service),
         _assertion_tenant_capability=_resolve_authenticated_agent_assertion_capability(
             credentials.agent_did, identity,
         ),
     )
+    storage._test_vector_service = service
     await storage.initialize()
     return storage
 
@@ -85,12 +120,9 @@ async def _embed(text: str):
     return [float(len(text)), float(sum(text.encode()) % 31 + 1)]
 
 
-def _provider(profile: SemanticVectorProfile, embedder=_embed):
-    return _issue_semantic_vector_embedding_provider(
-        provider=profile.provider, model=profile.model, profile_id=profile.profile_id,
-        dimension=profile.dimension, destination=profile.embedding_destination,
-        embedder=embedder,
-    )
+def _projection(storage, profile: SemanticVectorProfile, embedder=_embed):
+    storage._test_vector_service.configure(profile, embedder)
+    return storage.semantic_assertion_vector_projection(profile)
 
 
 @pytest.mark.asyncio
@@ -99,7 +131,7 @@ async def test_projection_is_assertion_revision_linked_and_canonically_fenced(tm
     try:
         fact = _assertion(storage, "alpha")
         await storage.put_assertion(fact, source_occurrences=(_source("alpha"),))
-        projection = storage.semantic_assertion_vector_projection(PROFILE, _provider(PROFILE))
+        projection = _projection(storage, PROFILE)
         checkpoint = await projection.sync()
         assert checkpoint.generation == (await storage.assertion_checkpoint()).generation
         candidates = await projection.recall([1.0, 1.0])
@@ -124,7 +156,7 @@ async def test_physical_erasure_rebuilds_unrelated_survivor_after_restart(tmp_pa
         survivor = _assertion(storage, "survivor")
         await storage.put_assertion(erased, source_occurrences=(_source("erased"),))
         await storage.put_assertion(survivor, source_occurrences=(_source("survivor"),))
-        projection = storage.semantic_assertion_vector_projection(PROFILE, _provider(PROFILE))
+        projection = _projection(storage, PROFILE)
         await projection.sync()
         before = await projection.erasure_observation()
         assert before.candidate_count == 2
@@ -138,7 +170,7 @@ async def test_physical_erasure_rebuilds_unrelated_survivor_after_restart(tmp_pa
         # consume the opaque erasure event without reviving the erased vector.
         await storage.close()
         await storage.initialize()
-        restarted = storage.semantic_assertion_vector_projection(PROFILE, _provider(PROFILE))
+        restarted = _projection(storage, PROFILE)
         await restarted.sync()
         assert (await restarted.erasure_observation()).candidate_count == 1
         assert [hit.assertion_id for hit in await restarted.recall([1.0, 1.0])] == [survivor.assertion_id]
@@ -153,8 +185,8 @@ async def test_projection_never_crosses_tenant_boundary(tmp_path):
     try:
         fact = _assertion(owner, "owner-only")
         await owner.put_assertion(fact, source_occurrences=(_source("owner-only"),))
-        own_projection = owner.semantic_assertion_vector_projection(PROFILE, _provider(PROFILE))
-        other_projection = other.semantic_assertion_vector_projection(PROFILE, _provider(PROFILE))
+        own_projection = _projection(owner, PROFILE)
+        other_projection = _projection(other, PROFILE)
         await own_projection.sync()
         assert (await own_projection.recall([1.0, 1.0]))
         empty = await other_projection.sync()
@@ -171,7 +203,7 @@ async def test_same_generation_partial_page_never_becomes_recall_ready(tmp_path)
     try:
         original = _assertion(storage, "before")
         await storage.put_assertion(original, source_occurrences=(_source("before"),))
-        projection = storage.semantic_assertion_vector_projection(PROFILE, _provider(PROFILE))
+        projection = _projection(storage, PROFILE)
         await projection.sync()
 
         replacement = _assertion(storage, "after")
@@ -207,7 +239,7 @@ async def test_profile_dimension_drift_and_timeout_fail_without_advancing(tmp_pa
         async def wrong_dimension(_text):
             return [1.0]
 
-        projection = storage.semantic_assertion_vector_projection(PROFILE, _provider(PROFILE, wrong_dimension))
+        projection = _projection(storage, PROFILE, wrong_dimension)
         with pytest.raises(SemanticVectorProjectionError, match="dimension"):
             await projection.sync()
         assert (await projection.checkpoint()).generation == 0
@@ -223,7 +255,7 @@ async def test_profile_dimension_drift_and_timeout_fail_without_advancing(tmp_pa
             provider="test-provider", model="test-model", dimension=2,
             embed_timeout_seconds=0.001,
         )
-        timed = storage.semantic_assertion_vector_projection(timeout_profile, _provider(timeout_profile, slow))
+        timed = _projection(storage, timeout_profile, slow)
         with pytest.raises(SemanticVectorProjectionError, match="timed out"):
             await timed.sync()
         assert (await timed.checkpoint()).generation == 0
@@ -232,7 +264,7 @@ async def test_profile_dimension_drift_and_timeout_fail_without_advancing(tmp_pa
             "semantic-assertion-drift-v1", "d" * 64,
             provider="test-provider", model="test-model", dimension=2,
         )
-        valid = storage.semantic_assertion_vector_projection(valid_profile, _provider(valid_profile))
+        valid = _projection(storage, valid_profile)
         await valid.sync()
         await storage.db.execute(
             "UPDATE semantic_assertion_vector_projection_entries SET embedding_model = ? "
@@ -264,7 +296,7 @@ async def test_remote_destination_rejects_private_content_before_embedder(tmp_pa
             provider="remote-provider", model="remote-model", dimension=2,
             embedding_destination="remote",
         )
-        projection = storage.semantic_assertion_vector_projection(remote, _provider(remote, remote_embed))
+        projection = _projection(storage, remote, remote_embed)
         with pytest.raises(SemanticVectorProjectionError, match="remote destination"):
             await projection.sync()
         assert seen == []
@@ -291,7 +323,7 @@ async def test_remote_requires_public_visibility_and_public_privacy(tmp_path):
             embedding_destination="remote", visibility_ceiling="public",
             privacy_ceiling="normal",
         )
-        projection = storage.semantic_assertion_vector_projection(remote, _provider(remote, remote_embed))
+        projection = _projection(storage, remote, remote_embed)
         with pytest.raises(SemanticVectorProjectionError, match="effective-public"):
             await projection.sync()
         assert seen == []
@@ -311,8 +343,18 @@ async def test_raw_callable_cannot_claim_a_fake_local_destination(tmp_path):
         return [1.0, 1.0]
 
     try:
-        with pytest.raises(TypeError, match="host-issued"):
+        with pytest.raises(TypeError):
             storage.semantic_assertion_vector_projection(PROFILE, disguised_remote)
+        with pytest.raises(TypeError, match="issued by the host"):
+            SemanticVectorEmbeddingProvider(
+                object(), provider=PROFILE.provider, model=PROFILE.model,
+                profile_id=PROFILE.profile_id, dimension=PROFILE.dimension,
+                destination="local", service=storage._test_vector_service,
+            )
+        with pytest.raises(TypeError, match="host authority"):
+            _resolve_host_semantic_vector_embedding_provider(
+                PROFILE, _HostLLM(storage._test_vector_service), host_authority=object(),
+            )
         assert called is False
     finally:
         await storage.close()
@@ -335,7 +377,7 @@ async def test_oversize_vector_is_rejected_before_iteration(tmp_path):
     try:
         fact = _assertion(storage, "oversize")
         await storage.put_assertion(fact, source_occurrences=(_source("oversize"),))
-        projection = storage.semantic_assertion_vector_projection(PROFILE, _provider(PROFILE, oversized))
+        projection = _projection(storage, PROFILE, oversized)
         with pytest.raises(SemanticVectorProjectionError, match="dimension"):
             await projection.sync()
         assert (await projection.checkpoint()).generation == 0
@@ -355,7 +397,7 @@ async def test_erasure_rebuild_budget_leaves_projection_unready(tmp_path):
         assertions = [_assertion(storage, name) for name in ("erase", "keep-a", "keep-b")]
         for assertion, name in zip(assertions, ("erase", "keep-a", "keep-b")):
             await storage.put_assertion(assertion, source_occurrences=(_source(name),))
-        projection = storage.semantic_assertion_vector_projection(bounded, _provider(bounded))
+        projection = _projection(storage, bounded)
         await projection.sync()
         await storage.erase_assertion(assertions[0].assertion_id, operation_id="bounded-erase")
         with pytest.raises(SemanticVectorProjectionError, match="row budget"):
@@ -438,7 +480,8 @@ async def test_retained_projection_handle_rechecks_privacy_after_mode_transition
     storage = await _storage(tmp_path, "privacy-transition")
     wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
     try:
-        handle = wrapper.semantic_assertion_vector_projection(PROFILE, _provider(PROFILE))
+        storage._test_vector_service.configure(PROFILE, _embed)
+        handle = wrapper.semantic_assertion_vector_projection(PROFILE)
         wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
         with pytest.raises(PrivacyViolationError):
             await handle.sync()
@@ -452,4 +495,53 @@ async def test_retained_projection_handle_rechecks_privacy_after_mode_transition
         with pytest.raises(PrivacyViolationError):
             await handle.sync()
     finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_mode_transition_refuses_during_blocked_vector_provider_and_recall(tmp_path):
+    storage = await _storage(tmp_path, "privacy-lease-concurrency")
+    wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+    embed_started = asyncio.Event()
+    release_embed = asyncio.Event()
+
+    async def blocked_embed(_text):
+        embed_started.set()
+        await release_embed.wait()
+        return [1.0, 1.0]
+
+    try:
+        fact = _assertion(storage, "lease-sensitive")
+        await storage.put_assertion(fact, source_occurrences=(_source("lease-sensitive"),))
+        storage._test_vector_service.configure(PROFILE, blocked_embed)
+        handle = wrapper.semantic_assertion_vector_projection(PROFILE)
+        sync_task = asyncio.create_task(handle.sync())
+        await asyncio.wait_for(embed_started.wait(), timeout=2)
+        with pytest.raises(PrivacyViolationError, match="vector operation"):
+            wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+        assert wrapper.privacy_mode is PrivacyMode.NORMAL
+        release_embed.set()
+        await sync_task
+
+        recall_started = asyncio.Event()
+        release_recall = asyncio.Event()
+        original_recall = handle._projection.recall
+
+        async def blocked_recall(*args, **kwargs):
+            recall_started.set()
+            await release_recall.wait()
+            return await original_recall(*args, **kwargs)
+
+        handle._projection.recall = blocked_recall
+        recall_task = asyncio.create_task(handle.recall([1.0, 1.0]))
+        await asyncio.wait_for(recall_started.wait(), timeout=2)
+        with pytest.raises(PrivacyViolationError, match="vector operation"):
+            wrapper.set_privacy_mode(PrivacyMode.ISOLATED)
+        assert wrapper.privacy_mode is PrivacyMode.NORMAL
+        release_recall.set()
+        assert await recall_task
+        wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+        assert wrapper.privacy_mode is PrivacyMode.EPHEMERAL
+    finally:
+        release_embed.set()
         await storage.close()

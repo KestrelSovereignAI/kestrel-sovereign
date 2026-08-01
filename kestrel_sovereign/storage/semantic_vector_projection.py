@@ -135,11 +135,11 @@ class SemanticVectorEmbeddingProvider:
     profile_id: str
     dimension: int
     destination: str
-    _embedder: Embedder
+    _service: object
 
     def __init__(
         self, token: object, *, provider: str, model: str, profile_id: str,
-        dimension: int, destination: str, embedder: Embedder,
+        dimension: int, destination: str, service: object,
     ) -> None:
         if token is not _EMBEDDING_PROVIDER_TOKEN:
             raise TypeError("semantic vector embedding providers are issued by the host")
@@ -148,28 +148,42 @@ class SemanticVectorEmbeddingProvider:
         object.__setattr__(self, "profile_id", profile_id)
         object.__setattr__(self, "dimension", dimension)
         object.__setattr__(self, "destination", destination)
-        object.__setattr__(self, "_embedder", embedder)
+        object.__setattr__(self, "_service", service)
 
     async def embed(self, text: str) -> Sequence[float] | None:
-        return await self._embedder(text)
+        return await self._service.aembed(text)
 
 
-def _issue_semantic_vector_embedding_provider(
-    *, provider: str, model: str, profile_id: str, dimension: int,
-    destination: str, embedder: Embedder,
+def _resolve_host_semantic_vector_embedding_provider(
+    profile: SemanticVectorProfile, host_llm_service: object, *, host_authority: object,
 ) -> SemanticVectorEmbeddingProvider:
-    """Issue a provider binding after the host resolved provider capabilities."""
-    # Reuse the profile validator for the immutable identity grammar/bounds.
-    SemanticVectorProfile(
-        profile_id, "0" * 64, provider=provider, model=model,
-        dimension=dimension, embedding_destination=destination,
-    )
-    if not callable(embedder):
-        raise TypeError("semantic vector provider embedder must be callable")
+    """Resolve immutable identity only from the host's configured provider."""
+    from .async_assertion_store import _AssertionTenantCapability
+
+    if type(host_authority) is not _AssertionTenantCapability:
+        raise TypeError("semantic vector provider resolution requires host authority")
+    get_service = getattr(host_llm_service, "get_embedding_service", None)
+    service = get_service() if callable(get_service) else None
+    describe = getattr(service, "describe", None)
+    descriptor = describe() if callable(describe) else None
+    destination_getter = getattr(service, "semantic_vector_destination", None)
+    destination = destination_getter() if callable(destination_getter) else None
+    if descriptor is None or destination not in {_LOCAL_EMBEDDING_DESTINATION, "remote"}:
+        raise SemanticVectorProjectionError("host semantic vector provider capability unavailable")
+    provider = str(getattr(descriptor, "provider", ""))
+    model = str(getattr(descriptor, "model", ""))
+    dimension = getattr(descriptor, "dim", None)
+    profile_id = str(getattr(descriptor, "profile_id", ""))
+    if (
+        provider != profile.provider or model != profile.model
+        or dimension != profile.dimension or profile_id != profile.profile_id
+        or destination != profile.embedding_destination
+    ):
+        raise SemanticVectorProjectionError("host semantic vector provider does not match profile")
     return SemanticVectorEmbeddingProvider(
         _EMBEDDING_PROVIDER_TOKEN, provider=provider, model=model,
         profile_id=profile_id, dimension=dimension, destination=destination,
-        embedder=embedder,
+        service=service,
     )
 
 

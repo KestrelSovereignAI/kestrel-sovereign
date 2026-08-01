@@ -505,12 +505,18 @@ fixed embedding provider/model/profile/dimension and the approved bounded
 semantic-recall renderer version, and remains non-authoritative: every hit is
 hydrated through the canonical recall fence before use. The projector's
 destination is taken from an immutable, host-issued embedding-provider binding,
-not a caller string or arbitrary callable. Remote disclosure requires both
+resolved from the LLM service captured when authenticated `AsyncStorage` is
+constructed—not a caller string, later service substitution, or arbitrary
+callable. Direct provider construction requires the host resolver authority.
+Remote disclosure requires both
 `visibility=public` and `privacy_classification=public`; every other effective
 policy is rejected before rendering or provider invocation. A projection
 obtained from `PrivacyEnforcingStorage` is a dynamic proxy that rechecks the
 current privacy mode on sync, recall, hydration, and observation, so a retained
-handle cannot escape a later EPHEMERAL or ISOLATED transition. Vector dimensions
+handle cannot escape a later EPHEMERAL or ISOLATED transition. Each awaited
+vector operation holds a counted lease acquired under the same re-entrant lock
+as `set_privacy_mode`; a transition is refused while provider, database, or
+hydration I/O is in flight and the lease is released in `finally`. Vector dimensions
 and serialized bytes are bounded before
 materialization. Opaque-erasure survivor rebuilds use bounded keyset pages plus
 total-row and wall-clock budgets; exhausting any budget leaves the checkpoint
