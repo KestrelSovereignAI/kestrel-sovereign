@@ -153,3 +153,15 @@ class TestBackstopRequiresARealDecrypt:
             _consolidator(store)._row_plaintext(ENVELOPE, ENC_META)
             == "KSAv2: is the prefix we use"
         )
+
+
+def test_legacy_fernet_with_lost_metadata_is_still_refused():
+    """decrypt is a no-op when `enc` is absent — the backstop must still catch it.
+
+    A KSAv2-only backstop would let the unchanged gAAAAA token reach topic
+    extraction and recreate the bug for legacy data (codex review r5).
+    """
+    store = MagicMock()
+    store.decrypt_stored_content.side_effect = lambda content, meta: content
+    assert _consolidator(store)._row_plaintext(FERNET, {}) is None
+    assert _consolidator(None)._row_plaintext(FERNET, None) is None

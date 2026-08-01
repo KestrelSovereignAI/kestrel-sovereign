@@ -709,16 +709,24 @@ class MemoryConsolidator:
     # Row content decoding (#2850)
     # ------------------------------------------------------------------
 
+    # Legacy Fernet tokens are urlsafe-base64 of a v0x80 envelope, so they
+    # always begin "gAAAAA". Those rows predate KSAv2 and, when their metadata
+    # is lost, decrypt_stored_content is a no-op — a KSAv2-only backstop would
+    # let them through and recreate the bug for legacy data (codex review r5).
+    _LEGACY_FERNET_PREFIX = "gAAAAA"
+
     @staticmethod
     def _looks_like_ciphertext(content: str) -> bool:
-        """Whether ``content`` still carries the at-rest AEAD envelope."""
+        """Whether ``content`` still carries an at-rest ciphertext envelope."""
         try:
             from kestrel_sdk.security.aead import KSA_V2_PREFIX
 
             prefix = KSA_V2_PREFIX.decode()
         except Exception:  # noqa: BLE001 - never let a probe break consolidation
             prefix = "KSAv2:"
-        return content.startswith(prefix)
+        return content.startswith(prefix) or content.startswith(
+            MemoryConsolidator._LEGACY_FERNET_PREFIX
+        )
 
     def _row_plaintext(self, content: Any, metadata: Optional[Dict]) -> Optional[str]:
         """Decrypt one raw ``conversation_history`` row to plaintext.
