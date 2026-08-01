@@ -2464,3 +2464,57 @@ def test_cli_budget_refuses_caller_supplied_samples(tmp_path: Path) -> None:
     assert result.returncode != 0
     assert not output.exists()
     assert "disabled" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Hermetic runner (#2849)
+# ---------------------------------------------------------------------------
+# The catalog's pytest workload must not inherit ambient third-party plugins.
+# A plugin that merely fails to IMPORT aborts pytest before it writes the JUnit
+# report, which the execution boundary records as a content-free `blocked` — so
+# the same commit yields a different release verdict depending on what else is
+# installed. The tests below guard the mechanism, not just the end state: the
+# end-to-end CLI test only catches this when a broken plugin happens to be
+# present in the running venv.
+
+
+def test_isolated_test_environment_disables_pytest_plugin_autoload(tmp_path):
+    from kestrel_sovereign.knowledge.release_evidence_workloads import (
+        _isolated_test_environment,
+    )
+
+    env = _isolated_test_environment(str(tmp_path))
+    assert env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] == "1", (
+        "ambient site-packages plugins must not load into an evidence run"
+    )
+    # The pre-existing hermeticity guarantees must survive alongside it.
+    assert env["PYTEST_ADDOPTS"] == ""
+    assert env["PYTHONNOUSERSITE"] == "1"
+
+
+def test_fixed_pytest_command_enables_the_plugins_the_selectors_need(monkeypatch, tmp_path):
+    """Autoload is off, so required plugins must be named explicitly.
+
+    ``asyncio_mode = "auto"`` plus ``async def`` gate selectors means
+    pytest-asyncio is load-bearing — without it those selectors ERROR at
+    collection instead of running, and the gate blocks.
+    """
+    from kestrel_sovereign.knowledge import release_evidence_workloads as mod
+
+    seen = {}
+
+    def _fake_run(command, **kwargs):
+        seen["command"] = command
+        seen["env"] = kwargs.get("env") or {}
+        raise AssertionError("stop before executing pytest")
+
+    monkeypatch.setattr(mod.subprocess, "run", _fake_run)
+    with pytest.raises(AssertionError):
+        mod._run_fixed_pytest("tests/unit/test_knowledge_rdf_codec.py::whatever")
+
+    command = seen["command"]
+    assert "-p" in command, "no plugin explicitly enabled while autoload is off"
+    assert "pytest_asyncio.plugin" in command, (
+        "pytest-asyncio must be enabled explicitly or async gate selectors error"
+    )
+    assert seen["env"].get("PYTEST_DISABLE_PLUGIN_AUTOLOAD") == "1"

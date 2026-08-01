@@ -67,6 +67,15 @@ def _isolated_test_environment(tempdir: str, *, postgres_dsn: str | None = None)
     }
     environment["PYTEST_ADDOPTS"] = ""
     environment["PYTHONNOUSERSITE"] = "1"
+    # Third-party pytest plugins advertised by site-packages are NOT part of
+    # the evidence contract, and letting them autoload makes a release verdict
+    # depend on whatever else happens to be installed. A plugin that merely
+    # fails to IMPORT (the local pydantic-ai/mcp skew that breaks `phoenix`)
+    # aborts pytest before it writes the JUnit report, which this module then
+    # records as a content-free `blocked` — so the same commit is "passed" in
+    # CI's core-only env and "blocked" on a dev checkout (#2849). Disable
+    # autoload and enable only the plugins the selectors genuinely need.
+    environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     environment["KESTREL_HOME"] = str(Path(tempdir) / "kestrel-home")
     environment["KESTREL_DB_PATH"] = str(Path(tempdir) / "kestrel-db")
     if postgres_dsn is not None:
@@ -106,6 +115,13 @@ def _run_fixed_pytest(*selectors: str, postgres_dsn: str | None = None) -> _Pyte
             "-m",
             "pytest",
             "-q",
+            # Autoload is disabled (see `_isolated_test_environment`), so the
+            # plugins the catalog depends on are named explicitly. pytest-asyncio
+            # is load-bearing: `asyncio_mode = "auto"` in pyproject.toml, and
+            # several gate selectors are `async def` — without it they ERROR at
+            # collection rather than run.
+            "-p",
+            "pytest_asyncio.plugin",
             "--junitxml",
             str(report),
             *selectors,

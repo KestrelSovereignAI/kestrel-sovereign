@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+import logging
 import os
 from pathlib import Path
 import stat
@@ -54,6 +55,8 @@ class CatalogWorkloadUnavailable(ReleaseEvidenceError):
         self.reason_code = reason_code
         super().__init__(reason_code)
 
+
+_logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class CatalogWorkloadResult:
@@ -277,8 +280,24 @@ class CatalogExecutionAuthority:
         except ReleaseEvidenceError:
             # This is an evidence failure, not an opportunity to construct a
             # placeholder pass.  Retain only a fixed reason code.
+            #
+            # The RECORD stays content-free by design, but the operator still
+            # needs the cause: diagnosing a blocked gate previously meant
+            # re-instrumenting the workload by hand, because the exception was
+            # discarded here without a trace anywhere (#2849). Log it — logs
+            # are not evidence and carry no catalog binding.
+            _logger.exception(
+                "catalog workload for gate %s raised an evidence error; "
+                "recording a content-free blocked result",
+                spec.gate_id,
+            )
             return self._blocked(spec, "catalog_execution_failed")
         except Exception:
+            _logger.exception(
+                "catalog workload for gate %s raised an unexpected error; "
+                "recording a content-free blocked result",
+                spec.gate_id,
+            )
             return self._blocked(spec, "catalog_execution_failed")
 
     def _emit(self, spec: GateSpec, result: CatalogWorkloadResult) -> CatalogExecution:
