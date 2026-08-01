@@ -924,13 +924,36 @@ def attach_external_capability_report(
         raise ReleaseEvidenceError("external adapter report must be ExternalCapabilityReport")
     if not isinstance(freshness_ledger, ExternalFreshnessLedger):
         raise ReleaseEvidenceError("trusted external adapter ingestion requires verifier-owned freshness ledger")
+    attached = validate_external_capability_attachment(
+        evidence, report,
+        expected_evidence_runner_revision=expected_evidence_runner_revision,
+    )
+    freshness_ledger.consume(report)
+    return attached
+
+
+def validate_external_capability_attachment(
+    evidence: SemanticReleaseEvidence,
+    report: ExternalCapabilityReport,
+    *,
+    expected_evidence_runner_revision: str,
+) -> SemanticReleaseEvidence:
+    """Validate an external report without consuming its verifier challenge.
+
+    Only the private verifier uses this preflight step.  It exists so that a
+    verifier can safely stage its signed outputs *before* atomically consuming
+    the one-time challenge.  Callers must still use
+    :func:`attach_external_capability_report` for normal trusted ingestion;
+    the public structural assembler never receives a freshness ledger.
+    """
+    if not isinstance(report, ExternalCapabilityReport):
+        raise ReleaseEvidenceError("external adapter report must be ExternalCapabilityReport")
     attached = replace(evidence, external_capabilities=(report,))
     _validate_external_capability_reports(
         attached.external_capabilities,
         attached.gates,
         expected_evidence_runner_revision=expected_evidence_runner_revision,
     )
-    freshness_ledger.consume(report)
     return attached
 
 

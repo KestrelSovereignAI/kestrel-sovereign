@@ -354,12 +354,25 @@ Trusted finalization uses the separate verifier-only module
 `kestrel_sovereign.knowledge.release_evidence_verifier_cli`, never the public
 `release_evidence` CLI. Its one protected owner-only configuration is rooted
 under a verifier-owned private directory and fixes the ledger path, public-key
-policy, expected external runner revision, and distinct receipt signer. It can
-issue a nonce and, only after every signed core record/budget and the external
-report verify, write one owner-only final artifact and an Ed25519 receipt. The
-ledger also records the evidence, policy, and receipt digests against the
-consumed challenge. The public `assemble` command remains structural and
-cannot issue challenges, consume a ledger, or emit `ready: true`.
+policy, expected external runner revision, `semantic_release_verifier` role,
+and distinct receipt signer. The executable reads only its host-provisioned
+fixed configuration locator: it has no `--config` argument or environment
+override, so a producer cannot select its own policy, ledger, or key. Every
+directory component below the verifier root is owner-only, non-symlinked, and
+rechecked around sensitive reads and writes; the receipt signer may not also
+be an execution-policy identity.
+
+After every signed core record/budget and the external report validate, the
+verifier stages content-addressed evidence and receipt files beneath that
+private root. Only then does one SQLite transaction consume the pending nonce
+and bind the external report's attestation digest to the evidence, policy, and
+receipt digests. The staged files are promoted with replacement-safe writes.
+If an output failure occurs before the transaction, the nonce remains pending;
+if a process dies after it, retrying the exact digest-bound finalization
+recovers the staged files and rejects a different receipt. The Ed25519 receipt
+signs the core release-evidence contract digest as well as both revisions and
+all receipt bindings. The public `assemble` command remains structural and
+cannot issue challenges, consume a ledger, emit a receipt, or set `ready: true`.
 
 An external report is supplied as safe structured JSON—never as pre-populated
 metadata—and is structurally checked against the locally assembled stage

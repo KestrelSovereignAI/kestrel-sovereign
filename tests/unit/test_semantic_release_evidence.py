@@ -51,6 +51,11 @@ from kestrel_sovereign.knowledge.release_evidence import (
 )
 from kestrel_sovereign.knowledge.release_evidence_freshness import ExternalFreshnessLedger
 from kestrel_sovereign.knowledge.release_evidence_execution import CatalogSigningIdentity
+from kestrel_sovereign.knowledge.release_evidence_verifier import (
+    read_verifier_configuration,
+    verification_receipt_from_mapping,
+    verify_verification_receipt,
+)
 from kestrel_sovereign.knowledge.release_evidence_models import (
     ExecutionSource,
     SemanticBenchmarkHarness,
@@ -960,12 +965,25 @@ def _cli(*arguments: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _verifier_cli(*arguments: str) -> subprocess.CompletedProcess[str]:
+def _verifier_cli(config: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    """Exercise the fixed-locator executable with a test-process patch only.
+
+    Production's ``python -m`` entry point has no config option or environment
+    override.  Tests patch its module constant before calling ``main`` so they
+    never need to create or modify the real host administrator's ``/etc``
+    authority file.
+    """
     return subprocess.run(
         [
             sys.executable,
-            "-m",
-            "kestrel_sovereign.knowledge.release_evidence_verifier_cli",
+            "-c",
+            (
+                "import sys; from pathlib import Path; "
+                "from kestrel_sovereign.knowledge import release_evidence_verifier_cli as cli; "
+                "cli.HOST_VERIFIER_CONFIGURATION = Path(sys.argv[1]); "
+                "raise SystemExit(cli.main(sys.argv[2:]))"
+            ),
+            str(config),
             *arguments,
         ],
         check=False,
@@ -1251,33 +1269,92 @@ def test_verifier_cli_requires_protected_config_and_consumes_one_external_challe
         "trust_policy": policy, "expected_external_runner_revision": "b" * 40,
         "receipt_key_file": str(receipt_key), "receipt_issuer_id": "verifier_ci",
         "receipt_key_id": "semantic_release", "receipt_public_key": receipt_public,
+        "verifier_role": "semantic_release_verifier",
     }), encoding="utf-8")
     config.chmod(0o600)
-    challenge = _verifier_cli("--config", str(config), "issue-challenge")
+    challenge = _verifier_cli(config, "issue-challenge")
     assert challenge.returncode == 0, challenge.stderr
     nonce = challenge.stdout.strip()
     records, budgets, _, report = _write_structurally_complete_submission(
         tmp_path, core_identity=_CATALOG_TEST_IDENTITY, external_identity=_EXTERNAL_TEST_IDENTITY,
         external_run_nonce=nonce,
     )
-    output, receipt = tmp_path / "verified.json", tmp_path / "receipt.json"
-    args = ["--config", str(config), "assemble", "--external-report", str(report), "--output", str(output), "--receipt-output", str(receipt)]
+    output, receipt = root / "verified.json", root / "receipt.json"
+    args = ["assemble", "--external-report", str(report), "--output", str(output), "--receipt-output", str(receipt)]
     for record in records:
         args.extend(("--record", str(record)))
     for budget in budgets:
         args.extend(("--budget", str(budget)))
-    assembled = _verifier_cli(*args)
+    # Output failure happens after evidence preparation but before ledger
+    # finalization.  The same verifier-issued challenge must remain usable.
+    receipt.write_text("impostor\n", encoding="utf-8")
+    receipt.chmod(0o600)
+    failed_output = _verifier_cli(config, *args)
+    assert failed_output.returncode == 1
+    assert not output.exists()
+    assert (root / ".verified.json.semantic-release-pending").exists()
+    receipt.unlink()
+    assembled = _verifier_cli(config, *args)
     assert assembled.returncode == 0, assembled.stderr
     assert json.loads(output.read_text())["ready"] is True
-    assert json.loads(receipt.read_text())["evidence_runner_revision"] == "b" * 40
+    receipt_mapping = json.loads(receipt.read_text())
+    assert receipt_mapping["evidence_runner_revision"] == "b" * 40
     assert receipt.stat().st_mode & 0o777 == 0o600
+    issued_receipt = verification_receipt_from_mapping(receipt_mapping)
+    verify_verification_receipt(issued_receipt, read_verifier_configuration(config))
+    tampered_contract = {**receipt_mapping, "core_release_evidence_contract_digest": "0" * 64}
+    with pytest.raises(ReleaseEvidenceError, match="unknown or missing"):
+        verification_receipt_from_mapping(tampered_contract)
     replay_args = [*args]
-    replay_args[replay_args.index(str(output))] = str(tmp_path / "replay.json")
-    replay_args[replay_args.index(str(receipt))] = str(tmp_path / "replay-receipt.json")
-    assert _verifier_cli(*replay_args).returncode == 1
+    replay_args[replay_args.index(str(output))] = str(root / "replay.json")
+    replay_args[replay_args.index(str(receipt))] = str(root / "replay-receipt.json")
+    replay = _verifier_cli(config, *replay_args)
+    assert replay.returncode == 1
+    assert "different verifier evidence" in replay.stderr
 
-    config.chmod(0o644)
-    denied = _verifier_cli("--config", str(config), "issue-challenge")
+    dangling_output = root / "dangling.json"
+    dangling_output.symlink_to(root / "missing.json")
+    dangling_args = [*args]
+    dangling_args[dangling_args.index(str(output))] = str(dangling_output)
+    dangling = _verifier_cli(config, *dangling_args)
+    assert dangling.returncode == 1
+    assert "owner-only regular non-symlink" in dangling.stderr
+
+    # The public executable itself has no caller-selectable configuration
+    # boundary; the test-only helper above patches its module constant only in
+    # the disposable child process.
+    public_config_override = subprocess.run(
+        [
+            sys.executable, "-m",
+            "kestrel_sovereign.knowledge.release_evidence_verifier_cli",
+            "--config", str(config), "issue-challenge",
+        ],
+        check=False, capture_output=True, text=True,
+    )
+    assert public_config_override.returncode == 2
+    assert "invalid choice" in public_config_override.stderr
+
+    wrong_role_mapping = json.loads(config.read_text(encoding="utf-8"))
+    wrong_role_mapping["verifier_role"] = "catalog_runner"
+    wrong_role = root / "wrong-role.json"
+    wrong_role.write_text(json.dumps(wrong_role_mapping), encoding="utf-8")
+    wrong_role.chmod(0o600)
+    rejected_role = _verifier_cli(wrong_role, "issue-challenge")
+    assert rejected_role.returncode == 1
+    assert "semantic_release_verifier role" in rejected_role.stderr
+
+    nested = root / "nested"
+    nested.mkdir(mode=0o700)
+    nested_config = nested / "verifier.json"
+    config.replace(nested_config)
+    symlinked_config_parent = root / "config-link"
+    symlinked_config_parent.symlink_to(nested, target_is_directory=True)
+    escaped = _verifier_cli(symlinked_config_parent / "verifier.json", "issue-challenge")
+    assert escaped.returncode == 1
+    assert "private non-symlink" in escaped.stderr
+
+    nested_config.chmod(0o644)
+    denied = _verifier_cli(nested_config, "issue-challenge")
     assert denied.returncode == 1
     assert "owner-only" in denied.stderr
 

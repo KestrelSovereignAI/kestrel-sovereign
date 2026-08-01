@@ -31,6 +31,7 @@ from .release_evidence import (
     performance_budget_from_mapping,
     release_evidence_template,
     trusted_execution_policy_from_mapping,
+    validate_external_capability_attachment,
 )
 from .release_evidence_freshness import ExternalFreshnessLedger
 from .release_evidence_models import (
@@ -84,6 +85,51 @@ def _read_owner_only_file(path: Path, *, kind: str) -> bytes:
             os.close(descriptor)
 
 
+def _validate_private_components(root: Path, path: Path, *, kind: str) -> tuple[tuple[int, int], ...]:
+    """Return a stable private component snapshot for a rooted verifier path."""
+    if not root.is_absolute() or not path.is_absolute() or ".." in path.parts:
+        raise ReleaseEvidenceError(f"{kind} must be an absolute non-traversing verifier path")
+    try:
+        relative = path.relative_to(root)
+    except ValueError as error:
+        raise ReleaseEvidenceError(f"{kind} escapes verifier trusted_root") from error
+    try:
+        if root.resolve(strict=True) != root:
+            raise ReleaseEvidenceError(f"{kind} trusted_root must be a resolved non-symlink directory")
+    except OSError as error:
+        raise ReleaseEvidenceError(f"{kind} trusted_root cannot be inspected") from error
+    current = root
+    snapshots: list[tuple[int, int]] = []
+    for component in (Path("."), *relative.parent.parts):
+        if component != Path("."):
+            current = current / component
+        try:
+            metadata = current.lstat()
+        except OSError as error:
+            raise ReleaseEvidenceError(f"{kind} parent cannot be inspected") from error
+        if (not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o077):
+            raise ReleaseEvidenceError(f"{kind} parent must be a private non-symlink directory")
+        snapshots.append((metadata.st_dev, metadata.st_ino))
+    return tuple(snapshots)
+
+
+def _recheck_private_components(
+    root: Path, path: Path, snapshot: tuple[tuple[int, int], ...], *, kind: str,
+) -> None:
+    """Reject a replacement or intermediate symlink after a sensitive action."""
+    if _validate_private_components(root, path, kind=kind) != snapshot:
+        raise ReleaseEvidenceError(f"{kind} parent changed while being used")
+
+
+def _read_rooted_owner_only_file(root: Path, path: Path, *, kind: str) -> bytes:
+    """Read a private rooted file while detecting ancestor replacement races."""
+    snapshot = _validate_private_components(root, path, kind=kind)
+    result = _read_owner_only_file(path, kind=kind)
+    _recheck_private_components(root, path, snapshot, kind=kind)
+    return result
+
+
 @dataclass(frozen=True, slots=True)
 class VerifierConfiguration:
     """One protected authority configuration for the separate verifier CLI."""
@@ -97,6 +143,7 @@ class VerifierConfiguration:
     receipt_issuer_id: str
     receipt_key_id: str
     receipt_public_key: str
+    verifier_role: str
 
 
 def read_verifier_configuration(path: Path) -> VerifierConfiguration:
@@ -108,7 +155,7 @@ def read_verifier_configuration(path: Path) -> VerifierConfiguration:
         raise ReleaseEvidenceError("verifier configuration is not valid JSON") from error
     if not isinstance(value, Mapping):
         raise ReleaseEvidenceError("verifier configuration must be a mapping")
-    expected = {"trusted_root", "ledger_path", "trust_policy", "expected_external_runner_revision", "receipt_key_file", "receipt_issuer_id", "receipt_key_id", "receipt_public_key"}
+    expected = {"trusted_root", "ledger_path", "trust_policy", "expected_external_runner_revision", "receipt_key_file", "receipt_issuer_id", "receipt_key_id", "receipt_public_key", "verifier_role"}
     if set(value) != expected:
         raise ReleaseEvidenceError("verifier configuration has unknown or missing fields")
     root = Path(str(value["trusted_root"]))
@@ -123,6 +170,16 @@ def read_verifier_configuration(path: Path) -> VerifierConfiguration:
         raise ReleaseEvidenceError("verifier configuration must be rooted in its private trusted_root") from error
     if root != resolved_root or relative_config == Path("."):
         raise ReleaseEvidenceError("verifier configuration trusted_root must be resolved and contain its config")
+    # Re-read only after the configuration's declared root has itself passed
+    # the private-component checks.  This prevents a safe leaf file beneath a
+    # replaced/symlinked intermediate directory from selecting its own root.
+    raw = _read_rooted_owner_only_file(resolved_root, path, kind="verifier configuration")
+    try:
+        if json.loads(raw.decode("utf-8")) != value:
+            raise ReleaseEvidenceError("verifier configuration changed while being read")
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReleaseEvidenceError("verifier configuration is not valid JSON") from error
+    _validate_private_components(resolved_root, receipt_key_file, kind="verifier receipt key")
     policy_mapping = value["trust_policy"]
     if not isinstance(policy_mapping, Mapping):
         raise ReleaseEvidenceError("verifier configuration trust_policy must be a mapping")
@@ -132,7 +189,12 @@ def read_verifier_configuration(path: Path) -> VerifierConfiguration:
     issuer_id, key_id, public_key = (value[field] for field in ("receipt_issuer_id", "receipt_key_id", "receipt_public_key"))
     if not all(isinstance(item, str) for item in (issuer_id, key_id, public_key)) or not _IDENTIFIER_RE.fullmatch(issuer_id) or not _IDENTIFIER_RE.fullmatch(key_id) or not re.fullmatch(r"[0-9a-f]{64}", public_key):
         raise ReleaseEvidenceError("verifier receipt identity is invalid")
-    return VerifierConfiguration(resolved_root, ledger_path, trusted_execution_policy_from_mapping(policy_mapping), _sha256(_canonical_json(policy_mapping)), revision, receipt_key_file, issuer_id, key_id, public_key)
+    if value["verifier_role"] != "semantic_release_verifier":
+        raise ReleaseEvidenceError("verifier configuration requires the semantic_release_verifier role")
+    policy = trusted_execution_policy_from_mapping(policy_mapping)
+    if (issuer_id, key_id) in {(key.issuer_id, key.key_id) for key in policy.keys}:
+        raise ReleaseEvidenceError("verifier receipt identity must be distinct from execution identities")
+    return VerifierConfiguration(resolved_root, ledger_path, policy, _sha256(_canonical_json(policy_mapping)), revision, receipt_key_file, issuer_id, key_id, public_key, value["verifier_role"])
 
 
 def _read_submission(path: Path, *, kind: str) -> Mapping[str, object]:
@@ -189,7 +251,11 @@ class VerificationReceipt:
             self.evidence_digest, self.policy_digest, self.external_freshness_receipt, self.run_nonce,
         ) for character in value):
             raise ReleaseEvidenceError("verification receipt requires lowercase digest values")
-        if not self.issuer_id or not self.key_id or len(self.signature) != 128:
+        if (not _IDENTIFIER_RE.fullmatch(self.issuer_id)
+                or not _IDENTIFIER_RE.fullmatch(self.key_id)
+                or not re.fullmatch(r"[0-9a-f]{128}", self.signature)
+                or not re.fullmatch(r"[0-9a-f]{40}", self.capability_source_revision)
+                or not re.fullmatch(r"[0-9a-f]{40}", self.evidence_runner_revision)):
             raise ReleaseEvidenceError("verification receipt identity or signature is invalid")
 
     def signed_payload(self) -> dict[str, str]:
@@ -218,12 +284,9 @@ def verification_receipt_from_mapping(value: Mapping[str, object]) -> Verificati
     expected = {"version", "evidence_digest", "policy_digest", "external_freshness_receipt", "core_release_evidence_contract_digest", "run_nonce", "capability_source_revision", "evidence_runner_revision", "issuer_id", "key_id", "signature"}
     if set(value) != expected or value.get("core_release_evidence_contract_digest") != CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST:
         raise ReleaseEvidenceError("verification receipt has unknown or missing fields")
-    return VerificationReceipt(
-        evidence_digest=str(value["evidence_digest"]), policy_digest=str(value["policy_digest"]),
-        external_freshness_receipt=str(value["external_freshness_receipt"]), run_nonce=str(value["run_nonce"]),
-        capability_source_revision=str(value["capability_source_revision"]), evidence_runner_revision=str(value["evidence_runner_revision"]),
-        issuer_id=str(value["issuer_id"]), key_id=str(value["key_id"]), signature=str(value["signature"]), version=str(value["version"]),
-    )
+    if not all(isinstance(value[field], str) for field in expected):
+        raise ReleaseEvidenceError("verification receipt fields must be strings")
+    return VerificationReceipt(**{field: value[field] for field in expected if field != "core_release_evidence_contract_digest"})
 
 
 def verify_verification_receipt(receipt: VerificationReceipt, identity: VerifierConfiguration) -> None:
@@ -252,6 +315,28 @@ def trusted_assemble(
     already satisfied, preventing an incomplete core submission from burning a
     valid external run.
     """
+    evidence = prepare_trusted_evidence(
+        records=records, budgets=budgets, report=report, trust_policy=trust_policy,
+        expected_evidence_runner_revision=expected_evidence_runner_revision,
+    )
+    freshness_ledger.consume(report)
+    return evidence
+
+
+def prepare_trusted_evidence(
+    *,
+    records: Iterable[EvidenceRecord],
+    budgets: Iterable[PerformanceBudget],
+    report: ExternalCapabilityReport,
+    trust_policy: TrustedExecutionPolicy,
+    expected_evidence_runner_revision: str,
+) -> SemanticReleaseEvidence:
+    """Prepare fully validated evidence without consuming a freshness nonce.
+
+    This narrow verifier-only split supports crash-safe output staging.  It is
+    not exported by the public structural assembly CLI and does not confer
+    readiness on an untrusted caller: nonce finalization remains ledger-owned.
+    """
     evidence = apply_evidence_records(
         release_evidence_template(), records, trust_policy=trust_policy
     )
@@ -260,10 +345,8 @@ def trusted_assemble(
         raise ReleaseEvidenceError(
             "trusted assembly requires all signed core records and performance budgets before external ingestion"
         )
-    evidence = attach_external_capability_report(
-        evidence,
-        report,
-        freshness_ledger=freshness_ledger,
+    evidence = validate_external_capability_attachment(
+        evidence, report,
         expected_evidence_runner_revision=expected_evidence_runner_revision,
     )
     if not evidence.ready:
@@ -289,6 +372,7 @@ def issue_verification_receipt(
         "evidence_digest": evidence_digest,
         "policy_digest": policy_digest,
         "external_freshness_receipt": report.freshness_receipt,
+        "core_release_evidence_contract_digest": CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
         "run_nonce": report.run_nonce,
         "capability_source_revision": report.capability_source_revision,
         "evidence_runner_revision": report.evidence_runner_revision,
@@ -296,6 +380,9 @@ def issue_verification_receipt(
         "key_id": identity.key_id,
     }
     signature = identity.private_key.sign(_canonical_json(unsigned).encode("utf-8")).hex()
+    # ``VerificationReceipt`` keeps the contract digest in the canonical
+    # signed payload rather than as a caller-controlled constructor field.
+    unsigned.pop("core_release_evidence_contract_digest")
     return VerificationReceipt(**unsigned, signature=signature)
 
 
@@ -309,7 +396,9 @@ class VerifierReceiptIdentity:
 
     @classmethod
     def from_configuration(cls, config: VerifierConfiguration) -> "VerifierReceiptIdentity":
-        raw = _read_owner_only_file(config.receipt_key_file, kind="verifier receipt key").decode("ascii").strip()
+        raw = _read_rooted_owner_only_file(
+            config.trusted_root, config.receipt_key_file, kind="verifier receipt key"
+        ).decode("ascii").strip()
         try:
             private = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(raw))
         except ValueError as error:
@@ -322,50 +411,107 @@ class VerifierReceiptIdentity:
         return cls(config.receipt_issuer_id, config.receipt_key_id, private, config.receipt_public_key)
 
 
-def write_verification_receipt(receipt: VerificationReceipt, output: Path) -> None:
-    if not output.is_absolute() or not output.parent.is_dir():
-        raise ReleaseEvidenceError("verification receipt output must have an existing absolute parent")
+def _expected_output(path: Path, payload: bytes, *, trusted_root: Path, kind: str) -> Path:
+    if not path.is_absolute() or not path.parent.is_dir() or path == trusted_root:
+        raise ReleaseEvidenceError(f"{kind} output must have an existing absolute private parent")
+    _validate_private_components(trusted_root, path, kind=f"{kind} output")
+    if path.exists() or path.is_symlink():
+        existing = _read_rooted_owner_only_file(trusted_root, path, kind=f"{kind} output")
+        if existing != payload:
+            raise ReleaseEvidenceError(f"{kind} output already exists with different content")
+    return path.with_name(f".{path.name}.semantic-release-pending")
+
+
+def _stage_output(path: Path, payload: bytes, *, trusted_root: Path, kind: str) -> Path:
+    staged = _expected_output(path, payload, trusted_root=trusted_root, kind=kind)
+    snapshot = _validate_private_components(trusted_root, staged, kind=f"{kind} staged output")
+    if staged.exists() or staged.is_symlink():
+        if _read_rooted_owner_only_file(trusted_root, staged, kind=f"{kind} staged output") != payload:
+            raise ReleaseEvidenceError(f"{kind} staged output already exists with different content")
+        return staged
     descriptor = -1
     try:
-        descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as destination:
+        descriptor = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(descriptor, "wb") as destination:
             descriptor = -1
-            destination.write(_canonical_json(receipt.to_mapping()) + "\n")
+            destination.write(payload)
+            destination.flush()
+            os.fsync(destination.fileno())
     except OSError as error:
-        raise ReleaseEvidenceError("verification receipt output cannot be securely created") from error
+        raise ReleaseEvidenceError(f"{kind} output cannot be securely staged") from error
     finally:
         if descriptor != -1:
             os.close(descriptor)
+    _recheck_private_components(trusted_root, staged, snapshot, kind=f"{kind} staged output")
+    if _read_rooted_owner_only_file(trusted_root, staged, kind=f"{kind} staged output") != payload:
+        raise ReleaseEvidenceError(f"{kind} staged output changed while being written")
+    return staged
 
 
-def write_verified_evidence(evidence: SemanticReleaseEvidence, output: Path) -> None:
-    """Write ready verifier evidence once, without following/replacing a path."""
-    if not output.is_absolute() or not output.parent.is_dir():
-        raise ReleaseEvidenceError("verified evidence output must have an existing absolute parent")
-    descriptor = -1
+def _promote_staged_output(path: Path, staged: Path, payload: bytes, *, trusted_root: Path, kind: str) -> None:
+    if path.exists() or path.is_symlink():
+        if _read_rooted_owner_only_file(trusted_root, path, kind=f"{kind} output") != payload:
+            raise ReleaseEvidenceError(f"{kind} output already exists with different content")
+        return
+    snapshot = _validate_private_components(trusted_root, path, kind=f"{kind} output")
+    if _read_rooted_owner_only_file(trusted_root, staged, kind=f"{kind} staged output") != payload:
+        raise ReleaseEvidenceError(f"{kind} staged output changed before finalization")
     try:
-        descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as destination:
-            descriptor = -1
-            destination.write(_canonical_json(evidence.to_mapping()) + "\n")
+        os.replace(staged, path)
+        directory_descriptor = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
     except OSError as error:
-        raise ReleaseEvidenceError("verified evidence output cannot be securely created") from error
-    finally:
-        if descriptor != -1:
-            os.close(descriptor)
+        raise ReleaseEvidenceError(f"{kind} staged output cannot be finalized; retry is safe") from error
+    _recheck_private_components(trusted_root, path, snapshot, kind=f"{kind} output")
+    if _read_rooted_owner_only_file(trusted_root, path, kind=f"{kind} output") != payload:
+        raise ReleaseEvidenceError(f"{kind} output changed while being finalized")
+
+
+def finalize_verified_artifacts(
+    evidence: SemanticReleaseEvidence,
+    receipt: VerificationReceipt,
+    *,
+    evidence_output: Path,
+    receipt_output: Path,
+    trusted_root: Path,
+    freshness_ledger: ExternalFreshnessLedger,
+) -> None:
+    """Stage artifacts, atomically bind the nonce, then recoverably promote them."""
+    if evidence_output == receipt_output:
+        raise ReleaseEvidenceError("verified evidence and receipt outputs must be distinct")
+    if not evidence.ready or len(evidence.external_capabilities) != 1:
+        raise ReleaseEvidenceError("verified artifact finalization requires ready trusted evidence")
+    evidence_payload = (_canonical_json(evidence.to_mapping()) + "\n").encode("utf-8")
+    receipt_payload = (_canonical_json(receipt.to_mapping()) + "\n").encode("utf-8")
+    staged_evidence = _stage_output(evidence_output, evidence_payload, trusted_root=trusted_root, kind="verified evidence")
+    staged_receipt = _stage_output(receipt_output, receipt_payload, trusted_root=trusted_root, kind="verification receipt")
+    finalization_digest = _sha256(_canonical_json({
+        "evidence_output": str(evidence_output.relative_to(trusted_root)),
+        "receipt_output": str(receipt_output.relative_to(trusted_root)),
+    }))
+    report = evidence.external_capabilities[0]
+    freshness_ledger.finalize_verified_receipt(
+        report, evidence_digest=receipt.evidence_digest, policy_digest=receipt.policy_digest,
+        receipt_digest=receipt.digest, finalization_digest=finalization_digest,
+    )
+    _promote_staged_output(evidence_output, staged_evidence, evidence_payload, trusted_root=trusted_root, kind="verified evidence")
+    _promote_staged_output(receipt_output, staged_receipt, receipt_payload, trusted_root=trusted_root, kind="verification receipt")
 
 
 __all__ = [
     "VERIFICATION_RECEIPT_VERSION",
     "VerificationReceipt",
+    "finalize_verified_artifacts",
     "issue_verification_receipt",
     "load_budgets",
     "load_external_report",
     "load_records",
-    "read_trusted_execution_policy",
+    "prepare_trusted_evidence",
+    "read_verifier_configuration",
     "trusted_assemble",
-    "write_verification_receipt",
-    "write_verified_evidence",
     "verification_receipt_from_mapping",
     "verify_verification_receipt",
 ]

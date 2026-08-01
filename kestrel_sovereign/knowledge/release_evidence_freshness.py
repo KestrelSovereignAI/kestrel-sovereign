@@ -187,10 +187,16 @@ class ExternalFreshnessLedger:
                 freshness_receipt TEXT PRIMARY KEY,
                 evidence_digest TEXT NOT NULL,
                 policy_digest TEXT NOT NULL,
-                receipt_digest TEXT NOT NULL
+                receipt_digest TEXT NOT NULL,
+                finalization_digest TEXT
             )
             """
         )
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(verified_external_release_receipts)")}
+        if "finalization_digest" not in columns:
+            connection.execute(
+                "ALTER TABLE verified_external_release_receipts ADD COLUMN finalization_digest TEXT"
+            )
 
     def issue_challenge(self) -> str:
         """Persist and return the verifier's one-time nonce for an external run."""
@@ -307,3 +313,81 @@ class ExternalFreshnessLedger:
             raise
         except sqlite3.Error as exc:
             raise ReleaseEvidenceError("external freshness ledger cannot record verified receipt") from exc
+
+    def finalize_verified_receipt(
+        self,
+        report: ExternalCapabilityReport,
+        *,
+        evidence_digest: str,
+        policy_digest: str,
+        receipt_digest: str,
+        finalization_digest: str,
+    ) -> None:
+        """Atomically consume a challenge and bind the final verifier receipt.
+
+        The verifier calls this only after both final artifacts have been
+        durably staged.  A retry of the exact same finalization is accepted so
+        a process failure while promoting staged files is recoverable; any
+        different receipt for the same external run remains a hard failure.
+        """
+        if not isinstance(report, ExternalCapabilityReport) or any(
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in (evidence_digest, policy_digest, receipt_digest, finalization_digest)
+        ):
+            raise ReleaseEvidenceError("verified receipt binding requires content-free digests")
+        expected_identity = self._prepare_path()
+        try:
+            with sqlite3.connect(f"{self._path.as_uri()}?mode=rw", uri=True, isolation_level=None) as connection:
+                self._initialize_connection(connection, expected_identity)
+                connection.execute("BEGIN IMMEDIATE")
+                challenge = connection.execute(
+                    "UPDATE external_freshness_challenges SET state = 'consumed' "
+                    "WHERE run_nonce = ? AND state = 'pending'",
+                    (report.run_nonce,),
+                )
+                if challenge.rowcount == 1:
+                    try:
+                        connection.execute(
+                            "INSERT INTO consumed_external_freshness "
+                            "(freshness_receipt, attestation_digest) VALUES (?, ?)",
+                            (report.freshness_receipt, report.attestation_digest),
+                        )
+                        connection.execute(
+                            "INSERT INTO verified_external_release_receipts "
+                            "(freshness_receipt, evidence_digest, policy_digest, receipt_digest, finalization_digest) "
+                            "VALUES (?, ?, ?, ?, ?)",
+                            (report.freshness_receipt, evidence_digest, policy_digest, receipt_digest, finalization_digest),
+                        )
+                    except sqlite3.IntegrityError as exc:
+                        connection.execute("ROLLBACK")
+                        raise ReleaseEvidenceError(
+                            "external freshness receipt was already consumed by this verifier"
+                        ) from exc
+                else:
+                    consumed = connection.execute(
+                        "SELECT attestation_digest FROM consumed_external_freshness "
+                        "WHERE freshness_receipt = ?",
+                        (report.freshness_receipt,),
+                    ).fetchone()
+                    verified = connection.execute(
+                        "SELECT evidence_digest, policy_digest, receipt_digest, finalization_digest "
+                        "FROM verified_external_release_receipts WHERE freshness_receipt = ?",
+                        (report.freshness_receipt,),
+                    ).fetchone()
+                    if consumed != (report.attestation_digest,) or verified != (
+                        evidence_digest, policy_digest, receipt_digest, finalization_digest,
+                    ):
+                        connection.execute("ROLLBACK")
+                        raise ReleaseEvidenceError(
+                            "external freshness nonce was already finalized with different verifier evidence"
+                        )
+                if self._prepare_path() != expected_identity:
+                    connection.execute("ROLLBACK")
+                    raise ReleaseEvidenceError("external freshness ledger changed during receipt finalization")
+                connection.execute("COMMIT")
+        except ReleaseEvidenceError:
+            raise
+        except sqlite3.Error as exc:
+            raise ReleaseEvidenceError("external freshness ledger cannot finalize verified receipt") from exc
