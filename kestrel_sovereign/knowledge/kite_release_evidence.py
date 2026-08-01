@@ -34,6 +34,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .capabilities import SemanticRuntimeCapabilities, semantic_capabilities_from_config
+from .registry import get_knowledge_registry
 from .release_evidence_models import DrillBinding, ErasureStage, ReleaseEvidenceError, _canonical_json, _sha256
 from .release_evidence_postgres import DisposablePostgresDatabase
 
@@ -93,6 +94,29 @@ _CHILD_ENV_ALLOWLIST = frozenset(
         "PYTHONIOENCODING",
     }
 )
+
+
+def _kite_inference_config() -> dict[str, object]:
+    """Build Kite's exact inference approval from locally verified registry pins.
+
+    The isolated agent still carries a normal operator-style inference config,
+    but the harness never copies a static ontology digest or compatibility
+    contract into its generated TOML.  Agent startup parses and validates this
+    mapping before the typed HTTP probe can use it.
+    """
+    registry = get_knowledge_registry()
+    ontology = registry.select_capability("vocabulary:rdfs11").resource
+    rules = registry.select_capability("reasoning-profile:rdfs-v1").resource
+    return {
+        "enabled": True,
+        "rdfs_version": str(rules.version),
+        "ontology": {
+            "namespace": ontology.namespace,
+            "version": str(ontology.version),
+            "content_digest": ontology.sha256,
+            "compatibility_profile": registry.contract_version,
+        },
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -399,6 +423,7 @@ class KiteHttpHarness:
         # evidence home explicitly so the server never falls back to a path
         # beneath the checkout (or an existing agent's state).
         agent["data_dir"] = str(self.config.home / "agent_data" / "kite")
+        agent["semantic_inference"] = _kite_inference_config()
         if self.config.profile == "stable_only":
             agent.pop("semantic_capabilities", None)
         else:

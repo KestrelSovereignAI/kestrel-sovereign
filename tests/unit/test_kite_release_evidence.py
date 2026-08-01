@@ -7,6 +7,7 @@ from pathlib import Path
 import socket
 import subprocess
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -40,6 +41,7 @@ from kestrel_sovereign.knowledge.capabilities import (
     SemanticRuntimeCapabilities,
     semantic_capabilities_from_config,
 )
+from kestrel_sovereign.knowledge.inference import inference_profile_from_config
 from kestrel_sovereign.knowledge.release_evidence_models import _canonical_json
 
 
@@ -658,6 +660,112 @@ def test_kite_invoke_returns_signed_runtime_observation_without_assistant_dispat
         app.router.lifespan_context = original_lifespan
         app.state.agent = original_agent
         app.state.agent_manager = original_manager
+
+
+@pytest.mark.asyncio
+async def test_kite_paraphrase_recall_uses_the_verified_agent_runtime_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The server must not reconstruct a stable profile for the draft gate."""
+    from kestrel_sovereign.endpoints.agent import _kite_runtime_observation
+    from kestrel_sovereign.agent.invocation import request_provenance
+    from kestrel_sovereign.knowledge.kite_release_evidence import _kite_inference_config
+
+    profile = inference_profile_from_config(_kite_inference_config())
+    assert profile is not None
+    capabilities = semantic_capabilities_from_config(_KITE_EXPERIMENTAL_CAPABILITIES)
+    storage = MagicMock()
+    storage.semantic_rdf_capability_report.return_value = (
+        capabilities.create_rdf_codec().capability_report
+    )
+    storage.run_semantic_maintenance = AsyncMock(
+        return_value=SimpleNamespace(status=SimpleNamespace(value="complete"))
+    )
+    recall_candidate = SimpleNamespace(
+        assertion=SimpleNamespace(assertion_id="server-owned-assertion"),
+    )
+    storage.semantic_recall_candidates = AsyncMock(
+        return_value=SimpleNamespace(candidates=(recall_candidate,), checkpoint_generation=7)
+    )
+    hydrated_candidate = SimpleNamespace(source_occurrences=("server-owned-source",))
+    storage.hydrate_semantic_recall_candidates = AsyncMock(
+        return_value=(hydrated_candidate,)
+    )
+    inference_limits = SimpleNamespace()
+    maintenance_limits = SimpleNamespace()
+    agent = SimpleNamespace(
+        is_test_instance=True,
+        storage=storage,
+        semantic_inference_profile=profile,
+        semantic_capabilities=capabilities,
+        semantic_inference_limits=inference_limits,
+        semantic_maintenance_limits=maintenance_limits,
+    )
+    home = tmp_path / "kite-home"
+    home.mkdir(mode=0o700)
+    _kite_evidence_env(monkeypatch, home)
+
+    operation, observation = await _kite_runtime_observation(
+        agent,
+        request_id="kite-runtime-contract",
+        provenance=request_provenance(
+            source_kind="test", source_locator="test:kite-runtime-contract"
+        ),
+        request={"operation": "paraphrase_recall", "nonce": "d" * 64},
+    )
+
+    assert operation == "paraphrase_recall"
+    assert observation == {"retrieval_count": 1, "provenance_check_count": 1}
+    storage.run_semantic_maintenance.assert_awaited_once_with(
+        profile,
+        inference_limits=inference_limits,
+        maintenance_limits=maintenance_limits,
+        semantic_capabilities=capabilities,
+    )
+    storage.semantic_recall_candidates.assert_awaited_once_with(
+        query="Which region should the deployment use?",
+        candidate_scan_limit=10,
+        inference_profile=profile,
+        inference_limits=inference_limits,
+        maintenance_limits=maintenance_limits,
+    )
+    storage.hydrate_semantic_recall_candidates.assert_awaited_once_with(
+        ("server-owned-assertion",),
+        expected_checkpoint_generation=7,
+        inference_profile=profile,
+        inference_limits=inference_limits,
+        maintenance_limits=maintenance_limits,
+    )
+
+
+@pytest.mark.asyncio
+async def test_kite_paraphrase_recall_fails_closed_without_a_verified_runtime_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kestrel_sovereign.endpoints.agent import _kite_runtime_observation
+    from kestrel_sovereign.agent.invocation import request_provenance
+
+    storage = MagicMock()
+    agent = SimpleNamespace(
+        is_test_instance=True,
+        storage=storage,
+        semantic_inference_profile=None,
+        semantic_capabilities=SemanticRuntimeCapabilities.stable(),
+    )
+    home = tmp_path / "kite-home"
+    home.mkdir(mode=0o700)
+    _kite_evidence_env(monkeypatch, home)
+
+    with pytest.raises(RuntimeError, match="locally verified runtime semantic selection"):
+        await _kite_runtime_observation(
+            agent,
+            request_id="kite-runtime-contract-reject",
+            provenance=request_provenance(
+                source_kind="test", source_locator="test:kite-runtime-contract-reject"
+            ),
+            request={"operation": "paraphrase_recall", "nonce": "e" * 64},
+        )
+    storage.run_semantic_maintenance.assert_not_called()
 
 
 def _kite_evidence_env(

@@ -1610,6 +1610,8 @@ class AsyncStorage:
             inference_profile=inference_profile,
             inference_limits=inference_limits,
             maintenance_limits=maintenance_limits,
+            semantic_capabilities=self.semantic_capabilities,
+            rdf_codec=self._semantic_rdf_codec,
         )
 
     def semantic_assertion_vector_projection(self, profile):
@@ -1685,7 +1687,12 @@ class AsyncStorage:
     async def hydrate_semantic_recall_candidates(self, assertion_ids, **kwargs):
         if not self._initialized:
             await self.initialize()
-        return await self._assertion_store().hydrate_recall_candidates(assertion_ids, **kwargs)
+        return await self._assertion_store().hydrate_recall_candidates(
+            assertion_ids,
+            semantic_capabilities=self.semantic_capabilities,
+            rdf_codec=self._semantic_rdf_codec,
+            **kwargs,
+        )
 
     async def semantic_inference_state(self, profile):
         """Read the durable complete/incomplete status for one exact profile."""

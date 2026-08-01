@@ -74,6 +74,43 @@ def _kite_evidence_signature(payload: dict[str, object]) -> str:
     return sign_kite_evidence(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
 
 
+def _kite_verified_runtime_semantic_selection(agent: Any) -> tuple[Any, Any]:
+    """Return the agent-bound semantic contract for the fixed recall probe.
+
+    The typed Kite route has no caller-provided semantic inputs.  Re-check the
+    already selected local profile and runtime pins at the operation boundary:
+    a test-only route must not turn an incomplete or stale draft selection
+    into a stable fallback.
+    """
+    from kestrel_sovereign.knowledge.capabilities import SemanticRuntimeCapabilities
+    from kestrel_sovereign.knowledge.inference import (
+        InferenceProfile,
+        validate_inference_profile,
+    )
+
+    profile = getattr(agent, "semantic_inference_profile", None)
+    capabilities = getattr(agent, "semantic_capabilities", None)
+    if not isinstance(profile, InferenceProfile) or not isinstance(
+        capabilities, SemanticRuntimeCapabilities
+    ):
+        raise RuntimeError(
+            "Kite paraphrase recall requires a locally verified runtime semantic selection"
+        )
+    try:
+        validate_inference_profile(profile)
+        capabilities.validate()
+        runtime_report = agent.storage.semantic_rdf_capability_report()
+    except (AttributeError, ValueError) as error:
+        raise RuntimeError(
+            "Kite paraphrase recall runtime semantic selection is unavailable"
+        ) from error
+    if not capabilities.rdf_runtime_matches(runtime_report):
+        raise RuntimeError(
+            "Kite paraphrase recall runtime semantic selection is unverified"
+        )
+    return profile, capabilities
+
+
 async def _kite_runtime_observation(
     agent: Any, *, request_id: str, provenance: Any, request: object,
 ) -> tuple[str, dict[str, object]]:
@@ -130,21 +167,27 @@ async def _kite_runtime_observation(
                 raise RuntimeError("Kite sleep operation did not complete")
             return operation, {"sleep_success_count": 1}
         if operation == "paraphrase_recall":
-            from kestrel_sovereign.knowledge import InferenceProfile, OntologyRef
-
-            profile = InferenceProfile(OntologyRef(
-                "http://www.w3.org/2000/01/rdf-schema#", "1.0.0",
-                "e362812917fddab7cfab3dc35553ad292725e8f264e05f376077340e91034db5", "semantic-kb-v1",
-            ), "1.0.0")
-            maintenance = await agent.storage.run_semantic_maintenance(profile)
+            profile, capabilities = _kite_verified_runtime_semantic_selection(agent)
+            maintenance = await agent.storage.run_semantic_maintenance(
+                profile,
+                inference_limits=getattr(agent, "semantic_inference_limits", None),
+                maintenance_limits=getattr(agent, "semantic_maintenance_limits", None),
+                semantic_capabilities=capabilities,
+            )
             if getattr(getattr(maintenance, "status", None), "value", None) not in {"complete", "no_op"}:
                 raise RuntimeError("Kite paraphrase recall maintenance did not reach a terminal checkpoint")
             recall = await agent.storage.semantic_recall_candidates(
-                query="Which region should the deployment use?", candidate_scan_limit=10, inference_profile=profile,
+                query="Which region should the deployment use?", candidate_scan_limit=10,
+                inference_profile=profile,
+                inference_limits=getattr(agent, "semantic_inference_limits", None),
+                maintenance_limits=getattr(agent, "semantic_maintenance_limits", None),
             )
             hydrated = await agent.storage.hydrate_semantic_recall_candidates(
                 tuple(candidate.assertion.assertion_id for candidate in getattr(recall, "candidates", ())),
-                expected_checkpoint_generation=recall.checkpoint_generation, inference_profile=profile,
+                expected_checkpoint_generation=recall.checkpoint_generation,
+                inference_profile=profile,
+                inference_limits=getattr(agent, "semantic_inference_limits", None),
+                maintenance_limits=getattr(agent, "semantic_maintenance_limits", None),
             )
             if not hydrated or any(not candidate.source_occurrences for candidate in hydrated):
                 raise RuntimeError("Kite paraphrase recall did not hydrate provenance")

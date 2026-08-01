@@ -5411,6 +5411,8 @@ class AsyncAssertionStore:
         inference_profile,
         inference_limits=None,
         maintenance_limits=None,
+        semantic_capabilities=None,
+        rdf_codec=None,
     ) -> AssertionRecallResult:
         """Return recallable assertions only from a complete current checkpoint.
 
@@ -5430,6 +5432,8 @@ class AsyncAssertionStore:
         service = SemanticMaintenanceService(
             self, inference_profile=inference_profile,
             inference_limits=inference_limits, limits=maintenance_limits,
+            semantic_capabilities=semantic_capabilities,
+            rdf_codec=rdf_codec,
         )
         readiness = await service.training_readiness()
         if not readiness.ready:
@@ -5477,6 +5481,7 @@ class AsyncAssertionStore:
     async def hydrate_recall_candidates(
         self, assertion_ids: Sequence[str], *, expected_checkpoint_generation: int,
         inference_profile, inference_limits=None, maintenance_limits=None,
+        semantic_capabilities=None, rdf_codec=None,
     ) -> tuple[AssertionRecallCandidate, ...]:
         """Fence final publication after async scoring, then hydrate in one batch."""
         if not assertion_ids:
@@ -5487,6 +5492,8 @@ class AsyncAssertionStore:
         readiness = await SemanticMaintenanceService(
             self, inference_profile=inference_profile,
             inference_limits=inference_limits, limits=maintenance_limits,
+            semantic_capabilities=semantic_capabilities,
+            rdf_codec=rdf_codec,
         ).training_readiness()
         if not readiness.ready:
             raise SemanticRecallUnavailableError(readiness.reason or "semantic_maintenance_unavailable")
@@ -5505,6 +5512,8 @@ class AsyncAssertionStore:
         final_readiness = await SemanticMaintenanceService(
             self, inference_profile=inference_profile,
             inference_limits=inference_limits, limits=maintenance_limits,
+            semantic_capabilities=semantic_capabilities,
+            rdf_codec=rdf_codec,
         ).training_readiness()
         if not final_readiness.ready:
             raise SemanticRecallUnavailableError(final_readiness.reason or "semantic_maintenance_unavailable")
