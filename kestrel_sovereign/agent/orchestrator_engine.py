@@ -67,6 +67,11 @@ KESTREL_MAX_LOW_DELTA = None
 KESTREL_BUDGET_STOP_PCT = None
 MAX_TOOL_CONCURRENCY = int(os.environ.get("KESTREL_MAX_TOOL_CONCURRENCY", "10"))
 
+# Last-resort context window for orchestrator pruning when neither the LLM
+# service nor the model catalogue can name one. Only reached after an explicit
+# warning naming the model that failed to resolve — never as a silent default.
+_DEFAULT_ORCHESTRATOR_CONTEXT_LIMIT = 131072
+
 # Per-LLM-call timeout for the orchestrator's multi-iteration tool loop.
 # Wraps each follow-up ``stream_with_tool_detection`` so a hung upstream
 # (anthropic 429 backoff, network blip, frozen provider queue) surfaces
@@ -2201,6 +2206,88 @@ class OrchestratorEngineMixin:
     # Non-streaming orchestrator response handler
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _seed_orchestrator_messages(
+        system_prompt: str,
+        conversation_history: Optional[List[Dict[str, Any]]],
+        user_message: Optional[str],
+        log_prefix: str,
+    ) -> tuple[List[Dict[str, Any]], frozenset]:
+        """Rebuild the turn's message prefix for a tool continuation.
+
+        A continuation must reconstruct the SAME prefix the turn's first
+        provider call used — ``[system, *history, user]`` — not just
+        ``[system, user]``. Seeding only the current user turn (#2841) left
+        every post-tool synthesis call answering from a blank conversation:
+        the model that writes the user-visible text had no memory of any
+        prior turn, so it contradicted itself, re-asked for information it
+        had already been given, and reported the session as fresh. The first
+        call was always correct, which is why this read as a memory/context
+        bug rather than an orchestrator one.
+
+        ``conversation_history`` is the caller's already-budgeted, already
+        session-filtered ``ContextResult.messages`` — the exact list the
+        first call sent — so replaying it here keeps the provider-side
+        prefix byte-stable (Anthropic ``messages[-2]``/``[-4]`` cache
+        markers, llama.cpp KV, OpenAI prefix caching) instead of presenting
+        a different prefix on every continuation.
+
+        Returns ``(messages, history_ids)``. ``history_ids`` identifies the
+        replayed rows by object identity so the prefix bounds can be
+        RE-derived on every pass (see :meth:`_prefix_bounds`) rather than
+        computed once here — a tool turn can prune between iterations, which
+        shifts every seed-time index.
+        """
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+        ]
+
+        history_ids: frozenset = frozenset()
+        if conversation_history:
+            messages.extend(conversation_history)
+            history_ids = frozenset(id(m) for m in conversation_history)
+            logging.debug(
+                "[%s] Seeded continuation with %d prior-turn messages",
+                log_prefix,
+                len(conversation_history),
+            )
+
+        if user_message:
+            messages.append({"role": "user", "content": user_message})
+            logging.debug(
+                f"[{log_prefix}] Added user message to context: {user_message[:100]}..."
+            )
+        else:
+            logging.warning(
+                f"[{log_prefix}] No user_message provided - LLM won't have context for tool results!"
+            )
+
+        return messages, history_ids
+
+    @staticmethod
+    def _prefix_bounds(
+        messages: List[Dict[str, Any]],
+        history_ids: frozenset,
+        has_user_message: bool,
+    ) -> tuple[int, int]:
+        """Derive ``(protected_prefix, history_len)`` for the CURRENT array.
+
+        Must be recomputed before every prune, not cached from seed time. A
+        multi-iteration tool turn prunes between iterations, and a prune that
+        sheds replayed history shortens ``messages`` — so a seed-time
+        ``protected_prefix`` would, on the next pass, reach past the current
+        user turn and misclassify this turn's own tool exchange as sheddable
+        history. That could drop the live request or an assistant ``tool_use``
+        while leaving its ``tool_result`` orphaned, which providers reject
+        outright (codex review, #2841).
+
+        Identity (``id``) is the stable marker: the seeded rows are the caller's
+        own dicts and the prune only ever drops or replaces whole entries, never
+        rewrites a replayed row in place.
+        """
+        history_len = sum(1 for m in messages if id(m) in history_ids)
+        return 1 + history_len + (1 if has_user_message else 0), history_len
+
     async def _handle_orchestrator_response(
         self,
         response: Union[str, LLMResponse],
@@ -2213,6 +2300,8 @@ class OrchestratorEngineMixin:
         session_id: Optional[str] = None,
         tool_results: Optional[list] = None,
         invocation_context=None,
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+        continuation_user_content: Optional[str] = None,
     ) -> str:
         """
         Handle the orchestrator's response, executing any tool calls.
@@ -2226,6 +2315,11 @@ class OrchestratorEngineMixin:
                 ``{tool_call_id, name, result}`` envelope so the caller can
                 forward them to the STOP HookInput (#1238 — non-streaming
                 parity with the streaming path's existing plumbing).
+            conversation_history: The turn's budgeted prior-turn messages
+                (``ContextResult.messages``). Replayed ahead of
+                ``user_message`` so tool continuations keep the session's
+                context instead of answering from a blank conversation
+                (#2841).
         """
         _init_constants()
         if max_iterations is None:
@@ -2235,18 +2329,24 @@ class OrchestratorEngineMixin:
             return response
 
         # Build message history for multi-turn tool calling
-        messages = [
-            {"role": "system", "content": system_prompt},
-        ]
-
-        if user_message:
-            messages.append({"role": "user", "content": user_message})
-            logging.debug(f"[ORCHESTRATOR] Added user message to context: {user_message[:100]}...")
-        else:
-            logging.warning("[ORCHESTRATOR] No user_message provided - LLM won't have context for tool results!")
+        messages, history_ids = OrchestratorEngineMixin._seed_orchestrator_messages(
+            system_prompt,
+            conversation_history,
+            continuation_user_content or user_message,
+            "ORCHESTRATOR",
+        )
 
         if not response.has_tool_calls:
             if feature_tools and OrchestratorEngineMixin._signals_unfinished_tool_work(response.content or ""):
+                # #2841: this array now carries replayed history, and the repair
+                # helper appends another exchange and calls the provider WITHOUT
+                # pruning. Size it here or a near-budget turn overflows on the
+                # repair call (codex review r5).
+                messages = OrchestratorEngineMixin._prune_repair_messages(
+                    self, messages, feature_tools, history_ids,
+                    bool(continuation_user_content or user_message),
+                    effective_model,
+                )
                 response = await self._repair_premature_turn_yield(
                     response=response,
                     messages=messages,
@@ -2302,7 +2402,15 @@ class OrchestratorEngineMixin:
 
             # Continue conversation with tool results
             all_tools = self._build_all_tools()
-            messages = self._prune_orchestrator_messages(messages, all_tools)
+            # Re-derive on every pass: a prior iteration's prune may have
+            # shed replayed history, shifting all seed-time indexes (#2841).
+            protected_prefix, history_len = OrchestratorEngineMixin._prefix_bounds(
+                messages, history_ids, bool(continuation_user_content or user_message)
+            )
+            messages = self._prune_orchestrator_messages(
+                messages, all_tools, protected_prefix=protected_prefix,
+                history_len=history_len, model=effective_model,
+            )
 
             logging.info(f"[ORCHESTRATOR] Calling LLM with {len(messages)} messages, {len(all_tools)} tools")
             # #2614: propagate the caller's explicit invocation_context (if
@@ -2369,20 +2477,157 @@ class OrchestratorEngineMixin:
     # Message pruning
     # ------------------------------------------------------------------
 
+    def _prune_repair_messages(
+        self, messages: list, tools: list, history_ids: frozenset,
+        has_user_message: bool, model: Optional[str],
+    ) -> list:
+        """Model-aware prune for a repair turn's message array (#2841).
+
+        ``_repair_premature_turn_yield`` appends an assistant turn plus another
+        user prompt and calls the provider directly, with no pruning of its
+        own. That was harmless while the array was just ``[system, user]``;
+        once history is replayed, a turn that fit the first call can overflow
+        on the repair call.
+        """
+        protected_prefix, history_len = OrchestratorEngineMixin._prefix_bounds(
+            messages, history_ids, has_user_message
+        )
+        return self._prune_orchestrator_messages(
+            messages, tools, protected_prefix=protected_prefix,
+            history_len=history_len, model=model,
+        )
+
+    @staticmethod
+    def _active_route_qualified_model(llm_service: Any) -> Optional[str]:
+        """The active model, route-qualified when the service can name it.
+
+        ``get_active_model_selection()`` is the canonical source ContextManager
+        plans against and yields "vendor:route/model"; ``get_active_model_id()``
+        yields only the bare model and so loses any route-level cap.
+        """
+        selection = getattr(llm_service, "get_active_model_selection", None)
+        if callable(selection):
+            try:
+                qualified = (selection() or {}).get("model")
+            except Exception as exc:  # noqa: BLE001
+                logging.debug(
+                    "[ORCHESTRATOR] get_active_model_selection failed (%s); "
+                    "falling back to get_active_model_id.", exc,
+                )
+            else:
+                if qualified and qualified != "auto":
+                    return qualified
+        active = getattr(llm_service, "get_active_model_id", None)
+        if callable(active):
+            try:
+                resolved = active()
+            except Exception as exc:  # noqa: BLE001
+                logging.warning(
+                    "[ORCHESTRATOR] Could not resolve the active model for "
+                    "continuation pruning (%s).", exc,
+                )
+            else:
+                if resolved and resolved != "auto":
+                    return resolved
+        return None
+
+    @staticmethod
+    def _resolve_orchestrator_context_limit(llm_service: Any, model: Optional[str]) -> int:
+        """Resolve the continuation's real context window.
+
+        ``LLMService`` has no ``_context_limit`` attribute, so the legacy
+        ``getattr(..., None) or 131072`` always resolved to 131072 regardless of
+        the model actually serving the turn. That was survivable while
+        continuations carried only ``[system, user]``; replaying history (#2841)
+        makes the payload large enough that a sub-131K window (many local and
+        small-context routes) would sail past the prune untouched and come back
+        as a provider context-length error. Resolve from the model's own
+        catalogued window instead (codex review, #2841).
+        """
+        explicit = getattr(llm_service, "_context_limit", None)
+        if explicit:
+            return int(explicit)
+        if not model:
+            # ``effective_model`` is None whenever the turn carried no override
+            # AND ``check_solvency()`` declined to name one — which it does for
+            # every agent without a wallet, i.e. the common case. Falling
+            # straight through to the default would leave most turns pruning
+            # against a window nothing served (codex review r3, #2841).
+            model = OrchestratorEngineMixin._active_route_qualified_model(llm_service)
+        elif ":" not in model:
+            # A bare/provider-only override ("gpt-5.5", "openai/gpt-5.5") names
+            # the model but NOT the serving route, and a route can carry a
+            # per-turn cap far below the model's own window. If the active
+            # selection is a route-qualified id for this same model, prefer it
+            # so the cap is honoured (codex review r5, #2841).
+            qualified = OrchestratorEngineMixin._active_route_qualified_model(
+                llm_service
+            )
+            if (
+                qualified
+                and ":" in qualified
+                and qualified.split("/")[-1] == model.split("/")[-1]
+            ):
+                model = qualified
+        if model:
+            try:
+                from kestrel_sovereign.agent.token_counter import get_token_counter
+
+                limit = get_token_counter(model).get_context_limit()
+                if limit:
+                    return int(limit)
+            except Exception as exc:  # noqa: BLE001
+                # Never silently substitute a window we can't justify — say
+                # which model failed to resolve and that the default is a guess.
+                logging.warning(
+                    "[ORCHESTRATOR] Could not resolve a context limit for %s "
+                    "(%s); pruning against the %d default, which may not match "
+                    "the served route.",
+                    model, exc, _DEFAULT_ORCHESTRATOR_CONTEXT_LIMIT,
+                )
+        return _DEFAULT_ORCHESTRATOR_CONTEXT_LIMIT
+
     def _prune_orchestrator_messages(
-        self, messages: list, tools: list, context_limit: int = None
+        self, messages: list, tools: list, context_limit: int = None,
+        protected_prefix: int = 2, history_len: int = 0,
+        model: Optional[str] = None,
     ) -> list:
         """Prune orchestrator messages to stay within context limits.
 
-        Strategy: keep system + user messages (first 2), keep the most recent
-        assistant+tool exchange, and progressively drop older tool results
-        (replacing with summaries) until we fit.
+        Strategy, cheapest-to-lose first:
+
+        1. Shed the OLDEST replayed prior-turn messages.
+        2. Only if that is not enough, truncate oversized tool results
+           (replacing them with a summary marker).
+
+        Stale history before live tool output: the synthesis call exists to
+        report what the tool returned, so destroying that result while an old
+        exchange nobody needed still occupies the same bytes would defeat the
+        turn (codex review r4).
+
+        ``system`` and the current user turn are never dropped — without them
+        the continuation cannot answer at all.
+
+        ``protected_prefix`` is the number of leading messages that form the
+        turn's conversation prefix — ``system`` + any replayed prior-turn
+        history + the current user turn — and ``history_len`` is how many of
+        those are the replayed history (see ``_seed_orchestrator_messages``).
+        They default to the historical ``[system, user]`` shape with no
+        history. Before #2841 the boundary was hard-coded to ``messages[:2]``,
+        which mis-sliced once history was replayed.
+
+        Step 2 exists because #2841 made continuations carry history: tool
+        truncation alone is no longer a sufficient pressure valve, since a long
+        session's history can exceed the ceiling on its own with no oversized
+        tool result to reclaim.
 
         Uses char-based estimation: ~4 chars per token.
         """
         _init_constants()
         if context_limit is None:
-            context_limit = getattr(self.llm_service, '_context_limit', None) or 131072
+            context_limit = OrchestratorEngineMixin._resolve_orchestrator_context_limit(
+                self.llm_service, model
+            )
 
         chars_per_token = 3.5
         max_chars = int(context_limit * chars_per_token * (1 - CONTEXT_RESERVE_FRACTION))
@@ -2409,9 +2654,48 @@ class OrchestratorEngineMixin:
             f"vs {context_limit}tok limit. Pruning old tool results."
         )
 
-        protected = messages[:2]  # system + user
-        middle = messages[2:]
+        protected = messages[:protected_prefix]  # system + history + user
+        middle = messages[protected_prefix:]
 
+        # Step 1 — shed the oldest replayed prior turns FIRST. Stale history is
+        # the cheapest thing in the payload to lose; this turn's tool output is
+        # the most expensive, since the synthesis call exists precisely to
+        # report it. Truncating the live result first (the pre-#2841 order, when
+        # history was not in the array at all) could destroy the lookup the
+        # answer depends on while an old exchange nobody needed sat untouched
+        # and would have freed the same bytes (codex review r4).
+        # ``system`` (index 0) and the current user turn (the tail of
+        # ``protected``) are structural and never dropped.
+        if history_len and _total_chars(protected + middle) > max_message_chars:
+            head = protected[:1]
+            history = list(protected[1:1 + history_len])
+            tail = list(protected[1 + history_len:])
+            shed = 0
+            while history and (
+                _total_chars(head + history + tail + middle) > max_message_chars
+            ):
+                history.pop(0)
+                shed += 1
+            if shed:
+                # A shed cuts mid-exchange: dropping a user row while keeping
+                # its assistant reply leaves the replayed span opening on a
+                # detached answer with no question. Anthropic's conversion path
+                # does not repair that, and providers reject a leading
+                # assistant turn outright. Advance to the next user boundary
+                # (codex review, #2841).
+                while history and history[0].get("role") != "user":
+                    history.pop(0)
+                    shed += 1
+                logging.warning(
+                    "[ORCHESTRATOR] Context pressure — dropped %d/%d oldest "
+                    "replayed history message(s) from the continuation.",
+                    shed,
+                    history_len,
+                )
+            protected = head + history + tail
+
+        # Step 2 — only if shedding every replayed turn still left the payload
+        # over: start reclaiming this turn's own tool output.
         for i, msg in enumerate(middle):
             if _total_chars(protected + middle) <= max_message_chars:
                 break
@@ -2452,6 +2736,8 @@ class OrchestratorEngineMixin:
         invocation_context=None,
         buffer_audit: bool = False,
         strict_timeout_state: Optional[dict] = None,
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+        continuation_user_content: Optional[str] = None,
     ):
         """
         Streaming version of _handle_orchestrator_response.
@@ -2484,6 +2770,22 @@ class OrchestratorEngineMixin:
         continuation and substitutes a deterministic safe block that is audited,
         persisted, and released like any other buffered turn.
 
+        ``conversation_history`` (#2841): the turn's budgeted prior-turn
+        messages (``ContextResult.messages``). Replayed ahead of the current
+        user turn so the post-tool synthesis call — the one that writes the
+        text the user actually reads — keeps the session's context instead of
+        answering from a blank conversation.
+
+        ``continuation_user_content`` (#2841): the exact bytes the turn's first
+        provider call sent as its last user message — the RENDERED prompt
+        (memories + RAG folded in) plus any lazy-attachment hint. This path
+        passes raw ``user_input`` as ``user_message`` because that same string
+        becomes a dispatched subagent's "User's original request" context,
+        which must stay clean user speech. Reconstructing the provider prefix
+        needs the rendered form, so the two are carried separately rather than
+        conflated — without it the synthesis call silently lost the CURRENT
+        turn's retrieved context (codex review r3).
+
         Yields:
             Text chunks as they arrive from the LLM
         """
@@ -2495,18 +2797,21 @@ class OrchestratorEngineMixin:
             yield response
             return
 
-        messages = [
-            {"role": "system", "content": system_prompt},
-        ]
-
-        if user_message:
-            messages.append({"role": "user", "content": user_message})
-            logging.debug(f"[ORCHESTRATOR-STREAM] Added user message to context: {user_message[:100]}...")
-        else:
-            logging.warning("[ORCHESTRATOR-STREAM] No user_message provided!")
+        messages, history_ids = OrchestratorEngineMixin._seed_orchestrator_messages(
+            system_prompt,
+            conversation_history,
+            continuation_user_content or user_message,
+            "ORCHESTRATOR-STREAM",
+        )
 
         if not response.has_tool_calls:
             if feature_tools and OrchestratorEngineMixin._signals_unfinished_tool_work(response.content or ""):
+                # #2841: see the non-streaming site — prune before repairing.
+                messages = OrchestratorEngineMixin._prune_repair_messages(
+                    self, messages, feature_tools, history_ids,
+                    bool(continuation_user_content or user_message),
+                    effective_model,
+                )
                 response = await self._repair_premature_turn_yield(
                     response=response,
                     messages=messages,
@@ -2641,7 +2946,15 @@ class OrchestratorEngineMixin:
                 return
 
             all_tools = self._build_all_tools()
-            messages = self._prune_orchestrator_messages(messages, all_tools)
+            # Re-derive on every pass: a prior iteration's prune may have
+            # shed replayed history, shifting all seed-time indexes (#2841).
+            protected_prefix, history_len = OrchestratorEngineMixin._prefix_bounds(
+                messages, history_ids, bool(continuation_user_content or user_message)
+            )
+            messages = self._prune_orchestrator_messages(
+                messages, all_tools, protected_prefix=protected_prefix,
+                history_len=history_len, model=effective_model,
+            )
 
             logging.info(f"[ORCHESTRATOR-STREAM] Checking for more tool calls with {len(messages)} messages, {len(all_tools)} tools")
             # Replaced the prior generate_with_messages → stream_with_messages

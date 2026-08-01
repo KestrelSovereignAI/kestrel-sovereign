@@ -3265,7 +3265,7 @@ class TestInvocationContextEndToEndThreading:
         agent._visible_known_tool_names = lambda: set()
         agent._execute_tool_batch = _AsyncMockCallable()
         agent._build_all_tools = lambda: []
-        agent._prune_orchestrator_messages = lambda m, t: m
+        agent._prune_orchestrator_messages = lambda m, t, **_kw: m
 
         # A single tool_calls-carrying response that triggers ONE continuation.
         tc = MagicMock(id="tc1", name="dummy_tool", arguments={})
