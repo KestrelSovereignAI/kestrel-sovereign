@@ -360,7 +360,8 @@ fixed configuration locator: it has no `--config` argument or environment
 override, so a producer cannot select its own policy, ledger, or key. Every
 directory component below the verifier root is owner-only, non-symlinked, and
 rechecked around sensitive reads and writes; the receipt signer may not also
-be an execution-policy identity.
+be an execution-policy identity, including under different issuer/key labels
+that alias the same Ed25519 public key.
 
 After every signed core record/budget and the external report validate, the
 verifier stages content-addressed evidence and receipt files beneath that
@@ -371,7 +372,12 @@ If an output failure occurs before the transaction, the nonce remains pending;
 if a process dies after it, retrying the exact digest-bound finalization
 recovers the staged files and rejects a different receipt. The Ed25519 receipt
 signs the core release-evidence contract digest as well as both revisions and
-all receipt bindings. The public `assemble` command remains structural and
+all receipt bindings. Finalization independently verifies that signature and
+recomputes the canonical evidence digest, then compares the policy digest,
+freshness receipt, nonce, capability revision, and runner revision against the
+exact evidence/report before staging or consuming. Its final ledger binding
+also covers both serialized payload digests and their verifier-rooted target
+paths. The public `assemble` command remains structural and
 cannot issue challenges, consume a ledger, emit a receipt, or set `ready: true`.
 
 An external report is supplied as safe structured JSON—never as pre-populated

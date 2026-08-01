@@ -53,7 +53,7 @@ def main(argv: list[str] | None = None) -> int:
         receipt = issue_verification_receipt(evidence, policy_digest=config.policy_digest, identity=identity)
         finalize_verified_artifacts(
             evidence, receipt, evidence_output=args.output, receipt_output=args.receipt_output,
-            trusted_root=config.trusted_root, freshness_ledger=ledger,
+            configuration=config, freshness_ledger=ledger,
         )
         print("semantic release evidence verified and receipt issued")
         return 0

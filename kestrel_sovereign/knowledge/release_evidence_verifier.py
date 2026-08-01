@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -192,8 +193,13 @@ def read_verifier_configuration(path: Path) -> VerifierConfiguration:
     if value["verifier_role"] != "semantic_release_verifier":
         raise ReleaseEvidenceError("verifier configuration requires the semantic_release_verifier role")
     policy = trusted_execution_policy_from_mapping(policy_mapping)
-    if (issuer_id, key_id) in {(key.issuer_id, key.key_id) for key in policy.keys}:
-        raise ReleaseEvidenceError("verifier receipt identity must be distinct from execution identities")
+    if (
+        (issuer_id, key_id) in {(key.issuer_id, key.key_id) for key in policy.keys}
+        or public_key in {key.public_key for key in policy.keys}
+    ):
+        raise ReleaseEvidenceError(
+            "verifier receipt identity and public key must be distinct from execution identities"
+        )
     return VerifierConfiguration(resolved_root, ledger_path, policy, _sha256(_canonical_json(policy_mapping)), revision, receipt_key_file, issuer_id, key_id, public_key, value["verifier_role"])
 
 
@@ -476,7 +482,7 @@ def finalize_verified_artifacts(
     *,
     evidence_output: Path,
     receipt_output: Path,
-    trusted_root: Path,
+    configuration: VerifierConfiguration,
     freshness_ledger: ExternalFreshnessLedger,
 ) -> None:
     """Stage artifacts, atomically bind the nonce, then recoverably promote them."""
@@ -484,15 +490,37 @@ def finalize_verified_artifacts(
         raise ReleaseEvidenceError("verified evidence and receipt outputs must be distinct")
     if not evidence.ready or len(evidence.external_capabilities) != 1:
         raise ReleaseEvidenceError("verified artifact finalization requires ready trusted evidence")
+    if (
+        freshness_ledger.trusted_root != configuration.trusted_root
+        or freshness_ledger.path != configuration.ledger_path
+    ):
+        raise ReleaseEvidenceError("verified artifact finalization requires the configured freshness ledger")
+    verify_verification_receipt(receipt, configuration)
+    report = evidence.external_capabilities[0]
+    evidence_digest = _sha256(_canonical_json(evidence.to_mapping()))
+    if (
+        receipt.evidence_digest != evidence_digest
+        or receipt.policy_digest != configuration.policy_digest
+        or receipt.external_freshness_receipt != report.freshness_receipt
+        or receipt.run_nonce != report.run_nonce
+        or receipt.capability_source_revision != report.capability_source_revision
+        or receipt.evidence_runner_revision != report.evidence_runner_revision
+        or receipt.evidence_runner_revision != configuration.expected_external_runner_revision
+    ):
+        raise ReleaseEvidenceError(
+            "verification receipt is not bound to the exact evidence, policy, and external report"
+        )
+    trusted_root = configuration.trusted_root
     evidence_payload = (_canonical_json(evidence.to_mapping()) + "\n").encode("utf-8")
     receipt_payload = (_canonical_json(receipt.to_mapping()) + "\n").encode("utf-8")
     staged_evidence = _stage_output(evidence_output, evidence_payload, trusted_root=trusted_root, kind="verified evidence")
     staged_receipt = _stage_output(receipt_output, receipt_payload, trusted_root=trusted_root, kind="verification receipt")
     finalization_digest = _sha256(_canonical_json({
+        "evidence_payload_digest": hashlib.sha256(evidence_payload).hexdigest(),
         "evidence_output": str(evidence_output.relative_to(trusted_root)),
+        "receipt_payload_digest": hashlib.sha256(receipt_payload).hexdigest(),
         "receipt_output": str(receipt_output.relative_to(trusted_root)),
     }))
-    report = evidence.external_capabilities[0]
     freshness_ledger.finalize_verified_receipt(
         report, evidence_digest=receipt.evidence_digest, policy_digest=receipt.policy_digest,
         receipt_digest=receipt.digest, finalization_digest=finalization_digest,

@@ -52,6 +52,13 @@ from kestrel_sovereign.knowledge.release_evidence import (
 from kestrel_sovereign.knowledge.release_evidence_freshness import ExternalFreshnessLedger
 from kestrel_sovereign.knowledge.release_evidence_execution import CatalogSigningIdentity
 from kestrel_sovereign.knowledge.release_evidence_verifier import (
+    VerifierReceiptIdentity,
+    finalize_verified_artifacts,
+    issue_verification_receipt,
+    load_budgets,
+    load_external_report,
+    load_records,
+    prepare_trusted_evidence,
     read_verifier_configuration,
     verification_receipt_from_mapping,
     verify_verification_receipt,
@@ -59,6 +66,7 @@ from kestrel_sovereign.knowledge.release_evidence_verifier import (
 from kestrel_sovereign.knowledge.release_evidence_models import (
     ExecutionSource,
     SemanticBenchmarkHarness,
+    _canonical_json,
 )
 
 
@@ -1264,13 +1272,14 @@ def test_verifier_cli_requires_protected_config_and_consumes_one_external_challe
         ]
     }
     config = root / "verifier.json"
-    config.write_text(json.dumps({
+    config_mapping = {
         "trusted_root": str(root), "ledger_path": str(root / "ledger.sqlite"),
         "trust_policy": policy, "expected_external_runner_revision": "b" * 40,
         "receipt_key_file": str(receipt_key), "receipt_issuer_id": "verifier_ci",
         "receipt_key_id": "semantic_release", "receipt_public_key": receipt_public,
         "verifier_role": "semantic_release_verifier",
-    }), encoding="utf-8")
+    }
+    config.write_text(json.dumps(config_mapping), encoding="utf-8")
     config.chmod(0o600)
     challenge = _verifier_cli(config, "issue-challenge")
     assert challenge.returncode == 0, challenge.stderr
@@ -1285,6 +1294,58 @@ def test_verifier_cli_requires_protected_config_and_consumes_one_external_challe
         args.extend(("--record", str(record)))
     for budget in budgets:
         args.extend(("--budget", str(budget)))
+
+    configuration = read_verifier_configuration(config)
+    ledger = ExternalFreshnessLedger(configuration.ledger_path, trusted_root=configuration.trusted_root)
+    external_report = load_external_report(report)
+    prepared = prepare_trusted_evidence(
+        records=load_records(records), budgets=load_budgets(budgets), report=external_report,
+        trust_policy=configuration.trust_policy,
+        expected_evidence_runner_revision=configuration.expected_external_runner_revision,
+    )
+    receipt_identity = VerifierReceiptIdentity.from_configuration(configuration)
+    valid_receipt = issue_verification_receipt(
+        prepared, policy_digest=configuration.policy_digest, identity=receipt_identity,
+    )
+    other_evidence = attach_retirement_telemetry(prepared, _retirement_telemetry())
+    receipt_for_other_evidence = issue_verification_receipt(
+        other_evidence, policy_digest=configuration.policy_digest, identity=receipt_identity,
+    )
+    with pytest.raises(ReleaseEvidenceError, match="not bound to the exact evidence"):
+        finalize_verified_artifacts(
+            prepared, receipt_for_other_evidence,
+            evidence_output=root / "wrong-evidence.json",
+            receipt_output=root / "wrong-evidence-receipt.json",
+            configuration=configuration, freshness_ledger=ledger,
+        )
+
+    tampered_report_receipt = replace(
+        valid_receipt, capability_source_revision="c" * 40, signature="0" * 128,
+    )
+    tampered_report_receipt = replace(
+        tampered_report_receipt,
+        signature=receipt_identity.private_key.sign(
+            _canonical_json(tampered_report_receipt.signed_payload()).encode("utf-8")
+        ).hex(),
+    )
+    with pytest.raises(ReleaseEvidenceError, match="not bound to the exact evidence"):
+        finalize_verified_artifacts(
+            prepared, tampered_report_receipt,
+            evidence_output=root / "tampered-report.json",
+            receipt_output=root / "tampered-report-receipt.json",
+            configuration=configuration, freshness_ledger=ledger,
+        )
+
+    with pytest.raises(ReleaseEvidenceError, match="signature verification failed"):
+        finalize_verified_artifacts(
+            prepared, replace(valid_receipt, signature="0" * 128),
+            evidence_output=root / "forged.json", receipt_output=root / "forged-receipt.json",
+            configuration=configuration, freshness_ledger=ledger,
+        )
+    assert not any(root.glob("wrong-evidence*"))
+    assert not any(root.glob("tampered-report*"))
+    assert not any(root.glob("forged*"))
+
     # Output failure happens after evidence preparation but before ledger
     # finalization.  The same verifier-issued challenge must remain usable.
     receipt.write_text("impostor\n", encoding="utf-8")
@@ -1342,6 +1403,14 @@ def test_verifier_cli_requires_protected_config_and_consumes_one_external_challe
     rejected_role = _verifier_cli(wrong_role, "issue-challenge")
     assert rejected_role.returncode == 1
     assert "semantic_release_verifier role" in rejected_role.stderr
+
+    aliased_key_mapping = {**config_mapping, "receipt_public_key": policy["keys"][0]["public_key"]}
+    aliased_key = root / "aliased-key.json"
+    aliased_key.write_text(json.dumps(aliased_key_mapping), encoding="utf-8")
+    aliased_key.chmod(0o600)
+    rejected_alias = _verifier_cli(aliased_key, "issue-challenge")
+    assert rejected_alias.returncode == 1
+    assert "public key must be distinct" in rejected_alias.stderr
 
     nested = root / "nested"
     nested.mkdir(mode=0o700)
