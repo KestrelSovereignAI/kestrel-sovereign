@@ -13,6 +13,7 @@ Checks are designed to be fast and non-destructive.
 import logging
 import shutil
 import time
+from datetime import datetime
 from typing import Any, Dict
 
 logger = logging.getLogger(__name__)
@@ -390,6 +391,66 @@ async def check_bootstrap_state(agent, threshold_seconds: int = 3600) -> Dict[st
         "message": f"Bootstrap state OK: {stale.state.value}",
         "duration_ms": _elapsed(start),
         "details": stale.to_dict(),
+    }
+
+
+async def check_signal_audit_log(agent) -> Dict[str, Any]:
+    """Report ``signal_log`` audit rows this process failed to persist (#2660).
+
+    A dropped audit row is a permanent loss, but until this check existed its
+    only trace was an ERROR line: 3,323 accumulated over two months of
+    production before anyone looked. The dispatcher counts them; this surfaces
+    the count where operators actually look.
+
+    ``warn`` rather than ``fail`` — the agent keeps serving correctly and the
+    audit trail has a hole. It does not clear when later writes succeed,
+    because the rows lost earlier are still lost; an operator acknowledging
+    that is the intent, not noise to be reset away.
+    """
+    start = time.monotonic()
+
+    dispatcher = getattr(agent, "dispatcher", None)
+    if dispatcher is None:
+        return {
+            "name": "signal_audit_log",
+            "status": "pass",
+            "message": "No signal dispatcher on this agent",
+            "duration_ms": _elapsed(start),
+        }
+
+    # Duck-typed on purpose: third-party agents and test doubles implement the
+    # DispatcherAgent protocol, not this accounting. A bare truthiness test
+    # would warn on any stand-in whose attribute access auto-creates a value
+    # (a MagicMock dispatcher reports a truthy count), so require a real
+    # positive integer before claiming rows were lost. Reporting a loss that
+    # did not happen is the same failure as hiding one that did.
+    dropped = getattr(dispatcher, "log_write_failure_count", 0)
+    if not isinstance(dropped, int) or isinstance(dropped, bool) or dropped <= 0:
+        return {
+            "name": "signal_audit_log",
+            "status": "pass",
+            "message": "No signal_log writes dropped",
+            "duration_ms": _elapsed(start),
+        }
+
+    last = getattr(dispatcher, "last_log_write_failure", None)
+    details: Dict[str, Any] = {"dropped": dropped}
+    if last is not None:
+        details["last_signal_id"] = str(getattr(last, "signal_id", ""))
+        details["last_error"] = str(getattr(last, "error", ""))
+        failed_at = getattr(last, "failed_at", None)
+        if isinstance(failed_at, datetime):
+            details["last_failed_at"] = failed_at.isoformat()
+
+    return {
+        "name": "signal_audit_log",
+        "status": "warn",
+        "message": (
+            f"{dropped} signal_log audit row(s) dropped since start; "
+            "the audit trail is incomplete"
+        ),
+        "duration_ms": _elapsed(start),
+        "details": details,
     }
 
 

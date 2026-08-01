@@ -40,6 +40,7 @@ from kestrel_sovereign.signals.dispatcher import (
     DEFAULT_TTL,
     DispatcherAgent,
     SignalDispatcher,
+    SignalLogWriteFailure,
 )
 from kestrel_sovereign.signals.durable import (
     ACKNOWLEDGED,
@@ -113,6 +114,7 @@ __all__ = [
     "RegistrationState",
     "SignalDispatcher",
     "SignalLogStore",
+    "SignalLogWriteFailure",
     "RETRY",
     "SourceRegistry",
     "template_artifact_handler",

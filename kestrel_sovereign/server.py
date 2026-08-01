@@ -3248,6 +3248,7 @@ async def _agent_detailed_health(agent) -> dict:
     from kestrel_sovereign.features.health.checks import (
         check_bootstrap_state, check_context_budget, check_database,
         check_disk_space, check_llm_service, check_memory_system,
+        check_signal_audit_log,
     )
     db = None
     if hasattr(agent, 'storage') and agent.storage:
@@ -3260,6 +3261,7 @@ async def _agent_detailed_health(agent) -> dict:
         await check_disk_space(),
         await check_context_budget(agent),
         await check_bootstrap_state(agent),
+        await check_signal_audit_log(agent),
     ]
     statuses = [c.get("status") for c in checks]
     if "fail" in statuses:

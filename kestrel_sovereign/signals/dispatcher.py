@@ -195,6 +195,21 @@ class _ConstitutionAudit:
 
 
 @dataclass(frozen=True)
+class SignalLogWriteFailure:
+    """One dropped ``signal_log`` audit row (#2660).
+
+    Public because the health surface reports it: an audit row that failed to
+    persist is a loss, and a loss nobody can observe is operationally the same
+    as no loss.  Carries enough to act on — which signal, what failed, when —
+    without retaining the payload the row would have redacted anyway.
+    """
+
+    signal_id: str
+    error: str
+    failed_at: datetime
+
+
+@dataclass(frozen=True)
 class _DurableSignalProjection:
     """The durable event representation and its initial selector contract.
 
@@ -425,6 +440,10 @@ class SignalDispatcher:
         self._registry = registry
         self._locks = lock_manager
         self._store = store
+        # Dropped-audit-row accounting (#2660). See ``_record_log_write_failure``
+        # for why this is in-memory rather than persisted.
+        self._log_write_failures = 0
+        self._last_log_write_failure: Optional[SignalLogWriteFailure] = None
         # Keep outcome/audit persistence and pending-delivery persistence
         # distinct.  Existing embeddings/tests construct only SignalLogStore;
         # deriving the durable store from its backend preserves that seam while
@@ -2816,13 +2835,62 @@ class SignalDispatcher:
                 # cancellation cannot create a post-close SQLite operation.
                 cancelled = True
                 continue
+            except Exception:
+                # ``asyncio.shield`` re-raises the writer's own failure here.
+                # Without this branch it escaped ``_log_safe`` entirely, so the
+                # handler below never ran: from #2713 (2026-07-24) until now a
+                # dropped signal_log row produced NO log line at all, because
+                # ``_track_background_task`` only discards and shutdown's
+                # ``gather(return_exceptions=True)`` swallows the rest.
+                #
+                # The failure is reported once, from ``writer.result()`` below,
+                # which is also where the loss is counted.  Break rather than
+                # handle it here so there is exactly one reporting path.
+                break
 
         try:
             writer.result()
-        except Exception:
+        except Exception as exc:
+            # A dropped audit row is a loss, and a loss that leaves no record
+            # anyone reads is indistinguishable from no loss at all (#2660):
+            # 3,323 of these accumulated in a log file over two months before
+            # anyone noticed. The ERROR line stays for the traceback; the
+            # counter is what makes the loss observable at /health/detailed.
+            #
+            # Deliberately in-memory: the write that just failed was the
+            # durable one, so recording the failure durably would need the
+            # backend that is unavailable. This is an observability signal,
+            # not a second audit trail.
+            self._record_log_write_failure(signal.id, exc)
             logger.exception("Failed to write signal_log entry for %s", signal.id)
         if cancelled:
             raise asyncio.CancelledError()
+
+    def _record_log_write_failure(
+        self, signal_id: str, error: BaseException
+    ) -> None:
+        """Count one dropped signal_log row and remember its most recent cause."""
+        self._log_write_failures += 1
+        self._last_log_write_failure = SignalLogWriteFailure(
+            signal_id=signal_id,
+            error=f"{type(error).__name__}: {error}",
+            failed_at=self._clock(),
+        )
+
+    @property
+    def log_write_failure_count(self) -> int:
+        """Number of signal_log rows dropped since this dispatcher was built.
+
+        Monotonic by design.  It does not reset when a later write succeeds:
+        the rows lost earlier are still lost, and an operator acknowledging
+        that is the point of surfacing it.
+        """
+        return self._log_write_failures
+
+    @property
+    def last_log_write_failure(self) -> Optional["SignalLogWriteFailure"]:
+        """The most recent dropped-row cause, or None if none have dropped."""
+        return self._last_log_write_failure
 
     async def _write_outcome_log(
         self,
