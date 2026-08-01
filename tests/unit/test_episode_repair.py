@@ -519,6 +519,131 @@ class TestDryRun:
             await db.close()
 
 
+class TestReviewFindings:
+    """Defects found in codex review r1, each pinned by its failure mode."""
+
+    @pytest.mark.asyncio
+    async def test_withdrawn_episodes_are_never_repaired(self, tmp_path):
+        """excluded_from_context = 1 means the lifecycle took this content away.
+
+        Rewriting the graph node from freshly decrypted sources would put
+        withdrawn topics back in the Memories panel. The ciphertext title is
+        the safer state for a row nobody may read.
+        """
+        db, ids, store = await _corrupt_fixture(tmp_path)
+        await db.execute(
+            "UPDATE memory_episodes SET excluded_from_context = 1 WHERE id = ?",
+            ("episode:corrupt",),
+        )
+        graph = _RecordingGraphStore(db)
+        c = _consolidator(db, store, graph)
+        try:
+            report = await c.repair_ciphertext_episodes()
+
+            assert report["scanned"] == 0
+            assert report["repaired"] == 0
+            assert graph.row_titles_at_write == [], "the KG node must not be touched"
+            assert await db.fetchval(
+                "SELECT label FROM graph_nodes WHERE node_id = ?",
+                ("episode:corrupt",)
+            ) == CORRUPT_TITLE
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_message_ids_are_bound_as_integers(self, tmp_path):
+        """conversation_history.id is an integer column.
+
+        key_message_ids persists strings, and on PostgreSQL asyncpg rejects a
+        text parameter against an integer column — which would make every
+        candidate a lookup failure and disable repair on that backend
+        entirely. Assert the binding type directly; SQLite is too permissive
+        to catch this on its own.
+        """
+        db, ids, store = await _corrupt_fixture(tmp_path)
+        bound: list = []
+        original = db.fetchall
+
+        async def _spy(sql, params=()):
+            if "FROM conversation_history" in sql and " id IN (" in sql:
+                bound.extend(params[1:])
+            return await original(sql, params)
+
+        db.fetchall = _spy
+        c = _consolidator(db, store, _RecordingGraphStore(db))
+        try:
+            report = await c.repair_ciphertext_episodes()
+
+            assert report["repaired"] == 1
+            assert bound, "the rehydration query never ran"
+            assert all(isinstance(b, int) for b in bound), (
+                f"message IDs must bind as integers, got {[type(b) for b in bound]}"
+            )
+        finally:
+            db.fetchall = original
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_poisoned_vector_is_cleared_even_with_no_embedder(self, tmp_path):
+        """The repair must not strand a base64-derived vector.
+
+        _embed_episode is best-effort and no-ops without a provider. Since the
+        repaired title no longer matches the pre-filter, the episode is never
+        selected again — so if the old vector survived that write it would sit
+        in the shared embedding space permanently.
+        """
+        db, ids, store = await _corrupt_fixture(tmp_path)
+        c = _consolidator(db, store, _RecordingGraphStore(db))
+        c._get_embedding_service = lambda: None  # no provider configured
+        try:
+            report = await c.repair_ciphertext_episodes()
+            assert report["repaired"] == 1
+
+            row = (await db.fetchall(
+                "SELECT embedding_vec, embedding_profile_id "
+                "FROM memory_episodes WHERE id = ?", ("episode:corrupt",)
+            ))[0]
+            assert row[0] is None, "the ciphertext-derived vector must not survive"
+            assert row[1] is None
+
+            second = await c.repair_ciphertext_episodes()
+            assert second["scanned"] == 0, (
+                "precondition: the episode is genuinely unreachable afterwards, "
+                "which is why the vector had to be cleared in the same write"
+            )
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_repair_titles_never_reach_the_log(self, tmp_path, caplog):
+        db, ids, store = await _corrupt_fixture(tmp_path)
+        c = _consolidator(db, store, _RecordingGraphStore(db))
+        try:
+            with caplog.at_level("INFO"):
+                await c.repair_ciphertext_episodes()
+            logged = "\n".join(r.getMessage() for r in caplog.records)
+            assert "episode:corrupt" in logged, "the outcome should still be logged"
+            assert ENVELOPE_BODY not in logged
+            assert "scheduler" not in logged.lower(), (
+                "user-derived topics must not reach an ungoverned log surface"
+            )
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_exhausting_the_budget_is_reported_not_silent(self, tmp_path):
+        db, ids, store = await _corrupt_fixture(tmp_path)
+        c = _consolidator(db, store, _RecordingGraphStore(db))
+        try:
+            report = await c.repair_ciphertext_episodes(limit=1)
+            assert report["limit_reached"] is True
+
+            fresh = await c.repair_ciphertext_episodes(limit=50)
+            assert "limit_reached" not in fresh
+        finally:
+            await db.close()
+
+
 class TestWiredIntoConsolidation:
     """Repair that nothing calls is repair that never happens."""
 

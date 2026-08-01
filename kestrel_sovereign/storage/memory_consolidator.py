@@ -889,7 +889,16 @@ class MemoryConsolidator:
     async def _repair_candidates(
         self, limit: int
     ) -> List[Tuple[str, Optional[str], Optional[str], Optional[str]]]:
-        """Cheap SQL pre-filter for episodes that may be ciphertext-derived."""
+        """Cheap SQL pre-filter for episodes that may be ciphertext-derived.
+
+        Withdrawn episodes are excluded. ``excluded_from_context = 1`` is set
+        by the assertion lifecycle precisely because an episode summary is a
+        derivative of conversation artifacts that may no longer be shown; a
+        repair would decrypt those withdrawn sources and rewrite the mirrored
+        graph node with fresh plaintext-derived topics, resurfacing the very
+        content the exclusion took away. The ciphertext title is the safer
+        state for a row nobody is allowed to read (codex review r1 P1).
+        """
         conditions: List[str] = []
         params: List[Any] = [self.agent_id]
         for term in self._envelope_magic_terms():
@@ -904,7 +913,9 @@ class MemoryConsolidator:
         rows = await self._db.fetchall(
             f"""SELECT id, title, summary, key_message_ids
                 FROM memory_episodes
-                WHERE agent_id = ? AND ({' OR '.join(conditions)})
+                WHERE agent_id = ?
+                  AND COALESCE(excluded_from_context, 0) = 0
+                  AND ({' OR '.join(conditions)})
                 ORDER BY created_at
                 LIMIT ?""",
             tuple(params),
@@ -922,10 +933,25 @@ class MemoryConsolidator:
         leaned on re-clustering would simply never rebuild the older ones
         (#2856). ``deleted_at`` IS honoured — a soft-deleted message must not
         be resurrected into a rebuilt narrative.
+
+        ``key_message_ids`` is persisted as JSON strings while
+        ``conversation_history.id`` is an integer column, so the IDs are bound
+        as integers: on PostgreSQL asyncpg rejects a text parameter against an
+        integer column, which would turn every candidate into a lookup failure
+        and silently disable repair on that backend. A non-numeric recorded ID
+        cannot match an integer primary key at all, so it is simply left
+        unresolved and surfaces through the ``sources_missing`` path.
         """
+        numeric_ids: List[int] = []
+        for message_id in message_ids:
+            try:
+                numeric_ids.append(int(message_id))
+            except (TypeError, ValueError):
+                continue
+
         found: Dict[str, Dict[str, Any]] = {}
-        for start in range(0, len(message_ids), self._REPAIR_ID_CHUNK):
-            chunk = message_ids[start:start + self._REPAIR_ID_CHUNK]
+        for start in range(0, len(numeric_ids), self._REPAIR_ID_CHUNK):
+            chunk = numeric_ids[start:start + self._REPAIR_ID_CHUNK]
             placeholders = ",".join("?" for _ in chunk)
             rows = await self._db.fetchall(
                 f"""SELECT id, content, metadata, created_at, role
@@ -1017,16 +1043,22 @@ class MemoryConsolidator:
                 )
             )
 
+        # The stored vector was computed from the base64 title+summary, so it
+        # poisons the shared embedding space until it is re-derived. Clearing
+        # it in the SAME write that fixes the narrative is what makes the
+        # repair safe to leave half-done: `_embed_episode` is best-effort and
+        # returns silently when no provider is configured, and by then the
+        # title no longer matches the pre-filter, so the episode would never be
+        # selected again — stranding a base64 vector in the shared space
+        # forever. NULL degrades to keyword recall, which is the documented
+        # fallback (codex review r1 P2).
         await self._db.execute(
-            "UPDATE memory_episodes SET title = ?, summary = ? "
+            "UPDATE memory_episodes SET title = ?, summary = ?, "
+            "embedding_vec = NULL, embedding_profile_id = NULL "
             "WHERE id = ? AND agent_id = ?",
             (title, summary, episode_id, self.agent_id),
         )
 
-        # The stored vector was computed from the base64 title+summary, so it
-        # poisons the shared embedding space until it is re-derived. Excluding
-        # the row from context would leave that vector in place; re-embedding
-        # replaces it (#2856).
         await self._embed_episode(episode_id, title, summary)
 
     async def repair_ciphertext_episodes(
@@ -1068,6 +1100,20 @@ class MemoryConsolidator:
 
         candidates = await self._repair_candidates(limit)
         report["scanned"] = len(candidates)
+
+        # A repaired episode leaves the pre-filter for good, but a CLEARED one
+        # (healthy, and genuinely about the envelope format) matches forever.
+        # If enough of those ever accumulate ahead of a corrupt episode in
+        # created_at order, that episode is never reached. Say so rather than
+        # truncating quietly — a silent cap reads as "nothing left to repair"
+        # (codex review r1 P2).
+        if len(candidates) >= limit:
+            report["limit_reached"] = True
+            logger.warning(
+                "episode repair examined its full budget of %d candidates for "
+                "%s; later candidates were not reached this pass",
+                limit, self.agent_id,
+            )
 
         for episode_id, title, summary, key_ids_json in candidates:
             episode_id = str(episode_id)
@@ -1177,9 +1223,12 @@ class MemoryConsolidator:
                 continue
 
             report["repaired"] += 1
+            # ID and outcome only. Both the old and new titles are
+            # user-derived conversation topics, and the log surface is not
+            # governed the way memory storage is (codex review r1 P1).
             logger.info(
-                "repaired ciphertext-derived episode %s: %r -> %r",
-                episode_id, title, new_title,
+                "repaired ciphertext-derived episode %s (%d source messages)",
+                episode_id, len(sources),
             )
 
         return report
