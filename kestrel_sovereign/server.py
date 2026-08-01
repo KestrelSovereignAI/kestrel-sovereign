@@ -3105,6 +3105,10 @@ async def get_bootstrap_key(request: Request):
     # seam, and the signing module refuses to initialize without its private
     # test-home trust anchor.
     agent = getattr(app.state, "agent", None)
+    if agent is None:
+        manager = getattr(app.state, "agent_manager", None)
+        getter = getattr(manager, "get_agent", None)
+        agent = getter("kite") if callable(getter) else None
     if (
         bool(getattr(agent, "is_test_instance", False))
         and os.environ.get("KESTREL_KITE_RELEASE_EVIDENCE", "").strip().lower()

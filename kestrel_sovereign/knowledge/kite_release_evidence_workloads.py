@@ -141,7 +141,10 @@ def _owned_catalog_harness(gate: KiteGate, backend: str) -> KiteHttpHarness:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
         reservation.bind(("127.0.0.1", 0))
         port = int(reservation.getsockname()[1])
-    home = Path(tempfile.mkdtemp(prefix="kestrel-kite-release-"))
+    # ``prepare`` requires the actual home to be absent so it can reject a
+    # reused agent state.  Keep a separate private parent for later forensic
+    # inspection of the owned process's content-free log and marker.
+    home = Path(tempfile.mkdtemp(prefix="kestrel-kite-release-")) / "home"
     return KiteHttpHarness(KiteIsolationConfig(worktree=worktree, home=home, port=port, gate=gate))
 
 

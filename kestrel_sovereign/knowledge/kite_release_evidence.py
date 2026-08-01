@@ -203,6 +203,8 @@ class KiteIsolationConfig:
         env["KESTREL_MULTI_AGENT_CONFIG"] = str(self.config_path)
         env["KESTREL_DEMO_SERVER"] = "1"
         env["KESTREL_KITE_RELEASE_EVIDENCE"] = "1"
+        # The isolated test identity must not borrow a production DID domain.
+        env["KESTREL_DID_WEB_DOMAIN"] = "kite.invalid"
         # Explicit local-only persistence wins over every inherited backend
         # selection or DSN.  The secondary URL is intentionally a SQLite URL,
         # never a production service address, for legacy consumers that read it.
@@ -349,6 +351,11 @@ class KiteHttpHarness:
             raise KiteEvidenceError("Kite inception did not register exactly the kite agent")
         agent["port"] = self.config.port
         agent["autostart"] = True
+        # Multi-agent config resolves relative data paths from the launched
+        # worktree, not from ``KESTREL_HOME``.  Pin the freshly created
+        # evidence home explicitly so the server never falls back to a path
+        # beneath the checkout (or an existing agent's state).
+        agent["data_dir"] = str(self.config.home / "agent_data" / "kite")
         if self.config.profile == "stable_only":
             agent.pop("semantic_capabilities", None)
         else:

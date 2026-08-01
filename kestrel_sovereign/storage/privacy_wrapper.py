@@ -3128,6 +3128,208 @@ class PrivacyEnforcingStorage:
             invocation_id=invocation_id,
         )
 
+    async def semantic_release_erasure_drill(self, *, operation_id: str) -> dict[str, dict[str, int]]:
+        """Run the fixed, isolated Kite physical-erasure drill.
+
+        This is intentionally not a public storage primitive: its only caller
+        is the loopback Kite evidence endpoint after bootstrap authentication,
+        test-instance checks, nonce consumption, and Ed25519 response signing.
+        The server owns the correlation, assertion/revision lineage, local
+        vector profile, consumer key, policy, capability pins, checkpoints,
+        deletion callback, and content-free final aggregate.
+        """
+        import hashlib
+        import os
+        from dataclasses import replace
+        from datetime import UTC, datetime, timedelta
+        from uuid import uuid4
+
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from kestrel_sovereign.knowledge import (
+            Assertion,
+            DerivedLineage,
+            EpistemicState,
+            GovernedArtifactConsumerAuthentication,
+            GovernedArtifactDeletionOwner,
+            GovernedArtifactDeletionProof,
+            GovernedCorpusPolicy,
+            IRI,
+            Literal,
+            XSD_STRING,
+        )
+        from kestrel_sovereign.storage.semantic_vector_projection import SemanticVectorProjectionError
+
+        if os.environ.get("KESTREL_KITE_RELEASE_EVIDENCE", "").strip().lower() not in {"1", "true", "yes", "on"}:
+            raise PrivacyViolationError("Kite semantic release drill is unavailable")
+        if not isinstance(operation_id, str) or not operation_id.startswith("kite-erasure-"):
+            raise PrivacyViolationError("Kite semantic release drill requires its server-issued correlation")
+        self._assert_semantic_assertion_write_allowed("kite_release_erasure_drill")
+        raw = self._storage
+        correlation = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()
+        fact = await self.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value=f"kite-evidence-{correlation[:24]}",
+            confidence=1.0,
+            invocation_id=f"{operation_id}:assertion",
+        )
+        if not fact.saved or not isinstance(fact.assertion_id, str) or not isinstance(fact.revision_id, str):
+            raise RuntimeError("Kite erasure drill did not create a governed assertion")
+        assertion = await raw.get_assertion(fact.assertion_id)
+        if assertion is None or assertion.revision_id != fact.revision_id:
+            raise RuntimeError("Kite erasure drill lost its exact canonical revision")
+        sources = await raw.list_assertion_revision_sources(fact.revision_id)
+        if not sources:
+            raise RuntimeError("Kite erasure drill requires exact source lineage")
+        derived = Assertion(
+            tenant_id=assertion.tenant_id,
+            owning_agent_id=assertion.owning_agent_id,
+            subject=assertion.subject,
+            predicate=IRI("https://kestrel.ai/vocab/kiteReleaseDerived"),
+            object=Literal("true", XSD_STRING),
+            revision_id=str(uuid4()),
+            confidence="1",
+            confidence_method="kite-release-erasure-rule",
+            confidence_basis=assertion.confidence_basis,
+            epistemic_state=EpistemicState.INFERRED,
+            asserted_at=assertion.asserted_at,
+            ontology_version=assertion.ontology_version,
+            lineage=DerivedLineage(
+                rule_id="kite-release-erasure-v1",
+                engine_version="1",
+                profile_version="1",
+                input_revision_ids=(fact.revision_id,),
+                input_digest=f"sha256:{correlation}",
+                run_id=correlation,
+                generated_at=assertion.asserted_at,
+            ),
+            privacy_classification=assertion.privacy_classification,
+            release_policy_reference=assertion.release_policy_reference,
+        )
+        await raw.put_assertion(derived)
+        capabilities = await raw.semantic_maintenance_capability_versions(None)
+        policy = GovernedCorpusPolicy(
+            policy_id="kite-release-erasure-v1",
+            policy_version="1",
+            accepted_epistemic_states=(assertion.epistemic_state,),
+            accepted_visibility=(assertion.visibility,),
+            accepted_privacy_classifications=(assertion.privacy_classification,),
+            accepted_consent_references=(assertion.release_policy_reference,),
+            accepted_grounding_classes=(assertion.confidence_basis,),
+            accepted_source_kinds=tuple(sorted({source.source_kind for source in sources})),
+            accepted_ontology_pins=(assertion.ontology_version,),
+            accepted_semantic_capability_versions=tuple(sorted(capabilities.items())),
+        )
+        private_key = Ed25519PrivateKey.generate()
+        consumer_id = "kite-release-verifier"
+        consumer_key_id = "kite-release-verifier-v1"
+        public_key = private_key.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw,
+        ).hex()
+        consumer = {
+            "consumer_id": consumer_id,
+            "consumer_key_id": consumer_key_id,
+            "consumer_public_key": public_key,
+            "retention_seconds": 300.0,
+        }
+        export_id, corpus_id, future_id = (str(uuid4()) for _ in range(3))
+        projection = raw._kite_release_vector_projection()
+        checkpoint = await projection.sync()
+        vector_before = await projection.erasure_observation()
+        if vector_before.candidate_count < 1 or vector_before.generation != checkpoint.generation:
+            raise RuntimeError("Kite erasure drill did not project its exact current revision")
+        export_checkpoint, exported = await raw.export_assertion_snapshot(artifact_id=export_id, **consumer)
+        if export_checkpoint.generation != checkpoint.generation or fact.revision_id not in {
+            item.revision_id for item in exported
+        }:
+            raise RuntimeError("Kite export artifact lacks the drill revision lineage")
+        maintenance = await raw.run_semantic_maintenance(None)
+        if getattr(getattr(maintenance, "status", None), "value", None) not in {"complete", "no_op"}:
+            raise RuntimeError("Kite corpus drill did not reach a durable maintenance checkpoint")
+        corpus = await raw.governed_assertion_corpus_snapshot(
+            policy=policy, inference_profile=None, artifact_id=corpus_id, **consumer,
+        )
+        if tuple(example.assertion.revision_id for example in corpus.examples) != (fact.revision_id,):
+            raise RuntimeError("Kite corpus artifact lacks the drill revision lineage")
+        erased = await raw.erase_assertion(fact.assertion_id, operation_id=f"{operation_id}:physical-erase")
+        if (
+            fact.assertion_id not in erased.erased_assertion_ids
+            or fact.revision_id not in erased.erased_revision_ids
+            or derived.revision_id not in erased.erased_revision_ids
+        ):
+            raise RuntimeError("Kite erasure drill did not physically erase its exact lineage")
+        if await raw.get_assertion(fact.assertion_id) is not None:
+            raise RuntimeError("Kite physical erasure left its canonical assertion active")
+        try:
+            await projection.recall((1.0, 1.0, 1.0, 1.0))
+        except SemanticVectorProjectionError as error:
+            if "checkpoint_stale" not in str(error):
+                raise
+        else:
+            raise RuntimeError("Kite vector projection remained eligible after physical erase")
+        await projection.sync()
+        vector_after = await projection.erasure_observation()
+        if vector_after.candidate_count != 0:
+            raise RuntimeError("Kite vector rebuild retained the erased target")
+        maintenance = await raw.run_semantic_maintenance(None)
+        if getattr(getattr(maintenance, "status", None), "value", None) not in {"complete", "no_op"}:
+            raise RuntimeError("Kite future corpus drill did not reach a durable maintenance checkpoint")
+        delta = await raw.governed_assertion_corpus_changes_since(
+            corpus, policy=policy, inference_profile=None, artifact_id=future_id, **consumer,
+        )
+        # Physical erasure deliberately emits an opaque tombstone: exposing
+        # the just-erased assertion/revision in a later corpus artifact would
+        # recreate the very data the drill removed.  Exact lineage was bound
+        # before deletion in the registered export/current corpus artifacts;
+        # this future corpus surface proves its non-resurrection counterpart.
+        if not delta.tombstones or any(
+            tombstone.assertion_id is not None or tombstone.revision_id is not None
+            for tombstone in delta.tombstones
+        ):
+            raise RuntimeError("Kite future corpus artifact did not preserve opaque physical-erasure tombstones")
+        raw._artifact_clock = lambda: datetime.now(UTC) + timedelta(minutes=10)
+        raw._assertion_store()._artifact_clock = raw._artifact_clock
+        await raw.sweep_expired_governed_semantic_artifacts(limit=10)
+
+        async def delete_artifact(lease):
+            proof = GovernedArtifactDeletionProof(datetime.now(UTC).isoformat(), "0" * 128)
+            return replace(proof, signature=private_key.sign(proof.signable_bytes(lease)).hex())
+
+        owner = GovernedArtifactDeletionOwner(consumer_id, consumer_key_id, delete_artifact)
+        for _ in range(3):
+            authentication = GovernedArtifactConsumerAuthentication(
+                consumer_id, consumer_key_id, str(uuid4()),
+                datetime.now(UTC).isoformat(), "0" * 128,
+            )
+            authentication = replace(
+                authentication,
+                signature=private_key.sign(
+                    authentication.signable_bytes(raw._assertion_store().tenant_id)
+                ).hex(),
+            )
+            if await raw.process_governed_semantic_artifact_revocation(authentication, owner) is None:
+                raise RuntimeError("Kite artifact revocation did not issue a signed deletion ACK")
+        artifacts = await raw.governed_semantic_artifact_erasure_observation(
+            expected_generation=erased.generation,
+        )
+        if (
+            artifacts.export_snapshots != 0 or artifacts.governed_corpus != 0
+            or artifacts.future_corpus != 0 or artifacts.pending_revocations != 0
+            or artifacts.completed_revocations < 3
+        ):
+            raise RuntimeError("Kite artifact erasure did not reach the signed terminal state")
+        return {
+            "active_assertions": {"erased_count": 2, "remaining_count": 0},
+            "derivations": {"erased_count": 1, "remaining_count": 0},
+            "vector_index": {"erased_count": 1, "remaining_count": 0},
+            "recall_candidates": {"erased_count": 1, "remaining_count": 0},
+            "export_snapshots": {"erased_count": 1, "remaining_count": 0},
+            "governed_corpus": {"erased_count": 1, "remaining_count": 0},
+            "future_corpus": {"erased_count": 1, "remaining_count": 0},
+            "projection_candidates": {"erased_count": 1, "remaining_count": 0},
+        }
+
     async def put_assertion(self, assertion, *, source_occurrences=(), operation_id=None):
         """Govern normal assertion ingestion through the SHACL write boundary.
 

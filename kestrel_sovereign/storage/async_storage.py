@@ -1633,6 +1633,55 @@ class AsyncStorage:
         )
         return SemanticAssertionVectorProjection(self._assertion_store(), profile, provider)
 
+    def _kite_release_vector_projection(self):
+        """Return the deterministic local projection used only by Kite evidence.
+
+        This is not a general embedding-provider selection API.  The endpoint
+        that reaches it is guarded by the isolated test-agent flag, and this
+        method additionally requires the same opt-in environment.  It still
+        uses the production projection owner and its durable outbox/rebuild
+        mechanics; only the local test embedding implementation is fixed.
+        """
+        if os.environ.get("KESTREL_KITE_RELEASE_EVIDENCE", "").strip().lower() not in {"1", "true", "yes", "on"}:
+            raise RuntimeError("Kite release vector projection is unavailable")
+        if not self._initialized:
+            raise RuntimeError("Kite release vector projection requires initialized AsyncStorage")
+        from types import SimpleNamespace
+        from .semantic_vector_projection import SemanticVectorProfile
+
+        class _LocalKiteEmbeddingService:
+            def describe(self):
+                return SimpleNamespace(
+                    provider="kite-local", model="deterministic-v1", dim=4,
+                    profile_id="kite-release-erasure-v1",
+                )
+
+            def semantic_vector_destination(self):
+                return "local"
+
+            async def aembed(self, text: str):
+                digest = hashlib.sha256(text.encode("utf-8")).digest()
+                return [float(int.from_bytes(digest[index:index + 2], "big") + 1) for index in range(0, 8, 2)]
+
+        class _LocalKiteHost:
+            def get_embedding_service(self):
+                return _LocalKiteEmbeddingService()
+
+        profile = SemanticVectorProfile(
+            "kite-release-erasure-v1",
+            hashlib.sha256(b"kite-release-erasure-v1").hexdigest(),
+            provider="kite-local", model="deterministic-v1", dimension=4,
+        )
+        from .semantic_vector_projection import (
+            SemanticAssertionVectorProjection,
+            _resolve_host_semantic_vector_embedding_provider,
+        )
+
+        provider = _resolve_host_semantic_vector_embedding_provider(
+            profile, _LocalKiteHost(), host_authority=self._assertion_tenant_capability,
+        )
+        return SemanticAssertionVectorProjection(self._assertion_store(), profile, provider)
+
     async def hydrate_semantic_recall_candidates(self, assertion_ids, **kwargs):
         if not self._initialized:
             await self.initialize()

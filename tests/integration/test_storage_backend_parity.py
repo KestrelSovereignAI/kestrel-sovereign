@@ -32,7 +32,7 @@ from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore, GraphNo
 from kestrel_sovereign.storage.async_rag_store import AsyncRAGStore
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
-from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage, PrivacyViolationError
 from kestrel_sovereign.storage.saved_items_store import SavedItemsStore
 from kestrel_sovereign.storage.schema_router import SchemaRouter
 from kestrel_sovereign.storage.sqla.migrations import (
@@ -988,6 +988,34 @@ async def test_vector_export_erasure_lifecycle_has_backend_parity(db_backend, tm
         ) == [(None, "")]
     finally:
         await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_isolated_kite_erasure_drill_uses_real_core_owners(
+    db_backend, tmp_path, monkeypatch,
+):
+    """The server-owned Kite drill proves all core stages without leaking IDs."""
+    tenant, identity = await _incepted_assertion_identity(tmp_path, "kite-erasure-drill")
+    raw_storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
+    try:
+        with pytest.raises(PrivacyViolationError, match="unavailable"):
+            await storage.semantic_release_erasure_drill(
+                operation_id=f"kite-erasure-{uuid4().hex}",
+            )
+        monkeypatch.setenv("KESTREL_KITE_RELEASE_EVIDENCE", "1")
+        result = await storage.semantic_release_erasure_drill(
+            operation_id=f"kite-erasure-{uuid4().hex}",
+        )
+        assert set(result) == {
+            "active_assertions", "derivations", "vector_index", "recall_candidates",
+            "export_snapshots", "governed_corpus", "future_corpus", "projection_candidates",
+        }
+        assert all(value["erased_count"] > 0 and value["remaining_count"] == 0 for value in result.values())
+        assert result["derivations"] == {"erased_count": 1, "remaining_count": 0}
+    finally:
+        await raw_storage.close()
 
 
 @pytest.mark.asyncio
