@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 
 _SEMANTIC_ASSERTION_SCHEMA_VERSION = "semantic_assertion_store_v5"
-_SEMANTIC_VECTOR_PROJECTION_SCHEMA_VERSION = "semantic_assertion_vector_projection_v1"
+_SEMANTIC_VECTOR_PROJECTION_SCHEMA_VERSION = "semantic_assertion_vector_projection_v2"
 _SEMANTIC_VALIDATION_SCHEMA_VERSION = "semantic_validation_reports_v2_revision_links"
 _SEMANTIC_MAINTENANCE_SCHEMA_VERSION = "semantic_maintenance_v1"
 _SEMANTIC_MAINTENANCE_CURSOR_SCHEMA_VERSION = "semantic_maintenance_v2_cursor"
@@ -491,14 +491,26 @@ async def migrate_semantic_vector_projection(db: "AsyncDatabase") -> None:
             tenant_id TEXT NOT NULL,
             profile_id TEXT NOT NULL,
             capability_digest TEXT NOT NULL,
+            embedding_provider TEXT NOT NULL,
+            embedding_model TEXT NOT NULL,
+            embedding_dimension INTEGER NOT NULL,
+            renderer_version TEXT NOT NULL,
+            visibility_ceiling TEXT NOT NULL,
+            privacy_ceiling TEXT NOT NULL,
+            visibility TEXT NOT NULL,
+            privacy_classification TEXT NOT NULL,
             assertion_id TEXT NOT NULL,
             revision_id TEXT NOT NULL,
+            revision_digest TEXT NOT NULL,
             source_generation INTEGER NOT NULL,
             vector_json TEXT NOT NULL,
             created_at TEXT NOT NULL,
             PRIMARY KEY (tenant_id, profile_id, capability_digest, assertion_id),
             UNIQUE (tenant_id, profile_id, capability_digest, revision_id),
-            CHECK (source_generation > 0)
+            CHECK (source_generation > 0),
+            CHECK (embedding_dimension > 0 AND embedding_dimension <= 8192),
+            CHECK (visibility_ceiling IN ('private', 'tenant', 'delegated', 'public')),
+            CHECK (visibility IN ('private', 'tenant', 'delegated', 'public'))
         )""",
         """CREATE TABLE IF NOT EXISTS semantic_assertion_vector_projection_state (
             tenant_id TEXT NOT NULL,

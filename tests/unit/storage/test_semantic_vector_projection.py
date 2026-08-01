@@ -25,7 +25,10 @@ ONTOLOGY = OntologyRef(
     "http://www.w3.org/2000/01/rdf-schema#", "1.0.0",
     "e362812917fddab7cfab3dc35553ad292725e8f264e05f376077340e91034db5", "semantic-kb-v1",
 )
-PROFILE = SemanticVectorProfile("semantic-assertion-test-v1", "a" * 64)
+PROFILE = SemanticVectorProfile(
+    "semantic-assertion-test-v1", "a" * 64,
+    provider="test-provider", model="test-model", dimension=2,
+)
 
 
 async def _storage(tmp_path, label: str) -> AsyncStorage:
@@ -142,3 +145,83 @@ async def test_projection_never_crosses_tenant_boundary(tmp_path):
     finally:
         await owner.close()
         await other.close()
+
+
+@pytest.mark.asyncio
+async def test_same_generation_partial_page_never_becomes_recall_ready(tmp_path):
+    storage = await _storage(tmp_path, "partial-page")
+    try:
+        original = _assertion(storage, "before")
+        await storage.put_assertion(original, source_occurrences=(_source("before"),))
+        projection = storage.semantic_assertion_vector_projection(PROFILE, _embed)
+        await projection.sync()
+
+        replacement = _assertion(storage, "after")
+        result = await storage.supersede_assertion(
+            original.revision_id,
+            replacement,
+            source_occurrences=(_source("after"),),
+        )
+        partial = await projection.sync(limit=1)
+        terminal = await storage._assertion_store().event_checkpoint()
+        assert partial.generation == result.generation == terminal.generation
+        assert partial.event_id != terminal.latest_event_id
+        with pytest.raises(SemanticVectorProjectionError, match="checkpoint_stale"):
+            await projection.recall([1.0, 1.0])
+        with pytest.raises(SemanticVectorProjectionError, match="checkpoint_stale"):
+            await projection.erasure_observation()
+
+        await projection.sync(limit=1)
+        assert [hit.assertion_id for hit in await projection.recall([1.0, 1.0])] == [
+            replacement.assertion_id
+        ]
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_profile_dimension_drift_and_timeout_fail_without_advancing(tmp_path):
+    storage = await _storage(tmp_path, "bounds")
+    try:
+        fact = _assertion(storage, "bounded")
+        await storage.put_assertion(fact, source_occurrences=(_source("bounded"),))
+
+        async def wrong_dimension(_text):
+            return [1.0]
+
+        projection = storage.semantic_assertion_vector_projection(PROFILE, wrong_dimension)
+        with pytest.raises(SemanticVectorProjectionError, match="dimension"):
+            await projection.sync()
+        assert (await projection.checkpoint()).generation == 0
+
+        async def slow(_text):
+            import asyncio
+
+            await asyncio.sleep(0.05)
+            return [1.0, 1.0]
+
+        timeout_profile = SemanticVectorProfile(
+            "semantic-assertion-timeout-v1", "b" * 64,
+            provider="test-provider", model="test-model", dimension=2,
+            embed_timeout_seconds=0.001,
+        )
+        timed = storage.semantic_assertion_vector_projection(timeout_profile, slow)
+        with pytest.raises(SemanticVectorProjectionError, match="timed out"):
+            await timed.sync()
+        assert (await timed.checkpoint()).generation == 0
+
+        valid_profile = SemanticVectorProfile(
+            "semantic-assertion-drift-v1", "d" * 64,
+            provider="test-provider", model="test-model", dimension=2,
+        )
+        valid = storage.semantic_assertion_vector_projection(valid_profile, _embed)
+        await valid.sync()
+        await storage.db.execute(
+            "UPDATE semantic_assertion_vector_projection_entries SET embedding_model = ? "
+            "WHERE tenant_id = ? AND profile_id = ?",
+            ("other-model", storage.agent_id, valid_profile.profile_id),
+        )
+        with pytest.raises(SemanticVectorProjectionError, match="profile_drift"):
+            await valid.recall([1.0, 1.0])
+    finally:
+        await storage.close()

@@ -10,6 +10,8 @@ not an alternate assertion or a generic RAG index.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import asyncio
+import hashlib
 import json
 import math
 import re
@@ -22,6 +24,10 @@ from .async_assertion_store import AssertionCheckpoint, AsyncAssertionStore
 
 _PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9._:-]{0,127}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_RENDERER_VERSION = "semantic-recall-claim-v1"
+_MAX_VECTOR_DIMENSION = 8192
+_MAX_VECTOR_BYTES = 262_144
+_MAX_RECALL_SCAN = 2_000
 
 
 class SemanticVectorProjectionError(RuntimeError):
@@ -34,12 +40,40 @@ class SemanticVectorProfile:
 
     profile_id: str
     capability_digest: str
+    provider: str
+    model: str
+    dimension: int
+    visibility_ceiling: str = "private"
+    privacy_ceiling: str = "normal"
+    renderer_version: str = _RENDERER_VERSION
+    max_claim_characters: int = 1_200
+    embed_timeout_seconds: float = 30.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.profile_id, str) or not _PROFILE_RE.fullmatch(self.profile_id):
             raise ValueError("semantic vector profile_id is invalid")
         if not isinstance(self.capability_digest, str) or not _DIGEST_RE.fullmatch(self.capability_digest):
             raise ValueError("semantic vector capability_digest must be lowercase sha256 hex")
+        if not isinstance(self.provider, str) or not _PROFILE_RE.fullmatch(self.provider):
+            raise ValueError("semantic vector provider is invalid")
+        if not isinstance(self.model, str) or not _PROFILE_RE.fullmatch(self.model):
+            raise ValueError("semantic vector model is invalid")
+        if type(self.dimension) is not int or not 1 <= self.dimension <= _MAX_VECTOR_DIMENSION:
+            raise ValueError("semantic vector dimension is outside the supported bound")
+        if self.visibility_ceiling not in {"private", "tenant", "delegated", "public"}:
+            raise ValueError("semantic vector visibility_ceiling is invalid")
+        if not isinstance(self.privacy_ceiling, str) or not _PROFILE_RE.fullmatch(self.privacy_ceiling):
+            raise ValueError("semantic vector privacy_ceiling is invalid")
+        if self.renderer_version != _RENDERER_VERSION:
+            raise ValueError("semantic vector renderer_version is not approved")
+        if type(self.max_claim_characters) is not int or not 1 <= self.max_claim_characters <= 8_192:
+            raise ValueError("semantic vector max_claim_characters is outside the supported bound")
+        if (
+            not isinstance(self.embed_timeout_seconds, (int, float))
+            or isinstance(self.embed_timeout_seconds, bool)
+            or not 0 < float(self.embed_timeout_seconds) <= 300
+        ):
+            raise ValueError("semantic vector embed_timeout_seconds is outside the supported bound")
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,22 +106,35 @@ class SemanticVectorErasureObservation:
 Embedder = Callable[[str], Awaitable[Sequence[float] | None]]
 
 
-def _claim_text(assertion: Assertion) -> str:
-    """The bounded projection payload; it is never returned by this module."""
-    obj = assertion.object.identity_mapping()["value"]
-    return f"{assertion.subject.value}\n{assertion.predicate.value}\n{obj}"
+def _revision_digest(assertion: Assertion) -> str:
+    payload = json.dumps(
+        assertion.to_mapping(), sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
-def _normalise_vector(value: Sequence[float]) -> tuple[float, ...]:
+def _approved_claim_text(assertion: Assertion, max_characters: int) -> str:
+    """Use the prompt-reviewed, bounded renderer rather than raw RDF terms."""
+    from kestrel_sovereign.agent.semantic_recall import _claim_text
+
+    return _claim_text(assertion, max_characters)
+
+
+def _normalise_vector(value: Sequence[float], *, dimension: int) -> tuple[float, ...]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or not value:
         raise SemanticVectorProjectionError("semantic vector embedder returned no vector")
     vector = tuple(float(item) for item in value)
+    if len(vector) != dimension:
+        raise SemanticVectorProjectionError("semantic vector dimension does not match profile")
     if any(not math.isfinite(item) for item in vector):
         raise SemanticVectorProjectionError("semantic vector contains non-finite values")
     magnitude = math.sqrt(sum(item * item for item in vector))
     if magnitude == 0:
         raise SemanticVectorProjectionError("semantic vector must have non-zero magnitude")
-    return tuple(item / magnitude for item in vector)
+    normalised = tuple(item / magnitude for item in vector)
+    if len(json.dumps(normalised, separators=(",", ":")).encode("utf-8")) > _MAX_VECTOR_BYTES:
+        raise SemanticVectorProjectionError("semantic vector exceeds serialized-size bound")
+    return normalised
 
 
 class SemanticAssertionVectorProjection:
@@ -109,6 +156,53 @@ class SemanticAssertionVectorProjection:
         self._store = store
         self._profile = profile
         self._embedder = embedder
+
+    async def _embed(self, assertion: Assertion) -> tuple[float, ...]:
+        try:
+            embedded = await asyncio.wait_for(
+                self._embedder(
+                    _approved_claim_text(assertion, self._profile.max_claim_characters)
+                ),
+                timeout=float(self._profile.embed_timeout_seconds),
+            )
+        except TimeoutError as error:
+            raise SemanticVectorProjectionError("semantic vector embedder timed out") from error
+        if embedded is None:
+            raise SemanticVectorProjectionError("semantic vector embedder unavailable")
+        return _normalise_vector(embedded, dimension=self._profile.dimension)
+
+    def _entry_values(
+        self, assertion: Assertion, generation: int, vector: tuple[float, ...],
+    ) -> tuple[object, ...]:
+        return (
+            self._store.tenant_id,
+            self._profile.profile_id,
+            self._profile.capability_digest,
+            self._profile.provider,
+            self._profile.model,
+            self._profile.dimension,
+            self._profile.renderer_version,
+            self._profile.visibility_ceiling,
+            self._profile.privacy_ceiling,
+            assertion.visibility.value,
+            assertion.privacy_classification,
+            assertion.assertion_id,
+            assertion.revision_id,
+            _revision_digest(assertion),
+            generation,
+            json.dumps(vector, separators=(",", ":")),
+        )
+
+    async def _canonical_terminal(self) -> SemanticVectorCheckpoint:
+        checkpoint = await self._store.event_checkpoint()
+        return SemanticVectorCheckpoint(checkpoint.generation, checkpoint.latest_event_id)
+
+    def _assert_privacy_scope(self, assertion: Assertion) -> None:
+        order = {"private": 0, "tenant": 1, "delegated": 2, "public": 3}
+        if order[assertion.visibility.value] > order[self._profile.visibility_ceiling]:
+            raise SemanticVectorProjectionError("semantic vector visibility exceeds profile ceiling")
+        if assertion.privacy_classification != self._profile.privacy_ceiling:
+            raise SemanticVectorProjectionError("semantic vector privacy classification exceeds profile scope")
 
     async def checkpoint(self) -> SemanticVectorCheckpoint:
         row = await self._store._database.fetchone(  # noqa: SLF001 - sibling projection persistence
@@ -148,10 +242,8 @@ class SemanticAssertionVectorProjection:
         assertion = await self._store.get_assertion(assertion_id)
         vector: tuple[float, ...] | None = None
         if eligible and assertion is not None and assertion.revision_id == revision_id and assertion.status is AssertionStatus.ACTIVE:
-            embedded = await self._embedder(_claim_text(assertion))
-            if embedded is None:
-                raise SemanticVectorProjectionError("semantic vector embedder unavailable")
-            vector = _normalise_vector(embedded)
+            self._assert_privacy_scope(assertion)
+            vector = await self._embed(assertion)
 
         # Recheck exactly under the canonical lifecycle lock after embedding.
         # A supersession/retraction/erase during provider I/O cannot publish a
@@ -172,12 +264,11 @@ class SemanticAssertionVectorProjection:
             if vector is not None and current_eligible:
                 await self._store._database.execute(  # noqa: SLF001
                     "INSERT INTO semantic_assertion_vector_projection_entries "
-                    "(tenant_id, profile_id, capability_digest, assertion_id, revision_id, source_generation, vector_json, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
-                    (
-                        self._store.tenant_id, self._profile.profile_id, self._profile.capability_digest,
-                        assertion_id, revision_id, generation, json.dumps(vector, separators=(",", ":")),
-                    ),
+                    "(tenant_id, profile_id, capability_digest, embedding_provider, embedding_model, "
+                    "embedding_dimension, renderer_version, visibility_ceiling, privacy_ceiling, visibility, privacy_classification, "
+                    "assertion_id, revision_id, revision_digest, source_generation, vector_json, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                    self._entry_values(current, generation, vector),
                 )
             await self._advance(event_id, generation, expected=expected)
 
@@ -194,10 +285,8 @@ class SemanticAssertionVectorProjection:
         survivors = await self._eligible_current_assertions()
         projected: list[tuple[Assertion, tuple[float, ...]]] = []
         for assertion in survivors:
-            embedded = await self._embedder(_claim_text(assertion))
-            if embedded is None:
-                raise SemanticVectorProjectionError("semantic vector embedder unavailable")
-            projected.append((assertion, _normalise_vector(embedded)))
+            self._assert_privacy_scope(assertion)
+            projected.append((assertion, await self._embed(assertion)))
         async with self._store._mutation():  # noqa: SLF001 - same lifecycle serialization as physical erase
             await self._store._database.execute(  # noqa: SLF001
                 "DELETE FROM semantic_assertion_vector_projection_entries "
@@ -218,13 +307,11 @@ class SemanticAssertionVectorProjection:
                     continue
                 await self._store._database.execute(  # noqa: SLF001
                     "INSERT INTO semantic_assertion_vector_projection_entries "
-                    "(tenant_id, profile_id, capability_digest, assertion_id, revision_id, source_generation, vector_json, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
-                    (
-                        self._store.tenant_id, self._profile.profile_id, self._profile.capability_digest,
-                        assertion.assertion_id, assertion.revision_id, generation,
-                        json.dumps(vector, separators=(",", ":")),
-                    ),
+                    "(tenant_id, profile_id, capability_digest, embedding_provider, embedding_model, "
+                    "embedding_dimension, renderer_version, visibility_ceiling, privacy_ceiling, visibility, privacy_classification, "
+                    "assertion_id, revision_id, revision_digest, source_generation, vector_json, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                    self._entry_values(current, generation, vector),
                 )
             await self._advance(event_id, generation, expected=expected)
 
@@ -267,16 +354,21 @@ class SemanticAssertionVectorProjection:
             "UPDATE semantic_assertion_vector_projection_state "
             "SET checkpoint_generation = ?, checkpoint_event_id = ?, updated_at = CURRENT_TIMESTAMP "
             "WHERE tenant_id = ? AND profile_id = ? AND capability_digest = ? "
-            "AND checkpoint_generation = ? AND checkpoint_event_id IS ?",
+            "AND checkpoint_generation = ? AND "
+            "(checkpoint_event_id = ? OR (checkpoint_event_id IS NULL AND ? IS NULL))",
             (
                 generation, event_id, self._store.tenant_id, self._profile.profile_id,
                 self._profile.capability_digest, expected.generation, expected.event_id,
+                expected.event_id,
             ),
         )
         if changed != 1:
             raise SemanticVectorProjectionError("semantic_vector_projection_concurrent_progress")
 
-    async def recall(self, query_vector: Sequence[float], *, limit: int = 8) -> tuple[SemanticVectorCandidate, ...]:
+    async def recall(
+        self, query_vector: Sequence[float], *, limit: int = 8,
+        candidate_scan_limit: int = _MAX_RECALL_SCAN,
+    ) -> tuple[SemanticVectorCandidate, ...]:
         """Return only lineage tokens, after a current projection fence.
 
         This is deliberately not a content-returning retrieval API.  Callers
@@ -284,27 +376,63 @@ class SemanticAssertionVectorProjection:
         """
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError("semantic vector recall limit must be an integer in [1, 100]")
-        query = _normalise_vector(query_vector)
+        if type(candidate_scan_limit) is not int or not 1 <= candidate_scan_limit <= _MAX_RECALL_SCAN:
+            raise ValueError("semantic vector candidate_scan_limit is outside the supported bound")
+        query = _normalise_vector(query_vector, dimension=self._profile.dimension)
         state = await self.checkpoint()
-        canonical = await self._store.checkpoint()
-        if state.generation != canonical.generation:
+        canonical = await self._canonical_terminal()
+        if state != canonical:
             raise SemanticVectorProjectionError("semantic_vector_projection_checkpoint_stale")
         rows = await self._store._database.fetchall(  # noqa: SLF001
-            "SELECT assertion_id, revision_id, source_generation, vector_json "
-            "FROM semantic_assertion_vector_projection_entries WHERE tenant_id = ? "
-            "AND profile_id = ? AND capability_digest = ?",
-            (self._store.tenant_id, self._profile.profile_id, self._profile.capability_digest),
+            "SELECT v.assertion_id, v.revision_id, v.source_generation, v.vector_json, "
+            "v.embedding_provider, v.embedding_model, v.embedding_dimension, v.renderer_version, "
+            "v.visibility_ceiling, v.privacy_ceiling, v.visibility, v.privacy_classification, v.revision_digest, "
+            "r.assertion_mapping FROM semantic_assertion_vector_projection_entries v "
+            "JOIN semantic_assertions a ON a.tenant_id = v.tenant_id "
+            " AND a.assertion_id = v.assertion_id AND a.current_revision_id = v.revision_id "
+            "JOIN semantic_assertion_revisions r ON r.tenant_id = v.tenant_id "
+            " AND r.revision_id = v.revision_id "
+            "JOIN semantic_projection_eligibility e ON e.tenant_id = v.tenant_id "
+            " AND e.revision_id = v.revision_id "
+            "WHERE v.tenant_id = ? AND v.profile_id = ? AND v.capability_digest = ? "
+            "AND r.status = ? AND r.eligible = 1 AND e.eligible = 1 "
+            "ORDER BY v.assertion_id, v.revision_id LIMIT ?",
+            (
+                self._store.tenant_id, self._profile.profile_id, self._profile.capability_digest,
+                AssertionStatus.ACTIVE.value, candidate_scan_limit + 1,
+            ),
         )
+        if len(rows) > candidate_scan_limit:
+            raise SemanticVectorProjectionError("semantic_vector_projection_candidate_window_exceeded")
         candidates: list[SemanticVectorCandidate] = []
-        for assertion_id, revision_id, generation, raw_vector in rows:
+        for (
+            assertion_id, revision_id, generation, raw_vector, provider, model, dimension,
+            renderer_version, visibility_ceiling, privacy_ceiling, visibility, privacy_classification,
+            revision_digest, assertion_mapping,
+        ) in rows:
+            assertion = Assertion.from_mapping(json.loads(assertion_mapping))
+            if (
+                provider != self._profile.provider
+                or model != self._profile.model
+                or int(dimension) != self._profile.dimension
+                or renderer_version != self._profile.renderer_version
+                or visibility_ceiling != self._profile.visibility_ceiling
+                or privacy_ceiling != self._profile.privacy_ceiling
+                or visibility != assertion.visibility.value
+                or privacy_classification != assertion.privacy_classification
+                or revision_digest != _revision_digest(assertion)
+            ):
+                raise SemanticVectorProjectionError("semantic_vector_projection_profile_drift")
+            if len(str(raw_vector).encode("utf-8")) > _MAX_VECTOR_BYTES:
+                raise SemanticVectorProjectionError("semantic vector exceeds serialized-size bound")
             vector = tuple(float(value) for value in json.loads(raw_vector))
             if len(vector) != len(query):
-                continue
+                raise SemanticVectorProjectionError("semantic_vector_projection_dimension_drift")
             score = sum(left * right for left, right in zip(query, vector))
             candidates.append(SemanticVectorCandidate(str(assertion_id), str(revision_id), score, int(generation)))
         candidates.sort(key=lambda item: (-item.score, item.assertion_id, item.revision_id))
         # A lifecycle mutation may have committed while vectors were read.
-        if (await self._store.checkpoint()).generation != canonical.generation:
+        if await self._canonical_terminal() != canonical:
             raise SemanticVectorProjectionError("semantic_vector_projection_checkpoint_changed")
         return tuple(candidates[:limit])
 
@@ -325,7 +453,7 @@ class SemanticAssertionVectorProjection:
         current provenance rather than vector-owned content.
         """
         hits = await self.recall(query_vector, limit=limit)
-        checkpoint = await self._store.checkpoint()
+        checkpoint = await self._canonical_terminal()
         hydrated = await self._store.hydrate_recall_candidates(
             [hit.assertion_id for hit in hits],
             expected_checkpoint_generation=checkpoint.generation,
@@ -348,13 +476,16 @@ class SemanticAssertionVectorProjection:
         """Return content-free candidate cardinality at one canonical fence."""
         checkpoint = await self._store.checkpoint()
         state = await self.checkpoint()
-        if state.generation != checkpoint.generation:
+        terminal = await self._canonical_terminal()
+        if state != terminal:
             raise SemanticVectorProjectionError("semantic_vector_projection_checkpoint_stale")
         count = await self._store._database.fetchval(  # noqa: SLF001
             "SELECT COUNT(*) FROM semantic_assertion_vector_projection_entries "
             "WHERE tenant_id = ? AND profile_id = ? AND capability_digest = ?",
             (self._store.tenant_id, self._profile.profile_id, self._profile.capability_digest),
         )
+        if await self._canonical_terminal() != terminal:
+            raise SemanticVectorProjectionError("semantic_vector_projection_checkpoint_changed")
         return SemanticVectorErasureObservation(checkpoint.generation, int(count or 0), state.generation)
 
 

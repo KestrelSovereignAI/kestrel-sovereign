@@ -498,8 +498,19 @@ reconstructs the complete source group, atomically requeues projection
 invalidation with every rollback receipt, and finishes the group. Rollback
 never removes legacy graph content or audit records.
 
-Core has no semantic-assertion vector/index projection to rebuild. A
-feature-owned projection may supply its public invalidator to the runner; it
+Core owns an explicit, derived semantic-assertion vector projection through
+`SemanticAssertionVectorProjection`. It consumes the canonical event stream,
+stores exact assertion/revision and canonical-revision-digest lineage under a
+fixed embedding provider/model/profile/dimension and the approved bounded
+semantic-recall renderer version, and remains non-authoritative: every hit is
+hydrated through the canonical recall fence before use. The projector's
+event-level checkpoint must equal the canonical terminal `(generation,
+event_id)`; processing only one event in a multi-event generation remains
+unready. Physical erasure's opaque event wipes and atomically rebuilds only
+current eligible survivors before advancing the checkpoint, so restart or
+replay cannot resurrect erased vectors or strand unrelated ones. Its public
+observer exposes only generation and counts. A feature-owned projection may
+additionally supply its public invalidator to the legacy migration runner; it
 receives only the bound tenant and accepted assertion IDs. Accepted IDs first
 enter a durable pending-invalidation ledger, and delivery is marked complete
 only after the public invalidator returns. Delivery drains bounded 500-ID

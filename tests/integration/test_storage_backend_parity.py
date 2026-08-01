@@ -559,6 +559,48 @@ async def test_governed_semantic_recall_storage_seam_has_backend_parity(db_backe
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_assertion_vector_projection_cursor_and_lineage_have_backend_parity(db_backend, tmp_path):
+    """Exercise the event CAS and bounded vector read on SQLite/PostgreSQL."""
+    from kestrel_sovereign.storage.semantic_vector_projection import SemanticVectorProfile
+
+    tenant, identity = await _incepted_assertion_identity(tmp_path, "vector-projection-parity")
+    storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+
+    async def embed(text: str):
+        return [float(len(text)), 1.0]
+
+    profile = SemanticVectorProfile(
+        "semantic-vector-parity-v1", "c" * 64,
+        provider="parity-provider", model="parity-model", dimension=2,
+    )
+    try:
+        first = _semantic_assertion(tenant, "vector-first", value="first", source_id="vector-first")
+        second = _semantic_assertion(tenant, "vector-second", value="second", source_id="vector-second")
+        await storage.put_assertion(first, source_occurrences=(_semantic_source("vector-first"),))
+        await storage.put_assertion(second, source_occurrences=(_semantic_source("vector-second"),))
+        projection = storage.semantic_assertion_vector_projection(profile, embed)
+        checkpoint = await projection.sync()
+        terminal = await storage._assertion_store().event_checkpoint()
+        assert (checkpoint.generation, checkpoint.event_id) == (
+            terminal.generation, terminal.latest_event_id,
+        )
+        assert {candidate.revision_id for candidate in await projection.recall([1.0, 1.0])} == {
+            first.revision_id, second.revision_id,
+        }
+        stored = await storage.db.fetchall(
+            "SELECT embedding_provider, embedding_model, embedding_dimension, renderer_version, "
+            "revision_digest FROM semantic_assertion_vector_projection_entries WHERE tenant_id = ?",
+            (tenant,),
+        )
+        assert len(stored) == 2
+        assert all(row[:4] == ("parity-provider", "parity-model", 2, "semantic-recall-claim-v1") for row in stored)
+        assert all(len(row[4]) == 64 for row in stored)
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_save_fact_adapter_has_canonical_create_retry_supersede_delete_restart_parity(
     db_backend,
     tmp_path,
