@@ -680,6 +680,11 @@ class SleepReport:
     # A pass-level repair failure. Without this, "0 repaired" reads the same
     # as "nothing to repair", so a permanently failing pass is invisible.
     episode_repair_failed: bool = False
+    # Episodes the pass could not resolve (missing, deleted or undecryptable
+    # sources, or a write failure). A count only — never an ID or a title.
+    # Without it a retrying repair reports "0 repaired, no failure" every
+    # night, indistinguishable from having nothing left to do.
+    episodes_unrepairable: int = 0
 
     # Export stats
     shards_exported: int = 0
@@ -737,6 +742,7 @@ class SleepReport:
                 "episodes_repaired": self.episodes_repaired,
                 "episode_repair_limit_reached": self.episode_repair_limit_reached,
                 "episode_repair_failed": self.episode_repair_failed,
+                "episodes_unrepairable": self.episodes_unrepairable,
                 "duration_ms": self.consolidation_ms,
             },
             "reflection": {
@@ -947,6 +953,9 @@ class SleepMixin:
                     # Content-free: the flag, never the exception text.
                     report.episode_repair_failed = bool(
                         consolidation_result.get("episode_repair_error")
+                    )
+                    report.episodes_unrepairable = len(
+                        consolidation_result.get("episodes_unrepairable") or ()
                     )
                     consolidation_succeeded = True
                     logger.info(
@@ -1954,6 +1963,7 @@ class SleepMixin:
             sleep_report.episode_repair_limit_reached
         )
         report.episode_repair_failed = sleep_report.episode_repair_failed
+        report.episodes_unrepairable = sleep_report.episodes_unrepairable
         report.shards_exported = sleep_report.shards_exported
         report.total_size_bytes = sleep_report.total_size_bytes
         report.storage_tier = sleep_report.storage_tier

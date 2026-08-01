@@ -1274,36 +1274,48 @@ class TestRunsOnceNotForever:
             await db.close()
 
     @pytest.mark.asyncio
-    async def test_retired_repair_does_not_even_take_the_lock(self, tmp_path):
-        """The fast path matters on its own.
+    async def test_repair_never_runs_inside_a_migration_transaction(
+        self, tmp_path
+    ):
+        """migration_lock is for schema migrations, and this pass is not one.
 
-        Correctness comes from the re-check inside the lock, but without the
-        check BEFORE it every sleep would acquire a migration lock forever for
-        work that is finished.
+        On SQLite it takes BEGIN IMMEDIATE — the writer slot — for its whole
+        block. This pass then waits on the privacy-transition lock per episode,
+        while a live streamed turn takes that lock FIRST and then writes the
+        conversation: database-then-transition against transition-then-database
+        is an ABBA deadlock that hangs both. It would also hold the writer slot
+        across a remote embedding call per repaired episode.
         """
         db, ids, store = await _corrupt_fixture(tmp_path)
+        locks: list = []
+        original_lock = db.migration_lock
+
+        def _spy(name):
+            locks.append(name)
+            return original_lock(name)
+
+        db.migration_lock = _spy
         c = _consolidator(db, store, _RecordingGraphStore(db))
         try:
-            await c.run_consolidation()
-            await c.run_consolidation()  # clean sweep -> retires
+            report = await c.run_consolidation()
 
-            locks: list = []
-            original_lock = db.migration_lock
-
-            def _spy(name):
-                locks.append(name)
-                return original_lock(name)
-
-            db.migration_lock = _spy
-            await c.run_consolidation()
-
+            assert report["episodes_repaired"] == 1, "precondition: it ran"
             assert locks == [], (
-                "a retired repair must not serialize on a migration lock "
-                "every night"
+                "the repair must not hold a migration transaction: it nests "
+                "the transition lock and makes network calls"
             )
         finally:
             db.migration_lock = original_lock
             await db.close()
+
+    @pytest.mark.asyncio
+    async def test_unresolved_episodes_reach_the_sleep_report(self):
+        """A retrying repair must not look like a finished one."""
+        from kestrel_sovereign.agent.sleep import SleepReport
+
+        report = SleepReport(success=True)
+        report.episodes_unrepairable = 2
+        assert report.to_dict()["consolidation"]["episodes_unrepairable"] == 2
 
     @pytest.mark.asyncio
     async def test_outstanding_work_does_not_retire_the_repair(self, tmp_path):

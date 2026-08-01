@@ -1310,6 +1310,32 @@ class MemoryConsolidator:
         one extra pass per agent; the cost of the alternative is a
         single hiccup permanently skipping an agent's repair.
 
+        Deliberately NOT wrapped in ``migration_lock``, despite reusing its
+        marker table. That helper is for schema migrations at init: it opens
+        ONE transaction — ``BEGIN IMMEDIATE`` on SQLite, taking the writer slot
+        outright — and requires the whole migration to run inside it. This pass
+        breaks every assumption behind that contract:
+
+        * it acquires the agent's privacy-transition lock per episode, while a
+          live streamed turn takes that lock FIRST and then writes the
+          conversation. Database-then-transition here against
+          transition-then-database there is an ABBA deadlock that hangs both
+          the turn and consolidation (codex review r6 P1);
+        * ``_embed_episode`` makes a remote call per repaired episode, so the
+          writer slot would be held across the network for the whole pass,
+          blocking every conversation and feature write;
+        * a per-candidate failure is caught so one bad episode cannot cost the
+          rest, but on PostgreSQL that leaves an aborted transaction in which
+          no later statement can run and the final commit discards repairs the
+          report already counted.
+
+        Losing the mutual exclusion costs nothing here. The pass is idempotent
+        — every write is conditional and a repaired episode leaves the
+        pre-filter — so two overlapping runs duplicate work rather than corrupt
+        anything, and ``mark_backfill_completed`` is itself an upsert. That is
+        a far better trade than a writer lock held across nested locks and
+        network calls.
+
         Returns the pass report, or ``None`` when the repair had already
         retired and did not run.
         """
@@ -1317,28 +1343,22 @@ class MemoryConsolidator:
         if await self._db.backfill_completed(name):
             return None
 
-        async with self._db.migration_lock(name):
-            # Re-check inside the lock: another initializer may have finished
-            # while this one waited, so the gate that let us in is stale.
-            if await self._db.backfill_completed(name):
-                return None
+        report = await self.repair_ciphertext_episodes()
 
-            report = await self.repair_ciphertext_episodes()
-
-            settled = (
-                report.get("repaired") == 0
-                and not report.get("unrepairable")
-                and not report.get("limit_reached")
-                and not report.get("scan_truncated")
-                and not report.get("skipped")
+        settled = (
+            report.get("repaired") == 0
+            and not report.get("unrepairable")
+            and not report.get("limit_reached")
+            and not report.get("scan_truncated")
+            and not report.get("skipped")
+        )
+        if settled:
+            await self._db.mark_backfill_completed(name)
+            logger.info(
+                "ciphertext-episode repair is complete for %s; it will not "
+                "run again", self.agent_id,
             )
-            if settled:
-                await self._db.mark_backfill_completed(name)
-                logger.info(
-                    "ciphertext-episode repair is complete for %s; it will not "
-                    "run again", self.agent_id,
-                )
-            return report
+        return report
 
     async def repair_ciphertext_episodes(
         self, *, dry_run: bool = False, limit: int = 100,
