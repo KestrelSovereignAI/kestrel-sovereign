@@ -231,6 +231,80 @@ def _first_name_matches(first: str, label: str) -> bool:
 # =============================================================================
 
 
+# ---------------------------------------------------------------------------
+# Extraction precision guards (#2852)
+# ---------------------------------------------------------------------------
+# The capture class in every pattern above is ``[^.!?\n]+``, which stops BEFORE
+# terminal punctuation. An interrogative therefore reads exactly like a
+# commitment: "do I need a heartbeat agent or what?" captures as the action
+# item "a heartbeat agent or what". Both false positives observed in production
+# were this shape. Nothing downstream can recover the distinction, because by
+# then the "?" has been discarded — so it is checked here, against the
+# enclosing sentence rather than the captured span.
+
+_SENTENCE_BOUNDARIES = (".", "!", "?", "\n")
+
+# A negated clause is not a commitment.
+_NEGATION_RE = re.compile(
+    r"\b(?:not|never|no longer|won'?t|don'?t|doesn'?t|didn'?t|can'?t|"
+    r"cannot|shouldn'?t|wouldn'?t)\b",
+    re.IGNORECASE,
+)
+
+# Trailing filler marks the clause as musing rather than committing.
+_FILLER_TAIL_RE = re.compile(
+    r"\b(?:or\s+(?:what|something|whatever|anything)|i\s+guess|i\s+suppose|"
+    r"maybe|perhaps)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _enclosing_sentence(content: str, start: int, end: int) -> str:
+    """The sentence containing ``content[start:end]``, terminator included."""
+    left = max(content.rfind(c, 0, start) for c in _SENTENCE_BOUNDARIES)
+    rights = [i for i in (content.find(c, end) for c in _SENTENCE_BOUNDARIES) if i != -1]
+    right = min(rights) if rights else len(content) - 1
+    return content[left + 1: right + 1]
+
+
+def _is_committing_clause(content: str, match, text: str) -> bool:
+    """Whether a raw pattern hit is a real commitment worth persisting.
+
+    Rejects the three shapes that produced the observed false positives: an
+    interrogative sentence, a negated clause, and a clause trailing off into
+    filler.
+    """
+    sentence = _enclosing_sentence(content, match.start(), match.end())
+    if sentence.rstrip().endswith("?"):
+        return False
+    if _NEGATION_RE.search(sentence):
+        return False
+    if _FILLER_TAIL_RE.search(text):
+        return False
+    return True
+
+
+# Evidence strength per claim. Confidence was previously the literal 0.7 on
+# every extracted item and decision, so the field carried no information and no
+# threshold could be tuned against it (#2852). An explicit ``TODO:`` is far
+# stronger evidence of a commitment than a bare "I'll".
+_STRONG_EVIDENCE_RE = re.compile(
+    r"\bTODO:?|\bremind me to\b|\bdon'?t forget to\b", re.IGNORECASE
+)
+STRONG_CLAIM_CONFIDENCE = 0.9
+DEFAULT_CLAIM_CONFIDENCE = 0.7
+
+
+def claim_confidence(text: str, source: str = "") -> float:
+    """Confidence for one extracted claim, derived from its evidence."""
+    probe = source or text
+    return (
+        STRONG_CLAIM_CONFIDENCE
+        if _STRONG_EVIDENCE_RE.search(probe)
+        else DEFAULT_CLAIM_CONFIDENCE
+    )
+
+
 class ActionItemExtractor:
     """Regex-based action item extraction.
 
@@ -246,6 +320,8 @@ class ActionItemExtractor:
             for match in re.finditer(pattern, content, flags=re.IGNORECASE):
                 text = match.group(len(match.groups())).strip().strip(",;")
                 if not text or len(text) < 3:
+                    continue
+                if not _is_committing_clause(content, match, text):
                     continue
                 key = text.lower()
                 if key in seen:
@@ -265,6 +341,8 @@ class DecisionExtractor:
             for match in re.finditer(pattern, content, flags=re.IGNORECASE):
                 text = match.group(len(match.groups())).strip().strip(",;")
                 if not text or len(text) < 3:
+                    continue
+                if not _is_committing_clause(content, match, text):
                     continue
                 key = text.lower()
                 if key in seen:
@@ -466,7 +544,7 @@ class SchemaRouter:
                 "status": existing_props.get("status", "pending"),
                 "assignee_concept_id": existing_props.get("assignee_concept_id"),
                 "due_date": existing_props.get("due_date"),
-                "confidence": 0.7,
+                "confidence": claim_confidence(text),
                 "source_message_id": message_id,
                 "agent_id": self.agent_id,
                 "created_at": existing_props.get("created_at", now_iso),
@@ -510,7 +588,7 @@ class SchemaRouter:
             properties = {
                 "text": text,
                 "source_message_id": message_id,
-                "confidence": 0.7,
+                "confidence": claim_confidence(text),
                 "created_at": now_iso,
                 "agent_id": self.agent_id,
             }
