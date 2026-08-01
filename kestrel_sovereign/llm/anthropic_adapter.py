@@ -493,12 +493,15 @@ class AnthropicAdapter(LLMAdapter):
     # Deliberately an allowlist so an unrecognised model fails CLOSED: the
     # fallback relays the notice as a visible user turn, which is merely
     # suboptimal, whereas claiming support that isn't there breaks the turn.
-    # A newly-supporting model is a one-line addition here.
-    _INLINE_SYSTEM_MODEL_PATTERNS = (
-        r"claude[-.]?opus[-.]?5",
-        r"claude[-.]?opus[-.]?4[-.]?8",
-        r"claude[-.]?fable[-.]?5",
-        r"claude[-.]?mythos[-.]?5",
+    # A newly-supporting model is a one-line addition to the alternation.
+    #
+    # FULLY ANCHORED, with an optional dated-snapshot suffix as the only
+    # permitted trailer. An unanchored search would fail OPEN on any id that
+    # merely STARTS with a supported lineage — ``claude-opus-5-1``,
+    # ``claude-fable-50``, ``claude-mythos-5-preview`` — which is exactly the
+    # route-wedge this gate exists to avoid (codex review, #2846).
+    _INLINE_SYSTEM_MODEL_RE = re.compile(
+        r"^claude-(?:opus-5|opus-4-8|fable-5|mythos-5)(?:-\d{8})?$"
     )
 
     @staticmethod
@@ -512,13 +515,17 @@ class AnthropicAdapter(LLMAdapter):
         and had its operator notices downgraded to visible
         ``<operator_notice>`` user turns — off the non-spoofable operator
         channel and into the replayed conversation history.
+
+        Accepts the id in any form Kestrel stores it: bare, dated-snapshot,
+        ``anthropic/``-prefixed, or route-qualified ``vendor:route/model``
+        (:meth:`_resolve_wire_model_id` only strips the bare ``anthropic/``
+        form, so the route segment is dropped here before matching).
         """
         wire_model = AnthropicAdapter._resolve_wire_model_id(model or "")
-        normalized = wire_model.lower().replace("_", "-")
-        return any(
-            re.search(pattern, normalized)
-            for pattern in AnthropicAdapter._INLINE_SYSTEM_MODEL_PATTERNS
-        )
+        normalized = re.sub(r"[._]", "-", wire_model.lower())
+        # "vendor:route/model" -> "model"; a bare id is unaffected.
+        bare = normalized.rsplit("/", 1)[-1]
+        return bool(AnthropicAdapter._INLINE_SYSTEM_MODEL_RE.match(bare))
 
     def _route_supports_inline_system(self) -> bool:
         """This adapter targets native Anthropic-compatible Messages routes.
