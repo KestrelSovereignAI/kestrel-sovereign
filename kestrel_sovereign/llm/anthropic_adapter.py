@@ -480,12 +480,52 @@ class AnthropicAdapter(LLMAdapter):
             return model[len("anthropic/"):]
         return model
 
+    # Models whose native Anthropic Messages route accepts a mid-conversation
+    # ``{"role": "system"}`` turn.
+    #
+    # This is a published CAPABILITY MATRIX, not a version ordering, and the
+    # distinction is load-bearing: Sonnet 5 postdates Opus 4.8 and does NOT
+    # support inline system turns, while Fable 5 and Mythos 5 do. A ">= 4.8"
+    # comparison would be wrong in both directions — it would drop Fable and
+    # Mythos, and would advertise the capability on Sonnet 5, whose route
+    # rejects the turn (the 400-wedge #2009 exists to prevent exactly that).
+    #
+    # Deliberately an allowlist so an unrecognised model fails CLOSED: the
+    # fallback relays the notice as a visible user turn, which is merely
+    # suboptimal, whereas claiming support that isn't there breaks the turn.
+    # A newly-supporting model is a one-line addition to the alternation.
+    #
+    # FULLY ANCHORED, with an optional dated-snapshot suffix as the only
+    # permitted trailer. An unanchored search would fail OPEN on any id that
+    # merely STARTS with a supported lineage — ``claude-opus-5-1``,
+    # ``claude-fable-50``, ``claude-mythos-5-preview`` — which is exactly the
+    # route-wedge this gate exists to avoid (codex review, #2846).
+    _INLINE_SYSTEM_MODEL_RE = re.compile(
+        r"^claude-(?:opus-5|opus-4-8|fable-5|mythos-5)(?:-\d{8})?$"
+    )
+
     @staticmethod
     def _model_supports_inline_system(model: str) -> bool:
-        """Anthropic currently gates inline system turns to Opus 4.8+."""
+        """Whether ``model`` accepts a mid-conversation system turn.
+
+        Anthropic ships mid-conversation system messages on Claude Opus 5,
+        Opus 4.8, Fable 5 and Mythos 5 — no beta header. Before #2846 this
+        matched ONLY ``claude-opus-4-8`` despite a docstring claiming "4.8+",
+        so every current production route (Opus 5, Fable 5) failed the gate
+        and had its operator notices downgraded to visible
+        ``<operator_notice>`` user turns — off the non-spoofable operator
+        channel and into the replayed conversation history.
+
+        Accepts the id in any form Kestrel stores it: bare, dated-snapshot,
+        ``anthropic/``-prefixed, or route-qualified ``vendor:route/model``
+        (:meth:`_resolve_wire_model_id` only strips the bare ``anthropic/``
+        form, so the route segment is dropped here before matching).
+        """
         wire_model = AnthropicAdapter._resolve_wire_model_id(model or "")
-        normalized = wire_model.lower().replace("_", "-")
-        return bool(re.search(r"claude[-.]?opus[-.]?4[-.]?8", normalized))
+        normalized = re.sub(r"[._]", "-", wire_model.lower())
+        # "vendor:route/model" -> "model"; a bare id is unaffected.
+        bare = normalized.rsplit("/", 1)[-1]
+        return bool(AnthropicAdapter._INLINE_SYSTEM_MODEL_RE.match(bare))
 
     def _route_supports_inline_system(self) -> bool:
         """This adapter targets native Anthropic-compatible Messages routes.
