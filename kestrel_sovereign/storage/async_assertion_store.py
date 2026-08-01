@@ -65,6 +65,7 @@ _LEGACY_ERASED_EXPLICIT_FACT_OPERATION = "legacy_erased_explicit_fact"
 _EXPLICIT_FACT_SAVE_OPERATION_PREFIX = "memory-agency-save-fact-v1:save:"
 _EXPLICIT_FACT_FORGET_OPERATION_PREFIX = "memory-agency-save-fact-v1:forget:"
 _ERASURE_MAINTENANCE_LEASE_HOLDER = "physical-erasure"
+_GOVERNED_ARTIFACT_AUTH_WINDOW_SECONDS = 300
 
 
 @dataclass(frozen=True, slots=True)
@@ -5863,12 +5864,17 @@ class AsyncAssertionStore:
                     revision_ids=tuple(str(item[1]) for item in lineage),
                     generation=generation,
                 )
-                raise GovernedArtifactError("artifact retention expiry elapsed")
-            return GovernedArtifactReceipt(
-                self._artifact_key(artifact_id), GovernedArtifactKind(str(kind)),
-                GovernedArtifactState.ACTIVE, generation,
-                self._artifact_receipt_digest(self._artifact_key(artifact_id), GovernedArtifactKind(str(kind)), GovernedArtifactState.ACTIVE, generation),
-            )
+                # Do not raise until the mutation context exits: the expiry
+                # receipt, registry removal, and pending physical-deletion
+                # work must commit before a consumer is told this artifact is
+                # unavailable.
+            else:
+                return GovernedArtifactReceipt(
+                    self._artifact_key(artifact_id), GovernedArtifactKind(str(kind)),
+                    GovernedArtifactState.ACTIVE, generation,
+                    self._artifact_receipt_digest(self._artifact_key(artifact_id), GovernedArtifactKind(str(kind)), GovernedArtifactState.ACTIVE, generation),
+                )
+        raise GovernedArtifactError("artifact retention expiry elapsed")
 
     async def _authenticate_governed_artifact_consumer(
         self, authentication: GovernedArtifactConsumerAuthentication,
@@ -5883,7 +5889,7 @@ class AsyncAssertionStore:
             authentication.issued_at.replace("Z", "+00:00")
         )
         age = abs((datetime.now(timezone.utc) - issued_at).total_seconds())
-        if age > 300:
+        if age > _GOVERNED_ARTIFACT_AUTH_WINDOW_SECONDS:
             raise GovernedArtifactError("consumer authentication is expired")
         row = await self._database.fetchone(
             "SELECT consumer_public_key FROM semantic_governed_artifact_consumers "
@@ -6092,6 +6098,21 @@ class AsyncAssertionStore:
         cutoff = clock_value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
         async with self._mutation():
             tenant_id, _ = self._require_scope()
+            # Authentication nonces are durable replay protection only for the
+            # same bounded window that admission accepts.  Prune strictly
+            # older rows on every retention sweep so a long-lived tenant does
+            # not accumulate an unbounded nonce ledger.  Use the host clock,
+            # not the testable artifact-retention clock: auth freshness must
+            # share the verifier's wall-clock domain.
+            nonce_cutoff = (
+                datetime.now(timezone.utc)
+                - timedelta(seconds=_GOVERNED_ARTIFACT_AUTH_WINDOW_SECONDS)
+            ).isoformat().replace("+00:00", "Z")
+            await self._database.execute(
+                "DELETE FROM semantic_governed_artifact_auth_nonces "
+                "WHERE tenant_id = ? AND used_at < ?",
+                (tenant_id, nonce_cutoff),
+            )
             rows = await self._database.fetchall(
                 "SELECT artifact_id, kind FROM semantic_governed_artifacts "
                 "WHERE tenant_id = ? AND state = ? AND retention_expires_at <= ? "

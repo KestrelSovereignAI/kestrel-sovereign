@@ -359,6 +359,80 @@ async def test_expiry_sweep_revokes_without_a_consume_attempt(storage: AsyncStor
 
 
 @pytest.mark.asyncio
+async def test_consume_time_expiry_commits_pending_deletion_before_rejecting(
+    storage: AsyncStorage,
+) -> None:
+    """A serving attempt must not roll its own expiry revocation back."""
+    private_key = Ed25519PrivateKey.generate()
+    assertion = _assertion(storage.agent_id, "consume-expiry-revision")
+    await storage.put_assertion(assertion, source_occurrences=(_source(),))
+    checkpoint = await storage.assertion_checkpoint()
+    registration = _registration(
+        assertion, checkpoint.generation, private_key=private_key,
+    )
+    await storage._assertion_store().register_governed_artifact(registration)
+    await storage.db.execute(
+        "UPDATE semantic_governed_artifacts SET retention_expires_at = ? "
+        "WHERE tenant_id = ? AND artifact_id = ?",
+        (
+            (datetime.now(timezone.utc) - timedelta(seconds=1))
+            .isoformat().replace("+00:00", "Z"),
+            storage.agent_id,
+            registration.artifact_id,
+        ),
+    )
+
+    with pytest.raises(GovernedArtifactError, match="retention expiry"):
+        await storage.consume_governed_semantic_artifact(
+            registration.artifact_id, expected_generation=checkpoint.generation,
+        )
+
+    assert await storage.db.fetchval(
+        "SELECT COUNT(*) FROM semantic_governed_artifacts "
+        "WHERE tenant_id = ? AND artifact_id = ?",
+        (storage.agent_id, registration.artifact_id),
+    ) == 0
+    assert await storage.db.fetchval(
+        "SELECT COUNT(*) FROM semantic_governed_artifact_revocations "
+        "WHERE tenant_id = ? AND acknowledged_at IS NULL",
+        (storage.agent_id,),
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_expiry_sweep_prunes_only_stale_consumer_authentication_nonces(
+    storage: AsyncStorage,
+) -> None:
+    private_key = Ed25519PrivateKey.generate()
+    assertion = _assertion(storage.agent_id, "nonce-prune-revision")
+    await storage.put_assertion(assertion, source_occurrences=(_source(),))
+    checkpoint = await storage.assertion_checkpoint()
+    registration = _registration(
+        assertion, checkpoint.generation, private_key=private_key,
+    )
+    await storage._assertion_store().register_governed_artifact(registration)
+    stale_nonce, fresh_nonce = str(uuid4()), str(uuid4())
+    now = datetime.now(timezone.utc)
+    await storage.db.execute(
+        "INSERT INTO semantic_governed_artifact_auth_nonces "
+        "(tenant_id, consumer_id, nonce, used_at) VALUES (?, ?, ?, ?), (?, ?, ?, ?)",
+        (
+            storage.agent_id, registration.consumer_id, stale_nonce,
+            (now - timedelta(minutes=6)).isoformat().replace("+00:00", "Z"),
+            storage.agent_id, registration.consumer_id, fresh_nonce,
+            (now - timedelta(minutes=4)).isoformat().replace("+00:00", "Z"),
+        ),
+    )
+
+    assert await storage.sweep_expired_governed_semantic_artifacts() == 0
+    assert await storage.db.fetchall(
+        "SELECT nonce FROM semantic_governed_artifact_auth_nonces "
+        "WHERE tenant_id = ? ORDER BY nonce",
+        (storage.agent_id,),
+    ) == [(fresh_nonce,)]
+
+
+@pytest.mark.asyncio
 async def test_privacy_wrapper_blocks_artifact_persistence_and_serving_in_volatile_modes(storage: AsyncStorage) -> None:
     private_key = Ed25519PrivateKey.generate()
     assertion = _assertion(storage.agent_id)
@@ -383,6 +457,60 @@ async def test_privacy_wrapper_blocks_artifact_persistence_and_serving_in_volati
     # Cleanup remains callable even in a volatile mode so a mode transition
     # cannot strand bytes written while persistence was allowed.
     assert await wrapper.sweep_expired_governed_semantic_artifacts() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("producer_name", "raw_method"),
+    [
+        ("export", "export_assertion_snapshot"),
+        ("corpus", "governed_assertion_corpus_snapshot"),
+        ("delta", "governed_assertion_corpus_changes_since"),
+    ],
+)
+async def test_artifact_producer_lease_blocks_transition_and_releases_on_cancel(
+    storage: AsyncStorage, monkeypatch, producer_name: str, raw_method: str,
+) -> None:
+    """No restrictive transition can bisect an admitted producer await."""
+    wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+    entered = asyncio.Event()
+    never_release = asyncio.Event()
+
+    async def blocked_producer(*args, **kwargs):
+        entered.set()
+        await never_release.wait()
+
+    monkeypatch.setattr(storage, raw_method, blocked_producer)
+    governance = {
+        "artifact_id": str(uuid4()),
+        "consumer_id": "lease-test",
+        "consumer_key_id": "lease-test-key",
+        "consumer_public_key": "0" * 64,
+        "retention_seconds": 60,
+    }
+    if producer_name == "export":
+        task = asyncio.create_task(wrapper.export_assertion_snapshot(**governance))
+    elif producer_name == "corpus":
+        task = asyncio.create_task(
+            wrapper.governed_assertion_corpus_snapshot(
+                policy=None, inference_profile=None, **governance,
+            )
+        )
+    else:
+        task = asyncio.create_task(
+            wrapper.governed_assertion_corpus_changes_since(
+                object(), policy=None, inference_profile=None, **governance,
+            )
+        )
+    await entered.wait()
+    with pytest.raises(PrivacyViolationError, match="artifact producer"):
+        wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert wrapper._active_semantic_artifact_producer_leases == 0
+    wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
 
 
 @pytest.mark.asyncio
