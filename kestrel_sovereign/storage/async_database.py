@@ -18,6 +18,16 @@ logger = logging.getLogger(__name__)
 _BACKFILL_LOCK_DOMAIN = b"kestrel:schema-backfill-lock:v1\0"
 
 
+def _collapse_ws(text: str) -> str:
+    """Normalize whitespace so stored DDL can be compared to a declaration.
+
+    SQLite returns the ``CREATE TABLE`` statement byte-for-byte as whichever
+    build wrote it, so an expression that is semantically identical can differ
+    in line breaks and indentation.
+    """
+    return " ".join(text.split())
+
+
 def _backfill_lock_id(name: str) -> int:
     """Stable signed-64-bit PostgreSQL advisory-lock key for a one-time backfill.
 
@@ -1683,6 +1693,164 @@ class AsyncDatabase:
                     f"{table} is missing column(s) after migration: "
                     + ", ".join(still_missing)
                 )
+
+    async def ensure_check_constraint(
+        self,
+        table: str,
+        constraint: str,
+        expression: str,
+        *,
+        canonical_ddl: str,
+        remediation=None,
+        lock_name: str = "",
+    ) -> None:
+        """Make a CHECK constraint true of ``table``, however it was created.
+
+        Callers declare WHAT must hold; this owns HOW on each backend. A table
+        created fresh carries its constraints in the ``CREATE TABLE``; one that
+        gained the column by ``ALTER`` does not, and no ALTER can retrofit a
+        CHECK on SQLite. Without this the two shapes diverge permanently and
+        nothing detects it — a column whose guarantee its readers assume but
+        whose schema does not enforce (#2804, the shape of #2774).
+
+        ``canonical_ddl`` is the full ``CREATE TABLE`` for the desired shape,
+        with the table name written as ``{table}``. The same template creates
+        the table fresh and rebuilds it here, so the two cannot drift — passing
+        a second, hand-copied spelling is exactly the divergence being fixed.
+
+        ``remediation`` is ``(sql, params)`` applied under the lock BEFORE the
+        constraint. Rows predating the constraint may already violate it, and
+        both backends refuse to add it while they do — Postgres fails
+        ``VALIDATE``, SQLite fails the rebuild's INSERT. Deciding what those
+        rows become is the caller's: only it knows which value is the safe one.
+
+        Idempotent and safe to call every boot: it probes first, and the whole
+        migration runs inside one ``migration_lock`` transaction, so an
+        interrupted rebuild rolls back rather than leaving a half-copied table.
+        """
+        if not await self.table_exists(table):
+            # Nothing to retrofit. A later CREATE will use canonical_ddl.
+            return
+        if await self._check_constraint_exists(table, constraint, expression):
+            return
+
+        async with self.migration_lock(lock_name or f"{table}_{constraint}"):
+            # Re-probed under the lock: a concurrent initializer may have
+            # rebuilt the table while this one waited.
+            if await self._check_constraint_exists(table, constraint, expression):
+                return
+            if remediation is not None:
+                sql, params = remediation
+                await self.execute(sql, params)
+
+            if self.backend_type == "postgres":
+                # NOT VALID adds the constraint without scanning the table, so
+                # new writes are enforced immediately and the (potentially
+                # long) scan does not hold an ACCESS EXCLUSIVE lock. VALIDATE
+                # then takes only a SHARE UPDATE EXCLUSIVE lock. Both inside
+                # the migration transaction: if VALIDATE finds a violation the
+                # ADD rolls back too, rather than leaving an unvalidated
+                # constraint nobody knows is unvalidated.
+                await self.execute(
+                    f"ALTER TABLE {table} ADD CONSTRAINT {constraint} "
+                    f"CHECK ({expression}) NOT VALID"
+                )
+                await self.execute(
+                    f"ALTER TABLE {table} VALIDATE CONSTRAINT {constraint}"
+                )
+            else:
+                await self._sqlite_rebuild_table(table, canonical_ddl)
+
+            if not await self._check_constraint_exists(
+                table, constraint, expression
+            ):
+                raise RuntimeError(
+                    f"{table} still lacks CHECK constraint {constraint!r} "
+                    "after migration"
+                )
+            logger.info("%s: enforced CHECK constraint %s", table, constraint)
+
+    async def _check_constraint_exists(
+        self, table: str, constraint: str, expression: str
+    ) -> bool:
+        """Report whether ``table`` already enforces this CHECK."""
+        if self.backend_type == "postgres":
+            # Same ``to_regclass`` reasoning as ``_column_exists``: probe the
+            # relation the search path actually resolves, not one named by a
+            # guessed schema.
+            row = await self._backend.fetch_one(
+                "SELECT COUNT(*) FROM pg_constraint "
+                "WHERE conrelid = to_regclass(?) AND conname = ? "
+                "AND contype = 'c' AND convalidated",
+                (table, constraint),
+            )
+            return bool(row and row[0])
+
+        # SQLite keeps constraints only in the table's DDL text, so that text
+        # is the only place to ask. Compared with whitespace collapsed because
+        # SQLite stores the CREATE statement verbatim, including the layout of
+        # whichever build wrote it.
+        row = await self._backend.fetch_one(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        )
+        if not row or not row[0]:
+            return False
+        return _collapse_ws(expression) in _collapse_ws(row[0])
+
+    async def _sqlite_rebuild_table(self, table: str, canonical_ddl: str) -> None:
+        """Rebuild a SQLite table into its canonical shape, preserving rows.
+
+        SQLite has no ``ADD CONSTRAINT``; the documented remedy is to build the
+        new table, copy, drop, and rename. Indexes are read back from
+        ``sqlite_master`` and replayed, because ``DROP TABLE`` takes them with
+        it and a silently-missing index degrades queries without failing them.
+
+        Runs inside the caller's ``migration_lock`` transaction, so a failure
+        anywhere leaves the original table untouched.
+        """
+        staging = f"{table}__rebuild"
+        old_columns = [
+            r[1]
+            for r in await self._backend.fetch_all(
+                f"PRAGMA table_info('{table}')"
+            )
+        ]
+        index_ddl = [
+            r[0]
+            for r in await self._backend.fetch_all(
+                "SELECT sql FROM sqlite_master WHERE type='index' "
+                "AND tbl_name=? AND sql IS NOT NULL",
+                (table,),
+            )
+        ]
+
+        await self.execute(f"DROP TABLE IF EXISTS {staging}")
+        await self.execute(canonical_ddl.format(table=staging))
+        new_columns = [
+            r[1]
+            for r in await self._backend.fetch_all(
+                f"PRAGMA table_info('{staging}')"
+            )
+        ]
+        # Copy the intersection in the NEW table's order. A column the new
+        # shape drops is intentionally left behind; one it adds takes its
+        # declared default rather than a NULL the DDL may forbid.
+        shared = [c for c in new_columns if c in old_columns]
+        if not shared:
+            raise RuntimeError(
+                f"{table}: canonical DDL shares no columns with the live "
+                "table; refusing to rebuild"
+            )
+        column_list = ", ".join(shared)
+        await self.execute(
+            f"INSERT INTO {staging} ({column_list}) "
+            f"SELECT {column_list} FROM {table}"
+        )
+        await self.execute(f"DROP TABLE {table}")
+        await self.execute(f"ALTER TABLE {staging} RENAME TO {table}")
+        for statement in index_ddl:
+            await self.execute(statement)
 
     async def _run_ownership_backfills_once(self, name: str) -> None:
         """Run the #2649 ownership backfills exactly once, serialized."""

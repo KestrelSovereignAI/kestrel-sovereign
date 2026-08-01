@@ -56,11 +56,22 @@ ROUTE_STATE_ROUTABLE = "routable"
 ROUTE_STATE_AMBIGUOUS = "ambiguous"
 """A historical duplicate route which must never be selected for routing."""
 
-_ROUTE_STATES = frozenset({
+# Ordered, because the CHECK constraint below is generated from it and a
+# frozenset would spell the same vocabulary differently between runs — the
+# stored DDL is compared as text to decide whether a rebuild is needed.
+ROUTE_STATES = (
     ROUTE_STATE_RESERVED,
     ROUTE_STATE_ROUTABLE,
     ROUTE_STATE_AMBIGUOUS,
-})
+)
+
+_ROUTE_STATES = frozenset(ROUTE_STATES)
+
+# Generated from the constants above rather than written out again, so the
+# schema's vocabulary cannot drift from the code's (#2804).
+ROUTE_STATE_CHECK = "route_state IN ({})".format(
+    ", ".join(f"'{state}'" for state in ROUTE_STATES)
+)
 
 
 class OutboundTaskRouteAmbiguousError(RuntimeError):
@@ -113,30 +124,39 @@ class OutboundTask:
         }
 
 
+# ONE canonical shape, used to create the table fresh and to rebuild an
+# upgraded one into it (#2804). ``{table}`` is substituted so the rebuild can
+# stage under a temporary name; a second hand-copied spelling is exactly the
+# divergence this fixes.
+A2A_OUTBOUND_TASKS_DDL = f"""
+    CREATE TABLE {{table}} (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        recipient TEXT NOT NULL,
+        recipient_agent_id TEXT,
+        verb TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        skill_id TEXT,
+        dispatch_tool TEXT NOT NULL,
+        message_summary TEXT,
+        created_at TEXT NOT NULL,
+        route_state TEXT NOT NULL DEFAULT 'routable' CHECK (
+            {ROUTE_STATE_CHECK}
+        ),
+        terminal_state TEXT,
+        terminal_at TEXT,
+        error TEXT
+    )
+"""
+
+
 async def ensure_a2a_outbound_tasks_table(db) -> None:
     """Create the table + indices if they don't already exist."""
     await db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS a2a_outbound_tasks (
-            id TEXT PRIMARY KEY,
-            agent_id TEXT NOT NULL,
-            task_id TEXT NOT NULL,
-            recipient TEXT NOT NULL,
-            recipient_agent_id TEXT,
-            verb TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            skill_id TEXT,
-            dispatch_tool TEXT NOT NULL,
-            message_summary TEXT,
-            created_at TEXT NOT NULL,
-            route_state TEXT NOT NULL DEFAULT 'routable' CHECK (
-                route_state IN ('reserved', 'routable', 'ambiguous')
-            ),
-            terminal_state TEXT,
-            terminal_at TEXT,
-            error TEXT
+        A2A_OUTBOUND_TASKS_DDL.replace(
+            "CREATE TABLE {table}", "CREATE TABLE IF NOT EXISTS a2a_outbound_tasks"
         )
-        """
     )
     # The outbound table is feature-owned, so it is created independently of
     # AsyncDatabase's core schema.  Existing agent databases predate stable
@@ -178,6 +198,28 @@ async def ensure_a2a_outbound_tasks_table(db) -> None:
               HAVING COUNT(*) > 1
           )
         """
+    )
+    # A database that gained ``route_state`` by ALTER carries it WITHOUT the
+    # CHECK the fresh CREATE declares, permanently and undetectably (#2804).
+    # ``route_state`` is routing *authorization* state and ``get_outbound_task``
+    # fails closed on exactly one of its values, so "the column holds one of
+    # three known values" has to be enforced rather than merely intended.
+    #
+    # The remediation runs first because both backends refuse to add a
+    # constraint rows already violate. Anything outside the vocabulary is
+    # quarantined to ``ambiguous`` rather than guessed into ``routable``: an
+    # unrecognised authorization state must fail closed, and the rows are kept
+    # so the audit history survives.
+    await db.ensure_check_constraint(
+        "a2a_outbound_tasks",
+        "a2a_outbound_tasks_route_state_check",
+        ROUTE_STATE_CHECK,
+        canonical_ddl=A2A_OUTBOUND_TASKS_DDL,
+        remediation=(
+            "UPDATE a2a_outbound_tasks SET route_state = 'ambiguous' "
+            f"WHERE route_state NOT IN ({', '.join('?' * len(ROUTE_STATES))})",
+            ROUTE_STATES,
+        ),
     )
     # ``NOT EXISTS`` in a rekey UPDATE is only a snapshot predicate.  It is
     # not an ownership invariant under PostgreSQL's READ COMMITTED isolation:
