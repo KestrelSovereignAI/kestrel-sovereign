@@ -226,6 +226,21 @@ class MemoryConsolidator:
             # nights. Best-effort; no-op when no embedding provider is wired.
             report["episodes_embedded"] = await self._backfill_episode_embeddings()
 
+            # 3c. Repair episodes synthesized from ciphertext before #2850.
+            # Sleep owns nightly memory maintenance, and this is maintenance:
+            # the damaged rows keep being served until something rewrites
+            # them. Isolated from the rest of the cycle — a repair failure is
+            # reported, never fatal to consolidation (#2856).
+            try:
+                repair = await self.repair_ciphertext_episodes()
+                report["episodes_repaired"] = repair.get("repaired", 0)
+                if repair.get("unrepairable"):
+                    report["episodes_unrepairable"] = repair["unrepairable"]
+            except Exception as e:  # noqa: BLE001
+                logger.warning("episode repair pass failed: %s", e)
+                report["episodes_repaired"] = 0
+                report["episode_repair_error"] = str(e)
+
             # Get total message count
             count = await self._db.fetchval(
                 "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ?",

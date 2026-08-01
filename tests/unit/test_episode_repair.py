@@ -519,6 +519,46 @@ class TestDryRun:
             await db.close()
 
 
+class TestWiredIntoConsolidation:
+    """Repair that nothing calls is repair that never happens."""
+
+    @pytest.mark.asyncio
+    async def test_nightly_consolidation_runs_the_repair_pass(self, tmp_path):
+        db, ids, store = await _corrupt_fixture(tmp_path)
+        c = _consolidator(db, store, _RecordingGraphStore(db))
+        try:
+            report = await c.run_consolidation()
+
+            assert report.get("episodes_repaired") == 1
+            assert await db.fetchval(
+                "SELECT title FROM memory_episodes WHERE id = ?",
+                ("episode:corrupt",)
+            ) != CORRUPT_TITLE
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_repair_failure_does_not_abort_consolidation(self, tmp_path):
+        db, ids, store = await _corrupt_fixture(tmp_path)
+        c = _consolidator(db, store, _RecordingGraphStore(db))
+
+        async def _boom(**kwargs):
+            raise RuntimeError("repair exploded")
+
+        c.repair_ciphertext_episodes = _boom
+        try:
+            report = await c.run_consolidation()
+
+            assert "error" not in report, "consolidation must survive a repair failure"
+            assert report["episodes_repaired"] == 0
+            assert report["episode_repair_error"] == "repair exploded"
+            assert "total_messages_processed" in report, (
+                "the steps after repair must still run"
+            )
+        finally:
+            await db.close()
+
+
 class TestIdempotence:
     @pytest.mark.asyncio
     async def test_second_pass_finds_nothing_to_do(self, tmp_path):
