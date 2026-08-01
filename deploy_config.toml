@@ -74,12 +74,26 @@ GITHUB_APP_ID = "github-app-id:latest"
 GITHUB_APP_PRIVATE_KEY = "github-app-private-key:latest"
 GITHUB_APP_WEBHOOK_SECRET = "github-app-webhook-secret:latest"
 
-# Production Profile - Cloud Run (durable single-agent, always warm, auto-scales)
+# Production Profile - Cloud Run (durable single-agent, always warm)
 #
 # The container filesystem is disposable. Production restores one encrypted,
 # version-pinned identity bundle from Secret Manager and keeps coherent state
 # in PostgreSQL. The profile stays single-agent until per-agent custody and
 # database bindings exist for the multi-agent host.
+#
+# ``max_instances`` is capped at 1 to match the substrate that actually exists.
+# Durable custody *permits* horizontal scale — every instance restores the same
+# verified identity over the same transactional database — but permission is not
+# capacity. Each instance opens up to 10 pooled plus 4 advisory PostgreSQL
+# connections (storage/db/postgres.py), and the provisioned Cloud SQL instance is
+# a ``db-f1-micro`` whose connection ceiling is ~25: a second instance exhausts
+# it. The previous value of 100 declared headroom nothing had been provisioned to
+# serve, which is the same shape of defect as a durable record claiming an
+# unobserved event.
+#
+# Raising this is therefore a paired change: raise the Cloud SQL tier (or add a
+# connection pooler) in the same pass, or the cap is the only thing standing
+# between a scale-up and connection exhaustion.
 [profiles.prod]
 name = "Cloud Run Production"
 provider = "cloudrun"
@@ -87,7 +101,7 @@ service_name = "kestrel-prod"
 region = "us-central1"
 persistence_mode = "durable_sovereign"
 min_instances = 1
-max_instances = 100
+max_instances = 1
 memory = "2Gi"
 cpu = 2
 port = 8080
