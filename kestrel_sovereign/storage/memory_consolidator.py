@@ -71,7 +71,7 @@ class MemoryConsolidator:
         return _GAP
 
     def __init__(self, db: AsyncDatabase, agent_id: str, graph_store=None,
-                 llm_service=None, persist_policy=None):
+                 llm_service=None, persist_policy=None, conversation_store=None):
         """
         Initialize consolidator.
 
@@ -87,6 +87,14 @@ class MemoryConsolidator:
                 recall (#1674 P2). When absent (or no embedding provider is
                 configured), episode recall degrades to keyword search and no
                 embeddings are written — both paths stay functional.
+            conversation_store: The AsyncConversationStore that owns message
+                decryption. This class reads ``conversation_history`` with its
+                own SQL for clustering, so without it every encrypted row's
+                at-rest envelope was treated as text and tokenized straight
+                into episode titles, summaries and affect (#2850). ``None``
+                (raw storage, tests) means rows are assumed plaintext, and any
+                row still carrying an envelope is skipped rather than
+                summarized.
             persist_policy: Optional privacy authority exposing
                 ``allows_persistent_writes() -> bool``. Consulted before the
                 direct ``memory_episodes`` write so manual / scheduled
@@ -100,6 +108,7 @@ class MemoryConsolidator:
         self._graph_store = graph_store
         self._llm_service = llm_service
         self._persist_policy = persist_policy
+        self._conversation_store = conversation_store
         # Lazily-built SQLAlchemy session factory for the shared vector
         # backend (mirrors SavedItemsStore). None when unavailable.
         self._sqla_factory = None
@@ -285,6 +294,12 @@ class MemoryConsolidator:
             # a fact lifecycle action, even if the original episode had been
             # excluded before this nightly pass.
             if metadata.get("excluded_from_context"):
+                continue
+
+            # #2850: rows come from raw SQL, so `content` is still the at-rest
+            # envelope. Decode before anything reads it as text.
+            content = self._row_plaintext(content, metadata)
+            if content is None:
                 continue
 
             # Parse date from created_at
@@ -689,6 +704,55 @@ class MemoryConsolidator:
                 position += 1
         ranked = sorted(counts, key=lambda term: (-counts[term], first_seen[term], term))
         return ranked[:limit]
+
+    # ------------------------------------------------------------------
+    # Row content decoding (#2850)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _looks_like_ciphertext(content: str) -> bool:
+        """Whether ``content`` still carries the at-rest AEAD envelope."""
+        try:
+            from kestrel_sdk.security.aead import KSA_V2_PREFIX
+
+            prefix = KSA_V2_PREFIX.decode()
+        except Exception:  # noqa: BLE001 - never let a probe break consolidation
+            prefix = "KSAv2:"
+        return content.startswith(prefix)
+
+    def _row_plaintext(self, content: Any, metadata: Optional[Dict]) -> Optional[str]:
+        """Decrypt one raw ``conversation_history`` row to plaintext.
+
+        Returns ``None`` when the row cannot be trusted as text, and the
+        caller must then SKIP it. Failing closed is the point: an episode
+        title, summary, emotional arc or embedding derived from ciphertext is
+        silently wrong forever, and it corrupts every downstream consumer with
+        no error anywhere (#2850). A dropped message is visible in the message
+        counts; a ciphertext topic is not.
+        """
+        text = "" if content is None else str(content)
+        store = self._conversation_store
+        if store is not None and hasattr(store, "decrypt_stored_content"):
+            try:
+                text = store.decrypt_stored_content(text, metadata)
+            except Exception as e:  # noqa: BLE001 - DecryptionError and friends
+                logger.warning(
+                    "episode consolidation skipped a message it could not "
+                    "decrypt: %s", e,
+                )
+                return None
+        if text and self._looks_like_ciphertext(text):
+            # Unreachable once the store is wired; loud rather than silent
+            # because this is precisely the bug that produced episode titles
+            # reading "Discussion of ksav2, <base64>".
+            logger.error(
+                "episode consolidation refused a message that is still "
+                "encrypted after decode (agent=%s) — check that the "
+                "conversation store is wired into MemoryConsolidator",
+                self.agent_id,
+            )
+            return None
+        return text
 
     def _durable_writes_allowed(self) -> bool:
         """Whether the current privacy mode permits persisting an episode.
@@ -1130,6 +1194,9 @@ class MemoryConsolidator:
                     metadata = json.loads(metadata)
                 except (json.JSONDecodeError, TypeError):
                     metadata = {}
+            content = self._row_plaintext(content, metadata)  # #2850
+            if content is None:
+                continue
             # Temporal patterns are durable derived memory too.  Do not allow
             # a hidden semantic-recall artifact to re-enter context through a
             # newly detected pattern on the next sleep cycle.
@@ -1374,6 +1441,12 @@ class MemoryConsolidator:
             # consolidation.  Apply the same barrier here or sleep/restart can
             # recreate visible episode text from an excluded derivative.
             if metadata.get("excluded_from_context"):
+                continue
+
+            # #2850: same raw-SQL source, same envelope — decode before this
+            # content reaches title/summary/affect synthesis.
+            content = self._row_plaintext(content, metadata)
+            if content is None:
                 continue
 
             messages.append({
