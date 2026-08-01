@@ -62,16 +62,72 @@ _SEMANTIC_MAINTENANCE_ERASURE_REDACTION_SCHEMA_VERSION = (
 _SEMANTIC_MAINTENANCE_LEASE_PRECISION_SCHEMA_VERSION = (
     "semantic_maintenance_v8_lease_precision"
 )
+# Every semantic migration below serializes on this ONE name, which preserves
+# the behaviour they had when each hand-rolled the same advisory-lock id: they
+# all create and read ``semantic_schema_migrations``, so they must not run
+# concurrently with each other. Giving them distinct names would let them
+# interleave on that shared table, which is a behaviour change, not a cleanup.
+_SEMANTIC_MIGRATION_LOCK = "semantic_assertion_schema"
+
+# One definition, used by every migration that ensures the marker table exists.
+# Previously two of the five spelled it with ``completed_at`` and three without;
+# under ``CREATE TABLE IF NOT EXISTS`` whichever migration ran first silently
+# decided the schema. Nothing reads the column today, so this is a latent trap
+# rather than a live bug — the same shape as #2804. Databases created by an
+# older build may lack the column; no backfill is added because adding one for
+# a column nothing reads would be ceremony, and the marker rows themselves are
+# what the migrations actually consult.
+_SEMANTIC_SCHEMA_MIGRATIONS_DDL = (
+    "CREATE TABLE IF NOT EXISTS semantic_schema_migrations ("
+    "version TEXT PRIMARY KEY, "
+    "completed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+)
+
 _SEMANTIC_ASSERTION_LOCK_DOMAIN = b"kestrel:semantic-assertion-schema:v1\0"
 
 
-def _semantic_assertion_lock_id() -> int:
-    """Stable transaction-scoped PostgreSQL lock for semantic-schema DDL."""
+def _legacy_semantic_assertion_lock_id() -> int:
+    """The advisory-lock key these migrations used before ``migration_lock``.
+
+    ``migration_lock`` derives its PostgreSQL key by hashing the lock *name* in
+    a generic backfill domain, which is a different integer from the one this
+    module used. That difference matters in exactly one window, and there it
+    matters a lot: a rolling PostgreSQL deploy where an instance on the old
+    code and an instance on the new code both reach these migrations against a
+    database whose semantic schema is not yet marked. Each would hold a
+    different advisory lock while running the same ``CREATE TABLE/INDEX IF NOT
+    EXISTS`` DDL — precisely the catalog race the lock exists to prevent.
+    """
     return int.from_bytes(
         hashlib.sha256(_SEMANTIC_ASSERTION_LOCK_DOMAIN).digest()[:8],
         "big",
         signed=True,
     )
+
+
+@asynccontextmanager
+async def _semantic_migration_lock(db: "AsyncDatabase"):
+    """Serialize one semantic migration against every other initializer.
+
+    ``migration_lock`` owns the mechanism: an advisory lock on PostgreSQL, an
+    IMMEDIATE transaction on SQLite. The legacy key is additionally taken on
+    PostgreSQL so an initializer still running pre-refactor code blocks against
+    this one during a rolling deploy.
+
+    Acquisition order is always new-then-legacy here, and old code takes only
+    the legacy key, so no cycle exists and the pair cannot deadlock.
+
+    REMOVE the legacy acquisition once no deployment can still be running
+    pre-refactor code against a shared PostgreSQL database. It costs one extra
+    lock per migration and protects only the mixed-version window.
+    """
+    async with db.migration_lock(_SEMANTIC_MIGRATION_LOCK):
+        if db.backend_type == "postgres":
+            await db.execute(
+                "SELECT pg_advisory_xact_lock(?)",
+                (_legacy_semantic_assertion_lock_id(),),
+            )
+        yield
 
 
 async def _semantic_schema_marker_exists(db: "AsyncDatabase") -> bool:
@@ -80,21 +136,6 @@ async def _semantic_schema_marker_exists(db: "AsyncDatabase") -> bool:
         (_SEMANTIC_ASSERTION_SCHEMA_VERSION,),
     )
     return row is not None
-
-
-@asynccontextmanager
-async def _semantic_validation_migration_transaction(db: "AsyncDatabase"):
-    """Serialize a validation-schema marker read with SQLite's writer slot."""
-    if db.backend_type == "sqlite":
-        # The normal SQLite transaction begins deferred.  Once it has read a
-        # schema marker, attempting to promote it to a writer races another
-        # initializer and fails immediately instead of observing busy_timeout.
-        # Begin as the writer so every marker read below is serialized.
-        async with db.backend.transaction(immediate=True):  # type: ignore[call-arg]
-            yield
-        return
-    async with db.transaction():
-        yield
 
 
 async def _ensure_erasure_receipts_are_opaque(db: "AsyncDatabase") -> None:
@@ -396,24 +437,8 @@ async def migrate_semantic_assertion_store(db: "AsyncDatabase") -> None:
         "CREATE INDEX IF NOT EXISTS idx_semantic_erased_operation_tombstones ON semantic_assertion_erased_operation_tombstones(tenant_id, operation_key)",
         "CREATE INDEX IF NOT EXISTS idx_semantic_legacy_erasure_fences ON semantic_assertion_legacy_erasure_fences(tenant_id, assertion_key)",
     )
-    async with db.transaction():
-        # PostgreSQL's catalog DDL can race even with IF NOT EXISTS.  A
-        # transaction-scoped advisory lock keeps a concurrent multi-agent boot
-        # from attempting this complete DDL set simultaneously; the marker is
-        # committed atomically with the schema.  SQLite promotes to its single
-        # writer slot before the marker read for the corresponding behavior.
-        if db.backend_type == "postgres":
-            await db.execute(
-                "SELECT pg_advisory_xact_lock(?)",
-                (_semantic_assertion_lock_id(),),
-            )
-        await db.execute(
-            "CREATE TABLE IF NOT EXISTS semantic_schema_migrations ("
-            "version TEXT PRIMARY KEY, completed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
-            (),
-        )
-        if db.backend_type == "sqlite":
-            await db.execute("DELETE FROM semantic_schema_migrations WHERE 0", ())
+    async with _semantic_migration_lock(db):
+        await db.execute(_SEMANTIC_SCHEMA_MIGRATIONS_DDL, ())
         if await _semantic_schema_marker_exists(db):
             return
         legacy_upgrade = await db.fetchone(
@@ -530,14 +555,8 @@ async def migrate_semantic_vector_projection(db: "AsyncDatabase") -> None:
         "CREATE INDEX IF NOT EXISTS idx_semantic_vector_projection_revision "
         "ON semantic_assertion_vector_projection_entries(tenant_id, revision_id)",
     )
-    async with _semantic_validation_migration_transaction(db):
-        if db.backend_type == "postgres":
-            await db.execute("SELECT pg_advisory_xact_lock(?)", (_semantic_assertion_lock_id(),))
-        await db.execute(
-            "CREATE TABLE IF NOT EXISTS semantic_schema_migrations ("
-            "version TEXT PRIMARY KEY, completed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
-            (),
-        )
+    async with _semantic_migration_lock(db):
+        await db.execute(_SEMANTIC_SCHEMA_MIGRATIONS_DDL, ())
         exists = await db.fetchone(
             "SELECT 1 FROM semantic_schema_migrations WHERE version = ?",
             (_SEMANTIC_VECTOR_PROJECTION_SCHEMA_VERSION,),
@@ -692,14 +711,8 @@ async def migrate_semantic_governed_artifacts(db: "AsyncDatabase") -> None:
         "CREATE INDEX IF NOT EXISTS idx_semantic_governed_artifact_lineage ON semantic_governed_artifact_lineage(tenant_id, assertion_id, revision_id)",
         "CREATE INDEX IF NOT EXISTS idx_semantic_governed_artifact_state ON semantic_governed_artifacts(tenant_id, state, kind)",
     )
-    async with _semantic_validation_migration_transaction(db):
-        if db.backend_type == "postgres":
-            await db.execute("SELECT pg_advisory_xact_lock(?)", (_semantic_assertion_lock_id(),))
-        await db.execute(
-            "CREATE TABLE IF NOT EXISTS semantic_schema_migrations "
-            "(version TEXT PRIMARY KEY)",
-            (),
-        )
+    async with _semantic_migration_lock(db):
+        await db.execute(_SEMANTIC_SCHEMA_MIGRATIONS_DDL, ())
         existing = await db.fetchone(
             "SELECT 1 FROM semantic_schema_migrations WHERE version = ?",
             (_SEMANTIC_GOVERNED_ARTIFACT_SCHEMA_VERSION,),
@@ -916,14 +929,8 @@ async def migrate_semantic_validation_reports(db: "AsyncDatabase") -> None:
         "CREATE INDEX IF NOT EXISTS idx_semantic_validation_report_revision ON semantic_validation_report_revisions(tenant_id, assertion_id, revision_id, report_id)",
         "CREATE INDEX IF NOT EXISTS idx_semantic_validation_result_tenant_assertion ON semantic_validation_results(tenant_id, assertion_id, report_id)",
     )
-    async with _semantic_validation_migration_transaction(db):
-        if db.backend_type == "postgres":
-            await db.execute("SELECT pg_advisory_xact_lock(?)", (_semantic_assertion_lock_id(),))
-        await db.execute(
-            "CREATE TABLE IF NOT EXISTS semantic_schema_migrations "
-            "(version TEXT PRIMARY KEY)",
-            (),
-        )
+    async with _semantic_migration_lock(db):
+        await db.execute(_SEMANTIC_SCHEMA_MIGRATIONS_DDL, ())
         existing = await db.fetchone(
             "SELECT 1 FROM semantic_schema_migrations WHERE version = ?",
             (_SEMANTIC_VALIDATION_SCHEMA_VERSION,),
@@ -1011,14 +1018,8 @@ async def migrate_semantic_maintenance(db: "AsyncDatabase") -> None:
         "CREATE INDEX IF NOT EXISTS idx_semantic_maintenance_runs_tenant_time ON semantic_maintenance_runs(tenant_id, started_at DESC, run_id)",
         "CREATE INDEX IF NOT EXISTS idx_semantic_maintenance_reports_tenant_kind ON semantic_maintenance_reports(tenant_id, report_kind, status)",
     )
-    async with _semantic_validation_migration_transaction(db):
-        if db.backend_type == "postgres":
-            await db.execute("SELECT pg_advisory_xact_lock(?)", (_semantic_assertion_lock_id(),))
-        await db.execute(
-            "CREATE TABLE IF NOT EXISTS semantic_schema_migrations "
-            "(version TEXT PRIMARY KEY)",
-            (),
-        )
+    async with _semantic_migration_lock(db):
+        await db.execute(_SEMANTIC_SCHEMA_MIGRATIONS_DDL, ())
         existing = await db.fetchone(
             "SELECT 1 FROM semantic_schema_migrations WHERE version = ?",
             (_SEMANTIC_MAINTENANCE_SCHEMA_VERSION,),
