@@ -91,22 +91,28 @@ def _read_owner_only_file(path: Path, *, kind: str) -> bytes:
             os.close(descriptor)
 
 
-def _validate_private_components(root: Path, path: Path, *, kind: str) -> tuple[tuple[int, int], ...]:
-    """Return a stable private component snapshot for a rooted verifier path."""
-    if not root.is_absolute() or not path.is_absolute() or ".." in path.parts:
+def _rooted_relative_path(root: Path, path: Path, *, kind: str) -> Path:
+    """Return ``path`` relative to ``root`` without resolving either locator."""
+    if (
+        not root.is_absolute()
+        or not path.is_absolute()
+        or ".." in root.parts
+        or ".." in path.parts
+    ):
         raise ReleaseEvidenceError(f"{kind} must be an absolute non-traversing verifier path")
     try:
-        relative = path.relative_to(root)
+        return path.relative_to(root)
     except ValueError as error:
         raise ReleaseEvidenceError(f"{kind} escapes verifier trusted_root") from error
-    try:
-        if root.resolve(strict=True) != root:
-            raise ReleaseEvidenceError(f"{kind} trusted_root must be a resolved non-symlink directory")
-    except OSError as error:
-        raise ReleaseEvidenceError(f"{kind} trusted_root cannot be inspected") from error
+
+
+def _private_component_snapshot(
+    root: Path, relative_parent: Path, *, kind: str,
+) -> tuple[tuple[int, int], ...]:
+    """Snapshot private, non-symlink directory components from ``root`` down."""
     current = root
     snapshots: list[tuple[int, int]] = []
-    for component in (Path("."), *relative.parent.parts):
+    for component in (Path("."), *relative_parent.parts):
         if component != Path("."):
             current = current / component
         try:
@@ -118,6 +124,34 @@ def _validate_private_components(root: Path, path: Path, *, kind: str) -> tuple[
             raise ReleaseEvidenceError(f"{kind} parent must be a private non-symlink directory")
         snapshots.append((metadata.st_dev, metadata.st_ino))
     return tuple(snapshots)
+
+
+def _canonicalize_declared_rooted_path(root: Path, path: Path, *, kind: str) -> tuple[Path, Path]:
+    """Canonicalize a rooted locator without accepting aliases below its root.
+
+    A host-level alias such as macOS ``/etc -> /private/etc`` is outside the
+    declared trusted root and may be canonicalized.  In contrast, every
+    component beginning with the declared root remains a literal ``lstat``
+    checked directory, so a symlink there cannot be hidden by resolution.
+    """
+    relative = _rooted_relative_path(root, path, kind=kind)
+    _private_component_snapshot(root, relative.parent, kind=kind)
+    try:
+        resolved_root = root.resolve(strict=True)
+    except OSError as error:
+        raise ReleaseEvidenceError(f"{kind} trusted_root cannot be inspected") from error
+    return resolved_root, resolved_root / relative
+
+
+def _validate_private_components(root: Path, path: Path, *, kind: str) -> tuple[tuple[int, int], ...]:
+    """Return a stable private component snapshot for a rooted verifier path."""
+    relative = _rooted_relative_path(root, path, kind=kind)
+    try:
+        if root.resolve(strict=True) != root:
+            raise ReleaseEvidenceError(f"{kind} trusted_root must be a resolved non-symlink directory")
+    except OSError as error:
+        raise ReleaseEvidenceError(f"{kind} trusted_root cannot be inspected") from error
+    return _private_component_snapshot(root, relative.parent, kind=kind)
 
 
 def _recheck_private_components(
@@ -167,19 +201,23 @@ def read_verifier_configuration(path: Path) -> VerifierConfiguration:
     root = Path(str(value["trusted_root"]))
     ledger_path = Path(str(value["ledger_path"]))
     receipt_key_file = Path(str(value["receipt_key_file"]))
-    try:
-        resolved_root = root.resolve(strict=True)
-        relative_config = path.relative_to(resolved_root)
-        ledger_path.relative_to(resolved_root)
-        receipt_key_file.relative_to(resolved_root)
-    except (OSError, ValueError) as error:
-        raise ReleaseEvidenceError("verifier configuration must be rooted in its private trusted_root") from error
-    if root != resolved_root or relative_config == Path("."):
-        raise ReleaseEvidenceError("verifier configuration trusted_root must be resolved and contain its config")
+    resolved_root, resolved_config = _canonicalize_declared_rooted_path(
+        root, path, kind="verifier configuration",
+    )
+    _, ledger_path = _canonicalize_declared_rooted_path(
+        root, ledger_path, kind="verifier freshness ledger",
+    )
+    _, receipt_key_file = _canonicalize_declared_rooted_path(
+        root, receipt_key_file, kind="verifier receipt key",
+    )
+    if resolved_config == resolved_root:
+        raise ReleaseEvidenceError("verifier configuration trusted_root must contain its config")
     # Re-read only after the configuration's declared root has itself passed
     # the private-component checks.  This prevents a safe leaf file beneath a
     # replaced/symlinked intermediate directory from selecting its own root.
-    raw = _read_rooted_owner_only_file(resolved_root, path, kind="verifier configuration")
+    raw = _read_rooted_owner_only_file(
+        resolved_root, resolved_config, kind="verifier configuration",
+    )
     try:
         if json.loads(raw.decode("utf-8")) != value:
             raise ReleaseEvidenceError("verifier configuration changed while being read")

@@ -16,6 +16,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives import serialization
 
+from kestrel_sovereign.knowledge import release_evidence_verifier as verifier_module
 from kestrel_sovereign.knowledge.release_evidence import (
     ArtifactReference,
     CompatibilityRetirementDecision,
@@ -1209,6 +1210,61 @@ def _write_private_key(path: Path, key_bytes: bytes) -> None:
     path.chmod(0o600)
 
 
+def _write_protected_verifier_configuration(
+    root: Path,
+    *,
+    declared_root: Path | None = None,
+    config_relative: Path = Path("verifier.json"),
+) -> Path:
+    """Create one complete private verifier configuration for locator tests."""
+    root.mkdir(parents=True, mode=0o700)
+    root.chmod(0o700)
+    config_parent = root / config_relative.parent
+    config_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    config_parent.chmod(0o700)
+    receipt_bytes = b"\x07" * 32
+    receipt_key = root / "receipt.key"
+    _write_private_key(receipt_key, receipt_bytes)
+    receipt_public = Ed25519PrivateKey.from_private_bytes(receipt_bytes).public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    ).hex()
+    locator_root = declared_root or root
+    policy = {
+        "keys": [
+            _CATALOG_TEST_IDENTITY.trusted_key(
+                tuple(
+                    sorted(
+                        {
+                            spec.runner.runner_id
+                            for spec in release_gate_specs()
+                            if spec.runner.runner_id != "external_ci"
+                        }
+                    )
+                )
+            ).to_mapping(),
+        ]
+    }
+    config = locator_root / config_relative
+    config.write_text(
+        json.dumps(
+            {
+                "trusted_root": str(locator_root),
+                "ledger_path": str(locator_root / "ledger.sqlite"),
+                "trust_policy": policy,
+                "expected_external_runner_revision": "b" * 40,
+                "receipt_key_file": str(locator_root / "receipt.key"),
+                "receipt_issuer_id": "verifier_ci",
+                "receipt_key_id": "semantic_release",
+                "receipt_public_key": receipt_public,
+                "verifier_role": "semantic_release_verifier",
+            }
+        ),
+        encoding="utf-8",
+    )
+    config.chmod(0o600)
+    return config
+
+
 def _external_envelope_mapping(
     records: tuple[EvidenceRecord, ...], report: ExternalCapabilityReport,
 ) -> dict[str, object]:
@@ -1448,6 +1504,77 @@ def test_cli_run_executes_an_allowlisted_registry_workload_and_assemble_marks_it
     assert report_payload["ready"] is False
     assert report_payload["trust_status"] == "unverified"
     assert report_payload["structurally_complete"] is False
+
+
+def test_verifier_configuration_canonicalizes_an_alias_above_its_declared_root(
+    tmp_path: Path,
+) -> None:
+    """A fixed ``/etc``-style alias must not defeat rooted containment."""
+    physical_parent = tmp_path / "private"
+    physical_root = physical_parent / "etc" / "kestrel"
+    physical_parent.mkdir(mode=0o700)
+    system_alias = tmp_path / "etc"
+    system_alias.symlink_to(physical_parent / "etc", target_is_directory=True)
+    declared_root = system_alias / "kestrel"
+    config = _write_protected_verifier_configuration(
+        physical_root, declared_root=declared_root,
+    )
+
+    configuration = read_verifier_configuration(config)
+
+    assert configuration.trusted_root == physical_root
+    assert configuration.ledger_path == physical_root / "ledger.sqlite"
+    assert configuration.receipt_key_file == physical_root / "receipt.key"
+
+
+def test_verifier_configuration_rejects_a_symlink_below_its_declared_root(
+    tmp_path: Path,
+) -> None:
+    """Canonicalizing a host alias must never hide a child-directory symlink."""
+    root = tmp_path / "verifier"
+    nested_config = _write_protected_verifier_configuration(
+        root, config_relative=Path("nested/verifier.json"),
+    )
+    config_alias = root / "config-link"
+    config_alias.symlink_to(root / "nested", target_is_directory=True)
+
+    with pytest.raises(ReleaseEvidenceError, match="private non-symlink"):
+        read_verifier_configuration(config_alias / nested_config.name)
+
+
+def test_verifier_configuration_rechecks_a_replaced_child_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The second config read must retain its before/after parent inode check."""
+    root = tmp_path / "verifier"
+    config = _write_protected_verifier_configuration(
+        root, config_relative=Path("config/verifier.json"),
+    )
+    replacement = root / "replacement"
+    replacement.mkdir(mode=0o700)
+    replacement.chmod(0o700)
+    replacement_config = replacement / config.name
+    replacement_config.write_bytes(config.read_bytes())
+    replacement_config.chmod(0o600)
+    original_parent = config.parent
+    original_reader = verifier_module._read_owner_only_file
+    reads = 0
+
+    def replace_after_rooted_read(path: Path, *, kind: str) -> bytes:
+        nonlocal reads
+        result = original_reader(path, kind=kind)
+        if kind == "verifier configuration":
+            reads += 1
+            if reads == 2:
+                original_parent.rename(root / "config-original")
+                replacement.rename(original_parent)
+        return result
+
+    monkeypatch.setattr(verifier_module, "_read_owner_only_file", replace_after_rooted_read)
+
+    with pytest.raises(ReleaseEvidenceError, match="parent changed while being used"):
+        read_verifier_configuration(config)
 
 
 def test_verifier_cli_requires_protected_config_and_consumes_one_external_challenge(
