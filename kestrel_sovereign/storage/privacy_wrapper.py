@@ -3251,6 +3251,59 @@ class PrivacyEnforcingStorage:
             operation_id=operation_id,
         )
 
+    async def register_governed_semantic_artifact(self, registration):
+        self._assert_semantic_assertion_write_allowed("governed artifact registration")
+        self._assert_semantic_assertion_read_allowed("governed artifact lineage")
+        return await self._storage.register_governed_semantic_artifact(registration)
+
+    async def consume_governed_semantic_artifact(
+        self, artifact_id, *, expected_generation: int,
+    ):
+        self._assert_semantic_assertion_read_allowed("governed artifact consumption")
+        return await self._storage.consume_governed_semantic_artifact(
+            artifact_id, expected_generation=expected_generation
+        )
+
+    async def claim_governed_semantic_artifact_revocation(
+        self, authentication, *, lease_seconds: float = 60.0,
+    ):
+        # Privacy modes never block cleanup of bytes written in an earlier
+        # durable mode. Consumer authentication remains mandatory in storage.
+        return await self._storage.claim_governed_semantic_artifact_revocation(
+            authentication, lease_seconds=lease_seconds
+        )
+
+    async def acknowledge_governed_semantic_artifact_revocation(
+        self, lease, proof,
+    ):
+        return await self._storage.acknowledge_governed_semantic_artifact_revocation(
+            lease, proof
+        )
+
+    async def process_governed_semantic_artifact_revocation(
+        self, authentication, owner, *, lease_seconds: float = 60.0,
+    ):
+        return await self._storage.process_governed_semantic_artifact_revocation(
+            authentication, owner, lease_seconds=lease_seconds
+        )
+
+    async def sweep_expired_governed_semantic_artifacts(
+        self, *, now=None, limit: int = 100,
+    ):
+        # Retention cleanup is always permitted; it can only remove active
+        # controlled artifacts and create authenticated deletion work.
+        return await self._storage.sweep_expired_governed_semantic_artifacts(
+            now=now, limit=limit
+        )
+
+    async def governed_semantic_artifact_erasure_observation(
+        self, *, expected_generation: int,
+    ):
+        self._assert_semantic_assertion_read_allowed("governed artifact observations")
+        return await self._storage.governed_semantic_artifact_erasure_observation(
+            expected_generation=expected_generation
+        )
+
     def _assert_semantic_assertion_read_allowed(self, operation: str) -> None:
         """Keep volatile sessions from observing durable semantic knowledge.
 

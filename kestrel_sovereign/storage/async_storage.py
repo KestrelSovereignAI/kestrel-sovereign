@@ -1904,20 +1904,36 @@ class AsyncStorage:
             artifact_id, expected_generation=expected_generation
         )
 
-    async def claim_governed_semantic_artifact_revocation(self, consumer_id, *, lease_seconds: float = 60.0):
+    async def claim_governed_semantic_artifact_revocation(self, authentication, *, lease_seconds: float = 60.0):
         if not self._initialized:
             await self.initialize()
         return await self._assertion_store().claim_governed_artifact_revocation(
-            consumer_id, lease_seconds=lease_seconds
+            authentication, lease_seconds=lease_seconds
         )
 
     async def acknowledge_governed_semantic_artifact_revocation(
-        self, consumer_id, lease, *, deletion_proof_digest: str,
+        self, lease, proof,
     ):
         if not self._initialized:
             await self.initialize()
         return await self._assertion_store().acknowledge_governed_artifact_revocation(
-            consumer_id, lease, deletion_proof_digest=deletion_proof_digest
+            lease, proof
+        )
+
+    async def process_governed_semantic_artifact_revocation(
+        self, authentication, owner, *, lease_seconds: float = 60.0,
+    ):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().process_governed_artifact_revocation(
+            authentication, owner, lease_seconds=lease_seconds
+        )
+
+    async def sweep_expired_governed_semantic_artifacts(self, *, now=None, limit: int = 100):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().sweep_expired_governed_artifacts(
+            now=now, limit=limit
         )
 
     async def governed_semantic_artifact_erasure_observation(self, *, expected_generation: int):

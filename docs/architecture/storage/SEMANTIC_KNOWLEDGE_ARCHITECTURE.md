@@ -1209,9 +1209,13 @@ fenced to the current tenant generation. A supersession, retraction,
 quarantine, lifecycle deletion, or privacy erasure that touches any registered
 assertion immediately removes the controlled artifact and its lineage in the
 canonical transaction. It creates one fresh opaque revocation item for the
-registered consumer. The consumer claims a short lease and must acknowledge
-physical deletion with a content-free deletion-proof digest; an expired lease
-is retried. No acknowledgement means revocation remains pending and no
+registered consumer. Registration binds the consumer principal, key ID, and
+Ed25519 public key. A claim consumes a fresh signed authentication nonce. The
+registry then drives that owner's physical-deletion callback and accepts its
+acknowledgement only when the signed proof binds the tenant, blinded artifact
+key, artifact digest, revocation ID, lease token, attempt, and deletion time.
+An arbitrary digest is not a deletion proof; an expired lease is retried. No
+verified acknowledgement means revocation remains pending and no
 Kestrel-controlled serving/generation is allowed. A new empty export, Story
 Archive timeline output, or unrelated corpus is never evidence that this
 controlled artifact was removed.
@@ -1223,6 +1227,9 @@ assertion ID, revision ID, source locator, source digest, or exported content.
 Erasure observations are generation-fenced aggregates for `export_snapshot`,
 `corpus_manifest`, and `future_corpus_candidate` plus pending/completed
 revocation counts; they are not an enumeration API.
+The reviewed `sweep_expired_governed_semantic_artifacts()` maintenance callable
+proactively converts expired active artifacts to opaque revocation work; expiry
+does not depend on a consumer attempting to serve the artifact first.
 
 ## Privacy and security boundary
 

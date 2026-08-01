@@ -51,6 +51,95 @@ from kestrel_sovereign.knowledge import InferenceProfile, OntologyRef
 from kestrel_sovereign.knowledge.capabilities import semantic_capabilities_from_config
 
 
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_governed_artifact_erasure_lifecycle_has_backend_parity(
+    db_backend, tmp_path,
+):
+    """SQLite/PostgreSQL share authenticated registration, expiry, and ACK semantics."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from kestrel_sovereign.knowledge import (
+        GovernedArtifactConsumerAuthentication,
+        GovernedArtifactDeletionOwner,
+        GovernedArtifactDeletionProof,
+        GovernedArtifactKind,
+        GovernedArtifactLineage,
+        GovernedArtifactRegistration,
+    )
+
+    tenant, identity = await _incepted_assertion_identity(tmp_path, "artifact-parity")
+    storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    private_key = Ed25519PrivateKey.generate()
+    unique = uuid4().hex
+    assertion = None
+    try:
+        assertion = _semantic_assertion(
+            tenant, f"artifact-parity-revision-{unique}",
+            value=f"artifact-parity-{unique}",
+            source_id=f"artifact-parity-source-{unique}",
+        )
+        await storage.put_assertion(
+            assertion,
+            source_occurrences=(_semantic_source(f"artifact-parity-source-{unique}"),),
+        )
+        checkpoint = await storage.assertion_checkpoint()
+        registration = GovernedArtifactRegistration(
+            artifact_id=str(uuid4()), kind=GovernedArtifactKind.EXPORT_SNAPSHOT,
+            tenant_id=tenant, consumer_id="parity-consumer", consumer_key_id="parity-key",
+            consumer_public_key=private_key.public_key().public_bytes(
+                serialization.Encoding.Raw, serialization.PublicFormat.Raw,
+            ).hex(),
+            checkpoint_generation=checkpoint.generation, policy_pin="a" * 64,
+            capability_pins={"semantic-kb-v1": "b" * 64},
+            lineage=(GovernedArtifactLineage(assertion.assertion_id, assertion.revision_id),),
+            retention_expires_at=(datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+            artifact_digest="c" * 64,
+        )
+        await storage.register_governed_semantic_artifact(registration)
+        assert await storage.sweep_expired_governed_semantic_artifacts(
+            now=(datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+        ) == 1
+        authentication = GovernedArtifactConsumerAuthentication(
+            "parity-consumer", "parity-key", str(uuid4()),
+            datetime.now(timezone.utc).isoformat(), "0" * 128,
+        )
+        authentication = replace(
+            authentication,
+            signature=private_key.sign(authentication.signable_bytes(tenant)).hex(),
+        )
+        deleted: list[str] = []
+
+        async def delete_artifact(lease):
+            deleted.append(lease.artifact_key)
+            proof = GovernedArtifactDeletionProof(
+                datetime.now(timezone.utc).isoformat(), "0" * 128,
+            )
+            return replace(
+                proof, signature=private_key.sign(proof.signable_bytes(lease)).hex(),
+            )
+
+        receipt = await storage.process_governed_semantic_artifact_revocation(
+            authentication,
+            GovernedArtifactDeletionOwner("parity-consumer", "parity-key", delete_artifact),
+        )
+        assert receipt is not None
+        assert deleted == [receipt.artifact_key]
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM semantic_governed_artifact_lineage WHERE tenant_id = ?",
+            (tenant,),
+        ) == 0
+    finally:
+        if assertion is not None:
+            current = await storage.get_assertion(assertion.assertion_id)
+            if current is not None:
+                await storage.erase_assertion(
+                    assertion.assertion_id,
+                    operation_id=f"artifact-parity-cleanup-{unique}",
+                )
+        await storage.close()
+
+
 def _semantic_source(source_id: str):
     from kestrel_sovereign.knowledge import SourceOccurrence
 

@@ -134,6 +134,9 @@ if TYPE_CHECKING:
     )
     from .artifact_lifecycle import (
         ARTIFACT_LIFECYCLE_SCHEMA_VERSION,
+        GovernedArtifactConsumerAuthentication,
+        GovernedArtifactDeletionOwner,
+        GovernedArtifactDeletionProof,
         GovernedArtifactErasureObservation,
         GovernedArtifactError,
         GovernedArtifactKind,
@@ -221,6 +224,9 @@ __all__ = [
     "DEFAULT_SHACL_WRITE_POLICY",
     "GovernedShaclValidationService",
     "GovernedAssertionCorpusService",
+    "GovernedArtifactConsumerAuthentication",
+    "GovernedArtifactDeletionOwner",
+    "GovernedArtifactDeletionProof",
     "GovernedArtifactErasureObservation",
     "GovernedArtifactError",
     "GovernedArtifactKind",
@@ -397,6 +403,9 @@ _CAPABILITY_CONFIGURATION_EXPORTS = frozenset(
 _ARTIFACT_LIFECYCLE_EXPORTS = frozenset(
     {
         "ARTIFACT_LIFECYCLE_SCHEMA_VERSION",
+        "GovernedArtifactConsumerAuthentication",
+        "GovernedArtifactDeletionOwner",
+        "GovernedArtifactDeletionProof",
         "GovernedArtifactErasureObservation",
         "GovernedArtifactError",
         "GovernedArtifactKind",

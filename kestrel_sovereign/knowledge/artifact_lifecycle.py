@@ -15,7 +15,7 @@ from enum import Enum
 import hashlib
 import json
 from types import MappingProxyType
-from typing import Mapping, Sequence
+from typing import Awaitable, Callable, Mapping, Sequence
 from uuid import UUID
 
 
@@ -91,6 +91,8 @@ class GovernedArtifactRegistration:
     kind: GovernedArtifactKind | str
     tenant_id: str
     consumer_id: str
+    consumer_key_id: str
+    consumer_public_key: str
     checkpoint_generation: int
     policy_pin: str
     capability_pins: Mapping[str, str]
@@ -108,6 +110,14 @@ class GovernedArtifactRegistration:
             raise GovernedArtifactError("artifact_id must be a UUIDv4")
         _text(self.tenant_id, "tenant_id")
         _text(self.consumer_id, "consumer_id")
+        _text(self.consumer_key_id, "consumer_key_id")
+        consumer_public_key = _text(self.consumer_public_key, "consumer_public_key")
+        if len(consumer_public_key) != 64 or any(
+            character not in "0123456789abcdef" for character in consumer_public_key
+        ):
+            raise GovernedArtifactError(
+                "consumer_public_key must be a raw lowercase-hex Ed25519 public key"
+            )
         _sha256(self.policy_pin, "policy_pin")
         retention_expires_at = _utc_timestamp(self.retention_expires_at, "retention_expires_at")
         _sha256(self.artifact_digest, "artifact_digest")
@@ -147,11 +157,99 @@ class GovernedArtifactReceipt:
 
 @dataclass(frozen=True, slots=True)
 class GovernedArtifactRevocationLease:
-    """Opaque, single-attempt acknowledgement authority for one consumer."""
+    """Exact deletion request and single-attempt authority for one consumer."""
 
     revocation_id: str
     lease_token: str
     attempt: int
+    tenant_id: str
+    consumer_id: str
+    consumer_key_id: str
+    artifact_key: str
+    artifact_digest: str
+
+    def signable_mapping(self, *, deleted_at: str) -> dict[str, object]:
+        return {
+            "namespace": "semantic-artifact-physical-deletion-v1",
+            "tenant_id": self.tenant_id,
+            "consumer_id": self.consumer_id,
+            "consumer_key_id": self.consumer_key_id,
+            "artifact_key": self.artifact_key,
+            "artifact_digest": self.artifact_digest,
+            "revocation_id": self.revocation_id,
+            "lease_token": self.lease_token,
+            "attempt": self.attempt,
+            "deleted_at": _utc_timestamp(deleted_at, "deleted_at"),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class GovernedArtifactConsumerAuthentication:
+    """One signed, replay-resistant claim request from a registered consumer."""
+
+    consumer_id: str
+    consumer_key_id: str
+    nonce: str
+    issued_at: str
+    signature: str
+
+    def __post_init__(self) -> None:
+        _text(self.consumer_id, "consumer_id")
+        _text(self.consumer_key_id, "consumer_key_id")
+        try:
+            nonce = UUID(_text(self.nonce, "nonce"))
+        except ValueError as error:
+            raise GovernedArtifactError("authentication nonce must be a UUIDv4") from error
+        if nonce.version != 4 or str(nonce) != self.nonce:
+            raise GovernedArtifactError("authentication nonce must be a UUIDv4")
+        object.__setattr__(self, "issued_at", _utc_timestamp(self.issued_at, "issued_at"))
+        signature = _text(self.signature, "signature")
+        if len(signature) != 128 or any(character not in "0123456789abcdef" for character in signature):
+            raise GovernedArtifactError("authentication signature must be raw lowercase-hex Ed25519")
+
+    def signable_bytes(self, tenant_id: str) -> bytes:
+        return _canonical_json({
+            "namespace": "semantic-artifact-consumer-auth-v1",
+            "tenant_id": _text(tenant_id, "tenant_id"),
+            "consumer_id": self.consumer_id,
+            "consumer_key_id": self.consumer_key_id,
+            "nonce": self.nonce,
+            "issued_at": self.issued_at,
+        }).encode("utf-8")
+
+
+@dataclass(frozen=True, slots=True)
+class GovernedArtifactDeletionProof:
+    """Consumer-signed attestation emitted only after its deletion callback."""
+
+    deleted_at: str
+    signature: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "deleted_at", _utc_timestamp(self.deleted_at, "deleted_at"))
+        signature = _text(self.signature, "signature")
+        if len(signature) != 128 or any(character not in "0123456789abcdef" for character in signature):
+            raise GovernedArtifactError("deletion signature must be raw lowercase-hex Ed25519")
+
+    def signable_bytes(self, lease: GovernedArtifactRevocationLease) -> bytes:
+        if not isinstance(lease, GovernedArtifactRevocationLease):
+            raise GovernedArtifactError("deletion proof requires its exact revocation lease")
+        return _canonical_json(lease.signable_mapping(deleted_at=self.deleted_at)).encode("utf-8")
+
+
+@dataclass(frozen=True, slots=True)
+class GovernedArtifactDeletionOwner:
+    """Authenticated owner callback used to physically remove controlled bytes."""
+
+    consumer_id: str
+    consumer_key_id: str
+    delete_artifact: Callable[[GovernedArtifactRevocationLease], Awaitable[GovernedArtifactDeletionProof]]
+
+    def __post_init__(self) -> None:
+        _text(self.consumer_id, "consumer_id")
+        _text(self.consumer_key_id, "consumer_key_id")
+        if not callable(self.delete_artifact):
+            raise GovernedArtifactError("delete_artifact must be an async callable")
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,7 +276,8 @@ class GovernedArtifactErasureObservation:
 
 __all__ = [
     "ARTIFACT_LIFECYCLE_SCHEMA_VERSION", "GovernedArtifactErasureObservation",
-    "GovernedArtifactError", "GovernedArtifactKind", "GovernedArtifactLineage",
+    "GovernedArtifactConsumerAuthentication", "GovernedArtifactDeletionOwner",
+    "GovernedArtifactDeletionProof", "GovernedArtifactError", "GovernedArtifactKind", "GovernedArtifactLineage",
     "GovernedArtifactReceipt", "GovernedArtifactRegistration", "GovernedArtifactRevocationLease",
     "GovernedArtifactState",
 ]

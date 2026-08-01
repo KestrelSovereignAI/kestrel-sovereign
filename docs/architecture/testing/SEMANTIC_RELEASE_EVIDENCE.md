@@ -284,7 +284,9 @@ candidates, and served eligibility.
 The `export_snapshots`, `governed_corpus`, and `future_corpus` stage records
 must be backed by the tenant-scoped governed artifact lifecycle: an exact
 checkpoint-fenced registration, a content-free aggregate observation, and—on
-erasure—a consumer revocation acknowledgement carrying a deletion-proof digest.
+erasure—a verifier-accepted, consumer-signed physical-deletion proof produced
+by the registered owner's deletion callback. The retained receipt carries only
+the content-free proof digest.
 A fresh empty export, Story Archive timeline export, or unrelated corpus is not
 evidence that a previously registered consumer artifact was deleted.
 

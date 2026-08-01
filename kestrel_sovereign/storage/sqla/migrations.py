@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 _SEMANTIC_ASSERTION_SCHEMA_VERSION = "semantic_assertion_store_v5"
 _SEMANTIC_VECTOR_PROJECTION_SCHEMA_VERSION = "semantic_assertion_vector_projection_v2"
-_SEMANTIC_GOVERNED_ARTIFACT_SCHEMA_VERSION = "semantic_governed_artifact_lifecycle_v1"
+_SEMANTIC_GOVERNED_ARTIFACT_SCHEMA_VERSION = "semantic_governed_artifact_lifecycle_v2_authenticated"
 _SEMANTIC_VALIDATION_SCHEMA_VERSION = "semantic_validation_reports_v2_revision_links"
 _SEMANTIC_MAINTENANCE_SCHEMA_VERSION = "semantic_maintenance_v1"
 _SEMANTIC_MAINTENANCE_CURSOR_SCHEMA_VERSION = "semantic_maintenance_v2_cursor"
@@ -615,6 +615,8 @@ async def migrate_semantic_governed_artifacts(db: "AsyncDatabase") -> None:
             artifact_id TEXT NOT NULL,
             kind TEXT NOT NULL,
             consumer_id TEXT NOT NULL,
+            consumer_key_id TEXT NOT NULL,
+            consumer_public_key TEXT NOT NULL,
             checkpoint_generation INTEGER NOT NULL,
             policy_pin TEXT NOT NULL,
             capability_digest TEXT NOT NULL,
@@ -643,6 +645,9 @@ async def migrate_semantic_governed_artifacts(db: "AsyncDatabase") -> None:
             artifact_key TEXT NOT NULL,
             kind TEXT NOT NULL,
             consumer_id TEXT NOT NULL,
+            consumer_key_id TEXT NOT NULL,
+            consumer_public_key TEXT NOT NULL,
+            artifact_digest TEXT,
             attempt INTEGER NOT NULL DEFAULT 0,
             lease_token TEXT,
             lease_expires_at TEXT,
@@ -667,6 +672,21 @@ async def migrate_semantic_governed_artifacts(db: "AsyncDatabase") -> None:
             CHECK (state IN ('active', 'revocation_pending', 'revoked', 'expired')),
             CHECK (generation >= 0)
         )""",
+        """CREATE TABLE IF NOT EXISTS semantic_governed_artifact_auth_nonces (
+            tenant_id TEXT NOT NULL,
+            consumer_id TEXT NOT NULL,
+            nonce TEXT NOT NULL,
+            used_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, consumer_id, nonce)
+        )""",
+        """CREATE TABLE IF NOT EXISTS semantic_governed_artifact_consumers (
+            tenant_id TEXT NOT NULL,
+            consumer_id TEXT NOT NULL,
+            consumer_key_id TEXT NOT NULL,
+            consumer_public_key TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, consumer_id, consumer_key_id)
+        )""",
         "CREATE INDEX IF NOT EXISTS idx_semantic_governed_artifact_lineage ON semantic_governed_artifact_lineage(tenant_id, assertion_id, revision_id)",
         "CREATE INDEX IF NOT EXISTS idx_semantic_governed_artifact_state ON semantic_governed_artifacts(tenant_id, state, kind)",
     )
@@ -686,6 +706,43 @@ async def migrate_semantic_governed_artifacts(db: "AsyncDatabase") -> None:
             return
         for statement in statements:
             await db.execute(statement, ())
+        # Pre-merge development databases may contain the original v1 tables.
+        # Upgrade them additively instead of trusting CREATE TABLE IF NOT
+        # EXISTS to change an existing definition.
+        required_columns = {
+            "semantic_governed_artifacts": (
+                ("consumer_key_id", "TEXT"),
+                ("consumer_public_key", "TEXT"),
+            ),
+            "semantic_governed_artifact_revocations": (
+                ("consumer_key_id", "TEXT"),
+                ("consumer_public_key", "TEXT"),
+                ("artifact_digest", "TEXT"),
+            ),
+        }
+        for table_name, columns in required_columns.items():
+            if db.backend_type == "postgres":
+                existing_columns = {
+                    str(row[0])
+                    for row in await db.fetchall(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() AND table_name = ?",
+                        (table_name,),
+                    )
+                }
+            else:
+                existing_columns = {
+                    str(row[0])
+                    for row in await db.fetchall(
+                        f"SELECT name FROM pragma_table_info('{table_name}')", ()
+                    )
+                }
+            for column_name, column_type in columns:
+                if column_name not in existing_columns:
+                    await db.execute(
+                        f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}",
+                        (),
+                    )
         await db.execute(
             "INSERT INTO semantic_schema_migrations (version) VALUES (?)",
             (_SEMANTIC_GOVERNED_ARTIFACT_SCHEMA_VERSION,),
