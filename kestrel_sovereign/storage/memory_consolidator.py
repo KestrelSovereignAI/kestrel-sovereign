@@ -438,24 +438,13 @@ class MemoryConsolidator:
         N-per-day queries (#1489 P2).
         """
         rows = await self._db.fetchall(
-            """SELECT key_message_ids, id, title, summary FROM memory_episodes
+            """SELECT key_message_ids FROM memory_episodes
                WHERE agent_id = ? AND COALESCE(excluded_from_context, 0) = 0""",
             (self.agent_id,),
         )
         covered: set = set()
-        corrupt_ids: List[str] = []
         for row in rows or []:
             kmi = row[0] if isinstance(row, (tuple, list)) else row
-
-            # #2850: an episode synthesized from ciphertext is not coverage —
-            # it is damage. Left in place it claims its source messages
-            # forever, so the corrupt title, summary, arc and embedding keep
-            # being served and consolidation never regenerates them
-            # (codex review r3). Drop it and release its messages.
-            if isinstance(row, (tuple, list)) and len(row) > 3:
-                if self._is_ciphertext_derived(row[2], row[3]):
-                    corrupt_ids.append(row[1])
-                    continue
             if isinstance(kmi, str):
                 try:
                     parsed = json.loads(kmi)
@@ -465,59 +454,7 @@ class MemoryConsolidator:
                     continue
             elif isinstance(kmi, list):
                 covered.update(str(x) for x in kmi)
-
-        if corrupt_ids:
-            await self._purge_ciphertext_episodes(corrupt_ids)
         return covered
-
-    def _is_ciphertext_derived(self, title: Any, summary: Any) -> bool:
-        """Whether an existing episode was synthesized from ciphertext."""
-        for field in (title, summary):
-            if isinstance(field, str) and self._looks_like_ciphertext_tokens(field):
-                return True
-        return False
-
-    @staticmethod
-    def _looks_like_ciphertext_tokens(text: str) -> bool:
-        """Detect an episode title/summary built from envelope tokens.
-
-        The synthesized text is not itself an envelope — it is
-        ``"Discussion of ksav2, <base64>, ..."`` — so the prefix check used on
-        raw rows does not apply. The envelope magic surviving as a *topic term*
-        is the signature, and it cannot occur in decrypted prose.
-        """
-        try:
-            from kestrel_sdk.security.aead import KSA_V2_PREFIX
-
-            magic = KSA_V2_PREFIX.decode().rstrip(":")
-        except Exception:  # noqa: BLE001
-            magic = "KSAv2"
-        return bool(re.search(rf"\b{re.escape(magic)}\b", text, flags=re.IGNORECASE))
-
-    async def _purge_ciphertext_episodes(self, episode_ids: List[str]) -> None:
-        """Delete episodes whose text was derived from ciphertext.
-
-        Deleted rather than excluded: the row's embedding was computed from
-        base64 too, so it has to be re-derived, not hidden. The source
-        messages then fall out of ``covered`` and the next consolidation
-        rebuilds the episode from plaintext.
-        """
-        logger.warning(
-            "purging %d ciphertext-derived episode(s) for agent %s so they "
-            "can be rebuilt from plaintext (#2850)",
-            len(episode_ids),
-            self.agent_id,
-        )
-        for episode_id in episode_ids:
-            try:
-                await self._db.execute(
-                    "DELETE FROM memory_episodes WHERE id = ? AND agent_id = ?",
-                    (episode_id, self.agent_id),
-                )
-            except Exception as e:  # noqa: BLE001 - never break consolidation
-                logger.warning(
-                    "could not purge ciphertext episode %s: %s", episode_id, e
-                )
 
     async def _all_messages_have_pending_salvage(
         self, messages: List[Dict[str, Any]]
