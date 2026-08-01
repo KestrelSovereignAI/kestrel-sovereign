@@ -74,12 +74,36 @@ GITHUB_APP_ID = "github-app-id:latest"
 GITHUB_APP_PRIVATE_KEY = "github-app-private-key:latest"
 GITHUB_APP_WEBHOOK_SECRET = "github-app-webhook-secret:latest"
 
-# Production Profile - Cloud Run (durable single-agent, always warm)
+# Production Profile - Cloud Run (durable single-agent, scales to zero)
 #
 # The container filesystem is disposable. Production restores one encrypted,
 # version-pinned identity bundle from Secret Manager and keeps coherent state
 # in PostgreSQL. The profile stays single-agent until per-agent custody and
 # database bindings exist for the multi-agent host.
+#
+# ``min_instances = 0``. Identity survives this, because custody is durable: a
+# cold start restores the same pinned bundle from Secret Manager and reads
+# coherent state from PostgreSQL. Verified on 2026-08-01 across three
+# independent cold starts that each came up on the same DID.
+#
+# What does NOT survive is scheduled work. ``SchedulerFeature`` polls
+# in-process, so while no container exists nothing fires. This deployment seeds
+# seven builtin schedules — ``wait_reconcile`` (every minute),
+# ``backup_snapshot`` (4h), ``trash_retention`` (6h), ``sleep``,
+# ``morning_signal``, ``signal_dispatch`` — whose ``next_run_at`` values pass
+# unhonoured while the service is idle. That is an accepted tradeoff for a
+# demo/testing deployment with no users; it is NOT evidence that scaling to
+# zero is free of consequences.
+#
+# An external wake ping does not rescue it: honouring a ``* * * * *`` schedule
+# needs a ping every minute, which keeps the container permanently warm and
+# removes the saving entirely. A deployment that needs its schedules kept must
+# set ``min_instances = 1``; one that scales to zero should disable the builtin
+# schedules so the table stops recording runs that will not happen.
+#
+# This is also the opposite of an ``ephemeral_demo`` profile, where scaling to
+# zero discards the identity and the SQLite state with it. Do not copy this
+# value into one of those.
 #
 # ``max_instances`` is capped at 1 to match the substrate that actually exists.
 # Durable custody *permits* horizontal scale — every instance restores the same
@@ -100,7 +124,7 @@ provider = "cloudrun"
 service_name = "kestrel-prod"
 region = "us-central1"
 persistence_mode = "durable_sovereign"
-min_instances = 1
+min_instances = 0
 max_instances = 1
 memory = "2Gi"
 cpu = 2

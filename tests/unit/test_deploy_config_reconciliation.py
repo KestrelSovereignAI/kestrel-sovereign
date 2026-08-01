@@ -311,13 +311,20 @@ def test_cloudrun_profiles_declare_honest_persistence(live_config):
 
 
 def test_prod_instance_cap_matches_provisioned_database(live_config):
-    """``prod`` must not advertise more instances than its database can serve.
+    """``prod``'s scaling numbers must match the substrate behind them.
 
     ``durable_sovereign`` *permits* horizontal scale, but permission is not
     capacity.  Each serving instance opens up to ``max_pool_size`` (10) pooled
     plus ``_advisory_max_pool_size`` (4) PostgreSQL connections, and the
     provisioned Cloud SQL instance is a ``db-f1-micro`` with a ~25 connection
     ceiling — so a second instance exhausts it.
+
+    The floor is the same argument read the other way: scaling to zero is safe
+    only because custody is durable.  A cold start restores the pinned bundle
+    from Secret Manager and reads coherent state from PostgreSQL, so it costs a
+    slower first request and nothing else.  Under ``ephemeral_demo`` the same
+    value would silently discard the identity, which is why the two are
+    asserted together rather than as independent numbers.
 
     This is deliberately a config assertion rather than a runtime check: the
     connection ceiling is a property of the provisioned database, which the
@@ -333,6 +340,10 @@ def test_prod_instance_cap_matches_provisioned_database(live_config):
     assert prod.max_instances == 1, (
         "prod max_instances was raised without raising the Cloud SQL tier; "
         "see the comment above [profiles.prod] in deploy_config.toml"
+    )
+    assert prod.min_instances == 0 and prod.is_durable_sovereign, (
+        "prod scales to zero, which is only safe under durable custody; if "
+        "the persistence mode changes, the floor must be revisited with it"
     )
 
     # Pin the per-instance connection cost the cap is derived from, so a change
