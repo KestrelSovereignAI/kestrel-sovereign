@@ -3501,11 +3501,17 @@ class PrivacyEnforcingStorage:
     async def governed_assertion_corpus_snapshot(self, **kwargs):
         """Expose the host corpus service through the normal privacy gate."""
         self._assert_semantic_assertion_read_allowed("governed learning corpus")
+        self._assert_semantic_assertion_write_allowed(
+            "governed learning corpus artifact registration"
+        )
         return await self._storage.governed_assertion_corpus_snapshot(**kwargs)
 
     async def governed_assertion_corpus_changes_since(self, snapshot, **kwargs):
         self._assert_semantic_assertion_incremental_read_allowed(
             "governed learning corpus"
+        )
+        self._assert_semantic_assertion_write_allowed(
+            "future corpus artifact registration"
         )
         return await self._storage.governed_assertion_corpus_changes_since(
             snapshot, **kwargs
@@ -3530,6 +3536,9 @@ class PrivacyEnforcingStorage:
 
     async def export_assertion_snapshot(self, query=None, **artifact_governance):
         self._assert_semantic_assertion_read_allowed("export")
+        self._assert_semantic_assertion_write_allowed(
+            "export artifact registration"
+        )
         return await self._storage.export_assertion_snapshot(
             query, **artifact_governance
         )

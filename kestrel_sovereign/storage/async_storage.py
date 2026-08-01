@@ -1874,6 +1874,16 @@ class AsyncStorage:
                 semantic_capabilities
             ),
         )
+        lineage_pairs = {
+            (example.assertion.assertion_id, example.assertion.revision_id)
+            for example in delta.additions
+        }
+        lineage_pairs.update(
+            (tombstone.assertion_id, tombstone.revision_id)
+            for tombstone in delta.tombstones
+            if tombstone.assertion_id is not None
+            and tombstone.revision_id is not None
+        )
         await self._register_produced_semantic_artifact(
             artifact_id=artifact_id,
             kind="future_corpus_candidate",
@@ -1883,10 +1893,7 @@ class AsyncStorage:
             checkpoint_generation=delta.checkpoint.generation,
             policy_pin=policy.digest,
             capability_versions=snapshot.capability_versions,
-            lineage=tuple(
-                (example.assertion.assertion_id, example.assertion.revision_id)
-                for example in delta.additions
-            ),
+            lineage=tuple(sorted(lineage_pairs)),
             retention_seconds=retention_seconds,
             artifact_digest=delta.snapshot_hash,
         )

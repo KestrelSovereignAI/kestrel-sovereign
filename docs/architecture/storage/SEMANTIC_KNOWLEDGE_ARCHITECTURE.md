@@ -1210,6 +1210,12 @@ and agent-bound semantic runtime they actually used. They require the
 destination identity and retention interval and complete registration before
 returning; there is no public free-form registration facade that can substitute
 caller-selected hashes.
+Incremental future-corpus artifacts bind the deduplicated exact lineage of both
+additions and non-opaque tombstones; tenant-wide erasure events with no
+assertion/revision identity remain deliberately opaque and add no invented
+lineage. The privacy facade treats producer registration as a durable semantic
+write as well as a read, so deidentified and anonymous modes reject it before
+any lifecycle row is persisted.
 
 Serving requires the artifact to remain active, unexpired, and generation
 fenced to the current tenant generation. A supersession, retraction,

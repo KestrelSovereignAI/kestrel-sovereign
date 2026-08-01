@@ -5784,6 +5784,21 @@ class AsyncAssertionStore:
                     "AND r.status = ? AND r.eligible = 1 AND e.eligible = 1",
                     (tenant_id, item.assertion_id, item.revision_id, AssertionStatus.ACTIVE.value),
                 )
+                if (
+                    row is None
+                    and registration.kind
+                    is GovernedArtifactKind.FUTURE_CORPUS_CANDIDATE
+                ):
+                    # Incremental artifacts must carry exact tombstone lineage
+                    # too. A retracted revision is no longer current/eligible,
+                    # but it must still be a real revision of this tenant and
+                    # assertion. Only the trusted future-corpus producer can
+                    # reach this private registration seam.
+                    row = await self._database.fetchone(
+                        "SELECT 1 FROM semantic_assertion_revisions "
+                        "WHERE tenant_id = ? AND assertion_id = ? AND revision_id = ?",
+                        (tenant_id, item.assertion_id, item.revision_id),
+                    )
                 if row is None:
                     raise GovernedArtifactError("artifact lineage is not a current eligible revision")
             now = _now()

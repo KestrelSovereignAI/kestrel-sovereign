@@ -28,10 +28,12 @@ from kestrel_sovereign.knowledge import (
     GovernedArtifactKind,
     GovernedArtifactLineage,
     GovernedArtifactRegistration,
+    GovernedCorpusPolicy,
     IRI,
     Literal,
     OntologyRef,
     SourceOccurrence,
+    Visibility,
     XSD_STRING,
 )
 from kestrel_sovereign.security.assertion_tenant_resolver import (
@@ -381,6 +383,118 @@ async def test_privacy_wrapper_blocks_artifact_persistence_and_serving_in_volati
     # Cleanup remains callable even in a volatile mode so a mode transition
     # cannot strand bytes written while persistence was allowed.
     assert await wrapper.sweep_expired_governed_semantic_artifacts() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [PrivacyMode.DEIDENTIFIED, PrivacyMode.ANONYMOUS])
+async def test_privacy_modes_reject_all_durable_artifact_producers_without_rows(
+    storage: AsyncStorage, mode: PrivacyMode
+) -> None:
+    wrapper = PrivacyEnforcingStorage(storage, mode)
+    governance = {
+        "artifact_id": str(uuid4()),
+        "consumer_id": "privacy-test",
+        "consumer_key_id": "privacy-key",
+        "consumer_public_key": "0" * 64,
+        "retention_seconds": 60,
+    }
+    with pytest.raises(PrivacyViolationError):
+        await wrapper.export_assertion_snapshot(**governance)
+    with pytest.raises(PrivacyViolationError):
+        await wrapper.governed_assertion_corpus_snapshot(
+            policy=None, inference_profile=None, **governance
+        )
+    with pytest.raises(PrivacyViolationError):
+        await wrapper.governed_assertion_corpus_changes_since(
+            object(), policy=None, inference_profile=None, **governance
+        )
+    for table in (
+        "semantic_governed_artifacts",
+        "semantic_governed_artifact_lineage",
+        "semantic_governed_artifact_consumers",
+        "semantic_governed_artifact_revocations",
+        "semantic_governed_artifact_receipts",
+    ):
+        assert await storage.db.fetchval(
+            f"SELECT COUNT(*) FROM {table} WHERE tenant_id = ?",
+            (storage.agent_id,),
+        ) == 0
+
+
+@pytest.mark.asyncio
+async def test_tombstone_delta_is_revoked_and_physically_deleted_after_erasure(
+    storage: AsyncStorage,
+) -> None:
+    private_key = Ed25519PrivateKey.generate()
+    assertion = _assertion(storage.agent_id, "future-delta-tombstone-revision")
+    await storage.put_assertion(assertion, source_occurrences=(_source(),))
+    await storage.run_semantic_maintenance(None)
+    capabilities = await storage.semantic_maintenance_capability_versions(None)
+    policy = GovernedCorpusPolicy(
+        policy_id="future-delta-erasure",
+        policy_version="1",
+        accepted_epistemic_states=(EpistemicState.REPORTED,),
+        accepted_visibility=(Visibility.PRIVATE,),
+        accepted_privacy_classifications=("normal",),
+        accepted_consent_references=("policy:private-v1",),
+        accepted_grounding_classes=("test",),
+        accepted_source_kinds=("conversation",),
+        accepted_ontology_pins=(assertion.ontology_version,),
+        accepted_semantic_capability_versions=tuple(capabilities.items()),
+    )
+    producer = {
+        "consumer_id": "parametric-self-test",
+        "consumer_key_id": "parametric-self-key-v1",
+        "consumer_public_key": _public_key(private_key),
+        "retention_seconds": 300,
+    }
+    snapshot = await storage.governed_assertion_corpus_snapshot(
+        policy=policy,
+        inference_profile=None,
+        artifact_id=str(uuid4()),
+        **producer,
+    )
+    retraction = await storage.retract_assertion(
+        assertion.assertion_id, assertion.revision_id
+    )
+    tombstone_revision_id = retraction.retracted[0].revision_id
+    await storage.run_semantic_maintenance(None)
+    delta_artifact_id = str(uuid4())
+    delta = await storage.governed_assertion_corpus_changes_since(
+        snapshot,
+        policy=policy,
+        inference_profile=None,
+        artifact_id=delta_artifact_id,
+        **producer,
+    )
+    assert any(
+        item.assertion_id == assertion.assertion_id
+        and item.revision_id == tombstone_revision_id
+        for item in delta.tombstones
+    )
+    assert await storage.db.fetchall(
+        "SELECT assertion_id, revision_id FROM semantic_governed_artifact_lineage "
+        "WHERE tenant_id = ? AND artifact_id = ?",
+        (storage.agent_id, delta_artifact_id),
+    ) == [(assertion.assertion_id, tombstone_revision_id)]
+    delivered = await storage.consume_governed_semantic_artifact(
+        delta_artifact_id, expected_generation=delta.checkpoint.generation
+    )
+    await storage.erase_assertion(assertion.assertion_id)
+    deleted: list[str] = []
+    owner = _owner(private_key, deleted)
+    while True:
+        receipt = await storage.process_governed_semantic_artifact_revocation(
+            _authentication(private_key, storage.agent_id), owner
+        )
+        if receipt is None:
+            break
+    assert delivered.artifact_key in deleted
+    assert await storage.db.fetchval(
+        "SELECT COUNT(*) FROM semantic_governed_artifact_revocations "
+        "WHERE tenant_id = ? AND acknowledged_at IS NULL",
+        (storage.agent_id,),
+    ) == 0
 
 
 @pytest.mark.asyncio
