@@ -52,6 +52,14 @@ from .async_assertion_store import (
     ValidationQuarantineResult,
 )
 from .async_rag_store import AsyncRAGStore
+from .semantic_vector_projection import (
+    SemanticAssertionVectorProjection,
+    SemanticVectorCandidate,
+    SemanticVectorCheckpoint,
+    SemanticVectorErasureObservation,
+    SemanticVectorProfile,
+    SemanticVectorProjectionError,
+)
 from .semantic_validation import (
     AsyncSemanticValidationReportStore,
     GovernedAssertionWriteResult,
@@ -119,6 +127,12 @@ __all__ = [
     "AsyncGraphStore",
     "AsyncAssertionStore",
     "AsyncRAGStore",
+    "SemanticAssertionVectorProjection",
+    "SemanticVectorCandidate",
+    "SemanticVectorCheckpoint",
+    "SemanticVectorErasureObservation",
+    "SemanticVectorProfile",
+    "SemanticVectorProjectionError",
     "AsyncSemanticValidationReportStore",
     "AgentResourceStore",
     "AgentResourceVersion",

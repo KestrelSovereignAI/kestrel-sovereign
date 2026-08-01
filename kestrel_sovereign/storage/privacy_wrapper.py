@@ -3288,6 +3288,12 @@ class PrivacyEnforcingStorage:
             maintenance_limits=maintenance_limits,
         )
 
+    def semantic_assertion_vector_projection(self, profile, embedder):
+        """Expose the derived projection only through the normal privacy rail."""
+        self._assert_semantic_assertion_read_allowed("semantic vector projection")
+        self._assert_semantic_assertion_write_allowed("semantic vector projection")
+        return self._storage.semantic_assertion_vector_projection(profile, embedder)
+
     async def hydrate_semantic_recall_candidates(self, assertion_ids, **kwargs):
         self._assert_semantic_assertion_read_allowed("semantic recall provenance")
         return await self._storage.hydrate_semantic_recall_candidates(assertion_ids, **kwargs)
