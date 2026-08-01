@@ -28,9 +28,11 @@ from __future__ import annotations
 import json
 import hashlib
 import logging
+import os
 import struct
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 from ..async_assertion_store import (
     _erasure_receipt_key,
@@ -46,6 +48,7 @@ logger = logging.getLogger(__name__)
 
 _SEMANTIC_ASSERTION_SCHEMA_VERSION = "semantic_assertion_store_v5"
 _SEMANTIC_VECTOR_PROJECTION_SCHEMA_VERSION = "semantic_assertion_vector_projection_v2"
+_SEMANTIC_GOVERNED_ARTIFACT_SCHEMA_VERSION = "semantic_governed_artifact_lifecycle_v2_authenticated"
 _SEMANTIC_VALIDATION_SCHEMA_VERSION = "semantic_validation_reports_v2_revision_links"
 _SEMANTIC_MAINTENANCE_SCHEMA_VERSION = "semantic_maintenance_v1"
 _SEMANTIC_MAINTENANCE_CURSOR_SCHEMA_VERSION = "semantic_maintenance_v2_cursor"
@@ -603,6 +606,253 @@ async def migrate_semantic_vector_projection(db: "AsyncDatabase") -> None:
         await db.execute(
             "INSERT INTO semantic_schema_migrations (version) VALUES (?)",
             (_SEMANTIC_VECTOR_PROJECTION_SCHEMA_VERSION,),
+        )
+
+
+async def migrate_semantic_governed_artifacts(db: "AsyncDatabase") -> None:
+    """Create the tenant-bound export/corpus artifact lifecycle registry."""
+    statements = (
+        """CREATE TABLE IF NOT EXISTS semantic_governed_artifacts (
+            tenant_id TEXT NOT NULL,
+            artifact_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            consumer_id TEXT NOT NULL,
+            consumer_key_id TEXT NOT NULL,
+            consumer_public_key TEXT NOT NULL,
+            checkpoint_generation INTEGER NOT NULL,
+            policy_pin TEXT NOT NULL,
+            capability_digest TEXT NOT NULL,
+            artifact_digest TEXT,
+            retention_expires_at TEXT NOT NULL,
+            state TEXT NOT NULL,
+            invalidated_generation INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, artifact_id),
+            CHECK (kind IN ('export_snapshot', 'corpus_manifest', 'future_corpus_candidate')),
+            CHECK (state IN ('active', 'revocation_pending', 'revoked', 'expired')),
+            CHECK (checkpoint_generation >= 0),
+            CHECK (invalidated_generation IS NULL OR invalidated_generation >= 0)
+        )""",
+        """CREATE TABLE IF NOT EXISTS semantic_governed_artifact_lineage (
+            tenant_id TEXT NOT NULL,
+            artifact_id TEXT NOT NULL,
+            assertion_id TEXT NOT NULL,
+            revision_id TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, artifact_id, assertion_id, revision_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS semantic_governed_artifact_revocations (
+            tenant_id TEXT NOT NULL,
+            revocation_id TEXT NOT NULL,
+            artifact_key TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            consumer_id TEXT NOT NULL,
+            consumer_key_id TEXT NOT NULL,
+            consumer_public_key TEXT NOT NULL,
+            artifact_digest TEXT,
+            attempt INTEGER NOT NULL DEFAULT 0,
+            lease_token TEXT,
+            lease_expires_at TEXT,
+            acknowledged_at TEXT,
+            deletion_proof_digest TEXT,
+            invalidated_generation INTEGER NOT NULL,
+            PRIMARY KEY (tenant_id, revocation_id),
+            CHECK (attempt >= 0),
+            CHECK (kind IN ('export_snapshot', 'corpus_manifest', 'future_corpus_candidate')),
+            CHECK (invalidated_generation >= 0)
+        )""",
+        """CREATE TABLE IF NOT EXISTS semantic_governed_artifact_receipts (
+            receipt_id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            artifact_key TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            state TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            receipt_digest TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            CHECK (kind IN ('export_snapshot', 'corpus_manifest', 'future_corpus_candidate')),
+            CHECK (state IN ('active', 'revocation_pending', 'revoked', 'expired')),
+            CHECK (generation >= 0)
+        )""",
+        """CREATE TABLE IF NOT EXISTS semantic_governed_artifact_auth_nonces (
+            tenant_id TEXT NOT NULL,
+            consumer_id TEXT NOT NULL,
+            nonce TEXT NOT NULL,
+            used_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, consumer_id, nonce)
+        )""",
+        """CREATE TABLE IF NOT EXISTS semantic_governed_artifact_consumers (
+            tenant_id TEXT NOT NULL,
+            consumer_id TEXT NOT NULL,
+            consumer_key_id TEXT NOT NULL,
+            consumer_public_key TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, consumer_id, consumer_key_id)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_semantic_governed_artifact_lineage ON semantic_governed_artifact_lineage(tenant_id, assertion_id, revision_id)",
+        "CREATE INDEX IF NOT EXISTS idx_semantic_governed_artifact_state ON semantic_governed_artifacts(tenant_id, state, kind)",
+    )
+    async with _semantic_validation_migration_transaction(db):
+        if db.backend_type == "postgres":
+            await db.execute("SELECT pg_advisory_xact_lock(?)", (_semantic_assertion_lock_id(),))
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS semantic_schema_migrations "
+            "(version TEXT PRIMARY KEY)",
+            (),
+        )
+        existing = await db.fetchone(
+            "SELECT 1 FROM semantic_schema_migrations WHERE version = ?",
+            (_SEMANTIC_GOVERNED_ARTIFACT_SCHEMA_VERSION,),
+        )
+        if existing is not None:
+            return
+        legacy_v1 = await db.fetchone(
+            "SELECT 1 FROM semantic_schema_migrations WHERE version = ?",
+            ("semantic_governed_artifact_lifecycle_v1",),
+        )
+        for statement in statements:
+            await db.execute(statement, ())
+        # Pre-merge development databases may contain the original v1 tables.
+        # Upgrade them additively instead of trusting CREATE TABLE IF NOT
+        # EXISTS to change an existing definition.
+        required_columns = {
+            "semantic_governed_artifacts": (
+                ("consumer_key_id", "TEXT"),
+                ("consumer_public_key", "TEXT"),
+            ),
+            "semantic_governed_artifact_revocations": (
+                ("consumer_key_id", "TEXT"),
+                ("consumer_public_key", "TEXT"),
+                ("artifact_digest", "TEXT"),
+            ),
+        }
+        for table_name, columns in required_columns.items():
+            if db.backend_type == "postgres":
+                existing_columns = {
+                    str(row[0])
+                    for row in await db.fetchall(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() AND table_name = ?",
+                        (table_name,),
+                    )
+                }
+            else:
+                existing_columns = {
+                    str(row[0])
+                    for row in await db.fetchall(
+                        f"SELECT name FROM pragma_table_info('{table_name}')", ()
+                    )
+                }
+            for column_name, column_type in columns:
+                if column_name not in existing_columns:
+                    await db.execute(
+                        f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}",
+                        (),
+                    )
+        # V1 did not authenticate consumers.  Never bless its active or pending
+        # rows with invented credentials: quarantine them under an explicit
+        # operator-owned migration key, remove all raw artifact/lineage IDs,
+        # and make the resulting physical-deletion work actually claimable.
+        if legacy_v1 is not None:
+            active_rows = await db.fetchall(
+                "SELECT tenant_id, artifact_id, kind, checkpoint_generation, artifact_digest "
+                "FROM semantic_governed_artifacts",
+                (),
+            )
+            pending_rows = await db.fetchall(
+                "SELECT tenant_id, revocation_id, artifact_key, artifact_digest "
+                "FROM semantic_governed_artifact_revocations WHERE acknowledged_at IS NULL",
+                (),
+            )
+            if active_rows or pending_rows:
+                migration_public_key = os.getenv(
+                    "KESTREL_LEGACY_ARTIFACT_MIGRATION_PUBLIC_KEY", ""
+                )
+                if (
+                    len(migration_public_key) != 64
+                    or any(c not in "0123456789abcdef" for c in migration_public_key)
+                ):
+                    raise RuntimeError(
+                        "legacy governed artifacts require an explicit "
+                        "KESTREL_LEGACY_ARTIFACT_MIGRATION_PUBLIC_KEY Ed25519 key"
+                    )
+                migration_consumer = "kestrel-artifact-migration"
+                migration_key_id = "legacy-quarantine-v1"
+                tenants = {str(row[0]) for row in (*active_rows, *pending_rows)}
+                for tenant_id in tenants:
+                    await db.execute(
+                        "INSERT INTO semantic_governed_artifact_consumers "
+                        "(tenant_id, consumer_id, consumer_key_id, consumer_public_key, created_at) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (
+                            tenant_id,
+                            migration_consumer,
+                            migration_key_id,
+                            migration_public_key,
+                            _now(),
+                        ),
+                    )
+                for tenant_id, artifact_id, kind, generation, artifact_digest in active_rows:
+                    artifact_key = hashlib.sha256(
+                        json.dumps(
+                            {
+                                "namespace": "semantic-artifact-key-v1",
+                                "artifact_id": str(artifact_id),
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    quarantine_digest = artifact_digest or hashlib.sha256(
+                        f"legacy-unknown-artifact:{artifact_key}".encode("utf-8")
+                    ).hexdigest()
+                    await db.execute(
+                        "INSERT INTO semantic_governed_artifact_revocations "
+                        "(tenant_id, revocation_id, artifact_key, kind, consumer_id, "
+                        "consumer_key_id, consumer_public_key, artifact_digest, attempt, "
+                        "invalidated_generation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+                        (
+                            str(tenant_id),
+                            str(uuid4()),
+                            artifact_key,
+                            str(kind),
+                            migration_consumer,
+                            migration_key_id,
+                            migration_public_key,
+                            quarantine_digest,
+                            int(generation),
+                        ),
+                    )
+                for tenant_id, _revocation_id, artifact_key, artifact_digest in pending_rows:
+                    quarantine_digest = artifact_digest or hashlib.sha256(
+                        f"legacy-unknown-artifact:{artifact_key}".encode("utf-8")
+                    ).hexdigest()
+                    await db.execute(
+                        "UPDATE semantic_governed_artifact_revocations SET consumer_id = ?, "
+                        "consumer_key_id = ?, consumer_public_key = ?, artifact_digest = ?, "
+                        "attempt = 0, lease_token = NULL, lease_expires_at = NULL "
+                        "WHERE tenant_id = ? AND revocation_id = ?",
+                        (
+                            migration_consumer,
+                            migration_key_id,
+                            migration_public_key,
+                            quarantine_digest,
+                            str(tenant_id),
+                            str(_revocation_id),
+                        ),
+                    )
+                await db.execute("DELETE FROM semantic_governed_artifact_lineage", ())
+                await db.execute("DELETE FROM semantic_governed_artifacts", ())
+                await db.execute(
+                    "UPDATE semantic_governed_artifact_revocations SET "
+                    "consumer_key_id = '', consumer_public_key = '', artifact_digest = NULL, "
+                    "lease_token = NULL, lease_expires_at = NULL "
+                    "WHERE acknowledged_at IS NOT NULL",
+                    (),
+                )
+        await db.execute(
+            "INSERT INTO semantic_schema_migrations (version) VALUES (?)",
+            (_SEMANTIC_GOVERNED_ARTIFACT_SCHEMA_VERSION,),
         )
 
 

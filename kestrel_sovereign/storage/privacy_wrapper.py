@@ -1488,6 +1488,12 @@ class PrivacyEnforcingStorage:
         self._explicit_fact_lease_lock = threading.RLock()
         self._active_explicit_fact_leases = 0
         self._active_semantic_vector_leases = 0
+        # A governed artifact producer reads canonical assertions and then
+        # creates a durable, externally-consumable representation.  It needs
+        # the same synchronous linearization point as explicit facts: a
+        # privacy transition must not land between the facade's policy check
+        # and the producer returning its registered artifact.
+        self._active_semantic_artifact_producer_leases = 0
 
         # Explicit semantic teaching is intentionally captured per wrapper.
         # There is no module-level adapter that accepts caller-supplied storage
@@ -2093,6 +2099,24 @@ class PrivacyEnforcingStorage:
             if self._active_semantic_vector_leases <= 0:
                 raise RuntimeError("semantic vector privacy lease underflow")
             self._active_semantic_vector_leases -= 1
+
+    def _acquire_semantic_artifact_producer_lease(self) -> None:
+        """Fence a governed artifact producer before its policy checks.
+
+        The lease deliberately precedes both the read and durable-write
+        policy checks at the public facade.  Once acquired, a concurrent mode
+        transition is refused until the producer has either returned or
+        unwound through cancellation.
+        """
+        with self._explicit_fact_lease_lock:
+            self._active_semantic_artifact_producer_leases += 1
+
+    def _release_semantic_artifact_producer_lease(self) -> None:
+        """Release one governed producer lease, including cancellation paths."""
+        with self._explicit_fact_lease_lock:
+            if self._active_semantic_artifact_producer_leases <= 0:
+                raise RuntimeError("semantic artifact producer privacy lease underflow")
+            self._active_semantic_artifact_producer_leases -= 1
     
     def set_privacy_mode(self, mode: Union[PrivacyMode, PrivacyConfig, str]) -> None:
         """
@@ -2116,11 +2140,13 @@ class PrivacyEnforcingStorage:
                 and (
                     self._active_explicit_fact_leases > 0
                     or self._active_semantic_vector_leases > 0
+                    or self._active_semantic_artifact_producer_leases > 0
                 )
             ):
                 raise PrivacyViolationError(
                     "privacy configuration transition refused while an "
-                    "explicit semantic fact or vector operation is in flight; retry "
+                    "explicit semantic fact, vector operation, or governed artifact "
+                    "producer is in flight; retry "
                     "the transition after that operation completes"
                 )
             was_ephemeral = old_config.is_ephemeral()
@@ -3251,6 +3277,52 @@ class PrivacyEnforcingStorage:
             operation_id=operation_id,
         )
 
+    async def consume_governed_semantic_artifact(
+        self, artifact_id, *, expected_generation: int,
+    ):
+        self._assert_semantic_assertion_read_allowed("governed artifact consumption")
+        return await self._storage.consume_governed_semantic_artifact(
+            artifact_id, expected_generation=expected_generation
+        )
+
+    async def claim_governed_semantic_artifact_revocation(
+        self, authentication, *, lease_seconds: float = 60.0,
+    ):
+        # Privacy modes never block cleanup of bytes written in an earlier
+        # durable mode. Consumer authentication remains mandatory in storage.
+        return await self._storage.claim_governed_semantic_artifact_revocation(
+            authentication, lease_seconds=lease_seconds
+        )
+
+    async def acknowledge_governed_semantic_artifact_revocation(
+        self, lease, proof,
+    ):
+        return await self._storage.acknowledge_governed_semantic_artifact_revocation(
+            lease, proof
+        )
+
+    async def process_governed_semantic_artifact_revocation(
+        self, authentication, owner, *, lease_seconds: float = 60.0,
+    ):
+        return await self._storage.process_governed_semantic_artifact_revocation(
+            authentication, owner, lease_seconds=lease_seconds
+        )
+
+    async def sweep_expired_governed_semantic_artifacts(self, *, limit: int = 100):
+        # Retention cleanup is always permitted; it can only remove active
+        # controlled artifacts and create authenticated deletion work.
+        return await self._storage.sweep_expired_governed_semantic_artifacts(
+            limit=limit
+        )
+
+    async def governed_semantic_artifact_erasure_observation(
+        self, *, expected_generation: int,
+    ):
+        self._assert_semantic_assertion_read_allowed("governed artifact observations")
+        return await self._storage.governed_semantic_artifact_erasure_observation(
+            expected_generation=expected_generation
+        )
+
     def _assert_semantic_assertion_read_allowed(self, operation: str) -> None:
         """Keep volatile sessions from observing durable semantic knowledge.
 
@@ -3454,16 +3526,30 @@ class PrivacyEnforcingStorage:
 
     async def governed_assertion_corpus_snapshot(self, **kwargs):
         """Expose the host corpus service through the normal privacy gate."""
-        self._assert_semantic_assertion_read_allowed("governed learning corpus")
-        return await self._storage.governed_assertion_corpus_snapshot(**kwargs)
+        self._acquire_semantic_artifact_producer_lease()
+        try:
+            self._assert_semantic_assertion_read_allowed("governed learning corpus")
+            self._assert_semantic_assertion_write_allowed(
+                "governed learning corpus artifact registration"
+            )
+            return await self._storage.governed_assertion_corpus_snapshot(**kwargs)
+        finally:
+            self._release_semantic_artifact_producer_lease()
 
     async def governed_assertion_corpus_changes_since(self, snapshot, **kwargs):
-        self._assert_semantic_assertion_incremental_read_allowed(
-            "governed learning corpus"
-        )
-        return await self._storage.governed_assertion_corpus_changes_since(
-            snapshot, **kwargs
-        )
+        self._acquire_semantic_artifact_producer_lease()
+        try:
+            self._assert_semantic_assertion_incremental_read_allowed(
+                "governed learning corpus"
+            )
+            self._assert_semantic_assertion_write_allowed(
+                "future corpus artifact registration"
+            )
+            return await self._storage.governed_assertion_corpus_changes_since(
+                snapshot, **kwargs
+            )
+        finally:
+            self._release_semantic_artifact_producer_lease()
 
     async def repair_semantic_maintenance(
         self,
@@ -3482,9 +3568,18 @@ class PrivacyEnforcingStorage:
             semantic_capabilities=semantic_capabilities,
         )
 
-    async def export_assertion_snapshot(self, query=None):
-        self._assert_semantic_assertion_read_allowed("export")
-        return await self._storage.export_assertion_snapshot(query)
+    async def export_assertion_snapshot(self, query=None, **artifact_governance):
+        self._acquire_semantic_artifact_producer_lease()
+        try:
+            self._assert_semantic_assertion_read_allowed("export")
+            self._assert_semantic_assertion_write_allowed(
+                "export artifact registration"
+            )
+            return await self._storage.export_assertion_snapshot(
+                query, **artifact_governance
+            )
+        finally:
+            self._release_semantic_artifact_producer_lease()
 
     # === Private Agent Identity Resources (privacy-governed durable writes) ===
     #

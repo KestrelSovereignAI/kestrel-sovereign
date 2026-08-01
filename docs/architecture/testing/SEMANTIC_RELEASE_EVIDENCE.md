@@ -281,6 +281,15 @@ drill is rejected. The stages cover active assertions, derivations, vector
 index, recall candidates, exports, governed/future corpus output, projection
 candidates, and served eligibility.
 
+The `export_snapshots`, `governed_corpus`, and `future_corpus` stage records
+must be backed by the tenant-scoped governed artifact lifecycle: an exact
+checkpoint-fenced registration, a content-free aggregate observation, and—on
+erasure—a verifier-accepted, consumer-signed physical-deletion proof produced
+by the registered owner's deletion callback. The retained receipt carries only
+the content-free proof digest.
+A fresh empty export, Story Archive timeline export, or unrelated corpus is not
+evidence that a previously registered consumer artifact was deleted.
+
 `kestrel-feature-parametric-self` is an external optional consumer, not a
 dependency imported by this repository. Its report is absent from a new
 template and therefore remains a readiness blocker until it contains all of:

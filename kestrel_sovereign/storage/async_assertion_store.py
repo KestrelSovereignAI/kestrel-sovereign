@@ -12,7 +12,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import time
@@ -20,6 +20,9 @@ import re
 from collections.abc import Awaitable, Callable
 from typing import Iterable, Mapping, Sequence
 from uuid import uuid4
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from kestrel_sovereign.knowledge import (
     Assertion,
@@ -34,6 +37,18 @@ from kestrel_sovereign.knowledge import (
 from kestrel_sovereign.knowledge.shacl_validation import (
     ShaclValidationReport,
     ValidationWriteAction,
+)
+from kestrel_sovereign.knowledge.artifact_lifecycle import (
+    GovernedArtifactConsumerAuthentication,
+    GovernedArtifactDeletionOwner,
+    GovernedArtifactDeletionProof,
+    GovernedArtifactErasureObservation,
+    GovernedArtifactError,
+    GovernedArtifactKind,
+    GovernedArtifactReceipt,
+    GovernedArtifactRegistration,
+    GovernedArtifactRevocationLease,
+    GovernedArtifactState,
 )
 
 from .async_database import AsyncDatabase
@@ -50,6 +65,7 @@ _LEGACY_ERASED_EXPLICIT_FACT_OPERATION = "legacy_erased_explicit_fact"
 _EXPLICIT_FACT_SAVE_OPERATION_PREFIX = "memory-agency-save-fact-v1:save:"
 _EXPLICIT_FACT_FORGET_OPERATION_PREFIX = "memory-agency-save-fact-v1:forget:"
 _ERASURE_MAINTENANCE_LEASE_HOLDER = "physical-erasure"
+_GOVERNED_ARTIFACT_AUTH_WINDOW_SECONDS = 300
 
 
 @dataclass(frozen=True, slots=True)
@@ -711,16 +727,24 @@ class AsyncAssertionStore:
 
     __slots__ = (
         "__scope",
+        "_artifact_clock",
         "_erasure_jobs",
         "_semantic_recall_derivative_revoker",
     )
 
-    def __init__(self, scope: _AssertionStoreScope, /) -> None:
+    def __init__(
+        self,
+        scope: _AssertionStoreScope,
+        /,
+        *,
+        artifact_clock: Callable[[], datetime] | None = None,
+    ) -> None:
         if type(scope) is not _AssertionStoreScope:
             raise TypeError(
                 "AsyncAssertionStore is created only by an agent-bound AsyncStorage facade"
             )
         self.__scope = scope
+        self._artifact_clock = artifact_clock or (lambda: datetime.now(timezone.utc))
         # Physical-erasure targets are intentionally process-local.  A retry
         # in this short window can receive the original deterministic result,
         # while a durable receipt after restart proves only that the erasure
@@ -998,7 +1022,7 @@ class AsyncAssertionStore:
                 await self._lock_tenant()
                 yield
         except TransactionError as error:
-            if isinstance(error.__cause__, AssertionStoreError):
+            if isinstance(error.__cause__, (AssertionStoreError, GovernedArtifactError)):
                 raise error.__cause__ from error
             raise
 
@@ -1467,6 +1491,14 @@ class AsyncAssertionStore:
             (event_id, tenant_id, assertion.assertion_id, assertion.revision_id,
              operation, generation, 1 if eligible else 0, _now()),
         )
+        if not eligible:
+            # A lifecycle transition cannot leave a registered export or
+            # corpus candidate serving the predecessor assertion.  The helper
+            # runs in this same canonical mutation, removes lineage before
+            # commit, and creates opaque consumer revocation work.
+            await self._revoke_governed_artifacts_for_lineage(
+                assertion_ids=(assertion.assertion_id,), generation=generation,
+            )
         return event_id
 
     async def _erasure_event(self, generation: int) -> str:
@@ -5221,6 +5253,11 @@ class AsyncAssertionStore:
             # The surrounding mutation keeps the generation, tombstones,
             # physical deletes, and opaque erasure event atomic.
             generation = await self._advance_generation()
+            await self._revoke_governed_artifacts_for_lineage(
+                assertion_ids=assertion_tuple,
+                revision_ids=revision_tuple,
+                generation=generation,
+            )
             await self._tombstone_and_delete_operations_referencing(
                 assertion_ids,
                 revision_ids,
@@ -5585,6 +5622,522 @@ class AsyncAssertionStore:
             return checkpoint, tuple(await self.query(query))
         return checkpoint, await self._complete_active_assertions()
 
+    @staticmethod
+    def _artifact_key(artifact_id: str) -> str:
+        """Blind a random artifact handle before putting it in durable receipts."""
+        return _operation_digest({"namespace": "semantic-artifact-key-v1", "artifact_id": artifact_id})
+
+    @staticmethod
+    def _artifact_receipt_digest(
+        artifact_key: str,
+        kind: GovernedArtifactKind,
+        state: GovernedArtifactState,
+        generation: int,
+    ) -> str:
+        return _operation_digest({
+            "namespace": "semantic-artifact-receipt-v1", "artifact_key": artifact_key,
+            "kind": kind.value, "state": state.value, "generation": generation,
+        })
+
+    async def _record_artifact_receipt(
+        self,
+        *,
+        artifact_key: str,
+        kind: GovernedArtifactKind,
+        state: GovernedArtifactState,
+        generation: int,
+    ) -> GovernedArtifactReceipt:
+        """Append a content-free receipt; never persist artifact/lineage IDs here."""
+        tenant_id, _ = self._require_scope()
+        digest = self._artifact_receipt_digest(artifact_key, kind, state, generation)
+        await self._database.execute(
+            "INSERT INTO semantic_governed_artifact_receipts "
+            "(receipt_id, tenant_id, artifact_key, kind, state, generation, receipt_digest, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (uuid4().hex, tenant_id, artifact_key, kind.value, state.value, generation, digest, _now()),
+        )
+        return GovernedArtifactReceipt(artifact_key, kind, state, generation, digest)
+
+    async def _revoke_governed_artifacts_for_lineage(
+        self,
+        *,
+        artifact_ids: Sequence[str] = (),
+        assertion_ids: Sequence[str] = (),
+        revision_ids: Sequence[str] = (),
+        generation: int,
+    ) -> int:
+        """Atomically remove targeted/dependent artifacts and start opaque revocation.
+
+        This helper runs under the canonical tenant mutation.  It deliberately
+        deletes the artifact row (including its caller-facing handle and digest)
+        before the lifecycle mutation commits.  The durable retry work retains
+        only a blinded key and a fresh revocation ID, so an erased assertion can
+        never be recovered through the artifact registry after restart. Exact
+        artifact IDs are selected directly so legitimate zero-lineage exports
+        remain cleanup-capable; assertion/revision targets use lineage EXISTS
+        predicates and cannot widen an exact artifact expiry.
+        """
+        if not artifact_ids and not assertion_ids and not revision_ids:
+            return 0
+        tenant_id, _ = self._require_scope()
+        clauses: list[str] = []
+        params: list[object] = [tenant_id]
+        if artifact_ids:
+            clauses.append(f"a.artifact_id IN ({_placeholders(tuple(artifact_ids))})")
+            params.extend(artifact_ids)
+        if assertion_ids:
+            clauses.append(
+                "EXISTS (SELECT 1 FROM semantic_governed_artifact_lineage l "
+                "WHERE l.tenant_id = a.tenant_id AND l.artifact_id = a.artifact_id "
+                f"AND l.assertion_id IN ({_placeholders(tuple(assertion_ids))}))"
+            )
+            params.extend(assertion_ids)
+        if revision_ids:
+            clauses.append(
+                "EXISTS (SELECT 1 FROM semantic_governed_artifact_lineage l "
+                "WHERE l.tenant_id = a.tenant_id AND l.artifact_id = a.artifact_id "
+                f"AND l.revision_id IN ({_placeholders(tuple(revision_ids))}))"
+            )
+            params.extend(revision_ids)
+        rows = await self._database.fetchall(
+            "SELECT DISTINCT a.artifact_id, a.kind, a.consumer_id, a.consumer_key_id, "
+            "a.consumer_public_key, a.artifact_digest "
+            "FROM semantic_governed_artifacts a "
+            "WHERE a.tenant_id = ? AND a.state = ? AND (" + " OR ".join(clauses) + ")",
+            tuple(params[:1] + [GovernedArtifactState.ACTIVE.value] + params[1:]),
+        )
+        for artifact_id, raw_kind, consumer_id, consumer_key_id, consumer_public_key, artifact_digest in rows:
+            artifact_id = str(artifact_id)
+            kind = GovernedArtifactKind(str(raw_kind))
+            artifact_key = self._artifact_key(artifact_id)
+            revocation_id = str(uuid4())
+            await self._database.execute(
+                "INSERT INTO semantic_governed_artifact_revocations "
+                "(tenant_id, revocation_id, artifact_key, kind, consumer_id, consumer_key_id, "
+                "consumer_public_key, artifact_digest, attempt, invalidated_generation) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+                (tenant_id, revocation_id, artifact_key, kind.value, str(consumer_id),
+                 str(consumer_key_id), str(consumer_public_key), str(artifact_digest), generation),
+            )
+            await self._database.execute(
+                "DELETE FROM semantic_governed_artifact_lineage WHERE tenant_id = ? AND artifact_id = ?",
+                (tenant_id, artifact_id),
+            )
+            await self._database.execute(
+                "DELETE FROM semantic_governed_artifacts WHERE tenant_id = ? AND artifact_id = ?",
+                (tenant_id, artifact_id),
+            )
+            await self._record_artifact_receipt(
+                artifact_key=artifact_key, kind=kind,
+                state=GovernedArtifactState.REVOCATION_PENDING, generation=generation,
+            )
+        return len(rows)
+
+    async def register_governed_artifact(
+        self, registration: GovernedArtifactRegistration,
+    ) -> GovernedArtifactReceipt:
+        """Register a controlled export/corpus artifact before it can be served.
+
+        Registration is a tenant-serialized compare-and-validate operation:
+        every exact assertion/revision pair must still be current, active, and
+        projection-eligible at the stated checkpoint.  A caller cannot create
+        an export from a stale in-memory snapshot then register it later.
+        """
+        if not isinstance(registration, GovernedArtifactRegistration):
+            raise AssertionStoreError("registration must be GovernedArtifactRegistration")
+        if registration.tenant_id != self.tenant_id:
+            raise TenantIsolationError("artifact registration tenant does not match bound store")
+        if datetime.fromisoformat(registration.retention_expires_at.replace("Z", "+00:00")) <= datetime.now(timezone.utc):
+            raise GovernedArtifactError("artifact retention expiry must be in the future")
+        async with self._mutation():
+            tenant_id, _ = self._require_scope()
+            existing = await self._database.fetchone(
+                "SELECT kind, checkpoint_generation, policy_pin, capability_digest, artifact_digest, retention_expires_at "
+                "FROM semantic_governed_artifacts WHERE tenant_id = ? AND artifact_id = ?",
+                (tenant_id, registration.artifact_id),
+            )
+            artifact_key = self._artifact_key(registration.artifact_id)
+            if existing is not None:
+                raise GovernedArtifactError("artifact_id was already registered and cannot be resurrected")
+            revoked = await self._database.fetchone(
+                "SELECT 1 FROM semantic_governed_artifact_revocations "
+                "WHERE tenant_id = ? AND artifact_key = ?",
+                (tenant_id, artifact_key),
+            )
+            if revoked is not None:
+                raise GovernedArtifactError("artifact_id was previously revoked and cannot be resurrected")
+            generation = await self._generation()
+            if generation != registration.checkpoint_generation:
+                raise GovernedArtifactError("artifact checkpoint is stale")
+            consumer = await self._database.fetchone(
+                "SELECT consumer_public_key FROM semantic_governed_artifact_consumers "
+                "WHERE tenant_id = ? AND consumer_id = ? AND consumer_key_id = ?",
+                (tenant_id, registration.consumer_id, registration.consumer_key_id),
+            )
+            if consumer is None:
+                await self._database.execute(
+                    "INSERT INTO semantic_governed_artifact_consumers "
+                    "(tenant_id, consumer_id, consumer_key_id, consumer_public_key, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (tenant_id, registration.consumer_id, registration.consumer_key_id,
+                     registration.consumer_public_key, _now()),
+                )
+            elif str(consumer[0]) != registration.consumer_public_key:
+                raise GovernedArtifactError(
+                    "consumer key ID is already bound to a different public key"
+                )
+            for item in registration.lineage:
+                row = await self._database.fetchone(
+                    "SELECT 1 FROM semantic_assertions a JOIN semantic_assertion_revisions r "
+                    "ON r.tenant_id = a.tenant_id AND r.revision_id = a.current_revision_id "
+                    "JOIN semantic_projection_eligibility e ON e.tenant_id = r.tenant_id AND e.revision_id = r.revision_id "
+                    "WHERE a.tenant_id = ? AND a.assertion_id = ? AND r.revision_id = ? "
+                    "AND r.status = ? AND r.eligible = 1 AND e.eligible = 1",
+                    (tenant_id, item.assertion_id, item.revision_id, AssertionStatus.ACTIVE.value),
+                )
+                if (
+                    row is None
+                    and registration.kind
+                    is GovernedArtifactKind.FUTURE_CORPUS_CANDIDATE
+                ):
+                    # Incremental artifacts must carry exact tombstone lineage
+                    # too. A retracted revision is no longer current/eligible,
+                    # but it must still be a real revision of this tenant and
+                    # assertion. Only the trusted future-corpus producer can
+                    # reach this private registration seam.
+                    row = await self._database.fetchone(
+                        "SELECT 1 FROM semantic_assertion_revisions "
+                        "WHERE tenant_id = ? AND assertion_id = ? AND revision_id = ?",
+                        (tenant_id, item.assertion_id, item.revision_id),
+                    )
+                if row is None:
+                    raise GovernedArtifactError("artifact lineage is not a current eligible revision")
+            now = _now()
+            await self._database.execute(
+                "INSERT INTO semantic_governed_artifacts "
+                "(tenant_id, artifact_id, kind, consumer_id, consumer_key_id, consumer_public_key, "
+                "checkpoint_generation, policy_pin, capability_digest, artifact_digest, retention_expires_at, state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (tenant_id, registration.artifact_id, registration.kind.value, registration.consumer_id,
+                 registration.consumer_key_id, registration.consumer_public_key,
+                 generation, registration.policy_pin, registration.capability_digest, registration.artifact_digest,
+                 registration.retention_expires_at, GovernedArtifactState.ACTIVE.value, now, now),
+            )
+            for item in registration.lineage:
+                await self._database.execute(
+                    "INSERT INTO semantic_governed_artifact_lineage "
+                    "(tenant_id, artifact_id, assertion_id, revision_id) VALUES (?, ?, ?, ?)",
+                    (tenant_id, registration.artifact_id, item.assertion_id, item.revision_id),
+                )
+            return await self._record_artifact_receipt(
+                artifact_key=artifact_key, kind=registration.kind,
+                state=GovernedArtifactState.ACTIVE, generation=generation,
+            )
+
+    async def consume_governed_artifact(
+        self, artifact_id: str, *, expected_generation: int,
+    ) -> GovernedArtifactReceipt:
+        """Fence serving/generation to a live, exact checkpoint-bound registry row."""
+        if not isinstance(artifact_id, str) or not artifact_id:
+            raise GovernedArtifactError("artifact_id must be non-empty")
+        if type(expected_generation) is not int or expected_generation < 0:
+            raise GovernedArtifactError("expected_generation must be a non-negative integer")
+        async with self._mutation():
+            generation = await self._generation()
+            tenant_id, _ = self._require_scope()
+            row = await self._database.fetchone(
+                "SELECT kind, checkpoint_generation, retention_expires_at, state FROM semantic_governed_artifacts "
+                "WHERE tenant_id = ? AND artifact_id = ?",
+                (tenant_id, artifact_id),
+            )
+            if row is None:
+                raise GovernedArtifactError("artifact is not registered or has been revoked")
+            kind, checkpoint, expires_at, state = row
+            if state != GovernedArtifactState.ACTIVE.value:
+                raise GovernedArtifactError("artifact is not active")
+            if generation != expected_generation or int(checkpoint) != generation:
+                raise GovernedArtifactError("artifact generation fence does not match current tenant generation")
+            if datetime.fromisoformat(str(expires_at).replace("Z", "+00:00")) <= datetime.now(timezone.utc):
+                await self._record_artifact_receipt(
+                    artifact_key=self._artifact_key(artifact_id),
+                    kind=GovernedArtifactKind(str(kind)),
+                    state=GovernedArtifactState.EXPIRED,
+                    generation=generation,
+                )
+                await self._revoke_governed_artifacts_for_lineage(
+                    artifact_ids=(artifact_id,),
+                    generation=generation,
+                )
+                # Do not raise until the mutation context exits: the expiry
+                # receipt, registry removal, and pending physical-deletion
+                # work must commit before a consumer is told this artifact is
+                # unavailable.
+            else:
+                return GovernedArtifactReceipt(
+                    self._artifact_key(artifact_id), GovernedArtifactKind(str(kind)),
+                    GovernedArtifactState.ACTIVE, generation,
+                    self._artifact_receipt_digest(self._artifact_key(artifact_id), GovernedArtifactKind(str(kind)), GovernedArtifactState.ACTIVE, generation),
+                )
+        raise GovernedArtifactError("artifact retention expiry elapsed")
+
+    async def _authenticate_governed_artifact_consumer(
+        self, authentication: GovernedArtifactConsumerAuthentication,
+    ) -> None:
+        """Verify one registered Ed25519 principal and consume its nonce."""
+        if not isinstance(authentication, GovernedArtifactConsumerAuthentication):
+            raise GovernedArtifactError(
+                "revocation claim requires GovernedArtifactConsumerAuthentication"
+            )
+        tenant_id, _ = self._require_scope()
+        issued_at = datetime.fromisoformat(
+            authentication.issued_at.replace("Z", "+00:00")
+        )
+        age = abs((datetime.now(timezone.utc) - issued_at).total_seconds())
+        if age > _GOVERNED_ARTIFACT_AUTH_WINDOW_SECONDS:
+            raise GovernedArtifactError("consumer authentication is expired")
+        row = await self._database.fetchone(
+            "SELECT consumer_public_key FROM semantic_governed_artifact_consumers "
+            "WHERE tenant_id = ? AND consumer_id = ? AND consumer_key_id = ?",
+            (tenant_id, authentication.consumer_id, authentication.consumer_key_id),
+        )
+        if row is None:
+            raise GovernedArtifactError("consumer authentication is invalid")
+        try:
+            Ed25519PublicKey.from_public_bytes(bytes.fromhex(str(row[0]))).verify(
+                bytes.fromhex(authentication.signature),
+                authentication.signable_bytes(tenant_id),
+            )
+        except (InvalidSignature, ValueError) as error:
+            raise GovernedArtifactError("consumer authentication is invalid") from error
+        replay = await self._database.fetchone(
+            "SELECT 1 FROM semantic_governed_artifact_auth_nonces "
+            "WHERE tenant_id = ? AND consumer_id = ? AND nonce = ?",
+            (tenant_id, authentication.consumer_id, authentication.nonce),
+        )
+        if replay is not None:
+            raise GovernedArtifactError("consumer authentication nonce was already used")
+        await self._database.execute(
+            "INSERT INTO semantic_governed_artifact_auth_nonces "
+            "(tenant_id, consumer_id, nonce, used_at) VALUES (?, ?, ?, ?)",
+            (tenant_id, authentication.consumer_id, authentication.nonce, _now()),
+        )
+
+    async def claim_governed_artifact_revocation(
+        self,
+        authentication: GovernedArtifactConsumerAuthentication,
+        *,
+        lease_seconds: float = 60.0,
+    ) -> GovernedArtifactRevocationLease | None:
+        """Lease one opaque pending revocation to its registered consumer."""
+        if not isinstance(lease_seconds, (int, float)) or isinstance(lease_seconds, bool) or lease_seconds <= 0:
+            raise GovernedArtifactError("lease_seconds must be positive")
+        async with self._mutation():
+            tenant_id, _ = self._require_scope()
+            await self._authenticate_governed_artifact_consumer(authentication)
+            row = await self._database.fetchone(
+                "SELECT revocation_id, attempt, artifact_key, artifact_digest, consumer_key_id "
+                "FROM semantic_governed_artifact_revocations "
+                "WHERE tenant_id = ? AND consumer_id = ? AND consumer_key_id = ? "
+                "AND acknowledged_at IS NULL "
+                "AND (lease_expires_at IS NULL OR lease_expires_at <= ?) "
+                "ORDER BY invalidated_generation ASC, revocation_id ASC LIMIT 1",
+                (tenant_id, authentication.consumer_id,
+                 authentication.consumer_key_id, _now()),
+            )
+            if row is None:
+                return None
+            revocation_id, prior_attempt = str(row[0]), int(row[1])
+            artifact_key, artifact_digest, consumer_key_id = map(str, row[2:])
+            token = uuid4().hex
+            expires_at = datetime.fromtimestamp(time.time() + float(lease_seconds), timezone.utc).isoformat().replace("+00:00", "Z")
+            await self._database.execute(
+                "UPDATE semantic_governed_artifact_revocations SET attempt = ?, lease_token = ?, lease_expires_at = ? "
+                "WHERE tenant_id = ? AND revocation_id = ? AND acknowledged_at IS NULL",
+                (prior_attempt + 1, token, expires_at, tenant_id, revocation_id),
+            )
+            return GovernedArtifactRevocationLease(
+                revocation_id, token, prior_attempt + 1, tenant_id,
+                authentication.consumer_id, consumer_key_id,
+                artifact_key, artifact_digest,
+            )
+
+    async def acknowledge_governed_artifact_revocation(
+        self,
+        lease: GovernedArtifactRevocationLease,
+        proof: GovernedArtifactDeletionProof,
+    ) -> GovernedArtifactReceipt:
+        """Verify a consumer-signed physical-deletion proof for its exact lease."""
+        if not isinstance(lease, GovernedArtifactRevocationLease):
+            raise GovernedArtifactError("lease must be GovernedArtifactRevocationLease")
+        if not isinstance(proof, GovernedArtifactDeletionProof):
+            raise GovernedArtifactError("proof must be GovernedArtifactDeletionProof")
+        async with self._mutation():
+            tenant_id, _ = self._require_scope()
+            if lease.tenant_id != tenant_id:
+                raise GovernedArtifactError("revocation lease tenant does not match bound store")
+            row = await self._database.fetchone(
+                "SELECT artifact_key, kind, invalidated_generation, artifact_digest, "
+                "consumer_id, consumer_key_id, consumer_public_key "
+                "FROM semantic_governed_artifact_revocations "
+                "WHERE tenant_id = ? AND revocation_id = ? AND consumer_id = ? AND lease_token = ? "
+                "AND attempt = ? AND acknowledged_at IS NULL AND lease_expires_at > ?",
+                (tenant_id, lease.revocation_id, lease.consumer_id,
+                 lease.lease_token, lease.attempt, _now()),
+            )
+            if row is None:
+                raise GovernedArtifactError("revocation acknowledgement does not match an active consumer lease")
+            artifact_key, raw_kind, generation = str(row[0]), GovernedArtifactKind(str(row[1])), int(row[2])
+            artifact_digest, consumer_id, consumer_key_id, public_key = map(str, row[3:])
+            if (
+                lease.artifact_key != artifact_key
+                or lease.artifact_digest != artifact_digest
+                or lease.consumer_id != consumer_id
+                or lease.consumer_key_id != consumer_key_id
+            ):
+                raise GovernedArtifactError("deletion proof lease binding does not match durable revocation")
+            deleted_at = datetime.fromisoformat(proof.deleted_at.replace("Z", "+00:00"))
+            if deleted_at > datetime.now(timezone.utc) + timedelta(seconds=30):
+                raise GovernedArtifactError("physical deletion proof timestamp is in the future")
+            try:
+                Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_key)).verify(
+                    bytes.fromhex(proof.signature), proof.signable_bytes(lease)
+                )
+            except (InvalidSignature, ValueError) as error:
+                raise GovernedArtifactError("physical deletion proof signature is invalid") from error
+            proof_digest = _operation_digest({
+                "payload": lease.signable_mapping(deleted_at=proof.deleted_at),
+                "signature": proof.signature,
+            })
+            await self._database.execute(
+                "UPDATE semantic_governed_artifact_revocations SET acknowledged_at = ?, "
+                "deletion_proof_digest = ?, artifact_digest = NULL, consumer_public_key = '', "
+                "lease_token = NULL, lease_expires_at = NULL "
+                "WHERE tenant_id = ? AND revocation_id = ?",
+                (_now(), proof_digest, tenant_id, lease.revocation_id),
+            )
+            return await self._record_artifact_receipt(
+                artifact_key=artifact_key, kind=raw_kind,
+                state=GovernedArtifactState.REVOKED, generation=generation,
+            )
+
+    async def process_governed_artifact_revocation(
+        self,
+        authentication: GovernedArtifactConsumerAuthentication,
+        owner: GovernedArtifactDeletionOwner,
+        *,
+        lease_seconds: float = 60.0,
+    ) -> GovernedArtifactReceipt | None:
+        """Drive the registered owner's physical deletion callback, then verify proof."""
+        if not isinstance(owner, GovernedArtifactDeletionOwner):
+            raise GovernedArtifactError("owner must be GovernedArtifactDeletionOwner")
+        if (
+            owner.consumer_id != authentication.consumer_id
+            or owner.consumer_key_id != authentication.consumer_key_id
+        ):
+            raise GovernedArtifactError("deletion owner does not match authenticated consumer")
+        lease = await self.claim_governed_artifact_revocation(
+            authentication, lease_seconds=lease_seconds
+        )
+        if lease is None:
+            return None
+        proof = await owner.delete_artifact(lease)
+        if not isinstance(proof, GovernedArtifactDeletionProof):
+            raise GovernedArtifactError(
+                "physical deletion callback did not return a signed deletion proof"
+            )
+        return await self.acknowledge_governed_artifact_revocation(lease, proof)
+
+    async def governed_artifact_erasure_observation(
+        self, *, expected_generation: int,
+    ) -> GovernedArtifactErasureObservation:
+        """Return only aggregate, generation-fenced erasure progress."""
+        if type(expected_generation) is not int or expected_generation < 0:
+            raise GovernedArtifactError("expected_generation must be a non-negative integer")
+        async with self._mutation():
+            generation = await self._generation()
+            if generation != expected_generation:
+                raise GovernedArtifactError(
+                    "erasure observation generation fence does not match current tenant generation"
+                )
+            tenant_id, _ = self._require_scope()
+            rows = await self._database.fetchall(
+                "SELECT kind, COUNT(*) FROM semantic_governed_artifacts "
+                "WHERE tenant_id = ? GROUP BY kind",
+                (tenant_id,),
+            )
+            counts = {str(kind): int(count) for kind, count in rows}
+            pending = await self._database.fetchval(
+                "SELECT COUNT(*) FROM semantic_governed_artifact_revocations "
+                "WHERE tenant_id = ? AND acknowledged_at IS NULL",
+                (tenant_id,),
+            )
+            complete = await self._database.fetchval(
+                "SELECT COUNT(*) FROM semantic_governed_artifact_revocations "
+                "WHERE tenant_id = ? AND acknowledged_at IS NOT NULL",
+                (tenant_id,),
+            )
+            if await self._generation() != generation:
+                raise GovernedArtifactError(
+                    "erasure observation generation changed during read"
+                )
+            return GovernedArtifactErasureObservation(
+                generation, counts.get(GovernedArtifactKind.EXPORT_SNAPSHOT.value, 0),
+                counts.get(GovernedArtifactKind.CORPUS_MANIFEST.value, 0),
+                counts.get(GovernedArtifactKind.FUTURE_CORPUS_CANDIDATE.value, 0),
+                int(pending or 0), int(complete or 0),
+            )
+
+    async def sweep_expired_governed_artifacts(self, *, limit: int = 100) -> int:
+        """Transition expired active artifacts into physical-deletion work.
+
+        This is the reviewed retention/maintenance callable.  It does not wait
+        for a consumer to attempt serving an expired artifact, and it uses the
+        same tenant mutation fence as assertion lifecycle changes.
+        """
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise GovernedArtifactError("expiry sweep limit must be in [1, 1000]")
+        clock_value = self._artifact_clock()
+        if not isinstance(clock_value, datetime) or clock_value.tzinfo is None:
+            raise GovernedArtifactError("artifact maintenance clock must return an aware datetime")
+        cutoff = clock_value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        async with self._mutation():
+            tenant_id, _ = self._require_scope()
+            # Authentication nonces are durable replay protection only for the
+            # same bounded window that admission accepts.  Prune strictly
+            # older rows on every retention sweep so a long-lived tenant does
+            # not accumulate an unbounded nonce ledger.  Use the host clock,
+            # not the testable artifact-retention clock: auth freshness must
+            # share the verifier's wall-clock domain.
+            nonce_cutoff = (
+                datetime.now(timezone.utc)
+                - timedelta(seconds=_GOVERNED_ARTIFACT_AUTH_WINDOW_SECONDS)
+            ).isoformat().replace("+00:00", "Z")
+            await self._database.execute(
+                "DELETE FROM semantic_governed_artifact_auth_nonces "
+                "WHERE tenant_id = ? AND used_at < ?",
+                (tenant_id, nonce_cutoff),
+            )
+            rows = await self._database.fetchall(
+                "SELECT artifact_id, kind FROM semantic_governed_artifacts "
+                "WHERE tenant_id = ? AND state = ? AND retention_expires_at <= ? "
+                "ORDER BY retention_expires_at ASC, artifact_id ASC LIMIT ?",
+                (tenant_id, GovernedArtifactState.ACTIVE.value, cutoff, limit),
+            )
+            if not rows:
+                return 0
+            generation = await self._generation()
+            for artifact_id, raw_kind in rows:
+                await self._record_artifact_receipt(
+                    artifact_key=self._artifact_key(str(artifact_id)),
+                    kind=GovernedArtifactKind(str(raw_kind)),
+                    state=GovernedArtifactState.EXPIRED,
+                    generation=generation,
+                )
+            return await self._revoke_governed_artifacts_for_lineage(
+                artifact_ids=tuple(str(row[0]) for row in rows),
+                generation=generation,
+            )
+
     async def checkpoint(self) -> AssertionCheckpoint:
         tenant_id, _ = self._require_scope()
         generation = await self._generation()
@@ -5739,6 +6292,7 @@ def _create_agent_bound_assertion_store(
     database: AsyncDatabase,
     *,
     tenant_capability: _AssertionTenantCapability,
+    artifact_clock: Callable[[], datetime] | None = None,
 ) -> AsyncAssertionStore:
     """Issue the sole assertion authority for an initialized agent storage.
 
@@ -5750,7 +6304,7 @@ def _create_agent_bound_assertion_store(
         database,
         tenant_capability,
     )
-    return AsyncAssertionStore(scope)
+    return AsyncAssertionStore(scope, artifact_clock=artifact_clock)
 
 
 # Architecture documents use the role name; retain it as an explicit alias so
