@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 
@@ -1553,6 +1554,23 @@ def test_verifier_cli_requires_protected_config_and_consumes_one_external_challe
     assert not any(root.glob("wrong-evidence*"))
     assert not any(root.glob("tampered-report*"))
     assert not any(root.glob("forged*"))
+
+    for duplicate_path in (envelope_path, tmp_path / "different-envelope.json"):
+        duplicate_envelope = _verifier_cli(
+            config,
+            *args,
+            "--external-envelope",
+            str(duplicate_path),
+        )
+        assert duplicate_envelope.returncode == 2
+        assert "--external-envelope may be supplied only once" in duplicate_envelope.stderr
+    assert not output.exists()
+    assert not receipt.exists()
+    with sqlite3.connect(ledger.path) as connection:
+        assert connection.execute(
+            "SELECT state FROM external_freshness_challenges WHERE run_nonce = ?",
+            (nonce,),
+        ).fetchone() == ("pending",)
 
     duplicated_external_record = _verifier_cli(
         config, *args, "--record", str(external_record_path)

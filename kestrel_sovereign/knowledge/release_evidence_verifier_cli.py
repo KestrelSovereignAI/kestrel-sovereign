@@ -27,6 +27,15 @@ from .release_evidence_verifier import (
 HOST_VERIFIER_CONFIGURATION = Path("/etc/kestrel/semantic-release-verifier.json")
 
 
+class _StoreOnce(argparse.Action):
+    """Reject duplicate singleton evidence inputs before verifier state opens."""
+
+    def __call__(self, parser, namespace, values, option_string=None) -> None:
+        if getattr(namespace, self.dest, None) is not None:
+            parser.error(f"{option_string} may be supplied only once")
+        setattr(namespace, self.dest, values)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Verifier-owned semantic release evidence operations.")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -37,6 +46,7 @@ def main(argv: list[str] | None = None) -> int:
     assemble.add_argument(
         "--external-envelope",
         type=Path,
+        action=_StoreOnce,
         help="the exact signed parametric-self external-CI envelope; mutually exclusive with split external inputs",
     )
     assemble.add_argument("--output", type=Path, required=True)
