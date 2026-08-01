@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import sqlite3
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -13,6 +15,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from kestrel_sovereign.identity.runtime_identity import AgentIdentity, load_agent_identity
+from kestrel_sovereign.agent.sleep import SleepMixin
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
 from kestrel_sovereign.knowledge import (
     Assertion,
@@ -149,9 +152,9 @@ async def test_registered_artifact_is_generation_fenced_and_erasure_leaves_only_
     await storage.put_assertion(assertion, source_occurrences=(_source(),))
     checkpoint = await storage.assertion_checkpoint()
     registration = _registration(assertion, checkpoint.generation, private_key=private_key)
-    registered = await storage.register_governed_semantic_artifact(registration)
+    registered = await storage._assertion_store().register_governed_artifact(registration)
     with pytest.raises(GovernedArtifactError, match="different public key"):
-        await storage.register_governed_semantic_artifact(
+        await storage._assertion_store().register_governed_artifact(
             _registration(
                 assertion, checkpoint.generation,
                 private_key=Ed25519PrivateKey.generate(),
@@ -243,7 +246,7 @@ async def test_registration_rejects_forged_stale_or_expired_lineage(storage: Asy
         retention_expires_at=registration.retention_expires_at, artifact_digest=registration.artifact_digest,
     )
     with pytest.raises(GovernedArtifactError, match="lineage"):
-        await storage.register_governed_semantic_artifact(forged)
+        await storage._assertion_store().register_governed_artifact(forged)
 
     expired = _registration(assertion, checkpoint.generation, private_key=private_key)
     expired = GovernedArtifactRegistration(
@@ -256,12 +259,12 @@ async def test_registration_rejects_forged_stale_or_expired_lineage(storage: Asy
         artifact_digest=expired.artifact_digest,
     )
     with pytest.raises(GovernedArtifactError, match="expiry"):
-        await storage.register_governed_semantic_artifact(expired)
+        await storage._assertion_store().register_governed_artifact(expired)
 
-    await storage.register_governed_semantic_artifact(registration)
+    await storage._assertion_store().register_governed_artifact(registration)
     await storage.retract_assertion(assertion.assertion_id, assertion.revision_id)
     with pytest.raises(GovernedArtifactError, match="resurrected"):
-        await storage.register_governed_semantic_artifact(registration)
+        await storage._assertion_store().register_governed_artifact(registration)
 
 
 @pytest.mark.asyncio
@@ -280,7 +283,7 @@ async def test_pending_revocation_survives_restart_and_replays_only_to_its_consu
     try:
         await first.put_assertion(assertion, source_occurrences=(_source(),))
         checkpoint = await first.assertion_checkpoint()
-        await first.register_governed_semantic_artifact(
+        await first._assertion_store().register_governed_artifact(
             _registration(assertion, checkpoint.generation, private_key=private_key)
         )
         await first.erase_assertion(assertion.assertion_id)
@@ -311,7 +314,7 @@ async def test_concurrent_registration_and_erasure_never_leaves_a_servable_artif
     checkpoint = await storage.assertion_checkpoint()
     registration = _registration(assertion, checkpoint.generation, private_key=private_key)
     registered, erased = await asyncio.gather(
-        storage.register_governed_semantic_artifact(registration),
+        storage._assertion_store().register_governed_artifact(registration),
         storage.erase_assertion(assertion.assertion_id),
         return_exceptions=True,
     )
@@ -337,10 +340,10 @@ async def test_expiry_sweep_revokes_without_a_consume_attempt(storage: AsyncStor
     registration = _registration(
         assertion, checkpoint.generation, private_key=private_key,
     )
-    await storage.register_governed_semantic_artifact(registration)
-    swept = await storage.sweep_expired_governed_semantic_artifacts(
-        now=(datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
-    )
+    await storage._assertion_store().register_governed_artifact(registration)
+    storage._artifact_clock = lambda: datetime.now(timezone.utc) + timedelta(hours=2)
+    storage._assertion_store()._artifact_clock = storage._artifact_clock
+    swept = await storage.sweep_expired_governed_semantic_artifacts()
     assert swept == 1
     assert await storage.db.fetchval(
         "SELECT COUNT(*) FROM semantic_governed_artifacts WHERE tenant_id = ?",
@@ -364,7 +367,13 @@ async def test_privacy_wrapper_blocks_artifact_persistence_and_serving_in_volati
     )
     wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
     with pytest.raises(PrivacyViolationError):
-        await wrapper.register_governed_semantic_artifact(registration)
+        await wrapper.export_assertion_snapshot(
+            artifact_id=registration.artifact_id,
+            consumer_id=registration.consumer_id,
+            consumer_key_id=registration.consumer_key_id,
+            consumer_public_key=registration.consumer_public_key,
+            retention_seconds=60,
+        )
     with pytest.raises(PrivacyViolationError):
         await wrapper.consume_governed_semantic_artifact(
             registration.artifact_id, expected_generation=checkpoint.generation
@@ -372,3 +381,158 @@ async def test_privacy_wrapper_blocks_artifact_persistence_and_serving_in_volati
     # Cleanup remains callable even in a volatile mode so a mode transition
     # cannot strand bytes written while persistence was allowed.
     assert await wrapper.sweep_expired_governed_semantic_artifacts() == 0
+
+
+@pytest.mark.asyncio
+async def test_export_producer_registers_exact_runtime_artifact_before_return(storage: AsyncStorage) -> None:
+    private_key = Ed25519PrivateKey.generate()
+    assertion = _assertion(storage.agent_id, "producer-export-revision")
+    await storage.put_assertion(assertion, source_occurrences=(_source(),))
+    artifact_id = str(uuid4())
+
+    checkpoint, exported = await storage.export_assertion_snapshot(
+        artifact_id=artifact_id,
+        consumer_id="export-owner",
+        consumer_key_id="export-owner-key",
+        consumer_public_key=_public_key(private_key),
+        retention_seconds=300,
+    )
+
+    assert tuple(item.revision_id for item in exported) == (assertion.revision_id,)
+    row = await storage.db.fetchone(
+        "SELECT checkpoint_generation, policy_pin, capability_digest, artifact_digest "
+        "FROM semantic_governed_artifacts WHERE tenant_id = ? AND artifact_id = ?",
+        (storage.agent_id, artifact_id),
+    )
+    assert row is not None and int(row[0]) == checkpoint.generation
+    assert all(isinstance(value, str) and len(value) == 64 for value in row[1:])
+    await storage.consume_governed_semantic_artifact(
+        artifact_id, expected_generation=checkpoint.generation
+    )
+    assert not hasattr(storage, "register_governed_semantic_artifact")
+    with pytest.raises(TypeError):
+        await storage.export_assertion_snapshot()
+
+
+@pytest.mark.asyncio
+async def test_sleep_drives_expiry_with_storage_owned_clock(storage: AsyncStorage) -> None:
+    private_key = Ed25519PrivateKey.generate()
+    assertion = _assertion(storage.agent_id, "sleep-expiry-revision")
+    await storage.put_assertion(assertion, source_occurrences=(_source(),))
+    checkpoint = await storage.assertion_checkpoint()
+    registration = _registration(
+        assertion, checkpoint.generation, private_key=private_key
+    )
+    await storage._assertion_store().register_governed_artifact(registration)
+    storage._artifact_clock = lambda: datetime.now(timezone.utc) + timedelta(hours=2)
+    storage._assertion_store()._artifact_clock = storage._artifact_clock
+
+    class SleepHarness(SleepMixin):
+        sleep_hooks = []
+        semantic_inference_configured = False
+        semantic_maintenance_configured = False
+        semantic_capabilities_configured = False
+        semantic_inference_profile = None
+
+        def __init__(self, bound_storage):
+            self.storage = bound_storage
+
+    await SleepHarness(storage).sleep(
+        skip_consolidation=True, skip_export=True, skip_reflection=True
+    )
+    assert await storage.db.fetchval(
+        "SELECT COUNT(*) FROM semantic_governed_artifact_revocations "
+        "WHERE tenant_id = ? AND acknowledged_at IS NULL",
+        (storage.agent_id,),
+    ) == 1
+    assert "now" not in inspect.signature(
+        storage.sweep_expired_governed_semantic_artifacts
+    ).parameters
+
+
+@pytest.mark.asyncio
+async def test_v1_migration_quarantines_and_makes_legacy_rows_claimable(
+    tmp_path, monkeypatch
+) -> None:
+    private_key = Ed25519PrivateKey.generate()
+    monkeypatch.delenv("KESTREL_LEGACY_ARTIFACT_MIGRATION_PUBLIC_KEY", raising=False)
+    identity_dir = tmp_path / "identity"
+    credentials = await create_kestrel_identity_async(
+        str(identity_dir), identity_method="did:pkh", agent_name="Legacy migration"
+    )
+    tenant_id = credentials.agent_did
+    identity_key = f"kestrel_{credentials.agent_did.rsplit(':', 1)[-1]}"
+    identity = load_agent_identity(identity_key, identity_dir)
+    capability = _resolve_authenticated_agent_assertion_capability(tenant_id, identity)
+    db_path = tmp_path / "legacy-artifacts.db"
+    connection = sqlite3.connect(db_path)
+    connection.executescript(
+        """
+        CREATE TABLE semantic_schema_migrations (version TEXT PRIMARY KEY);
+        INSERT INTO semantic_schema_migrations VALUES ('semantic_governed_artifact_lifecycle_v1');
+        CREATE TABLE semantic_governed_artifacts (
+          tenant_id TEXT, artifact_id TEXT, kind TEXT, consumer_id TEXT,
+          checkpoint_generation INTEGER, policy_pin TEXT, capability_digest TEXT,
+          artifact_digest TEXT, retention_expires_at TEXT, state TEXT,
+          invalidated_generation INTEGER, created_at TEXT, updated_at TEXT,
+          PRIMARY KEY (tenant_id, artifact_id));
+        CREATE TABLE semantic_governed_artifact_lineage (
+          tenant_id TEXT, artifact_id TEXT, assertion_id TEXT, revision_id TEXT,
+          PRIMARY KEY (tenant_id, artifact_id, assertion_id, revision_id));
+        CREATE TABLE semantic_governed_artifact_revocations (
+          tenant_id TEXT, revocation_id TEXT, artifact_key TEXT, kind TEXT,
+          consumer_id TEXT, attempt INTEGER, lease_token TEXT, lease_expires_at TEXT,
+          acknowledged_at TEXT, deletion_proof_digest TEXT,
+          invalidated_generation INTEGER, PRIMARY KEY (tenant_id, revocation_id));
+        CREATE TABLE semantic_governed_artifact_receipts (
+          receipt_id TEXT PRIMARY KEY, tenant_id TEXT, artifact_key TEXT, kind TEXT,
+          state TEXT, generation INTEGER, receipt_digest TEXT, created_at TEXT);
+        """
+    )
+    artifact_id = str(uuid4())
+    connection.execute(
+        "INSERT INTO semantic_governed_artifacts VALUES (?, ?, 'export_snapshot', "
+        "'unauthenticated-v1', 7, ?, ?, ?, '2099-01-01T00:00:00Z', 'active', NULL, ?, ?)",
+        (tenant_id, artifact_id, "a" * 64, "b" * 64, "c" * 64,
+         "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+    )
+    connection.execute(
+        "INSERT INTO semantic_governed_artifact_lineage VALUES (?, ?, 'raw-assertion', 'raw-revision')",
+        (tenant_id, artifact_id),
+    )
+    connection.commit()
+    connection.close()
+
+    blocked = AsyncStorage(
+        str(db_path), agent_id=tenant_id, _assertion_tenant_capability=capability
+    )
+    try:
+        with pytest.raises(Exception, match="explicit.*MIGRATION_PUBLIC_KEY"):
+            await blocked.initialize()
+    finally:
+        await blocked.close()
+    monkeypatch.setenv(
+        "KESTREL_LEGACY_ARTIFACT_MIGRATION_PUBLIC_KEY", _public_key(private_key)
+    )
+    migrated = await _open_storage(str(db_path), tenant_id, capability)
+    try:
+        assert await migrated.db.fetchval("SELECT COUNT(*) FROM semantic_governed_artifacts") == 0
+        assert await migrated.db.fetchval("SELECT COUNT(*) FROM semantic_governed_artifact_lineage") == 0
+        row = await migrated.db.fetchone(
+            "SELECT consumer_id, consumer_key_id, consumer_public_key, artifact_digest "
+            "FROM semantic_governed_artifact_revocations"
+        )
+        assert row == (
+            "kestrel-artifact-migration", "legacy-quarantine-v1",
+            _public_key(private_key), "c" * 64,
+        )
+        auth = GovernedArtifactConsumerAuthentication(
+            "kestrel-artifact-migration", "legacy-quarantine-v1", str(uuid4()),
+            datetime.now(timezone.utc).isoformat(), "0" * 128,
+        )
+        auth = replace(
+            auth, signature=private_key.sign(auth.signable_bytes(tenant_id)).hex()
+        )
+        assert await migrated.claim_governed_semantic_artifact_revocation(auth) is not None
+    finally:
+        await migrated.close()

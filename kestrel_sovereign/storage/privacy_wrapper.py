@@ -3251,11 +3251,6 @@ class PrivacyEnforcingStorage:
             operation_id=operation_id,
         )
 
-    async def register_governed_semantic_artifact(self, registration):
-        self._assert_semantic_assertion_write_allowed("governed artifact registration")
-        self._assert_semantic_assertion_read_allowed("governed artifact lineage")
-        return await self._storage.register_governed_semantic_artifact(registration)
-
     async def consume_governed_semantic_artifact(
         self, artifact_id, *, expected_generation: int,
     ):
@@ -3287,13 +3282,11 @@ class PrivacyEnforcingStorage:
             authentication, owner, lease_seconds=lease_seconds
         )
 
-    async def sweep_expired_governed_semantic_artifacts(
-        self, *, now=None, limit: int = 100,
-    ):
+    async def sweep_expired_governed_semantic_artifacts(self, *, limit: int = 100):
         # Retention cleanup is always permitted; it can only remove active
         # controlled artifacts and create authenticated deletion work.
         return await self._storage.sweep_expired_governed_semantic_artifacts(
-            now=now, limit=limit
+            limit=limit
         )
 
     async def governed_semantic_artifact_erasure_observation(
@@ -3535,9 +3528,11 @@ class PrivacyEnforcingStorage:
             semantic_capabilities=semantic_capabilities,
         )
 
-    async def export_assertion_snapshot(self, query=None):
+    async def export_assertion_snapshot(self, query=None, **artifact_governance):
         self._assert_semantic_assertion_read_allowed("export")
-        return await self._storage.export_assertion_snapshot(query)
+        return await self._storage.export_assertion_snapshot(
+            query, **artifact_governance
+        )
 
     # === Private Agent Identity Resources (privacy-governed durable writes) ===
     #

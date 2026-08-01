@@ -1203,6 +1203,13 @@ artifact digest, expiry, and canonical checkpoint. Registration occurs under
 the same tenant mutation fence as the assertion store: each pair must be an
 active, eligible current revision at the exact checkpoint, so an old in-memory
 export cannot become a newly registered stale artifact.
+The production `export_assertion_snapshot()`,
+`governed_assertion_corpus_snapshot()`, and incremental future-corpus producer
+derive the artifact digest, policy digest, and capability pins from the bytes
+and agent-bound semantic runtime they actually used. They require the
+destination identity and retention interval and complete registration before
+returning; there is no public free-form registration facade that can substitute
+caller-selected hashes.
 
 Serving requires the artifact to remain active, unexpired, and generation
 fenced to the current tenant generation. A supersession, retraction,
@@ -1229,7 +1236,14 @@ Erasure observations are generation-fenced aggregates for `export_snapshot`,
 revocation counts; they are not an enumeration API.
 The reviewed `sweep_expired_governed_semantic_artifacts()` maintenance callable
 proactively converts expired active artifacts to opaque revocation work; expiry
-does not depend on a consumer attempting to serve the artifact first.
+does not depend on a consumer attempting to serve the artifact first. Its
+cutoff comes only from the storage-owned host clock, and both semantic
+maintenance and the scheduler's real nightly `sleep` path invoke it. A public
+caller cannot supply a future cutoff. Upgrading an unauthenticated v1 registry
+fails closed when legacy rows exist unless the operator supplies
+`KESTREL_LEGACY_ARTIFACT_MIGRATION_PUBLIC_KEY`; the migration then removes raw
+artifact/lineage identifiers and quarantines all active/pending work under that
+explicit authority so it remains authenticated and claimable.
 
 ## Privacy and security boundary
 

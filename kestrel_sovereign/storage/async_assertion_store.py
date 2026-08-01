@@ -726,16 +726,24 @@ class AsyncAssertionStore:
 
     __slots__ = (
         "__scope",
+        "_artifact_clock",
         "_erasure_jobs",
         "_semantic_recall_derivative_revoker",
     )
 
-    def __init__(self, scope: _AssertionStoreScope, /) -> None:
+    def __init__(
+        self,
+        scope: _AssertionStoreScope,
+        /,
+        *,
+        artifact_clock: Callable[[], datetime] | None = None,
+    ) -> None:
         if type(scope) is not _AssertionStoreScope:
             raise TypeError(
                 "AsyncAssertionStore is created only by an agent-bound AsyncStorage facade"
             )
         self.__scope = scope
+        self._artifact_clock = artifact_clock or (lambda: datetime.now(timezone.utc))
         # Physical-erasure targets are intentionally process-local.  A retry
         # in this short window can receive the original deterministic result,
         # while a durable receipt after restart proves only that the erasure
@@ -6054,9 +6062,7 @@ class AsyncAssertionStore:
                 int(pending or 0), int(complete or 0),
             )
 
-    async def sweep_expired_governed_artifacts(
-        self, *, now: str | None = None, limit: int = 100,
-    ) -> int:
+    async def sweep_expired_governed_artifacts(self, *, limit: int = 100) -> int:
         """Transition expired active artifacts into physical-deletion work.
 
         This is the reviewed retention/maintenance callable.  It does not wait
@@ -6065,16 +6071,10 @@ class AsyncAssertionStore:
         """
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise GovernedArtifactError("expiry sweep limit must be in [1, 1000]")
-        cutoff = now or _now()
-        try:
-            parsed_cutoff = datetime.fromisoformat(cutoff.replace("Z", "+00:00"))
-            if parsed_cutoff.tzinfo is None:
-                raise ValueError("missing timezone")
-            cutoff = parsed_cutoff.astimezone(timezone.utc).isoformat().replace(
-                "+00:00", "Z"
-            )
-        except (AttributeError, ValueError) as error:
-            raise GovernedArtifactError("expiry sweep now must be an aware timestamp") from error
+        clock_value = self._artifact_clock()
+        if not isinstance(clock_value, datetime) or clock_value.tzinfo is None:
+            raise GovernedArtifactError("artifact maintenance clock must return an aware datetime")
+        cutoff = clock_value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
         async with self._mutation():
             tenant_id, _ = self._require_scope()
             rows = await self._database.fetchall(
@@ -6252,6 +6252,7 @@ def _create_agent_bound_assertion_store(
     database: AsyncDatabase,
     *,
     tenant_capability: _AssertionTenantCapability,
+    artifact_clock: Callable[[], datetime] | None = None,
 ) -> AsyncAssertionStore:
     """Issue the sole assertion authority for an initialized agent storage.
 
@@ -6263,7 +6264,7 @@ def _create_agent_bound_assertion_store(
         database,
         tenant_capability,
     )
-    return AsyncAssertionStore(scope)
+    return AsyncAssertionStore(scope, artifact_clock=artifact_clock)
 
 
 # Architecture documents use the role name; retain it as an explicit alias so

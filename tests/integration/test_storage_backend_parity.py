@@ -63,9 +63,6 @@ async def test_governed_artifact_erasure_lifecycle_has_backend_parity(
         GovernedArtifactConsumerAuthentication,
         GovernedArtifactDeletionOwner,
         GovernedArtifactDeletionProof,
-        GovernedArtifactKind,
-        GovernedArtifactLineage,
-        GovernedArtifactRegistration,
     )
 
     tenant, identity = await _incepted_assertion_identity(tmp_path, "artifact-parity")
@@ -84,22 +81,21 @@ async def test_governed_artifact_erasure_lifecycle_has_backend_parity(
             source_occurrences=(_semantic_source(f"artifact-parity-source-{unique}"),),
         )
         checkpoint = await storage.assertion_checkpoint()
-        registration = GovernedArtifactRegistration(
-            artifact_id=str(uuid4()), kind=GovernedArtifactKind.EXPORT_SNAPSHOT,
-            tenant_id=tenant, consumer_id="parity-consumer", consumer_key_id="parity-key",
+        artifact_id = str(uuid4())
+        produced_checkpoint, produced = await storage.export_assertion_snapshot(
+            artifact_id=artifact_id,
+            consumer_id="parity-consumer",
+            consumer_key_id="parity-key",
             consumer_public_key=private_key.public_key().public_bytes(
                 serialization.Encoding.Raw, serialization.PublicFormat.Raw,
             ).hex(),
-            checkpoint_generation=checkpoint.generation, policy_pin="a" * 64,
-            capability_pins={"semantic-kb-v1": "b" * 64},
-            lineage=(GovernedArtifactLineage(assertion.assertion_id, assertion.revision_id),),
-            retention_expires_at=(datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
-            artifact_digest="c" * 64,
+            retention_seconds=300,
         )
-        await storage.register_governed_semantic_artifact(registration)
-        assert await storage.sweep_expired_governed_semantic_artifacts(
-            now=(datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
-        ) == 1
+        assert produced_checkpoint.generation == checkpoint.generation
+        assert assertion.revision_id in {item.revision_id for item in produced}
+        storage._artifact_clock = lambda: datetime.now(timezone.utc) + timedelta(minutes=10)
+        storage._assertion_store()._artifact_clock = storage._artifact_clock
+        assert await storage.sweep_expired_governed_semantic_artifacts() == 1
         authentication = GovernedArtifactConsumerAuthentication(
             "parity-consumer", "parity-key", str(uuid4()),
             datetime.now(timezone.utc).isoformat(), "0" * 128,

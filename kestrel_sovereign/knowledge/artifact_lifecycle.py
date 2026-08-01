@@ -130,7 +130,7 @@ class GovernedArtifactRegistration:
         for value in pins.values():
             _sha256(value, "capability pin")
         lineage = tuple(self.lineage)
-        if not lineage or any(not isinstance(item, GovernedArtifactLineage) for item in lineage):
+        if any(not isinstance(item, GovernedArtifactLineage) for item in lineage):
             raise GovernedArtifactError("lineage must contain GovernedArtifactLineage values")
         if len({(item.assertion_id, item.revision_id) for item in lineage}) != len(lineage):
             raise GovernedArtifactError("lineage must not contain duplicate assertion/revision pairs")

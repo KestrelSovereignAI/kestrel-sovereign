@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from dataclasses import replace
+from uuid import uuid4
 
 import pytest
 from rdflib import Graph, Literal, Namespace, RDF, URIRef
@@ -1505,7 +1506,13 @@ async def test_governed_supersession_validates_the_complete_graph_beyond_query_p
         )
         await put(retained, retained_source)
 
-        _, snapshot = await storage.export_assertion_snapshot()
+        _, snapshot = await storage.export_assertion_snapshot(
+            artifact_id=str(uuid4()),
+            consumer_id="validation-export-test",
+            consumer_key_id="validation-export-key",
+            consumer_public_key="0" * 64,
+            retention_seconds=60,
+        )
         assert len(snapshot) == 101
         assert {item.revision_id for item in snapshot} >= {
             original.revision_id,

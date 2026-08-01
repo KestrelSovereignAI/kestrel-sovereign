@@ -875,6 +875,22 @@ class SleepMixin:
         consolidation_succeeded = False
         export_succeeded = False
 
+        # The nightly scheduler invokes this same sleep path.  Sweep governed
+        # semantic artifacts even when inference maintenance is disabled so a
+        # retention deadline never depends on a consumer attempting a read.
+        artifact_sweep = getattr(
+            getattr(self, "storage", None),
+            "sweep_expired_governed_semantic_artifacts",
+            None,
+        )
+        if callable(artifact_sweep):
+            try:
+                await artifact_sweep()
+            except Exception:
+                logger.warning("Governed semantic artifact expiry sweep failed")
+                report.error = "semantic_artifact_expiry_sweep_failed"
+                return report
+
         # Note: Privacy mode checks are handled by the storage layer.
         # - EPHEMERAL/ISOLATED: Storage will raise PrivacyViolationError on export
         # - Consolidation is always allowed (reorganizes existing data)

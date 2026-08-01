@@ -28,9 +28,11 @@ from __future__ import annotations
 import json
 import hashlib
 import logging
+import os
 import struct
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 from ..async_assertion_store import (
     _erasure_receipt_key,
@@ -704,6 +706,10 @@ async def migrate_semantic_governed_artifacts(db: "AsyncDatabase") -> None:
         )
         if existing is not None:
             return
+        legacy_v1 = await db.fetchone(
+            "SELECT 1 FROM semantic_schema_migrations WHERE version = ?",
+            ("semantic_governed_artifact_lifecycle_v1",),
+        )
         for statement in statements:
             await db.execute(statement, ())
         # Pre-merge development databases may contain the original v1 tables.
@@ -743,6 +749,107 @@ async def migrate_semantic_governed_artifacts(db: "AsyncDatabase") -> None:
                         f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}",
                         (),
                     )
+        # V1 did not authenticate consumers.  Never bless its active or pending
+        # rows with invented credentials: quarantine them under an explicit
+        # operator-owned migration key, remove all raw artifact/lineage IDs,
+        # and make the resulting physical-deletion work actually claimable.
+        if legacy_v1 is not None:
+            active_rows = await db.fetchall(
+                "SELECT tenant_id, artifact_id, kind, checkpoint_generation, artifact_digest "
+                "FROM semantic_governed_artifacts",
+                (),
+            )
+            pending_rows = await db.fetchall(
+                "SELECT tenant_id, revocation_id, artifact_key, artifact_digest "
+                "FROM semantic_governed_artifact_revocations WHERE acknowledged_at IS NULL",
+                (),
+            )
+            if active_rows or pending_rows:
+                migration_public_key = os.getenv(
+                    "KESTREL_LEGACY_ARTIFACT_MIGRATION_PUBLIC_KEY", ""
+                )
+                if (
+                    len(migration_public_key) != 64
+                    or any(c not in "0123456789abcdef" for c in migration_public_key)
+                ):
+                    raise RuntimeError(
+                        "legacy governed artifacts require an explicit "
+                        "KESTREL_LEGACY_ARTIFACT_MIGRATION_PUBLIC_KEY Ed25519 key"
+                    )
+                migration_consumer = "kestrel-artifact-migration"
+                migration_key_id = "legacy-quarantine-v1"
+                tenants = {str(row[0]) for row in (*active_rows, *pending_rows)}
+                for tenant_id in tenants:
+                    await db.execute(
+                        "INSERT INTO semantic_governed_artifact_consumers "
+                        "(tenant_id, consumer_id, consumer_key_id, consumer_public_key, created_at) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (
+                            tenant_id,
+                            migration_consumer,
+                            migration_key_id,
+                            migration_public_key,
+                            _now(),
+                        ),
+                    )
+                for tenant_id, artifact_id, kind, generation, artifact_digest in active_rows:
+                    artifact_key = hashlib.sha256(
+                        json.dumps(
+                            {
+                                "namespace": "semantic-artifact-key-v1",
+                                "artifact_id": str(artifact_id),
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    quarantine_digest = artifact_digest or hashlib.sha256(
+                        f"legacy-unknown-artifact:{artifact_key}".encode("utf-8")
+                    ).hexdigest()
+                    await db.execute(
+                        "INSERT INTO semantic_governed_artifact_revocations "
+                        "(tenant_id, revocation_id, artifact_key, kind, consumer_id, "
+                        "consumer_key_id, consumer_public_key, artifact_digest, attempt, "
+                        "invalidated_generation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+                        (
+                            str(tenant_id),
+                            str(uuid4()),
+                            artifact_key,
+                            str(kind),
+                            migration_consumer,
+                            migration_key_id,
+                            migration_public_key,
+                            quarantine_digest,
+                            int(generation),
+                        ),
+                    )
+                for tenant_id, _revocation_id, artifact_key, artifact_digest in pending_rows:
+                    quarantine_digest = artifact_digest or hashlib.sha256(
+                        f"legacy-unknown-artifact:{artifact_key}".encode("utf-8")
+                    ).hexdigest()
+                    await db.execute(
+                        "UPDATE semantic_governed_artifact_revocations SET consumer_id = ?, "
+                        "consumer_key_id = ?, consumer_public_key = ?, artifact_digest = ?, "
+                        "attempt = 0, lease_token = NULL, lease_expires_at = NULL "
+                        "WHERE tenant_id = ? AND revocation_id = ?",
+                        (
+                            migration_consumer,
+                            migration_key_id,
+                            migration_public_key,
+                            quarantine_digest,
+                            str(tenant_id),
+                            str(_revocation_id),
+                        ),
+                    )
+                await db.execute("DELETE FROM semantic_governed_artifact_lineage", ())
+                await db.execute("DELETE FROM semantic_governed_artifacts", ())
+                await db.execute(
+                    "UPDATE semantic_governed_artifact_revocations SET "
+                    "consumer_key_id = '', consumer_public_key = '', artifact_digest = NULL, "
+                    "lease_token = NULL, lease_expires_at = NULL "
+                    "WHERE acknowledged_at IS NOT NULL",
+                    (),
+                )
         await db.execute(
             "INSERT INTO semantic_schema_migrations (version) VALUES (?)",
             (_SEMANTIC_GOVERNED_ARTIFACT_SCHEMA_VERSION,),

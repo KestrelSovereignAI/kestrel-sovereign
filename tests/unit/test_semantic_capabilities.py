@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
@@ -337,11 +338,45 @@ async def test_experimental_sleep_readiness_and_corpus_share_one_durable_runtime
             ),
             accepted_semantic_capability_versions=tuple(capability_versions.items()),
         )
+        corpus_artifact_id = str(uuid4())
         snapshot = await storage.governed_assertion_corpus_snapshot(
             policy=policy,
             inference_profile=None,
             semantic_capabilities=selection,
+            artifact_id=corpus_artifact_id,
+            consumer_id="semantic-capability-test",
+            consumer_key_id="semantic-capability-key",
+            consumer_public_key="0" * 64,
+            retention_seconds=60,
         )
         assert snapshot.capability_versions == capability_versions
+        registered = await raw_storage.db.fetchone(
+            "SELECT policy_pin, artifact_digest FROM semantic_governed_artifacts "
+            "WHERE tenant_id = ? AND artifact_id = ? AND kind = 'corpus_manifest'",
+            (credentials.agent_did, corpus_artifact_id),
+        )
+        assert registered == (policy.digest, snapshot.snapshot_hash)
+        await storage.consume_governed_semantic_artifact(
+            corpus_artifact_id,
+            expected_generation=snapshot.checkpoint.generation,
+        )
+        future_artifact_id = str(uuid4())
+        delta = await storage.governed_assertion_corpus_changes_since(
+            snapshot,
+            policy=policy,
+            inference_profile=None,
+            semantic_capabilities=selection,
+            artifact_id=future_artifact_id,
+            consumer_id="semantic-capability-test",
+            consumer_key_id="semantic-capability-key",
+            consumer_public_key="0" * 64,
+            retention_seconds=60,
+        )
+        assert delta.checkpoint.generation == snapshot.checkpoint.generation
+        assert await raw_storage.db.fetchval(
+            "SELECT COUNT(*) FROM semantic_governed_artifacts WHERE tenant_id = ? "
+            "AND artifact_id = ? AND kind = 'future_corpus_candidate'",
+            (credentials.agent_did, future_artifact_id),
+        ) == 1
     finally:
         await raw_storage.close()

@@ -15,6 +15,7 @@ import logging
 import tarfile
 import tempfile
 import shutil
+import hashlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, UTC
 from typing import Dict, Optional, List, Any, Union
@@ -125,6 +126,7 @@ class AsyncStorage:
         llm_service: Optional[Any] = None,
         _assertion_tenant_capability: Optional[_AssertionTenantCapability] = None,
         semantic_capabilities=None,
+        _artifact_clock=None,
     ):
         """
         Initialize AsyncStorage.
@@ -145,6 +147,9 @@ class AsyncStorage:
         # mutating the public chat-service attribute later cannot substitute a
         # feature-supplied callable or relabel a remote route as local.
         self.__semantic_vector_llm_service = llm_service
+        if _artifact_clock is not None and not callable(_artifact_clock):
+            raise TypeError("_artifact_clock must be callable")
+        self._artifact_clock = _artifact_clock or (lambda: datetime.now(UTC))
         # A semantic runtime is agent-owned, not a caller-selected option on
         # individual maintenance/corpus requests.  Keep its RDF/SPARQL codec
         # alive with storage so the pins used by live sleep work are the pins
@@ -322,6 +327,7 @@ class AsyncStorage:
                 self._assertions = _create_agent_bound_assertion_store(
                     self.db,
                     tenant_capability=self._assertion_tenant_capability,
+                    artifact_clock=self._artifact_clock,
                 )
                 self._assertions._bind_semantic_recall_derivative_revoker(  # noqa: SLF001 - storage composition seam
                     self._withdraw_semantic_recall_derivatives
@@ -1686,6 +1692,9 @@ class AsyncStorage:
         """
         if not self._initialized:
             await self.initialize()
+        # Retention expiry is part of every real semantic-maintenance unit and
+        # uses the storage-owned host clock.  It cannot be advanced by a caller.
+        await self._assertion_store().sweep_expired_governed_artifacts()
         from kestrel_sovereign.knowledge.maintenance import SemanticMaintenanceService
 
         selected_capabilities = self._resolve_semantic_capabilities(
@@ -1786,6 +1795,11 @@ class AsyncStorage:
         semantic_capabilities=None,
         prior_verified_snapshot=None,
         allow_prior_verified_snapshot: bool = False,
+        artifact_id: str,
+        consumer_id: str,
+        consumer_key_id: str,
+        consumer_public_key: str,
+        retention_seconds: float,
     ):
         """Produce the public immutable learning-corpus snapshot.
 
@@ -1797,7 +1811,7 @@ class AsyncStorage:
             GovernedCorpusLimits,
         )
 
-        return await GovernedAssertionCorpusService(self).snapshot(
+        snapshot = await GovernedAssertionCorpusService(self).snapshot(
             policy=policy,
             inference_profile=inference_profile,
             limits=limits if limits is not None else GovernedCorpusLimits(),
@@ -1809,6 +1823,23 @@ class AsyncStorage:
             prior_verified_snapshot=prior_verified_snapshot,
             allow_prior_verified_snapshot=allow_prior_verified_snapshot,
         )
+        await self._register_produced_semantic_artifact(
+            artifact_id=artifact_id,
+            kind="corpus_manifest",
+            consumer_id=consumer_id,
+            consumer_key_id=consumer_key_id,
+            consumer_public_key=consumer_public_key,
+            checkpoint_generation=snapshot.checkpoint.generation,
+            policy_pin=snapshot.policy.digest,
+            capability_versions=snapshot.capability_versions,
+            lineage=tuple(
+                (example.assertion.assertion_id, example.assertion.revision_id)
+                for example in snapshot.examples
+            ),
+            retention_seconds=retention_seconds,
+            artifact_digest=snapshot.snapshot_hash,
+        )
+        return snapshot
 
     async def governed_assertion_corpus_changes_since(
         self,
@@ -1820,6 +1851,11 @@ class AsyncStorage:
         inference_limits=None,
         maintenance_limits=None,
         semantic_capabilities=None,
+        artifact_id: str,
+        consumer_id: str,
+        consumer_key_id: str,
+        consumer_public_key: str,
+        retention_seconds: float,
     ):
         """Read first-class governed additions/tombstones after a snapshot."""
         from kestrel_sovereign.knowledge.corpus import (
@@ -1827,7 +1863,7 @@ class AsyncStorage:
             GovernedCorpusLimits,
         )
 
-        return await GovernedAssertionCorpusService(self).changes_since(
+        delta = await GovernedAssertionCorpusService(self).changes_since(
             snapshot,
             policy=policy,
             inference_profile=inference_profile,
@@ -1838,6 +1874,23 @@ class AsyncStorage:
                 semantic_capabilities
             ),
         )
+        await self._register_produced_semantic_artifact(
+            artifact_id=artifact_id,
+            kind="future_corpus_candidate",
+            consumer_id=consumer_id,
+            consumer_key_id=consumer_key_id,
+            consumer_public_key=consumer_public_key,
+            checkpoint_generation=delta.checkpoint.generation,
+            policy_pin=policy.digest,
+            capability_versions=snapshot.capability_versions,
+            lineage=tuple(
+                (example.assertion.assertion_id, example.assertion.revision_id)
+                for example in delta.additions
+            ),
+            retention_seconds=retention_seconds,
+            artifact_digest=delta.snapshot_hash,
+        )
+        return delta
 
     async def repair_semantic_maintenance(
         self,
@@ -1885,15 +1938,110 @@ class AsyncStorage:
             backend, decode_row, **kwargs
         )
 
-    async def export_assertion_snapshot(self, query=None):
+    async def export_assertion_snapshot(
+        self,
+        query=None,
+        *,
+        artifact_id: str,
+        consumer_id: str,
+        consumer_key_id: str,
+        consumer_public_key: str,
+        retention_seconds: float,
+    ):
         if not self._initialized:
             await self.initialize()
-        return await self._assertion_store().export_snapshot(query)
+        checkpoint, assertions = await self._assertion_store().export_snapshot(query)
+        canonical = json.dumps(
+            [assertion.to_mapping() for assertion in assertions],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        policy_pin = hashlib.sha256(
+            b"kestrel:semantic-export-policy:v1"
+        ).hexdigest()
+        await self._register_produced_semantic_artifact(
+            artifact_id=artifact_id,
+            kind="export_snapshot",
+            consumer_id=consumer_id,
+            consumer_key_id=consumer_key_id,
+            consumer_public_key=consumer_public_key,
+            checkpoint_generation=checkpoint.generation,
+            policy_pin=policy_pin,
+            capability_versions=self.semantic_capabilities.capability_versions(),
+            lineage=tuple(
+                (assertion.assertion_id, assertion.revision_id)
+                for assertion in assertions
+            ),
+            retention_seconds=retention_seconds,
+            artifact_digest=digest,
+        )
+        return checkpoint, assertions
 
-    async def register_governed_semantic_artifact(self, registration):
-        """Seal a controlled semantic export/corpus artifact before serving it."""
+    async def _register_produced_semantic_artifact(
+        self,
+        *,
+        artifact_id,
+        kind,
+        consumer_id,
+        consumer_key_id,
+        consumer_public_key,
+        checkpoint_generation,
+        policy_pin,
+        capability_versions,
+        lineage,
+        retention_seconds,
+        artifact_digest,
+    ):
+        """Seal producer-derived bytes and trusted runtime pins before return."""
         if not self._initialized:
             await self.initialize()
+        if (
+            not isinstance(retention_seconds, (int, float))
+            or isinstance(retention_seconds, bool)
+            or retention_seconds <= 0
+        ):
+            raise ValueError("retention_seconds must be positive")
+        from kestrel_sovereign.knowledge.artifact_lifecycle import (
+            GovernedArtifactKind,
+            GovernedArtifactLineage,
+            GovernedArtifactRegistration,
+        )
+
+        capability_pins = {
+            name: hashlib.sha256(
+                json.dumps(
+                    {"name": name, "version": value},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            for name, value in sorted(dict(capability_versions).items())
+        }
+        clock_value = self._artifact_clock()
+        if not isinstance(clock_value, datetime) or clock_value.tzinfo is None:
+            raise ValueError("_artifact_clock must return an aware datetime")
+        registration = GovernedArtifactRegistration(
+            artifact_id=artifact_id,
+            kind=GovernedArtifactKind(kind),
+            tenant_id=self._assertion_store().tenant_id,
+            consumer_id=consumer_id,
+            consumer_key_id=consumer_key_id,
+            consumer_public_key=consumer_public_key,
+            checkpoint_generation=checkpoint_generation,
+            policy_pin=policy_pin,
+            capability_pins=capability_pins,
+            lineage=tuple(
+                GovernedArtifactLineage(assertion_id, revision_id)
+                for assertion_id, revision_id in lineage
+            ),
+            retention_expires_at=(
+                clock_value.astimezone(UTC)
+                + timedelta(seconds=float(retention_seconds))
+            ).isoformat().replace("+00:00", "Z"),
+            artifact_digest=artifact_digest,
+        )
         return await self._assertion_store().register_governed_artifact(registration)
 
     async def consume_governed_semantic_artifact(self, artifact_id, *, expected_generation: int):
@@ -1929,11 +2077,11 @@ class AsyncStorage:
             authentication, owner, lease_seconds=lease_seconds
         )
 
-    async def sweep_expired_governed_semantic_artifacts(self, *, now=None, limit: int = 100):
+    async def sweep_expired_governed_semantic_artifacts(self, *, limit: int = 100):
         if not self._initialized:
             await self.initialize()
         return await self._assertion_store().sweep_expired_governed_artifacts(
-            now=now, limit=limit
+            limit=limit
         )
 
     async def governed_semantic_artifact_erasure_observation(self, *, expected_generation: int):
