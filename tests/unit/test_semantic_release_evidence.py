@@ -1395,6 +1395,47 @@ def test_disposable_postgres_closes_admin_connection_when_creation_fails(
     assert connection.closed is True
 
 
+@pytest.mark.parametrize("failure_point", ("factory", "temporary_directory"))
+def test_postgres_benchmark_closes_disposable_database_when_setup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    """A setup failure after DB creation must still drop the isolated DB."""
+    from kestrel_sovereign.knowledge import release_evidence_benchmarks as benchmarks
+
+    class DisposableDatabase:
+        dsn = "postgresql://isolated/kestrel_semantic_release_0123456789abcdef0123456789abcdef"
+        closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    database = DisposableDatabase()
+
+    async def create() -> DisposableDatabase:
+        return database
+
+    monkeypatch.setattr(
+        benchmarks.DisposablePostgresDatabase,
+        "create",
+        staticmethod(create),
+    )
+    if failure_point == "factory":
+        def fail_factory(*_args, **_kwargs):
+            raise RuntimeError("factory failed")
+
+        monkeypatch.setattr(benchmarks, "_IsolatedStorageFactory", fail_factory)
+    else:
+        def fail_temporary_directory(*_args, **_kwargs):
+            raise OSError("temporary directory failed")
+
+        monkeypatch.setattr(benchmarks, "TemporaryDirectory", fail_temporary_directory)
+
+    with pytest.raises((RuntimeError, OSError), match="failed"):
+        asyncio.run(benchmarks._run_benchmark(_gate("performance_startup_postgres_startup")))
+    assert database.closed is True
+
+
 @pytest.mark.parametrize(
     "shared_name",
     ("postgres", "template0", "template1", "kestrel", "kestrel_test", "test"),

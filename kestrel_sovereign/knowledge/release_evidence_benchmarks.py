@@ -222,12 +222,7 @@ async def _run_benchmark(spec: GateSpec) -> CatalogWorkloadResult:
         # invoking maintenance directly would misrepresent the mode.
         raise CatalogWorkloadUnavailable("kite_http_benchmark_runner_required")
     disposable_database: DisposablePostgresDatabase | None = None
-    if target.backend == "postgres":
-        disposable_database = await DisposablePostgresDatabase.create()
-    factory = _IsolatedStorageFactory(
-        target.backend,
-        postgres_dsn=disposable_database.dsn if disposable_database else None,
-    )
+    factory: _IsolatedStorageFactory | None = None
     current: _StorageSample | None = None
     sequence = 0
 
@@ -236,6 +231,7 @@ async def _run_benchmark(spec: GateSpec) -> CatalogWorkloadResult:
         if current is not None:
             raise ReleaseEvidenceError("semantic benchmark sample lifecycle is not isolated")
         sequence += 1
+        assert factory is not None
         current = await factory.open()
 
     async def operation() -> None:
@@ -259,16 +255,24 @@ async def _run_benchmark(spec: GateSpec) -> CatalogWorkloadResult:
 
     async def close_storage_growth_sample() -> None:
         nonlocal current
+        assert factory is not None
         await factory.close(current)
         current = None
 
     async def close_sample() -> None:
         nonlocal current
         if current is not None:
+            assert factory is not None
             await factory.close(current)
             current = None
 
     try:
+        if target.backend == "postgres":
+            disposable_database = await DisposablePostgresDatabase.create()
+        factory = _IsolatedStorageFactory(
+            target.backend,
+            postgres_dsn=disposable_database.dsn if disposable_database else None,
+        )
         harness = SemanticBenchmarkHarness(iterations=_BENCHMARK_ITERATIONS)
         if target.metric is PerformanceMetric.STORAGE_GROWTH:
             # ``operation`` closes after the write.  The SQLite file remains
@@ -292,8 +296,9 @@ async def _run_benchmark(spec: GateSpec) -> CatalogWorkloadResult:
             )
         return _benchmark_result(spec, run)
     finally:
-        await factory.close(current)
-        factory.dispose()
+        if factory is not None:
+            await factory.close(current)
+            factory.dispose()
         if disposable_database is not None:
             await disposable_database.close()
 
