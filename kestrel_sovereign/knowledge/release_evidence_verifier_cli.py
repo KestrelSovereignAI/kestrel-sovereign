@@ -10,10 +10,11 @@ from .release_evidence import ReleaseEvidenceError
 from .release_evidence_freshness import ExternalFreshnessLedger
 from .release_evidence_verifier import (
     VerifierReceiptIdentity,
+    combine_external_envelope_submission,
     issue_verification_receipt,
     finalize_verified_artifacts,
     load_budgets,
-    load_external_report,
+    load_external_envelope,
     load_records,
     read_verifier_configuration,
     prepare_trusted_evidence,
@@ -33,7 +34,11 @@ def main(argv: list[str] | None = None) -> int:
     assemble = commands.add_parser("assemble", help="verify evidence and issue a verifier receipt")
     assemble.add_argument("--record", type=Path, action="append", default=[])
     assemble.add_argument("--budget", type=Path, action="append", default=[])
-    assemble.add_argument("--external-report", type=Path, required=True)
+    assemble.add_argument(
+        "--external-envelope",
+        type=Path,
+        help="the exact signed parametric-self external-CI envelope; mutually exclusive with split external inputs",
+    )
     assemble.add_argument("--output", type=Path, required=True)
     assemble.add_argument("--receipt-output", type=Path, required=True)
     args = parser.parse_args(argv)
@@ -43,10 +48,17 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "issue-challenge":
             print(ledger.issue_challenge())
             return 0
-        report = load_external_report(args.external_report)
+        envelope = (
+            load_external_envelope(args.external_envelope)
+            if args.external_envelope is not None
+            else None
+        )
+        records, report = combine_external_envelope_submission(
+            records=load_records(args.record), envelope=envelope
+        )
         identity = VerifierReceiptIdentity.from_configuration(config)
         evidence = prepare_trusted_evidence(
-            records=load_records(args.record), budgets=load_budgets(args.budget), report=report,
+            records=records, budgets=load_budgets(args.budget), report=report,
             trust_policy=config.trust_policy,
             expected_evidence_runner_revision=config.expected_external_runner_revision,
         )

@@ -277,9 +277,11 @@ backend, mode, environment, fixture, and successful evidence digest.
 One release erasure drill has the catalog-defined content-free ID/digest
 `semantic_erasure_release_drill_v1`. Every required core stage and every
 external adapter stage must carry that same binding; a mismatched or omitted
-drill is rejected. The stages cover active assertions, derivations, vector
-index, recall candidates, exports, governed/future corpus output, projection
-candidates, and served eligibility.
+drill is rejected. Core records cover active assertions, derivations, vector
+index, recall candidates, exports, governed/future corpus output, and
+projection candidates. The parametric-self external-CI contract owns served
+adapter eligibility because only that adapter can observe its real serving
+state.
 
 The `export_snapshots`, `governed_corpus`, and `future_corpus` stage records
 must be backed by the tenant-scoped governed artifact lifecycle: an exact
@@ -292,14 +294,27 @@ evidence that a previously registered consumer artifact was deleted.
 
 `kestrel-feature-parametric-self` is an external optional consumer, not a
 dependency imported by this repository. Its report is absent from a new
-template and therefore remains a readiness blocker until it contains all of:
+template and therefore remains a readiness blocker until its envelope contains
+exactly four signed records in catalog order:
+
+- `erasure_served_adapter_eligibility` first, followed by
+  `external_corpus_consumed`, `external_candidate_invalidated`, and
+  `external_served_eligibility_rejected`;
+- the same verifier-issued nonce, external-CI runner revision, core contract
+  digest, and erasure drill binding on every record; and
+- each record's exact gate-spec digest, evidence-result digest, and artifact
+  reference/digest.
+
+The capability report inside that envelope remains intentionally narrower: it
+attests exactly the three `external_*` capability records, never the served
+adapter record. It must contain all of:
 
 - the exact repository, immutable capability source revision, and evidence
   runner revision;
 - an attestation for `external_corpus_consumed`,
   `external_candidate_invalidated`, and
-  `external_served_eligibility_rejected`;
-- each stage's exact gate-spec digest, evidence-result digest, artifact
+  `external_served_eligibility_rejected` only;
+- those three stages' exact gate-spec digest, evidence-result digest, artifact
   reference/digest, and common drill binding; and
 - the exact core release-evidence contract digest and a new 64-hex run nonce;
   and
@@ -334,7 +349,7 @@ independent verifier calls `ExternalFreshnessLedger.issue_challenge()` and
 persists its one-time nonce as `pending`; it sends that challenge to external
 CI over its authenticated control plane. External CI must bind the exact nonce
 into every external `EvidenceRecord` run digest before signing it, then bind it
-in the report. Trusted ingestion verifies all three record nonces match the
+in the report. Trusted ingestion verifies all four record nonces against the
 report and atomically marks the challenge `consumed` while recording the
 core-derived receipt. Unknown, reused, and merely rewrapped nonces are
 rejected, so old signed records cannot become a fresh report.
@@ -389,22 +404,24 @@ also covers both serialized payload digests and their verifier-rooted target
 paths. The public `assemble` command remains structural and
 cannot issue challenges, consume a ledger, emit a receipt, or set `ready: true`.
 
-An external report is supplied as safe structured JSON—never as pre-populated
-metadata—and is structurally checked against the locally assembled stage
-records:
+External CI writes one signed envelope. The verifier-only CLI parses that
+exact envelope schema, rejects split external records or reports beside it,
+and structurally checks every enclosed record against the local catalog before
+freshness consumption:
 
 ```bash
-uv run python -m kestrel_sovereign.knowledge.release_evidence assemble \
-  --record /tmp/external-corpus-consumed.json \
-  --record /tmp/external-candidate-invalidated.json \
-  --record /tmp/external-served-eligibility-rejected.json \
-  --external-report /tmp/parametric-self-erasure-report.json \
-  --output /tmp/semantic-release-evidence.json
+uv run python -m kestrel_sovereign.knowledge.release_evidence_verifier_cli assemble \
+  --record /tmp/core-release-record.json \
+  --budget /tmp/core-performance-budget.json \
+  --external-envelope /tmp/parametric-self-erasure-envelope.json \
+  --output /secure/verifier/semantic-release-evidence.json \
+  --receipt-output /secure/verifier/semantic-release-receipt.json
 ```
 
-Missing stages, another repository/revision, a different result, a different
-artifact, or a different drill remains rejected rather than being narrated as
-evidence.
+The verifier still requires every required core record and budget; the command
+above abbreviates those repeated core inputs. Missing, duplicated, or
+substituted served evidence; another repository/revision; a different result,
+artifact, or drill remains rejected rather than being narrated as evidence.
 
 ## Content-free diagnostics and Kite HTTP proof
 
