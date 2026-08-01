@@ -1193,6 +1193,37 @@ remediation; it cannot claim to untrain that model, but the model registry must
 expose the affected *non-identifying* remediation case and require an explicit
 decision.
 
+### Governed export and corpus artifact lifecycle
+
+Every Kestrel-controlled export snapshot, corpus manifest, and future-corpus
+candidate is registered **before** a consumer may serve or generate from it.
+The registry records its tenant, random artifact handle, consumer owner, exact
+current `(assertion_id, revision_id)` lineage, policy/capability pins, retained
+artifact digest, expiry, and canonical checkpoint. Registration occurs under
+the same tenant mutation fence as the assertion store: each pair must be an
+active, eligible current revision at the exact checkpoint, so an old in-memory
+export cannot become a newly registered stale artifact.
+
+Serving requires the artifact to remain active, unexpired, and generation
+fenced to the current tenant generation. A supersession, retraction,
+quarantine, lifecycle deletion, or privacy erasure that touches any registered
+assertion immediately removes the controlled artifact and its lineage in the
+canonical transaction. It creates one fresh opaque revocation item for the
+registered consumer. The consumer claims a short lease and must acknowledge
+physical deletion with a content-free deletion-proof digest; an expired lease
+is retried. No acknowledgement means revocation remains pending and no
+Kestrel-controlled serving/generation is allowed. A new empty export, Story
+Archive timeline output, or unrelated corpus is never evidence that this
+controlled artifact was removed.
+
+After invalidation, durable revocation/replay receipts keep only a blinded
+artifact key, random revocation ID, artifact class, consumer ownership,
+generation, timestamps, and aggregate state. They retain no artifact handle,
+assertion ID, revision ID, source locator, source digest, or exported content.
+Erasure observations are generation-fenced aggregates for `export_snapshot`,
+`corpus_manifest`, and `future_corpus_candidate` plus pending/completed
+revocation counts; they are not an enumeration API.
+
 ## Privacy and security boundary
 
 The semantic writer is a privacy-governed storage operation. It has no raw

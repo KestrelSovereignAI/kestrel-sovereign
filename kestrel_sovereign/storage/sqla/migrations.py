@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 
 _SEMANTIC_ASSERTION_SCHEMA_VERSION = "semantic_assertion_store_v5"
 _SEMANTIC_VECTOR_PROJECTION_SCHEMA_VERSION = "semantic_assertion_vector_projection_v2"
+_SEMANTIC_GOVERNED_ARTIFACT_SCHEMA_VERSION = "semantic_governed_artifact_lifecycle_v1"
 _SEMANTIC_VALIDATION_SCHEMA_VERSION = "semantic_validation_reports_v2_revision_links"
 _SEMANTIC_MAINTENANCE_SCHEMA_VERSION = "semantic_maintenance_v1"
 _SEMANTIC_MAINTENANCE_CURSOR_SCHEMA_VERSION = "semantic_maintenance_v2_cursor"
@@ -603,6 +604,91 @@ async def migrate_semantic_vector_projection(db: "AsyncDatabase") -> None:
         await db.execute(
             "INSERT INTO semantic_schema_migrations (version) VALUES (?)",
             (_SEMANTIC_VECTOR_PROJECTION_SCHEMA_VERSION,),
+        )
+
+
+async def migrate_semantic_governed_artifacts(db: "AsyncDatabase") -> None:
+    """Create the tenant-bound export/corpus artifact lifecycle registry."""
+    statements = (
+        """CREATE TABLE IF NOT EXISTS semantic_governed_artifacts (
+            tenant_id TEXT NOT NULL,
+            artifact_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            consumer_id TEXT NOT NULL,
+            checkpoint_generation INTEGER NOT NULL,
+            policy_pin TEXT NOT NULL,
+            capability_digest TEXT NOT NULL,
+            artifact_digest TEXT,
+            retention_expires_at TEXT NOT NULL,
+            state TEXT NOT NULL,
+            invalidated_generation INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, artifact_id),
+            CHECK (kind IN ('export_snapshot', 'corpus_manifest', 'future_corpus_candidate')),
+            CHECK (state IN ('active', 'revocation_pending', 'revoked', 'expired')),
+            CHECK (checkpoint_generation >= 0),
+            CHECK (invalidated_generation IS NULL OR invalidated_generation >= 0)
+        )""",
+        """CREATE TABLE IF NOT EXISTS semantic_governed_artifact_lineage (
+            tenant_id TEXT NOT NULL,
+            artifact_id TEXT NOT NULL,
+            assertion_id TEXT NOT NULL,
+            revision_id TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, artifact_id, assertion_id, revision_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS semantic_governed_artifact_revocations (
+            tenant_id TEXT NOT NULL,
+            revocation_id TEXT NOT NULL,
+            artifact_key TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            consumer_id TEXT NOT NULL,
+            attempt INTEGER NOT NULL DEFAULT 0,
+            lease_token TEXT,
+            lease_expires_at TEXT,
+            acknowledged_at TEXT,
+            deletion_proof_digest TEXT,
+            invalidated_generation INTEGER NOT NULL,
+            PRIMARY KEY (tenant_id, revocation_id),
+            CHECK (attempt >= 0),
+            CHECK (kind IN ('export_snapshot', 'corpus_manifest', 'future_corpus_candidate')),
+            CHECK (invalidated_generation >= 0)
+        )""",
+        """CREATE TABLE IF NOT EXISTS semantic_governed_artifact_receipts (
+            receipt_id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            artifact_key TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            state TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            receipt_digest TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            CHECK (kind IN ('export_snapshot', 'corpus_manifest', 'future_corpus_candidate')),
+            CHECK (state IN ('active', 'revocation_pending', 'revoked', 'expired')),
+            CHECK (generation >= 0)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_semantic_governed_artifact_lineage ON semantic_governed_artifact_lineage(tenant_id, assertion_id, revision_id)",
+        "CREATE INDEX IF NOT EXISTS idx_semantic_governed_artifact_state ON semantic_governed_artifacts(tenant_id, state, kind)",
+    )
+    async with _semantic_validation_migration_transaction(db):
+        if db.backend_type == "postgres":
+            await db.execute("SELECT pg_advisory_xact_lock(?)", (_semantic_assertion_lock_id(),))
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS semantic_schema_migrations "
+            "(version TEXT PRIMARY KEY)",
+            (),
+        )
+        existing = await db.fetchone(
+            "SELECT 1 FROM semantic_schema_migrations WHERE version = ?",
+            (_SEMANTIC_GOVERNED_ARTIFACT_SCHEMA_VERSION,),
+        )
+        if existing is not None:
+            return
+        for statement in statements:
+            await db.execute(statement, ())
+        await db.execute(
+            "INSERT INTO semantic_schema_migrations (version) VALUES (?)",
+            (_SEMANTIC_GOVERNED_ARTIFACT_SCHEMA_VERSION,),
         )
 
 

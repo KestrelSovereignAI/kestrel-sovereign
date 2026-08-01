@@ -132,9 +132,21 @@ if TYPE_CHECKING:
         SemanticRuntimeCapabilities,
         semantic_capabilities_from_config,
     )
+    from .artifact_lifecycle import (
+        ARTIFACT_LIFECYCLE_SCHEMA_VERSION,
+        GovernedArtifactErasureObservation,
+        GovernedArtifactError,
+        GovernedArtifactKind,
+        GovernedArtifactLineage,
+        GovernedArtifactReceipt,
+        GovernedArtifactRegistration,
+        GovernedArtifactRevocationLease,
+        GovernedArtifactState,
+    )
 
 __all__ = [
     "ArtifactPin",
+    "ARTIFACT_LIFECYCLE_SCHEMA_VERSION",
     "Assertion",
     "AssertionObject",
     "AssertionQuery",
@@ -209,6 +221,14 @@ __all__ = [
     "DEFAULT_SHACL_WRITE_POLICY",
     "GovernedShaclValidationService",
     "GovernedAssertionCorpusService",
+    "GovernedArtifactErasureObservation",
+    "GovernedArtifactError",
+    "GovernedArtifactKind",
+    "GovernedArtifactLineage",
+    "GovernedArtifactReceipt",
+    "GovernedArtifactRegistration",
+    "GovernedArtifactRevocationLease",
+    "GovernedArtifactState",
     "GovernedCorpusBudgetExceeded",
     "GovernedCorpusDelta",
     "GovernedCorpusError",
@@ -374,6 +394,20 @@ _CAPABILITY_CONFIGURATION_EXPORTS = frozenset(
     }
 )
 
+_ARTIFACT_LIFECYCLE_EXPORTS = frozenset(
+    {
+        "ARTIFACT_LIFECYCLE_SCHEMA_VERSION",
+        "GovernedArtifactErasureObservation",
+        "GovernedArtifactError",
+        "GovernedArtifactKind",
+        "GovernedArtifactLineage",
+        "GovernedArtifactReceipt",
+        "GovernedArtifactRegistration",
+        "GovernedArtifactRevocationLease",
+        "GovernedArtifactState",
+    }
+)
+
 _CORPUS_EXPORTS = frozenset(
     {
         "CORPUS_SCHEMA_VERSION",
@@ -415,6 +449,10 @@ def __getattr__(name: str):
         from . import capabilities
 
         return getattr(capabilities, name)
+    if name in _ARTIFACT_LIFECYCLE_EXPORTS:
+        from . import artifact_lifecycle
+
+        return getattr(artifact_lifecycle, name)
     if name in _CORPUS_EXPORTS:
         from . import corpus
 

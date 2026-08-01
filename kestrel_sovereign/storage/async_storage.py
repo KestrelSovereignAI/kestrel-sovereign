@@ -1890,6 +1890,43 @@ class AsyncStorage:
             await self.initialize()
         return await self._assertion_store().export_snapshot(query)
 
+    async def register_governed_semantic_artifact(self, registration):
+        """Seal a controlled semantic export/corpus artifact before serving it."""
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().register_governed_artifact(registration)
+
+    async def consume_governed_semantic_artifact(self, artifact_id, *, expected_generation: int):
+        """Generation-fenced guard for a previously sealed semantic artifact."""
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().consume_governed_artifact(
+            artifact_id, expected_generation=expected_generation
+        )
+
+    async def claim_governed_semantic_artifact_revocation(self, consumer_id, *, lease_seconds: float = 60.0):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().claim_governed_artifact_revocation(
+            consumer_id, lease_seconds=lease_seconds
+        )
+
+    async def acknowledge_governed_semantic_artifact_revocation(
+        self, consumer_id, lease, *, deletion_proof_digest: str,
+    ):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().acknowledge_governed_artifact_revocation(
+            consumer_id, lease, deletion_proof_digest=deletion_proof_digest
+        )
+
+    async def governed_semantic_artifact_erasure_observation(self, *, expected_generation: int):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().governed_artifact_erasure_observation(
+            expected_generation=expected_generation
+        )
+
     # --- RAG Operations ---
     
     async def chunk_document(self, content_hash: str) -> int:
