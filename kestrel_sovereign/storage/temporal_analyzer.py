@@ -16,6 +16,7 @@ from typing import List, Dict, Any, Optional
 
 from .memory_models import TemporalPattern
 from .async_database import AsyncDatabase
+from .session_grouping import timestamp_query_param
 
 logger = logging.getLogger(__name__)
 
@@ -373,7 +374,9 @@ class TemporalAnalyzer:
                         json.dumps(pattern.trigger_conditions),
                         pattern.confidence,
                         pattern.observations,
-                        datetime.now(timezone.utc),
+                        timestamp_query_param(
+                            self._db.backend_type, datetime.now(timezone.utc)
+                        ),
                         pattern.id,
                     )
                 )
@@ -393,8 +396,12 @@ class TemporalAnalyzer:
                         json.dumps(pattern.trigger_conditions),
                         pattern.confidence,
                         pattern.observations,
-                        datetime.now(timezone.utc),
-                        datetime.now(timezone.utc),
+                        timestamp_query_param(
+                            self._db.backend_type, datetime.now(timezone.utc)
+                        ),
+                        timestamp_query_param(
+                            self._db.backend_type, datetime.now(timezone.utc)
+                        ),
                     )
                 )
             saved += 1

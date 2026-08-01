@@ -3095,11 +3095,29 @@ async def get_bootstrap_key(request: Request):
         logger.warning(f"Auth key request from non-allowed host: {client_host}")
         raise HTTPException(status_code=403, detail="API key bootstrap only accessible from localhost")
 
-    return {
+    response = {
         "key": get_api_key(),
         "header": API_KEY_NAME,
         "usage": "Include as 'X-API-Key' header or 'Authorization: Bearer <key>'"
     }
+    # The public half is exposed only to the explicitly isolated Kite test
+    # process.  Ordinary bootstrap callers never learn about the evidence
+    # seam, and the signing module refuses to initialize without its private
+    # test-home trust anchor.
+    agent = getattr(app.state, "agent", None)
+    if agent is None:
+        manager = getattr(app.state, "agent_manager", None)
+        getter = getattr(manager, "get_agent", None)
+        agent = getter("kite") if callable(getter) else None
+    if (
+        bool(getattr(agent, "is_test_instance", False))
+        and os.environ.get("KESTREL_KITE_RELEASE_EVIDENCE", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    ):
+        from kestrel_sovereign.knowledge.kite_evidence_signing import kite_evidence_public_key
+
+        response["kite_evidence_public_key"] = kite_evidence_public_key()
+    return response
 
 
 @app.get("/health")

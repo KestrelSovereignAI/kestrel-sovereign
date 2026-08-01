@@ -1259,6 +1259,11 @@ class TestMemoryConsolidatorEpisodeCreation:
             f"Expected at least 1 episode from 5 unenriched messages, "
             f"got {len(episodes)}; skipped={skipped}"
         )
+        # asyncpg rejects ISO strings for TIMESTAMP parameters. The nightly
+        # consolidator must preserve the native timestamp through this query.
+        cutoff = mock_db.fetchall.await_args_list[0].args[1][1]
+        assert isinstance(cutoff, datetime)
+        assert cutoff.tzinfo is not None
 
     @pytest.mark.asyncio
     async def test_automatic_episode_summary_contains_conversation_topics(self, _now):

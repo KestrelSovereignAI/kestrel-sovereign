@@ -51,6 +51,201 @@ router = APIRouter(prefix="/api/agent", tags=["agent"])
 _INVALID_JSON_ESCAPE = re.compile(rb'\\([^"\\/bfnrtu])')
 
 LEGACY_CONTEXT_MODEL = "legacy/unknown"
+_KITE_EVIDENCE_CONTRACT = "kite-http-evidence-v1"
+_KITE_EVIDENCE_NONCE_RE = re.compile(r"^[0-9a-f]{64}$")
+_KITE_EVIDENCE_VALUE_RE = re.compile(r"^kite-evidence-[A-Za-z0-9_-]{20,128}$")
+
+
+def _kite_release_evidence_allowed(agent: Any) -> bool:
+    """Expose the fixed evidence seam only on an opted-in test agent."""
+    return bool(getattr(agent, "is_test_instance", False)) and os.environ.get(
+        "KESTREL_KITE_RELEASE_EVIDENCE", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _kite_evidence_error(message: str) -> ApiHTTPException:
+    return ApiHTTPException(status_code=400, code="invalid_kite_evidence_request", message=message)
+
+
+def _kite_evidence_signature(payload: dict[str, object]) -> str:
+    """Sign only the fixed, content-free typed envelope."""
+    from kestrel_sovereign.knowledge.kite_evidence_signing import sign_kite_evidence
+
+    return sign_kite_evidence(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
+
+
+def _kite_verified_runtime_semantic_selection(agent: Any) -> tuple[Any, Any]:
+    """Return the agent-bound semantic contract for the fixed recall probe.
+
+    The typed Kite route has no caller-provided semantic inputs.  Re-check the
+    already selected local profile and runtime pins at the operation boundary:
+    a test-only route must not turn an incomplete or stale draft selection
+    into a stable fallback.
+    """
+    from kestrel_sovereign.knowledge.capabilities import SemanticRuntimeCapabilities
+    from kestrel_sovereign.knowledge.inference import (
+        InferenceProfile,
+        validate_inference_profile,
+    )
+
+    profile = getattr(agent, "semantic_inference_profile", None)
+    capabilities = getattr(agent, "semantic_capabilities", None)
+    if not isinstance(profile, InferenceProfile) or not isinstance(
+        capabilities, SemanticRuntimeCapabilities
+    ):
+        raise RuntimeError(
+            "Kite paraphrase recall requires a locally verified runtime semantic selection"
+        )
+    try:
+        validate_inference_profile(profile)
+        capabilities.validate()
+        runtime_report = agent.storage.semantic_rdf_capability_report()
+    except (AttributeError, ValueError) as error:
+        raise RuntimeError(
+            "Kite paraphrase recall runtime semantic selection is unavailable"
+        ) from error
+    if not capabilities.rdf_runtime_matches(runtime_report):
+        raise RuntimeError(
+            "Kite paraphrase recall runtime semantic selection is unverified"
+        )
+    return profile, capabilities
+
+
+async def _kite_runtime_observation(
+    agent: Any, *, request_id: str, provenance: Any, request: object,
+) -> tuple[str, dict[str, object]]:
+    """Run one allowlisted test operation, never an assistant prompt.
+
+    The endpoint cannot select a storage method, query, artifact, or identity:
+    operation names are a closed set and the server owns the underlying call.
+    """
+    if not _kite_release_evidence_allowed(agent):
+        raise ApiHTTPException(status_code=404, code="not_found", message="Not found.")
+    if not isinstance(request, dict) or set(request).difference({"operation", "nonce", "value"}):
+        raise _kite_evidence_error("Invalid Kite evidence request.")
+    operation, nonce, value = request.get("operation"), request.get("nonce"), request.get("value")
+    if not isinstance(operation, str) or not _KITE_EVIDENCE_NONCE_RE.fullmatch(nonce if isinstance(nonce, str) else ""):
+        raise _kite_evidence_error("Invalid Kite evidence request.")
+    if operation == "save":
+        if not isinstance(value, str) or not _KITE_EVIDENCE_VALUE_RE.fullmatch(value):
+            raise _kite_evidence_error("Invalid Kite evidence value.")
+        command: str | None = f"!memory-save-fact user preferred_deploy_region {value}"
+    elif operation == "delete":
+        if value is not None:
+            raise _kite_evidence_error("Invalid Kite evidence request.")
+        command = "!memory-forget-fact user preferred_deploy_region"
+    elif operation == "diagnostics":
+        if value is not None:
+            raise _kite_evidence_error("Invalid Kite evidence request.")
+        command = None
+    elif operation == "quarantine":
+        if value is not None:
+            raise _kite_evidence_error("Invalid Kite evidence request.")
+        command = None
+    elif operation in {"sleep", "sleep_changed", "sleep_unchanged", "paraphrase_recall", "erasure_core_snapshot"}:
+        if value is not None:
+            raise _kite_evidence_error("Invalid Kite evidence request.")
+        command = None
+    else:
+        raise _kite_evidence_error("Invalid Kite evidence operation.")
+
+    from kestrel_sovereign.agent.invocation import invocation_scope
+    from kestrel_sovereign.knowledge.kite_evidence_signing import (
+        KiteEvidenceNonceReplay, KiteEvidenceSigningError, consume_kite_evidence_nonce,
+    )
+    try:
+        nonce_receipt = consume_kite_evidence_nonce(
+            nonce, issue_receipt=operation == "erasure_core_snapshot",
+        )
+    except KiteEvidenceNonceReplay as error:
+        raise ApiHTTPException(status_code=409, code="kite_evidence_nonce_replayed", message="Kite evidence nonce was already consumed.") from error
+    except KiteEvidenceSigningError as error:
+        raise RuntimeError("Kite evidence nonce ledger is unavailable") from error
+
+    with invocation_scope(request_id, provenance=provenance):
+        if operation in {"sleep", "sleep_changed", "sleep_unchanged"}:
+            report = await agent.sleep(tier="local", skip_export=True)
+            if getattr(report, "success", None) is not True:
+                raise RuntimeError("Kite sleep operation did not complete")
+            return operation, {"sleep_success_count": 1}
+        if operation == "paraphrase_recall":
+            profile, capabilities = _kite_verified_runtime_semantic_selection(agent)
+            maintenance = await agent.storage.run_semantic_maintenance(
+                profile,
+                inference_limits=getattr(agent, "semantic_inference_limits", None),
+                maintenance_limits=getattr(agent, "semantic_maintenance_limits", None),
+                semantic_capabilities=capabilities,
+            )
+            if getattr(getattr(maintenance, "status", None), "value", None) not in {"complete", "no_op"}:
+                raise RuntimeError("Kite paraphrase recall maintenance did not reach a terminal checkpoint")
+            recall = await agent.storage.semantic_recall_candidates(
+                query="Which region should the deployment use?", candidate_scan_limit=10,
+                inference_profile=profile,
+                inference_limits=getattr(agent, "semantic_inference_limits", None),
+                maintenance_limits=getattr(agent, "semantic_maintenance_limits", None),
+            )
+            hydrated = await agent.storage.hydrate_semantic_recall_candidates(
+                tuple(candidate.assertion.assertion_id for candidate in getattr(recall, "candidates", ())),
+                expected_checkpoint_generation=recall.checkpoint_generation,
+                inference_profile=profile,
+                inference_limits=getattr(agent, "semantic_inference_limits", None),
+                maintenance_limits=getattr(agent, "semantic_maintenance_limits", None),
+            )
+            if not hydrated or any(not candidate.source_occurrences for candidate in hydrated):
+                raise RuntimeError("Kite paraphrase recall did not hydrate provenance")
+            return operation, {"retrieval_count": len(hydrated), "provenance_check_count": len(hydrated)}
+        if operation == "erasure_core_snapshot":
+            from kestrel_sovereign.knowledge.kite_erasure_authority import (
+                KiteErasureDrillAuthorityError,
+                _issue_kite_erasure_drill_capability,
+                _typed_kite_erasure_endpoint_issuance_scope,
+            )
+
+            try:
+                with _typed_kite_erasure_endpoint_issuance_scope():
+                    capability = _issue_kite_erasure_drill_capability(
+                        nonce_receipt, operation=operation,
+                    )
+                    observation = await agent.storage.semantic_release_erasure_drill(
+                        capability=capability,
+                    )
+            except (KiteErasureDrillAuthorityError, KiteEvidenceSigningError) as error:
+                raise RuntimeError("Kite core erasure authority is unavailable") from error
+            if not isinstance(observation, dict):
+                raise RuntimeError("Kite core erasure drill is unavailable")
+            return operation, observation
+        if operation == "diagnostics":
+            observation = await agent.storage.semantic_release_kite_diagnostics(
+                operation_id=f"kite-diagnostics-{nonce}"
+            )
+            if not isinstance(observation, dict):
+                raise RuntimeError("Kite semantic diagnostics are unavailable")
+            return operation, observation
+        if operation == "quarantine":
+            observation = await agent.storage.semantic_release_kite_invalid_import_quarantine(
+                operation_id=f"kite-import-quarantine-{nonce}"
+            )
+            if observation != {"invalid_import_quarantine_count": 1}:
+                raise RuntimeError("Kite invalid import probe did not complete")
+            return operation, observation
+
+        task_manager = getattr(agent, "task_manager", None)
+        if task_manager is None:
+            raise RuntimeError("Kite runtime command dispatcher is unavailable")
+        raw = await task_manager.execute_command(command)
+    from kestrel_sovereign.features.base import is_flat_toolresult_envelope
+    if not is_flat_toolresult_envelope(raw) or raw.get("status") != "ok" or not isinstance(raw.get("data"), dict):
+        raise RuntimeError("Kite runtime command did not return a successful typed result")
+    data = raw["data"]
+    if operation == "save":
+        if data.get("saved") is not True:
+            raise RuntimeError("Kite runtime fact write did not complete")
+        return operation, {"fact_write_count": 1}
+    if operation == "delete":
+        if data.get("deleted") is not True:
+            raise RuntimeError("Kite runtime fact deletion did not complete")
+        return operation, {"fact_delete_count": 1}
+    raise RuntimeError("Kite runtime command operation was not recognized")
 
 
 def _privacy_transition_conflict() -> HTTPException:
@@ -166,8 +361,9 @@ async def invoke_agent(request: Request, http_response: Response):
         provider_override = data.get("provider")
         session_id = data.get("session_id")
         user_passphrase = data.get("user_passphrase")
+        kite_evidence_request = data.get("kite_evidence")
 
-        if user_input is None:
+        if user_input is None and not isinstance(kite_evidence_request, dict):
             raise ApiHTTPException(
                 status_code=400,
                 code="input_required",
@@ -194,6 +390,37 @@ async def invoke_agent(request: Request, http_response: Response):
             agent.register_active_request(request_id)
         else:
             agent._current_request_id = request_id
+
+        if isinstance(kite_evidence_request, dict):
+            if user_input not in (None, ""):
+                raise _kite_evidence_error("Kite evidence requests cannot include input.")
+            try:
+                operation, observation = await _kite_runtime_observation(
+                    agent,
+                    request_id=request_id,
+                    provenance=request_invocation_provenance(
+                        request, source_locator="POST:/api/agent/invoke#kite-release-evidence",
+                    ),
+                    request=kite_evidence_request,
+                )
+            finally:
+                agent._cleanup_cancelled_request(request_id)
+            nonce = kite_evidence_request.get("nonce")
+            assert isinstance(nonce, str)
+            signed = {
+                "contract": _KITE_EVIDENCE_CONTRACT,
+                "nonce": nonce,
+                "operation": operation,
+                "observation": observation,
+            }
+            http_response.headers["X-Request-ID"] = invocation_id_response_header(request_id)
+            return {
+                "response": "Kite runtime evidence operation complete.",
+                "session_id": None,
+                "model": None,
+                "provider": None,
+                "kite_evidence": {**signed, "signature": _kite_evidence_signature(signed)},
+            }
 
         # Pre-resolve the effective session_id so it can be returned to
         # the client. Without this, the frontend pane never learns the

@@ -292,6 +292,26 @@ the content-free proof digest.
 A fresh empty export, Story Archive timeline export, or unrelated corpus is not
 evidence that a previously registered consumer artifact was deleted.
 
+The core-erasure storage drill accepts no caller-selected operation ID or
+prefix-shaped correlation.  Only the authenticated typed loopback endpoint can
+exchange its durably committed, exact request nonce for an opaque one-shot
+authority.  That authority is bound to the endpoint's exact asyncio task, not
+merely task-local context (which child tasks inherit), and is bound to
+`erasure_core_snapshot` and its server-derived correlation, and consumed before
+the storage owner touches durable state.  Direct construction, a same-process
+call outside that endpoint scope, a malformed receipt, reuse, a cross-operation
+attempt, or a capability retained after the route returns is rejected; a
+cross-operation attempt burns the authority.  Non-erasure typed probes retain
+no capability receipt.  Consequently no lower-level storage call can be
+relabeled as core release evidence.
+
+Every catalog-created Kite home is an owner-managed temporary directory. Its
+`finally` cleanup runs after both successful and failed prepare/start/invoke
+attempts and removes the ephemeral SQLite database, signing key, nonce ledger,
+and child log. Only sanitized lifecycle diagnostics (catalog gate and backend)
+are retained by the parent process; no forensic home is kept with release
+evidence secrets or test data.
+
 `kestrel-feature-parametric-self` is an external optional consumer, not a
 dependency imported by this repository. Its report is absent from a new
 template and therefore remains a readiness blocker until its envelope contains
@@ -322,12 +342,18 @@ adapter record. It must contain all of:
 
 For this contract the immutable capability source is
 `KestrelSovereignAI/kestrel-feature-parametric-self` at
-`260ba985bcfdfab3dab1ea58da5b259057f3749f`. It describes the governed adapter
-runtime under test and is deliberately not the commit of the newer evidence
-emitter. The emitter supplies its own full 40-hex `evidence_runner_revision`:
-it must resolve a clean, verifiable VCS `HEAD` at runtime, is bound into every
-external record's signed run digest, and must equal the report field. Another
-capability revision, omitted runner revision, or runner/report mismatch
+`7aad9bb924f61434485e5eae22e61c95d3f97187`. It describes the governed adapter
+runtime under test. Run its standalone two-phase release CLI: prepare the
+candidate/served eligibility before core physical erasure, then observe the
+same drill after erasure. The current verifier policy pins the external CI
+runner to merged parametric-self PR #27 squash commit
+`761728de2617cf43033aa5bebcc1d66c923897c4`. That full 40-hex
+`evidence_runner_revision` must resolve a clean, verifiable VCS `HEAD` at
+runtime, is bound into every external record's signed run digest, and must
+equal both the envelope/report field and the verifier's expected runner
+revision. The capability-source baseline above remains distinct: it identifies
+the governed adapter contract under test, not the evidence emitter. Another
+capability revision, omitted runner revision, or runner/report/policy mismatch
 remains non-evidence even if its result fields look similar.
 
 The core contract pin is not a self-referential runtime Git SHA. It is a
@@ -446,6 +472,14 @@ provenance, contradiction/supersession, invalid-import quarantine, sleep,
 restart persistence, and post-delete non-recall. The release artifact records
 only the catalog-bound aggregate observation and approved artifact reference;
 the transcript remains in the isolated evidence environment.
+
+Kite has no public semantic-evidence command. Its fixed diagnostics and
+invalid-import probes are server-owned typed operations, available only to
+the loopback isolated test instance after bootstrap authentication, nonce
+consumption, and signed-response verification. They derive tenant scope,
+capability pins, active explicit-fact provenance, migration receipts, and the
+fixed validation budget in production storage code; callers supply none of
+those inputs and receive only aggregate counts.
 
 ## Compatibility retirement is an observed decision
 

@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import os
 import tempfile
+import json
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -27,6 +29,7 @@ import pytest_asyncio
 
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
+from kestrel_sovereign.storage.session_grouping import timestamp_query_param
 
 
 pytestmark = pytest.mark.asyncio
@@ -49,6 +52,125 @@ async def _insert_episode(db, ep_id, title, summary, *, agent_id="agent-p2"):
         (ep_id, agent_id, title, summary),
     )
     await db.commit()
+
+
+async def _insert_conversation(
+    db, content: str, created_at: str, metadata: dict[str, object], *, agent_id: str
+) -> int:
+    """Insert a history row with a deliberately chosen legacy timestamp form."""
+    await db.execute(
+        """INSERT INTO conversation_history
+           (agent_id, role, content, metadata, created_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (agent_id, "user", content, json.dumps(metadata), created_at),
+    )
+    row = await db.fetchone("SELECT last_insert_rowid()")
+    assert row is not None
+    return int(row[0])
+
+
+class _FrozenDateTime(datetime):
+    """A deterministic UTC clock while preserving real SQLite database I/O."""
+
+    value = datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc)
+
+    @classmethod
+    def now(cls, tz=None):
+        if tz is None:
+            return cls.value.replace(tzinfo=None)
+        return cls.value.astimezone(tz)
+
+
+async def test_consolidator_sqlite_cutoffs_normalize_mixed_timestamp_forms(
+    db, monkeypatch: pytest.MonkeyPatch
+):
+    """Nightly episode, pattern, and session cutoffs share one SQLite boundary.
+
+    The database deliberately contains the same cutoff day in SQL text and
+    ISO ``T``/``Z`` text. Each real storage query must exclude its strict
+    cutoff row and include only later rows, without binding an aware datetime
+    through SQLite's deprecated implicit adapter.
+    """
+    import kestrel_sovereign.storage.memory_consolidator as consolidator_module
+
+    monkeypatch.setattr(consolidator_module, "datetime", _FrozenDateTime)
+    assert timestamp_query_param("sqlite", _FrozenDateTime.value) == (
+        "2026-07-31T12:00:00+00:00"
+    )
+    assert await db.fetchone(
+        "SELECT julianday(?)", (timestamp_query_param("sqlite", _FrozenDateTime.value),)
+    )
+
+    # 30-day episode cutoff: only the three post-cutoff ISO rows may form the
+    # episode. The exact SQL-text boundary and the earlier ISO row stay out.
+    episode_agent = "agent-cutoff-episodes"
+    await _insert_conversation(
+        db, "episode at boundary", "2026-07-01 12:00:00", {}, agent_id=episode_agent
+    )
+    await _insert_conversation(
+        db, "episode before boundary", "2026-07-01T11:59:59Z", {}, agent_id=episode_agent
+    )
+    episode_ids = [
+        await _insert_conversation(
+            db,
+            f"episode after boundary {index}",
+            f"2026-07-01T12:00:0{index}Z",
+            {},
+            agent_id=episode_agent,
+        )
+        for index in range(1, 4)
+    ]
+    episodes, skipped = await MemoryConsolidator(db, episode_agent)._create_episodes()
+    assert not skipped
+    assert len(episodes) == 1
+    assert episodes[0].key_message_ids == [str(value) for value in episode_ids]
+
+    # 90-day pattern cutoff: five post-boundary rows yield a single morning
+    # pattern. Five exact/before-boundary late-night rows must not contribute.
+    pattern_agent = "agent-cutoff-patterns"
+    for index in range(5):
+        await _insert_conversation(
+            db,
+            f"pattern excluded {index}",
+            "2026-05-02 12:00:00" if index == 0 else f"2026-05-02T11:59:5{index}Z",
+            {"time_of_day": "late_night"},
+            agent_id=pattern_agent,
+        )
+        await _insert_conversation(
+            db,
+            f"pattern included {index}",
+            f"2026-05-02T12:00:0{index + 1}Z",
+            {"time_of_day": "morning"},
+            agent_id=pattern_agent,
+        )
+    patterns = await MemoryConsolidator(db, pattern_agent)._detect_patterns()
+    assert [(pattern.pattern_type, pattern.observations) for pattern in patterns] == [
+        ("time_preference", 5),
+    ]
+    assert patterns[0].trigger_conditions["time_of_day"] == "morning"
+
+    # Session fallback has no prior episode and therefore uses its 24-hour
+    # cutoff. It must apply the same canonical strict comparison.
+    session_agent = "agent-cutoff-session"
+    await _insert_conversation(
+        db, "session at boundary", "2026-07-30 12:00:00", {}, agent_id=session_agent
+    )
+    await _insert_conversation(
+        db, "session before boundary", "2026-07-30T11:59:59Z", {}, agent_id=session_agent
+    )
+    session_ids = [
+        await _insert_conversation(
+            db,
+            f"session after boundary {index}",
+            f"2026-07-30T12:00:0{index}Z",
+            {},
+            agent_id=session_agent,
+        )
+        for index in range(1, 4)
+    ]
+    session = await MemoryConsolidator(db, session_agent).create_session_episode(force=True)
+    assert session is not None
+    assert session.key_message_ids == [str(value) for value in session_ids]
 
 
 # --------------------------------------------------------------------------

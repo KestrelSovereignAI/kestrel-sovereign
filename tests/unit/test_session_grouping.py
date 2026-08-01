@@ -8,9 +8,12 @@ session boundaries and the agent can soft-delete the wrong conversation.
 from datetime import datetime, timedelta, timezone
 
 from kestrel_sovereign.storage.session_grouping import (
+    canonical_timestamp_sql,
     coerce_session_timestamp,
     coalesce_sessions_by_session_id,
     group_messages_into_sessions,
+    timestamp_predicate,
+    timestamp_query_param,
 )
 
 BASE = datetime(2026, 6, 29, 12, 0, 0)
@@ -156,6 +159,21 @@ def test_timestamp_coercion_normalizes_iso_offsets_to_naive_utc():
         datetime(2026, 6, 29, 7, 0, 0, tzinfo=timezone(timedelta(hours=-5)))
     ) == expected
     assert coerce_session_timestamp("not-a-date") is None
+
+
+def test_timestamp_sql_boundary_normalizes_sqlite_and_preserves_postgres_binds():
+    aware = datetime(2026, 6, 29, 7, 0, 0, tzinfo=timezone(timedelta(hours=-5)))
+
+    assert canonical_timestamp_sql("sqlite", "created_at") == "julianday(created_at)"
+    assert timestamp_predicate("sqlite", "created_at", ">") == (
+        "julianday(created_at) > julianday(?)"
+    )
+    assert timestamp_query_param("sqlite", aware) == "2026-06-29T12:00:00+00:00"
+
+    postgres_bound = timestamp_query_param("postgres", aware)
+    assert postgres_bound == datetime(2026, 6, 29, 12, 0, 0)
+    assert postgres_bound.tzinfo is None
+    assert timestamp_predicate("postgres", "created_at", ">") == "created_at > ?"
 
 
 def test_grouping_safely_mixes_naive_and_aware_timestamp_shapes():
