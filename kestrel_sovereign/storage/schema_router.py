@@ -251,6 +251,11 @@ _NEGATION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Reminder cues that CONTAIN a negation token but are positive commitments.
+_POSITIVE_CUE_RE = re.compile(
+    r"\b(?:don'?t|never)\s+forget\s+to\b|\bremind me to\b", re.IGNORECASE
+)
+
 # Trailing filler marks the clause as musing rather than committing.
 _FILLER_TAIL_RE = re.compile(
     r"\b(?:or\s+(?:what|something|whatever|anything)|i\s+guess|i\s+suppose|"
@@ -271,14 +276,28 @@ def _is_committing_clause(content: str, match, text: str) -> bool:
     """Whether a raw pattern hit is a real commitment worth persisting.
 
     Rejects the three shapes that produced the observed false positives: an
-    interrogative sentence, a negated clause, and a clause trailing off into
-    filler.
+    interrogative sentence, a negated commitment, and a clause trailing off
+    into filler.
     """
+    matched = match.group(0)
     sentence = _enclosing_sentence(content, match.start(), match.end())
+
+    # Interrogation is a property of the whole sentence.
     if sentence.rstrip().endswith("?"):
         return False
-    if _NEGATION_RE.search(sentence):
+
+    # Negation is a property of THIS commitment, not the sentence. Two things
+    # go wrong with a sentence-wide veto (codex review r1):
+    #   * "Don't forget to submit the report" — the reminder cue contains its
+    #     own "don't", so the guard would veto the very pattern written to
+    #     catch it;
+    #   * "I don't need to deploy, but I will restart the host" — an unrelated
+    #     negated clause would drop a genuine commitment.
+    # Positive reminder cues are exempt outright; everything else is checked
+    # against the matched span only.
+    if not _POSITIVE_CUE_RE.search(matched) and _NEGATION_RE.search(matched):
         return False
+
     if _FILLER_TAIL_RE.search(text):
         return False
     return True
@@ -314,7 +333,17 @@ class ActionItemExtractor:
     """
 
     def extract(self, content: str) -> List[str]:
-        items: List[str] = []
+        return [text for text, _evidence in self.extract_with_evidence(content)]
+
+    def extract_with_evidence(self, content: str) -> List[Tuple[str, str]]:
+        """Extracted items paired with the raw span that matched.
+
+        The captured text has the cue stripped ("TODO: ship it" -> "ship it"),
+        so confidence scored from the capture alone can never see the strongest
+        evidence there is (codex review r1). Callers that persist confidence
+        must use this, not :meth:`extract`.
+        """
+        items: List[Tuple[str, str]] = []
         seen: set[str] = set()
         for pattern in ACTION_ITEM_PATTERNS:
             for match in re.finditer(pattern, content, flags=re.IGNORECASE):
@@ -327,7 +356,7 @@ class ActionItemExtractor:
                 if key in seen:
                     continue
                 seen.add(key)
-                items.append(text)
+                items.append((text, match.group(0)))
         return items
 
 
@@ -483,7 +512,7 @@ class SchemaRouter:
 
         # 1. Action items (graph nodes)
         try:
-            items = self.action_extractor.extract(content)
+            items = self.action_extractor.extract_with_evidence(content)
             if items:
                 await self._persist_action_items(items, message_id, epistemic)
                 summary["action_items"] = len(items)
@@ -530,7 +559,11 @@ class SchemaRouter:
         (message, text). No separate table, no separate migration.
         """
         now_iso = datetime.now(timezone.utc).isoformat()
-        for text in items:
+        for item in items:
+            # Items arrive as (text, matched-span) so confidence can see the
+            # cue that extraction stripped (codex review r1). Tolerate a bare
+            # string for any caller still on the older shape.
+            text, evidence = item if isinstance(item, tuple) else (item, "")
             node_id = _deterministic_action_node_id(self.agent_id, message_id, text)
 
             # Preserve existing status / assignee / due_date if the node
@@ -544,7 +577,7 @@ class SchemaRouter:
                 "status": existing_props.get("status", "pending"),
                 "assignee_concept_id": existing_props.get("assignee_concept_id"),
                 "due_date": existing_props.get("due_date"),
-                "confidence": claim_confidence(text),
+                "confidence": claim_confidence(text, evidence),
                 "source_message_id": message_id,
                 "agent_id": self.agent_id,
                 "created_at": existing_props.get("created_at", now_iso),

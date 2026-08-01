@@ -113,3 +113,102 @@ class TestProductionFalsePositivesAreGone:
     def test_be_precise_fragment_is_rejected(self):
         content = "Can you be precise about why? I'd like to understand."
         assert not any("precise about why" in i for i in _items(content))
+
+
+# ---------------------------------------------------------------------------
+# codex review r1
+# ---------------------------------------------------------------------------
+
+class TestNegationVetoIsScopedToTheCommitment:
+    """A sentence-wide negation veto broke more than it fixed."""
+
+    def test_dont_forget_to_survives_its_own_negation_token(self):
+        """The reminder cue literally contains 'don't'."""
+        assert _items("Don't forget to submit the report.") == ["submit the report"]
+
+    def test_unrelated_negated_clause_does_not_veto_a_real_commitment(self):
+        items = _items("I don't need to deploy, but I will restart the host.")
+        assert any("restart the host" in i for i in items), items
+
+    def test_the_negated_clause_itself_is_still_rejected(self):
+        assert not any("deploy" in i for i in _items("I don't need to deploy."))
+
+
+class TestConfidenceOnTheProductionPath:
+    """The earlier test passed `source=` by hand and never exercised routing.
+
+    Extraction strips the cue ("TODO: ship it" -> "ship it"), so scoring the
+    capture alone can never see the strongest evidence — the persisted value
+    stayed 0.7 no matter what.
+    """
+
+    def test_extractor_carries_the_matched_span(self):
+        pairs = ActionItemExtractor().extract_with_evidence("TODO: ship the fix")
+        assert pairs, "nothing extracted"
+        text, evidence = pairs[0]
+        assert text == "ship the fix"
+        assert "TODO" in evidence, "cue lost before confidence can see it"
+
+    def test_strong_cue_scores_strong_via_the_carried_evidence(self):
+        pairs = ActionItemExtractor().extract_with_evidence("TODO: ship the fix")
+        text, evidence = pairs[0]
+        assert claim_confidence(text, evidence) == STRONG_CLAIM_CONFIDENCE
+
+    def test_bare_promise_stays_default_via_the_carried_evidence(self):
+        pairs = ActionItemExtractor().extract_with_evidence("I'll ship the fix")
+        text, evidence = pairs[0]
+        assert claim_confidence(text, evidence) == DEFAULT_CLAIM_CONFIDENCE
+
+    def test_reminder_cue_scores_strong_end_to_end(self):
+        pairs = ActionItemExtractor().extract_with_evidence("Remind me to call Gabi")
+        text, evidence = pairs[0]
+        assert claim_confidence(text, evidence) == STRONG_CLAIM_CONFIDENCE
+
+    def test_extract_still_returns_plain_strings(self):
+        """The legacy shape stays intact for existing callers."""
+        assert ActionItemExtractor().extract("TODO: ship the fix") == ["ship the fix"]
+
+
+@pytest.mark.asyncio
+class TestPersistedConfidenceIsReal:
+    """Drive the actual persistence path.
+
+    The tests above check `extract_with_evidence` and `claim_confidence`
+    separately, which a mutation proved is not enough: reverting the persist
+    call to `claim_confidence(text)` left every one of them green while the
+    stored value silently went back to a constant. Assert what lands on the
+    node.
+    """
+
+    async def _persisted(self, content):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from kestrel_sovereign.storage.schema_router import SchemaRouter
+
+        router = SchemaRouter.__new__(SchemaRouter)
+        router.agent_id = "did:test:agent"
+        router.graph = MagicMock()
+        router.graph.get_node = AsyncMock(return_value=None)
+        router.graph.add_node = AsyncMock()
+        router.graph.add_edge = AsyncMock()
+
+        items = ActionItemExtractor().extract_with_evidence(content)
+        await router._persist_action_items(items, message_id=1, epistemic=None)
+        return [c.args[0] for c in router.graph.add_node.await_args_list]
+
+    async def test_explicit_todo_persists_strong_confidence(self):
+        nodes = await self._persisted("TODO: ship the fix")
+        assert nodes, "nothing persisted"
+        assert nodes[0].properties["confidence"] == STRONG_CLAIM_CONFIDENCE
+
+    async def test_bare_promise_persists_default_confidence(self):
+        nodes = await self._persisted("I'll ship the fix")
+        assert nodes, "nothing persisted"
+        assert nodes[0].properties["confidence"] == DEFAULT_CLAIM_CONFIDENCE
+
+    async def test_persisted_confidence_is_not_a_constant(self):
+        strong = (await self._persisted("TODO: ship the fix"))[0]
+        weak = (await self._persisted("I'll ship the fix"))[0]
+        assert (
+            strong.properties["confidence"] != weak.properties["confidence"]
+        ), "persisted confidence carries no information"
