@@ -320,6 +320,38 @@ def test_core_erasure_rejects_a_non_dual_backend_catalog_contract() -> None:
         asyncio.run(workloads._core_erasure_workload(sqlite_only, lambda _gate, _storage: None))
 
 
+@pytest.mark.parametrize("fails", (False, True))
+def test_owned_catalog_harness_removes_ephemeral_home_on_success_and_failure(
+    monkeypatch: pytest.MonkeyPatch, fails: bool,
+) -> None:
+    """No catalog-owned SQLite DB, key, nonce ledger, or log survives a run."""
+    harness = workloads._owned_catalog_harness(KiteGate.STABLE_ONLY, KiteStorageConfig())
+    temporary_root = harness.config.home.parent
+
+    def prepare() -> None:
+        harness.config.home.mkdir()
+        for name in (
+            "kite-evidence.sqlite3",
+            ".kite-evidence-ed25519.key",
+            ".kite-evidence-nonces.sqlite3",
+            "kite-evidence.log",
+        ):
+            (harness.config.home / name).write_text("transient", encoding="utf-8")
+
+    monkeypatch.setattr(harness, "prepare", prepare)
+    monkeypatch.setattr(harness, "start", lambda: None)
+    if fails:
+        def fail(_harness) -> None:
+            raise KiteEvidenceError("forced owned harness failure")
+
+        with pytest.raises(KiteEvidenceError, match="forced owned harness failure"):
+            workloads._run_with_owned_harness(harness, fail)
+    else:
+        assert workloads._run_with_owned_harness(harness, lambda _harness: "complete") == "complete"
+
+    assert not temporary_root.exists()
+
+
 def test_kite_postgres_child_receives_only_the_disposable_authority_dsn(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

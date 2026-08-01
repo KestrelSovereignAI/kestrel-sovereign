@@ -12,6 +12,7 @@ home, port, DSN, or observation.
 from __future__ import annotations
 
 from collections.abc import Callable
+import logging
 import math
 from pathlib import Path
 import socket
@@ -36,6 +37,7 @@ from .release_evidence_models import ErasureStage
 
 
 KiteHarnessFactory = Callable[[KiteGate, KiteStorageConfig], KiteHttpHarness]
+logger = logging.getLogger(__name__)
 
 _LIVE_GATE_BY_ID = {
     "kite_http_stable_only_release_drill": KiteGate.STABLE_ONLY,
@@ -44,28 +46,58 @@ _LIVE_GATE_BY_ID = {
 }
 
 
+def _dispose_owned_harness(harness: KiteHttpHarness) -> None:
+    """Remove a catalog-created home without requiring fake harnesses to know it."""
+    cleanup = getattr(harness, "cleanup_owned_home", None)
+    if callable(cleanup):
+        cleanup()
+
+
+def _log_ephemeral_harness_cleanup(harness: KiteHttpHarness) -> None:
+    """Emit only catalog metadata when an ephemeral run fails."""
+    config = getattr(harness, "config", None)
+    gate = getattr(getattr(config, "gate", None), "value", "unknown")
+    backend = getattr(getattr(config, "storage", None), "backend", "unknown")
+    logger.info(
+        "Kite catalog harness failed; removing ephemeral home",
+        extra={"kite_gate": gate, "kite_backend": backend},
+    )
+
+
 def _run_with_owned_harness(harness: KiteHttpHarness, callback):
     """Own the isolated lifecycle even when an evidence operation fails."""
-    harness.prepare()
-    harness.start()
     try:
+        harness.prepare()
+        harness.start()
         return callback(harness)
+    except BaseException:
+        _log_ephemeral_harness_cleanup(harness)
+        raise
     finally:
-        harness.stop()
+        try:
+            harness.stop()
+        finally:
+            _dispose_owned_harness(harness)
 
 
 async def _run_with_owned_postgres_harness(harness: KiteHttpHarness, callback):
     """Seed the fresh test identity before starting an owned PostgreSQL host."""
-    harness.prepare()
     try:
+        harness.prepare()
         seed_identity = getattr(harness, "seed_disposable_postgres_test_identity", None)
         if not callable(seed_identity):
             raise ReleaseEvidenceError("Kite PostgreSQL harness lacks the isolated identity seed")
         await seed_identity()
         harness.start()
         return callback(harness)
+    except BaseException:
+        _log_ephemeral_harness_cleanup(harness)
+        raise
     finally:
-        harness.stop()
+        try:
+            harness.stop()
+        finally:
+            _dispose_owned_harness(harness)
 
 
 async def _dual_backend_observations(
@@ -246,6 +278,18 @@ def kite_http_workloads(factory: KiteHarnessFactory) -> dict[tuple[str, str], Ca
     return workloads
 
 
+class _OwnedCatalogKiteHttpHarness(KiteHttpHarness):
+    """A harness whose fresh parent is removed after every catalog attempt."""
+
+    def __init__(self, config: KiteIsolationConfig, temporary_root) -> None:
+        super().__init__(config)
+        self.__temporary_root = temporary_root
+
+    def cleanup_owned_home(self) -> None:
+        """Erase the isolated home, including its DB, keys, nonce ledger, and log."""
+        self.__temporary_root.cleanup()
+
+
 def _owned_catalog_harness(gate: KiteGate, storage: KiteStorageConfig) -> KiteHttpHarness:
     """Create the one local-only harness accepted by the immutable catalog.
 
@@ -261,12 +305,19 @@ def _owned_catalog_harness(gate: KiteGate, storage: KiteStorageConfig) -> KiteHt
         reservation.bind(("127.0.0.1", 0))
         port = int(reservation.getsockname()[1])
     # ``prepare`` requires the actual home to be absent so it can reject a
-    # reused agent state.  Keep a separate private parent for later forensic
-    # inspection of the owned process's content-free log and marker.
-    home = Path(tempfile.mkdtemp(prefix="kestrel-kite-release-")) / "home"
-    return KiteHttpHarness(
-        KiteIsolationConfig(worktree=worktree, home=home, port=port, gate=gate, storage=storage)
-    )
+    # reused agent state. The catalog owns its parent and removes it in a
+    # finally block, including the transient SQLite DB, key, nonce ledger, and
+    # child log. Failures retain only the sanitized lifecycle log above.
+    temporary_root = tempfile.TemporaryDirectory(prefix="kestrel-kite-release-")
+    home = Path(temporary_root.name) / "home"
+    try:
+        config = KiteIsolationConfig(
+            worktree=worktree, home=home, port=port, gate=gate, storage=storage,
+        )
+        return _OwnedCatalogKiteHttpHarness(config, temporary_root)
+    except BaseException:
+        temporary_root.cleanup()
+        raise
 
 
 def owned_kite_http_workloads() -> dict[tuple[str, str], CatalogWorkload]:

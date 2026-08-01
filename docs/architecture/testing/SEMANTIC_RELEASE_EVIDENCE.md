@@ -295,7 +295,8 @@ evidence that a previously registered consumer artifact was deleted.
 The core-erasure storage drill accepts no caller-selected operation ID or
 prefix-shaped correlation.  Only the authenticated typed loopback endpoint can
 exchange its durably committed, exact request nonce for an opaque one-shot
-authority.  That authority is task-local to the endpoint, bound to
+authority.  That authority is bound to the endpoint's exact asyncio task, not
+merely task-local context (which child tasks inherit), and is bound to
 `erasure_core_snapshot` and its server-derived correlation, and consumed before
 the storage owner touches durable state.  Direct construction, a same-process
 call outside that endpoint scope, a malformed receipt, reuse, a cross-operation
@@ -303,6 +304,13 @@ attempt, or a capability retained after the route returns is rejected; a
 cross-operation attempt burns the authority.  Non-erasure typed probes retain
 no capability receipt.  Consequently no lower-level storage call can be
 relabeled as core release evidence.
+
+Every catalog-created Kite home is an owner-managed temporary directory. Its
+`finally` cleanup runs after both successful and failed prepare/start/invoke
+attempts and removes the ephemeral SQLite database, signing key, nonce ledger,
+and child log. Only sanitized lifecycle diagnostics (catalog gate and backend)
+are retained by the parent process; no forensic home is kept with release
+evidence secrets or test data.
 
 `kestrel-feature-parametric-self` is an external optional consumer, not a
 dependency imported by this repository. Its report is absent from a new

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -42,13 +43,17 @@ def test_erasure_authority_rejects_direct_construction_and_same_process_issuance
 
     with pytest.raises(TypeError, match="typed evidence endpoint"):
         KiteErasureDrillCapability()
-    with pytest.raises(KiteErasureDrillAuthorityError, match="typed endpoint"):
+    with pytest.raises(KiteErasureDrillAuthorityError, match="endpoint task"):
         _issue_kite_erasure_drill_capability(
             _receipt("a" * 64), operation=ERASURE_CORE_SNAPSHOT_OPERATION,
         )
+    with pytest.raises(KiteErasureDrillAuthorityError, match="active endpoint task"):
+        with _typed_kite_erasure_endpoint_issuance_scope():
+            pass
 
 
-def test_erasure_authority_is_exactly_bound_burned_and_route_scoped(
+@pytest.mark.asyncio
+async def test_erasure_authority_is_exactly_bound_burned_and_route_scoped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _enabled_home(monkeypatch, tmp_path)
@@ -76,13 +81,62 @@ def test_erasure_authority_is_exactly_bound_burned_and_route_scoped(
         )
     assert binding.operation_id == f"kite-erasure-{'c' * 64}"
     assert len(binding.correlation) == 64
-    with pytest.raises(KiteErasureDrillAuthorityError, match="typed endpoint"):
+    with pytest.raises(KiteErasureDrillAuthorityError, match="endpoint task"):
         _consume_kite_erasure_drill_capability(
             capability, expected_operation=ERASURE_CORE_SNAPSHOT_OPERATION,
         )
 
 
-def test_erasure_authority_rejects_malformed_receipts_and_non_erasure_receipts_do_not_accumulate(
+@pytest.mark.asyncio
+async def test_child_task_cannot_issue_or_consume_copied_erasure_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enabled_home(monkeypatch, tmp_path)
+
+    async def issue_in_child(receipt: object):
+        return _issue_kite_erasure_drill_capability(
+            receipt, operation=ERASURE_CORE_SNAPSHOT_OPERATION,
+        )
+
+    async def consume_in_child(capability: object):
+        return _consume_kite_erasure_drill_capability(
+            capability, expected_operation=ERASURE_CORE_SNAPSHOT_OPERATION,
+        )
+
+    with _typed_kite_erasure_endpoint_issuance_scope():
+        child_issue = asyncio.create_task(issue_in_child(_receipt("d" * 64)))
+        with pytest.raises(KiteErasureDrillAuthorityError, match="endpoint task"):
+            await child_issue
+        capability = _issue_kite_erasure_drill_capability(
+            _receipt("e" * 64), operation=ERASURE_CORE_SNAPSHOT_OPERATION,
+        )
+        child_consume = asyncio.create_task(consume_in_child(capability))
+        with pytest.raises(KiteErasureDrillAuthorityError, match="endpoint task"):
+            await child_consume
+        # Child rejection does not convert the valid parent's authority into a
+        # replay; the exact owner can still consume it once.
+        _consume_kite_erasure_drill_capability(
+            capability, expected_operation=ERASURE_CORE_SNAPSHOT_OPERATION,
+        )
+
+    release_child = asyncio.Event()
+
+    async def consume_after_route(capability: object):
+        await release_child.wait()
+        return await consume_in_child(capability)
+
+    with _typed_kite_erasure_endpoint_issuance_scope():
+        delayed_capability = _issue_kite_erasure_drill_capability(
+            _receipt("f" * 64), operation=ERASURE_CORE_SNAPSHOT_OPERATION,
+        )
+        delayed_child = asyncio.create_task(consume_after_route(delayed_capability))
+    release_child.set()
+    with pytest.raises(KiteErasureDrillAuthorityError, match="endpoint task"):
+        await delayed_child
+
+
+@pytest.mark.asyncio
+async def test_erasure_authority_rejects_malformed_receipts_and_non_erasure_receipts_do_not_accumulate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _enabled_home(monkeypatch, tmp_path)
@@ -97,5 +151,5 @@ def test_erasure_authority_rejects_malformed_receipts_and_non_erasure_receipts_d
             )
         with pytest.raises(KiteErasureDrillAuthorityError, match="operation is invalid"):
             _issue_kite_erasure_drill_capability(
-                _receipt("e" * 64), operation="diagnostics",
+                _receipt("a" * 64), operation="diagnostics",
             )
