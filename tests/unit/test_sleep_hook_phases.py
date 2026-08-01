@@ -113,6 +113,21 @@ async def test_artifact_sweep_failure_reports_failure_but_runs_other_sleep_phase
     assert "private backend detail" not in report.to_dict()["error"]
 
 
+@pytest.mark.asyncio
+async def test_storage_without_artifact_sweep_capability_skips_it_as_unconfigured():
+    class LegacyStorage:
+        pass
+
+    agent = _Agent([])
+    agent.storage = LegacyStorage()
+
+    report = await agent.sleep(skip_export=True)
+
+    assert report.success is True
+    assert report.episodes_created == 1
+    assert report.error is None
+
+
 class _ReflectionMemory:
     def __init__(self, db):
         self.storage = type("Storage", (), {"db": db})()

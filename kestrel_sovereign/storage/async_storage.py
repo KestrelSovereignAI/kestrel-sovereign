@@ -2085,6 +2085,13 @@ class AsyncStorage:
         )
 
     async def sweep_expired_governed_semantic_artifacts(self, *, limit: int = 100):
+        # Legacy/test storage instances without authenticated assertion-tenant
+        # authority cannot own a governed artifact registry.  Treat that
+        # capability absence as an unconfigured no-op; once authority exists,
+        # every initialization/database/sweep failure still propagates to the
+        # sleep fail-closed path.
+        if self._assertion_tenant_capability is None:
+            return 0
         if not self._initialized:
             await self.initialize()
         return await self._assertion_store().sweep_expired_governed_artifacts(
