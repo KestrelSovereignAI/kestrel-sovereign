@@ -324,6 +324,11 @@ class TrustedExecutionPolicy:
         identities = {(key.issuer_id, key.key_id) for key in self.keys}
         if len(identities) != len(self.keys):
             raise ReleaseEvidenceError("trusted execution policy repeats an issuer/key identity")
+        public_keys = {key.public_key for key in self.keys}
+        if len(public_keys) != len(self.keys):
+            raise ReleaseEvidenceError(
+                "trusted execution policy repeats an Ed25519 public key under multiple identities"
+            )
 
     def _key_for(self, attestation: ExecutionAttestation, runner_id: str) -> TrustedExecutionKey:
         if not isinstance(attestation, ExecutionAttestation):

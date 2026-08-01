@@ -137,6 +137,31 @@ def _test_policy() -> TrustedExecutionPolicy:
     )
 
 
+def test_trusted_execution_policy_rejects_public_key_aliases_across_sources_and_labels() -> None:
+    shared_private_key = Ed25519PrivateKey.from_private_bytes(b"\x09" * 32)
+    catalog = CatalogSigningIdentity(
+        issuer_id="catalog_alias", key_id="catalog_key", private_key=shared_private_key,
+    )
+    external = CatalogSigningIdentity(
+        issuer_id="external_alias", key_id="external_key", private_key=shared_private_key,
+        source=ExecutionSource.EXTERNAL_CI,
+    )
+    with pytest.raises(ReleaseEvidenceError, match="repeats an Ed25519 public key"):
+        TrustedExecutionPolicy((
+            catalog.trusted_key(("pytest",)),
+            external.trusted_key(("external_ci",)),
+        ))
+
+    relabeled_catalog = CatalogSigningIdentity(
+        issuer_id="catalog_alias_two", key_id="catalog_key_two", private_key=shared_private_key,
+    )
+    with pytest.raises(ReleaseEvidenceError, match="repeats an Ed25519 public key"):
+        TrustedExecutionPolicy((
+            catalog.trusted_key(("pytest",)),
+            relabeled_catalog.trusted_key(("semantic_benchmark",)),
+        ))
+
+
 def _record(
     spec,
     *,
