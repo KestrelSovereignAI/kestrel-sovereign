@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 
 import pytest
 
@@ -223,5 +224,133 @@ async def test_profile_dimension_drift_and_timeout_fail_without_advancing(tmp_pa
         )
         with pytest.raises(SemanticVectorProjectionError, match="profile_drift"):
             await valid.recall([1.0, 1.0])
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_remote_destination_rejects_private_content_before_embedder(tmp_path):
+    storage = await _storage(tmp_path, "remote-private")
+    seen: list[str] = []
+
+    async def remote_embed(text: str):
+        seen.append(text)
+        return [1.0, 1.0]
+
+    try:
+        sensitive = _assertion(storage, "secret-medical-detail")
+        await storage.put_assertion(
+            sensitive, source_occurrences=(_source("secret-medical-detail"),),
+        )
+        remote = SemanticVectorProfile(
+            "semantic-assertion-remote-v1", "e" * 64,
+            provider="remote-provider", model="remote-model", dimension=2,
+            embedding_destination="remote",
+        )
+        projection = storage.semantic_assertion_vector_projection(remote, remote_embed)
+        with pytest.raises(SemanticVectorProjectionError, match="remote destination"):
+            await projection.sync()
+        assert seen == []
+        assert (await projection.checkpoint()).generation == 0
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_oversize_vector_is_rejected_before_iteration(tmp_path):
+    storage = await _storage(tmp_path, "oversize")
+
+    class OversizeSequence(Sequence):
+        def __len__(self):
+            return 8_193
+
+        def __getitem__(self, _index):
+            raise AssertionError("oversize vector must not be materialized")
+
+    async def oversized(_text):
+        return OversizeSequence()
+
+    try:
+        fact = _assertion(storage, "oversize")
+        await storage.put_assertion(fact, source_occurrences=(_source("oversize"),))
+        projection = storage.semantic_assertion_vector_projection(PROFILE, oversized)
+        with pytest.raises(SemanticVectorProjectionError, match="dimension"):
+            await projection.sync()
+        assert (await projection.checkpoint()).generation == 0
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_erasure_rebuild_budget_leaves_projection_unready(tmp_path):
+    storage = await _storage(tmp_path, "rebuild-budget")
+    bounded = SemanticVectorProfile(
+        "semantic-assertion-bounded-rebuild-v1", "f" * 64,
+        provider="test-provider", model="test-model", dimension=2,
+        rebuild_page_size=1, max_rebuild_rows=1,
+    )
+    try:
+        assertions = [_assertion(storage, name) for name in ("erase", "keep-a", "keep-b")]
+        for assertion, name in zip(assertions, ("erase", "keep-a", "keep-b")):
+            await storage.put_assertion(assertion, source_occurrences=(_source(name),))
+        projection = storage.semantic_assertion_vector_projection(bounded, _embed)
+        await projection.sync()
+        await storage.erase_assertion(assertions[0].assertion_id, operation_id="bounded-erase")
+        with pytest.raises(SemanticVectorProjectionError, match="row budget"):
+            await projection.sync()
+        with pytest.raises(SemanticVectorProjectionError, match="checkpoint_stale"):
+            await projection.recall([1.0, 1.0])
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_v1_projection_schema_is_disposed_and_rebuilt(tmp_path):
+    from kestrel_sovereign.storage.sqla.migrations import migrate_semantic_vector_projection
+
+    storage = await _storage(tmp_path, "legacy-v1")
+    try:
+        await storage.db.execute("DROP TABLE semantic_assertion_vector_projection_entries", ())
+        await storage.db.execute("DROP TABLE semantic_assertion_vector_projection_state", ())
+        await storage.db.execute(
+            "DELETE FROM semantic_schema_migrations WHERE version = ?",
+            ("semantic_assertion_vector_projection_v2",),
+        )
+        await storage.db.execute(
+            "INSERT INTO semantic_schema_migrations (version) VALUES (?)",
+            ("semantic_assertion_vector_projection_v1",),
+        )
+        await storage.db.execute(
+            "CREATE TABLE semantic_assertion_vector_projection_entries ("
+            "tenant_id TEXT, profile_id TEXT, capability_digest TEXT, assertion_id TEXT)",
+            (),
+        )
+        await storage.db.execute(
+            "CREATE TABLE semantic_assertion_vector_projection_state (tenant_id TEXT)",
+            (),
+        )
+        await storage.db.execute(
+            "INSERT INTO semantic_assertion_vector_projection_entries VALUES (?, ?, ?, ?)",
+            (storage.agent_id, "legacy", "a" * 64, "sensitive-legacy-id"),
+        )
+
+        await migrate_semantic_vector_projection(storage.db)
+        columns = {
+            row[1] for row in await storage.db.fetchall(
+                "PRAGMA table_info(semantic_assertion_vector_projection_entries)", ()
+            )
+        }
+        assert {"revision_digest", "embedding_destination", "privacy_ceiling"} <= columns
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM semantic_assertion_vector_projection_entries"
+        ) == 0
+        assert not await storage.db.fetchone(
+            "SELECT 1 FROM semantic_schema_migrations WHERE version = ?",
+            ("semantic_assertion_vector_projection_v1",),
+        )
+        assert await storage.db.fetchone(
+            "SELECT 1 FROM semantic_schema_migrations WHERE version = ?",
+            ("semantic_assertion_vector_projection_v2",),
+        )
     finally:
         await storage.close()

@@ -561,6 +561,9 @@ async def test_governed_semantic_recall_storage_seam_has_backend_parity(db_backe
 @pytest.mark.dual_backend
 async def test_assertion_vector_projection_cursor_and_lineage_have_backend_parity(db_backend, tmp_path):
     """Exercise the event CAS and bounded vector read on SQLite/PostgreSQL."""
+    from kestrel_sovereign.storage.async_assertion_store import (
+        _issue_raw_assertion_mutation_capability,
+    )
     from kestrel_sovereign.storage.semantic_vector_projection import SemanticVectorProfile
 
     tenant, identity = await _incepted_assertion_identity(tmp_path, "vector-projection-parity")
@@ -574,10 +577,25 @@ async def test_assertion_vector_projection_cursor_and_lineage_have_backend_parit
         provider="parity-provider", model="parity-model", dimension=2,
     )
     try:
-        first = _semantic_assertion(tenant, "vector-first", value="first", source_id="vector-first")
-        second = _semantic_assertion(tenant, "vector-second", value="second", source_id="vector-second")
-        await storage.put_assertion(first, source_occurrences=(_semantic_source("vector-first"),))
-        await storage.put_assertion(second, source_occurrences=(_semantic_source("vector-second"),))
+        run_id = uuid4().hex
+        first_id = f"vector-first-{run_id}"
+        second_id = f"vector-second-{run_id}"
+        first = _semantic_assertion(tenant, first_id, value="first", source_id=first_id)
+        second = _semantic_assertion(tenant, second_id, value="second", source_id=second_id)
+        # Projection parity is below the governed SHACL acceptance seam; use
+        # the already tenant-bound canonical owner so this test isolates SQL
+        # cursor/vector behavior from concurrent validation-retry coverage.
+        migration_capability = _issue_raw_assertion_mutation_capability(
+            storage._assertion_tenant_capability
+        )
+        await storage._assertion_store().put_assertion(
+            first, source_occurrences=(_semantic_source(first_id),),
+            _migration_capability=migration_capability,
+        )
+        await storage._assertion_store().put_assertion(
+            second, source_occurrences=(_semantic_source(second_id),),
+            _migration_capability=migration_capability,
+        )
         projection = storage.semantic_assertion_vector_projection(profile, embed)
         checkpoint = await projection.sync()
         terminal = await storage._assertion_store().event_checkpoint()

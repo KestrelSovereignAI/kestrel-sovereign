@@ -504,6 +504,14 @@ stores exact assertion/revision and canonical-revision-digest lineage under a
 fixed embedding provider/model/profile/dimension and the approved bounded
 semantic-recall renderer version, and remains non-authoritative: every hit is
 hydrated through the canonical recall fence before use. The projector's
+destination pin forbids private, tenant, or delegated assertion text from
+reaching a remote embedder; this check occurs before rendering or provider
+invocation. Vector dimensions and serialized bytes are bounded before
+materialization. Opaque-erasure survivor rebuilds use bounded keyset pages plus
+total-row and wall-clock budgets; exhausting any budget leaves the checkpoint
+unready for safe retry.
+
+The projector's
 event-level checkpoint must equal the canonical terminal `(generation,
 event_id)`; processing only one event in a multi-event generation remains
 unready. Physical erasure's opaque event wipes and atomically rebuilds only

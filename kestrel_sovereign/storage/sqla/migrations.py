@@ -495,6 +495,7 @@ async def migrate_semantic_vector_projection(db: "AsyncDatabase") -> None:
             embedding_model TEXT NOT NULL,
             embedding_dimension INTEGER NOT NULL,
             renderer_version TEXT NOT NULL,
+            embedding_destination TEXT NOT NULL,
             visibility_ceiling TEXT NOT NULL,
             privacy_ceiling TEXT NOT NULL,
             visibility TEXT NOT NULL,
@@ -509,6 +510,7 @@ async def migrate_semantic_vector_projection(db: "AsyncDatabase") -> None:
             UNIQUE (tenant_id, profile_id, capability_digest, revision_id),
             CHECK (source_generation > 0),
             CHECK (embedding_dimension > 0 AND embedding_dimension <= 8192),
+            CHECK (embedding_destination IN ('local', 'remote')),
             CHECK (visibility_ceiling IN ('private', 'tenant', 'delegated', 'public')),
             CHECK (visibility IN ('private', 'tenant', 'delegated', 'public'))
         )""",
@@ -538,7 +540,47 @@ async def migrate_semantic_vector_projection(db: "AsyncDatabase") -> None:
             (_SEMANTIC_VECTOR_PROJECTION_SCHEMA_VERSION,),
         )
         if exists is not None:
-            return
+            if db.backend_type == "postgres":
+                column_rows = await db.fetchall(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() AND table_name = ?",
+                    ("semantic_assertion_vector_projection_entries",),
+                )
+                columns = {str(row[0]) for row in column_rows}
+            else:
+                column_rows = await db.fetchall(
+                    "PRAGMA table_info(semantic_assertion_vector_projection_entries)", ()
+                )
+                columns = {str(row[1]) for row in column_rows}
+            required_v2 = {
+                "revision_digest", "embedding_destination", "privacy_ceiling",
+                "visibility_ceiling", "renderer_version", "embedding_dimension",
+            }
+            if required_v2 <= columns:
+                return
+            # Dispose an incomplete pre-release v2 shape by the same derived-
+            # data rule as v1.  This also makes interrupted upgrades retryable.
+            await db.execute("DROP TABLE IF EXISTS semantic_assertion_vector_projection_entries", ())
+            await db.execute("DROP TABLE IF EXISTS semantic_assertion_vector_projection_state", ())
+            await db.execute(
+                "DELETE FROM semantic_schema_migrations WHERE version = ?",
+                (_SEMANTIC_VECTOR_PROJECTION_SCHEMA_VERSION,),
+            )
+        legacy_v1 = await db.fetchone(
+            "SELECT 1 FROM semantic_schema_migrations WHERE version = ?",
+            ("semantic_assertion_vector_projection_v1",),
+        )
+        if legacy_v1 is not None:
+            # v1 was never canonical data: it is a rebuildable acceleration
+            # surface whose rows lack the v2 privacy/profile/digest contract.
+            # Dispose of both rows and cursor atomically so no old checkpoint
+            # can authenticate an incomplete upgraded shape.
+            await db.execute("DROP TABLE IF EXISTS semantic_assertion_vector_projection_entries", ())
+            await db.execute("DROP TABLE IF EXISTS semantic_assertion_vector_projection_state", ())
+            await db.execute(
+                "DELETE FROM semantic_schema_migrations WHERE version = ?",
+                ("semantic_assertion_vector_projection_v1",),
+            )
         for statement in statements:
             await db.execute(statement, ())
         await db.execute(
