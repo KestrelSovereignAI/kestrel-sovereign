@@ -720,6 +720,7 @@ class EvidenceRecord:
     observation: Mapping[str, object] | None = None
     artifact: ArtifactReference | None = None
     run_digest: str | None = None
+    external_run_nonce: str | None = None
     execution_attestation: ExecutionAttestation | None = None
     drill: DrillBinding | None = None
     reason_code: str | None = None
@@ -735,6 +736,8 @@ class EvidenceRecord:
             raise ReleaseEvidenceError("outside_advertised_capability must be a boolean")
         if self.drill is not None and not isinstance(self.drill, DrillBinding):
             raise ReleaseEvidenceError("evidence drill must be DrillBinding or null")
+        if self.external_run_nonce is not None:
+            _require_digest(self.external_run_nonce, "external evidence run_nonce")
         technical = (
             self.gate_spec_digest,
             self.runner_id,
@@ -770,6 +773,11 @@ class EvidenceRecord:
             _require_digest(self.run_digest, "run_digest")
             if not isinstance(self.execution_attestation, ExecutionAttestation):
                 raise ReleaseEvidenceError("release-ready evidence requires an execution attestation")
+            is_external = self.runner_id == "external_ci"
+            if is_external and self.external_run_nonce is None:
+                raise ReleaseEvidenceError("external CI evidence requires a signed external run_nonce")
+            if not is_external and self.external_run_nonce is not None:
+                raise ReleaseEvidenceError("only external CI evidence may carry an external run_nonce")
             if self.state is EvidenceState.PASSED and self.reason_code is not None:
                 raise ReleaseEvidenceError("passed evidence cannot have a reason_code")
             if self.state is EvidenceState.FAILED and self.reason_code is None:
@@ -779,11 +787,15 @@ class EvidenceRecord:
                 raise ReleaseEvidenceError(f"{self.state.value} evidence requires a reason_code")
             if any(value is not None for value in technical):
                 raise ReleaseEvidenceError("blocked/not_run evidence cannot carry an unbound result")
+            if self.external_run_nonce is not None:
+                raise ReleaseEvidenceError("blocked/not_run evidence cannot carry an external run_nonce")
         elif self.state is EvidenceState.SKIPPED:
             if not self.outside_advertised_capability or self.reason_code is None:
                 raise ReleaseEvidenceError("skipped evidence is permitted only outside advertised capability")
             if any(value is not None for value in technical):
                 raise ReleaseEvidenceError("skipped evidence cannot carry an unbound result")
+            if self.external_run_nonce is not None:
+                raise ReleaseEvidenceError("skipped evidence cannot carry an external run_nonce")
         if self.outside_advertised_capability and self.state is not EvidenceState.SKIPPED:
             raise ReleaseEvidenceError("outside_advertised_capability is valid only for skipped evidence")
 
@@ -812,6 +824,7 @@ class EvidenceRecord:
         *,
         state: EvidenceState,
         reason_code: str | None = None,
+        external_run_nonce: str | None = None,
     ) -> tuple[Mapping[str, object], str]:
         """Build content-free bound fields before an authority signs them."""
         if state not in {EvidenceState.PASSED, EvidenceState.FAILED}:
@@ -829,6 +842,7 @@ class EvidenceRecord:
             "fixture": spec.fixture.binding.to_mapping(),
             "observation": dict(safe_observation),
             "artifact": artifact.to_mapping(),
+            "external_run_nonce": external_run_nonce,
             "drill": spec.correlation.to_mapping() if spec.correlation else None,
             "reason_code": reason_code,
         }
@@ -844,6 +858,7 @@ class EvidenceRecord:
         state: EvidenceState,
         execution_attestation: ExecutionAttestation,
         reason_code: str | None = None,
+        external_run_nonce: str | None = None,
     ) -> "EvidenceRecord":
         """Construct a signed record for an execution authority only.
 
@@ -859,6 +874,7 @@ class EvidenceRecord:
             artifact,
             state=state,
             reason_code=reason_code,
+            external_run_nonce=external_run_nonce,
         )
         return cls(
             gate_id=spec.gate_id,
@@ -873,6 +889,7 @@ class EvidenceRecord:
             observation=safe_observation,
             artifact=artifact,
             run_digest=run_digest,
+            external_run_nonce=external_run_nonce,
             execution_attestation=execution_attestation,
             drill=spec.correlation,
             reason_code=reason_code,
@@ -899,6 +916,7 @@ class EvidenceRecord:
                     "fixture": self.fixture.to_mapping(),
                     "observation": dict(self.observation),
                     "artifact": self.artifact.to_mapping(),
+                    "external_run_nonce": self.external_run_nonce,
                     "drill": self.drill.to_mapping() if self.drill else None,
                     "reason_code": self.reason_code,
                 }
@@ -923,6 +941,7 @@ class EvidenceRecord:
             "observation": dict(self.observation) if self.observation else None,
             "artifact": self.artifact.to_mapping() if self.artifact else None,
             "run_digest": self.run_digest,
+            "external_run_nonce": self.external_run_nonce,
             "execution_attestation": (
                 self.execution_attestation.to_mapping() if self.execution_attestation else None
             ),

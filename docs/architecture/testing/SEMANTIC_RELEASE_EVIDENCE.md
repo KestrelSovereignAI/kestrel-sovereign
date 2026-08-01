@@ -314,15 +314,27 @@ The report digest binds the contract digest and nonce. This is deliberately
 content-free: it carries no test output, database name, tenant, or source
 location.
 
+The nonce is verifier-issued, not producer-chosen. Before an external run, the
+independent verifier calls `ExternalFreshnessLedger.issue_challenge()` and
+persists its one-time nonce as `pending`; it sends that challenge to external
+CI over its authenticated control plane. External CI must bind the exact nonce
+into every external `EvidenceRecord` run digest before signing it, then bind it
+in the report. Trusted ingestion verifies all three record nonces match the
+report and atomically marks the challenge `consumed` while recording the
+core-derived receipt. Unknown, reused, and merely rewrapped nonces are
+rejected, so old signed records cannot become a fresh report.
+
 Only an independent Talon/CI verifier may ingest that report through
 `attach_external_capability_report`, which requires an explicit absolute path
-for an `ExternalFreshnessLedger`. The ledger's direct parent must be an
-owner-only verifier directory (shared paths such as `/tmp` are refused); every
-component is a real directory, and the ledger is an owner-only regular file.
-It is securely created and inode-checked before and after SQLite opens it. The
-verifier atomically consumes each valid receipt once and rejects a replay even
-if a later verifier process creates a new ledger object for the same path. A
-report author cannot choose, reset, or supply the ledger. The public `assemble`
+for an `ExternalFreshnessLedger` and an explicit `trusted_root`. The root must
+be a resolved owner-only verifier directory; every component from it through
+the ledger parent must likewise be a real owner-only directory, and the ledger
+is an owner-only regular file. This permits a private verifier root beneath a
+system-managed ancestor while refusing `/tmp` itself as a trust root. The
+ledger is securely created and inode-checked before and after SQLite opens it.
+The verifier atomically consumes each valid receipt once and rejects a replay
+even if a later verifier process creates a new ledger object for the same path.
+A report author cannot choose, reset, or supply the ledger. The public `assemble`
 CLI uses `attach_structural_external_capability_report` instead: it may
 preserve the structural JSON for inspection, but never consumes a receipt and remains
 `trust_status: "unverified"`, `ready: false`.

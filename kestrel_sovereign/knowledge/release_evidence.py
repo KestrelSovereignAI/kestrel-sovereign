@@ -638,9 +638,10 @@ def _validate_external_capability_reports(
             or attestation.result_digest != evidence.run_digest
             or attestation.artifact != evidence.artifact
             or attestation.drill != gate.spec.correlation
+            or evidence.external_run_nonce != report.run_nonce
         ):
             raise ReleaseEvidenceError(
-                "external adapter attestation is not bound to its correlated gate result/artifact"
+                "external adapter attestation is not bound to its external run_nonce or correlated gate result/artifact"
             )
 
 
@@ -1022,6 +1023,7 @@ def evidence_record_from_mapping(value: Mapping[str, object]) -> EvidenceRecord:
     expected = {
         "gate_id", "state", "gate_spec_digest", "runner_id", "command_id", "command_digest",
         "environment", "environment_digest", "fixture", "observation", "artifact", "run_digest",
+        "external_run_nonce",
         "execution_attestation", "drill",
         "reason_code", "outside_advertised_capability",
     }
@@ -1038,6 +1040,7 @@ def evidence_record_from_mapping(value: Mapping[str, object]) -> EvidenceRecord:
         environment=_environment_from_mapping(mapping["environment"]), environment_digest=cast(str | None, mapping["environment_digest"]),
         fixture=_fixture_from_mapping(mapping["fixture"]), observation=_expect_mapping(observation, "observation") if observation is not None else None,
         artifact=_artifact_from_mapping(mapping["artifact"]), run_digest=cast(str | None, mapping["run_digest"]),
+        external_run_nonce=cast(str | None, mapping["external_run_nonce"]),
         execution_attestation=_execution_attestation_from_mapping(mapping["execution_attestation"]),
         drill=_drill_from_mapping(mapping["drill"]),
         reason_code=cast(str | None, mapping["reason_code"]), outside_advertised_capability=cast(bool, mapping["outside_advertised_capability"]),

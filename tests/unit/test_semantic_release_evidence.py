@@ -128,6 +128,7 @@ def _record(
     *,
     observation: dict[str, object] | None = None,
     identity: CatalogSigningIdentity | None = None,
+    external_run_nonce: str | None = None,
 ):
     observed = observation or _observation(spec)
     artifact = _artifact(spec.gate_id)
@@ -136,11 +137,17 @@ def _record(
         if spec.runner.runner_id == "external_ci"
         else _CATALOG_TEST_IDENTITY
     )
+    external_run_nonce = (
+        external_run_nonce or "a" * 64
+        if spec.runner.runner_id == "external_ci"
+        else None
+    )
     _, run_digest = EvidenceRecord._bound_run_digest(
         spec,
         observed,
         artifact,
         state=EvidenceState.PASSED,
+        external_run_nonce=external_run_nonce,
     )
     return EvidenceRecord._from_trusted_execution(
         spec,
@@ -150,6 +157,7 @@ def _record(
         execution_attestation=selected_identity.sign(
             kind="evidence_record", spec=spec, run_digest=run_digest
         ),
+        external_run_nonce=external_run_nonce,
     )
 
 
@@ -201,7 +209,7 @@ def _retirement_telemetry() -> TelemetryAttestation:
     )
 
 
-def _external_report(evidence) -> ExternalCapabilityReport:
+def _external_report(evidence, *, run_nonce: str = "a" * 64) -> ExternalCapabilityReport:
     external_gates = [gate for gate in evidence.gates if gate.spec.category == "external_adapter"]
     attestations: list[ExternalGateAttestation] = []
     for gate in external_gates:
@@ -222,7 +230,7 @@ def _external_report(evidence) -> ExternalCapabilityReport:
         repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
         source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
         core_release_evidence_contract_digest=CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
-        run_nonce="a" * 64,
+        run_nonce=run_nonce,
         attestations=tuple(attestations),
     )
 
@@ -385,15 +393,21 @@ def test_reviewer_adversarial_external_report_requires_exact_stages_repo_revisio
 ) -> None:
     template = release_evidence_template()
     external_specs = [spec for spec in release_gate_specs() if spec.category == "external_adapter"]
-    evidence = _apply_records(template, tuple(_record(spec) for spec in external_specs))
-    report = _external_report(evidence)
+    ledger = ExternalFreshnessLedger(
+        tmp_path / "verifier-freshness.sqlite", trusted_root=tmp_path
+    )
+    run_nonce = ledger.issue_challenge()
+    evidence = _apply_records(
+        template,
+        tuple(_record(spec, external_run_nonce=run_nonce) for spec in external_specs),
+    )
+    report = _external_report(evidence, run_nonce=run_nonce)
 
     assert set(report.gate_ids) == {
         "external_corpus_consumed",
         "external_candidate_invalidated",
         "external_served_eligibility_rejected",
     }
-    ledger = ExternalFreshnessLedger(tmp_path / "verifier-freshness.sqlite")
     attached = attach_external_capability_report(evidence, report, freshness_ledger=ledger)
     assert attached.external_capabilities == (report,)
     assert "external_adapter_attestation" not in attached.blocking_gate_ids()
@@ -436,7 +450,7 @@ def test_reviewer_adversarial_external_report_requires_exact_stages_repo_revisio
         repository=report.repository,
         source_revision=report.source_revision,
         core_release_evidence_contract_digest=report.core_release_evidence_contract_digest,
-        run_nonce="e" * 64,
+        run_nonce="a" * 64,
         attestations=(
             replace(report.attestations[0], artifact=_artifact("wrong-external-artifact")),
             *report.attestations[1:],
@@ -451,8 +465,14 @@ def test_external_report_freshness_is_hash_bound_and_replay_protected_across_ver
 ) -> None:
     template = release_evidence_template()
     external_specs = [spec for spec in release_gate_specs() if spec.category == "external_adapter"]
-    evidence = _apply_records(template, tuple(_record(spec) for spec in external_specs))
-    report = _external_report(evidence)
+    ledger_path = tmp_path / "independent-verifier.sqlite"
+    ledger = ExternalFreshnessLedger(ledger_path, trusted_root=tmp_path)
+    run_nonce = ledger.issue_challenge()
+    evidence = _apply_records(
+        template,
+        tuple(_record(spec, external_run_nonce=run_nonce) for spec in external_specs),
+    )
+    report = _external_report(evidence, run_nonce=run_nonce)
 
     tampered = report.to_mapping()
     tampered["run_nonce"] = "b" * 64
@@ -463,11 +483,31 @@ def test_external_report_freshness_is_hash_bound_and_replay_protected_across_ver
     with pytest.raises(ReleaseEvidenceError, match="unknown or missing"):
         external_capability_report_from_mapping(caller_receipt)
 
-    ledger_path = tmp_path / "independent-verifier.sqlite"
+    rewrap_nonce = ledger.issue_challenge()
+    rewrapped = ExternalCapabilityReport.attest(
+        capability_id=report.capability_id,
+        repository=report.repository,
+        source_revision=report.source_revision,
+        core_release_evidence_contract_digest=report.core_release_evidence_contract_digest,
+        run_nonce=rewrap_nonce,
+        attestations=report.attestations,
+    )
+    with pytest.raises(ReleaseEvidenceError, match="external run_nonce"):
+        attach_external_capability_report(evidence, rewrapped, freshness_ledger=ledger)
+
+    caller_nonce = "f" * 64
+    caller_evidence = _apply_records(
+        template,
+        tuple(_record(spec, external_run_nonce=caller_nonce) for spec in external_specs),
+    )
+    caller_report = _external_report(caller_evidence, run_nonce=caller_nonce)
+    with pytest.raises(ReleaseEvidenceError, match="not an issued pending"):
+        attach_external_capability_report(caller_evidence, caller_report, freshness_ledger=ledger)
+
     attached = attach_external_capability_report(
         evidence,
         report,
-        freshness_ledger=ExternalFreshnessLedger(ledger_path),
+        freshness_ledger=ledger,
     )
     assert attached.external_capabilities == (report,)
 
@@ -477,7 +517,7 @@ def test_external_report_freshness_is_hash_bound_and_replay_protected_across_ver
         attach_external_capability_report(
             evidence,
             report,
-            freshness_ledger=ExternalFreshnessLedger(ledger_path),
+            freshness_ledger=ExternalFreshnessLedger(ledger_path, trusted_root=tmp_path),
         )
 
 
@@ -485,17 +525,23 @@ def test_structural_external_attachment_does_not_consume_verifier_freshness(
     tmp_path: Path,
 ) -> None:
     external_specs = [spec for spec in release_gate_specs() if spec.category == "external_adapter"]
-    records = tuple(_record(spec) for spec in external_specs)
+    ledger = ExternalFreshnessLedger(
+        tmp_path / "verifier.sqlite", trusted_root=tmp_path
+    )
+    run_nonce = ledger.issue_challenge()
+    records = tuple(
+        _record(spec, external_run_nonce=run_nonce) for spec in external_specs
+    )
     structural = apply_structural_evidence_records(structural_release_evidence_template(), records)
     verified = _apply_records(release_evidence_template(), records)
-    report = _external_report(verified)
+    report = _external_report(verified, run_nonce=run_nonce)
 
     structural_attached = attach_structural_external_capability_report(structural, report)
     assert structural_attached.trust_status == "unverified"
     trusted_attached = attach_external_capability_report(
         verified,
         report,
-        freshness_ledger=ExternalFreshnessLedger(tmp_path / "verifier.sqlite"),
+        freshness_ledger=ledger,
     )
     assert trusted_attached.external_capabilities == (report,)
 
@@ -510,34 +556,51 @@ def test_external_freshness_ledger_rejects_insecure_parent_file_and_symlink_path
     insecure_parent.mkdir(mode=0o700)
     insecure_parent.chmod(0o755)
     with pytest.raises(ReleaseEvidenceError, match="no group/other access"):
-        ExternalFreshnessLedger(insecure_parent / "ledger.sqlite")
+        ExternalFreshnessLedger(insecure_parent / "ledger.sqlite", trusted_root=insecure_parent)
     with pytest.raises(ReleaseEvidenceError):
-        ExternalFreshnessLedger(Path("/tmp/kestrel-semantic-release-ledger.sqlite"))
+        ExternalFreshnessLedger(
+            Path("/tmp/kestrel-semantic-release-ledger.sqlite"), trusted_root=Path("/tmp")
+        )
 
     secure_parent = tmp_path / "secure"
     secure_parent.mkdir(mode=0o700)
+    nested_secure_parent = secure_parent / "nested"
+    nested_secure_parent.mkdir(mode=0o700)
+    assert ExternalFreshnessLedger(
+        nested_secure_parent / "ledger.sqlite", trusted_root=secure_parent
+    ).trusted_root == secure_parent
+
+    shared_ancestor = tmp_path / "shared-ancestor"
+    shared_ancestor.mkdir(mode=0o700)
+    shared_ancestor.chmod(0o777)
+    private_root = shared_ancestor / "private-root"
+    private_root.mkdir(mode=0o700)
+    assert ExternalFreshnessLedger(
+        private_root / "ledger.sqlite", trusted_root=private_root
+    ).path == private_root / "ledger.sqlite"
+
     insecure_file = secure_parent / "insecure.sqlite"
     insecure_file.touch()
     insecure_file.chmod(0o644)
     with pytest.raises(ReleaseEvidenceError, match="owner-only access"):
-        ExternalFreshnessLedger(insecure_file)
+        ExternalFreshnessLedger(insecure_file, trusted_root=secure_parent)
 
     symlink_parent = tmp_path / "symlink-parent"
     symlink_parent.symlink_to(secure_parent, target_is_directory=True)
     with pytest.raises(ReleaseEvidenceError, match="symlink"):
-        ExternalFreshnessLedger(symlink_parent / "ledger.sqlite")
+        ExternalFreshnessLedger(symlink_parent / "ledger.sqlite", trusted_root=tmp_path)
 
     symlink_file = secure_parent / "symlink.sqlite"
     symlink_file.symlink_to(insecure_file)
     with pytest.raises(ReleaseEvidenceError, match="non-symlink"):
-        ExternalFreshnessLedger(symlink_file)
+        ExternalFreshnessLedger(symlink_file, trusted_root=secure_parent)
 
     owner_only_file = secure_parent / "owner.sqlite"
     owner_only_file.touch(mode=0o600)
     current_euid = os.geteuid()
     monkeypatch.setattr(release_evidence_freshness.os, "geteuid", lambda: current_euid + 1)
     with pytest.raises(ReleaseEvidenceError, match="verifier-owned"):
-        ExternalFreshnessLedger(owner_only_file)
+        ExternalFreshnessLedger(owner_only_file, trusted_root=secure_parent)
 
 
 def test_external_freshness_ledger_fails_closed_if_path_replaced_while_opening(
@@ -557,7 +620,7 @@ def test_external_freshness_ledger_fails_closed_if_path_replaced_while_opening(
     ledger_path = secure_parent / "ledger.sqlite"
     replacement = secure_parent / "replacement.sqlite"
     replacement.touch(mode=0o600)
-    ledger = ExternalFreshnessLedger(ledger_path)
+    ledger = ExternalFreshnessLedger(ledger_path, trusted_root=secure_parent)
     original_connect = release_evidence_freshness.sqlite3.connect
 
     def replace_then_connect(*args: object, **kwargs: object):
@@ -568,6 +631,31 @@ def test_external_freshness_ledger_fails_closed_if_path_replaced_while_opening(
     monkeypatch.setattr(release_evidence_freshness.sqlite3, "connect", replace_then_connect)
     with pytest.raises(ReleaseEvidenceError, match="changed while opening"):
         ledger.consume(report)
+
+
+def test_external_freshness_ledger_fails_closed_if_trusted_root_is_replaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kestrel_sovereign.knowledge import release_evidence_freshness
+
+    trusted_root = tmp_path / "trusted-root"
+    trusted_root.mkdir(mode=0o700)
+    ledger_path = trusted_root / "ledger.sqlite"
+    ledger = ExternalFreshnessLedger(ledger_path, trusted_root=trusted_root)
+    original_connect = release_evidence_freshness.sqlite3.connect
+
+    def replace_root_then_connect(*args: object, **kwargs: object):
+        trusted_root.replace(tmp_path / "original-trusted-root")
+        replacement_root = tmp_path / "replacement-root"
+        replacement_root.mkdir(mode=0o700)
+        (replacement_root / "ledger.sqlite").touch(mode=0o600)
+        replacement_root.replace(trusted_root)
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(release_evidence_freshness.sqlite3, "connect", replace_root_then_connect)
+    with pytest.raises(ReleaseEvidenceError, match="changed while opening"):
+        ledger.issue_challenge()
 
 
 def test_reviewer_adversarial_record_cannot_spoof_a_gate_with_exit_zero() -> None:
@@ -895,7 +983,7 @@ def _write_structurally_complete_submission(
         repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
         source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
         core_release_evidence_contract_digest=CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
-        run_nonce="e" * 64,
+        run_nonce="a" * 64,
         attestations=tuple(external_attestations),
     )
     external_report_path = tmp_path / "submitted-external-report.json"
@@ -1193,6 +1281,48 @@ def test_catalog_benchmark_blocks_postgres_without_an_isolated_admin_database(
     assert execution.record.reason_code == "isolated_postgres_admin_unavailable"
 
 
+@pytest.mark.parametrize("failure_point", ("fetchval", "create_database"))
+def test_disposable_postgres_closes_admin_connection_when_creation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    from types import SimpleNamespace
+
+    from kestrel_sovereign.knowledge.release_evidence_execution import CatalogWorkloadUnavailable
+    from kestrel_sovereign.knowledge.release_evidence_postgres import DisposablePostgresDatabase
+
+    class FailingConnection:
+        closed = False
+
+        async def fetchval(self, _query: str):
+            if failure_point == "fetchval":
+                raise RuntimeError("admin fetch failed")
+            return "postgres"
+
+        async def execute(self, _query: str):
+            if failure_point == "create_database":
+                raise RuntimeError("create failed")
+
+        async def close(self) -> None:
+            self.closed = True
+
+    connection = FailingConnection()
+
+    async def connect(_dsn: str) -> FailingConnection:
+        return connection
+
+    monkeypatch.setenv("KESTREL_SEMANTIC_RELEASE_ISOLATED", "1")
+    monkeypatch.setenv(
+        "KESTREL_SEMANTIC_RELEASE_ISOLATED_POSTGRES_ADMIN_DSN",
+        "postgresql://admin@localhost/postgres",
+    )
+    monkeypatch.setitem(sys.modules, "asyncpg", SimpleNamespace(connect=connect))
+
+    with pytest.raises(CatalogWorkloadUnavailable, match="isolated_postgres_database_create_failed"):
+        asyncio.run(DisposablePostgresDatabase.create())
+    assert connection.closed is True
+
+
 @pytest.mark.parametrize(
     "shared_name",
     ("postgres", "template0", "template1", "kestrel", "kestrel_test", "test"),
@@ -1423,7 +1553,7 @@ def test_cli_assemble_safely_binds_retirement_and_external_adapter_attestations(
         repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
         source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
         core_release_evidence_contract_digest=CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
-        run_nonce="f" * 64,
+        run_nonce="a" * 64,
         attestations=tuple(
             ExternalGateAttestation(
                 gate_id=spec.gate_id,

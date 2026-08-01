@@ -68,17 +68,28 @@ class DisposablePostgresDatabase:
             import asyncpg
         except ImportError as error:
             raise CatalogWorkloadUnavailable("isolated_postgres_driver_unavailable") from error
+        connection = None
+        created = False
         try:
             connection = await asyncpg.connect(admin_dsn)
             actual_admin_database = await connection.fetchval("SELECT current_database()")
             if not isinstance(actual_admin_database, str) or not actual_admin_database:
-                await connection.close()
                 raise CatalogWorkloadUnavailable("isolated_postgres_admin_database_invalid")
             await connection.execute(f"CREATE DATABASE {_quoted_identifier(database_name)}")
+            created = True
         except CatalogWorkloadUnavailable:
             raise
         except Exception as error:
             raise CatalogWorkloadUnavailable("isolated_postgres_database_create_failed") from error
+        finally:
+            if connection is not None and not created:
+                try:
+                    await connection.close()
+                except Exception:
+                    # The original failure is already content-free and more
+                    # useful than a shutdown failure from the admin channel.
+                    pass
+        assert connection is not None
         return cls(target_dsn, database_name, admin_dsn, connection)
 
     async def close(self) -> None:
