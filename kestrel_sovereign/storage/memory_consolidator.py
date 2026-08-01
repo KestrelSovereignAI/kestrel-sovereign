@@ -40,6 +40,13 @@ _SALVAGE_STATE_DURABLE_FOLDED = "durable-folded"
 
 logger = logging.getLogger(__name__)
 
+# The single tokenizer used to turn message text into episode topic terms.
+# Episode repair (#2856) decides whether a persisted term came from a source
+# row's plaintext or from its at-rest envelope, which is only a sound
+# comparison while detection and generation split text identically — so both
+# read this one pattern rather than each carrying a copy.
+_TOPIC_TOKEN_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9'-]{2,}")
+
 
 class MemoryConsolidator:
     """
@@ -696,7 +703,7 @@ class MemoryConsolidator:
             content = str(message.get("content") or "")
             if message.get("role") == "user":
                 content = extract_raw_user_content(content)
-            for token in re.findall(r"[a-zA-Z][a-zA-Z0-9'-]{2,}", content.lower()):
+            for token in _TOPIC_TOKEN_RE.findall(content.lower()):
                 if token in stop_words:
                     continue
                 counts[token] += 1
@@ -793,6 +800,374 @@ class MemoryConsolidator:
             )
             return None
         return text
+
+    # ------------------------------------------------------------------
+    # Repair of episodes already synthesized from ciphertext (#2856)
+    # ------------------------------------------------------------------
+
+    #: How many persisted topic terms must be traceable to a source row's
+    #: at-rest envelope — and absent from that row's plaintext — before an
+    #: episode is treated as ciphertext-derived. The envelope magic on its own
+    #: is exactly one term, and a conversation *about* the envelope format
+    #: yields that term from plaintext, so one is never enough.
+    _REPAIR_MIN_ENVELOPE_TERMS = 2
+
+    #: Bound on the ``IN`` list used to rehydrate one episode's source rows,
+    #: kept well under SQLite's variable limit.
+    _REPAIR_ID_CHUNK = 400
+
+    @classmethod
+    def _envelope_magic_terms(cls) -> Tuple[str, ...]:
+        """The topic terms the at-rest envelope prefixes reduce to.
+
+        Used only to PRE-FILTER repair candidates cheaply in SQL. It never
+        authorizes a write on its own — :meth:`_envelope_derived_terms` does
+        that, against the episode's own source rows.
+        """
+        try:
+            from kestrel_sdk.security.aead import KSA_V2_PREFIX
+
+            ksa_prefix = KSA_V2_PREFIX.decode()
+        except Exception:  # noqa: BLE001 - never let a probe break maintenance
+            ksa_prefix = "KSAv2:"
+        terms: List[str] = []
+        for prefix in (ksa_prefix, cls._LEGACY_FERNET_PREFIX):
+            terms.extend(_TOPIC_TOKEN_RE.findall(prefix.lower()))
+        return tuple(dict.fromkeys(terms))
+
+    @staticmethod
+    def _topic_terms(text: Optional[str]) -> set:
+        """Tokenize text the way episode topics are extracted."""
+        return set(_TOPIC_TOKEN_RE.findall(str(text or "").lower()))
+
+    @classmethod
+    def _envelope_derived_terms(
+        cls,
+        title: Optional[str],
+        summary: Optional[str],
+        sources: List[Dict[str, Any]],
+    ) -> set:
+        """Persisted terms that came from the sources' envelope, not their text.
+
+        This is the evidence that authorizes a rewrite. A term counts only when
+        it is absent from every source's decrypted content AND present in the
+        raw at-rest bytes of a source that actually needed decrypting. So an
+        episode about the encryption format keeps its title (its terms are in
+        the plaintext), while ``Discussion of ksav2, ax1iv9waarjjkc8...`` does
+        not (those terms exist only in the envelope).
+        """
+        persisted = cls._topic_terms(title) | cls._topic_terms(summary)
+        if not persisted:
+            return set()
+        plaintext: set = set()
+        envelope: set = set()
+        for source in sources:
+            plaintext |= cls._topic_terms(source.get("content"))
+            raw = source.get("raw")
+            # Only rows that were genuinely encrypted at rest can contribute
+            # envelope evidence; for a plaintext row raw == content and there
+            # is no envelope to blame.
+            if raw is not None and raw != source.get("content"):
+                envelope |= cls._topic_terms(raw)
+        return (persisted - plaintext) & envelope
+
+    async def _repair_candidates(
+        self, limit: int
+    ) -> List[Tuple[str, Optional[str], Optional[str], Optional[str]]]:
+        """Cheap SQL pre-filter for episodes that may be ciphertext-derived."""
+        conditions: List[str] = []
+        params: List[Any] = [self.agent_id]
+        for term in self._envelope_magic_terms():
+            pattern = f"%{term}%"
+            conditions.append("lower(title) LIKE ?")
+            params.append(pattern)
+            conditions.append("lower(summary) LIKE ?")
+            params.append(pattern)
+        if not conditions:
+            return []
+        params.append(int(limit))
+        rows = await self._db.fetchall(
+            f"""SELECT id, title, summary, key_message_ids
+                FROM memory_episodes
+                WHERE agent_id = ? AND ({' OR '.join(conditions)})
+                ORDER BY created_at
+                LIMIT ?""",
+            tuple(params),
+        )
+        return list(rows or [])
+
+    async def _rehydrate_episode_sources(
+        self, message_ids: List[str]
+    ) -> Dict[str, Dict[str, Any]]:
+        """Load an episode's source rows BY ID, with both raw and plain text.
+
+        Deliberately NOT bounded by ``_create_episodes``' 30-day clustering
+        window and NOT filtered on ``archived_at``: an episode is a durable
+        record of a span that may long predate the window, and a repair that
+        leaned on re-clustering would simply never rebuild the older ones
+        (#2856). ``deleted_at`` IS honoured — a soft-deleted message must not
+        be resurrected into a rebuilt narrative.
+        """
+        found: Dict[str, Dict[str, Any]] = {}
+        for start in range(0, len(message_ids), self._REPAIR_ID_CHUNK):
+            chunk = message_ids[start:start + self._REPAIR_ID_CHUNK]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = await self._db.fetchall(
+                f"""SELECT id, content, metadata, created_at, role
+                    FROM conversation_history
+                    WHERE agent_id = ? AND id IN ({placeholders})
+                      AND deleted_at IS NULL""",
+                (self.agent_id, *chunk),
+            )
+            for msg_id, content, metadata, created_at, role in rows or []:
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (json.JSONDecodeError, TypeError):
+                        metadata = {}
+                raw = "" if content is None else str(content)
+                found[str(msg_id)] = {
+                    "id": msg_id,
+                    "raw": raw,
+                    "content": self._row_plaintext(content, metadata),
+                    "metadata": metadata or {},
+                    "created_at": created_at,
+                    "role": role,
+                }
+        return found
+
+    async def _episode_graph_node_exists(self, episode_id: str) -> bool:
+        """Whether a KG node mirrors this episode.
+
+        A missing ``graph_nodes`` table means no projection exists. Any other
+        failure propagates: the caller must refuse the repair rather than
+        assume the visible surface is clean.
+        """
+        if not await self._db.table_exists("graph_nodes"):
+            return False
+        return bool(
+            await self._db.fetchval(
+                "SELECT 1 FROM graph_nodes WHERE node_id = ?", (episode_id,)
+            )
+        )
+
+    def _resynthesize_narrative(
+        self, sources: List[Dict[str, Any]]
+    ) -> Tuple[str, str]:
+        """Rebuild an episode's title and summary from decrypted sources.
+
+        Runs the same generators as first synthesis, so a repaired episode is
+        byte-identical to what #2850's fix would have produced originally.
+        Note the emotional arc is reproduced, not corrected: it derives from
+        ``emotional_valence`` metadata written by the inline tagger from
+        request-path plaintext, so it was never ciphertext-damaged.
+        """
+        intensities = [
+            s["metadata"].get("emotional_intensity", 0.0) for s in sources
+        ]
+        avg_intensity = sum(intensities) / len(intensities) if intensities else 0.0
+        valences = [s["metadata"].get("emotional_valence", 0.0) for s in sources]
+        arc = self._describe_emotional_arc(valences)
+        title = self._generate_episode_title(sources, avg_intensity)
+        summary = self._generate_episode_summary(sources, arc)
+        return title, summary
+
+    async def _apply_episode_repair(
+        self, episode_id: str, title: str, summary: str, has_node: bool
+    ) -> None:
+        """Persist a rebuilt narrative: graph node first, then row, then vector.
+
+        Ordering is the requirement, not an implementation detail. The KG node
+        is what ``/api/memories`` renders, so it must never be the thing left
+        holding the ciphertext label. Because the node id IS the episode id
+        this is an in-place upsert — no fresh UUID is minted, so the stale node
+        cannot survive as a duplicate. If the node write fails the row write
+        never runs, and the episode stays wholly corrupt and wholly repairable
+        on the next pass; the reverse order could leave a clean row behind a
+        poisoned panel with nothing left to re-detect from.
+        """
+        if has_node:
+            from .async_graph_store import GraphNode
+
+            existing = await self._graph_store.get_node(episode_id)
+            properties = dict(getattr(existing, "properties", None) or {})
+            properties["summary"] = summary
+            properties["repaired_from_ciphertext"] = True
+            await self._graph_store.add_node(
+                GraphNode(
+                    node_id=episode_id,
+                    node_type="episode",
+                    label=title,
+                    properties=properties,
+                )
+            )
+
+        await self._db.execute(
+            "UPDATE memory_episodes SET title = ?, summary = ? "
+            "WHERE id = ? AND agent_id = ?",
+            (title, summary, episode_id, self.agent_id),
+        )
+
+        # The stored vector was computed from the base64 title+summary, so it
+        # poisons the shared embedding space until it is re-derived. Excluding
+        # the row from context would leave that vector in place; re-embedding
+        # replaces it (#2856).
+        await self._embed_episode(episode_id, title, summary)
+
+    async def repair_ciphertext_episodes(
+        self, *, dry_run: bool = False, limit: int = 100
+    ) -> Dict[str, Any]:
+        """Re-synthesize episodes whose narrative was built from ciphertext.
+
+        #2850 stopped NEW episodes being derived from at-rest envelopes; rows
+        written before it keep serving titles like ``Discussion of ksav2,
+        ax1iv9waarjjkc8...`` until repaired. This is that repair.
+
+        It is proof-driven, not heuristic. An episode is rewritten only when
+        its own source rows show that its persisted terms came from their
+        envelope and not their plaintext, and only when every declared source
+        is still present and decryptable. Anything unprovable is reported and
+        left alone — serving a bad title is recoverable, deleting a real
+        memory is not.
+
+        Args:
+            dry_run: Report what would be repaired without writing anything.
+            limit: Maximum candidate episodes to examine in one pass.
+        """
+        report: Dict[str, Any] = {
+            "scanned": 0,
+            "repaired": 0,
+            "cleared": 0,
+            "unrepairable": [],
+            "planned": [],
+            "dry_run": bool(dry_run),
+        }
+
+        # A rebuilt title and summary are user-derived content, so a live
+        # repair is a durable write like any other and answers to the same
+        # privacy boundary (#2672). A dry run only reads.
+        if not dry_run and not self._durable_writes_allowed():
+            report["skipped"] = True
+            report["skipped_reason"] = "privacy_mode_forbids_persistence"
+            return report
+
+        candidates = await self._repair_candidates(limit)
+        report["scanned"] = len(candidates)
+
+        for episode_id, title, summary, key_ids_json in candidates:
+            episode_id = str(episode_id)
+            try:
+                declared = json.loads(key_ids_json or "[]")
+                if not isinstance(declared, list):
+                    raise ValueError("key_message_ids is not a list")
+                declared = [str(m) for m in declared]
+            except (json.JSONDecodeError, TypeError, ValueError):
+                report["unrepairable"].append(
+                    {"episode_id": episode_id, "reason": "unreadable_key_message_ids"}
+                )
+                continue
+
+            if not declared:
+                report["unrepairable"].append(
+                    {"episode_id": episode_id, "reason": "no_recorded_sources"}
+                )
+                continue
+
+            try:
+                found = await self._rehydrate_episode_sources(declared)
+            except Exception as e:  # noqa: BLE001 - one bad episode must not halt the pass
+                logger.warning(
+                    "episode repair could not rehydrate sources for %s: %s",
+                    episode_id, e,
+                )
+                report["unrepairable"].append(
+                    {"episode_id": episode_id, "reason": "source_lookup_failed"}
+                )
+                continue
+
+            # Fail closed on incomplete provenance. ``key_message_ids`` is the
+            # episode's provenance trail; silently rebuilding from a subset
+            # would rewrite what the episode claims to be a record OF, and the
+            # new message counts would look authoritative while being wrong.
+            missing = [m for m in declared if m not in found]
+            if missing:
+                report["unrepairable"].append({
+                    "episode_id": episode_id,
+                    "reason": "sources_missing",
+                    "missing": len(missing),
+                })
+                continue
+
+            # Preserve the recorded order — it is the order the episode was
+            # originally synthesized in, and the emotional arc reads the first
+            # and last entries.
+            sources = [found[m] for m in declared]
+
+            if any(s["content"] is None for s in sources):
+                report["unrepairable"].append(
+                    {"episode_id": episode_id, "reason": "undecryptable_sources"}
+                )
+                continue
+
+            evidence = self._envelope_derived_terms(title, summary, sources)
+            if len(evidence) < self._REPAIR_MIN_ENVELOPE_TERMS:
+                # Pre-filter hit, proof did not follow — a healthy episode that
+                # genuinely discusses the envelope format lands here.
+                report["cleared"] += 1
+                continue
+
+            new_title, new_summary = self._resynthesize_narrative(sources)
+
+            try:
+                has_node = await self._episode_graph_node_exists(episode_id)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "episode repair could not probe the graph node for %s: %s",
+                    episode_id, e,
+                )
+                report["unrepairable"].append(
+                    {"episode_id": episode_id, "reason": "graph_probe_failed"}
+                )
+                continue
+
+            if has_node and self._graph_store is None:
+                # A stale node exists but nothing can rewrite it. Repairing the
+                # row alone would leave the ciphertext label rendering in the
+                # Memories panel forever.
+                report["unrepairable"].append(
+                    {"episode_id": episode_id, "reason": "graph_store_unavailable"}
+                )
+                continue
+
+            if dry_run:
+                report["planned"].append({
+                    "episode_id": episode_id,
+                    "old_title": title,
+                    "new_title": new_title,
+                    "evidence_terms": sorted(evidence)[:8],
+                    "sources": len(sources),
+                    "graph_node": has_node,
+                })
+                continue
+
+            try:
+                await self._apply_episode_repair(
+                    episode_id, new_title, new_summary, has_node
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("episode repair failed for %s: %s", episode_id, e)
+                report["unrepairable"].append(
+                    {"episode_id": episode_id, "reason": "write_failed"}
+                )
+                continue
+
+            report["repaired"] += 1
+            logger.info(
+                "repaired ciphertext-derived episode %s: %r -> %r",
+                episode_id, title, new_title,
+            )
+
+        return report
 
     def _durable_writes_allowed(self) -> bool:
         """Whether the current privacy mode permits persisting an episode.
