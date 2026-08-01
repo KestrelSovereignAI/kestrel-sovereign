@@ -171,6 +171,10 @@ class MemorySystem:
             # manual / scheduled consolidation can't persist user-derived
             # episodes in a volatile mode (#2672).
             persist_policy=self._privacy_storage,
+            # #2850: the consolidator reads conversation_history with its own
+            # SQL, so it needs the store that owns decryption — without it the
+            # at-rest envelope was tokenized straight into episode topics.
+            conversation_store=self.storage.conversation,
         )
 
         # Schema-aware routing: promote extracted structure (action items,

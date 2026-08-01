@@ -1653,6 +1653,24 @@ class AsyncConversationStore:
                     return False
         return True
 
+    def decrypt_stored_content(self, content: str, meta: Optional[Dict]) -> str:
+        """Public: decrypt one stored row's content to plaintext.
+
+        The conversation store owns message decryption. Consumers that read
+        ``conversation_history`` with their own SQL (the memory consolidator
+        does, for clustering and episode synthesis) previously had no
+        supported way to reach it, so they treated the at-rest envelope as
+        text — which is how ciphertext ended up tokenized into episode topics
+        (#2850). This is that supported way; it deliberately does NOT
+        opportunistically migrate, because a read-only consumer must not
+        rewrite rows.
+
+        Raises ``DecryptionError`` when the row is marked encrypted and no
+        key can open it — callers decide whether to skip or fail.
+        """
+        plaintext, _needs_migration = self._decrypt_with_fallback(content, meta)
+        return plaintext
+
     def _decrypt_with_fallback(self, content: str, meta: Optional[Dict]) -> tuple[str, bool]:
         """Decrypt content, trying per-agent key first then global.
 
