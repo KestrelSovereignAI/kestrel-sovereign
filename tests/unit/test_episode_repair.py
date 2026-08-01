@@ -81,6 +81,12 @@ async def _make_db(tmp_path, name="repair.db"):
         "node_id TEXT PRIMARY KEY, node_type TEXT NOT NULL, "
         "label TEXT NOT NULL, properties TEXT)"
     )
+    # Mirrors CORE_SCHEMA: the one-shot repair records its completion here.
+    await db.execute(
+        "CREATE TABLE schema_backfills ("
+        "name TEXT PRIMARY KEY, "
+        "completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+    )
     return db
 
 
@@ -1078,7 +1084,9 @@ class TestRoundFourFindings:
         c.repair_ciphertext_episodes = _boom
         try:
             result = await c.run_consolidation()
-            assert result["episode_repair_error"] == "pass exploded"
+            # The once-guard runs the pass inside a transaction, so the text is
+            # wrapped; what matters is that the failure is recorded at all.
+            assert "pass exploded" in result["episode_repair_error"]
             assert result["episodes_repaired"] == 0
         finally:
             await db.close()
@@ -1224,6 +1232,124 @@ class TestLockReachesTheConsolidator:
             await storage.close()
 
 
+class TestRunsOnceNotForever:
+    """The damage set is closed, so this is a migration, not maintenance.
+
+    #2850 stopped new episodes being built from the envelope, so nothing can
+    join the damaged set. Once an agent's corpus is provably clean there is
+    nothing left to look for — and re-scanning nightly would re-decrypt healthy
+    episodes that merely mention the envelope format, forever.
+    """
+
+    @pytest.mark.asyncio
+    async def test_repair_retires_after_a_clean_sweep(self, tmp_path):
+        db, ids, store = await _corrupt_fixture(tmp_path)
+        c = _consolidator(db, store, _RecordingGraphStore(db))
+        try:
+            first = await c.run_consolidation()
+            assert first["episodes_repaired"] == 1
+
+            # Second night: something was repaired last time, so the pass runs
+            # again and finds nothing — that is the sweep that retires it.
+            second = await c.run_consolidation()
+            assert second["episodes_repaired"] == 0
+
+            # Third night: it must not run at all.
+            calls = {"n": 0}
+            original = c.repair_ciphertext_episodes
+
+            async def _count(**kwargs):
+                calls["n"] += 1
+                return await original(**kwargs)
+
+            c.repair_ciphertext_episodes = _count
+            third = await c.run_consolidation()
+
+            assert calls["n"] == 0, (
+                "a closed damage set means the pass must retire, not re-scan "
+                "every night for the life of the agent"
+            )
+            assert "episodes_repaired" not in third
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_retired_repair_does_not_even_take_the_lock(self, tmp_path):
+        """The fast path matters on its own.
+
+        Correctness comes from the re-check inside the lock, but without the
+        check BEFORE it every sleep would acquire a migration lock forever for
+        work that is finished.
+        """
+        db, ids, store = await _corrupt_fixture(tmp_path)
+        c = _consolidator(db, store, _RecordingGraphStore(db))
+        try:
+            await c.run_consolidation()
+            await c.run_consolidation()  # clean sweep -> retires
+
+            locks: list = []
+            original_lock = db.migration_lock
+
+            def _spy(name):
+                locks.append(name)
+                return original_lock(name)
+
+            db.migration_lock = _spy
+            await c.run_consolidation()
+
+            assert locks == [], (
+                "a retired repair must not serialize on a migration lock "
+                "every night"
+            )
+        finally:
+            db.migration_lock = original_lock
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_outstanding_work_does_not_retire_the_repair(self, tmp_path):
+        """One transient hiccup must not permanently skip an agent."""
+        db, ids, store = await _corrupt_fixture(tmp_path)
+        await db.execute(
+            "UPDATE conversation_history SET deleted_at = ? WHERE id = ?",
+            (datetime.now(timezone.utc).isoformat(), ids[0]),
+        )
+        c = _consolidator(db, store, _RecordingGraphStore(db))
+        try:
+            report = await c.run_consolidation()
+            assert report["episodes_unrepairable"], "precondition"
+
+            assert not await db.backfill_completed(
+                f"{MemoryConsolidator._REPAIR_BACKFILL}:{AGENT}"
+            ), "an unresolved episode must leave the repair eligible to retry"
+
+            calls = {"n": 0}
+            original = c.repair_ciphertext_episodes
+
+            async def _count(**kwargs):
+                calls["n"] += 1
+                return await original(**kwargs)
+
+            c.repair_ciphertext_episodes = _count
+            await c.run_consolidation()
+            assert calls["n"] == 1, "it must try again while work is outstanding"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_an_agent_with_no_damage_retires_immediately(self, tmp_path):
+        """The common case: nothing was ever corrupt, so one cheap pass."""
+        db = await _make_db(tmp_path)
+        c = _consolidator(db, _decrypting_store({}), _RecordingGraphStore(db))
+        try:
+            first = await c.run_consolidation()
+            assert first["episodes_repaired"] == 0
+            assert await db.backfill_completed(
+                f"{MemoryConsolidator._REPAIR_BACKFILL}:{AGENT}"
+            )
+        finally:
+            await db.close()
+
+
 class TestWiredIntoConsolidation:
     """Repair that nothing calls is repair that never happens."""
     """Repair that nothing calls is repair that never happens."""
@@ -1257,7 +1383,7 @@ class TestWiredIntoConsolidation:
 
             assert "error" not in report, "consolidation must survive a repair failure"
             assert report["episodes_repaired"] == 0
-            assert report["episode_repair_error"] == "repair exploded"
+            assert "repair exploded" in report["episode_repair_error"]
             assert "total_messages_processed" in report, (
                 "the steps after repair must still run"
             )

@@ -236,20 +236,24 @@ class MemoryConsolidator:
             report["episodes_embedded"] = await self._backfill_episode_embeddings()
 
             # 3c. Repair episodes synthesized from ciphertext before #2850.
-            # Sleep owns nightly memory maintenance, and this is maintenance:
-            # the damaged rows keep being served until something rewrites
-            # them. Isolated from the rest of the cycle — a repair failure is
-            # reported, never fatal to consolidation (#2856).
+            # Sleep is the vehicle because it already owns memory maintenance,
+            # but this is a MIGRATION, not maintenance: the damage set is
+            # closed — no episode written after #2850 can be ciphertext-derived
+            # — so once an agent's corpus is provably clean there is nothing
+            # left to look for, ever. It therefore runs at most once per agent
+            # and then retires itself. Isolated from the rest of the cycle: a
+            # repair failure is reported, never fatal to consolidation (#2856).
             try:
-                repair = await self.repair_ciphertext_episodes()
-                report["episodes_repaired"] = repair.get("repaired", 0)
-                if repair.get("unrepairable"):
-                    report["episodes_unrepairable"] = repair["unrepairable"]
-                if repair.get("limit_reached"):
-                    # This is the only production caller, so dropping the
-                    # marker here means nothing ever reports that later corrupt
-                    # episodes went unexamined (codex review r2 P2).
-                    report["episode_repair_limit_reached"] = True
+                repair = await self._repair_ciphertext_episodes_once()
+                if repair is not None:
+                    report["episodes_repaired"] = repair.get("repaired", 0)
+                    if repair.get("unrepairable"):
+                        report["episodes_unrepairable"] = repair["unrepairable"]
+                    if repair.get("limit_reached"):
+                        # This is the only production caller, so dropping the
+                        # marker here means nothing ever reports that later
+                        # corrupt episodes went unexamined (codex r2 P2).
+                        report["episode_repair_limit_reached"] = True
             except Exception as e:  # noqa: BLE001
                 logger.warning("episode repair pass failed: %s", e)
                 report["episodes_repaired"] = 0
@@ -1285,6 +1289,56 @@ class MemoryConsolidator:
                 "sources: %s", episode_id, e,
             )
             raise
+
+    #: Marker name for the one-shot repair, in the shared ``schema_backfills``
+    #: table. Agent-scoped: each agent's corpus is repaired independently.
+    _REPAIR_BACKFILL = "ciphertext_episode_repair_2856"
+
+    async def _repair_ciphertext_episodes_once(self) -> Optional[Dict[str, Any]]:
+        """Run the repair until this agent's episodes are clean, then retire.
+
+        The damage is a CLOSED set: #2850 stopped new episodes being built from
+        the at-rest envelope, so nothing can join it. A pass that finds nothing
+        left to repair has therefore finished for good, and re-running it every
+        night would only re-decrypt healthy episodes that merely mention the
+        envelope format, forever.
+
+        Completion requires a genuinely clean sweep — nothing repaired, nothing
+        outstanding, nothing left unexamined. A pass that repaired something,
+        hit a transient failure, or ran out of budget does NOT retire, so the
+        next sleep picks up where it left off. The cost of that conservatism is
+        one extra pass per agent; the cost of the alternative is a
+        single hiccup permanently skipping an agent's repair.
+
+        Returns the pass report, or ``None`` when the repair had already
+        retired and did not run.
+        """
+        name = f"{self._REPAIR_BACKFILL}:{self.agent_id}"
+        if await self._db.backfill_completed(name):
+            return None
+
+        async with self._db.migration_lock(name):
+            # Re-check inside the lock: another initializer may have finished
+            # while this one waited, so the gate that let us in is stale.
+            if await self._db.backfill_completed(name):
+                return None
+
+            report = await self.repair_ciphertext_episodes()
+
+            settled = (
+                report.get("repaired") == 0
+                and not report.get("unrepairable")
+                and not report.get("limit_reached")
+                and not report.get("scan_truncated")
+                and not report.get("skipped")
+            )
+            if settled:
+                await self._db.mark_backfill_completed(name)
+                logger.info(
+                    "ciphertext-episode repair is complete for %s; it will not "
+                    "run again", self.agent_id,
+                )
+            return report
 
     async def repair_ciphertext_episodes(
         self, *, dry_run: bool = False, limit: int = 100,
