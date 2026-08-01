@@ -995,25 +995,38 @@ async def test_vector_export_erasure_lifecycle_has_backend_parity(db_backend, tm
 async def test_isolated_kite_erasure_drill_uses_real_core_owners(
     db_backend, tmp_path, monkeypatch,
 ):
-    """The server-owned Kite drill proves all core stages without leaking IDs."""
+    """Storage refuses every direct call; only the loopback typed route runs it."""
     tenant, identity = await _incepted_assertion_identity(tmp_path, "kite-erasure-drill")
     raw_storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
     storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
     try:
         with pytest.raises(PrivacyViolationError, match="unavailable"):
-            await storage.semantic_release_erasure_drill(
-                operation_id=f"kite-erasure-{uuid4().hex}",
-            )
+            await storage.semantic_release_erasure_drill(capability=object())
         monkeypatch.setenv("KESTREL_KITE_RELEASE_EVIDENCE", "1")
-        result = await storage.semantic_release_erasure_drill(
-            operation_id=f"kite-erasure-{uuid4().hex}",
+        evidence_home = tmp_path / "kite-evidence-home"
+        evidence_home.mkdir(mode=0o700)
+        monkeypatch.setenv("KESTREL_HOME", str(evidence_home))
+        monkeypatch.setenv("KESTREL_KITE_RELEASE_EVIDENCE_ROOT", str(evidence_home))
+        with pytest.raises(PrivacyViolationError, match="one-shot authority"):
+            await storage.semantic_release_erasure_drill(capability=object())
+
+        # Even an endpoint-issued capability cannot escape its route-local
+        # task scope and become a lower-level release-evidence shortcut.
+        from kestrel_sovereign.knowledge.kite_erasure_authority import (
+            _issue_kite_erasure_drill_capability,
+            _typed_kite_erasure_endpoint_issuance_scope,
         )
-        assert set(result) == {
-            "active_assertions", "derivations", "vector_index", "recall_candidates",
-            "export_snapshots", "governed_corpus", "future_corpus", "projection_candidates",
-        }
-        assert all(value["erased_count"] > 0 and value["remaining_count"] == 0 for value in result.values())
-        assert result["derivations"] == {"erased_count": 1, "remaining_count": 0}
+        from kestrel_sovereign.knowledge.kite_evidence_signing import (
+            consume_kite_evidence_nonce,
+        )
+
+        with _typed_kite_erasure_endpoint_issuance_scope():
+            capability = _issue_kite_erasure_drill_capability(
+                consume_kite_evidence_nonce("a" * 64, issue_receipt=True),
+                operation="erasure_core_snapshot",
+            )
+        with pytest.raises(PrivacyViolationError, match="one-shot authority"):
+            await storage.semantic_release_erasure_drill(capability=capability)
     finally:
         await raw_storage.close()
 

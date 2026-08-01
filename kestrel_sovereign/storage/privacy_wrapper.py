@@ -3274,17 +3274,21 @@ class PrivacyEnforcingStorage:
             raise RuntimeError("Kite invalid import did not stay in the quarantine boundary")
         return {"invalid_import_quarantine_count": 1}
 
-    async def semantic_release_erasure_drill(self, *, operation_id: str) -> dict[str, dict[str, int]]:
+    async def semantic_release_erasure_drill(
+        self, *, capability: object,
+    ) -> dict[str, dict[str, int]]:
         """Run the fixed, isolated Kite physical-erasure drill.
 
         This is intentionally not a public storage primitive: its only caller
         is the loopback Kite evidence endpoint after bootstrap authentication,
-        test-instance checks, nonce consumption, and Ed25519 response signing.
-        The server owns the correlation, assertion/revision lineage, local
-        vector profile, consumer key, policy, capability pins, checkpoints,
-        deletion callback, and content-free final aggregate.
+        test-instance checks, durable exact-nonce consumption, and Ed25519
+        response signing. The endpoint exchanges that nonce receipt for an
+        opaque capability bound to this operation and correlation; this method
+        consumes it before touching storage. The server owns the
+        assertion/revision lineage, local vector profile, consumer key, policy,
+        capability pins, checkpoints, deletion callback, and content-free
+        final aggregate.
         """
-        import hashlib
         import os
         from dataclasses import replace
         from datetime import UTC, datetime, timedelta
@@ -3304,15 +3308,27 @@ class PrivacyEnforcingStorage:
             Literal,
             XSD_STRING,
         )
+        from kestrel_sovereign.knowledge.kite_erasure_authority import (
+            ERASURE_CORE_SNAPSHOT_OPERATION,
+            KiteErasureDrillAuthorityError,
+            _consume_kite_erasure_drill_capability,
+        )
         from kestrel_sovereign.storage.semantic_vector_projection import SemanticVectorProjectionError
 
         if os.environ.get("KESTREL_KITE_RELEASE_EVIDENCE", "").strip().lower() not in {"1", "true", "yes", "on"}:
             raise PrivacyViolationError("Kite semantic release drill is unavailable")
-        if not isinstance(operation_id, str) or not operation_id.startswith("kite-erasure-"):
-            raise PrivacyViolationError("Kite semantic release drill requires its server-issued correlation")
+        try:
+            authority = _consume_kite_erasure_drill_capability(
+                capability, expected_operation=ERASURE_CORE_SNAPSHOT_OPERATION,
+            )
+        except KiteErasureDrillAuthorityError as error:
+            raise PrivacyViolationError(
+                "Kite semantic release drill requires its endpoint-issued one-shot authority"
+            ) from error
         self._assert_semantic_assertion_write_allowed("kite_release_erasure_drill")
         raw = self._storage
-        correlation = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()
+        operation_id = authority.operation_id
+        correlation = authority.correlation
         fact = await self.save_explicit_fact(
             subject="user",
             predicate="preferred_deploy_region",

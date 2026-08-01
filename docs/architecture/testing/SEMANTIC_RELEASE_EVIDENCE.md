@@ -292,6 +292,18 @@ the content-free proof digest.
 A fresh empty export, Story Archive timeline export, or unrelated corpus is not
 evidence that a previously registered consumer artifact was deleted.
 
+The core-erasure storage drill accepts no caller-selected operation ID or
+prefix-shaped correlation.  Only the authenticated typed loopback endpoint can
+exchange its durably committed, exact request nonce for an opaque one-shot
+authority.  That authority is task-local to the endpoint, bound to
+`erasure_core_snapshot` and its server-derived correlation, and consumed before
+the storage owner touches durable state.  Direct construction, a same-process
+call outside that endpoint scope, a malformed receipt, reuse, a cross-operation
+attempt, or a capability retained after the route returns is rejected; a
+cross-operation attempt burns the authority.  Non-erasure typed probes retain
+no capability receipt.  Consequently no lower-level storage call can be
+relabeled as core release evidence.
+
 `kestrel-feature-parametric-self` is an external optional consumer, not a
 dependency imported by this repository. Its report is absent from a new
 template and therefore remains a readiness blocker until its envelope contains

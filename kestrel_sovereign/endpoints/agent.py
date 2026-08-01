@@ -154,7 +154,9 @@ async def _kite_runtime_observation(
         KiteEvidenceNonceReplay, KiteEvidenceSigningError, consume_kite_evidence_nonce,
     )
     try:
-        consume_kite_evidence_nonce(nonce)
+        nonce_receipt = consume_kite_evidence_nonce(
+            nonce, issue_receipt=operation == "erasure_core_snapshot",
+        )
     except KiteEvidenceNonceReplay as error:
         raise ApiHTTPException(status_code=409, code="kite_evidence_nonce_replayed", message="Kite evidence nonce was already consumed.") from error
     except KiteEvidenceSigningError as error:
@@ -193,7 +195,22 @@ async def _kite_runtime_observation(
                 raise RuntimeError("Kite paraphrase recall did not hydrate provenance")
             return operation, {"retrieval_count": len(hydrated), "provenance_check_count": len(hydrated)}
         if operation == "erasure_core_snapshot":
-            observation = await agent.storage.semantic_release_erasure_drill(operation_id=f"kite-erasure-{nonce}")
+            from kestrel_sovereign.knowledge.kite_erasure_authority import (
+                KiteErasureDrillAuthorityError,
+                _issue_kite_erasure_drill_capability,
+                _typed_kite_erasure_endpoint_issuance_scope,
+            )
+
+            try:
+                with _typed_kite_erasure_endpoint_issuance_scope():
+                    capability = _issue_kite_erasure_drill_capability(
+                        nonce_receipt, operation=operation,
+                    )
+                    observation = await agent.storage.semantic_release_erasure_drill(
+                        capability=capability,
+                    )
+            except (KiteErasureDrillAuthorityError, KiteEvidenceSigningError) as error:
+                raise RuntimeError("Kite core erasure authority is unavailable") from error
             if not isinstance(observation, dict):
                 raise RuntimeError("Kite core erasure drill is unavailable")
             return operation, observation

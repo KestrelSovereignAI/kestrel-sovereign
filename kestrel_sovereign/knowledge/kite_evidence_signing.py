@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
+import weakref
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -33,6 +34,46 @@ class KiteEvidenceSigningError(RuntimeError):
 
 class KiteEvidenceNonceReplay(KiteEvidenceSigningError):
     """A request nonce has already been consumed by this isolated evidence home."""
+
+
+class KiteEvidenceNonceReceipt:
+    """Opaque proof that one exact Kite nonce committed to the local ledger.
+
+    The typed evidence endpoint is the only code that receives this object.
+    Callers cannot construct or copy it: its nonce remains in this module's
+    private, one-shot registry until an operation-specific authority claims it.
+    """
+
+    __slots__ = ("__weakref__",)
+
+    def __new__(cls, *args, **kwargs):
+        raise TypeError("Kite evidence nonce receipts are issued after durable consumption")
+
+
+_nonce_receipts: weakref.WeakKeyDictionary[KiteEvidenceNonceReceipt, str] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _issued_nonce_receipt(nonce: str) -> KiteEvidenceNonceReceipt:
+    """Create the unforgeable receipt only after the ledger transaction commits."""
+    receipt = object.__new__(KiteEvidenceNonceReceipt)
+    _nonce_receipts[receipt] = nonce
+    return receipt
+
+
+def claim_kite_evidence_nonce_receipt(receipt: object) -> str:
+    """Consume a committed nonce receipt for one typed internal authority.
+
+    This deliberately returns the nonce only to another internal authority;
+    it is not an HTTP or storage operation and cannot itself produce evidence.
+    """
+    if type(receipt) is not KiteEvidenceNonceReceipt:
+        raise KiteEvidenceSigningError("Kite evidence nonce receipt is invalid")
+    try:
+        return _nonce_receipts.pop(receipt)
+    except KeyError as error:
+        raise KiteEvidenceSigningError("Kite evidence nonce receipt was already claimed") from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,7 +370,9 @@ def _assert_nonce_ledger_unchanged(
         raise KiteEvidenceSigningError("Kite evidence nonce ledger changed while opening")
 
 
-def consume_kite_evidence_nonce(nonce: str) -> None:
+def consume_kite_evidence_nonce(
+    nonce: str, *, issue_receipt: bool = False,
+) -> KiteEvidenceNonceReceipt | None:
     """Durably reserve ``nonce`` before operation execution, including restarts."""
     if not isinstance(nonce, str):
         raise KiteEvidenceSigningError("Kite evidence nonce must be text")
@@ -363,3 +406,8 @@ def consume_kite_evidence_nonce(nonce: str) -> None:
     finally:
         if connection is not None:
             connection.close()
+    # The ordinary typed probes need only durable replay protection.  Retain a
+    # live receipt solely for the core-erasure route, which immediately hands
+    # it to the endpoint-scoped authority.  This keeps ignored/non-erasure
+    # requests from accumulating in the private weak registry.
+    return _issued_nonce_receipt(nonce) if issue_receipt else None

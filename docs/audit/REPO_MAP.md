@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-08-01
-**Scope:** 2274 tracked files (1512 `.py`, 345 `.md`, 417 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 2281 tracked files (1519 `.py`, 345 `.md`, 417 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -797,6 +797,14 @@ Repo entry points and standard project files.
   - `class GovernedCorpusError`; `class GovernedCorpusUnavailable`; `class GovernedCorpusBudgetExceeded`; `class CorpusEligibilityReason`; `class CorpusCheckpoint`; `class GovernedCorpusLimits`; `class GovernedCorpusPolicy`; `class CorpusValidationStatus`; `…`
 - **kestrel_sovereign/knowledge/inference.py** — Deterministic, bounded RDFS and allowlisted OWL 2 RL materialization.
   - `class InferenceError`; `class ClosureStatus`; `class InferenceLimits`; `class InferenceProfile`; `def inference_profile_from_config(config)`; `def inference_limits_from_config(config)`; `def validate_inference_profile(profile)`; `class ClosureState`; `…`
+- **kestrel_sovereign/knowledge/kite_erasure_authority.py** — Opaque, one-shot authority for the fixed Kite core-erasure drill.
+  - `class KiteErasureDrillAuthorityError`; `class KiteErasureDrillCapability`
+- **kestrel_sovereign/knowledge/kite_evidence_signing.py** — Private signing and replay state for an isolated Kite evidence run.
+  - `class KiteEvidenceSigningError`; `class KiteEvidenceNonceReplay`; `class KiteEvidenceNonceReceipt`; `def claim_kite_evidence_nonce_receipt(receipt)`; `def kite_evidence_public_key()`; `def sign_kite_evidence(payload)`; `def consume_kite_evidence_nonce(nonce)`
+- **kestrel_sovereign/knowledge/kite_release_evidence.py** — Isolated, content-free Kite HTTP evidence harness.
+  - `class KiteEvidenceError`; `class KiteEvidenceUnsupported`; `class KiteGate`; `class KiteStorageConfig`; `class KiteIsolationConfig`; `class KiteAggregateObservation`; `class SurfaceErasureObservation`; `class ErasureSurfaceProbe`; `…`
+- **kestrel_sovereign/knowledge/kite_release_evidence_workloads.py** — Executable, explicitly provisioned Kite HTTP release workloads.
+  - `def kite_http_workloads(factory)`; `def owned_kite_http_workloads()`
 - **kestrel_sovereign/knowledge/maintenance.py** — Incremental, restart-safe semantic maintenance after memory consolidation.
   - `class SemanticMaintenanceError`; `class SemanticMaintenanceStatus`; `class SemanticMaintenanceTrainingReadiness`; `class SemanticMaintenanceLimits`; `def maintenance_limits_from_config(config)`; `def maintenance_allows_prior_verified_snapshot(config)`; `class SemanticMaintenanceResult`; `class SemanticMaintenanceService`
 - **kestrel_sovereign/knowledge/rdf_codec.py** — Bounded RDF projections for the canonical assertion contract.
@@ -806,7 +814,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/knowledge/registry.py** — The offline registry for Kestrel semantic knowledge artifacts.
   - `class KnowledgeRegistryError`; `class ResourceNotFoundError`; `class VersionRequiredError`; `class IncompatibleSemanticVersionError`; `class AmbiguousSemanticVersionError`; `class ImportCycleError`; `class DuplicateNamespaceError`; `class ResourceDigestMismatchError`; `…`
 - **kestrel_sovereign/knowledge/release_evidence.py** — Spec-bound semantic release evidence catalog and report assembly.
-  - `def performance_targets()`; `def release_gate_specs(registry)`; `class SemanticReleaseEvidence`; `class StructuralReleaseEvidence`; `def build_standards_matrix(registry)`; `def implementation_versions()`; `def inspect_stable_only_capabilities(registry)`; `def release_evidence_template(registry)`; `…`
+  - `def erasure_drill_binding()`; `def performance_targets()`; `def release_gate_specs(registry)`; `class SemanticReleaseEvidence`; `class StructuralReleaseEvidence`; `def build_standards_matrix(registry)`; `def implementation_versions()`; `def inspect_stable_only_capabilities(registry)`; `…`
 - **kestrel_sovereign/knowledge/release_evidence_benchmarks.py** — Real, isolated semantic benchmark workloads for release evidence.
   - `def semantic_benchmark_workloads()`
 - **kestrel_sovereign/knowledge/release_evidence_cli.py** — CLI for content-free semantic release evidence.
@@ -1289,7 +1297,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/storage/semantic_vector_projection.py** — Derived, tenant-bound vector projection for canonical semantic assertions.
   - `class SemanticVectorProjectionError`; `class SemanticVectorProfile`; `class SemanticVectorCandidate`; `class SemanticVectorCheckpoint`; `class SemanticVectorErasureObservation`; `class SemanticVectorEmbeddingProvider`; `class SemanticAssertionVectorProjection`
 - **kestrel_sovereign/storage/session_grouping.py** — Shared session-boundary algorithm (#2019).
-  - `def coerce_session_timestamp(created_at)`; `def group_messages_into_sessions(messages, gap_minutes, now, keep_empty_markers, …)`; `def coalesce_sessions_by_session_id(sessions)`; `def summarize_sessions(messages, names, limit, include_trashed, …)`
+  - `def coerce_session_timestamp(created_at)`; `def timestamp_query_param(backend_type, value)`; `def canonical_timestamp_sql(backend_type, expression)`; `def timestamp_predicate(backend_type, column, operator)`; `def group_messages_into_sessions(messages, gap_minutes, now, keep_empty_markers, …)`; `def coalesce_sessions_by_session_id(sessions)`; `def summarize_sessions(messages, names, limit, include_trashed, …)`
 - **kestrel_sovereign/storage/sovereign_adapter.py** — Sovereign Storage Adapter V2 - The Encrypted Merkle Forest.
   - `class ShardMetadata`; `class AssetDescriptor`; `class AssetMetadata`; `class AssetCollector`; `class AssetRestorer`; `class RootManifest`; `class ImportCheck`; `class ImportContinuity`; `…`
 - **kestrel_sovereign/storage/sovereign_import_consent.py** — Sovereignty-CAR import-consent wiring (#1379, follow-up to #1273).
@@ -2140,7 +2148,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_ephemeral_purge_scoped.py** — Integration tests for the scoped EPHEMERAL leak-purge (#867).
   - `async def test_no_writes_during_ephemeral_destroys_nothing(tmp_path)`; `async def test_only_in_window_rows_are_purged(tmp_path)`; `async def test_purge_without_watermark_refuses(tmp_path)`; `async def test_watermark_refreshes_on_re_entry(tmp_path)`; `async def test_graph_nodes_with_iso_timestamps_are_scoped_correctly(tmp_path)`; `async def test_graph_nodes_without_created_at_are_skipped_with_warning(tmp_path, caplog)`; `async def test_other_agents_data_untouched(tmp_path)`
 - **tests/integration/test_episode_recall.py** — Relevance-based episode recall + access tracking (#1674 P2).
-  - `async def db()`; `async def test_keyword_recall_when_no_embedding_provider(db)`; `async def test_keyword_recall_accepts_natural_language_topic_query(db)`; `async def test_keyword_recall_ranks_full_overlap_before_recent_partial_hits(db)`; `async def test_recall_increments_access_count(db)`; `async def test_from_row_tolerates_native_datetimes()`; `async def test_recall_empty_query_returns_nothing(db)`; `async def test_recall_merges_vector_and_keyword(db)`; `…`
+  - `async def db()`; `async def test_consolidator_sqlite_cutoffs_normalize_mixed_timestamp_forms(db, monkeypatch)`; `async def test_keyword_recall_when_no_embedding_provider(db)`; `async def test_keyword_recall_accepts_natural_language_topic_query(db)`; `async def test_keyword_recall_ranks_full_overlap_before_recent_partial_hits(db)`; `async def test_recall_increments_access_count(db)`; `async def test_from_row_tolerates_native_datetimes()`; `async def test_recall_empty_query_returns_nothing(db)`; `…`
 - **tests/integration/test_exact_conversation_purge.py** — Exact-id hard-purge contracts for conversation history (#2509).
   - `async def test_purge_message_removes_its_blind_index(db_backend)`; `async def test_purge_message_reclaims_an_empty_legacy_lexical_key(db_backend)`; `async def test_purge_preserves_shared_blind_index_until_last_owner(db_backend)`; `async def test_concurrent_final_shared_key_purges_reclaim_tokens(db_backend, monkeypatch)`; `async def test_postgres_session_and_full_purge_share_one_row_lock_order(db_backend, monkeypatch)`; `async def test_session_preview_and_hard_purge_are_not_capped_at_ten_thousand(db_backend)`; `async def test_mixed_sqlite_session_timestamps_keep_every_public_scope_exact(tmp_path, anchor_timestamp, other_timestamp, other_belongs)`; `async def test_implicit_session_gap_boundaries_match_on_both_backends(db_backend)`; `…`
 - **tests/integration/test_feature_install_discover_e2e.py** — E2E tests for the feature install/discover lifecycle (Issue #495).
@@ -2966,6 +2974,12 @@ Repo entry points and standard project files.
   - `def master_key()`; `def test_private_key()`; `def storage(master_key, temp_dir, monkeypatch)`; `class TestSecureKeyStorageInit`; `class TestKeyEncryption`; `class TestKeyMigration`; `class TestEncryptedKeyBundle`; `class TestEdgeCases`; `…`
 - **tests/unit/test_keys_rotation_fail_closed.py** — Key rotation fails CLOSED when the approval queue raises (#1723).
   - `async def test_rotation_fails_closed_when_approval_queue_raises(monkeypatch)`; `async def test_rotation_proceeds_with_partial_under_override(monkeypatch)`
+- **tests/unit/test_kite_erasure_authority.py** — Authority-boundary tests for the loopback Kite core-erasure drill.
+  - `def test_erasure_authority_rejects_direct_construction_and_same_process_issuance(tmp_path, monkeypatch)`; `def test_erasure_authority_is_exactly_bound_burned_and_route_scoped(tmp_path, monkeypatch)`; `def test_erasure_authority_rejects_malformed_receipts_and_non_erasure_receipts_do_not_accumulate(tmp_path, monkeypatch)`
+- **tests/unit/test_kite_release_evidence.py** — Safety and content-boundary tests for the isolated Kite evidence harness.
+  - `def test_prepare_creates_fresh_disjoint_test_home_and_experimental_profile(tmp_path)`; `def test_child_environment_is_minimal_and_overrides_production_configuration(tmp_path, monkeypatch)`; `def test_isolation_rejects_worktree_home_overlap_and_non_loopback(tmp_path)`; `def test_start_invokes_only_worktree_python_and_documented_http_endpoint(tmp_path)`; `def test_stop_cannot_target_an_unowned_listener(tmp_path)`; `def test_occupied_port_is_rejected_without_pid_discovery(tmp_path)`; `def test_each_kite_aggregate_matches_its_exact_catalog_schema(gate)`; `def test_stable_live_gate_requires_content_free_http_diagnostics(tmp_path, monkeypatch)`; `…`
+- **tests/unit/test_kite_release_evidence_workloads.py** — Dual-backend ownership contracts for the registered Kite erasure runner.
+  - `def test_core_erasure_runs_both_owned_backends_and_closes_database(monkeypatch)`; `def test_core_erasure_closes_disposable_database_when_postgres_harness_fails(monkeypatch)`; `def test_core_erasure_requires_postgres_before_starting_sqlite(monkeypatch)`; `def test_live_workload_requires_and_aggregates_both_backends(monkeypatch)`; `def test_postgres_sleep_uses_only_the_disposable_authority_and_closes_it(monkeypatch)`; `def test_sqlite_sleep_never_acquires_postgres_authority(monkeypatch)`; `def test_core_erasure_rejects_a_non_dual_backend_catalog_contract()`; `def test_kite_postgres_child_receives_only_the_disposable_authority_dsn(monkeypatch, tmp_path)`
 - **tests/unit/test_knowledge_assertion.py** — Conformance tests for the dependency-free semantic assertion contract.
   - `def direct_assertion()`; `def test_fixed_identity_vector_and_dict_ordering_are_exact()`; `def test_iri_object_uses_the_complete_v1_object_term_grammar()`; `def test_identity_changes_for_meaningful_term_distinctions(left, right)`; `def test_identity_is_stable_across_a_fresh_python_process()`; `def test_pinned_iri_profile_normalizes_contract_vectors(raw, expected)`; `def test_pinned_iri_profile_normalizes_case_insensitive_ipvfuture_marker()`; `def test_host_percent_equivalence_has_same_identity_preimage()`; `…`
 - **tests/unit/test_knowledge_rdf_codec.py** — Conformance coverage for the bounded RDF assertion codec.
