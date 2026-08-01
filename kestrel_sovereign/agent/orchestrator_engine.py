@@ -67,6 +67,11 @@ KESTREL_MAX_LOW_DELTA = None
 KESTREL_BUDGET_STOP_PCT = None
 MAX_TOOL_CONCURRENCY = int(os.environ.get("KESTREL_MAX_TOOL_CONCURRENCY", "10"))
 
+# Last-resort context window for orchestrator pruning when neither the LLM
+# service nor the model catalogue can name one. Only reached after an explicit
+# warning naming the model that failed to resolve — never as a silent default.
+_DEFAULT_ORCHESTRATOR_CONTEXT_LIMIT = 131072
+
 # Per-LLM-call timeout for the orchestrator's multi-iteration tool loop.
 # Wraps each follow-up ``stream_with_tool_detection`` so a hung upstream
 # (anthropic 429 backoff, network blip, frozen provider queue) surfaces
@@ -2391,7 +2396,7 @@ class OrchestratorEngineMixin:
             )
             messages = self._prune_orchestrator_messages(
                 messages, all_tools, protected_prefix=protected_prefix,
-                history_len=history_len,
+                history_len=history_len, model=effective_model,
             )
 
             logging.info(f"[ORCHESTRATOR] Calling LLM with {len(messages)} messages, {len(all_tools)} tools")
@@ -2459,9 +2464,44 @@ class OrchestratorEngineMixin:
     # Message pruning
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _resolve_orchestrator_context_limit(llm_service: Any, model: Optional[str]) -> int:
+        """Resolve the continuation's real context window.
+
+        ``LLMService`` has no ``_context_limit`` attribute, so the legacy
+        ``getattr(..., None) or 131072`` always resolved to 131072 regardless of
+        the model actually serving the turn. That was survivable while
+        continuations carried only ``[system, user]``; replaying history (#2841)
+        makes the payload large enough that a sub-131K window (many local and
+        small-context routes) would sail past the prune untouched and come back
+        as a provider context-length error. Resolve from the model's own
+        catalogued window instead (codex review, #2841).
+        """
+        explicit = getattr(llm_service, "_context_limit", None)
+        if explicit:
+            return int(explicit)
+        if model:
+            try:
+                from kestrel_sovereign.agent.token_counter import get_token_counter
+
+                limit = get_token_counter(model).get_context_limit()
+                if limit:
+                    return int(limit)
+            except Exception as exc:  # noqa: BLE001
+                # Never silently substitute a window we can't justify — say
+                # which model failed to resolve and that the default is a guess.
+                logging.warning(
+                    "[ORCHESTRATOR] Could not resolve a context limit for %s "
+                    "(%s); pruning against the %d default, which may not match "
+                    "the served route.",
+                    model, exc, _DEFAULT_ORCHESTRATOR_CONTEXT_LIMIT,
+                )
+        return _DEFAULT_ORCHESTRATOR_CONTEXT_LIMIT
+
     def _prune_orchestrator_messages(
         self, messages: list, tools: list, context_limit: int = None,
         protected_prefix: int = 2, history_len: int = 0,
+        model: Optional[str] = None,
     ) -> list:
         """Prune orchestrator messages to stay within context limits.
 
@@ -2490,7 +2530,9 @@ class OrchestratorEngineMixin:
         """
         _init_constants()
         if context_limit is None:
-            context_limit = getattr(self.llm_service, '_context_limit', None) or 131072
+            context_limit = OrchestratorEngineMixin._resolve_orchestrator_context_limit(
+                self.llm_service, model
+            )
 
         chars_per_token = 3.5
         max_chars = int(context_limit * chars_per_token * (1 - CONTEXT_RESERVE_FRACTION))
@@ -2545,6 +2587,15 @@ class OrchestratorEngineMixin:
                 history.pop(0)
                 shed += 1
             if shed:
+                # A shed cuts mid-exchange: dropping a user row while keeping
+                # its assistant reply leaves the replayed span opening on a
+                # detached answer with no question. Anthropic's conversion path
+                # does not repair that, and providers reject a leading
+                # assistant turn outright. Advance to the next user boundary
+                # (codex review, #2841).
+                while history and history[0].get("role") != "user":
+                    history.pop(0)
+                    shed += 1
                 logging.warning(
                     "[ORCHESTRATOR] Context pressure persists after tool "
                     "truncation — dropped %d/%d oldest replayed history "
@@ -2783,7 +2834,7 @@ class OrchestratorEngineMixin:
             )
             messages = self._prune_orchestrator_messages(
                 messages, all_tools, protected_prefix=protected_prefix,
-                history_len=history_len,
+                history_len=history_len, model=effective_model,
             )
 
             logging.info(f"[ORCHESTRATOR-STREAM] Checking for more tool calls with {len(messages)} messages, {len(all_tools)} tools")

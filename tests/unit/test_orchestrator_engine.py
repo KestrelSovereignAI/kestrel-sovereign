@@ -282,6 +282,109 @@ class TestPrefixBoundsSurviveShedding:
             seeded, history_ids, False
         ) == (3, 2)
 
+    def test_shed_advances_to_a_user_boundary(self):
+        """A shed must not leave a detached assistant reply at the head.
+
+        History alternates user/assistant. Dropping an odd number of rows
+        strands an answer with no question — and providers reject a replayed
+        span that opens on an assistant turn.
+        """
+        # Uneven row sizes so the fit-loop stops at both odd and even counts;
+        # a single fixed limit can land on a user boundary by luck.
+        history = []
+        for i in range(8):
+            history.append(
+                {"role": "user", "content": f"q{i} " + "z" * (400 if i == 0 else 90)}
+            )
+            history.append({"role": "assistant", "content": f"a{i} " + "z" * 90})
+
+        base = (
+            [{"role": "system", "content": "sys"}]
+            + history
+            + [{"role": "user", "content": "current ask"}]
+            + [
+                {"role": "assistant", "content": "", "tool_calls": []},
+                {"role": "tool", "tool_call_id": "c1", "content": "small"},
+            ]
+        )
+        agent = MagicMock()
+        agent.llm_service = MagicMock(spec=[])
+        prune = OrchestratorEngineMixin._prune_orchestrator_messages.__get__(agent)
+
+        checked = 0
+        for limit in range(120, 900, 7):
+            result = prune(
+                [dict(m) for m in base], [],
+                context_limit=limit,
+                protected_prefix=1 + len(history) + 1,
+                history_len=len(history),
+            )
+            kept = [
+                m for m in result[1:]
+                if m.get("content", "")[:1] in ("q", "a")
+            ]
+            if not kept:
+                continue
+            checked += 1
+            assert kept[0]["role"] == "user", (
+                f"at context_limit={limit} the replayed span opens on a "
+                f"detached {kept[0]['role']} turn: {kept[0]['content'][:20]!r}"
+            )
+        assert checked > 5, "sweep never exercised a partial shed"
+
+
+class TestContextLimitResolution:
+    """Pruning must size against the model actually serving the turn."""
+
+    def test_limit_comes_from_the_model_when_service_has_none(self):
+        service = MagicMock(spec=[])  # no _context_limit attribute
+        resolve = OrchestratorEngineMixin._resolve_orchestrator_context_limit
+
+        from kestrel_sovereign.agent.token_counter import get_token_counter
+
+        expected = get_token_counter("claude-opus-5").get_context_limit()
+        assert resolve(service, "claude-opus-5") == expected
+        # A real model window must not silently collapse to the legacy default
+        # unless that genuinely IS its window.
+        assert expected > 0
+
+    def test_explicit_service_limit_wins(self):
+        service = MagicMock()
+        service._context_limit = 4096
+        assert OrchestratorEngineMixin._resolve_orchestrator_context_limit(
+            service, "claude-opus-5"
+        ) == 4096
+
+    def test_falls_back_only_with_no_model(self):
+        from kestrel_sovereign.agent.orchestrator_engine import (
+            _DEFAULT_ORCHESTRATOR_CONTEXT_LIMIT,
+        )
+
+        service = MagicMock(spec=[])
+        assert OrchestratorEngineMixin._resolve_orchestrator_context_limit(
+            service, None
+        ) == _DEFAULT_ORCHESTRATOR_CONTEXT_LIMIT
+
+    def test_prune_threads_the_model_through(self):
+        agent = MagicMock()
+        agent.llm_service = MagicMock(spec=[])
+        prune = OrchestratorEngineMixin._prune_orchestrator_messages.__get__(agent)
+        sig = inspect.signature(
+            OrchestratorEngineMixin._prune_orchestrator_messages
+        )
+        assert "model" in sig.parameters
+        # A tiny-window model must trigger pruning where the 131072 default
+        # would have waved the same payload through.
+        big = {"role": "tool", "tool_call_id": "c1", "content": "x" * 40000}
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "ask"},
+            {"role": "assistant", "content": "", "tool_calls": []},
+            big,
+        ]
+        result = prune(list(messages), [], model="gpt-4o-mini-tiny-unknown")
+        assert result is not None
+
     def test_seed_reports_history_identity(self):
         history = [{"role": "user", "content": "a"}]
         messages, history_ids = OrchestratorEngineMixin._seed_orchestrator_messages(
