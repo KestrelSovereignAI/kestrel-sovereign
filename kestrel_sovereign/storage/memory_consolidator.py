@@ -978,6 +978,15 @@ class MemoryConsolidator:
         graph node with fresh plaintext-derived topics, resurfacing the very
         content the exclusion took away. The ciphertext title is the safer
         state for a row nobody is allowed to read (codex review r1 P1).
+
+        The scan is RANDOMISED rather than ordered. Repaired episodes leave
+        this predicate for good, but cleared and permanently-unrepairable ones
+        match forever — so any fixed ordering hands the same prefix to every
+        nightly pass, and a corrupt episode sitting past ``scan_limit`` behind
+        enough of them would never be examined at all. Sampling instead gives
+        every candidate an independent chance each night, so coverage is
+        eventual without a persisted cursor. Below the limit the order is
+        irrelevant: every candidate is examined regardless (codex review r5).
         """
         conditions: List[str] = []
         params: List[Any] = [self.agent_id]
@@ -996,7 +1005,7 @@ class MemoryConsolidator:
                 WHERE agent_id = ?
                   AND COALESCE(excluded_from_context, 0) = 0
                   AND ({' OR '.join(conditions)})
-                ORDER BY created_at
+                ORDER BY random()
                 LIMIT ?""",
             tuple(params),
         )
@@ -1177,21 +1186,39 @@ class MemoryConsolidator:
             )
             params: List[Any] = [title, summary, episode_id, self.agent_id]
             if source_ids:
+                # Require every declared source to still EXIST and be live.
+                # Testing only for `deleted_at IS NOT NULL` would be satisfied
+                # by a hard purge, because a row that is gone cannot match it —
+                # so a purged source would have waved the write straight
+                # through (codex review r5 P1).
                 placeholders = ",".join("?" for _ in source_ids)
                 predicates += (
-                    " AND NOT EXISTS (SELECT 1 FROM conversation_history "
+                    " AND (SELECT COUNT(*) FROM conversation_history "
                     f"WHERE agent_id = ? AND id IN ({placeholders}) "
-                    "AND deleted_at IS NOT NULL)"
+                    "AND deleted_at IS NULL) = ?"
                 )
                 params.append(self.agent_id)
                 params.extend(source_ids)
+                params.append(len(source_ids))
 
-            changed = await self._db.execute(
-                "UPDATE memory_episodes SET title = ?, summary = ?, "
-                "embedding_vec = NULL, embedding_profile_id = NULL "
-                + predicates,
-                tuple(params),
-            )
+            try:
+                changed = await self._db.execute(
+                    "UPDATE memory_episodes SET title = ?, summary = ?, "
+                    "embedding_vec = NULL, embedding_profile_id = NULL "
+                    + predicates,
+                    tuple(params),
+                )
+            except Exception:
+                # The node already carries the rebuilt narrative. If this write
+                # never lands — a lock timeout, a transient query error — the
+                # outer handler would report `write_failed` while the panel
+                # kept showing reconstructed topics, and a withdrawal racing or
+                # committing afterwards would make that permanent, because the
+                # row is then excluded from every future scan (codex review r5
+                # P1). Undo the node before letting the failure propagate.
+                if restore is not None:
+                    await self._restore_graph_node(episode_id, *restore)
+                raise
 
             if not changed:
                 # Lost the race after the node was rewritten. Put the node

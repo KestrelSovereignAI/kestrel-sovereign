@@ -872,11 +872,14 @@ class TestRoundThreeFindings:
         try:
             report = await c.repair_ciphertext_episodes(limit=1)
 
-            assert report["cleared"] == 3
-            assert report["repaired"] == 1, (
-                "the corrupt episode sits behind three permanent false "
-                "positives; a scan-bounded budget would never reach it"
+            # The invariant, stated without depending on scan order: a repair
+            # budget of ONE must not stop three other candidates being
+            # examined. A scan-bounded budget would surface exactly one row.
+            assert report["scanned"] == 4, (
+                "examination must not be bounded by the repair budget, or "
+                "permanent false positives can hide corrupt episodes forever"
             )
+            assert report["repaired"] == 1
             assert await db.fetchval(
                 "SELECT title FROM memory_episodes WHERE id = ?",
                 ("episode:corrupt",)
@@ -1077,6 +1080,118 @@ class TestRoundFourFindings:
             result = await c.run_consolidation()
             assert result["episode_repair_error"] == "pass exploded"
             assert result["episodes_repaired"] == 0
+        finally:
+            await db.close()
+
+
+class TestRoundFiveFindings:
+    @pytest.mark.asyncio
+    async def test_hard_purged_source_blocks_the_write(self, tmp_path):
+        """A purged row cannot satisfy `deleted_at IS NOT NULL`.
+
+        Testing only for soft deletion would wave a hard purge straight
+        through, publishing topics decrypted from a message that no longer
+        exists at all.
+        """
+        db, ids, store = await _corrupt_fixture(tmp_path)
+        graph = _RecordingGraphStore(db)
+        original_add = graph.add_node
+
+        async def _purge_then_write(node):
+            await db.execute(
+                "DELETE FROM conversation_history WHERE id = ?", (ids[0],)
+            )
+            graph.add_node = original_add
+            return await original_add(node)
+
+        graph.add_node = _purge_then_write
+        c = _consolidator(db, store, graph)
+        try:
+            report = await c.repair_ciphertext_episodes()
+
+            assert report["repaired"] == 0
+            assert [u["reason"] for u in report["unrepairable"]] == [
+                "abandoned_mid_repair"
+            ]
+            assert await db.fetchval(
+                "SELECT title FROM memory_episodes WHERE id = ?",
+                ("episode:corrupt",)
+            ) == CORRUPT_TITLE
+            assert await db.fetchval(
+                "SELECT label FROM graph_nodes WHERE node_id = ?",
+                ("episode:corrupt",)
+            ) == CORRUPT_TITLE
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_node_is_restored_when_the_row_update_raises(self, tmp_path):
+        """A raising row update must not leave the rebuilt narrative on the panel.
+
+        Control jumps to the outer write_failed handler, so without an explicit
+        undo the node keeps the plaintext-derived title — and a withdrawal
+        landing afterwards makes that permanent, since the row is then excluded
+        from every future scan.
+        """
+        db, ids, store = await _corrupt_fixture(tmp_path)
+        graph = _RecordingGraphStore(db)
+        c = _consolidator(db, store, graph)
+
+        original_execute = db.execute
+
+        async def _fail_the_episode_update(sql, params=()):
+            if sql.startswith("UPDATE memory_episodes SET title"):
+                raise RuntimeError("lock timeout")
+            return await original_execute(sql, params)
+
+        db.execute = _fail_the_episode_update
+        try:
+            report = await c.repair_ciphertext_episodes()
+
+            assert report["repaired"] == 0
+            assert [u["reason"] for u in report["unrepairable"]] == [
+                "write_failed"
+            ]
+            db.execute = original_execute
+            assert await db.fetchval(
+                "SELECT label FROM graph_nodes WHERE node_id = ?",
+                ("episode:corrupt",)
+            ) == CORRUPT_TITLE, (
+                "the node must not keep the rebuilt narrative after a failed "
+                "row update"
+            )
+        finally:
+            db.execute = original_execute
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_every_candidate_is_examined_below_the_scan_limit(
+        self, tmp_path
+    ):
+        """Randomising the scan must not cost coverage in the normal case."""
+        db, ids, store = await _corrupt_fixture(tmp_path)
+        healthy_ids = await _add_messages(
+            db, [HEALTHY_ENVELOPE, HEALTHY_ENVELOPE], encrypted=True
+        )
+        for n in range(4):
+            await _add_episode(
+                db, f"episode:healthy-{n}",
+                "Discussion of ksav2, base64, prefix, aead",
+                "Topics: ksav2, base64, prefix, aead.", healthy_ids,
+            )
+        healthy_talk = iter(HEALTHY_PLAINTEXTS * 16)
+        seq = iter(PLAINTEXTS * 16)
+        store.decrypt_stored_content.side_effect = lambda content, meta: (
+            next(seq) if content == ENVELOPE
+            else next(healthy_talk) if content == HEALTHY_ENVELOPE
+            else content
+        )
+        c = _consolidator(db, store, _RecordingGraphStore(db))
+        try:
+            report = await c.repair_ciphertext_episodes()
+            assert report["scanned"] == 5
+            assert report["cleared"] == 4
+            assert report["repaired"] == 1
         finally:
             await db.close()
 
