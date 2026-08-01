@@ -2212,7 +2212,7 @@ class OrchestratorEngineMixin:
         conversation_history: Optional[List[Dict[str, Any]]],
         user_message: Optional[str],
         log_prefix: str,
-    ) -> tuple[List[Dict[str, Any]], int, int]:
+    ) -> tuple[List[Dict[str, Any]], frozenset]:
         """Rebuild the turn's message prefix for a tool continuation.
 
         A continuation must reconstruct the SAME prefix the turn's first
@@ -2338,6 +2338,15 @@ class OrchestratorEngineMixin:
 
         if not response.has_tool_calls:
             if feature_tools and OrchestratorEngineMixin._signals_unfinished_tool_work(response.content or ""):
+                # #2841: this array now carries replayed history, and the repair
+                # helper appends another exchange and calls the provider WITHOUT
+                # pruning. Size it here or a near-budget turn overflows on the
+                # repair call (codex review r5).
+                messages = OrchestratorEngineMixin._prune_repair_messages(
+                    self, messages, feature_tools, history_ids,
+                    bool(continuation_user_content or user_message),
+                    effective_model,
+                )
                 response = await self._repair_premature_turn_yield(
                     response=response,
                     messages=messages,
@@ -2468,6 +2477,60 @@ class OrchestratorEngineMixin:
     # Message pruning
     # ------------------------------------------------------------------
 
+    def _prune_repair_messages(
+        self, messages: list, tools: list, history_ids: frozenset,
+        has_user_message: bool, model: Optional[str],
+    ) -> list:
+        """Model-aware prune for a repair turn's message array (#2841).
+
+        ``_repair_premature_turn_yield`` appends an assistant turn plus another
+        user prompt and calls the provider directly, with no pruning of its
+        own. That was harmless while the array was just ``[system, user]``;
+        once history is replayed, a turn that fit the first call can overflow
+        on the repair call.
+        """
+        protected_prefix, history_len = OrchestratorEngineMixin._prefix_bounds(
+            messages, history_ids, has_user_message
+        )
+        return self._prune_orchestrator_messages(
+            messages, tools, protected_prefix=protected_prefix,
+            history_len=history_len, model=model,
+        )
+
+    @staticmethod
+    def _active_route_qualified_model(llm_service: Any) -> Optional[str]:
+        """The active model, route-qualified when the service can name it.
+
+        ``get_active_model_selection()`` is the canonical source ContextManager
+        plans against and yields "vendor:route/model"; ``get_active_model_id()``
+        yields only the bare model and so loses any route-level cap.
+        """
+        selection = getattr(llm_service, "get_active_model_selection", None)
+        if callable(selection):
+            try:
+                qualified = (selection() or {}).get("model")
+            except Exception as exc:  # noqa: BLE001
+                logging.debug(
+                    "[ORCHESTRATOR] get_active_model_selection failed (%s); "
+                    "falling back to get_active_model_id.", exc,
+                )
+            else:
+                if qualified and qualified != "auto":
+                    return qualified
+        active = getattr(llm_service, "get_active_model_id", None)
+        if callable(active):
+            try:
+                resolved = active()
+            except Exception as exc:  # noqa: BLE001
+                logging.warning(
+                    "[ORCHESTRATOR] Could not resolve the active model for "
+                    "continuation pruning (%s).", exc,
+                )
+            else:
+                if resolved and resolved != "auto":
+                    return resolved
+        return None
+
     @staticmethod
     def _resolve_orchestrator_context_limit(llm_service: Any, model: Optional[str]) -> int:
         """Resolve the continuation's real context window.
@@ -2490,37 +2553,22 @@ class OrchestratorEngineMixin:
             # every agent without a wallet, i.e. the common case. Falling
             # straight through to the default would leave most turns pruning
             # against a window nothing served (codex review r3, #2841).
-            # Prefer the ROUTE-QUALIFIED selection ("vendor:route/model") — the
-            # same canonical source ContextManager plans against. The bare id
-            # from get_active_model_id() loses a route-level cap (a plan route
-            # can serve a smaller window than the model's own), which would size
-            # the prune to the model's full window and let an oversized
-            # continuation through (codex review r4, #2841).
-            selection = getattr(llm_service, "get_active_model_selection", None)
-            if callable(selection):
-                try:
-                    qualified = (selection() or {}).get("model")
-                except Exception as exc:  # noqa: BLE001
-                    logging.debug(
-                        "[ORCHESTRATOR] get_active_model_selection failed (%s); "
-                        "falling back to get_active_model_id.", exc,
-                    )
-                else:
-                    if qualified and qualified != "auto":
-                        model = qualified
-            if not model:
-                active = getattr(llm_service, "get_active_model_id", None)
-                if callable(active):
-                    try:
-                        resolved = active()
-                    except Exception as exc:  # noqa: BLE001
-                        logging.warning(
-                            "[ORCHESTRATOR] Could not resolve the active model "
-                            "for continuation pruning (%s).", exc,
-                        )
-                    else:
-                        if resolved and resolved != "auto":
-                            model = resolved
+            model = OrchestratorEngineMixin._active_route_qualified_model(llm_service)
+        elif ":" not in model:
+            # A bare/provider-only override ("gpt-5.5", "openai/gpt-5.5") names
+            # the model but NOT the serving route, and a route can carry a
+            # per-turn cap far below the model's own window. If the active
+            # selection is a route-qualified id for this same model, prefer it
+            # so the cap is honoured (codex review r5, #2841).
+            qualified = OrchestratorEngineMixin._active_route_qualified_model(
+                llm_service
+            )
+            if (
+                qualified
+                and ":" in qualified
+                and qualified.split("/")[-1] == model.split("/")[-1]
+            ):
+                model = qualified
         if model:
             try:
                 from kestrel_sovereign.agent.token_counter import get_token_counter
@@ -2758,6 +2806,12 @@ class OrchestratorEngineMixin:
 
         if not response.has_tool_calls:
             if feature_tools and OrchestratorEngineMixin._signals_unfinished_tool_work(response.content or ""):
+                # #2841: see the non-streaming site — prune before repairing.
+                messages = OrchestratorEngineMixin._prune_repair_messages(
+                    self, messages, feature_tools, history_ids,
+                    bool(continuation_user_content or user_message),
+                    effective_model,
+                )
                 response = await self._repair_premature_turn_yield(
                     response=response,
                     messages=messages,

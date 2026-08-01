@@ -433,6 +433,40 @@ class TestContextLimitResolution:
 
         counter.assert_called_once_with("anthropic:plan/claude-opus-5")
 
+    def test_bare_override_still_picks_up_the_route_cap(self):
+        """A bare/provider-only override names the model, not the route.
+
+        A route can carry a per-turn cap far below the model's own window, so
+        a truthy-but-unqualified override must not bypass the route lookup.
+        """
+        service = MagicMock(spec=["get_active_model_selection", "get_active_model_id"])
+        service.get_active_model_selection.return_value = {
+            "model": "openai:plan/gpt-5.5"
+        }
+        with patch(
+            "kestrel_sovereign.agent.token_counter.get_token_counter"
+        ) as counter:
+            counter.return_value.get_context_limit.return_value = 20480
+            assert OrchestratorEngineMixin._resolve_orchestrator_context_limit(
+                service, "openai/gpt-5.5"
+            ) == 20480
+        counter.assert_called_once_with("openai:plan/gpt-5.5")
+
+    def test_a_different_override_model_is_respected_not_overridden(self):
+        """The route cap only applies when it IS this model's route."""
+        service = MagicMock(spec=["get_active_model_selection", "get_active_model_id"])
+        service.get_active_model_selection.return_value = {
+            "model": "openai:plan/gpt-5.5"
+        }
+        with patch(
+            "kestrel_sovereign.agent.token_counter.get_token_counter"
+        ) as counter:
+            counter.return_value.get_context_limit.return_value = 999
+            OrchestratorEngineMixin._resolve_orchestrator_context_limit(
+                service, "claude-opus-5"
+            )
+        counter.assert_called_once_with("claude-opus-5")
+
     def test_falls_back_only_when_the_route_is_unresolved(self):
         from kestrel_sovereign.agent.orchestrator_engine import (
             _DEFAULT_ORCHESTRATOR_CONTEXT_LIMIT,
@@ -543,6 +577,56 @@ class TestPruneThreadsTheTurnModel:
         # The resolved (tiny) window must actually drive pruning — the 131072
         # default would have waved this payload straight through.
         assert "truncated" in result[-1]["content"].lower()
+
+
+@pytest.mark.asyncio
+class TestRepairTurnIsPruned:
+    """A repair turn calls the provider directly, with no pruning of its own.
+
+    Harmless while the array was ``[system, user]``; once history is replayed a
+    turn that fit the first call can overflow on the repair call.
+    """
+
+    async def test_repair_path_prunes_the_history_bearing_array(self):
+        agent = _base_agent()
+        agent.llm_service = MagicMock()
+        agent.llm_service.generate_with_messages = AsyncMock(
+            return_value=LLMResponse(content="done", tool_calls=None)
+        )
+        agent._repair_premature_turn_yield = AsyncMock(
+            return_value=LLMResponse(content="repaired", tool_calls=None)
+        )
+        pruned = MagicMock(side_effect=lambda msgs, _tools, **_kw: msgs)
+        agent._prune_orchestrator_messages = pruned
+
+        # No tool calls, but text that trips the unfinished-tool-work guard.
+        with patch.object(
+            OrchestratorEngineMixin,
+            "_signals_unfinished_tool_work",
+            return_value=True,
+        ):
+            handler = OrchestratorEngineMixin._handle_orchestrator_response.__get__(
+                agent
+            )
+            await handler(
+                response=LLMResponse(content="let me check that", tool_calls=None),
+                feature_tools=[{"function": {"name": "t"}}],
+                system_prompt="sys",
+                force_local_only=False,
+                effective_model="claude-opus-5",
+                user_message="ask",
+                session_id="s-1",
+                conversation_history=HISTORY,
+            )
+
+        pruned.assert_called_once()
+        kwargs = pruned.call_args.kwargs
+        # Sized against the turn's model, with the prefix bounds that describe
+        # the replayed history.
+        assert kwargs["model"] == "claude-opus-5"
+        assert kwargs["history_len"] == len(HISTORY)
+        assert kwargs["protected_prefix"] == 1 + len(HISTORY) + 1
+        agent._repair_premature_turn_yield.assert_awaited()
 
 
 class TestSeedIdentity:
