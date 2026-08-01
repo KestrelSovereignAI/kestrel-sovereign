@@ -57,7 +57,10 @@ SEMANTIC_RELEASE_CONTRACT = "semantic-kb-v1-release-evidence-v3"
 STRUCTURAL_RELEASE_EVIDENCE_SCHEMA_VERSION = 1
 STRUCTURAL_RELEASE_CONTRACT = "semantic-kb-v1-release-evidence-structural-v1"
 PARAMETRIC_SELF_EVIDENCE_REPOSITORY = "KestrelSovereignAI/kestrel-feature-parametric-self"
-PARAMETRIC_SELF_EVIDENCE_REVISION = "260ba985bcfdfab3dab1ea58da5b259057f3749f"
+PARAMETRIC_SELF_CAPABILITY_SOURCE_REVISION = "260ba985bcfdfab3dab1ea58da5b259057f3749f"
+# Compatibility name for callers that only need the immutable capability
+# baseline. Evidence producers must also provide a separate runner revision.
+PARAMETRIC_SELF_EVIDENCE_REVISION = PARAMETRIC_SELF_CAPABILITY_SOURCE_REVISION
 _ERASURE_DRILL = DrillBinding(
     "semantic_erasure_release_drill_v1",
     _sha256("semantic-release-evidence-v3:drill:semantic_erasure_release_drill_v1"),
@@ -608,6 +611,8 @@ def _external_gate_results(
 def _validate_external_capability_reports(
     reports: tuple[ExternalCapabilityReport, ...],
     gates: tuple[GateResult | StructuralGateResult, ...],
+    *,
+    expected_evidence_runner_revision: str | None = None,
 ) -> None:
     """Require exact repo/revision and hashed result/artifact bindings from Pself."""
     if len(reports) != 1:
@@ -616,9 +621,18 @@ def _validate_external_capability_reports(
     if (
         report.capability_id != "parametric_self_governed_corpus"
         or report.repository != PARAMETRIC_SELF_EVIDENCE_REPOSITORY
-        or report.source_revision != PARAMETRIC_SELF_EVIDENCE_REVISION
+        or report.capability_source_revision != PARAMETRIC_SELF_CAPABILITY_SOURCE_REVISION
     ):
         raise ReleaseEvidenceError("external adapter report repository or revision does not match contract")
+    if expected_evidence_runner_revision is not None:
+        if (
+            not isinstance(expected_evidence_runner_revision, str)
+            or len(expected_evidence_runner_revision) != 40
+            or any(character not in "0123456789abcdef" for character in expected_evidence_runner_revision)
+        ):
+            raise ReleaseEvidenceError("expected external evidence runner revision must be a full lowercase commit SHA")
+        if report.evidence_runner_revision != expected_evidence_runner_revision:
+            raise ReleaseEvidenceError("external adapter report runner revision does not match verifier policy")
     if report.core_release_evidence_contract_digest != CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST:
         raise ReleaseEvidenceError("external adapter report core catalog contract does not match")
     expected = _external_gate_results(gates)
@@ -639,9 +653,10 @@ def _validate_external_capability_reports(
             or attestation.artifact != evidence.artifact
             or attestation.drill != gate.spec.correlation
             or evidence.external_run_nonce != report.run_nonce
+            or evidence.external_evidence_runner_revision != report.evidence_runner_revision
         ):
             raise ReleaseEvidenceError(
-                "external adapter attestation is not bound to its external run_nonce or correlated gate result/artifact"
+                "external adapter attestation is not bound to its runner revision, external run_nonce, or correlated gate result/artifact"
             )
 
 
@@ -897,6 +912,7 @@ def attach_external_capability_report(
     report: ExternalCapabilityReport,
     *,
     freshness_ledger: ExternalFreshnessLedger,
+    expected_evidence_runner_revision: str,
 ) -> SemanticReleaseEvidence:
     """Attach and durably consume a fully bound report from external CI.
 
@@ -909,7 +925,11 @@ def attach_external_capability_report(
     if not isinstance(freshness_ledger, ExternalFreshnessLedger):
         raise ReleaseEvidenceError("trusted external adapter ingestion requires verifier-owned freshness ledger")
     attached = replace(evidence, external_capabilities=(report,))
-    _validate_external_capability_reports(attached.external_capabilities, attached.gates)
+    _validate_external_capability_reports(
+        attached.external_capabilities,
+        attached.gates,
+        expected_evidence_runner_revision=expected_evidence_runner_revision,
+    )
     freshness_ledger.consume(report)
     return attached
 
@@ -1023,7 +1043,7 @@ def evidence_record_from_mapping(value: Mapping[str, object]) -> EvidenceRecord:
     expected = {
         "gate_id", "state", "gate_spec_digest", "runner_id", "command_id", "command_digest",
         "environment", "environment_digest", "fixture", "observation", "artifact", "run_digest",
-        "external_run_nonce",
+        "external_run_nonce", "external_evidence_runner_revision",
         "execution_attestation", "drill",
         "reason_code", "outside_advertised_capability",
     }
@@ -1041,6 +1061,7 @@ def evidence_record_from_mapping(value: Mapping[str, object]) -> EvidenceRecord:
         fixture=_fixture_from_mapping(mapping["fixture"]), observation=_expect_mapping(observation, "observation") if observation is not None else None,
         artifact=_artifact_from_mapping(mapping["artifact"]), run_digest=cast(str | None, mapping["run_digest"]),
         external_run_nonce=cast(str | None, mapping["external_run_nonce"]),
+        external_evidence_runner_revision=cast(str | None, mapping["external_evidence_runner_revision"]),
         execution_attestation=_execution_attestation_from_mapping(mapping["execution_attestation"]),
         drill=_drill_from_mapping(mapping["drill"]),
         reason_code=cast(str | None, mapping["reason_code"]), outside_advertised_capability=cast(bool, mapping["outside_advertised_capability"]),
@@ -1116,7 +1137,8 @@ def external_capability_report_from_mapping(value: Mapping[str, object]) -> Exte
         {
             "capability_id",
             "repository",
-            "source_revision",
+            "capability_source_revision",
+            "evidence_runner_revision",
             "core_release_evidence_contract_digest",
             "run_nonce",
             "attestations",
@@ -1153,7 +1175,8 @@ def external_capability_report_from_mapping(value: Mapping[str, object]) -> Exte
     return ExternalCapabilityReport(
         capability_id=cast(str, mapping["capability_id"]),
         repository=cast(str, mapping["repository"]),
-        source_revision=cast(str, mapping["source_revision"]),
+        capability_source_revision=cast(str, mapping["capability_source_revision"]),
+        evidence_runner_revision=cast(str, mapping["evidence_runner_revision"]),
         core_release_evidence_contract_digest=cast(str, mapping["core_release_evidence_contract_digest"]),
         run_nonce=cast(str, mapping["run_nonce"]),
         attestations=tuple(attestations),

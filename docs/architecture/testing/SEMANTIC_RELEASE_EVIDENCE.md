@@ -285,7 +285,8 @@ candidates, and served eligibility.
 dependency imported by this repository. Its report is absent from a new
 template and therefore remains a readiness blocker until it contains all of:
 
-- the exact repository and source revision required by the catalog;
+- the exact repository, immutable capability source revision, and evidence
+  runner revision;
 - an attestation for `external_corpus_consumed`,
   `external_candidate_invalidated`, and
   `external_served_eligibility_rejected`;
@@ -295,10 +296,15 @@ template and therefore remains a readiness blocker until it contains all of:
   and
 - a report digest over all of those fields.
 
-For this contract the pinned source is
+For this contract the immutable capability source is
 `KestrelSovereignAI/kestrel-feature-parametric-self` at
-`260ba985bcfdfab3dab1ea58da5b259057f3749f`; another revision remains
-non-evidence even if its result fields look similar.
+`260ba985bcfdfab3dab1ea58da5b259057f3749f`. It describes the governed adapter
+runtime under test and is deliberately not the commit of the newer evidence
+emitter. The emitter supplies its own full 40-hex `evidence_runner_revision`:
+it must resolve a clean, verifiable VCS `HEAD` at runtime, is bound into every
+external record's signed run digest, and must equal the report field. Another
+capability revision, omitted runner revision, or runner/report mismatch
+remains non-evidence even if its result fields look similar.
 
 The core contract pin is not a self-referential runtime Git SHA. It is a
 SHA-256 over canonical JSON containing the release-evidence schema version,
@@ -309,10 +315,10 @@ have executed a future core checkout. The external JSON carries that
 `core_release_evidence_contract_digest` and `run_nonce`, but never a caller
 chosen freshness receipt. Core derives the receipt as SHA-256 over canonical
 JSON containing exactly `core_release_evidence_contract_digest`, `repository`,
-`source_revision`, `run_nonce`, and the declared-order `record_digests` list.
-The report digest binds the contract digest and nonce. This is deliberately
-content-free: it carries no test output, database name, tenant, or source
-location.
+`capability_source_revision`, `evidence_runner_revision`, `run_nonce`, and the
+declared-order `record_digests` list. The report digest binds both revisions,
+the contract digest, and nonce. This is deliberately content-free: it carries
+no test output, database name, tenant, or source location.
 
 The nonce is verifier-issued, not producer-chosen. Before an external run, the
 independent verifier calls `ExternalFreshnessLedger.issue_challenge()` and
@@ -338,6 +344,11 @@ A report author cannot choose, reset, or supply the ledger. The public `assemble
 CLI uses `attach_structural_external_capability_report` instead: it may
 preserve the structural JSON for inspection, but never consumes a receipt and remains
 `trust_status: "unverified"`, `ready: false`.
+
+Trusted ingestion additionally requires the independent verifier to pass its
+expected full `evidence_runner_revision` into
+`attach_external_capability_report`; omission or mismatch fails. That policy
+input is never accepted by the public structural assembler or report author.
 
 An external report is supplied as safe structured JSON—never as pre-populated
 metadata—and is structurally checked against the locally assembled stage

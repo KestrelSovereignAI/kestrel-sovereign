@@ -129,6 +129,7 @@ def _record(
     observation: dict[str, object] | None = None,
     identity: CatalogSigningIdentity | None = None,
     external_run_nonce: str | None = None,
+    external_evidence_runner_revision: str | None = None,
 ):
     observed = observation or _observation(spec)
     artifact = _artifact(spec.gate_id)
@@ -142,12 +143,18 @@ def _record(
         if spec.runner.runner_id == "external_ci"
         else None
     )
+    external_evidence_runner_revision = (
+        external_evidence_runner_revision or "b" * 40
+        if spec.runner.runner_id == "external_ci"
+        else None
+    )
     _, run_digest = EvidenceRecord._bound_run_digest(
         spec,
         observed,
         artifact,
         state=EvidenceState.PASSED,
         external_run_nonce=external_run_nonce,
+        external_evidence_runner_revision=external_evidence_runner_revision,
     )
     return EvidenceRecord._from_trusted_execution(
         spec,
@@ -158,6 +165,7 @@ def _record(
             kind="evidence_record", spec=spec, run_digest=run_digest
         ),
         external_run_nonce=external_run_nonce,
+        external_evidence_runner_revision=external_evidence_runner_revision,
     )
 
 
@@ -209,7 +217,12 @@ def _retirement_telemetry() -> TelemetryAttestation:
     )
 
 
-def _external_report(evidence, *, run_nonce: str = "a" * 64) -> ExternalCapabilityReport:
+def _external_report(
+    evidence,
+    *,
+    run_nonce: str = "a" * 64,
+    evidence_runner_revision: str = "b" * 40,
+) -> ExternalCapabilityReport:
     external_gates = [gate for gate in evidence.gates if gate.spec.category == "external_adapter"]
     attestations: list[ExternalGateAttestation] = []
     for gate in external_gates:
@@ -228,7 +241,8 @@ def _external_report(evidence, *, run_nonce: str = "a" * 64) -> ExternalCapabili
     return ExternalCapabilityReport.attest(
         capability_id="parametric_self_governed_corpus",
         repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
-        source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
+        capability_source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
+        evidence_runner_revision=evidence_runner_revision,
         core_release_evidence_contract_digest=CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
         run_nonce=run_nonce,
         attestations=tuple(attestations),
@@ -408,47 +422,62 @@ def test_reviewer_adversarial_external_report_requires_exact_stages_repo_revisio
         "external_candidate_invalidated",
         "external_served_eligibility_rejected",
     }
-    attached = attach_external_capability_report(evidence, report, freshness_ledger=ledger)
+    attached = attach_external_capability_report(
+        evidence,
+        report,
+        freshness_ledger=ledger,
+        expected_evidence_runner_revision="b" * 40,
+    )
     assert attached.external_capabilities == (report,)
     assert "external_adapter_attestation" not in attached.blocking_gate_ids()
 
     incomplete = ExternalCapabilityReport.attest(
         capability_id=report.capability_id,
         repository=report.repository,
-        source_revision=report.source_revision,
+        capability_source_revision=report.capability_source_revision,
+        evidence_runner_revision=report.evidence_runner_revision,
         core_release_evidence_contract_digest=report.core_release_evidence_contract_digest,
         run_nonce="b" * 64,
         attestations=report.attestations[:-1],
     )
     with pytest.raises(ReleaseEvidenceError, match="cover corpus, candidate, and served stages"):
-        attach_external_capability_report(evidence, incomplete, freshness_ledger=ledger)
+        attach_external_capability_report(
+            evidence, incomplete, freshness_ledger=ledger, expected_evidence_runner_revision="b" * 40
+        )
 
     wrong_repository = ExternalCapabilityReport.attest(
         capability_id=report.capability_id,
         repository="example/other-adapter",
-        source_revision=report.source_revision,
+        capability_source_revision=report.capability_source_revision,
+        evidence_runner_revision=report.evidence_runner_revision,
         core_release_evidence_contract_digest=report.core_release_evidence_contract_digest,
         run_nonce="c" * 64,
         attestations=report.attestations,
     )
     with pytest.raises(ReleaseEvidenceError, match="repository or revision"):
-        attach_external_capability_report(evidence, wrong_repository, freshness_ledger=ledger)
+        attach_external_capability_report(
+            evidence, wrong_repository, freshness_ledger=ledger, expected_evidence_runner_revision="b" * 40
+        )
 
     wrong_core_contract = ExternalCapabilityReport.attest(
         capability_id=report.capability_id,
         repository=report.repository,
-        source_revision=report.source_revision,
+        capability_source_revision=report.capability_source_revision,
+        evidence_runner_revision=report.evidence_runner_revision,
         core_release_evidence_contract_digest="0" * 64,
         run_nonce="d" * 64,
         attestations=report.attestations,
     )
     with pytest.raises(ReleaseEvidenceError, match="core catalog contract"):
-        attach_external_capability_report(evidence, wrong_core_contract, freshness_ledger=ledger)
+        attach_external_capability_report(
+            evidence, wrong_core_contract, freshness_ledger=ledger, expected_evidence_runner_revision="b" * 40
+        )
 
     mismatched_artifact = ExternalCapabilityReport.attest(
         capability_id=report.capability_id,
         repository=report.repository,
-        source_revision=report.source_revision,
+        capability_source_revision=report.capability_source_revision,
+        evidence_runner_revision=report.evidence_runner_revision,
         core_release_evidence_contract_digest=report.core_release_evidence_contract_digest,
         run_nonce="a" * 64,
         attestations=(
@@ -457,7 +486,9 @@ def test_reviewer_adversarial_external_report_requires_exact_stages_repo_revisio
         ),
     )
     with pytest.raises(ReleaseEvidenceError, match="correlated gate result/artifact"):
-        attach_external_capability_report(evidence, mismatched_artifact, freshness_ledger=ledger)
+        attach_external_capability_report(
+            evidence, mismatched_artifact, freshness_ledger=ledger, expected_evidence_runner_revision="b" * 40
+        )
 
 
 def test_external_report_freshness_is_hash_bound_and_replay_protected_across_verifiers(
@@ -482,18 +513,46 @@ def test_external_report_freshness_is_hash_bound_and_replay_protected_across_ver
     caller_receipt["freshness_receipt"] = "0" * 64
     with pytest.raises(ReleaseEvidenceError, match="unknown or missing"):
         external_capability_report_from_mapping(caller_receipt)
+    missing_runner_revision = report.to_mapping()
+    del missing_runner_revision["evidence_runner_revision"]
+    with pytest.raises(ReleaseEvidenceError, match="unknown or missing"):
+        external_capability_report_from_mapping(missing_runner_revision)
+
+    masqueraded_runner = ExternalCapabilityReport.attest(
+        capability_id=report.capability_id,
+        repository=report.repository,
+        capability_source_revision=report.capability_source_revision,
+        evidence_runner_revision="c" * 40,
+        core_release_evidence_contract_digest=report.core_release_evidence_contract_digest,
+        run_nonce=run_nonce,
+        attestations=report.attestations,
+    )
+    with pytest.raises(ReleaseEvidenceError, match="runner revision"):
+        attach_external_capability_report(
+            evidence, masqueraded_runner, freshness_ledger=ledger, expected_evidence_runner_revision="b" * 40
+        )
+    with pytest.raises(ReleaseEvidenceError, match="runner revision does not match verifier policy"):
+        attach_external_capability_report(
+            evidence,
+            report,
+            freshness_ledger=ledger,
+            expected_evidence_runner_revision="c" * 40,
+        )
 
     rewrap_nonce = ledger.issue_challenge()
     rewrapped = ExternalCapabilityReport.attest(
         capability_id=report.capability_id,
         repository=report.repository,
-        source_revision=report.source_revision,
+        capability_source_revision=report.capability_source_revision,
+        evidence_runner_revision=report.evidence_runner_revision,
         core_release_evidence_contract_digest=report.core_release_evidence_contract_digest,
         run_nonce=rewrap_nonce,
         attestations=report.attestations,
     )
     with pytest.raises(ReleaseEvidenceError, match="external run_nonce"):
-        attach_external_capability_report(evidence, rewrapped, freshness_ledger=ledger)
+        attach_external_capability_report(
+            evidence, rewrapped, freshness_ledger=ledger, expected_evidence_runner_revision="b" * 40
+        )
 
     caller_nonce = "f" * 64
     caller_evidence = _apply_records(
@@ -502,12 +561,15 @@ def test_external_report_freshness_is_hash_bound_and_replay_protected_across_ver
     )
     caller_report = _external_report(caller_evidence, run_nonce=caller_nonce)
     with pytest.raises(ReleaseEvidenceError, match="not an issued pending"):
-        attach_external_capability_report(caller_evidence, caller_report, freshness_ledger=ledger)
+        attach_external_capability_report(
+            caller_evidence, caller_report, freshness_ledger=ledger, expected_evidence_runner_revision="b" * 40
+        )
 
     attached = attach_external_capability_report(
         evidence,
         report,
         freshness_ledger=ledger,
+        expected_evidence_runner_revision="b" * 40,
     )
     assert attached.external_capabilities == (report,)
 
@@ -518,6 +580,7 @@ def test_external_report_freshness_is_hash_bound_and_replay_protected_across_ver
             evidence,
             report,
             freshness_ledger=ExternalFreshnessLedger(ledger_path, trusted_root=tmp_path),
+            expected_evidence_runner_revision="b" * 40,
         )
 
 
@@ -542,6 +605,7 @@ def test_structural_external_attachment_does_not_consume_verifier_freshness(
         verified,
         report,
         freshness_ledger=ledger,
+        expected_evidence_runner_revision="b" * 40,
     )
     assert trusted_attached.external_capabilities == (report,)
 
@@ -988,7 +1052,8 @@ def _write_structurally_complete_submission(
     external_report = ExternalCapabilityReport.attest(
         capability_id="parametric_self_governed_corpus",
         repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
-        source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
+        capability_source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
+        evidence_runner_revision="b" * 40,
         core_release_evidence_contract_digest=CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
         run_nonce="a" * 64,
         attestations=tuple(external_attestations),
@@ -1558,7 +1623,8 @@ def test_cli_assemble_safely_binds_retirement_and_external_adapter_attestations(
     report = ExternalCapabilityReport.attest(
         capability_id="parametric_self_governed_corpus",
         repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
-        source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
+        capability_source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
+        evidence_runner_revision="b" * 40,
         core_release_evidence_contract_digest=CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
         run_nonce="a" * 64,
         attestations=tuple(
