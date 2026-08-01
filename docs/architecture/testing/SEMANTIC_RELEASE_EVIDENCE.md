@@ -291,12 +291,32 @@ template and therefore remains a readiness blocker until it contains all of:
   `external_served_eligibility_rejected`;
 - each stage's exact gate-spec digest, evidence-result digest, artifact
   reference/digest, and common drill binding; and
-- a report digest over those fields.
+- a full exact core-catalog commit, a new 64-hex run nonce, and a freshness
+  receipt over the ordered external result digests; and
+- a report digest over all of those fields.
 
 For this contract the pinned source is
 `KestrelSovereignAI/kestrel-feature-parametric-self` at
 `260ba985bcfdfab3dab1ea58da5b259057f3749f`; another revision remains
 non-evidence even if its result fields look similar.
+
+The core-catalog commit is pinned as the full
+`265cf41831a6d82392771771723184eef75fd7b2`, never as a short SHA prefix.
+The freshness receipt is SHA-256 over canonical JSON containing exactly
+`core_release_evidence_commit`, `repository`, `source_revision`, `run_nonce`,
+and the declared-order `record_digests` list. Each report digest also binds
+the receipt and nonce. This is deliberately content-free: it carries no test
+output, database name, tenant, or source location.
+
+Only an independent Talon/CI verifier may ingest that report through
+`attach_external_capability_report`, which requires an explicit absolute path
+for an `ExternalFreshnessLedger`. The verifier owns that SQLite ledger; it
+atomically consumes each valid receipt once and rejects a replay even if a
+later verifier process creates a new ledger object for the same path. A report
+author cannot choose, reset, or supply the ledger. The public `assemble` CLI
+uses `attach_structural_external_capability_report` instead: it may preserve
+the structural JSON for inspection, but never consumes a receipt and remains
+`trust_status: "unverified"`, `ready: false`.
 
 An external report is supplied as safe structured JSON—never as pre-populated
 metadata—and is structurally checked against the locally assembled stage

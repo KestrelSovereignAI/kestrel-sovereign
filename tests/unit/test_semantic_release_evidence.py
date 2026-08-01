@@ -23,6 +23,7 @@ from kestrel_sovereign.knowledge.release_evidence import (
     ExternalCapabilityReport,
     ExternalGateAttestation,
     GateResult,
+    CORE_RELEASE_EVIDENCE_COMMIT,
     PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
     PARAMETRIC_SELF_EVIDENCE_REVISION,
     PerformanceBudget,
@@ -32,17 +33,22 @@ from kestrel_sovereign.knowledge.release_evidence import (
     TelemetryAttestation,
     TrustedExecutionPolicy,
     attach_external_capability_report,
+    attach_structural_external_capability_report,
     attach_retirement_telemetry,
     apply_evidence_records,
     apply_performance_budgets,
+    apply_structural_evidence_records,
     build_standards_matrix,
     evidence_record_from_mapping,
+    external_capability_report_from_mapping,
     inspect_stable_only_capabilities,
     performance_targets,
     release_evidence_template,
     release_gate_specs,
+    structural_release_evidence_template,
     telemetry_attestation_from_mapping,
 )
+from kestrel_sovereign.knowledge.release_evidence_freshness import ExternalFreshnessLedger
 from kestrel_sovereign.knowledge.release_evidence_execution import CatalogSigningIdentity
 from kestrel_sovereign.knowledge.release_evidence_models import (
     ExecutionSource,
@@ -215,6 +221,8 @@ def _external_report(evidence) -> ExternalCapabilityReport:
         capability_id="parametric_self_governed_corpus",
         repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
         source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
+        core_release_evidence_commit=CORE_RELEASE_EVIDENCE_COMMIT,
+        run_nonce="a" * 64,
         attestations=tuple(attestations),
     )
 
@@ -372,7 +380,9 @@ def test_retirement_telemetry_requires_its_digest_and_bound_equivalence_record()
     assert decision.decision == "eligible_for_review"
 
 
-def test_reviewer_adversarial_external_report_requires_exact_stages_repo_revision_and_artifacts() -> None:
+def test_reviewer_adversarial_external_report_requires_exact_stages_repo_revision_and_artifacts(
+    tmp_path: Path,
+) -> None:
     template = release_evidence_template()
     external_specs = [spec for spec in release_gate_specs() if spec.category == "external_adapter"]
     evidence = _apply_records(template, tuple(_record(spec) for spec in external_specs))
@@ -383,7 +393,8 @@ def test_reviewer_adversarial_external_report_requires_exact_stages_repo_revisio
         "external_candidate_invalidated",
         "external_served_eligibility_rejected",
     }
-    attached = attach_external_capability_report(evidence, report)
+    ledger = ExternalFreshnessLedger(tmp_path / "verifier-freshness.sqlite")
+    attached = attach_external_capability_report(evidence, report, freshness_ledger=ledger)
     assert attached.external_capabilities == (report,)
     assert "external_adapter_attestation" not in attached.blocking_gate_ids()
 
@@ -391,31 +402,98 @@ def test_reviewer_adversarial_external_report_requires_exact_stages_repo_revisio
         capability_id=report.capability_id,
         repository=report.repository,
         source_revision=report.source_revision,
+        core_release_evidence_commit=report.core_release_evidence_commit,
+        run_nonce="b" * 64,
         attestations=report.attestations[:-1],
     )
     with pytest.raises(ReleaseEvidenceError, match="cover corpus, candidate, and served stages"):
-        attach_external_capability_report(evidence, incomplete)
+        attach_external_capability_report(evidence, incomplete, freshness_ledger=ledger)
 
     wrong_repository = ExternalCapabilityReport.attest(
         capability_id=report.capability_id,
         repository="example/other-adapter",
         source_revision=report.source_revision,
+        core_release_evidence_commit=report.core_release_evidence_commit,
+        run_nonce="c" * 64,
         attestations=report.attestations,
     )
     with pytest.raises(ReleaseEvidenceError, match="repository or revision"):
-        attach_external_capability_report(evidence, wrong_repository)
+        attach_external_capability_report(evidence, wrong_repository, freshness_ledger=ledger)
+
+    wrong_core_commit = ExternalCapabilityReport.attest(
+        capability_id=report.capability_id,
+        repository=report.repository,
+        source_revision=report.source_revision,
+        core_release_evidence_commit="0" * 40,
+        run_nonce="d" * 64,
+        attestations=report.attestations,
+    )
+    with pytest.raises(ReleaseEvidenceError, match="core catalog commit"):
+        attach_external_capability_report(evidence, wrong_core_commit, freshness_ledger=ledger)
 
     mismatched_artifact = ExternalCapabilityReport.attest(
         capability_id=report.capability_id,
         repository=report.repository,
         source_revision=report.source_revision,
+        core_release_evidence_commit=report.core_release_evidence_commit,
+        run_nonce="e" * 64,
         attestations=(
             replace(report.attestations[0], artifact=_artifact("wrong-external-artifact")),
             *report.attestations[1:],
         ),
     )
     with pytest.raises(ReleaseEvidenceError, match="correlated gate result/artifact"):
-        attach_external_capability_report(evidence, mismatched_artifact)
+        attach_external_capability_report(evidence, mismatched_artifact, freshness_ledger=ledger)
+
+
+def test_external_report_freshness_is_hash_bound_and_replay_protected_across_verifiers(
+    tmp_path: Path,
+) -> None:
+    template = release_evidence_template()
+    external_specs = [spec for spec in release_gate_specs() if spec.category == "external_adapter"]
+    evidence = _apply_records(template, tuple(_record(spec) for spec in external_specs))
+    report = _external_report(evidence)
+
+    tampered = report.to_mapping()
+    tampered["run_nonce"] = "b" * 64
+    with pytest.raises(ReleaseEvidenceError, match="freshness receipt"):
+        external_capability_report_from_mapping(tampered)
+
+    ledger_path = tmp_path / "independent-verifier.sqlite"
+    attached = attach_external_capability_report(
+        evidence,
+        report,
+        freshness_ledger=ExternalFreshnessLedger(ledger_path),
+    )
+    assert attached.external_capabilities == (report,)
+
+    # A fresh verifier object represents a later process opening the same
+    # verifier-owned ledger; SQLite persists the receipt claim across both.
+    with pytest.raises(ReleaseEvidenceError, match="already consumed"):
+        attach_external_capability_report(
+            evidence,
+            report,
+            freshness_ledger=ExternalFreshnessLedger(ledger_path),
+        )
+
+
+def test_structural_external_attachment_does_not_consume_verifier_freshness(
+    tmp_path: Path,
+) -> None:
+    external_specs = [spec for spec in release_gate_specs() if spec.category == "external_adapter"]
+    records = tuple(_record(spec) for spec in external_specs)
+    structural = apply_structural_evidence_records(structural_release_evidence_template(), records)
+    verified = _apply_records(release_evidence_template(), records)
+    report = _external_report(verified)
+
+    structural_attached = attach_structural_external_capability_report(structural, report)
+    assert structural_attached.trust_status == "unverified"
+    trusted_attached = attach_external_capability_report(
+        verified,
+        report,
+        freshness_ledger=ExternalFreshnessLedger(tmp_path / "verifier.sqlite"),
+    )
+    assert trusted_attached.external_capabilities == (report,)
 
 
 def test_reviewer_adversarial_record_cannot_spoof_a_gate_with_exit_zero() -> None:
@@ -593,6 +671,47 @@ def test_storage_growth_benchmark_requires_a_real_byte_reader() -> None:
         asyncio.run(SemanticBenchmarkHarness(iterations=3).run(spec, lambda: None))
 
 
+def test_duration_benchmark_excludes_prepared_sample_setup_from_the_timer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-startup benchmark callers may prepare an isolated sample untimed."""
+    from kestrel_sovereign.knowledge import release_evidence_models
+
+    spec = _performance_spec(PerformanceMetric.HYBRID_RECALL, "sqlite")
+    events: list[str] = []
+    timestamps = iter((10.0, 10.002, 20.0, 20.002, 30.0, 30.002))
+
+    def perf_counter() -> float:
+        events.append("timer")
+        return next(timestamps)
+
+    async def prepare() -> None:
+        events.append("setup")
+
+    async def operation() -> None:
+        events.append("operation")
+
+    async def close() -> None:
+        events.append("teardown")
+
+    monkeypatch.setattr(release_evidence_models.time, "perf_counter", perf_counter)
+    measured = asyncio.run(
+        SemanticBenchmarkHarness(iterations=3).run(
+            spec,
+            operation,
+            before_sample=prepare,
+            after_sample=close,
+        )
+    )
+
+    assert measured.samples == pytest.approx((2.0, 2.0, 2.0))
+    assert events == [
+        "setup", "timer", "operation", "timer", "teardown",
+        "setup", "timer", "operation", "timer", "teardown",
+        "setup", "timer", "operation", "timer", "teardown",
+    ]
+
+
 def _cli(*arguments: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
@@ -701,6 +820,8 @@ def _write_structurally_complete_submission(
         capability_id="parametric_self_governed_corpus",
         repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
         source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
+        core_release_evidence_commit=CORE_RELEASE_EVIDENCE_COMMIT,
+        run_nonce="e" * 64,
         attestations=tuple(external_attestations),
     )
     external_report_path = tmp_path / "submitted-external-report.json"
@@ -967,7 +1088,7 @@ def test_catalog_benchmark_blocks_postgres_without_explicit_isolated_configurati
     )
 
     monkeypatch.delenv("KESTREL_SEMANTIC_RELEASE_ISOLATED", raising=False)
-    monkeypatch.delenv("KESTREL_SEMANTIC_RELEASE_ISOLATED_POSTGRES_DSN", raising=False)
+    monkeypatch.delenv("KESTREL_SEMANTIC_RELEASE_ISOLATED_POSTGRES_ADMIN_DSN", raising=False)
     execution = asyncio.run(
         CatalogExecutionAuthority(_CATALOG_TEST_IDENTITY, default_catalog_workloads()).execute(
             _gate("performance_startup_postgres_startup")
@@ -1227,6 +1348,8 @@ def test_cli_assemble_safely_binds_retirement_and_external_adapter_attestations(
         capability_id="parametric_self_governed_corpus",
         repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
         source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
+        core_release_evidence_commit=CORE_RELEASE_EVIDENCE_COMMIT,
+        run_nonce="f" * 64,
         attestations=tuple(
             ExternalGateAttestation(
                 gate_id=spec.gate_id,

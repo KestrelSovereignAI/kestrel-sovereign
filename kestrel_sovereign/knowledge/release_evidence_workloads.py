@@ -250,8 +250,6 @@ def _backend_workload(selectors: tuple[str, ...]) -> CatalogWorkload:
         backend = spec.environment.backend
         if backend not in {"sqlite", "postgres"}:
             raise ReleaseEvidenceError("backend parity workload requires sqlite or postgres")
-        if spec.environment.backend != backend:
-            raise ReleaseEvidenceError("backend parity workload does not match its catalog environment")
         selected = tuple(f"{selector}[{backend}]" for selector in selectors)
         if backend == "sqlite":
             return await asyncio.to_thread(_result_for, spec, selected)

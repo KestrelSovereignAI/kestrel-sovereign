@@ -241,15 +241,12 @@ async def _run_benchmark(spec: GateSpec) -> CatalogWorkloadResult:
     async def operation() -> None:
         nonlocal current
         # Startup owns creation/initialization, so it opens only within the
-        # timed operation.  Every other metric is prepared outside the timer.
+        # timed operation.  Other duration metrics receive an initialized
+        # sample from ``before_sample`` and measure only their declared work.
         if target.metric is PerformanceMetric.STARTUP:
             await open_sample()
         assert current is not None
-        try:
-            await _benchmark_operation(target.metric, current, sequence)
-        finally:
-            if target.metric is not PerformanceMetric.STORAGE_GROWTH:
-                await factory.close(current)
+        await _benchmark_operation(target.metric, current, sequence)
 
     async def prepare_storage_growth_sample() -> None:
         if target.metric is PerformanceMetric.STORAGE_GROWTH:
@@ -265,15 +262,10 @@ async def _run_benchmark(spec: GateSpec) -> CatalogWorkloadResult:
         await factory.close(current)
         current = None
 
-    async def timed_operation() -> None:
+    async def close_sample() -> None:
         nonlocal current
-        if target.metric is not PerformanceMetric.STARTUP:
-            await open_sample()
-        await operation()
-        # The next iteration must not observe an old sample object.  A closed
-        # SQLite path remains readable for byte observation; Postgres reads
-        # happen before this assignment in the harness.
-        if target.metric is not PerformanceMetric.STORAGE_GROWTH:
+        if current is not None:
+            await factory.close(current)
             current = None
 
     try:
@@ -290,7 +282,14 @@ async def _run_benchmark(spec: GateSpec) -> CatalogWorkloadResult:
                 after_sample=close_storage_growth_sample,
             )
         else:
-            run = await harness.run(spec, timed_operation)
+            # The generic harness invokes before/after outside the duration
+            # timer.  Startup intentionally has no preparation hook.
+            run = await harness.run(
+                spec,
+                operation,
+                before_sample=None if target.metric is PerformanceMetric.STARTUP else open_sample,
+                after_sample=close_sample,
+            )
         return _benchmark_result(spec, run)
     finally:
         await factory.close(current)

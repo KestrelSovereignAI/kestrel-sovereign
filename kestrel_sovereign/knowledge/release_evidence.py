@@ -49,6 +49,7 @@ from .release_evidence_models import (
     _canonical_json,
     _sha256,
 )
+from .release_evidence_freshness import ExternalFreshnessLedger
 
 
 RELEASE_EVIDENCE_SCHEMA_VERSION = 3
@@ -57,6 +58,9 @@ STRUCTURAL_RELEASE_EVIDENCE_SCHEMA_VERSION = 1
 STRUCTURAL_RELEASE_CONTRACT = "semantic-kb-v1-release-evidence-structural-v1"
 PARAMETRIC_SELF_EVIDENCE_REPOSITORY = "KestrelSovereignAI/kestrel-feature-parametric-self"
 PARAMETRIC_SELF_EVIDENCE_REVISION = "260ba985bcfdfab3dab1ea58da5b259057f3749f"
+# The external report must bind to the exact immutable core catalog it ran
+# against; a prefix is not a revision pin.
+CORE_RELEASE_EVIDENCE_COMMIT = "265cf41831a6d82392771771723184eef75fd7b2"
 _ERASURE_DRILL = DrillBinding(
     "semantic_erasure_release_drill_v1",
     _sha256("semantic-release-evidence-v3:drill:semantic_erasure_release_drill_v1"),
@@ -597,10 +601,14 @@ def _validate_external_capability_reports(
         or report.source_revision != PARAMETRIC_SELF_EVIDENCE_REVISION
     ):
         raise ReleaseEvidenceError("external adapter report repository or revision does not match contract")
+    if report.core_release_evidence_commit != CORE_RELEASE_EVIDENCE_COMMIT:
+        raise ReleaseEvidenceError("external adapter report core catalog commit does not match contract")
     expected = _external_gate_results(gates)
     supplied = {item.gate_id: item for item in report.attestations}
     if set(supplied) != set(expected) or set(supplied) != set(_EXTERNAL_ADAPTER_GATE_IDS):
         raise ReleaseEvidenceError("external adapter report must cover corpus, candidate, and served stages")
+    if report.gate_ids != _EXTERNAL_ADAPTER_GATE_IDS or tuple(expected) != _EXTERNAL_ADAPTER_GATE_IDS:
+        raise ReleaseEvidenceError("external adapter report must preserve declared external gate order")
     for gate_id, gate in expected.items():
         attestation = supplied[gate_id]
         evidence = gate.evidence
@@ -868,11 +876,23 @@ def attach_structural_retirement_telemetry(
 def attach_external_capability_report(
     evidence: SemanticReleaseEvidence,
     report: ExternalCapabilityReport,
+    *,
+    freshness_ledger: ExternalFreshnessLedger,
 ) -> SemanticReleaseEvidence:
-    """Attach only a fully hash-bound report from the declared external consumer."""
+    """Attach and durably consume a fully bound report from external CI.
+
+    This is verifier-only ingestion.  It deliberately requires a ledger owned
+    by that verifier, so the public structural assembler cannot mark an
+    external bundle fresh or reuse a report author's transient state.
+    """
     if not isinstance(report, ExternalCapabilityReport):
         raise ReleaseEvidenceError("external adapter report must be ExternalCapabilityReport")
-    return replace(evidence, external_capabilities=(report,))
+    if not isinstance(freshness_ledger, ExternalFreshnessLedger):
+        raise ReleaseEvidenceError("trusted external adapter ingestion requires verifier-owned freshness ledger")
+    attached = replace(evidence, external_capabilities=(report,))
+    _validate_external_capability_reports(attached.external_capabilities, attached.gates)
+    freshness_ledger.consume(report)
+    return attached
 
 
 def attach_structural_external_capability_report(
@@ -1072,7 +1092,16 @@ def external_capability_report_from_mapping(value: Mapping[str, object]) -> Exte
     mapping = _expect_mapping(value, "external adapter report")
     _strict_keys(
         mapping,
-        {"capability_id", "repository", "source_revision", "attestations", "attestation_digest"},
+        {
+            "capability_id",
+            "repository",
+            "source_revision",
+            "core_release_evidence_commit",
+            "run_nonce",
+            "freshness_receipt",
+            "attestations",
+            "attestation_digest",
+        },
         "external adapter report",
     )
     raw_attestations = mapping["attestations"]
@@ -1105,6 +1134,9 @@ def external_capability_report_from_mapping(value: Mapping[str, object]) -> Exte
         capability_id=cast(str, mapping["capability_id"]),
         repository=cast(str, mapping["repository"]),
         source_revision=cast(str, mapping["source_revision"]),
+        core_release_evidence_commit=cast(str, mapping["core_release_evidence_commit"]),
+        run_nonce=cast(str, mapping["run_nonce"]),
+        freshness_receipt=cast(str, mapping["freshness_receipt"]),
         attestations=tuple(attestations),
         attestation_digest=cast(str, mapping["attestation_digest"]),
     )

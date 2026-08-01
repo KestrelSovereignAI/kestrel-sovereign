@@ -1550,6 +1550,9 @@ class ExternalCapabilityReport:
     capability_id: str
     repository: str
     source_revision: str
+    core_release_evidence_commit: str
+    run_nonce: str
+    freshness_receipt: str
     attestations: tuple[ExternalGateAttestation, ...]
     attestation_digest: str
 
@@ -1558,6 +1561,9 @@ class ExternalCapabilityReport:
         if not isinstance(self.repository, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.repository):
             raise ReleaseEvidenceError("external repository must be owner/name")
         _require_commit(self.source_revision, "external source_revision")
+        _require_commit(self.core_release_evidence_commit, "external core_release_evidence_commit")
+        _require_digest(self.run_nonce, "external run_nonce")
+        _require_digest(self.freshness_receipt, "external freshness_receipt")
         if (
             not isinstance(self.attestations, tuple)
             or not self.attestations
@@ -1567,9 +1573,11 @@ class ExternalCapabilityReport:
         gate_ids = [item.gate_id for item in self.attestations]
         if len(set(gate_ids)) != len(gate_ids):
             raise ReleaseEvidenceError("external capability report cannot repeat a gate")
+        if self.freshness_receipt != self.calculated_freshness_receipt():
+            raise ReleaseEvidenceError("external freshness receipt does not bind its nonce and result digests")
         _require_digest(self.attestation_digest, "external attestation_digest")
         if self.attestation_digest != self.calculated_digest():
-            raise ReleaseEvidenceError("external attestation digest does not bind result/artifact references")
+            raise ReleaseEvidenceError("external attestation digest does not bind freshness/result/artifact references")
 
     @classmethod
     def attest(
@@ -1578,18 +1586,33 @@ class ExternalCapabilityReport:
         capability_id: str,
         repository: str,
         source_revision: str,
+        core_release_evidence_commit: str,
+        run_nonce: str,
         attestations: tuple[ExternalGateAttestation, ...],
     ) -> "ExternalCapabilityReport":
+        freshness_receipt = calculate_external_freshness_receipt(
+            core_release_evidence_commit=core_release_evidence_commit,
+            repository=repository,
+            source_revision=source_revision,
+            run_nonce=run_nonce,
+            record_digests=tuple(item.result_digest for item in attestations),
+        )
         payload = {
             "capability_id": capability_id,
             "repository": repository,
             "source_revision": source_revision,
+            "core_release_evidence_commit": core_release_evidence_commit,
+            "run_nonce": run_nonce,
+            "freshness_receipt": freshness_receipt,
             "attestations": [item.to_mapping() for item in attestations],
         }
         return cls(
             capability_id=capability_id,
             repository=repository,
             source_revision=source_revision,
+            core_release_evidence_commit=core_release_evidence_commit,
+            run_nonce=run_nonce,
+            freshness_receipt=freshness_receipt,
             attestations=attestations,
             attestation_digest=_sha256(_canonical_json(payload)),
         )
@@ -1598,6 +1621,21 @@ class ExternalCapabilityReport:
     def gate_ids(self) -> tuple[str, ...]:
         return tuple(item.gate_id for item in self.attestations)
 
+    def calculated_freshness_receipt(self) -> str:
+        """Return the content-free replay key shared with external CI.
+
+        The result-digest sequence is intentionally ordered.  The core
+        catalog validates that order against its immutable external gates
+        before a verifier consumes this receipt.
+        """
+        return calculate_external_freshness_receipt(
+            core_release_evidence_commit=self.core_release_evidence_commit,
+            repository=self.repository,
+            source_revision=self.source_revision,
+            run_nonce=self.run_nonce,
+            record_digests=tuple(item.result_digest for item in self.attestations),
+        )
+
     def calculated_digest(self) -> str:
         return _sha256(
             _canonical_json(
@@ -1605,6 +1643,9 @@ class ExternalCapabilityReport:
                     "capability_id": self.capability_id,
                     "repository": self.repository,
                     "source_revision": self.source_revision,
+                    "core_release_evidence_commit": self.core_release_evidence_commit,
+                    "run_nonce": self.run_nonce,
+                    "freshness_receipt": self.freshness_receipt,
                     "attestations": [item.to_mapping() for item in self.attestations],
                 }
             )
@@ -1615,6 +1656,31 @@ class ExternalCapabilityReport:
             "capability_id": self.capability_id,
             "repository": self.repository,
             "source_revision": self.source_revision,
+            "core_release_evidence_commit": self.core_release_evidence_commit,
+            "run_nonce": self.run_nonce,
+            "freshness_receipt": self.freshness_receipt,
             "attestations": [item.to_mapping() for item in self.attestations],
             "attestation_digest": self.attestation_digest,
         }
+
+
+def calculate_external_freshness_receipt(
+    *,
+    core_release_evidence_commit: str,
+    repository: str,
+    source_revision: str,
+    run_nonce: str,
+    record_digests: tuple[str, ...],
+) -> str:
+    """Calculate the portable, content-free receipt an independent verifier consumes."""
+    return _sha256(
+        _canonical_json(
+            {
+                "core_release_evidence_commit": core_release_evidence_commit,
+                "repository": repository,
+                "source_revision": source_revision,
+                "run_nonce": run_nonce,
+                "record_digests": list(record_digests),
+            }
+        )
+    )
