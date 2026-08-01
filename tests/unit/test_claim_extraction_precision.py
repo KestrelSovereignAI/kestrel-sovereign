@@ -244,3 +244,42 @@ class TestDedupKeepsStrongestEvidence:
         pairs = ActionItemExtractor().extract_with_evidence("I will ship.")
         text, evidence = pairs[0]
         assert claim_confidence(text, evidence) == DEFAULT_CLAIM_CONFIDENCE
+
+
+# ---------------------------------------------------------------------------
+# codex review r3
+# ---------------------------------------------------------------------------
+
+class TestExplicitCuesSurviveQuestionShapedText:
+    """An explicit directive is a task even when its action is a question."""
+
+    def test_todo_with_a_question_action_survives(self):
+        assert _items("TODO: determine why CI is failing?") == [
+            "determine why CI is failing"
+        ]
+
+    def test_reminder_with_a_question_action_survives(self):
+        items = _items("Remind me to ask whether the deploy succeeded?")
+        assert any("deploy succeeded" in i for i in items), items
+
+    def test_speculative_question_is_still_rejected(self):
+        assert _items("Do I need a heartbeat agent or what?") == []
+
+
+class TestNegationBeyondTheOperator:
+    def test_negation_at_the_head_of_the_action_is_caught(self):
+        """'I should not restart' — the capture itself starts at 'not'."""
+        assert not any("restart" in i for i in _items("I should not restart."))
+
+    def test_negation_scoping_an_inner_cue_is_caught(self):
+        assert not any(
+            "restart" in i for i in _items("I don't think I need to restart.")
+        )
+
+    def test_unrelated_negated_clause_still_does_not_veto(self):
+        items = _items("I don't need to deploy, but I will restart the host.")
+        assert any("restart the host" in i for i in items), items
+
+    def test_negative_condition_deep_in_the_action_still_survives(self):
+        items = _items("I need to ensure the backup never expires.")
+        assert any("backup never expires" in i for i in items), items

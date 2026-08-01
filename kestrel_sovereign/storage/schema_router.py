@@ -251,6 +251,11 @@ _NEGATION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Explicit task directives. These stay tasks even when phrased as questions.
+_EXPLICIT_CUE_RE = re.compile(
+    r"\bTODO:?|\bremind me to\b|\bdon'?t forget to\b", re.IGNORECASE
+)
+
 # Reminder cues that CONTAIN a negation token but are positive commitments.
 _POSITIVE_CUE_RE = re.compile(
     r"\b(?:don'?t|never)\s+forget\s+to\b|\bremind me to\b", re.IGNORECASE
@@ -272,18 +277,35 @@ def _enclosing_sentence(content: str, start: int, end: int) -> str:
     return content[left + 1: right + 1]
 
 
-def _is_committing_clause(content: str, match, text: str) -> bool:
+def _sentence_offset(content: str, match, sentence: str) -> int:
+    """Index in ``content`` where ``sentence`` begins."""
+    return content.rfind(sentence, 0, match.end()) if sentence else 0
+
+
+def _is_committing_clause(
+    content: str, match, text: str, *, negative_action_ok: bool = False
+) -> bool:
     """Whether a raw pattern hit is a real commitment worth persisting.
 
     Rejects the three shapes that produced the observed false positives: an
     interrogative sentence, a negated commitment, and a clause trailing off
     into filler.
+
+    ``negative_action_ok`` distinguishes the two consumers. For an ACTION ITEM
+    a negated action is no task at all ("I should not restart"). For a
+    DECISION it is still a decision — choosing *not* to do something is an
+    explicit choice, and "We've decided not to deploy" must be recorded.
     """
     matched = match.group(0)
     sentence = _enclosing_sentence(content, match.start(), match.end())
+    explicit_cue = bool(_EXPLICIT_CUE_RE.search(matched))
 
-    # Interrogation is a property of the whole sentence.
-    if sentence.rstrip().endswith("?"):
+    # Interrogation is a property of the whole sentence — but only for
+    # SPECULATIVE commitments. An explicit directive stays a task even when its
+    # action is phrased as a question: "TODO: determine why CI is failing?" and
+    # "Remind me to ask whether the deploy succeeded?" are real tasks, and the
+    # base extractor kept them (codex review r3).
+    if not explicit_cue and sentence.rstrip().endswith("?"):
         return False
 
     # Negation attaches to the COMMITMENT OPERATOR, not to the sentence and not
@@ -297,7 +319,24 @@ def _is_committing_clause(content: str, match, text: str) -> bool:
     #                       though choosing not to do something is a decision.
     # The operator is the matched span with the captured action removed.
     operator = matched[: match.start(match.lastindex or 0) - match.start()] if match.lastindex else matched
-    if not _POSITIVE_CUE_RE.search(operator) and _NEGATION_RE.search(operator):
+
+    # The operator alone is not enough. Two shapes slip past it (codex r3):
+    #   * "I should not restart"        -> the capture STARTS at "not", so the
+    #                                      operator is clean and "not restart"
+    #                                      would persist as an action;
+    #   * "I don't think I need to X"   -> the match begins at the INNER cue,
+    #                                      so the negator sits just before it.
+    # Widen to the leading words of the action, and to a short look-back that
+    # stops at a conjunction so an unrelated negated clause can't veto.
+    action_head = " ".join(text.split()[:2])
+    lookback = sentence[: max(0, match.start() - _sentence_offset(content, match, sentence))]
+    lookback = re.split(r"\b(?:but|and|however|though)\b|[,;]", lookback)[-1]
+
+    negated = _NEGATION_RE.search(operator) or _NEGATION_RE.search(lookback)
+    if not negative_action_ok:
+        negated = negated or _NEGATION_RE.search(action_head)
+
+    if not _POSITIVE_CUE_RE.search(operator) and negated:
         return False
 
     if _FILLER_TAIL_RE.search(text):
@@ -383,7 +422,10 @@ class DecisionExtractor:
                 text = match.group(len(match.groups())).strip().strip(",;")
                 if not text or len(text) < 3:
                     continue
-                if not _is_committing_clause(content, match, text):
+                # Deciding NOT to do something is still a decision.
+                if not _is_committing_clause(
+                    content, match, text, negative_action_ok=True
+                ):
                     continue
                 key = text.lower()
                 if key in seen:
