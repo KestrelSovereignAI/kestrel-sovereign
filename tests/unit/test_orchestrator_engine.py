@@ -15,7 +15,7 @@ first call used, on both transports, and that the prune boundary follows it.
 import inspect
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
 from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
@@ -355,36 +355,136 @@ class TestContextLimitResolution:
             service, "claude-opus-5"
         ) == 4096
 
-    def test_falls_back_only_with_no_model(self):
+    def test_falls_back_to_the_active_route_when_the_turn_names_no_model(self):
+        """``effective_model`` is None for every wallet-less agent.
+
+        ``check_solvency()`` returns None when there is no wallet, so most
+        turns arrive here with no model at all. Dropping to the default then
+        would mis-size the majority of continuations.
+        """
+        from kestrel_sovereign.agent.token_counter import get_token_counter
+
+        service = MagicMock(spec=["get_active_model_id"])
+        service.get_active_model_id.return_value = "claude-opus-5"
+
+        assert OrchestratorEngineMixin._resolve_orchestrator_context_limit(
+            service, None
+        ) == get_token_counter("claude-opus-5").get_context_limit()
+        service.get_active_model_id.assert_called_once()
+
+    def test_falls_back_only_when_the_route_is_unresolved(self):
         from kestrel_sovereign.agent.orchestrator_engine import (
             _DEFAULT_ORCHESTRATOR_CONTEXT_LIMIT,
         )
 
-        service = MagicMock(spec=[])
+        service = MagicMock(spec=["get_active_model_id"])
+        service.get_active_model_id.return_value = "auto"
         assert OrchestratorEngineMixin._resolve_orchestrator_context_limit(
             service, None
         ) == _DEFAULT_ORCHESTRATOR_CONTEXT_LIMIT
 
-    def test_prune_threads_the_model_through(self):
+        bare = MagicMock(spec=[])
+        assert OrchestratorEngineMixin._resolve_orchestrator_context_limit(
+            bare, None
+        ) == _DEFAULT_ORCHESTRATOR_CONTEXT_LIMIT
+
+
+@pytest.mark.asyncio
+class TestContinuationReplaysRenderedPrompt:
+    """The continuation's last user turn must be the bytes the first call sent.
+
+    The streaming path passes RAW user input as ``user_message`` because that
+    string also becomes a dispatched subagent's "User's original request".
+    The provider prefix needs the RENDERED prompt (memories + RAG + lazy
+    hint), so the two travel separately.
+    """
+
+    async def test_rendered_prompt_is_used_over_raw_user_message(self):
+        agent = _base_agent()
+        captured = {}
+
+        async def _fake_stream(*_args, **kwargs):
+            captured["messages"] = kwargs["messages"]
+            yield LLMResponse(content="done", tool_calls=None)
+
+        agent.llm_service = MagicMock()
+        agent.llm_service.stream_with_tool_detection = _fake_stream
+        agent.is_request_cancelled = MagicMock(return_value=False)
+
+        handler = (
+            OrchestratorEngineMixin._handle_orchestrator_response_streaming.__get__(
+                agent
+            )
+        )
+        async for _ in handler(
+            response=_tool_call_response(),
+            feature_tools=[],
+            system_prompt="sys",
+            force_local_only=False,
+            effective_model="claude-opus-5",
+            user_message="raw ask",
+            tool_events=[],
+            tool_results=[],
+            session_id="s-1",
+            conversation_history=HISTORY,
+            continuation_user_content="RENDERED: memories+rag\n\nraw ask",
+        ):
+            pass
+
+        sent = captured["messages"]
+        assert sent[3] == {
+            "role": "user",
+            "content": "RENDERED: memories+rag\n\nraw ask",
+        }, "continuation lost this turn's retrieved context"
+
+    async def test_falls_back_to_user_message_when_not_supplied(self):
+        agent = _base_agent()
+        agent.llm_service = MagicMock()
+        agent.llm_service.generate_with_messages = AsyncMock(
+            return_value=LLMResponse(content="done", tool_calls=None)
+        )
+
+        handler = OrchestratorEngineMixin._handle_orchestrator_response.__get__(agent)
+        await handler(
+            response=_tool_call_response(),
+            feature_tools=[],
+            system_prompt="sys",
+            force_local_only=False,
+            effective_model="claude-opus-5",
+            user_message="plain ask",
+            session_id="s-1",
+            conversation_history=HISTORY,
+        )
+        sent = agent.llm_service.generate_with_messages.await_args.kwargs["messages"]
+        assert sent[3] == {"role": "user", "content": "plain ask"}
+
+
+class TestPruneThreadsTheTurnModel:
+    def test_prune_consults_the_resolver_with_the_turn_model(self):
         agent = MagicMock()
         agent.llm_service = MagicMock(spec=[])
         prune = OrchestratorEngineMixin._prune_orchestrator_messages.__get__(agent)
-        sig = inspect.signature(
-            OrchestratorEngineMixin._prune_orchestrator_messages
-        )
-        assert "model" in sig.parameters
-        # A tiny-window model must trigger pruning where the 131072 default
-        # would have waved the same payload through.
-        big = {"role": "tool", "tool_call_id": "c1", "content": "x" * 40000}
+
         messages = [
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "ask"},
             {"role": "assistant", "content": "", "tool_calls": []},
-            big,
+            {"role": "tool", "tool_call_id": "c1", "content": "x" * 40000},
         ]
-        result = prune(list(messages), [], model="gpt-4o-mini-tiny-unknown")
-        assert result is not None
+        with patch.object(
+            OrchestratorEngineMixin,
+            "_resolve_orchestrator_context_limit",
+            return_value=100,
+        ) as spy:
+            result = prune(messages, [], model="some-route/some-model")
 
+        spy.assert_called_once_with(agent.llm_service, "some-route/some-model")
+        # The resolved (tiny) window must actually drive pruning — the 131072
+        # default would have waved this payload straight through.
+        assert "truncated" in result[-1]["content"].lower()
+
+
+class TestSeedIdentity:
     def test_seed_reports_history_identity(self):
         history = [{"role": "user", "content": "a"}]
         messages, history_ids = OrchestratorEngineMixin._seed_orchestrator_messages(

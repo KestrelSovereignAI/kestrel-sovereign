@@ -2301,6 +2301,7 @@ class OrchestratorEngineMixin:
         tool_results: Optional[list] = None,
         invocation_context=None,
         conversation_history: Optional[List[Dict[str, Any]]] = None,
+        continuation_user_content: Optional[str] = None,
     ) -> str:
         """
         Handle the orchestrator's response, executing any tool calls.
@@ -2329,7 +2330,10 @@ class OrchestratorEngineMixin:
 
         # Build message history for multi-turn tool calling
         messages, history_ids = OrchestratorEngineMixin._seed_orchestrator_messages(
-            system_prompt, conversation_history, user_message, "ORCHESTRATOR"
+            system_prompt,
+            conversation_history,
+            continuation_user_content or user_message,
+            "ORCHESTRATOR",
         )
 
         if not response.has_tool_calls:
@@ -2392,7 +2396,7 @@ class OrchestratorEngineMixin:
             # Re-derive on every pass: a prior iteration's prune may have
             # shed replayed history, shifting all seed-time indexes (#2841).
             protected_prefix, history_len = OrchestratorEngineMixin._prefix_bounds(
-                messages, history_ids, bool(user_message)
+                messages, history_ids, bool(continuation_user_content or user_message)
             )
             messages = self._prune_orchestrator_messages(
                 messages, all_tools, protected_prefix=protected_prefix,
@@ -2480,6 +2484,24 @@ class OrchestratorEngineMixin:
         explicit = getattr(llm_service, "_context_limit", None)
         if explicit:
             return int(explicit)
+        if not model:
+            # ``effective_model`` is None whenever the turn carried no override
+            # AND ``check_solvency()`` declined to name one — which it does for
+            # every agent without a wallet, i.e. the common case. Falling
+            # straight through to the default would leave most turns pruning
+            # against a window nothing served (codex review r3, #2841).
+            active = getattr(llm_service, "get_active_model_id", None)
+            if callable(active):
+                try:
+                    resolved = active()
+                except Exception as exc:  # noqa: BLE001
+                    logging.warning(
+                        "[ORCHESTRATOR] Could not resolve the active model for "
+                        "continuation pruning (%s).", exc,
+                    )
+                else:
+                    if resolved and resolved != "auto":
+                        model = resolved
         if model:
             try:
                 from kestrel_sovereign.agent.token_counter import get_token_counter
@@ -2635,6 +2657,7 @@ class OrchestratorEngineMixin:
         buffer_audit: bool = False,
         strict_timeout_state: Optional[dict] = None,
         conversation_history: Optional[List[Dict[str, Any]]] = None,
+        continuation_user_content: Optional[str] = None,
     ):
         """
         Streaming version of _handle_orchestrator_response.
@@ -2668,10 +2691,20 @@ class OrchestratorEngineMixin:
         persisted, and released like any other buffered turn.
 
         ``conversation_history`` (#2841): the turn's budgeted prior-turn
-        messages (``ContextResult.messages``). Replayed ahead of
-        ``user_message`` so the post-tool synthesis call — the one that writes
-        the text the user actually reads — keeps the session's context instead
-        of answering from a blank conversation.
+        messages (``ContextResult.messages``). Replayed ahead of the current
+        user turn so the post-tool synthesis call — the one that writes the
+        text the user actually reads — keeps the session's context instead of
+        answering from a blank conversation.
+
+        ``continuation_user_content`` (#2841): the exact bytes the turn's first
+        provider call sent as its last user message — the RENDERED prompt
+        (memories + RAG folded in) plus any lazy-attachment hint. This path
+        passes raw ``user_input`` as ``user_message`` because that same string
+        becomes a dispatched subagent's "User's original request" context,
+        which must stay clean user speech. Reconstructing the provider prefix
+        needs the rendered form, so the two are carried separately rather than
+        conflated — without it the synthesis call silently lost the CURRENT
+        turn's retrieved context (codex review r3).
 
         Yields:
             Text chunks as they arrive from the LLM
@@ -2687,7 +2720,7 @@ class OrchestratorEngineMixin:
         messages, history_ids = OrchestratorEngineMixin._seed_orchestrator_messages(
             system_prompt,
             conversation_history,
-            user_message,
+            continuation_user_content or user_message,
             "ORCHESTRATOR-STREAM",
         )
 
@@ -2830,7 +2863,7 @@ class OrchestratorEngineMixin:
             # Re-derive on every pass: a prior iteration's prune may have
             # shed replayed history, shifting all seed-time indexes (#2841).
             protected_prefix, history_len = OrchestratorEngineMixin._prefix_bounds(
-                messages, history_ids, bool(user_message)
+                messages, history_ids, bool(continuation_user_content or user_message)
             )
             messages = self._prune_orchestrator_messages(
                 messages, all_tools, protected_prefix=protected_prefix,
