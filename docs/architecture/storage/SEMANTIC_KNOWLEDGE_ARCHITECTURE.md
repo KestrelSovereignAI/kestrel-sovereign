@@ -498,8 +498,38 @@ reconstructs the complete source group, atomically requeues projection
 invalidation with every rollback receipt, and finishes the group. Rollback
 never removes legacy graph content or audit records.
 
-Core has no semantic-assertion vector/index projection to rebuild. A
-feature-owned projection may supply its public invalidator to the runner; it
+Core owns an explicit, derived semantic-assertion vector projection through
+`SemanticAssertionVectorProjection`. It consumes the canonical event stream,
+stores exact assertion/revision and canonical-revision-digest lineage under a
+fixed embedding provider/model/profile/dimension and the approved bounded
+semantic-recall renderer version, and remains non-authoritative: every hit is
+hydrated through the canonical recall fence before use. The projector's
+destination is taken from an immutable, host-issued embedding-provider binding,
+resolved from the LLM service captured when authenticated `AsyncStorage` is
+constructed—not a caller string, later service substitution, or arbitrary
+callable. Direct provider construction requires the host resolver authority.
+Remote disclosure requires both
+`visibility=public` and `privacy_classification=public`; every other effective
+policy is rejected before rendering or provider invocation. A projection
+obtained from `PrivacyEnforcingStorage` is a dynamic proxy that rechecks the
+current privacy mode on sync, recall, hydration, and observation, so a retained
+handle cannot escape a later EPHEMERAL or ISOLATED transition. Each awaited
+vector operation holds a counted lease acquired under the same re-entrant lock
+as `set_privacy_mode`; a transition is refused while provider, database, or
+hydration I/O is in flight and the lease is released in `finally`. Vector dimensions
+and serialized bytes are bounded before
+materialization. Opaque-erasure survivor rebuilds use bounded keyset pages plus
+total-row and wall-clock budgets; exhausting any budget leaves the checkpoint
+unready for safe retry.
+
+The projector's
+event-level checkpoint must equal the canonical terminal `(generation,
+event_id)`; processing only one event in a multi-event generation remains
+unready. Physical erasure's opaque event wipes and atomically rebuilds only
+current eligible survivors before advancing the checkpoint, so restart or
+replay cannot resurrect erased vectors or strand unrelated ones. Its public
+observer exposes only generation and counts. A feature-owned projection may
+additionally supply its public invalidator to the legacy migration runner; it
 receives only the bound tenant and accepted assertion IDs. Accepted IDs first
 enter a durable pending-invalidation ledger, and delivery is marked complete
 only after the public invalidator returns. Delivery drains bounded 500-ID

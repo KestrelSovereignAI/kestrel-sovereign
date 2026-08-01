@@ -266,6 +266,7 @@ async def _assertion_storage_for_backend(
     identity: AgentIdentity,
     *,
     semantic_capabilities=None,
+    llm_service=None,
 ) -> AsyncStorage:
     """Open a boot-resolver-authorized assertion store for parity coverage."""
     capability = _resolve_authenticated_agent_assertion_capability(
@@ -278,6 +279,7 @@ async def _assertion_storage_for_backend(
             agent_id=tenant_id,
             _assertion_tenant_capability=capability,
             semantic_capabilities=semantic_capabilities,
+            llm_service=llm_service,
         )
         await storage.initialize()
         return storage
@@ -290,6 +292,7 @@ async def _assertion_storage_for_backend(
         agent_id=tenant_id,
         _assertion_tenant_capability=capability,
         semantic_capabilities=semantic_capabilities,
+        llm_service=llm_service,
     )
     await storage.initialize()
     return storage
@@ -553,6 +556,82 @@ async def test_governed_semantic_recall_storage_seam_has_backend_parity(db_backe
             await storage.semantic_recall_candidates(
                 query="", candidate_scan_limit=1, inference_profile=_RECALL_PROFILE,
             )
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_assertion_vector_projection_cursor_and_lineage_have_backend_parity(db_backend, tmp_path):
+    """Exercise the event CAS and bounded vector read on SQLite/PostgreSQL."""
+    from kestrel_sovereign.storage.async_assertion_store import (
+        _issue_raw_assertion_mutation_capability,
+    )
+    from kestrel_sovereign.storage.semantic_vector_projection import SemanticVectorProfile
+
+    async def embed(text: str):
+        return [float(len(text)), 1.0]
+
+    profile = SemanticVectorProfile(
+        "semantic-vector-parity-v1", "c" * 64,
+        provider="parity-provider", model="parity-model", dimension=2,
+    )
+
+    class EmbeddingService:
+        def describe(self):
+            return SimpleNamespace(
+                provider=profile.provider, model=profile.model,
+                dim=profile.dimension, profile_id=profile.profile_id,
+            )
+
+        def semantic_vector_destination(self):
+            return profile.embedding_destination
+
+        async def aembed(self, text):
+            return await embed(text)
+
+    tenant, identity = await _incepted_assertion_identity(tmp_path, "vector-projection-parity")
+    storage = await _assertion_storage_for_backend(
+        db_backend, tenant, identity,
+        llm_service=SimpleNamespace(get_embedding_service=lambda: EmbeddingService()),
+    )
+    try:
+        run_id = uuid4().hex
+        first_id = f"vector-first-{run_id}"
+        second_id = f"vector-second-{run_id}"
+        first = _semantic_assertion(tenant, first_id, value="first", source_id=first_id)
+        second = _semantic_assertion(tenant, second_id, value="second", source_id=second_id)
+        # Projection parity is below the governed SHACL acceptance seam; use
+        # the already tenant-bound canonical owner so this test isolates SQL
+        # cursor/vector behavior from concurrent validation-retry coverage.
+        migration_capability = _issue_raw_assertion_mutation_capability(
+            storage._assertion_tenant_capability
+        )
+        await storage._assertion_store().put_assertion(
+            first, source_occurrences=(_semantic_source(first_id),),
+            _migration_capability=migration_capability,
+        )
+        await storage._assertion_store().put_assertion(
+            second, source_occurrences=(_semantic_source(second_id),),
+            _migration_capability=migration_capability,
+        )
+        projection = storage.semantic_assertion_vector_projection(profile)
+        checkpoint = await projection.sync()
+        terminal = await storage._assertion_store().event_checkpoint()
+        assert (checkpoint.generation, checkpoint.event_id) == (
+            terminal.generation, terminal.latest_event_id,
+        )
+        assert {candidate.revision_id for candidate in await projection.recall([1.0, 1.0])} == {
+            first.revision_id, second.revision_id,
+        }
+        stored = await storage.db.fetchall(
+            "SELECT embedding_provider, embedding_model, embedding_dimension, renderer_version, "
+            "revision_digest FROM semantic_assertion_vector_projection_entries WHERE tenant_id = ?",
+            (tenant,),
+        )
+        assert len(stored) == 2
+        assert all(row[:4] == ("parity-provider", "parity-model", 2, "semantic-recall-claim-v1") for row in stored)
+        assert all(len(row[4]) == 64 for row in stored)
     finally:
         await storage.close()
 

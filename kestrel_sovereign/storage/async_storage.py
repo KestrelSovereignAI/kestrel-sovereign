@@ -141,6 +141,10 @@ class AsyncStorage:
         self.db_path: Optional[str] = None
         self.agent_id = agent_id
         self.llm_service = llm_service
+        # Semantic-vector provider authority is captured at host construction;
+        # mutating the public chat-service attribute later cannot substitute a
+        # feature-supplied callable or relabel a remote route as local.
+        self.__semantic_vector_llm_service = llm_service
         # A semantic runtime is agent-owned, not a caller-selected option on
         # individual maintenance/corpus requests.  Keep its RDF/SPARQL codec
         # alive with storage so the pins used by live sleep work are the pins
@@ -1601,6 +1605,27 @@ class AsyncStorage:
             inference_limits=inference_limits,
             maintenance_limits=maintenance_limits,
         )
+
+    def semantic_assertion_vector_projection(self, profile):
+        """Create the tenant-bound derived assertion-vector projection.
+
+        This is intentionally an explicit capability, not a generic RAG
+        vector accessor.  Its candidates have to be canonically hydrated
+        before they can enter agent context.
+        """
+        if not self._initialized:
+            raise RuntimeError("semantic vector projection requires initialized AsyncStorage")
+        from .semantic_vector_projection import (
+            SemanticAssertionVectorProjection,
+            _resolve_host_semantic_vector_embedding_provider,
+        )
+
+        provider = _resolve_host_semantic_vector_embedding_provider(
+            profile,
+            self.__semantic_vector_llm_service,
+            host_authority=self._assertion_tenant_capability,
+        )
+        return SemanticAssertionVectorProjection(self._assertion_store(), profile, provider)
 
     async def hydrate_semantic_recall_candidates(self, assertion_ids, **kwargs):
         if not self._initialized:

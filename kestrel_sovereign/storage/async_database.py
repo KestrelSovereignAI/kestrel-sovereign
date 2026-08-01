@@ -873,8 +873,10 @@ class AsyncDatabase:
             migrate_semantic_assertion_store,
             migrate_semantic_maintenance,
             migrate_semantic_validation_reports,
+            migrate_semantic_vector_projection,
         )
         await migrate_semantic_assertion_store(self)
+        await migrate_semantic_vector_projection(self)
         await migrate_semantic_validation_reports(self)
         await migrate_semantic_maintenance(self)
         await migrate_legacy_graph_fact_migration_state(self)

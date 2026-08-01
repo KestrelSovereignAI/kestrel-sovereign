@@ -1388,6 +1388,49 @@ class EphemeralPurgeReport(dict):
         )
 
 
+class _PrivacyGuardedSemanticVectorProjection:
+    """Dynamic privacy rail for a projection handle retained across transitions."""
+
+    def __init__(self, owner: "PrivacyEnforcingStorage", projection) -> None:
+        self._owner = owner
+        self._projection = projection
+
+    async def checkpoint(self):
+        self._owner._acquire_semantic_vector_lease(write=False)
+        try:
+            return await self._projection.checkpoint()
+        finally:
+            self._owner._release_semantic_vector_lease()
+
+    async def sync(self, **kwargs):
+        self._owner._acquire_semantic_vector_lease(write=True)
+        try:
+            return await self._projection.sync(**kwargs)
+        finally:
+            self._owner._release_semantic_vector_lease()
+
+    async def recall(self, *args, **kwargs):
+        self._owner._acquire_semantic_vector_lease(write=False)
+        try:
+            return await self._projection.recall(*args, **kwargs)
+        finally:
+            self._owner._release_semantic_vector_lease()
+
+    async def recall_hydrated(self, *args, **kwargs):
+        self._owner._acquire_semantic_vector_lease(write=False)
+        try:
+            return await self._projection.recall_hydrated(*args, **kwargs)
+        finally:
+            self._owner._release_semantic_vector_lease()
+
+    async def erasure_observation(self):
+        self._owner._acquire_semantic_vector_lease(write=False)
+        try:
+            return await self._projection.erasure_observation()
+        finally:
+            self._owner._release_semantic_vector_lease()
+
+
 class PrivacyEnforcingStorage:
     """
     A storage wrapper that enforces privacy mode at the storage layer.
@@ -1444,6 +1487,7 @@ class PrivacyEnforcingStorage:
         # of taking effect between a durable commit/replay and its return.
         self._explicit_fact_lease_lock = threading.RLock()
         self._active_explicit_fact_leases = 0
+        self._active_semantic_vector_leases = 0
 
         # Explicit semantic teaching is intentionally captured per wrapper.
         # There is no module-level adapter that accepts caller-supplied storage
@@ -2035,6 +2079,20 @@ class PrivacyEnforcingStorage:
             if self._active_explicit_fact_leases <= 0:
                 raise RuntimeError("explicit fact privacy lease underflow")
             self._active_explicit_fact_leases -= 1
+
+    def _acquire_semantic_vector_lease(self, *, write: bool) -> None:
+        """Atomically check current privacy and lease an awaited vector operation."""
+        with self._explicit_fact_lease_lock:
+            self._assert_semantic_assertion_read_allowed("semantic vector projection")
+            if write:
+                self._assert_semantic_assertion_write_allowed("semantic vector projection")
+            self._active_semantic_vector_leases += 1
+
+    def _release_semantic_vector_lease(self) -> None:
+        with self._explicit_fact_lease_lock:
+            if self._active_semantic_vector_leases <= 0:
+                raise RuntimeError("semantic vector privacy lease underflow")
+            self._active_semantic_vector_leases -= 1
     
     def set_privacy_mode(self, mode: Union[PrivacyMode, PrivacyConfig, str]) -> None:
         """
@@ -2055,11 +2113,14 @@ class PrivacyEnforcingStorage:
             old_config = self._privacy_config
             if (
                 new_config != old_config
-                and self._active_explicit_fact_leases > 0
+                and (
+                    self._active_explicit_fact_leases > 0
+                    or self._active_semantic_vector_leases > 0
+                )
             ):
                 raise PrivacyViolationError(
                     "privacy configuration transition refused while an "
-                    "explicit semantic fact operation is in flight; retry "
+                    "explicit semantic fact or vector operation is in flight; retry "
                     "the transition after that operation completes"
                 )
             was_ephemeral = old_config.is_ephemeral()
@@ -3287,6 +3348,13 @@ class PrivacyEnforcingStorage:
             inference_limits=inference_limits,
             maintenance_limits=maintenance_limits,
         )
+
+    def semantic_assertion_vector_projection(self, profile):
+        """Return a retained handle whose every operation rechecks privacy."""
+        self._assert_semantic_assertion_read_allowed("semantic vector projection")
+        self._assert_semantic_assertion_write_allowed("semantic vector projection")
+        projection = self._storage.semantic_assertion_vector_projection(profile)
+        return _PrivacyGuardedSemanticVectorProjection(self, projection)
 
     async def hydrate_semantic_recall_candidates(self, assertion_ids, **kwargs):
         self._assert_semantic_assertion_read_allowed("semantic recall provenance")

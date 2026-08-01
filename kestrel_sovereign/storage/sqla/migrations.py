@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 
 
 _SEMANTIC_ASSERTION_SCHEMA_VERSION = "semantic_assertion_store_v5"
+_SEMANTIC_VECTOR_PROJECTION_SCHEMA_VERSION = "semantic_assertion_vector_projection_v2"
 _SEMANTIC_VALIDATION_SCHEMA_VERSION = "semantic_validation_reports_v2_revision_links"
 _SEMANTIC_MAINTENANCE_SCHEMA_VERSION = "semantic_maintenance_v1"
 _SEMANTIC_MAINTENANCE_CURSOR_SCHEMA_VERSION = "semantic_maintenance_v2_cursor"
@@ -474,6 +475,134 @@ async def migrate_semantic_assertion_store(db: "AsyncDatabase") -> None:
         await db.execute(
             "INSERT INTO semantic_schema_migrations (version) VALUES (?)",
             (_SEMANTIC_ASSERTION_SCHEMA_VERSION,),
+        )
+
+
+async def migrate_semantic_vector_projection(db: "AsyncDatabase") -> None:
+    """Install the derived assertion-vector owner without altering canonical rows.
+
+    Existing databases have already completed the assertion-store migration,
+    so this distinct marker makes the upgrade additive.  A row retains exact
+    assertion/revision lineage and the embedding capability pin; the state
+    row carries the event-level canonical fence needed for safe replay.
+    """
+    statements = (
+        """CREATE TABLE IF NOT EXISTS semantic_assertion_vector_projection_entries (
+            tenant_id TEXT NOT NULL,
+            profile_id TEXT NOT NULL,
+            capability_digest TEXT NOT NULL,
+            embedding_provider TEXT NOT NULL,
+            embedding_model TEXT NOT NULL,
+            embedding_dimension INTEGER NOT NULL,
+            renderer_version TEXT NOT NULL,
+            embedding_destination TEXT NOT NULL,
+            visibility_ceiling TEXT NOT NULL,
+            privacy_ceiling TEXT NOT NULL,
+            visibility TEXT NOT NULL,
+            privacy_classification TEXT NOT NULL,
+            assertion_id TEXT NOT NULL,
+            revision_id TEXT NOT NULL,
+            revision_digest TEXT NOT NULL,
+            source_generation INTEGER NOT NULL,
+            vector_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, profile_id, capability_digest, assertion_id),
+            UNIQUE (tenant_id, profile_id, capability_digest, revision_id),
+            CHECK (source_generation > 0),
+            CHECK (embedding_dimension > 0 AND embedding_dimension <= 8192),
+            CHECK (embedding_destination IN ('local', 'remote')),
+            CHECK (visibility_ceiling IN ('private', 'tenant', 'delegated', 'public')),
+            CHECK (visibility IN ('private', 'tenant', 'delegated', 'public'))
+        )""",
+        """CREATE TABLE IF NOT EXISTS semantic_assertion_vector_projection_state (
+            tenant_id TEXT NOT NULL,
+            profile_id TEXT NOT NULL,
+            capability_digest TEXT NOT NULL,
+            checkpoint_generation INTEGER NOT NULL,
+            checkpoint_event_id TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, profile_id, capability_digest),
+            CHECK (checkpoint_generation >= 0)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_semantic_vector_projection_revision "
+        "ON semantic_assertion_vector_projection_entries(tenant_id, revision_id)",
+    )
+    async with _semantic_validation_migration_transaction(db):
+        if db.backend_type == "postgres":
+            await db.execute("SELECT pg_advisory_xact_lock(?)", (_semantic_assertion_lock_id(),))
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS semantic_schema_migrations ("
+            "version TEXT PRIMARY KEY, completed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+            (),
+        )
+        exists = await db.fetchone(
+            "SELECT 1 FROM semantic_schema_migrations WHERE version = ?",
+            (_SEMANTIC_VECTOR_PROJECTION_SCHEMA_VERSION,),
+        )
+        if exists is not None:
+            if db.backend_type == "postgres":
+                column_rows = await db.fetchall(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() AND table_name = ?",
+                    ("semantic_assertion_vector_projection_entries",),
+                )
+                columns = {str(row[0]) for row in column_rows}
+                state_rows = await db.fetchall(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() AND table_name = ?",
+                    ("semantic_assertion_vector_projection_state",),
+                )
+                state_columns = {str(row[0]) for row in state_rows}
+            else:
+                column_rows = await db.fetchall(
+                    "PRAGMA table_info(semantic_assertion_vector_projection_entries)", ()
+                )
+                columns = {str(row[1]) for row in column_rows}
+                state_rows = await db.fetchall(
+                    "PRAGMA table_info(semantic_assertion_vector_projection_state)", ()
+                )
+                state_columns = {str(row[1]) for row in state_rows}
+            required_v2 = {
+                "tenant_id", "profile_id", "capability_digest", "embedding_provider",
+                "embedding_model", "embedding_dimension", "renderer_version",
+                "embedding_destination", "visibility_ceiling", "privacy_ceiling",
+                "visibility", "privacy_classification", "assertion_id", "revision_id",
+                "revision_digest", "source_generation", "vector_json", "created_at",
+            }
+            required_state_v2 = {
+                "tenant_id", "profile_id", "capability_digest", "checkpoint_generation",
+                "checkpoint_event_id", "updated_at",
+            }
+            if required_v2 <= columns and required_state_v2 <= state_columns:
+                return
+            # Dispose an incomplete pre-release v2 shape by the same derived-
+            # data rule as v1.  This also makes interrupted upgrades retryable.
+            await db.execute("DROP TABLE IF EXISTS semantic_assertion_vector_projection_entries", ())
+            await db.execute("DROP TABLE IF EXISTS semantic_assertion_vector_projection_state", ())
+            await db.execute(
+                "DELETE FROM semantic_schema_migrations WHERE version = ?",
+                (_SEMANTIC_VECTOR_PROJECTION_SCHEMA_VERSION,),
+            )
+        legacy_v1 = await db.fetchone(
+            "SELECT 1 FROM semantic_schema_migrations WHERE version = ?",
+            ("semantic_assertion_vector_projection_v1",),
+        )
+        if legacy_v1 is not None:
+            # v1 was never canonical data: it is a rebuildable acceleration
+            # surface whose rows lack the v2 privacy/profile/digest contract.
+            # Dispose of both rows and cursor atomically so no old checkpoint
+            # can authenticate an incomplete upgraded shape.
+            await db.execute("DROP TABLE IF EXISTS semantic_assertion_vector_projection_entries", ())
+            await db.execute("DROP TABLE IF EXISTS semantic_assertion_vector_projection_state", ())
+            await db.execute(
+                "DELETE FROM semantic_schema_migrations WHERE version = ?",
+                ("semantic_assertion_vector_projection_v1",),
+            )
+        for statement in statements:
+            await db.execute(statement, ())
+        await db.execute(
+            "INSERT INTO semantic_schema_migrations (version) VALUES (?)",
+            (_SEMANTIC_VECTOR_PROJECTION_SCHEMA_VERSION,),
         )
 
 
