@@ -11,6 +11,11 @@ import pytest
 
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
 from kestrel_sovereign.identity.runtime_identity import load_agent_identity
+from kestrel_sovereign.llm.embedding_service import (
+    EmbeddingService, ProviderEmbeddingService,
+)
+from kestrel_sovereign.llm.ollama_adapter import OllamaAdapter
+from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
 from kestrel_sovereign.knowledge import (
     Assertion, DirectLineage, EpistemicState, IRI, Literal, OntologyRef,
     SourceOccurrence, XSD_STRING,
@@ -356,6 +361,82 @@ async def test_raw_callable_cannot_claim_a_fake_local_destination(tmp_path):
                 PROFILE, _HostLLM(storage._test_vector_service), host_authority=object(),
             )
         assert called is False
+    finally:
+        await storage.close()
+
+
+def _production_route_service(*, local: bool) -> ProviderEmbeddingService:
+    """Build the same exact route shape emitted by LLMService's registry."""
+    adapter = OllamaAdapter() if local else OpenAIAdapter(native_openai=True)
+    return ProviderEmbeddingService({
+        "name": "ollama:local" if local else "openai:api",
+        "vendor": "ollama" if local else "openai",
+        "route": "local" if local else "api",
+        "adapter": adapter,
+        "client": SimpleNamespace(),
+        "is_local": local,
+        "is_cloud": not local,
+        "capabilities": adapter.provider_capabilities().to_dict(),
+    })
+
+
+def _semantic_profile_for(service, destination: str) -> SemanticVectorProfile:
+    descriptor = service.describe()
+    assert descriptor is not None
+    return SemanticVectorProfile(
+        descriptor.profile_id, "f" * 64,
+        provider=descriptor.provider, model=descriptor.model,
+        dimension=descriptor.dim, embedding_destination=destination,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["legacy-ollama", "provider-local", "provider-cloud"])
+async def test_resolver_accepts_production_embedding_destinations(tmp_path, kind):
+    storage = await _storage(tmp_path, f"production-{kind}")
+    if kind == "legacy-ollama":
+        service = EmbeddingService()
+        destination = "local"
+    else:
+        destination = "local" if kind == "provider-local" else "remote"
+        service = _production_route_service(local=destination == "local")
+    profile = _semantic_profile_for(service, destination)
+    if isinstance(service, ProviderEmbeddingService):
+        # Resolution uses the construction-time registry fact, not later
+        # mutation of the route dictionary retained for normal LLM routing.
+        service.provider["is_local"] = destination != "local"
+        service.provider["is_cloud"] = destination == "local"
+    try:
+        resolved = _resolve_host_semantic_vector_embedding_provider(
+            profile, _HostLLM(service),
+            host_authority=storage._assertion_tenant_capability,
+        )
+        assert resolved.destination == destination
+        assert resolved.profile_id == profile.profile_id
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_resolver_rejects_production_route_with_unknown_destination(tmp_path):
+    storage = await _storage(tmp_path, "production-unknown")
+    adapter = OpenAIAdapter(native_openai=True)
+    # Third-party/legacy routes without the registry's exact complementary
+    # route flags must not inherit a destination from their vendor label.
+    service = ProviderEmbeddingService({
+        "name": "openai:api", "vendor": "openai", "route": "api",
+        "adapter": adapter, "client": SimpleNamespace(),
+        "capabilities": adapter.provider_capabilities().to_dict(),
+    })
+    profile = _semantic_profile_for(service, "remote")
+    try:
+        with pytest.raises(
+            SemanticVectorProjectionError, match="capability unavailable",
+        ):
+            _resolve_host_semantic_vector_embedding_provider(
+                profile, _HostLLM(service),
+                host_authority=storage._assertion_tenant_capability,
+            )
     finally:
         await storage.close()
 
