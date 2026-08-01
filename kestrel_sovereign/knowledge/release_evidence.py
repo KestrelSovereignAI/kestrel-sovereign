@@ -58,9 +58,6 @@ STRUCTURAL_RELEASE_EVIDENCE_SCHEMA_VERSION = 1
 STRUCTURAL_RELEASE_CONTRACT = "semantic-kb-v1-release-evidence-structural-v1"
 PARAMETRIC_SELF_EVIDENCE_REPOSITORY = "KestrelSovereignAI/kestrel-feature-parametric-self"
 PARAMETRIC_SELF_EVIDENCE_REVISION = "260ba985bcfdfab3dab1ea58da5b259057f3749f"
-# The external report must bind to the exact immutable core catalog it ran
-# against; a prefix is not a revision pin.
-CORE_RELEASE_EVIDENCE_COMMIT = "265cf41831a6d82392771771723184eef75fd7b2"
 _ERASURE_DRILL = DrillBinding(
     "semantic_erasure_release_drill_v1",
     _sha256("semantic-release-evidence-v3:drill:semantic_erasure_release_drill_v1"),
@@ -335,6 +332,27 @@ def release_gate_specs(
     return conformance + stable_selection + parity + performance + erasure + external + diagnostics + live_agent + compatibility
 
 
+def _external_adapter_contract_digest() -> str:
+    """Hash the immutable external-facing catalog contract, not a runtime SHA."""
+    external_specs = tuple(
+        spec for spec in release_gate_specs() if spec.category == "external_adapter"
+    )
+    if tuple(spec.gate_id for spec in external_specs) != _EXTERNAL_ADAPTER_GATE_IDS:
+        raise ReleaseEvidenceError("external adapter catalog does not preserve its declared gate order")
+    return _sha256(
+        _canonical_json(
+            {
+                "release_evidence_schema_version": RELEASE_EVIDENCE_SCHEMA_VERSION,
+                "semantic_release_contract": SEMANTIC_RELEASE_CONTRACT,
+                "external_adapter_gates": [
+                    {"gate_id": spec.gate_id, "gate_spec_digest": spec.digest}
+                    for spec in external_specs
+                ],
+            }
+        )
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class SemanticReleaseEvidence:
     """One report whose readiness is recomputed from the immutable catalog."""
@@ -601,8 +619,8 @@ def _validate_external_capability_reports(
         or report.source_revision != PARAMETRIC_SELF_EVIDENCE_REVISION
     ):
         raise ReleaseEvidenceError("external adapter report repository or revision does not match contract")
-    if report.core_release_evidence_commit != CORE_RELEASE_EVIDENCE_COMMIT:
-        raise ReleaseEvidenceError("external adapter report core catalog commit does not match contract")
+    if report.core_release_evidence_contract_digest != CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST:
+        raise ReleaseEvidenceError("external adapter report core catalog contract does not match")
     expected = _external_gate_results(gates)
     supplied = {item.gate_id: item for item in report.attestations}
     if set(supplied) != set(expected) or set(supplied) != set(_EXTERNAL_ADAPTER_GATE_IDS):
@@ -1096,9 +1114,8 @@ def external_capability_report_from_mapping(value: Mapping[str, object]) -> Exte
             "capability_id",
             "repository",
             "source_revision",
-            "core_release_evidence_commit",
+            "core_release_evidence_contract_digest",
             "run_nonce",
-            "freshness_receipt",
             "attestations",
             "attestation_digest",
         },
@@ -1134,9 +1151,8 @@ def external_capability_report_from_mapping(value: Mapping[str, object]) -> Exte
         capability_id=cast(str, mapping["capability_id"]),
         repository=cast(str, mapping["repository"]),
         source_revision=cast(str, mapping["source_revision"]),
-        core_release_evidence_commit=cast(str, mapping["core_release_evidence_commit"]),
+        core_release_evidence_contract_digest=cast(str, mapping["core_release_evidence_contract_digest"]),
         run_nonce=cast(str, mapping["run_nonce"]),
-        freshness_receipt=cast(str, mapping["freshness_receipt"]),
         attestations=tuple(attestations),
         attestation_digest=cast(str, mapping["attestation_digest"]),
     )
@@ -1174,6 +1190,11 @@ def _experimental_capabilities(registry: SemanticKnowledgeRegistry) -> tuple[str
 
 def _stable_capabilities(registry: SemanticKnowledgeRegistry) -> tuple[str, ...]:
     return tuple(sorted(capability for resource in registry.resources if resource.maturity is StandardsMaturity.STABLE for capability in resource.capabilities))
+
+
+# This pin can be produced by a feature using the new report API: it changes
+# only when the immutable evidence schema, contract, or external gate specs do.
+CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST = _external_adapter_contract_digest()
 
 
 def _write_json(value: Mapping[str, object], output: Path, *, overwrite: bool, kind: str) -> None:

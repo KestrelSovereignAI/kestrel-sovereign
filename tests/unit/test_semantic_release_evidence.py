@@ -23,7 +23,7 @@ from kestrel_sovereign.knowledge.release_evidence import (
     ExternalCapabilityReport,
     ExternalGateAttestation,
     GateResult,
-    CORE_RELEASE_EVIDENCE_COMMIT,
+    CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
     PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
     PARAMETRIC_SELF_EVIDENCE_REVISION,
     PerformanceBudget,
@@ -221,7 +221,7 @@ def _external_report(evidence) -> ExternalCapabilityReport:
         capability_id="parametric_self_governed_corpus",
         repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
         source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
-        core_release_evidence_commit=CORE_RELEASE_EVIDENCE_COMMIT,
+        core_release_evidence_contract_digest=CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
         run_nonce="a" * 64,
         attestations=tuple(attestations),
     )
@@ -402,7 +402,7 @@ def test_reviewer_adversarial_external_report_requires_exact_stages_repo_revisio
         capability_id=report.capability_id,
         repository=report.repository,
         source_revision=report.source_revision,
-        core_release_evidence_commit=report.core_release_evidence_commit,
+        core_release_evidence_contract_digest=report.core_release_evidence_contract_digest,
         run_nonce="b" * 64,
         attestations=report.attestations[:-1],
     )
@@ -413,29 +413,29 @@ def test_reviewer_adversarial_external_report_requires_exact_stages_repo_revisio
         capability_id=report.capability_id,
         repository="example/other-adapter",
         source_revision=report.source_revision,
-        core_release_evidence_commit=report.core_release_evidence_commit,
+        core_release_evidence_contract_digest=report.core_release_evidence_contract_digest,
         run_nonce="c" * 64,
         attestations=report.attestations,
     )
     with pytest.raises(ReleaseEvidenceError, match="repository or revision"):
         attach_external_capability_report(evidence, wrong_repository, freshness_ledger=ledger)
 
-    wrong_core_commit = ExternalCapabilityReport.attest(
+    wrong_core_contract = ExternalCapabilityReport.attest(
         capability_id=report.capability_id,
         repository=report.repository,
         source_revision=report.source_revision,
-        core_release_evidence_commit="0" * 40,
+        core_release_evidence_contract_digest="0" * 64,
         run_nonce="d" * 64,
         attestations=report.attestations,
     )
-    with pytest.raises(ReleaseEvidenceError, match="core catalog commit"):
-        attach_external_capability_report(evidence, wrong_core_commit, freshness_ledger=ledger)
+    with pytest.raises(ReleaseEvidenceError, match="core catalog contract"):
+        attach_external_capability_report(evidence, wrong_core_contract, freshness_ledger=ledger)
 
     mismatched_artifact = ExternalCapabilityReport.attest(
         capability_id=report.capability_id,
         repository=report.repository,
         source_revision=report.source_revision,
-        core_release_evidence_commit=report.core_release_evidence_commit,
+        core_release_evidence_contract_digest=report.core_release_evidence_contract_digest,
         run_nonce="e" * 64,
         attestations=(
             replace(report.attestations[0], artifact=_artifact("wrong-external-artifact")),
@@ -456,8 +456,12 @@ def test_external_report_freshness_is_hash_bound_and_replay_protected_across_ver
 
     tampered = report.to_mapping()
     tampered["run_nonce"] = "b" * 64
-    with pytest.raises(ReleaseEvidenceError, match="freshness receipt"):
+    with pytest.raises(ReleaseEvidenceError, match="attestation digest"):
         external_capability_report_from_mapping(tampered)
+    caller_receipt = report.to_mapping()
+    caller_receipt["freshness_receipt"] = "0" * 64
+    with pytest.raises(ReleaseEvidenceError, match="unknown or missing"):
+        external_capability_report_from_mapping(caller_receipt)
 
     ledger_path = tmp_path / "independent-verifier.sqlite"
     attached = attach_external_capability_report(
@@ -494,6 +498,76 @@ def test_structural_external_attachment_does_not_consume_verifier_freshness(
         freshness_ledger=ExternalFreshnessLedger(tmp_path / "verifier.sqlite"),
     )
     assert trusted_attached.external_capabilities == (report,)
+
+
+def test_external_freshness_ledger_rejects_insecure_parent_file_and_symlink_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kestrel_sovereign.knowledge import release_evidence_freshness
+
+    insecure_parent = tmp_path / "insecure"
+    insecure_parent.mkdir(mode=0o700)
+    insecure_parent.chmod(0o755)
+    with pytest.raises(ReleaseEvidenceError, match="no group/other access"):
+        ExternalFreshnessLedger(insecure_parent / "ledger.sqlite")
+    with pytest.raises(ReleaseEvidenceError):
+        ExternalFreshnessLedger(Path("/tmp/kestrel-semantic-release-ledger.sqlite"))
+
+    secure_parent = tmp_path / "secure"
+    secure_parent.mkdir(mode=0o700)
+    insecure_file = secure_parent / "insecure.sqlite"
+    insecure_file.touch()
+    insecure_file.chmod(0o644)
+    with pytest.raises(ReleaseEvidenceError, match="owner-only access"):
+        ExternalFreshnessLedger(insecure_file)
+
+    symlink_parent = tmp_path / "symlink-parent"
+    symlink_parent.symlink_to(secure_parent, target_is_directory=True)
+    with pytest.raises(ReleaseEvidenceError, match="symlink"):
+        ExternalFreshnessLedger(symlink_parent / "ledger.sqlite")
+
+    symlink_file = secure_parent / "symlink.sqlite"
+    symlink_file.symlink_to(insecure_file)
+    with pytest.raises(ReleaseEvidenceError, match="non-symlink"):
+        ExternalFreshnessLedger(symlink_file)
+
+    owner_only_file = secure_parent / "owner.sqlite"
+    owner_only_file.touch(mode=0o600)
+    current_euid = os.geteuid()
+    monkeypatch.setattr(release_evidence_freshness.os, "geteuid", lambda: current_euid + 1)
+    with pytest.raises(ReleaseEvidenceError, match="verifier-owned"):
+        ExternalFreshnessLedger(owner_only_file)
+
+
+def test_external_freshness_ledger_fails_closed_if_path_replaced_while_opening(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kestrel_sovereign.knowledge import release_evidence_freshness
+
+    external_specs = [spec for spec in release_gate_specs() if spec.category == "external_adapter"]
+    evidence = _apply_records(
+        release_evidence_template(),
+        tuple(_record(spec) for spec in external_specs),
+    )
+    report = _external_report(evidence)
+    secure_parent = tmp_path / "secure"
+    secure_parent.mkdir(mode=0o700)
+    ledger_path = secure_parent / "ledger.sqlite"
+    replacement = secure_parent / "replacement.sqlite"
+    replacement.touch(mode=0o600)
+    ledger = ExternalFreshnessLedger(ledger_path)
+    original_connect = release_evidence_freshness.sqlite3.connect
+
+    def replace_then_connect(*args: object, **kwargs: object):
+        ledger_path.replace(secure_parent / "original.sqlite")
+        replacement.replace(ledger_path)
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(release_evidence_freshness.sqlite3, "connect", replace_then_connect)
+    with pytest.raises(ReleaseEvidenceError, match="changed while opening"):
+        ledger.consume(report)
 
 
 def test_reviewer_adversarial_record_cannot_spoof_a_gate_with_exit_zero() -> None:
@@ -820,7 +894,7 @@ def _write_structurally_complete_submission(
         capability_id="parametric_self_governed_corpus",
         repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
         source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
-        core_release_evidence_commit=CORE_RELEASE_EVIDENCE_COMMIT,
+        core_release_evidence_contract_digest=CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
         run_nonce="e" * 64,
         attestations=tuple(external_attestations),
     )
@@ -1348,7 +1422,7 @@ def test_cli_assemble_safely_binds_retirement_and_external_adapter_attestations(
         capability_id="parametric_self_governed_corpus",
         repository=PARAMETRIC_SELF_EVIDENCE_REPOSITORY,
         source_revision=PARAMETRIC_SELF_EVIDENCE_REVISION,
-        core_release_evidence_commit=CORE_RELEASE_EVIDENCE_COMMIT,
+        core_release_evidence_contract_digest=CORE_RELEASE_EVIDENCE_CONTRACT_DIGEST,
         run_nonce="f" * 64,
         attestations=tuple(
             ExternalGateAttestation(
