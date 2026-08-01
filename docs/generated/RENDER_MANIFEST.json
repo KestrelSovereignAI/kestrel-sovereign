@@ -1539,6 +1539,7 @@
     },
     {
       "existing_code_refs": [
+        "kestrel_sovereign/knowledge/kite_release_evidence.py",
         "kestrel_sovereign/knowledge/release_evidence.py",
         "tests/unit/test_semantic_release_evidence.py",
         "tests/unit/test_sleep_observability.py"

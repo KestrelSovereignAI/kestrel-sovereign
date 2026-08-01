@@ -451,6 +451,8 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `memory_pinned` | `!memory-pinned` | `memory` |  | 37 | `enabled` |
 | `memory_release` | `!memory-release` | `memory` | `message_id` | 67 | `enabled` |
 | `save_fact` | `!memory-save-fact` | `memory` | `subject`, `predicate`, `value`, `confidence` | 182 | `enabled` |
+| `semantic_evidence_diagnostics` | `!memory-semantic-evidence` | `system` |  | 58 | `enabled` |
+| `semantic_evidence_import_quarantine_probe` | `!memory-semantic-evidence-quarantine` | `system` |  | 41 | `enabled` |
 
 ### `model` (ModelAgent)
 
@@ -1029,6 +1031,8 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!memory-pinned` | `memory_agency` |  | List all currently pinned memories with their reasons. Use this to review what the agent has chosen to protect. |
 | `!memory-release` | `memory_agency` | `<message_id>` | Release a pinned memory so it resumes normal decay. Use this when a previously important memory is no longer needed. |
 | `!memory-save-fact` | `memory_agency` | `<subject> <predicate> <value> [confidence]` | Save an explicitly approved canonical fact. The current mapping supports subject 'user' and predicate 'preferred_deploy_region'. Unsupported local terms are rejected rather than guessed. |
+| `!memory-semantic-evidence` | `memory_agency` |  | Show bounded semantic release-evidence diagnostics: verified active capability pins, canonical migration count, and explicit-fact provenance presence. No fact content or identifiers are returned. |
+| `!memory-semantic-evidence-quarantine` | `memory_agency` |  | Run the fixed invalid-import quarantine probe for an explicitly opted-in isolated test instance. It never accepts user data. |
 | `!model` | `model` |  | Report the currently active AI model. Read-only; takes no arguments. |
 | `!model-info` | `model` | `<model_name>` | Get detailed information about a specific model. |
 | `!model-list` | `model` | `[use_cache]` | List all available AI models. |
@@ -1126,6 +1130,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!wellness-history` | `wellness` | `[limit]` | View wellness trends over time |
 
 <!-- END AUTO-GENERATED FEATURE INVENTORY -->
+
 
 
 
