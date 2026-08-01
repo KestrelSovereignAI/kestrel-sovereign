@@ -480,12 +480,45 @@ class AnthropicAdapter(LLMAdapter):
             return model[len("anthropic/"):]
         return model
 
+    # Models whose native Anthropic Messages route accepts a mid-conversation
+    # ``{"role": "system"}`` turn.
+    #
+    # This is a published CAPABILITY MATRIX, not a version ordering, and the
+    # distinction is load-bearing: Sonnet 5 postdates Opus 4.8 and does NOT
+    # support inline system turns, while Fable 5 and Mythos 5 do. A ">= 4.8"
+    # comparison would be wrong in both directions — it would drop Fable and
+    # Mythos, and would advertise the capability on Sonnet 5, whose route
+    # rejects the turn (the 400-wedge #2009 exists to prevent exactly that).
+    #
+    # Deliberately an allowlist so an unrecognised model fails CLOSED: the
+    # fallback relays the notice as a visible user turn, which is merely
+    # suboptimal, whereas claiming support that isn't there breaks the turn.
+    # A newly-supporting model is a one-line addition here.
+    _INLINE_SYSTEM_MODEL_PATTERNS = (
+        r"claude[-.]?opus[-.]?5",
+        r"claude[-.]?opus[-.]?4[-.]?8",
+        r"claude[-.]?fable[-.]?5",
+        r"claude[-.]?mythos[-.]?5",
+    )
+
     @staticmethod
     def _model_supports_inline_system(model: str) -> bool:
-        """Anthropic currently gates inline system turns to Opus 4.8+."""
+        """Whether ``model`` accepts a mid-conversation system turn.
+
+        Anthropic ships mid-conversation system messages on Claude Opus 5,
+        Opus 4.8, Fable 5 and Mythos 5 — no beta header. Before #2846 this
+        matched ONLY ``claude-opus-4-8`` despite a docstring claiming "4.8+",
+        so every current production route (Opus 5, Fable 5) failed the gate
+        and had its operator notices downgraded to visible
+        ``<operator_notice>`` user turns — off the non-spoofable operator
+        channel and into the replayed conversation history.
+        """
         wire_model = AnthropicAdapter._resolve_wire_model_id(model or "")
         normalized = wire_model.lower().replace("_", "-")
-        return bool(re.search(r"claude[-.]?opus[-.]?4[-.]?8", normalized))
+        return any(
+            re.search(pattern, normalized)
+            for pattern in AnthropicAdapter._INLINE_SYSTEM_MODEL_PATTERNS
+        )
 
     def _route_supports_inline_system(self) -> bool:
         """This adapter targets native Anthropic-compatible Messages routes.
