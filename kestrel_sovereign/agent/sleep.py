@@ -677,6 +677,9 @@ class SleepReport:
     # no IDs — so this operator surface stays content-free.
     episodes_repaired: int = 0
     episode_repair_limit_reached: bool = False
+    # A pass-level repair failure. Without this, "0 repaired" reads the same
+    # as "nothing to repair", so a permanently failing pass is invisible.
+    episode_repair_failed: bool = False
 
     # Export stats
     shards_exported: int = 0
@@ -733,6 +736,7 @@ class SleepReport:
                 "total_messages": self.total_messages,
                 "episodes_repaired": self.episodes_repaired,
                 "episode_repair_limit_reached": self.episode_repair_limit_reached,
+                "episode_repair_failed": self.episode_repair_failed,
                 "duration_ms": self.consolidation_ms,
             },
             "reflection": {
@@ -939,6 +943,10 @@ class SleepMixin:
                     )
                     report.episode_repair_limit_reached = bool(
                         consolidation_result.get("episode_repair_limit_reached")
+                    )
+                    # Content-free: the flag, never the exception text.
+                    report.episode_repair_failed = bool(
+                        consolidation_result.get("episode_repair_error")
                     )
                     consolidation_succeeded = True
                     logger.info(
@@ -1945,6 +1953,7 @@ class SleepMixin:
         report.episode_repair_limit_reached = (
             sleep_report.episode_repair_limit_reached
         )
+        report.episode_repair_failed = sleep_report.episode_repair_failed
         report.shards_exported = sleep_report.shards_exported
         report.total_size_bytes = sleep_report.total_size_bytes
         report.storage_tier = sleep_report.storage_tier

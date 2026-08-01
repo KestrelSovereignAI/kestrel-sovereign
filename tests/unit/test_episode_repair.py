@@ -29,11 +29,15 @@ ENC_META = {"enc": True, "key_version": 1}
 # The shape the bug actually produced: the envelope magic plus the base64 body
 # it was concatenated with.
 ENVELOPE_BODY = "ax1iv9waarjjkc8neundo25yhy9nmiw5hvx8dr8mxj7ixr4rlfls"
-ENVELOPE = f"KSAv2:{ENVELOPE_BODY}"
-CORRUPT_TITLE = f"Discussion of ksav2, {ENVELOPE_BODY}"
+ENVELOPE_BODY2 = "axvp51xic1htadk6n1kqaxivtagj6ejuywjwdzf91r9otnvxvbwup"
+# Standard base64 contains '+', so a real envelope tokenizes into the magic
+# prefix plus several body chunks — which is what Emma's damaged titles show.
+ENVELOPE = f"KSAv2:{ENVELOPE_BODY}+{ENVELOPE_BODY2}"
+CORRUPT_TITLE = f"Discussion of ksav2, {ENVELOPE_BODY}, {ENVELOPE_BODY2}"
 CORRUPT_SUMMARY = (
     f"A conversation with 3 messages (2 from user). Topics: ksav2, "
-    f"{ENVELOPE_BODY}. Emotional trajectory: emotionally steady."
+    f"{ENVELOPE_BODY}, {ENVELOPE_BODY2}. "
+    f"Emotional trajectory: emotionally steady."
 )
 
 PLAINTEXTS = [
@@ -935,6 +939,146 @@ class TestRoundThreeFindings:
         consolidation = report.to_dict()["consolidation"]
         assert consolidation["episodes_repaired"] == 3
         assert consolidation["episode_repair_limit_reached"] is True
+
+
+class TestRoundFourFindings:
+    @pytest.mark.asyncio
+    async def test_corruption_is_detected_after_ciphertext_rotation(
+        self, tmp_path
+    ):
+        """KeyRotationService re-encrypts conversation_history.content.
+
+        Afterwards the stored envelope shares only the magic prefix with the
+        body tokens baked into the corrupt title. Requiring a match against the
+        CURRENT ciphertext would clear a genuinely corrupt episode forever.
+        """
+        db, ids, store = await _corrupt_fixture(tmp_path)
+        # Re-encrypt: same plaintext, entirely different envelope bytes.
+        rotated = "KSAv2:zzq7rt4mplk9wwvv2xh8ddn3+ppl0aa5ssq2mmz7ttx4vv9bb1cc"
+        await db.execute(
+            "UPDATE conversation_history SET content = ? WHERE agent_id = ?",
+            (rotated, AGENT),
+        )
+        seq = iter(PLAINTEXTS * 4)
+        store.decrypt_stored_content.side_effect = (
+            lambda content, meta: next(seq) if content == rotated else content
+        )
+        c = _consolidator(db, store, _RecordingGraphStore(db))
+        try:
+            report = await c.repair_ciphertext_episodes()
+
+            assert report["repaired"] == 1, (
+                "rotation must not make a corrupt episode undetectable"
+            )
+            title = await db.fetchval(
+                "SELECT title FROM memory_episodes WHERE id = ?",
+                ("episode:corrupt",)
+            )
+            assert ENVELOPE_BODY not in title
+            assert "scheduler" in title.lower()
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_healthy_episode_survives_rotation_too(self, tmp_path):
+        """The rotation fallback must not weaken the healthy-episode guard."""
+        db = await _make_db(tmp_path)
+        ids = await _add_messages(
+            db, [HEALTHY_ENVELOPE, HEALTHY_ENVELOPE], encrypted=True
+        )
+        title = "Discussion of ksav2, base64, prefix, aead"
+        await _add_episode(
+            db, "episode:healthy", title,
+            "A conversation with 2 messages (1 from user). Topics: ksav2, "
+            "base64, prefix, aead. Emotional trajectory: emotionally steady.",
+            ids,
+        )
+        rotated = "KSAv2:qqw8ee4rr7tt2yy5uu1ii3oo9pp6aa0ss"
+        await db.execute(
+            "UPDATE conversation_history SET content = ? WHERE agent_id = ?",
+            (rotated, AGENT),
+        )
+        talk = iter(HEALTHY_PLAINTEXTS * 4)
+        store = MagicMock()
+        store.decrypt_stored_content.side_effect = (
+            lambda content, meta: next(talk) if content == rotated else content
+        )
+        c = _consolidator(db, store, _RecordingGraphStore(db))
+        try:
+            report = await c.repair_ciphertext_episodes()
+            assert report["repaired"] == 0
+            assert report["cleared"] == 1
+            assert await db.fetchval(
+                "SELECT title FROM memory_episodes WHERE id = ?",
+                ("episode:healthy",)
+            ) == title
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_source_trashed_mid_repair_does_not_persist(self, tmp_path):
+        """Soft deletion only stamps conversation_history.deleted_at.
+
+        It never touches the episode's exclusion flag, so no predicate on
+        memory_episodes alone would notice; the write would publish topics
+        drawn from a message the user just moved to Trash.
+        """
+        db, ids, store = await _corrupt_fixture(tmp_path)
+        graph = _RecordingGraphStore(db)
+        original_add = graph.add_node
+
+        async def _trash_then_write(node):
+            await db.execute(
+                "UPDATE conversation_history SET deleted_at = ? WHERE id = ?",
+                (datetime.now(timezone.utc).isoformat(), ids[0]),
+            )
+            graph.add_node = original_add
+            return await original_add(node)
+
+        graph.add_node = _trash_then_write
+        c = _consolidator(db, store, graph)
+        try:
+            report = await c.repair_ciphertext_episodes()
+
+            assert report["repaired"] == 0
+            assert [u["reason"] for u in report["unrepairable"]] == [
+                "abandoned_mid_repair"
+            ]
+            assert await db.fetchval(
+                "SELECT title FROM memory_episodes WHERE id = ?",
+                ("episode:corrupt",)
+            ) == CORRUPT_TITLE
+            assert await db.fetchval(
+                "SELECT label FROM graph_nodes WHERE node_id = ?",
+                ("episode:corrupt",)
+            ) == CORRUPT_TITLE, "the node rewrite must have been rolled back"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_sleep_report_surfaces_a_failing_repair_pass(self):
+        """"0 repaired" must not read the same as "nothing to repair"."""
+        from kestrel_sovereign.agent.sleep import SleepReport
+
+        report = SleepReport(success=True)
+        report.episode_repair_failed = True
+        assert report.to_dict()["consolidation"]["episode_repair_failed"] is True
+
+    @pytest.mark.asyncio
+    async def test_consolidation_records_a_repair_failure(self, tmp_path):
+        db, ids, store = await _corrupt_fixture(tmp_path)
+        c = _consolidator(db, store, _RecordingGraphStore(db))
+
+        async def _boom(**kwargs):
+            raise RuntimeError("pass exploded")
+
+        c.repair_ciphertext_episodes = _boom
+        try:
+            result = await c.run_consolidation()
+            assert result["episode_repair_error"] == "pass exploded"
+            assert result["episodes_repaired"] == 0
+        finally:
+            await db.close()
 
 
 class TestLockReachesTheConsolidator:

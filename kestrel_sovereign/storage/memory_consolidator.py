@@ -869,36 +869,102 @@ class MemoryConsolidator:
         """Tokenize text the way episode topics are extracted."""
         return set(_TOPIC_TOKEN_RE.findall(str(text or "").lower()))
 
+    #: A term already proven alien is treated as envelope material rather than
+    #: a word when it is at least this long and carries a digit. Base64 bodies
+    #: are; topic words are not. Only ever consulted for alien terms, so it
+    #: cannot by itself put a healthy episode at risk.
+    _ENVELOPE_TOKEN_MIN_LEN = 16
+
     @classmethod
-    def _envelope_derived_terms(
+    def _looks_like_envelope_token(cls, term: str) -> bool:
+        return (
+            len(term) >= cls._ENVELOPE_TOKEN_MIN_LEN
+            and any(character.isdigit() for character in term)
+        )
+
+    @classmethod
+    def _alien_terms(
         cls,
         title: Optional[str],
         summary: Optional[str],
         sources: List[Dict[str, Any]],
+        expected_title: str,
+        expected_summary: str,
     ) -> set:
-        """Persisted terms that came from the sources' envelope, not their text.
+        """Persisted terms the episode's own sources cannot account for.
 
-        This is the evidence that authorizes a rewrite. A term counts only when
-        it is absent from every source's decrypted content AND present in the
-        raw at-rest bytes of a source that actually needed decrypting. So an
-        episode about the encryption format keeps its title (its terms are in
-        the plaintext), while ``Discussion of ksav2, ax1iv9waarjjkc8...`` does
-        not (those terms exist only in the envelope).
+        Episode topics are extracted FROM message text, so every term in a
+        healthy narrative appears either in the decrypted sources or in the
+        fixed scaffolding the generators emit — and re-synthesizing from those
+        same sources reproduces that scaffolding exactly, which is why the
+        expected text is the template allowlist rather than a hand-maintained
+        stop list. Anything left over was never in this episode's content.
         """
         persisted = cls._topic_terms(title) | cls._topic_terms(summary)
         if not persisted:
             return set()
-        plaintext: set = set()
+        accounted = (
+            cls._topic_terms(expected_title) | cls._topic_terms(expected_summary)
+        )
+        for source in sources:
+            accounted |= cls._topic_terms(source.get("content"))
+        return persisted - accounted
+
+    @classmethod
+    def _envelope_terms(cls, sources: List[Dict[str, Any]]) -> set:
+        """Terms present in the sources' CURRENT at-rest bytes.
+
+        Only rows that genuinely needed decrypting contribute: for a plaintext
+        row raw == content and there is no envelope to blame.
+        """
         envelope: set = set()
         for source in sources:
-            plaintext |= cls._topic_terms(source.get("content"))
             raw = source.get("raw")
-            # Only rows that were genuinely encrypted at rest can contribute
-            # envelope evidence; for a plaintext row raw == content and there
-            # is no envelope to blame.
             if raw is not None and raw != source.get("content"):
                 envelope |= cls._topic_terms(raw)
-        return (persisted - plaintext) & envelope
+        return envelope
+
+    @classmethod
+    def _corruption_evidence(
+        cls,
+        title: Optional[str],
+        summary: Optional[str],
+        sources: List[Dict[str, Any]],
+        expected_title: str,
+        expected_summary: str,
+    ) -> set:
+        """The evidence that authorizes a rewrite, or an empty set.
+
+        Two independent routes, because matching the CURRENT ciphertext cannot
+        be required: ``KeyRotationService`` re-encrypts
+        ``conversation_history.content``, and migrate-on-read rewrites legacy
+        global-key rows. After either, the envelope no longer contains the body
+        tokens baked into the corrupted title — only the shared magic prefix
+        intersects, and a genuinely corrupt episode would be cleared forever
+        (codex review r4 P1).
+
+        Both routes are gated on the term being ALIEN first, which is what
+        keeps a conversation genuinely about the envelope format safe: its
+        terms come from its own plaintext, so nothing is ever alien.
+        """
+        alien = cls._alien_terms(
+            title, summary, sources, expected_title, expected_summary
+        )
+        if len(alien) < cls._REPAIR_MIN_ENVELOPE_TERMS:
+            return set()
+
+        # Route 1 — the strongest proof: the terms are still sitting in the
+        # sources' own at-rest bytes.
+        corroborated = alien & cls._envelope_terms(sources)
+        if len(corroborated) >= cls._REPAIR_MIN_ENVELOPE_TERMS:
+            return corroborated
+
+        # Route 2 — the ciphertext has since been rotated, so fall back to the
+        # shape of the alien terms themselves.
+        shaped = {term for term in alien if cls._looks_like_envelope_token(term)}
+        if len(shaped) >= cls._REPAIR_MIN_ENVELOPE_TERMS:
+            return shaped
+        return set()
 
     async def _repair_candidates(
         self, scan_limit: int
@@ -1028,7 +1094,8 @@ class MemoryConsolidator:
         return title, summary
 
     async def _apply_episode_repair(
-        self, episode_id: str, title: str, summary: str, has_node: bool
+        self, episode_id: str, title: str, summary: str, has_node: bool,
+        source_ids: Optional[List[int]] = None,
     ) -> bool:
         """Persist a rebuilt narrative: graph node first, then row, then vector.
 
@@ -1097,12 +1164,33 @@ class MemoryConsolidator:
             #
             # The exclusion predicate makes this write lose cleanly to a
             # concurrent withdrawal rather than overwriting it.
+            #
+            # Source liveness is re-tested in the SAME statement. A user can
+            # move a key source message to Trash between rehydration and here;
+            # soft deletion only stamps conversation_history.deleted_at and
+            # never touches the episode's exclusion flag, so no predicate on
+            # memory_episodes alone would notice, and the rewrite would publish
+            # topics drawn from a deleted message (codex review r4 P1).
+            predicates = (
+                "WHERE id = ? AND agent_id = ? "
+                "AND COALESCE(excluded_from_context, 0) = 0"
+            )
+            params: List[Any] = [title, summary, episode_id, self.agent_id]
+            if source_ids:
+                placeholders = ",".join("?" for _ in source_ids)
+                predicates += (
+                    " AND NOT EXISTS (SELECT 1 FROM conversation_history "
+                    f"WHERE agent_id = ? AND id IN ({placeholders}) "
+                    "AND deleted_at IS NOT NULL)"
+                )
+                params.append(self.agent_id)
+                params.extend(source_ids)
+
             changed = await self._db.execute(
                 "UPDATE memory_episodes SET title = ?, summary = ?, "
                 "embedding_vec = NULL, embedding_profile_id = NULL "
-                "WHERE id = ? AND agent_id = ? "
-                "AND COALESCE(excluded_from_context, 0) = 0",
-                (title, summary, episode_id, self.agent_id),
+                + predicates,
+                tuple(params),
             )
 
             if not changed:
@@ -1288,13 +1376,9 @@ class MemoryConsolidator:
                 )
                 continue
 
-            evidence = self._envelope_derived_terms(title, summary, sources)
-            if len(evidence) < self._REPAIR_MIN_ENVELOPE_TERMS:
-                # Pre-filter hit, proof did not follow — a healthy episode that
-                # genuinely discusses the envelope format lands here.
-                report["cleared"] += 1
-                continue
-
+            # Re-synthesis comes FIRST: what these sources would produce today
+            # is also the allowlist the detector measures the persisted
+            # narrative against.
             try:
                 new_title, new_summary = self._resynthesize_narrative(sources)
             except Exception as e:  # noqa: BLE001
@@ -1309,6 +1393,15 @@ class MemoryConsolidator:
                 report["unrepairable"].append(
                     {"episode_id": episode_id, "reason": "resynthesis_failed"}
                 )
+                continue
+
+            evidence = self._corruption_evidence(
+                title, summary, sources, new_title, new_summary
+            )
+            if not evidence:
+                # Pre-filter hit, proof did not follow — a healthy episode that
+                # genuinely discusses the envelope format lands here.
+                report["cleared"] += 1
                 continue
 
             try:
@@ -1345,7 +1438,8 @@ class MemoryConsolidator:
 
             try:
                 applied = await self._apply_episode_repair(
-                    episode_id, new_title, new_summary, has_node
+                    episode_id, new_title, new_summary, has_node,
+                    source_ids=[s["id"] for s in sources],
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning("episode repair failed for %s: %s", episode_id, e)
