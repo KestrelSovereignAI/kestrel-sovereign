@@ -325,11 +325,15 @@ For this contract the immutable capability source is
 `7aad9bb924f61434485e5eae22e61c95d3f97187`. It describes the governed adapter
 runtime under test. Run its standalone two-phase release CLI: prepare the
 candidate/served eligibility before core physical erasure, then observe the
-same drill after erasure. The emitter supplies its own full 40-hex
-`evidence_runner_revision`:
-it must resolve a clean, verifiable VCS `HEAD` at runtime, is bound into every
-external record's signed run digest, and must equal the report field. Another
-capability revision, omitted runner revision, or runner/report mismatch
+same drill after erasure. The current verifier policy pins the external CI
+runner to merged parametric-self PR #27 squash commit
+`761728de2617cf43033aa5bebcc1d66c923897c4`. That full 40-hex
+`evidence_runner_revision` must resolve a clean, verifiable VCS `HEAD` at
+runtime, is bound into every external record's signed run digest, and must
+equal both the envelope/report field and the verifier's expected runner
+revision. The capability-source baseline above remains distinct: it identifies
+the governed adapter contract under test, not the evidence emitter. Another
+capability revision, omitted runner revision, or runner/report/policy mismatch
 remains non-evidence even if its result fields look similar.
 
 The core contract pin is not a self-referential runtime Git SHA. It is a

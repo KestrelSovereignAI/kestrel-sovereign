@@ -57,7 +57,12 @@ SEMANTIC_RELEASE_CONTRACT = "semantic-kb-v1-release-evidence-v3"
 STRUCTURAL_RELEASE_EVIDENCE_SCHEMA_VERSION = 1
 STRUCTURAL_RELEASE_CONTRACT = "semantic-kb-v1-release-evidence-structural-v1"
 PARAMETRIC_SELF_EVIDENCE_REPOSITORY = "KestrelSovereignAI/kestrel-feature-parametric-self"
+# The governed adapter contract intentionally pins the capability baseline
+# separately from the external CI checkout that emits its signed envelope.
+# PR #27 was merged as this squash commit; verifier policy must require it
+# until a subsequent reviewed runner revision is explicitly adopted.
 PARAMETRIC_SELF_CAPABILITY_SOURCE_REVISION = "7aad9bb924f61434485e5eae22e61c95d3f97187"
+PARAMETRIC_SELF_EVIDENCE_RUNNER_REVISION = "761728de2617cf43033aa5bebcc1d66c923897c4"
 # Compatibility name for callers that only need the immutable capability
 # baseline. Evidence producers must also provide a separate runner revision.
 PARAMETRIC_SELF_EVIDENCE_REVISION = PARAMETRIC_SELF_CAPABILITY_SOURCE_REVISION
