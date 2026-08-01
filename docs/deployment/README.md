@@ -67,11 +67,19 @@ instance. Kestrel profiles therefore declare one of two explicit contracts:
 
 The checked-in `dev` and `multi-agent-dev` profiles are explicit ephemeral
 demos and cap `max_instances` at 1. They are not sovereign production
-deployments. `prod` is durable and may scale horizontally because every
-instance restores the same cryptographically verified signing identity and
-uses the same transactional PostgreSQL database. `multi-agent-prod` is
-intentionally refused until Kestrel can bind a separate custody bundle and
-database identity to every hosted agent.
+deployments. `prod` is durable and *may* scale horizontally, because every
+instance restores the same cryptographically verified signing identity and uses
+the same transactional PostgreSQL database. `multi-agent-prod` is intentionally
+refused until Kestrel can bind a separate custody bundle and database identity
+to every hosted agent.
+
+The checked-in `prod` profile nonetheless caps `max_instances` at 1, because the
+contract permitting horizontal scale is not the same thing as a substrate able
+to serve it. Each instance opens up to 10 pooled plus 4 advisory PostgreSQL
+connections, so the cap must be raised together with the database tier (or a
+connection pooler added) rather than on its own — see the comment above
+`[profiles.prod]` in `deploy_config.toml`. A profile that advertises capacity
+its database cannot supply is a declaration nothing has provisioned.
 
 Do not put SQLite on a Cloud Storage mount. Object storage does not provide the
 filesystem locking/transaction semantics SQLite requires. See Google's
