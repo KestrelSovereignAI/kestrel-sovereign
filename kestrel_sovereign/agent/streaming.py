@@ -1744,6 +1744,10 @@ class StreamingMixin:
                 invocation_context=resolved_context,
                 buffer_audit=buffer_audit,
                 strict_timeout_state=strict_timeout_state,
+                # #2841: the same budgeted history this turn's FIRST provider
+                # call sent. Without it the post-tool synthesis — the text the
+                # user actually reads — was written from a blank conversation.
+                conversation_history=context_result.messages,
             ):
                 if isinstance(chunk, ThinkingDelta):
                     if not buffer_audit:

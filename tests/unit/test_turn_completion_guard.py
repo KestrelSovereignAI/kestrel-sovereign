@@ -136,7 +136,7 @@ async def test_no_tool_continuation_gets_one_repair_step():
     )
     agent._execute_tool_batch = AsyncMock()
     agent._build_all_tools = MagicMock(return_value=[])
-    agent._prune_orchestrator_messages = MagicMock(side_effect=lambda msgs, _tools: msgs)
+    agent._prune_orchestrator_messages = MagicMock(side_effect=lambda msgs, _tools, **_kw: msgs)
 
     handler = OrchestratorEngineMixin._handle_orchestrator_response.__get__(agent)
     result = await handler(
@@ -244,7 +244,7 @@ async def test_tool_call_as_text_gets_repaired_and_executed():
     )
     agent._execute_tool_batch = AsyncMock()
     agent._build_all_tools = MagicMock(return_value=[])
-    agent._prune_orchestrator_messages = MagicMock(side_effect=lambda msgs, _tools: msgs)
+    agent._prune_orchestrator_messages = MagicMock(side_effect=lambda msgs, _tools, **_kw: msgs)
 
     tools_as_text = (
         '<function_calls><invoke name="todo_add">'

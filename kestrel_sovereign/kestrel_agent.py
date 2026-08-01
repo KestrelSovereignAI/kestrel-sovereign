@@ -5382,6 +5382,10 @@ Expected Duration: {expected_duration}
             session_id=session_id,
             tool_results=stop_tool_results,
             invocation_context=resolved_context,
+            # #2841: the same budgeted history this turn's FIRST provider call
+            # sent. Without it the post-tool continuation answered from a blank
+            # conversation while the first call had full context.
+            conversation_history=context_result.messages,
         )
 
         # #2675: assemble the SAME tool/narration evidence the streaming path
