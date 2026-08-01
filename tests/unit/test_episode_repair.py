@@ -175,9 +175,14 @@ class _RecordingGraphStore:
         )
         if self._fail:
             raise RuntimeError("graph write refused")
+        # Production AsyncGraphStore.add_node is a whole-row UPSERT
+        # (INSERT OR REPLACE / ON CONFLICT DO UPDATE). Modelling it as a plain
+        # UPDATE would silently hide the case this suite cares most about: a
+        # node deleted concurrently being recreated by the repair.
         await self._db.execute(
-            "UPDATE graph_nodes SET label = ?, properties = ? WHERE node_id = ?",
-            (node.label, json.dumps(node.properties), node.node_id),
+            "INSERT OR REPLACE INTO graph_nodes "
+            "(node_id, node_type, label, properties) VALUES (?, ?, ?, ?)",
+            (node.node_id, "episode", node.label, json.dumps(node.properties)),
         )
 
     async def add_edge(self, *args, **kwargs):
@@ -519,7 +524,9 @@ class TestDryRun:
             assert plan["episode_id"] == "episode:corrupt"
             assert plan["old_title"] == CORRUPT_TITLE
             assert "ksav2" not in plan["new_title"].lower()
-            assert "ksav2" in plan["evidence_terms"]
+            # The evidence is the envelope material itself — the conclusive
+            # terms — not the magic prefix, which can never authorize a write.
+            assert ENVELOPE_BODY in plan["evidence_terms"]
 
             assert graph.row_titles_at_write == [], "dry run must not touch the KG"
             assert await db.fetchval(
@@ -1230,6 +1237,116 @@ class TestLockReachesTheConsolidator:
             assert ms.consolidator._transition_lock is sentinel
         finally:
             await storage.close()
+
+
+class TestRoundSevenFindings:
+    @pytest.mark.asyncio
+    async def test_single_legacy_fernet_source_is_repaired(self, tmp_path):
+        """A legacy Fernet token is ONE chunk, so a single-source episode
+        yields exactly one alien term.
+
+        The two-term floor would clear it and then mark the whole agent done,
+        leaving real corruption unrepaired forever. An alien term that is both
+        present in the source envelope and shaped like a base64 body is
+        conclusive on its own.
+        """
+        db = await _make_db(tmp_path)
+        # No '_' anywhere: the tokenizer keeps it as a single term.
+        fernet = "gAAAAABmQ7xK9tLpZr3vNw8sYhDcVbGf2JmXe5RtWq1AoIuYeTr4PlKjHgFdSaZxCvBnM"
+        ids = await _add_messages(db, [fernet], encrypted=True)
+        await _add_episode(
+            db, "episode:legacy",
+            f"Discussion of {fernet.lower()}",
+            f"A conversation with 1 messages (1 from user). Topics: "
+            f"{fernet.lower()}. Emotional trajectory: emotionally steady.",
+            ids,
+        )
+        store = _decrypting_store({fernet: "we shipped the release last night"})
+        c = _consolidator(db, store, _RecordingGraphStore(db))
+        try:
+            report = await c.repair_ciphertext_episodes()
+
+            assert report["repaired"] == 1, (
+                "one conclusive term must be enough; otherwise the agent is "
+                "marked done with the corruption still in place"
+            )
+            title = await db.fetchval(
+                "SELECT title FROM memory_episodes WHERE id = ?",
+                ("episode:legacy",)
+            )
+            assert "gaaaaa" not in title.lower()
+            assert "release" in title.lower()
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_bare_magic_prefix_still_cannot_authorize_a_write(
+        self, tmp_path
+    ):
+        """Route 0 must not reopen what the two-term floor was guarding."""
+        db = await _make_db(tmp_path)
+        ids = await _add_messages(db, [ENVELOPE, ENVELOPE])
+        await _add_episode(db, "episode:thin", "Discussion of ksav2",
+                           "Topics: ksav2.", ids)
+        store = _decrypting_store({ENVELOPE: "an entirely ordinary sentence"})
+        c = _consolidator(db, store, _RecordingGraphStore(db))
+        try:
+            report = await c.repair_ciphertext_episodes()
+            assert report["repaired"] == 0
+            assert report["cleared"] == 1
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_a_concurrently_deleted_node_is_not_resurrected(
+        self, tmp_path
+    ):
+        """A maintenance pass must never undo a deliberate deletion."""
+        db, ids, store = await _corrupt_fixture(tmp_path)
+        graph = _RecordingGraphStore(db)
+        original_get = graph.get_node
+
+        async def _delete_then_probe(node_id):
+            # The user removes the memory between the existence probe and the
+            # write, through /api/memories.
+            await db.execute(
+                "DELETE FROM graph_nodes WHERE node_id = ?", (node_id,)
+            )
+            return await original_get(node_id)
+
+        graph.get_node = _delete_then_probe
+        c = _consolidator(db, store, graph)
+        try:
+            report = await c.repair_ciphertext_episodes()
+
+            assert report["repaired"] == 1, "the row itself is still repaired"
+            assert await db.fetchval(
+                "SELECT COUNT(*) FROM graph_nodes WHERE node_id = ?",
+                ("episode:corrupt",)
+            ) == 0, "the deleted node must stay deleted"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_truncated_scan_reaches_the_consolidation_report(
+        self, tmp_path
+    ):
+        db, ids, store = await _corrupt_fixture(tmp_path)
+        c = _consolidator(db, store, _RecordingGraphStore(db))
+        original = c.repair_ciphertext_episodes
+
+        async def _truncated(**kwargs):
+            return await original(max_examined=1)
+
+        c.repair_ciphertext_episodes = _truncated
+        try:
+            report = await c.run_consolidation()
+            assert report["episode_repair_limit_reached"] is True, (
+                "truncation leaves rows unseen AND blocks retirement, so the "
+                "operator report must not look idle"
+            )
+        finally:
+            await db.close()
 
 
 class TestRunsOnceNotForever:

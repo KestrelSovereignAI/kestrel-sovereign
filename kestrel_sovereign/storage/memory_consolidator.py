@@ -249,10 +249,12 @@ class MemoryConsolidator:
                     report["episodes_repaired"] = repair.get("repaired", 0)
                     if repair.get("unrepairable"):
                         report["episodes_unrepairable"] = repair["unrepairable"]
-                    if repair.get("limit_reached"):
-                        # This is the only production caller, so dropping the
-                        # marker here means nothing ever reports that later
-                        # corrupt episodes went unexamined (codex r2 P2).
+                    if repair.get("limit_reached") or repair.get("scan_truncated"):
+                        # This is the only production caller, so dropping these
+                        # here means nothing ever reports that candidates went
+                        # unexamined. Truncation counts too: it leaves rows
+                        # unseen AND blocks retirement, so the pass repeats
+                        # nightly while the report looks idle (codex r2/r7 P2).
                         report["episode_repair_limit_reached"] = True
             except Exception as e:  # noqa: BLE001
                 logger.warning("episode repair pass failed: %s", e)
@@ -954,12 +956,33 @@ class MemoryConsolidator:
         alien = cls._alien_terms(
             title, summary, sources, expected_title, expected_summary
         )
+        if not alien:
+            return set()
+        envelope = cls._envelope_terms(sources)
+
+        # Route 0 — conclusive on a single term: it is BOTH still present in
+        # the sources' at-rest bytes AND shaped like a base64 body. A legacy
+        # Fernet token is one long chunk (the alphabet's '_' is the only
+        # separator the tokenizer honours, and plenty of tokens contain none),
+        # so a single-source episode yields exactly one alien term — and the
+        # two-term floor would clear it and then mark the agent done, leaving
+        # real corruption unrepaired forever (codex review r7 P2). The floor
+        # exists to stop the bare magic prefix authorizing a write; `ksav2`
+        # and `gaaaaa` are far too short to be shaped, so this cannot fire on
+        # a healthy episode that merely mentions the format.
+        exact = {
+            term for term in alien
+            if term in envelope and cls._looks_like_envelope_token(term)
+        }
+        if exact:
+            return exact
+
         if len(alien) < cls._REPAIR_MIN_ENVELOPE_TERMS:
             return set()
 
         # Route 1 — the strongest proof: the terms are still sitting in the
         # sources' own at-rest bytes.
-        corroborated = alien & cls._envelope_terms(sources)
+        corroborated = alien & envelope
         if len(corroborated) >= cls._REPAIR_MIN_ENVELOPE_TERMS:
             return corroborated
 
@@ -1149,21 +1172,28 @@ class MemoryConsolidator:
                 from .async_graph_store import GraphNode
 
                 existing = await self._graph_store.get_node(episode_id)
-                properties = dict(getattr(existing, "properties", None) or {})
-                restore = (
-                    getattr(existing, "label", None) or "",
-                    dict(properties),
-                )
-                properties["summary"] = summary
-                properties["repaired_from_ciphertext"] = True
-                await self._graph_store.add_node(
-                    GraphNode(
-                        node_id=episode_id,
-                        node_type="episode",
-                        label=title,
-                        properties=properties,
+                if existing is None:
+                    # Deleted through /api/memories between the probe and here.
+                    # `has_node` is stale, and upserting it back would resurrect
+                    # a memory the user explicitly removed — a maintenance pass
+                    # must never undo a deliberate deletion (codex review r7).
+                    has_node = False
+                else:
+                    properties = dict(getattr(existing, "properties", None) or {})
+                    restore = (
+                        getattr(existing, "label", None) or "",
+                        dict(properties),
                     )
-                )
+                    properties["summary"] = summary
+                    properties["repaired_from_ciphertext"] = True
+                    await self._graph_store.add_node(
+                        GraphNode(
+                            node_id=episode_id,
+                            node_type="episode",
+                            label=title,
+                            properties=properties,
+                        )
+                    )
 
             # The stored vector was computed from the base64 title+summary, so
             # it poisons the shared embedding space until it is re-derived.
