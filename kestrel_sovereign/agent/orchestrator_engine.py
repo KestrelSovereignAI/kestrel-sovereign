@@ -2227,25 +2227,24 @@ class OrchestratorEngineMixin:
         markers, llama.cpp KV, OpenAI prefix caching) instead of presenting
         a different prefix on every continuation.
 
-        Returns ``(messages, protected_prefix, history_len)``:
-        ``protected_prefix`` is the count of leading messages that are
-        conversation prefix rather than this turn's tool exchange, and
-        ``history_len`` is how many of those are replayed prior turns. The
-        prune needs both to tell ``system`` / replayed history / the current
-        user turn apart (see ``_prune_orchestrator_messages``).
+        Returns ``(messages, history_ids)``. ``history_ids`` identifies the
+        replayed rows by object identity so the prefix bounds can be
+        RE-derived on every pass (see :meth:`_prefix_bounds`) rather than
+        computed once here — a tool turn can prune between iterations, which
+        shifts every seed-time index.
         """
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
         ]
 
-        history_len = 0
+        history_ids: frozenset = frozenset()
         if conversation_history:
             messages.extend(conversation_history)
-            history_len = len(conversation_history)
+            history_ids = frozenset(id(m) for m in conversation_history)
             logging.debug(
                 "[%s] Seeded continuation with %d prior-turn messages",
                 log_prefix,
-                history_len,
+                len(conversation_history),
             )
 
         if user_message:
@@ -2258,7 +2257,31 @@ class OrchestratorEngineMixin:
                 f"[{log_prefix}] No user_message provided - LLM won't have context for tool results!"
             )
 
-        return messages, len(messages), history_len
+        return messages, history_ids
+
+    @staticmethod
+    def _prefix_bounds(
+        messages: List[Dict[str, Any]],
+        history_ids: frozenset,
+        has_user_message: bool,
+    ) -> tuple[int, int]:
+        """Derive ``(protected_prefix, history_len)`` for the CURRENT array.
+
+        Must be recomputed before every prune, not cached from seed time. A
+        multi-iteration tool turn prunes between iterations, and a prune that
+        sheds replayed history shortens ``messages`` — so a seed-time
+        ``protected_prefix`` would, on the next pass, reach past the current
+        user turn and misclassify this turn's own tool exchange as sheddable
+        history. That could drop the live request or an assistant ``tool_use``
+        while leaving its ``tool_result`` orphaned, which providers reject
+        outright (codex review, #2841).
+
+        Identity (``id``) is the stable marker: the seeded rows are the caller's
+        own dicts and the prune only ever drops or replaces whole entries, never
+        rewrites a replayed row in place.
+        """
+        history_len = sum(1 for m in messages if id(m) in history_ids)
+        return 1 + history_len + (1 if has_user_message else 0), history_len
 
     async def _handle_orchestrator_response(
         self,
@@ -2300,7 +2323,7 @@ class OrchestratorEngineMixin:
             return response
 
         # Build message history for multi-turn tool calling
-        messages, protected_prefix, history_len = OrchestratorEngineMixin._seed_orchestrator_messages(
+        messages, history_ids = OrchestratorEngineMixin._seed_orchestrator_messages(
             system_prompt, conversation_history, user_message, "ORCHESTRATOR"
         )
 
@@ -2361,6 +2384,11 @@ class OrchestratorEngineMixin:
 
             # Continue conversation with tool results
             all_tools = self._build_all_tools()
+            # Re-derive on every pass: a prior iteration's prune may have
+            # shed replayed history, shifting all seed-time indexes (#2841).
+            protected_prefix, history_len = OrchestratorEngineMixin._prefix_bounds(
+                messages, history_ids, bool(user_message)
+            )
             messages = self._prune_orchestrator_messages(
                 messages, all_tools, protected_prefix=protected_prefix,
                 history_len=history_len,
@@ -2605,7 +2633,7 @@ class OrchestratorEngineMixin:
             yield response
             return
 
-        messages, protected_prefix, history_len = OrchestratorEngineMixin._seed_orchestrator_messages(
+        messages, history_ids = OrchestratorEngineMixin._seed_orchestrator_messages(
             system_prompt,
             conversation_history,
             user_message,
@@ -2748,6 +2776,11 @@ class OrchestratorEngineMixin:
                 return
 
             all_tools = self._build_all_tools()
+            # Re-derive on every pass: a prior iteration's prune may have
+            # shed replayed history, shifting all seed-time indexes (#2841).
+            protected_prefix, history_len = OrchestratorEngineMixin._prefix_bounds(
+                messages, history_ids, bool(user_message)
+            )
             messages = self._prune_orchestrator_messages(
                 messages, all_tools, protected_prefix=protected_prefix,
                 history_len=history_len,

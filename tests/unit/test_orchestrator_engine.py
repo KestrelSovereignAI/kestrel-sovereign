@@ -234,3 +234,58 @@ class TestPruneShedsHistoryUnderPressure:
         )
         assert sig.parameters["protected_prefix"].default == 2
         assert sig.parameters["history_len"].default == 0
+
+
+class TestPrefixBoundsSurviveShedding:
+    """Bounds must be re-derived per pass, not cached from seed time.
+
+    A multi-iteration tool turn prunes between iterations. Once a prune sheds
+    replayed history the array is shorter, so seed-time indexes reach past the
+    current user turn — the next pass would treat this turn's own request and
+    ``tool_use`` as sheddable history and orphan the matching ``tool_result``.
+    """
+
+    def test_bounds_track_history_that_was_already_shed(self):
+        history = [{"role": "user", "content": f"turn-{i}"} for i in range(6)]
+        user_turn = {"role": "user", "content": "current ask"}
+        history_ids = frozenset(id(m) for m in history)
+
+        seeded = [{"role": "system", "content": "sys"}] + history + [user_turn]
+        prefix, hist_len = OrchestratorEngineMixin._prefix_bounds(
+            seeded, history_ids, True
+        )
+        assert (prefix, hist_len) == (8, 6)
+        assert seeded[prefix - 1] is user_turn
+
+        # Simulate a prune having shed the 4 oldest replayed turns.
+        after_shed = (
+            [{"role": "system", "content": "sys"}]
+            + history[4:]
+            + [user_turn]
+            + [{"role": "assistant", "content": "", "tool_calls": []},
+               {"role": "tool", "tool_call_id": "c1", "content": "r"}]
+        )
+        prefix2, hist_len2 = OrchestratorEngineMixin._prefix_bounds(
+            after_shed, history_ids, True
+        )
+        assert (prefix2, hist_len2) == (4, 2)
+        # The boundary still lands exactly on the current user turn, so the
+        # tool exchange stays in the prunable middle.
+        assert after_shed[prefix2 - 1] is user_turn
+        assert after_shed[prefix2]["role"] == "assistant"
+
+    def test_bounds_without_a_user_message(self):
+        history = [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}]
+        history_ids = frozenset(id(m) for m in history)
+        seeded = [{"role": "system", "content": "sys"}] + history
+        assert OrchestratorEngineMixin._prefix_bounds(
+            seeded, history_ids, False
+        ) == (3, 2)
+
+    def test_seed_reports_history_identity(self):
+        history = [{"role": "user", "content": "a"}]
+        messages, history_ids = OrchestratorEngineMixin._seed_orchestrator_messages(
+            "sys", history, "ask", "TEST"
+        )
+        assert messages[1] is history[0]
+        assert history_ids == frozenset({id(history[0])})
