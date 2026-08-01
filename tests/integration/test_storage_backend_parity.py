@@ -564,7 +564,10 @@ async def test_assertion_vector_projection_cursor_and_lineage_have_backend_parit
     from kestrel_sovereign.storage.async_assertion_store import (
         _issue_raw_assertion_mutation_capability,
     )
-    from kestrel_sovereign.storage.semantic_vector_projection import SemanticVectorProfile
+    from kestrel_sovereign.storage.semantic_vector_projection import (
+        SemanticVectorProfile,
+        _issue_semantic_vector_embedding_provider,
+    )
 
     tenant, identity = await _incepted_assertion_identity(tmp_path, "vector-projection-parity")
     storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
@@ -596,7 +599,12 @@ async def test_assertion_vector_projection_cursor_and_lineage_have_backend_parit
             second, source_occurrences=(_semantic_source(second_id),),
             _migration_capability=migration_capability,
         )
-        projection = storage.semantic_assertion_vector_projection(profile, embed)
+        provider = _issue_semantic_vector_embedding_provider(
+            provider=profile.provider, model=profile.model, profile_id=profile.profile_id,
+            dimension=profile.dimension, destination=profile.embedding_destination,
+            embedder=embed,
+        )
+        projection = storage.semantic_assertion_vector_projection(profile, provider)
         checkpoint = await projection.sync()
         terminal = await storage._assertion_store().event_checkpoint()
         assert (checkpoint.generation, checkpoint.event_id) == (

@@ -1388,6 +1388,41 @@ class EphemeralPurgeReport(dict):
         )
 
 
+class _PrivacyGuardedSemanticVectorProjection:
+    """Dynamic privacy rail for a projection handle retained across transitions."""
+
+    def __init__(self, owner: "PrivacyEnforcingStorage", projection) -> None:
+        self._owner = owner
+        self._projection = projection
+
+    def _read(self) -> None:
+        self._owner._assert_semantic_assertion_read_allowed("semantic vector projection")
+
+    def _write(self) -> None:
+        self._read()
+        self._owner._assert_semantic_assertion_write_allowed("semantic vector projection")
+
+    async def checkpoint(self):
+        self._read()
+        return await self._projection.checkpoint()
+
+    async def sync(self, **kwargs):
+        self._write()
+        return await self._projection.sync(**kwargs)
+
+    async def recall(self, *args, **kwargs):
+        self._read()
+        return await self._projection.recall(*args, **kwargs)
+
+    async def recall_hydrated(self, *args, **kwargs):
+        self._read()
+        return await self._projection.recall_hydrated(*args, **kwargs)
+
+    async def erasure_observation(self):
+        self._read()
+        return await self._projection.erasure_observation()
+
+
 class PrivacyEnforcingStorage:
     """
     A storage wrapper that enforces privacy mode at the storage layer.
@@ -3288,11 +3323,12 @@ class PrivacyEnforcingStorage:
             maintenance_limits=maintenance_limits,
         )
 
-    def semantic_assertion_vector_projection(self, profile, embedder):
-        """Expose the derived projection only through the normal privacy rail."""
+    def semantic_assertion_vector_projection(self, profile, provider):
+        """Return a retained handle whose every operation rechecks privacy."""
         self._assert_semantic_assertion_read_allowed("semantic vector projection")
         self._assert_semantic_assertion_write_allowed("semantic vector projection")
-        return self._storage.semantic_assertion_vector_projection(profile, embedder)
+        projection = self._storage.semantic_assertion_vector_projection(profile, provider)
+        return _PrivacyGuardedSemanticVectorProjection(self, projection)
 
     async def hydrate_semantic_recall_candidates(self, assertion_ids, **kwargs):
         self._assert_semantic_assertion_read_allowed("semantic recall provenance")

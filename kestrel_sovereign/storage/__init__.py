@@ -57,6 +57,7 @@ from .semantic_vector_projection import (
     SemanticVectorCandidate,
     SemanticVectorCheckpoint,
     SemanticVectorErasureObservation,
+    SemanticVectorEmbeddingProvider,
     SemanticVectorProfile,
     SemanticVectorProjectionError,
 )
@@ -131,6 +132,7 @@ __all__ = [
     "SemanticVectorCandidate",
     "SemanticVectorCheckpoint",
     "SemanticVectorErasureObservation",
+    "SemanticVectorEmbeddingProvider",
     "SemanticVectorProfile",
     "SemanticVectorProjectionError",
     "AsyncSemanticValidationReportStore",

@@ -547,16 +547,33 @@ async def migrate_semantic_vector_projection(db: "AsyncDatabase") -> None:
                     ("semantic_assertion_vector_projection_entries",),
                 )
                 columns = {str(row[0]) for row in column_rows}
+                state_rows = await db.fetchall(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() AND table_name = ?",
+                    ("semantic_assertion_vector_projection_state",),
+                )
+                state_columns = {str(row[0]) for row in state_rows}
             else:
                 column_rows = await db.fetchall(
                     "PRAGMA table_info(semantic_assertion_vector_projection_entries)", ()
                 )
                 columns = {str(row[1]) for row in column_rows}
+                state_rows = await db.fetchall(
+                    "PRAGMA table_info(semantic_assertion_vector_projection_state)", ()
+                )
+                state_columns = {str(row[1]) for row in state_rows}
             required_v2 = {
-                "revision_digest", "embedding_destination", "privacy_ceiling",
-                "visibility_ceiling", "renderer_version", "embedding_dimension",
+                "tenant_id", "profile_id", "capability_digest", "embedding_provider",
+                "embedding_model", "embedding_dimension", "renderer_version",
+                "embedding_destination", "visibility_ceiling", "privacy_ceiling",
+                "visibility", "privacy_classification", "assertion_id", "revision_id",
+                "revision_digest", "source_generation", "vector_json", "created_at",
             }
-            if required_v2 <= columns:
+            required_state_v2 = {
+                "tenant_id", "profile_id", "capability_digest", "checkpoint_generation",
+                "checkpoint_event_id", "updated_at",
+            }
+            if required_v2 <= columns and required_state_v2 <= state_columns:
                 return
             # Dispose an incomplete pre-release v2 shape by the same derived-
             # data rule as v1.  This also makes interrupted upgrades retryable.

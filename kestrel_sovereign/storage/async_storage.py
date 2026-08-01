@@ -1602,7 +1602,7 @@ class AsyncStorage:
             maintenance_limits=maintenance_limits,
         )
 
-    def semantic_assertion_vector_projection(self, profile, embedder):
+    def semantic_assertion_vector_projection(self, profile, provider):
         """Create the tenant-bound derived assertion-vector projection.
 
         This is intentionally an explicit capability, not a generic RAG
@@ -1613,7 +1613,7 @@ class AsyncStorage:
             raise RuntimeError("semantic vector projection requires initialized AsyncStorage")
         from .semantic_vector_projection import SemanticAssertionVectorProjection
 
-        return SemanticAssertionVectorProjection(self._assertion_store(), profile, embedder)
+        return SemanticAssertionVectorProjection(self._assertion_store(), profile, provider)
 
     async def hydrate_semantic_recall_candidates(self, assertion_ids, **kwargs):
         if not self._initialized:

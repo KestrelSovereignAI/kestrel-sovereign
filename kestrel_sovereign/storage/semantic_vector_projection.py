@@ -123,6 +123,54 @@ class SemanticVectorErasureObservation:
 
 
 Embedder = Callable[[str], Awaitable[Sequence[float] | None]]
+_EMBEDDING_PROVIDER_TOKEN = object()
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class SemanticVectorEmbeddingProvider:
+    """Host-issued immutable binding to one verified embedding destination."""
+
+    provider: str
+    model: str
+    profile_id: str
+    dimension: int
+    destination: str
+    _embedder: Embedder
+
+    def __init__(
+        self, token: object, *, provider: str, model: str, profile_id: str,
+        dimension: int, destination: str, embedder: Embedder,
+    ) -> None:
+        if token is not _EMBEDDING_PROVIDER_TOKEN:
+            raise TypeError("semantic vector embedding providers are issued by the host")
+        object.__setattr__(self, "provider", provider)
+        object.__setattr__(self, "model", model)
+        object.__setattr__(self, "profile_id", profile_id)
+        object.__setattr__(self, "dimension", dimension)
+        object.__setattr__(self, "destination", destination)
+        object.__setattr__(self, "_embedder", embedder)
+
+    async def embed(self, text: str) -> Sequence[float] | None:
+        return await self._embedder(text)
+
+
+def _issue_semantic_vector_embedding_provider(
+    *, provider: str, model: str, profile_id: str, dimension: int,
+    destination: str, embedder: Embedder,
+) -> SemanticVectorEmbeddingProvider:
+    """Issue a provider binding after the host resolved provider capabilities."""
+    # Reuse the profile validator for the immutable identity grammar/bounds.
+    SemanticVectorProfile(
+        profile_id, "0" * 64, provider=provider, model=model,
+        dimension=dimension, embedding_destination=destination,
+    )
+    if not callable(embedder):
+        raise TypeError("semantic vector provider embedder must be callable")
+    return SemanticVectorEmbeddingProvider(
+        _EMBEDDING_PROVIDER_TOKEN, provider=provider, model=model,
+        profile_id=profile_id, dimension=dimension, destination=destination,
+        embedder=embedder,
+    )
 
 
 def _revision_digest(assertion: Assertion) -> str:
@@ -165,16 +213,27 @@ class SemanticAssertionVectorProjection:
     tenant/profile wipe, preventing erased vector resurrection after restart.
     """
 
-    def __init__(self, store: AsyncAssertionStore, profile: SemanticVectorProfile, embedder: Embedder) -> None:
+    def __init__(
+        self, store: AsyncAssertionStore, profile: SemanticVectorProfile,
+        provider: SemanticVectorEmbeddingProvider,
+    ) -> None:
         if not isinstance(store, AsyncAssertionStore):
             raise TypeError("semantic vector projection requires AsyncAssertionStore")
         if not isinstance(profile, SemanticVectorProfile):
             raise TypeError("semantic vector projection requires SemanticVectorProfile")
-        if not callable(embedder):
-            raise TypeError("semantic vector projection embedder must be callable")
+        if not isinstance(provider, SemanticVectorEmbeddingProvider):
+            raise TypeError("semantic vector projection requires a host-issued embedding provider")
+        if (
+            provider.provider != profile.provider
+            or provider.model != profile.model
+            or provider.profile_id != profile.profile_id
+            or provider.dimension != profile.dimension
+            or provider.destination != profile.embedding_destination
+        ):
+            raise SemanticVectorProjectionError("semantic vector provider binding does not match profile")
         self._store = store
         self._profile = profile
-        self._embedder = embedder
+        self._provider = provider
 
     async def _embed(self, assertion: Assertion) -> tuple[float, ...]:
         # A remote embedding route is an external disclosure destination.
@@ -183,14 +242,17 @@ class SemanticAssertionVectorProjection:
         # if a future renderer or provider adapter is compromised.
         if (
             self._profile.embedding_destination != _LOCAL_EMBEDDING_DESTINATION
-            and assertion.visibility.value != "public"
+            and (
+                assertion.visibility.value != "public"
+                or assertion.privacy_classification != "public"
+            )
         ):
             raise SemanticVectorProjectionError(
-                "semantic vector remote destination rejects non-public assertion"
+                "semantic vector remote destination requires effective-public assertion"
             )
         try:
             embedded = await asyncio.wait_for(
-                self._embedder(
+                self._provider.embed(
                     _approved_claim_text(assertion, self._profile.max_claim_characters)
                 ),
                 timeout=float(self._profile.embed_timeout_seconds),
@@ -553,5 +615,6 @@ class SemanticAssertionVectorProjection:
 
 __all__ = [
     "SemanticAssertionVectorProjection", "SemanticVectorCandidate", "SemanticVectorCheckpoint",
-    "SemanticVectorErasureObservation", "SemanticVectorProfile", "SemanticVectorProjectionError",
+    "SemanticVectorEmbeddingProvider", "SemanticVectorErasureObservation", "SemanticVectorProfile",
+    "SemanticVectorProjectionError",
 ]
