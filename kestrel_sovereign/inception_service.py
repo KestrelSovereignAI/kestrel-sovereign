@@ -893,7 +893,8 @@ async def create_kestrel_identity_async(
             cleanup_artifacts(identity_paths)  # Only clean up key files, not external DB
         raise e
 
-    # 4. Create the Kestrel Constitution node in the graph (keyed by content hash)
+    # 4. Build the Kestrel Constitution node (keyed by content hash). Its write
+    #    is deferred to the single atomic identity commit below (#2867).
     constitution_node = GraphNode(
         node_id=constitution_hash,
         node_type="document",
@@ -904,8 +905,6 @@ async def create_kestrel_identity_async(
             "created_at": datetime.now(timezone.utc).isoformat()
         }
     )
-    await graph.add_node(constitution_node)
-
     # 5. Create the root "agent" node
     agent_properties = {
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -955,10 +954,32 @@ async def create_kestrel_identity_async(
         label=agent_name,
         properties=agent_properties
     )
-    await graph.add_node(agent_node)
-
-    # 6. Link the agent to its constitution
-    await graph.add_edge(agent_node.node_id, constitution_node.node_id, "governed_by")
+    # 4-6. Commit the constitution node, the agent node, and the governing
+    #      edge as ONE atomic unit (#2867). An agent must never be recorded as
+    #      existing without its governed_by edge: a present agent node makes
+    #      every later boot treat inception as done, so a dropped edge is never
+    #      repaired — "existing but not governed". Either all three commit or
+    #      none do. Both backends make transaction() re-entrant within this task
+    #      (SQLite: a nested transaction() in the owning task yields without a
+    #      second BEGIN; Postgres: a nested transaction() reuses this task's
+    #      connection as a savepoint, #1726), so the inner add_node/add_edge
+    #      calls join this transaction with no change to the graph store.
+    #
+    #      The span is bounded to exactly these three writes, and that is
+    #      load-bearing: step 8 indexes the constitution for RAG with
+    #      compute_embeddings=True, and on SQLite transaction() holds the
+    #      connection write lock for the whole BEGIN..COMMIT span (#1675).
+    #      Widening it across a provider round-trip or local model inference
+    #      would block every other writer on the database (#2660). RAG
+    #      indexing, the spawned_by edge, the genesis-audit event and key
+    #      provisioning are all recoverable by re-running and stay OUTSIDE it.
+    async with db.transaction():
+        await graph.add_node(constitution_node)
+        await graph.add_node(agent_node)
+        # 6. Link the agent to its constitution.
+        await graph.add_edge(
+            agent_node.node_id, constitution_node.node_id, "governed_by"
+        )
 
     # A completed audit has two durable witnesses: the structured node receipt
     # and a conversation/audit event. Pending is already explicit on the node
