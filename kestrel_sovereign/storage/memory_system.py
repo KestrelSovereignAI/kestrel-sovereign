@@ -85,6 +85,7 @@ class MemorySystem:
         agent_id: str,
         enable_spacy: bool = False,
         privacy_storage=None,
+        transition_lock=None,
     ):
         """
         Initialize the memory system.
@@ -102,10 +103,16 @@ class MemorySystem:
                 manual / scheduled consolidation cannot leak user-derived memory
                 into durable storage in a volatile privacy mode (#2672). ``None``
                 (raw storage, tests) leaves writes ungoverned, as before.
+            transition_lock: The agent's privacy-transition mutex, forwarded to
+                the consolidator so episode repair holds it across its
+                mode check and its durable writes (#2856). ``None`` runs
+                unguarded.
         """
         self.storage = storage
         self.agent_id = agent_id
         self._privacy_storage = privacy_storage
+        # Components are built in initialize(), so this has to survive __init__.
+        self._transition_lock = transition_lock
 
         # Initialize components
         self.tagger = EmotionalTagger(use_spacy=enable_spacy)
@@ -175,6 +182,10 @@ class MemorySystem:
             # SQL, so it needs the store that owns decryption — without it the
             # at-rest envelope was tokenized straight into episode topics.
             conversation_store=self.storage.conversation,
+            # #2856: repair checks the privacy mode then awaits decryption and
+            # several writes; the lock keeps a transition from landing in that
+            # gap.
+            transition_lock=self._transition_lock,
         )
 
         # Schema-aware routing: promote extracted structure (action items,

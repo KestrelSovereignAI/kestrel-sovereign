@@ -2663,6 +2663,11 @@ class KestrelAgent(
             # so manual / scheduled consolidation can't leak user-derived
             # memory in a volatile privacy mode (#2672).
             privacy_storage=self.storage,
+            # Episode repair (#2856) checks the privacy mode and then awaits
+            # decryption and several durable writes. Without the same mutex a
+            # transition holds, a flip to EPHEMERAL / ISOLATED can land in that
+            # gap and the raw memory_episodes write persists regardless.
+            transition_lock=self._get_privacy_transition_lock(),
         )
         # Register teardown BEFORE initialize so a failure partway through
         # ``MemorySystem.initialize()`` (which may open stores / start workers)
