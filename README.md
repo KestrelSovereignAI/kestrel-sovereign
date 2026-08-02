@@ -277,21 +277,22 @@ DID join a known fresh-v2 fleet safely, but an absent/unknown provenance marker
 is always treated as a legacy migration; do not seed or unfence scheduler rows
 manually.
 
-#### SDK 0.32 release cascade
+#### SDK 0.34 release cascade
 
-Core requires `kestrel-sovereign-sdk[tracing]>=0.32.0,<0.33`; the
+Core requires `kestrel-sovereign-sdk[tracing]>=0.34.0,<0.35`; the
 `observability` extra carries the same SDK line with `metrics`. This is a
-runtime contract for durable isolated scheduler execution, not a preference
-that a downstream package may relax. The Core-owned release-cascade contract is:
+runtime contract for durable isolated execution and provider-neutral private
+inference leases, not a preference that a downstream package may relax. The
+Core-owned release-cascade contract is:
 
 | Downstream release gate | Required published SDK constraint before Core ships | Core assertion |
 |---|---|---|
-| Frinz | `kestrel-sovereign-sdk>=0.32.0,<0.33` | External prerequisite; Core does not claim Frinz has changed. |
-| Observability fleet | `kestrel-sovereign-sdk>=0.32.0,<0.33` | External prerequisite; Core does not claim observability has changed. |
+| Frinz | `kestrel-sovereign-sdk>=0.34.0,<0.35` | External prerequisite; Core does not claim Frinz has changed. |
+| Observability fleet | `kestrel-sovereign-sdk>=0.34.0,<0.35` | External prerequisite; Core does not claim observability has changed. |
 
-Frinz main and the observability fleet currently have constraints below this
-line, so their compatible releases and tests must precede the Core publish. Do
-not weaken Core's requirement to make an older sibling resolver succeed.
+Verify the published Frinz and observability constraints and tests before the
+Core publish. Do not weaken Core's requirement to make an older sibling
+resolver succeed.
 
 The Core dependency-contract test verifies the base and observability
 declarations and lockfile resolve the same SDK line. It cannot validate another

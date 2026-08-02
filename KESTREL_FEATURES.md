@@ -186,7 +186,7 @@ The generated inventory below lists bundled Feature lifecycle modules only: the 
 Installed entry point feature classes are included in JSON output when present in the active environment.
 Runtime security policy can still deny a discovered tool at call time; static generation marks source-discovered tools as enabled unless their feature is disabled.
 
-- Current audited snapshot: `37` discoverable modules and `37` exported `Feature` subclasses.
+- Current audited snapshot: `38` discoverable modules and `38` exported `Feature` subclasses.
 
 ### `attachments` (AttachmentsFeature)
 
@@ -388,6 +388,17 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `lifecycle_status` | `!identity status` | `system` |  | 70 | `enabled` |
 | `migration_history` | `!identity history` | `system` |  | 38 | `enabled` |
 | `verify_identity` | `!identity verify` | `system` | `source`, `key_hash`, `identity_trust_policy` | 149 | `enabled` |
+
+### `inference_lease` (InferenceLeaseFeature)
+
+- Source: [`kestrel_sovereign/features/inference_lease/feature.py`](kestrel_sovereign/features/inference_lease/feature.py)
+- Enablement state: `enabled`
+
+| Tool | Command | Category | Params | Token cost | State |
+|---|---|---|---|---:|---|
+| `inference_lease_acquire` |  | `model_management` | `model`, `max_hourly_cost_usd`, `max_total_cost_usd`, `runtime`, `privacy`, `expected_session_seconds`, `idle_ttl_seconds`, `ready_deadline_seconds`, `expected_concurrency`, `allowed_regions`, `capabilities`, `request_id` | 497 | `enabled` |
+| `inference_lease_release` |  | `model_management` | `lease_id` | 72 | `enabled` |
+| `inference_lease_status` |  | `model_management` | `lease_id` | 75 | `enabled` |
 
 ### `keys` (KeyManagementFeature)
 
@@ -1126,6 +1137,8 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!wellness-history` | `wellness` | `[limit]` | View wellness trends over time |
 
 <!-- END AUTO-GENERATED FEATURE INVENTORY -->
+
+
 
 
 

@@ -6,22 +6,59 @@ No real API calls are made.
 """
 
 import asyncio
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 import pytest_asyncio
-from pydantic import BaseModel
+from kestrel_sdk.llm import (
+    InferenceLease,
+    InferenceLeaseState,
+    InferencePrivacy,
+    InferenceRoute,
+)
+from pydantic import BaseModel, SecretStr
 
 from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
+from kestrel_sovereign.llm.error_handling import (
+    LLMAllProvidersFailedError,
+    LLMProviderError,
+)
+from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
 from kestrel_sovereign.llm.service import (
     BackendType,
     LLMService,
     LLMServiceError,
-    RemoteGPUConfig,
 )
-from kestrel_sovereign.llm.error_handling import LLMAllProvidersFailedError, LLMProviderError
-from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
+
+
+def _ready_remote_lease(*, expired: bool = False) -> InferenceLease:
+    now = datetime.now(UTC)
+    created_at = now - timedelta(hours=2) if expired else now
+    expires_at = now - timedelta(hours=1) if expired else now + timedelta(hours=1)
+    return InferenceLease(
+        lease_id="lease-test",
+        quote_id="quote-test",
+        request_id="request-test",
+        owner_id="agent-test",
+        provider_name="runpod",
+        state=InferenceLeaseState.READY,
+        model="remote-model",
+        runtime="ollama",
+        privacy=InferencePrivacy.AUTHENTICATED_ENDPOINT,
+        created_at=created_at,
+        updated_at=created_at,
+        expires_at=expires_at,
+        hourly_cost_usd=Decimal("0.50"),
+        estimated_total_cost_usd=Decimal("0.25"),
+        route=InferenceRoute(
+            endpoint=SecretStr("https://gpu.example.test/v1"),
+            model="remote-model",
+            api_key=SecretStr("test-route-key"),
+        ),
+    )
 
 
 # =============================================================================
@@ -231,6 +268,7 @@ class TestModelPreference:
         rather than relying on the old silent-accept loophole.
         """
         from unittest.mock import MagicMock, patch
+
         from kestrel_sovereign.llm.model_metadata import ModelCategory, ModelInfo
 
         llm_service.providers.append(
@@ -485,6 +523,7 @@ class TestCoreGeneration:
         call must go through and hit the adapter.
         """
         from unittest.mock import MagicMock, patch
+
         from kestrel_sovereign.llm.model_metadata import ModelCategory, ModelInfo
 
         # Wire an OpenRouter route into the service. Its configured model is a
@@ -540,6 +579,7 @@ class TestCoreGeneration:
         ``LLMAllProvidersFailedError`` rather than a wrong-vendor call.
         """
         from unittest.mock import MagicMock, patch
+
         from kestrel_sovereign.llm.model_metadata import ModelCategory, ModelInfo
 
         warm_cache = MagicMock()
@@ -1106,9 +1146,10 @@ class TestInvocationBoundary:
             adapter.get_response.return_value = outcome
         llm_service._backend = BackendType.REMOTE_GPU
         llm_service._remote_client = AsyncMock()
-        llm_service._remote_config = RemoteGPUConfig(
-            base_url="https://gpu.example.test/v1",
-            model="remote-model",
+        llm_service._remote_lease = _ready_remote_lease()
+        llm_service._remote_accepting = True
+        llm_service._remote_capabilities = frozenset(
+            {"chat", "streaming", "tools", "structured_output", "vision"}
         )
         llm_service._remote_adapter = adapter
         return adapter
@@ -1189,7 +1230,7 @@ class TestInvocationBoundary:
         assert await asyncio.create_task(unrelated_child()) == LLMInvocationContext()
 
     @pytest.mark.asyncio
-    async def test_remote_fallback_keeps_entry_context_after_ambient_mutation(
+    async def test_remote_failure_keeps_entry_context_without_cloud_fallback(
         self, llm_service
     ):
         adapter = self._activate_fake_remote(
@@ -1209,12 +1250,16 @@ class TestInvocationBoundary:
         store = AsyncMock()
         llm_service.set_observability_store(store)
 
-        await llm_service.generate(system_prompt="system", user_prompt="hello")
+        with pytest.raises(LLMServiceError, match="no cloud fallback"):
+            await llm_service.generate(system_prompt="system", user_prompt="hello")
 
-        assert store.log_llm_call.await_count == 2
+        assert store.log_llm_call.await_count == 1
         for call in store.log_llm_call.await_args_list:
             assert call.kwargs["companion_id"] == "entry-companion"
             assert call.kwargs["user_id"] == "entry-user"
+            assert call.kwargs["error_message"] == (
+                llm_service._managed_remote_failure_message
+            )
 
     @pytest.mark.asyncio
     async def test_nested_audit_cannot_change_persisted_visible_identity(
@@ -1576,7 +1621,7 @@ class TestInvocationBoundary:
         )
 
     @pytest.mark.asyncio
-    async def test_remote_failure_fallback_records_each_provider_attempt_once(
+    async def test_remote_failure_records_one_sanitized_attempt_and_stops(
         self, llm_service
     ):
         self._activate_fake_remote(llm_service, ConnectionError("gpu unavailable"))
@@ -1584,25 +1629,22 @@ class TestInvocationBoundary:
         store = AsyncMock()
         llm_service.set_observability_store(store)
 
-        result = await llm_service.generate(
-            system_prompt="system",
-            user_prompt="hello",
-            invocation_context=LLMInvocationContext(session_id="fallback-session"),
-        )
+        with pytest.raises(LLMServiceError, match="no cloud fallback") as caught:
+            await llm_service.generate(
+                system_prompt="system",
+                user_prompt="hello",
+                invocation_context=LLMInvocationContext(
+                    session_id="fallback-session"
+                ),
+            )
 
-        assert isinstance(result, str)
-        llm_service._track_model_usage.assert_awaited_once()
-        assert store.log_llm_call.await_count == 2
-        failed, succeeded = [
-            call.kwargs for call in store.log_llm_call.await_args_list
-        ]
+        assert "gpu unavailable" not in str(caught.value)
+        llm_service._track_model_usage.assert_not_awaited()
+        store.log_llm_call.assert_awaited_once()
+        failed = store.log_llm_call.await_args.kwargs
         assert (failed["success"], failed["provider"]) == (False, "remote_gpu")
-        assert failed["error_message"] == "gpu unavailable"
-        assert (succeeded["success"], succeeded["provider"]) == (
-            True,
-            "openai:api",
-        )
-        assert failed["session_id"] == succeeded["session_id"] == "fallback-session"
+        assert failed["error_message"] == llm_service._managed_remote_failure_message
+        assert failed["session_id"] == "fallback-session"
 
     @pytest.mark.asyncio
     async def test_remote_tool_stream_finalizes_terminal_response_once(
@@ -2113,24 +2155,21 @@ class TestBackendLifecycle:
         assert status["current_backend"] == "local"
 
     @pytest.mark.asyncio
-    async def test_switch_backend_to_remote_gpu(self, llm_service):
-        """Test switching to remote GPU backend."""
+    async def test_direct_remote_gpu_configuration_is_retired(self, llm_service):
+        """A caller cannot inject a URL outside the validated lease contract."""
         config = {
             "base_url": "https://gpu.example.com/v1",
             "model": "llama-70b",
             "api_key": "test-key",
         }
 
-        llm_service.switch_backend(BackendType.REMOTE_GPU, config=config)
-
-        status = llm_service.get_backend_status()
-        assert status["current_backend"] == "remote_gpu"
-        assert status["remote_active"] is True
+        with pytest.raises(LLMServiceError, match="Direct remote GPU"):
+            llm_service.switch_backend(BackendType.REMOTE_GPU, config=config)
 
     @pytest.mark.asyncio
-    async def test_switch_backend_remote_gpu_requires_config(self, llm_service):
-        """Test that remote GPU backend requires configuration."""
-        with pytest.raises(LLMServiceError, match="requires configuration"):
+    async def test_remote_gpu_requires_a_validated_lease(self, llm_service):
+        """The remote backend cannot be selected without a provider lease."""
+        with pytest.raises(LLMServiceError, match="Direct remote GPU"):
             llm_service.switch_backend(BackendType.REMOTE_GPU)
 
     @pytest.mark.asyncio
@@ -2168,6 +2207,22 @@ class TestBackendLifecycle:
 
         # Should not raise
         await llm_service.close()
+
+    @pytest.mark.asyncio
+    async def test_close_usage_db_runs_when_remote_drain_times_out(self, llm_service):
+        llm_service._remote_lease = SimpleNamespace(lease_id="lease-1")
+        llm_service.deactivate_inference_lease = AsyncMock(
+            side_effect=LLMServiceError("timed out draining private route")
+        )
+        llm_service.close_usage_db = AsyncMock()
+
+        await llm_service.close()
+
+        llm_service.deactivate_inference_lease.assert_awaited_once_with(
+            "lease-1",
+            require_active=False,
+        )
+        llm_service.close_usage_db.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_close_accepts_sync_provider_close(self, llm_service, caplog):
@@ -2277,46 +2332,46 @@ class TestEdgeCases:
 
     @pytest.mark.asyncio
     async def test_remote_gpu_with_ttl_expiry(self, llm_service):
-        """Test that expired remote GPU sessions are deactivated."""
-        from datetime import datetime, timedelta, timezone
+        """An expired managed lease fails closed before provider I/O."""
+        llm_service._backend = BackendType.REMOTE_GPU
+        llm_service._remote_lease = _ready_remote_lease(expired=True)
+        llm_service._remote_client = AsyncMock()
+        llm_service._remote_accepting = True
+        llm_service._remote_capabilities = frozenset({"chat"})
 
-        config = {
-            "base_url": "https://gpu.example.com/v1",
-            "model": "llama-70b",
-            "expires_at": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
-        }
-
-        llm_service.switch_backend(BackendType.REMOTE_GPU, config=config)
-
-        # Try to use expired backend
         with pytest.raises(LLMServiceError, match="expired"):
-            llm_service._ensure_remote_active()
+            async with llm_service._remote_route_attempt(
+                force_local_only=False,
+                model_override=None,
+                required_capabilities=("chat",),
+            ):
+                pytest.fail("expired route must not be returned")
 
     @pytest.mark.asyncio
-    async def test_generate_with_remote_gpu_fallback(self, llm_service, mock_adapter):
-        """Test that generate falls back to providers when remote GPU fails."""
-        # Setup remote GPU backend
-        config = {
-            "base_url": "https://gpu.example.com/v1",
-            "model": "llama-70b",
-        }
-        llm_service.switch_backend(BackendType.REMOTE_GPU, config=config)
-
-        # Mock remote adapter to fail
+    async def test_generate_with_remote_gpu_failure_is_fail_closed(
+        self, llm_service, mock_adapter
+    ):
+        """A selected private route never silently sends data to cloud."""
+        llm_service._backend = BackendType.REMOTE_GPU
+        llm_service._remote_lease = _ready_remote_lease()
+        llm_service._remote_client = AsyncMock()
+        llm_service._remote_accepting = True
+        llm_service._remote_capabilities = frozenset({"chat"})
         llm_service._remote_adapter.get_response = AsyncMock(
-            side_effect=Exception("Remote GPU unavailable")
+            side_effect=Exception("secret provider failure")
         )
 
-        # Should fall back to regular providers
-        response = await llm_service.generate(
-            system_prompt="Test",
-            user_prompt="Hello",
-        )
+        with pytest.raises(LLMServiceError, match="no cloud fallback") as caught:
+            await llm_service.generate(
+                system_prompt="Test",
+                user_prompt="Hello",
+            )
 
-        assert isinstance(response, str)
-        # Backend should be deactivated after failure
+        assert "secret provider failure" not in str(caught.value)
+        mock_adapter.get_response.assert_not_awaited()
         status = llm_service.get_backend_status()
-        assert not status["remote_active"]
+        assert status["remote_active"] is True
+        assert status["last_remote_error"] == "Exception"
 
 
 # =============================================================================

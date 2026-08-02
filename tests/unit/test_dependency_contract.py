@@ -47,13 +47,13 @@ SECURITY_FLOORS = {
     "web3": "7.15.0",
 }
 
-# Durable scheduler dispatch requires the 0.32 execution-context wire
-# contract.  This is intentionally a Core-only release gate: sibling packages
+# Private inference leases require the 0.34 owner-scoped request/quote/route
+# contract. This is intentionally a Core-only release gate: sibling packages
 # are released from their own repositories, but Core must never silently lower
 # its declared/locked line to accommodate an older Frinz or observability
 # constraint.  Their compatible releases remain a documented release-cascade
 # prerequisite in README.md.
-SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.32.0"), ("<", "0.33")})
+SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.34.0"), ("<", "0.35")})
 SDK_RELEASE_CASCADE_CONTRACTS = {
     "base": frozenset({"tracing"}),
     "observability": frozenset({"metrics", "tracing"}),
@@ -62,8 +62,8 @@ SDK_RELEASE_CASCADE_DOWNSTREAM_REQUIREMENTS = {
     # These are release prerequisites, not declarations about sibling repos'
     # current branches. Each downstream must publish/test this line before a
     # Core release can be cut.
-    "frinz": ">=0.32.0,<0.33",
-    "observability fleet": ">=0.32.0,<0.33",
+    "frinz": ">=0.34.0,<0.35",
+    "observability fleet": ">=0.34.0,<0.35",
 }
 
 
@@ -223,8 +223,8 @@ def _sdk_contract_requirement(raw_requirements, *, extras):
     return requirement
 
 
-def test_sdk_032_release_cascade_contract_is_declared_and_locked():
-    """Core and its observability extra must share the v0.32 SDK line.
+def test_sdk_034_release_cascade_contract_is_declared_and_locked():
+    """Core and its observability extra must share the v0.34 SDK line.
 
     This deliberately does not inspect sibling worktrees: their compatible
     Frinz/observability releases are an external release prerequisite, while
@@ -253,11 +253,11 @@ def test_sdk_032_release_cascade_contract_is_declared_and_locked():
         if requirement["name"] == "kestrel-sovereign-sdk"
     }
     assert locked_contracts == {
-        (SDK_RELEASE_CASCADE_CONTRACTS["base"], None, ">=0.32.0,<0.33"),
+        (SDK_RELEASE_CASCADE_CONTRACTS["base"], None, ">=0.34.0,<0.35"),
         (
             SDK_RELEASE_CASCADE_CONTRACTS["observability"],
             "extra == 'observability'",
-            ">=0.32.0,<0.33",
+            ">=0.34.0,<0.35",
         ),
     }
 
@@ -268,7 +268,7 @@ def test_sdk_032_release_cascade_contract_is_declared_and_locked():
     ]
     assert sdk_versions
     assert all(
-        Version("0.32.0") <= version < Version("0.33.0")
+        Version("0.34.0") <= version < Version("0.35.0")
         for version in sdk_versions
     )
 

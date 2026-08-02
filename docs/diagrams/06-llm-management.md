@@ -264,27 +264,31 @@ graph LR
 sequenceDiagram
     participant U as User
     participant K as Kestrel
-    participant RP as RunPod
-    participant BR as BrainRouter
+    participant P as Lease Provider
+    participant L as LLMService
     
-    U->>K: !gpu on llama-70b
-    K->>RP: Provision pod
-    RP-->>K: Pod ID, status: PROVISIONING
+    U->>K: Approve inference_lease_acquire
+    K->>P: Quote bounded model/runtime/cost/privacy request
+    P-->>K: Sanitized quote
+    K->>K: Persist idempotency plan
+    K->>P: Acquire with durable request ID
+    P-->>K: Lease PENDING
     loop Until READY
-        K->>RP: Check status
-        RP-->>K: Status update
+        K->>P: Owner-scoped status
+        P-->>K: Sanitized lease state
     end
-    RP-->>K: Status: READY, URL
-    K->>BR: switch_backend(REMOTE_GPU, url)
-    BR-->>K: Backend switched
-    K-->>U: ✅ GPU ready, TTL: 30min
+    P-->>K: READY plus host-only route
+    K->>L: Activate validated lease
+    L-->>K: Private route ready
+    K-->>U: ✅ Lease ready, bounded cost and expiry
     
-    Note over U,BR: User chats with GPU backend
+    Note over U,L: Calls pin the route; failures do not fall back to cloud
     
-    U->>K: !gpu off
-    K->>RP: Terminate pod
-    K->>BR: switch_backend(CLOUD)
-    K-->>U: ✅ GPU released
+    U->>K: inference_lease_release
+    K->>L: Stop new calls and drain in-flight calls
+    K->>P: Release capacity idempotently
+    P-->>K: RELEASED
+    K-->>U: ✅ Capacity released
 ```
 
 ---

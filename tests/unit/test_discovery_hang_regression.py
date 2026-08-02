@@ -47,6 +47,11 @@ async def test_generate_with_messages_lazy_resolves_auto_models():
     svc = LLMService.__new__(LLMService)
     svc._backend = MagicMock(name="not-remote")
     svc._remote_client = None
+    svc._remote_lease = None
+    svc._remote_route_condition = asyncio.Condition()
+    svc._remote_inflight = 0
+    svc._remote_accepting = False
+    svc._remote_capabilities = frozenset()
     svc._disabled_routes = {}
     svc._mandate_preference = {"vendor": None, "model": None, "route": None}
 

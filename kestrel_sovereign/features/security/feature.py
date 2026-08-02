@@ -72,6 +72,7 @@ _DEFAULT_PERMISSION_BY_FEATURE: Dict[str, PermissionLevel] = {
     "BridgeFeature": PermissionLevel.ASK,
     "DeployFeature": PermissionLevel.ASK,
     "TalonCoordinatorFeature": PermissionLevel.ASK,
+    "InferenceLeaseFeature": PermissionLevel.ASK,
     # KeyManagementFeature is ASK at the feature level because it bundles
     # destructive operations (delete_service_key, remove_service_key) with
     # read-only listings. ALLOW on the whole feature would auto-grant
@@ -130,6 +131,14 @@ _DEFAULT_PERMISSION_BY_TOOL: Dict[str, Dict[str, PermissionLevel]] = {
         # ecosystem_discovery_watch can wake cognition on stale work. Talon
         # dispatch/claim/verification tools remain feature-level ASK.
         "scan_stale_work": PermissionLevel.ALLOW,
+    },
+    "InferenceLeaseFeature": {
+        # Acquisition starts billable infrastructure and remains a hard
+        # approval rail. Status is read-only; release is owner-scoped and stops
+        # spend, so both must remain available for unattended reconciliation.
+        "inference_lease_acquire": PermissionLevel.ALWAYS_ASK,
+        "inference_lease_status": PermissionLevel.ALLOW,
+        "inference_lease_release": PermissionLevel.ALLOW,
     },
 }
 

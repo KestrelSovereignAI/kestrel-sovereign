@@ -265,11 +265,10 @@ class StreamingMixin:
     - _backend: BackendType
     - _remote_client: Optional[AsyncOpenAI]
     - _remote_adapter: OpenAIAdapter
-    - _remote_config: Optional[RemoteGPUConfig]
+    - _remote_lease: Optional[InferenceLease]
+    - _remote_route_attempt(...): async context manager
     - _last_remote_error: Optional[str]
     - _mandate_preference: Dict[str, Optional[str]]
-    - _ensure_remote_active() -> None
-    - _deactivate_remote_backend(reason: Optional[str]) -> None
     - resolve_provider_routing(...) -> RoutingResolution
     - _available_providers() -> List[Dict[str, Any]]
     - discover_all_models(use_cache: bool) -> Awaitable[...]
@@ -916,6 +915,7 @@ class StreamingMixin:
             Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]
         ] = None,
         cancel_token: Optional[CancelToken] = None,
+        error_message_override: Optional[str] = None,
     ) -> AsyncIterator[Union[str, ThinkingDelta, ToolCallStarted, LLMResponse]]:
         """The sole adapter streaming leaf and attempt-finalization boundary.
 
@@ -1058,7 +1058,11 @@ class StreamingMixin:
                     duration_ms=duration_ms,
                     path=path,
                     success=False,
-                    error_message=str(failure),
+                    error_message=(
+                        error_message_override
+                        if error_message_override is not None
+                        else str(failure)
+                    ),
                     usage_available=False,
                     publish_identity=False,
                     invocation_context=invocation_context,
@@ -1347,37 +1351,42 @@ class StreamingMixin:
         resolver = getattr(self, "_resolve_invocation_context", None)
         if resolver is not None:
             invocation_context = resolver(invocation_context)
-        from .remote_backend import BackendType
-
-        # Try remote GPU first when active AND routing isn't pinned — #734.
-        if (
-            self._backend == BackendType.REMOTE_GPU
-            and self._remote_client
-            and not force_local_only
-            and self._remote_first_allowed(model_override)
-        ):
-            try:
-                self._ensure_remote_active()
-                messages = messages_for(self._remote_adapter, user_prompt=user_prompt, system_prompt=system_prompt)
-                model = self._scrub_auto(model_override) or self._remote_config.model
-                async for chunk in self._stream_adapter_with_usage(
-                    adapter=self._remote_adapter,
-                    client=self._remote_client,
-                    model=model,
-                    messages=messages,
-                    provider_name="remote_gpu",
-                    path="generate_stream.remote_gpu",
-                    invocation_context=invocation_context,
-                    expose_protocol_events=False,
-                    response_format=response_format,
-                    cancel_token=cancel_token,
-                ):
-                    yield chunk
+        async with self._remote_route_attempt(
+            force_local_only=force_local_only,
+            model_override=model_override,
+            required_capabilities=(
+                "chat",
+                "streaming",
+                *(("structured_output",) if response_format else ()),
+            ),
+        ) as remote_route:
+            if remote_route is not None:
+                try:
+                    messages = messages_for(
+                        remote_route.adapter,
+                        user_prompt=user_prompt,
+                        system_prompt=system_prompt,
+                    )
+                    model = self._scrub_auto(model_override) or remote_route.model
+                    async for chunk in self._stream_adapter_with_usage(
+                        adapter=remote_route.adapter,
+                        client=remote_route.client,
+                        model=model,
+                        messages=messages,
+                        provider_name="remote_gpu",
+                        path="generate_stream.remote_gpu",
+                        invocation_context=invocation_context,
+                        expose_protocol_events=False,
+                        response_format=response_format,
+                        cancel_token=cancel_token,
+                        error_message_override=(
+                            self._managed_remote_failure_message
+                        ),
+                    ):
+                        yield chunk
+                except Exception as exc:
+                    self._raise_managed_remote_failure(exc)
                 return
-            except Exception as exc:
-                self._last_remote_error = str(exc)
-                logger.warning(f"Remote GPU streaming failed: {exc}, falling back")
-                self._deactivate_remote_backend(reason=str(exc))
 
         # Fall back to standard streaming
         async for chunk in self._get_streaming_response_frozen(
@@ -1424,36 +1433,33 @@ class StreamingMixin:
                 invocation_context,
                 session_id=session_id,
             )
-        from .remote_backend import BackendType
-
-        # Try remote GPU first when active AND routing isn't pinned — #734.
-        if (
-            self._backend == BackendType.REMOTE_GPU
-            and self._remote_client
-            and not force_local_only
-            and self._remote_first_allowed(model_override)
-        ):
-            try:
-                self._ensure_remote_active()
-                model = self._scrub_auto(model_override) or self._remote_config.model
-                async for chunk in self._stream_adapter_with_usage(
-                    adapter=self._remote_adapter,
-                    client=self._remote_client,
-                    model=model,
-                    messages=messages,
-                    provider_name="remote_gpu",
-                    path="stream_with_messages.remote_gpu",
-                    invocation_context=invocation_context,
-                    expose_protocol_events=False,
-                    session_id=session_id,
-                    cancel_token=cancel_token,
-                ):
-                    yield chunk
+        async with self._remote_route_attempt(
+            force_local_only=force_local_only,
+            model_override=model_override,
+            required_capabilities=("chat", "streaming"),
+        ) as remote_route:
+            if remote_route is not None:
+                try:
+                    model = self._scrub_auto(model_override) or remote_route.model
+                    async for chunk in self._stream_adapter_with_usage(
+                        adapter=remote_route.adapter,
+                        client=remote_route.client,
+                        model=model,
+                        messages=messages,
+                        provider_name="remote_gpu",
+                        path="stream_with_messages.remote_gpu",
+                        invocation_context=invocation_context,
+                        expose_protocol_events=False,
+                        session_id=session_id,
+                        cancel_token=cancel_token,
+                        error_message_override=(
+                            self._managed_remote_failure_message
+                        ),
+                    ):
+                        yield chunk
+                except Exception as exc:
+                    self._raise_managed_remote_failure(exc)
                 return
-            except Exception as exc:
-                self._last_remote_error = str(exc)
-                logger.warning(f"Remote GPU streaming failed: {exc}, falling back")
-                self._deactivate_remote_backend(reason=str(exc))
 
         # Fall back to standard providers — use centralized routing
         resolution = await self._resolve_routing_with_discovery(
@@ -1746,43 +1752,38 @@ class StreamingMixin:
                 invocation_context,
                 session_id=session_id,
             )
-        from .remote_backend import BackendType
-
-        # Try remote GPU first when active AND routing isn't pinned — #734.
-        if (
-            self._backend == BackendType.REMOTE_GPU
-            and self._remote_client
-            and not force_local_only
-            and self._remote_first_allowed(model_override)
-            # Never shortcut to the remote GPU for an image-bearing turn (#1662).
-            # `_remote_adapter` is a fixed OpenAIAdapter whose static capability
-            # flag can't tell us whether the *configured* remote model (often a
-            # text-only local GGUF) can actually see images — so probing it
-            # would lie. Fall through to normal routing, which resolves vision
-            # per concrete model and picks a vision-capable provider.
-            and not images
-        ):
-            try:
-                self._ensure_remote_active()
-                model = self._scrub_auto(model_override) or self._remote_config.model
-                async for item in self._stream_adapter_with_usage(
-                    adapter=self._remote_adapter,
-                    client=self._remote_client,
-                    model=model,
-                    messages=messages,
-                    provider_name="remote_gpu",
-                    path="stream_with_tool_detection",
-                    invocation_context=invocation_context,
-                    expose_protocol_events=True,
-                    tools=tools,
-                    cancel_token=cancel_token,
-                ):
-                    yield item
+        async with self._remote_route_attempt(
+            force_local_only=force_local_only,
+            model_override=model_override,
+            required_capabilities=(
+                "chat",
+                "streaming",
+                *(("tools",) if tools else ()),
+                *(("vision",) if images else ()),
+            ),
+        ) as remote_route:
+            if remote_route is not None:
+                try:
+                    model = self._scrub_auto(model_override) or remote_route.model
+                    async for item in self._stream_adapter_with_usage(
+                        adapter=remote_route.adapter,
+                        client=remote_route.client,
+                        model=model,
+                        messages=messages,
+                        provider_name="remote_gpu",
+                        path="stream_with_tool_detection",
+                        invocation_context=invocation_context,
+                        expose_protocol_events=True,
+                        tools=tools,
+                        cancel_token=cancel_token,
+                        error_message_override=(
+                            self._managed_remote_failure_message
+                        ),
+                    ):
+                        yield item
+                except Exception as exc:
+                    self._raise_managed_remote_failure(exc)
                 return
-            except Exception as exc:
-                self._last_remote_error = str(exc)
-                logger.warning(f"Remote GPU streaming with tools failed: {exc}, falling back")
-                self._deactivate_remote_backend(reason=str(exc))
 
         # Use centralized provider routing
         resolution = await self._resolve_routing_with_discovery(
