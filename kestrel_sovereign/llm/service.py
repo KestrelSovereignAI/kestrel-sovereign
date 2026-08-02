@@ -55,7 +55,7 @@ from .invocation_context import (
     resolve_invocation_context,
 )
 from .constitutional_awareness import ConstitutionalAwarenessMixin
-from .remote_backend import RemoteBackendMixin, BackendType, RemoteGPUConfig
+from .remote_backend import BackendType, RemoteBackendMixin
 from kestrel_sovereign.kestrel_config.constants import (
     CLIENT_CLOSE_TIMEOUT,
 )
@@ -487,13 +487,20 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # ``passed=True`` has its shared space_id applied to member routes.
         self._verified_space_pins: Dict[str, "ParityResult"] = {}
 
-        # Remote GPU backend state (merged from BrainRouter)
+        # Provider-neutral private inference route. Infrastructure state lives
+        # in an external lease provider; only the validated, host-only route is
+        # retained here. The condition/refcount make route removal drain
+        # in-flight calls before provider capacity can be released.
         self._backend = BackendType.CLOUD
         self._default_backend = BackendType.CLOUD
-        self._remote_config: Optional[RemoteGPUConfig] = None
+        self._remote_lease = None
         self._remote_client: Optional[openai.AsyncOpenAI] = None
         self._remote_adapter = OpenAIAdapter()
         self._last_remote_error: Optional[str] = None
+        self._remote_route_condition = asyncio.Condition()
+        self._remote_inflight = 0
+        self._remote_accepting = False
+        self._remote_capabilities: frozenset[str] = frozenset()
 
         # Observability store for logging LLM calls (A2A-compatible)
         # Set via set_observability_store() after initialization
@@ -3664,6 +3671,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         metadata: Optional[Dict[str, Any]] = None,
         tools_used: Optional[bool] = None,
         publish_identity: bool = True,
+        error_message_override: Optional[str] = None,
     ) -> Any:
         """Await and finalize one provider call, successful or failed."""
 
@@ -3681,7 +3689,11 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 path=path,
                 invocation_context=invocation_context,
                 duration_ms=int((time.monotonic() - started) * 1000),
-                error=exc,
+                error=(
+                    LLMServiceError(error_message_override)
+                    if error_message_override is not None
+                    else exc
+                ),
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 tools=tools,
@@ -3970,10 +3982,9 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
     @staticmethod
     def _scrub_auto(model_override: Optional[str]) -> Optional[str]:
         """Normalize the ``"auto"`` sentinel to ``None``. Used by entry
-        points that bypass :meth:`resolve_provider_routing` — chiefly the
-        remote-GPU fast path which reads ``model_override`` directly via
-        ``model_override or self._remote_config.model``. See #1408 for
-        why ``"auto"`` must never reach a provider client."""
+        points that bypass :meth:`resolve_provider_routing` — including the
+        inference-lease route. See #1408 for why ``"auto"`` must never reach
+        a provider client."""
         return None if model_override == "auto" else model_override
 
     def _resolve_concrete_model(
@@ -4670,18 +4681,21 @@ No other text or formatting.
             except Exception as e:
                 logger.warning(f"Unexpected error closing {provider.get('name')} client: {e}", exc_info=True)
 
-        # Close remote GPU client if active
-        if self._remote_client:
+        # Stop accepting remote calls and drain them before discarding route
+        # credentials. Provider capacity is deliberately NOT released here:
+        # the durable provider reconciler owns expiry/release after host death.
+        if self._remote_lease is not None:
             try:
-                await asyncio.wait_for(self._remote_client.close(), timeout=CLIENT_CLOSE_TIMEOUT)
-            except (asyncio.TimeoutError, asyncio.CancelledError, ConnectionError, OSError):
-                pass
-            except (RuntimeError, AttributeError) as e:
-                logger.debug(f"Error closing remote client: {e}", exc_info=True)
-            except Exception as e:
-                logger.debug(f"Error closing remote client: {e}", exc_info=True)
-            finally:
-                self._remote_client = None
+                await self.deactivate_inference_lease(
+                    self._remote_lease.lease_id,
+                    require_active=False,
+                )
+            except LLMServiceError as exc:
+                logger.warning(
+                    "Private inference route cleanup did not complete during "
+                    "LLMService shutdown (%s)",
+                    type(exc).__name__,
+                )
 
         # Close the async usage tracking database
         try:
@@ -4734,59 +4748,72 @@ No other text or formatting.
             session_id=invocation_context.session_id,
             redact=_redact,
         ) as span:
-            # Try remote GPU first when active AND routing isn't pinned.
-            # A persisted mandate or vendor-prefixed model_override must
-            # beat the remote shortcut — see #734 and _remote_first_allowed.
-            if (
-                self._backend == BackendType.REMOTE_GPU
-                and self._remote_client
-                and not force_local_only
-                and self._remote_first_allowed(model_override)
-            ):
-                try:
-                    self._ensure_remote_active()
-                    messages = messages_for(self._remote_adapter, user_prompt=user_prompt, system_prompt=system_prompt)
-                    model = self._scrub_auto(model_override) or self._remote_config.model
-                    response = await self._run_provider_attempt(
-                        self._remote_adapter.get_response(
-                            client=self._remote_client,
-                            model=model,
-                            messages=messages,
+            async with self._remote_route_attempt(
+                force_local_only=force_local_only,
+                model_override=model_override,
+                required_capabilities=(
+                    "chat",
+                    *(("tools",) if tools else ()),
+                    *(("structured_output",) if response_format else ()),
+                ),
+            ) as remote_route:
+                if remote_route is None:
+                    remote_response = None
+                else:
+                    try:
+                        messages = messages_for(
+                            remote_route.adapter,
+                            user_prompt=user_prompt,
+                            system_prompt=system_prompt,
+                        )
+                        model = self._scrub_auto(model_override) or remote_route.model
+                        remote_response = await self._run_provider_attempt(
+                            remote_route.adapter.get_response(
+                                client=remote_route.client,
+                                model=model,
+                                messages=messages,
+                                tools=tools,
+                                response_format=response_format,
+                                cancel_token=cancel_token,
+                            ),
+                            "remote_gpu",
+                            model,
+                            path="generate.remote_gpu",
+                            invocation_context=invocation_context,
+                            system_prompt=system_prompt,
+                            user_prompt=user_prompt,
                             tools=tools,
                             response_format=response_format,
-                            cancel_token=cancel_token,
-                        ),
-                        "remote_gpu",
-                        model,
-                        path="generate.remote_gpu",
-                        invocation_context=invocation_context,
-                        system_prompt=system_prompt,
-                        user_prompt=user_prompt,
-                        tools=tools,
-                        response_format=response_format,
-                        force_local_only=force_local_only,
+                            force_local_only=force_local_only,
+                            error_message_override=(
+                                self._managed_remote_failure_message
+                            ),
+                        )
+                    except Exception as exc:
+                        # Adapter implementations can raise provider-specific
+                        # exception types. The boundary intentionally catches
+                        # them all, exposes only a safe category, and never
+                        # falls through to a different provider.
+                        self._raise_managed_remote_failure(exc)
+
+            if remote_route is not None:
+                if tools is not None or response_format is not None:
+                    return self._annotate_and_return(
+                        span,
+                        remote_response,
+                        redact=_redact,
                     )
-                    if tools is not None or response_format is not None:
-                        return self._annotate_and_return(span, response, redact=_redact)
-                    if isinstance(response, LLMResponse):
-                        return self._annotate_and_return(span, response.content or "", redact=_redact)
-                    return self._annotate_and_return(span, response, redact=_redact)
-                except (openai.APIError, openai.APIConnectionError, openai.RateLimitError, openai.AuthenticationError) as exc:
-                    self._last_remote_error = str(exc)
-                    logger.warning(f"Remote GPU API error: {exc}, falling back to providers", exc_info=True)
-                    self._deactivate_remote_backend(reason=str(exc))
-                except (httpx.HTTPError, ConnectionError, TimeoutError, asyncio.TimeoutError) as exc:
-                    self._last_remote_error = str(exc)
-                    logger.warning(f"Remote GPU network error: {exc}, falling back to providers", exc_info=True)
-                    self._deactivate_remote_backend(reason=str(exc))
-                except LLMServiceError as exc:
-                    self._last_remote_error = str(exc)
-                    logger.warning(f"Remote GPU service error: {exc}, falling back to providers", exc_info=True)
-                    self._deactivate_remote_backend(reason=str(exc))
-                except Exception as exc:
-                    self._last_remote_error = str(exc)
-                    logger.warning(f"Remote GPU failed: {exc}, falling back to providers", exc_info=True)
-                    self._deactivate_remote_backend(reason=str(exc))
+                if isinstance(remote_response, LLMResponse):
+                    return self._annotate_and_return(
+                        span,
+                        remote_response.content or "",
+                        redact=_redact,
+                    )
+                return self._annotate_and_return(
+                    span,
+                    remote_response,
+                    redact=_redact,
+                )
 
             # Fall back to standard provider chain
             result = await self._get_response_frozen(
@@ -4886,54 +4913,61 @@ No other text or formatting.
         # span's output.value under an enforcing audit (input.value was already
         # blanked when the span opened).
         _redact = invocation_context.redact_content
-        # Try remote GPU first when active AND routing isn't pinned — #734.
-        if (
-            self._backend == BackendType.REMOTE_GPU
-            and self._remote_client
-            and not force_local_only
-            and self._remote_first_allowed(model_override)
-        ):
-            try:
-                self._ensure_remote_active()
-                model = self._scrub_auto(model_override) or self._remote_config.model
-                response = await self._run_provider_attempt(
-                    self._remote_adapter.get_response(
-                        client=self._remote_client,
-                        model=model,
-                        messages=messages,
+        async with self._remote_route_attempt(
+            force_local_only=force_local_only,
+            model_override=model_override,
+            required_capabilities=(
+                "chat",
+                *(("tools",) if tools else ()),
+                *(("structured_output",) if response_format else ()),
+            ),
+        ) as remote_route:
+            if remote_route is None:
+                remote_response = None
+            else:
+                try:
+                    model = self._scrub_auto(model_override) or remote_route.model
+                    remote_response = await self._run_provider_attempt(
+                        remote_route.adapter.get_response(
+                            client=remote_route.client,
+                            model=model,
+                            messages=messages,
+                            tools=tools,
+                            response_format=response_format,
+                            cancel_token=cancel_token,
+                        ),
+                        "remote_gpu",
+                        model,
+                        path="generate_with_messages.remote_gpu",
+                        invocation_context=invocation_context,
                         tools=tools,
                         response_format=response_format,
-                        cancel_token=cancel_token,
-                    ),
-                    "remote_gpu",
-                    model,
-                    path="generate_with_messages.remote_gpu",
-                    invocation_context=invocation_context,
-                    tools=tools,
-                    response_format=response_format,
-                    force_local_only=force_local_only,
+                        force_local_only=force_local_only,
+                        error_message_override=(
+                            self._managed_remote_failure_message
+                        ),
+                    )
+                except Exception as exc:
+                    self._raise_managed_remote_failure(exc)
+
+        if remote_route is not None:
+            if tools is not None or response_format is not None:
+                return self._annotate_and_return(
+                    span,
+                    remote_response,
+                    redact=_redact,
                 )
-                if tools is not None or response_format is not None:
-                    return self._annotate_and_return(span, response, redact=_redact)
-                if isinstance(response, LLMResponse):
-                    return self._annotate_and_return(span, response.content or "", redact=_redact)
-                return self._annotate_and_return(span, response, redact=_redact)
-            except (openai.APIError, openai.APIConnectionError, openai.RateLimitError, openai.AuthenticationError) as exc:
-                self._last_remote_error = str(exc)
-                logger.warning(f"Remote GPU API error: {exc}, falling back", exc_info=True)
-                self._deactivate_remote_backend(reason=str(exc))
-            except (httpx.HTTPError, ConnectionError, TimeoutError, asyncio.TimeoutError) as exc:
-                self._last_remote_error = str(exc)
-                logger.warning(f"Remote GPU network error: {exc}, falling back", exc_info=True)
-                self._deactivate_remote_backend(reason=str(exc))
-            except LLMServiceError as exc:
-                self._last_remote_error = str(exc)
-                logger.warning(f"Remote GPU service error: {exc}, falling back", exc_info=True)
-                self._deactivate_remote_backend(reason=str(exc))
-            except Exception as exc:
-                self._last_remote_error = str(exc)
-                logger.warning(f"Remote GPU failed: {exc}, falling back", exc_info=True)
-                self._deactivate_remote_backend(reason=str(exc))
+            if isinstance(remote_response, LLMResponse):
+                return self._annotate_and_return(
+                    span,
+                    remote_response.content or "",
+                    redact=_redact,
+                )
+            return self._annotate_and_return(
+                span,
+                remote_response,
+                redact=_redact,
+            )
 
         # Fall back to standard providers (skip any disabled by auth failure).
         providers = self._available_providers()
@@ -5137,4 +5171,4 @@ No other text or formatting.
     # generate_stream, stream_with_messages, and stream_with_tool_detection
     # are provided by StreamingMixin
 
-    # _ensure_remote_active is provided by RemoteBackendMixin
+    # Private inference lease routing is provided by RemoteBackendMixin.

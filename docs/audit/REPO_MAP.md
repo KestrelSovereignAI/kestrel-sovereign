@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-08-02
-**Scope:** 2289 tracked files (1527 `.py`, 345 `.md`, 417 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 2294 tracked files (1532 `.py`, 345 `.md`, 417 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -495,6 +495,9 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/identity/__init__.py** — Identity Feature: Agent tools for identity export, import, and verification.
 - **kestrel_sovereign/features/identity/feature.py** — Identity Feature: Agent tools for identity portability.
   - `class IdentityFeature`
+- **kestrel_sovereign/features/inference_lease/__init__.py** — Agent tools for provider-neutral private inference capacity.
+- **kestrel_sovereign/features/inference_lease/feature.py** — Owner-scoped tools for private, on-demand inference capacity.
+  - `class InferenceLeaseFeature`
 - **kestrel_sovereign/features/isolated_runtime.py** — Isolated feature runtime proxy and per-agent venv provisioning.
   - `class SchedulerExecutionContextUnavailable`; `class SchedulerTerminalAdmissionError`; `class IsolatedFeatureTool`; `class ProxyFeature`; `class ProxyChannelAdapter`
 - **kestrel_sovereign/features/keys/__init__.py** — Key Management Feature for external service API keys.
@@ -519,11 +522,6 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/model/component.yaml** — (configuration)
 - **kestrel_sovereign/features/model/feature.py** — —
   - `class ModelAgent`
-- **kestrel_sovereign/features/ollama/__init__.py** — Ollama GPU Manager - Cloud Ollama on RunPod/Vast.ai
-- **kestrel_sovereign/features/ollama/ollama_gpu_adapter.py** — Ollama GPU Adapter - Remote Ollama Integration for LLMService
-  - `class OllamaGPUAdapter`; `async def start_remote_ollama(llm_service, model, ttl_minutes)`; `async def stop_remote_ollama(llm_service, terminate)`
-- **kestrel_sovereign/features/ollama/ollama_manager.py** — Ollama GPU Manager - Cloud Ollama Pod Lifecycle Management
-  - `class OllamaSession`; `class OllamaGPUManagerError`; `class OllamaGPUManager`
 - **kestrel_sovereign/features/peers/__init__.py** — —
 - **kestrel_sovereign/features/peers/directory.py** — Scoped peer-directory and routing boundary for :mod:`peers`.
   - `class PeerDirectoryError`; `class PeerDirectoryConfigurationError`; `class PeerNotFoundError`; `class PeerAccessDeniedError`; `class PeerSelfTargetError`; `class PeerUnavailableError`; `class PeerTransportError`; `class PeerProtocolError`; `…`
@@ -878,6 +876,8 @@ Repo entry points and standard project files.
   - `def is_gpt5_model_id(model_id)`; `def prepend_gpt5_overlay(base, model_id)`
 - **kestrel_sovereign/llm/image_utils.py** — Centralized image handling utilities for LLM adapters.
   - `class ProcessedImage`; `def detect_mime_type_from_bytes(data)`; `def detect_mime_type_from_base64(data)`; `def detect_mime_type_from_extension(path)`; `def resize_image_if_needed(image_bytes, max_dimensions, output_format)`; `def process_image(image, max_dimensions, provider)`; `def process_images(images, max_dimensions, provider)`; `def get_base64_only(images, max_dimensions, provider)`; `…`
+- **kestrel_sovereign/llm/inference_leases.py** — Provider-neutral orchestration for owner-scoped inference leases.
+  - `class InferenceLeaseProviderDiscoveryError`; `class InferenceLeaseRecord`; `def discover_inference_lease_providers()`; `class InferenceLeaseCoordinator`
 - **kestrel_sovereign/llm/invocation_context.py** — Request-scoped identity for LLM invocation telemetry.
   - `class LLMInvocationContext`; `class LLMInvocationContextState`; `def set_ambient_invocation_context(context)`; `def resolve_invocation_context(context)`
 - **kestrel_sovereign/llm/mandate.py** — Model mandate management for LLM Service.
@@ -902,8 +902,8 @@ Repo entry points and standard project files.
   - `class OpenRouterAdapter`
 - **kestrel_sovereign/llm/provider_registry.py** — Provider Registry for LLM Service.
   - `class ProviderInitializationError`; `class ProviderRegistry`; `def provider_cache_body(provider)`
-- **kestrel_sovereign/llm/remote_backend.py** — Remote GPU backend management for LLM Service.
-  - `class RemoteGPUConfig`; `class RemoteBackendMixin`
+- **kestrel_sovereign/llm/remote_backend.py** — Readiness-gated private inference routing for :class:`LLMService`.
+  - `class RemoteRouteSnapshot`; `class RemoteBackendMixin`
 - **kestrel_sovereign/llm/retry.py** — Retry Utilities for LLM Adapters
   - `def retry_after_seconds(error)`; `def is_retryable_error(error)`; `async def with_retry(func)`; `async def retry_with_backoff(func)`
 - **kestrel_sovereign/llm/route_credentials.py** — Single source of truth for which env vars satisfy an LLM route.
@@ -1478,6 +1478,8 @@ Repo entry points and standard project files.
   - `def main()`
 - **scripts/release/load_signing_key_from_env.py** — Load SLH-DSA-SHA2-128s release-signing key material from environment variables into a SecureKeyStorage directory, then exit.
   - `def main()`
+- **scripts/repair_ciphertext_episodes.py** — Repair episodes whose narrative was synthesized from at-rest ciphertext.
+  - `def main(argv)`
 - **scripts/rotate_agent_key.py** — Rotate an agent's AEAD encryption-master passphrase.
   - `def passphrase_to_master_key(passphrase)`; `def derive_agent_fernet(master_key, agent_id)`; `async def rotate_conversation_keys(db_path, old_pass, new_pass)`; `async def main()`
 - **scripts/sdxl_direct_demo.py** — SDXL Direct Generation Demo - No LoRA (baseline test)
@@ -2464,8 +2466,8 @@ Repo entry points and standard project files.
   - `class MockDB`; `class FailingHistoryClearDB`; `class MockLLMService`; `def mock_db()`; `def mock_llm()`; `def temp_agent_dir(tmp_path)`; `def bootstrap_service(mock_db, mock_llm, temp_agent_dir)`; `class TestBootstrapState`; `…`
 - **tests/unit/test_born_hybrid_inception.py** — Born-hybrid inception (#2397): new agents mint a hybrid did:web identity (Ed25519 + ML-DSA-65) by default — no classical secp256k1 key ever exists.
   - `def hybrid_env(monkeypatch)`; `def test_default_method_is_did_web(monkeypatch)`; `def test_unknown_method_rejected()`; `def test_slugify_agent_name(name, expected)`; `def test_slugify_rejects_empty()`; `async def test_explicit_slug_validated_before_any_disk_writes(tmp_path, hybrid_env, bad_slug)`; `async def test_invalid_identity_method_leaves_no_db(tmp_path, hybrid_env)`; `async def test_genesis_rejection_cleans_born_hybrid_keys_and_db(tmp_path, hybrid_env)`; `…`
-- **tests/unit/test_brain_router.py** — Tests for LLMService GPU backend routing functionality.
-  - `class FakeRemoteClient`; `async def test_switch_backend_to_remote_gpu(monkeypatch)`; `async def test_generate_uses_remote_backend(monkeypatch)`; `async def test_remote_failure_falls_back_to_cloud(monkeypatch)`
+- **tests/unit/test_brain_router.py** — Integration coverage for the managed private route in ``LLMService``.
+  - `class FakeRemoteClient`; `async def test_validated_lease_activates_and_releases(monkeypatch)`; `async def test_generate_uses_validated_private_route(monkeypatch)`; `async def test_private_route_failure_does_not_fall_back(monkeypatch)`
 - **tests/unit/test_bridge_feature.py** — Unit Tests for the KestrelClaw Bridge Feature (#157).
   - `class TestProtocolModels`; `class TestBridgeFeatureInitialize`; `class TestBridgeFeatureInitializeWithoutDb`; `class TestSessionManagement`; `class TestInvocationLogging`; `class TestBridgeStatus`; `class TestBridgeConnections`; `class TestBridgeHistory`; `…`
 - **tests/unit/test_bridge_router_mounted.py** — Regression test for F105: the bridge HTTP router must be mounted.
@@ -2723,7 +2725,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_denied_tools_dispatch.py** — Tests for security DENY enforcement at orchestrator dispatch level.
   - `class TestDeniedToolsStripping`; `class TestSubagentDeniedToolsExclusion`
 - **tests/unit/test_dependency_contract.py** — Security contracts for declared dependencies and the resolved lock.
-  - `def test_banned_packages_not_declared()`; `def test_banned_packages_not_locked()`; `def test_security_floors_are_declared()`; `def test_security_floors_are_locked()`; `def test_windows_tzdata_is_a_direct_base_dependency_and_is_locked()`; `def test_sdk_032_release_cascade_contract_is_declared_and_locked()`
+  - `def test_banned_packages_not_declared()`; `def test_banned_packages_not_locked()`; `def test_security_floors_are_declared()`; `def test_security_floors_are_locked()`; `def test_windows_tzdata_is_a_direct_base_dependency_and_is_locked()`; `def test_sdk_034_release_cascade_contract_is_declared_and_locked()`
 - **tests/unit/test_deploy_azure.py** — Unit tests for Azure Container Apps deployment provider.
   - `def deployment_profile()`; `def provider_and_client()`; `async def test_deploy_logs_create_only_for_resource_not_found(deployment_profile, provider_and_client, caplog)`; `async def test_deploy_logs_update_when_resource_exists(deployment_profile, provider_and_client, caplog)`; `async def test_deploy_does_not_misclassify_lookup_failure_as_absent(deployment_profile, provider_and_client)`; `async def test_deploy_lookup_preserves_caller_cancellation(deployment_profile, provider_and_client)`
 - **tests/unit/test_deploy_bugs.py** — Unit tests for deploy feature bug fixes (#101).
@@ -2830,6 +2832,8 @@ Repo entry points and standard project files.
   - `async def test_clean_ephemeral_exit_calls_purge_and_skips_audit()`; `async def test_leaked_ephemeral_exit_writes_audit_with_breakdown()`; `async def test_normal_to_ephemeral_does_not_purge()`; `async def test_public_to_ephemeral_stages_pending_and_confirm_applies_atomically()`; `async def test_confirm_with_nothing_pending_is_a_safe_noop()`; `async def test_normal_to_isolated_does_not_purge()`; `async def test_ephemeral_to_ephemeral_does_not_purge()`; `async def test_audit_failure_does_not_block_purge_or_transition()`; `…`
 - **tests/unit/test_episode_ciphertext.py** — Episode synthesis must never tokenize the at-rest envelope (#2850).
   - `class TestRowPlaintext`; `class TestTopicsNeverContainCiphertext`; `def test_title_input_is_gated_before_synthesis(bad)`; `def test_legacy_fernet_row_is_skipped_when_no_store_is_wired()`; `def test_legacy_fernet_row_is_decrypted_when_a_store_is_wired()`; `def test_unencrypted_row_still_passes_without_a_store()`; `def test_plaintext_beginning_with_the_marker_survives_decryption()`; `class TestBackstopRequiresARealDecrypt`; `…`
+- **tests/unit/test_episode_repair.py** — Repair of episodes already synthesized from ciphertext (#2856).
+  - `class TestHealthyEpisodesSurvive`; `class TestRebuildIgnoresTheClusteringWindow`; `class TestGraphNodeOrdering`; `class TestReEmbedding`; `class TestFailsClosed`; `class TestDryRun`; `class TestReviewFindings`; `class TestRacesDuringRepair`; `…`
 - **tests/unit/test_epistemic_status.py** — Tests for the epistemic status layer (#680).
   - `class TestMemoryMetadataEpistemicFields`; `class TestEpistemicDetection`; `class TestExtractEpistemicFields`; `async def router()`; `class TestSchemaRouterEpistemicProvenance`; `class TestMarkSuperseded`; `class TestRecallSupersededFilter`; `class TestRetrieverCertaintyWeighting`; `…`
 - **tests/unit/test_escalation_classifier.py** — Tests for the escalation classifier (#1540 / #1563).
@@ -2962,6 +2966,10 @@ Repo entry points and standard project files.
   - `def test_inception_cli_accepts_output_alias()`; `def test_inception_cli_disallows_abbrev_prefixes()`
 - **tests/unit/test_inception_emancipation.py** — Inception-level tests for Amendment VIII substitution (#1109).
   - `def constitution_path()`; `async def test_inception_dormant_anchors_canonical_text(tmp_path, constitution_path)`; `async def test_inception_active_inlines_sovereign_terms(tmp_path, constitution_path)`
+- **tests/unit/test_inference_lease_coordinator.py** — Provider-neutral orchestration and crash-recovery tests for #2844.
+  - `async def test_selects_cheapest_quote_then_fastest_without_mutating_others()`; `async def test_persists_idempotency_plan_before_billable_acquire()`; `async def test_pending_status_activates_ready_route_without_public_secrets()`; `async def test_release_deactivates_and_persists_before_provider_mutation()`; `async def test_owner_scope_rejects_unknown_lease_before_provider_call()`; `async def test_restore_plan_resumes_same_request_after_pre_return_crash()`; `async def test_restore_ready_reference_refetches_host_only_route()`; `async def test_restore_terminal_reference_does_not_repoll_provider()`; `…`
+- **tests/unit/test_inference_lease_feature.py** — Agent feature and policy tests for private inference leases.
+  - `def test_feature_is_discoverable_and_billable_tool_is_always_ask()`; `async def test_acquire_refuses_cloud_when_privacy_policy_disallows_it()`; `async def test_acquire_refuses_billable_mutation_without_durable_storage()`; `async def test_tool_result_omits_endpoint_and_credentials()`; `async def test_persisted_state_is_scoped_by_owner_and_credential_free()`; `async def test_initialize_reconciles_persisted_state(monkeypatch)`; `async def test_initialize_isolates_broken_provider_discovery(monkeypatch)`
 - **tests/unit/test_inline_tool_emit_part_context.py** — Regression: #1914 typed parts survive the codex reader-task boundary (#2081).
   - `async def test_inline_emit_part_lands_on_owning_turn_across_reader_boundary()`; `async def test_anthropic_style_in_turn_tool_still_delivers()`
 - **tests/unit/test_input_guardrails.py** — Tests for prompt injection detection and input guardrails.
@@ -3224,6 +3232,8 @@ Repo entry points and standard project files.
   - `async def test_fixed_order_conversation_first_never_deadlocks()`; `async def test_old_transition_first_order_would_deadlock()`
 - **tests/unit/test_privacy_wrapper.py** — Tests for the Privacy-Enforcing Storage Wrapper.
   - `class TestPrivacyPolicy`; `async def test_governed_corpus_delta_uses_incremental_privacy_gate(monkeypatch)`; `class TestEphemeralMode`; `class TestIsolatedMode`; `class TestAnonymousMode`; `class TestNormalMode`; `class TestDeidentifiedMode`; `class TestModeTransitions`; `…`
+- **tests/unit/test_private_inference_routing.py** — Host-only, fail-closed routing tests for private inference leases.
+  - `async def test_activation_keeps_route_host_only_and_disables_sdk_retries(monkeypatch)`; `async def test_custom_authorization_header_overrides_client_sentinel(monkeypatch)`; `async def test_ready_reconciliation_rotates_the_host_only_client(monkeypatch)`; `async def test_unchanged_ready_poll_does_not_rebuild_or_drain_client(monkeypatch)`; `async def test_route_attempt_requires_capabilities_and_never_falls_back(monkeypatch)`; `async def test_release_drains_an_inflight_route_before_forgetting_secrets(monkeypatch)`; `async def test_expired_managed_route_fails_closed(monkeypatch)`; `def test_direct_remote_configuration_is_retired()`; `…`
 - **tests/unit/test_process_input_preinit_defer.py** — Regression: a COGNITION dispatch reaching process_input before the agent finishes initialize() must DEFER (clean retryable error), not crash.
   - `async def test_cognition_turn_before_init_defers_with_clear_error()`; `async def test_preinit_turn_does_not_raise_attributeerror()`
 - **tests/unit/test_process_manager.py** — Unit tests for the Kestrel ProcessManager.

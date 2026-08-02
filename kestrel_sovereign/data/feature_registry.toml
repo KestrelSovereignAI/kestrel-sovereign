@@ -129,6 +129,21 @@ list_models = { description = "List available LLM models", category = "model_man
 set_model = { description = "Change active LLM model", category = "model_management", tags = ["model", "llm"] }
 model_info = { description = "Get details about a specific model", category = "model_management", tags = ["model", "llm"] }
 
+[inference_lease]
+boundary = "bundled"
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+features = ["InferenceLeaseFeature"]
+description = "Owner-scoped, cost-bounded private inference lease orchestration"
+tags = ["core", "llm", "inference", "gpu", "privacy"]
+icon = "server"
+core = true
+
+[inference_lease.skills]
+inference_lease_acquire = { description = "Acquire approved private inference capacity within cost and privacy bounds", category = "model_management", tags = ["inference", "gpu", "lease"] }
+inference_lease_status = { description = "Inspect this agent's sanitized inference lease state", category = "model_management", tags = ["inference", "status"] }
+inference_lease_release = { description = "Drain routing and release this agent's inference capacity", category = "model_management", tags = ["inference", "release"] }
+
 [bootstrap]
 boundary = "bundled"
 package = "kestrel-sovereign"

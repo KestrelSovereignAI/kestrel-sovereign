@@ -9,8 +9,9 @@ Covers the three layers the dispatch crosses:
 """
 import base64
 import logging
-import pytest
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 # Smallest valid image: a 1x1 transparent PNG (so process_images/PIL accept it).
 _PNG = base64.b64decode(
@@ -157,7 +158,7 @@ def test_apply_eager_vision_errors_when_vision_adapter_lacks_helper(caplog):
 
 @pytest.mark.asyncio
 async def test_resolve_eager_images_caps_count():
-    from kestrel_sovereign.agent.streaming import StreamingMixin, _MAX_EAGER_IMAGES
+    from kestrel_sovereign.agent.streaming import _MAX_EAGER_IMAGES, StreamingMixin
     agent = MagicMock()
     agent.storage.retrieve_file = AsyncMock(return_value=_PNG)
     resolve = StreamingMixin._resolve_eager_images.__get__(agent)
@@ -169,7 +170,7 @@ async def test_resolve_eager_images_caps_count():
 
 @pytest.mark.asyncio
 async def test_resolve_eager_images_skips_oversized():
-    from kestrel_sovereign.agent.streaming import StreamingMixin, _MAX_EAGER_IMAGE_BYTES
+    from kestrel_sovereign.agent.streaming import _MAX_EAGER_IMAGE_BYTES, StreamingMixin
     agent = MagicMock()
     agent.storage.retrieve_file = AsyncMock(
         return_value=b"x" * (_MAX_EAGER_IMAGE_BYTES + 1))
@@ -227,8 +228,9 @@ def test_apply_eager_vision_respects_model_level_capability(monkeypatch, caplog)
     """A vision-capable adapter family (OpenAI/Ollama/...) running a concrete
     model discovery knows is text-only must NOT get images — warn, pass through."""
     from types import SimpleNamespace
-    from kestrel_sovereign.llm.streaming import StreamingMixin
+
     from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
+    from kestrel_sovereign.llm.streaming import StreamingMixin
     svc = StreamingMixin.__new__(StreamingMixin)
     adapter = OpenAIAdapter()  # adapter-family supports_vision is True
     # Realistic shapes: route key is "vendor:route"; ModelInfo.provider is bare.
@@ -246,8 +248,9 @@ def test_apply_eager_vision_respects_model_level_capability(monkeypatch, caplog)
 def test_apply_eager_vision_model_known_vision_folds(monkeypatch):
     """When discovery confirms the concrete model is vision-capable, fold it."""
     from types import SimpleNamespace
-    from kestrel_sovereign.llm.streaming import StreamingMixin
+
     from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
+    from kestrel_sovereign.llm.streaming import StreamingMixin
     svc = StreamingMixin.__new__(StreamingMixin)
     adapter = OpenAIAdapter()
     cache = SimpleNamespace(get_any=lambda: [
@@ -261,15 +264,12 @@ def test_apply_eager_vision_model_known_vision_folds(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_remote_gpu_shortcut_skipped_for_image_turn(monkeypatch):
-    """An image-bearing turn must NOT take the remote-GPU first-try shortcut
-    (its fixed OpenAIAdapter can't tell us the configured local model's real
-    vision capability). It falls through to normal routing, which folds the
-    image for a provider whose capability is resolved per concrete model."""
-    from kestrel_sovereign.llm.service import LLMService
-    from kestrel_sovereign.llm.remote_backend import BackendType
+async def test_unvalidated_remote_client_is_never_used_for_image_turn(monkeypatch):
+    """A stale client without an SDK lease cannot bypass normal routing."""
     from kestrel_sovereign.llm.adapter import LLMResponse
     from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
+    from kestrel_sovereign.llm.remote_backend import BackendType
+    from kestrel_sovereign.llm.service import LLMService
 
     svc = LLMService()
     # Constructing a real LLMService loads the on-disk discovery cache into the
@@ -283,7 +283,6 @@ async def test_remote_gpu_shortcut_skipped_for_image_turn(monkeypatch):
     svc._remote_client = object()
     monkeypatch.setattr(svc, "_remote_first_allowed", lambda *a, **k: True)
     monkeypatch.setattr(svc, "_check_policy", lambda *a, **k: None)
-    monkeypatch.setattr(svc, "_ensure_remote_active", lambda *a, **k: None)
     # Neutralize the #2069 lazy-discovery warm-up: this test drives a real
     # LLMService whose seeded routes are model="auto", so the streaming path
     # would otherwise run REAL discovery — pointless here (the test mocks

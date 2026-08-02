@@ -13,6 +13,7 @@ the existing rotate-to-next-provider semantics.
 
 Mirrors openclaw commit ``3a64dc7623`` ("keep turn timeouts inside Codex").
 """
+from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, List, Optional
 from unittest.mock import MagicMock
 
@@ -117,6 +118,11 @@ class _RecordingHost(StreamingMixin):
 
     def _check_policy(self) -> None:
         return None
+
+    @asynccontextmanager
+    async def _remote_route_attempt(self, **_kwargs):
+        """This provider-fallback harness has no managed private route."""
+        yield None
 
     def _available_providers(self):
         # Mirror LLMService: drop session-disabled routes. Tests don't
