@@ -673,18 +673,6 @@ class SleepReport:
     messages_archived: int = 0
     episodes_deleted: int = 0  # forgetting deletion tier (#1674)
     total_messages: int = 0
-    # Ciphertext-episode repair (#2856). Counts and a flag only — no titles,
-    # no IDs — so this operator surface stays content-free.
-    episodes_repaired: int = 0
-    episode_repair_limit_reached: bool = False
-    # A pass-level repair failure. Without this, "0 repaired" reads the same
-    # as "nothing to repair", so a permanently failing pass is invisible.
-    episode_repair_failed: bool = False
-    # Episodes the pass could not resolve (missing, deleted or undecryptable
-    # sources, or a write failure). A count only — never an ID or a title.
-    # Without it a retrying repair reports "0 repaired, no failure" every
-    # night, indistinguishable from having nothing left to do.
-    episodes_unrepairable: int = 0
 
     # Export stats
     shards_exported: int = 0
@@ -739,10 +727,6 @@ class SleepReport:
                 "messages_archived": self.messages_archived,
                 "episodes_deleted": self.episodes_deleted,
                 "total_messages": self.total_messages,
-                "episodes_repaired": self.episodes_repaired,
-                "episode_repair_limit_reached": self.episode_repair_limit_reached,
-                "episode_repair_failed": self.episode_repair_failed,
-                "episodes_unrepairable": self.episodes_unrepairable,
                 "duration_ms": self.consolidation_ms,
             },
             "reflection": {
@@ -944,19 +928,6 @@ class SleepMixin:
                     report.messages_archived = consolidation_result.get("messages_archived", 0)
                     report.episodes_deleted = consolidation_result.get("episodes_deleted", 0)
                     report.total_messages = consolidation_result.get("total_messages_processed", 0)
-                    report.episodes_repaired = consolidation_result.get(
-                        "episodes_repaired", 0
-                    )
-                    report.episode_repair_limit_reached = bool(
-                        consolidation_result.get("episode_repair_limit_reached")
-                    )
-                    # Content-free: the flag, never the exception text.
-                    report.episode_repair_failed = bool(
-                        consolidation_result.get("episode_repair_error")
-                    )
-                    report.episodes_unrepairable = len(
-                        consolidation_result.get("episodes_unrepairable") or ()
-                    )
                     consolidation_succeeded = True
                     logger.info(
                         f"Consolidation complete: {report.episodes_created} episodes, "
@@ -1958,12 +1929,6 @@ class SleepMixin:
         report.patterns_found = sleep_report.patterns_found
         report.messages_archived = sleep_report.messages_archived
         report.total_messages = sleep_report.total_messages
-        report.episodes_repaired = sleep_report.episodes_repaired
-        report.episode_repair_limit_reached = (
-            sleep_report.episode_repair_limit_reached
-        )
-        report.episode_repair_failed = sleep_report.episode_repair_failed
-        report.episodes_unrepairable = sleep_report.episodes_unrepairable
         report.shards_exported = sleep_report.shards_exported
         report.total_size_bytes = sleep_report.total_size_bytes
         report.storage_tier = sleep_report.storage_tier

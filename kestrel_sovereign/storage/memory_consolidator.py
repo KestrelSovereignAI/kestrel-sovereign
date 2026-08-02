@@ -235,32 +235,6 @@ class MemoryConsolidator:
             # nights. Best-effort; no-op when no embedding provider is wired.
             report["episodes_embedded"] = await self._backfill_episode_embeddings()
 
-            # 3c. Repair episodes synthesized from ciphertext before #2850.
-            # Sleep is the vehicle because it already owns memory maintenance,
-            # but this is a MIGRATION, not maintenance: the damage set is
-            # closed — no episode written after #2850 can be ciphertext-derived
-            # — so once an agent's corpus is provably clean there is nothing
-            # left to look for, ever. It therefore runs at most once per agent
-            # and then retires itself. Isolated from the rest of the cycle: a
-            # repair failure is reported, never fatal to consolidation (#2856).
-            try:
-                repair = await self._repair_ciphertext_episodes_once()
-                if repair is not None:
-                    report["episodes_repaired"] = repair.get("repaired", 0)
-                    if repair.get("unrepairable"):
-                        report["episodes_unrepairable"] = repair["unrepairable"]
-                    if repair.get("limit_reached") or repair.get("scan_truncated"):
-                        # This is the only production caller, so dropping these
-                        # here means nothing ever reports that candidates went
-                        # unexamined. Truncation counts too: it leaves rows
-                        # unseen AND blocks retirement, so the pass repeats
-                        # nightly while the report looks idle (codex r2/r7 P2).
-                        report["episode_repair_limit_reached"] = True
-            except Exception as e:  # noqa: BLE001
-                logger.warning("episode repair pass failed: %s", e)
-                report["episodes_repaired"] = 0
-                report["episode_repair_error"] = str(e)
-
             # Get total message count
             count = await self._db.fetchval(
                 "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ?",
@@ -1319,76 +1293,6 @@ class MemoryConsolidator:
                 "sources: %s", episode_id, e,
             )
             raise
-
-    #: Marker name for the one-shot repair, in the shared ``schema_backfills``
-    #: table. Agent-scoped: each agent's corpus is repaired independently.
-    _REPAIR_BACKFILL = "ciphertext_episode_repair_2856"
-
-    async def _repair_ciphertext_episodes_once(self) -> Optional[Dict[str, Any]]:
-        """Run the repair until this agent's episodes are clean, then retire.
-
-        The damage is a CLOSED set: #2850 stopped new episodes being built from
-        the at-rest envelope, so nothing can join it. A pass that finds nothing
-        left to repair has therefore finished for good, and re-running it every
-        night would only re-decrypt healthy episodes that merely mention the
-        envelope format, forever.
-
-        Completion requires a genuinely clean sweep — nothing repaired, nothing
-        outstanding, nothing left unexamined. A pass that repaired something,
-        hit a transient failure, or ran out of budget does NOT retire, so the
-        next sleep picks up where it left off. The cost of that conservatism is
-        one extra pass per agent; the cost of the alternative is a
-        single hiccup permanently skipping an agent's repair.
-
-        Deliberately NOT wrapped in ``migration_lock``, despite reusing its
-        marker table. That helper is for schema migrations at init: it opens
-        ONE transaction — ``BEGIN IMMEDIATE`` on SQLite, taking the writer slot
-        outright — and requires the whole migration to run inside it. This pass
-        breaks every assumption behind that contract:
-
-        * it acquires the agent's privacy-transition lock per episode, while a
-          live streamed turn takes that lock FIRST and then writes the
-          conversation. Database-then-transition here against
-          transition-then-database there is an ABBA deadlock that hangs both
-          the turn and consolidation (codex review r6 P1);
-        * ``_embed_episode`` makes a remote call per repaired episode, so the
-          writer slot would be held across the network for the whole pass,
-          blocking every conversation and feature write;
-        * a per-candidate failure is caught so one bad episode cannot cost the
-          rest, but on PostgreSQL that leaves an aborted transaction in which
-          no later statement can run and the final commit discards repairs the
-          report already counted.
-
-        Losing the mutual exclusion costs nothing here. The pass is idempotent
-        — every write is conditional and a repaired episode leaves the
-        pre-filter — so two overlapping runs duplicate work rather than corrupt
-        anything, and ``mark_backfill_completed`` is itself an upsert. That is
-        a far better trade than a writer lock held across nested locks and
-        network calls.
-
-        Returns the pass report, or ``None`` when the repair had already
-        retired and did not run.
-        """
-        name = f"{self._REPAIR_BACKFILL}:{self.agent_id}"
-        if await self._db.backfill_completed(name):
-            return None
-
-        report = await self.repair_ciphertext_episodes()
-
-        settled = (
-            report.get("repaired") == 0
-            and not report.get("unrepairable")
-            and not report.get("limit_reached")
-            and not report.get("scan_truncated")
-            and not report.get("skipped")
-        )
-        if settled:
-            await self._db.mark_backfill_completed(name)
-            logger.info(
-                "ciphertext-episode repair is complete for %s; it will not "
-                "run again", self.agent_id,
-            )
-        return report
 
     async def repair_ciphertext_episodes(
         self, *, dry_run: bool = False, limit: int = 100,

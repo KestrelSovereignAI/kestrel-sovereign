@@ -1528,19 +1528,6 @@ class AsyncDatabase:
         """
         await self.execute(sql)
 
-    async def backfill_completed(self, name: str) -> bool:
-        """Public: has the named one-time backfill already recorded success?
-
-        Exposed so one-shot data repairs that live outside ``_init_schema``
-        (the ciphertext-episode repair in #2856) can use the same marker table
-        as the schema backfills instead of inventing their own bookkeeping.
-        """
-        return await self._backfill_completed(name)
-
-    async def mark_backfill_completed(self, name: str) -> None:
-        """Public companion to :meth:`backfill_completed`. Idempotent."""
-        await self._mark_backfill_completed(name)
-
     async def _backfill_completed(self, name: str) -> bool:
         """True if the named one-time backfill has already recorded success.
 
