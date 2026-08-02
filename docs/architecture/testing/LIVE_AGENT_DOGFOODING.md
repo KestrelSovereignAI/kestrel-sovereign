@@ -99,9 +99,23 @@ object (e.g. `kestrel restart <name>`) does **not** reload changed module code.
    checkout's code and lose isolation. Find your worktree with `git worktree list`; confirm the
    loaded code with:
    ```bash
-   <worktree>/.venv/bin/python -c "import importlib.util; print(importlib.util.find_spec('kestrel_sovereign').origin)"
+   cd <worktree> && ./.venv/bin/python -c "import importlib.util; print(importlib.util.find_spec('kestrel_sovereign').origin)"
    ```
    (must resolve inside the worktree).
+
+   **Run that check from a directory that does not itself contain a
+   `kestrel_sovereign/` package** — the worktree or any neutral path is fine, the
+   primary checkout is not. `python -c` puts the current directory first on
+   `sys.path`, so running it from the primary checkout resolves to *that* source
+   whichever interpreter you used, and reports a leak that isn't there. (Observed
+   2026-08-02: a correctly-installed worktree venv reported the primary
+   checkout's path, and an uninstall/reinstall "fix" changed nothing because
+   nothing was broken.)
+
+   The same shadowing is why **cwd matters when you launch the host**: start it
+   from the worktree or the test `KESTREL_HOME`, never from the primary
+   checkout, or you silently serve the primary checkout's code — the exact
+   failure this step exists to catch.
 2. **Kill by PORT/PID — never by app-module name.** A test host and a production host run the
    *byte-identical* command `uvicorn kestrel_sovereign.server:app ... --port <N>` (only the port
    differs), so `pkill -f "kestrel_sovereign.server:app"` **also kills production**. Instead:
