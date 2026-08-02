@@ -13,6 +13,7 @@ rather than mocked.
 """
 
 import json
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
@@ -1282,3 +1283,80 @@ class TestIdempotence:
             assert second["repaired"] == 0
         finally:
             await db.close()
+
+
+class TestFinalReviewFindings:
+    """codex review of the manual-pass restructure."""
+
+    @pytest.mark.asyncio
+    async def test_hidden_source_rows_block_repair(self, tmp_path):
+        """`metadata.excluded_from_context` hides a row without deleting it.
+
+        Compaction, stashing and the fact lifecycle all use it, and
+        `_create_episodes` skips such rows outright. Repair must match, or it
+        rebuilds a title from content deliberately taken out of context.
+        """
+        db, ids, store = await _corrupt_fixture(tmp_path)
+        row = await db.fetchall(
+            "SELECT metadata FROM conversation_history WHERE id = ?", (ids[0],)
+        )
+        meta = json.loads(row[0][0])
+        meta["excluded_from_context"] = True
+        await db.execute(
+            "UPDATE conversation_history SET metadata = ? WHERE id = ?",
+            (json.dumps(meta), ids[0]),
+        )
+        c = _consolidator(db, store, _RecordingGraphStore(db))
+        try:
+            report = await c.repair_ciphertext_episodes()
+
+            assert report["repaired"] == 0
+            assert report["unrepairable"][0]["reason"] == "sources_missing"
+            assert await db.fetchval(
+                "SELECT title FROM memory_episodes WHERE id = ?",
+                ("episode:corrupt",)
+            ) == CORRUPT_TITLE
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_a_zero_budget_writes_nothing(self, tmp_path):
+        """A nominal zero-write bound must not be destructive."""
+        db, ids, store = await _corrupt_fixture(tmp_path)
+        c = _consolidator(db, store, _RecordingGraphStore(db))
+        try:
+            report = await c.repair_ciphertext_episodes(limit=0)
+
+            assert report["repaired"] == 0
+            assert await db.fetchval(
+                "SELECT title FROM memory_episodes WHERE id = ?",
+                ("episode:corrupt",)
+            ) == CORRUPT_TITLE
+        finally:
+            await db.close()
+
+    def test_backup_is_owner_only(self, tmp_path):
+        """The copy holds the whole conversation history."""
+        import stat
+        import sqlite3
+        import sys
+
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+        from repair_ciphertext_episodes import _backup
+
+        source = tmp_path / "agent.db"
+        conn = sqlite3.connect(str(source))
+        conn.execute("CREATE TABLE t (a INTEGER)")
+        conn.commit()
+        conn.close()
+        source.chmod(0o600)
+
+        target = _backup(source)
+        try:
+            mode = stat.S_IMODE(target.stat().st_mode)
+            assert mode == 0o600, (
+                f"backup is {oct(mode)}; sqlite3.connect creates 0644 under a "
+                "022 umask, publishing private agent state"
+            )
+        finally:
+            target.unlink(missing_ok=True)

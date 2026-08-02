@@ -31,7 +31,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,11 +59,26 @@ def _parse_args(argv=None) -> argparse.Namespace:
 
 def _backup(db_path: Path) -> Path:
     """Copy the database before mutating it, using SQLite's own backup API so
-    a live WAL cannot produce a torn copy."""
+    a live WAL cannot produce a torn copy.
+
+    The copy holds the agent's entire conversation history, so it is created
+    owner-only BEFORE SQLite opens it: ``sqlite3.connect`` would otherwise
+    create it 0644 under a typical 022 umask, publishing private state to every
+    local user who can traverse the directory — regardless of the source being
+    0600. Any stricter mode on the source is carried over.
+    """
+    import os
     import sqlite3
+    import stat
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     target = db_path.with_name(f"{db_path.name}.pre-2856-{stamp}")
+
+    source_mode = stat.S_IMODE(db_path.stat().st_mode)
+    mode = source_mode & 0o600 if source_mode else 0o600
+    fd = os.open(str(target), os.O_CREAT | os.O_WRONLY | os.O_EXCL, mode)
+    os.close(fd)
+
     src = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     dst = sqlite3.connect(str(target))
     try:
@@ -73,6 +87,8 @@ def _backup(db_path: Path) -> Path:
     finally:
         src.close()
         dst.close()
+    # SQLite may create sidecars; make sure nothing widened the target.
+    os.chmod(str(target), mode)
     return target
 
 
@@ -143,6 +159,9 @@ def main(argv=None) -> int:
     db_path = Path(args.db)
     if not db_path.exists():
         print(f"No such database: {db_path}", file=sys.stderr)
+        return 2
+    if args.limit < 1:
+        print("--limit must be at least 1", file=sys.stderr)
         return 2
 
     if args.apply and not args.no_backup:

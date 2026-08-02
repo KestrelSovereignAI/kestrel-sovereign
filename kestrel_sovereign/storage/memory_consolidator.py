@@ -1056,6 +1056,15 @@ class MemoryConsolidator:
                         metadata = json.loads(metadata)
                     except (json.JSONDecodeError, TypeError):
                         metadata = {}
+                if (metadata or {}).get("excluded_from_context"):
+                    # Compaction, stashing and the fact lifecycle all mark a
+                    # row hidden without deleting it, and `_create_episodes`
+                    # skips those rows outright. Repair must match, or it would
+                    # synthesize a fresh title from content deliberately taken
+                    # out of context. Leaving it out here makes the episode fail
+                    # the all-sources-present gate, so nothing is rewritten
+                    # (codex review r9 P1).
+                    continue
                 raw = "" if content is None else str(content)
                 found[str(msg_id)] = {
                     "id": msg_id,
@@ -1357,6 +1366,12 @@ class MemoryConsolidator:
             )
 
         for episode_id, title, summary, key_ids_json in candidates:
+            if report["repaired"] >= limit:
+                # Checked BEFORE the write path, not only after it: a limit of
+                # 0 would otherwise still repair the first candidate, making a
+                # nominal zero-write bound destructive (codex review r9 P2).
+                report["limit_reached"] = True
+                break
             episode_id = str(episode_id)
             try:
                 declared = json.loads(key_ids_json or "[]")
