@@ -312,14 +312,16 @@ test('sovereignty import and export read controls inside a closed shadow overlay
         sovereignty.initSovereigntyButtons();
 
         document.getElementById('btn-export-ipfs').click();
-        const filecoin = mount.querySelector('input[value="FILECOIN"]');
+        // Tier tokens are the lowercase values the endpoint allowlist accepts
+        // ('local' | 'ipfs' | 'filecoin'); uppercase values were rejected 400 (#2872).
+        const filecoin = mount.querySelector('input[value="filecoin"]');
         const encrypt = mount.querySelector('#export-encrypt');
         filecoin.checked = true;
         encrypt.checked = false;
         [...mount.querySelectorAll('.modal-btn')]
             .find((button) => button.textContent === 'Export').click();
         await tick();
-        assert.deepEqual(exports, [{ tier: 'FILECOIN', encrypt: false }]);
+        assert.deepEqual(exports, [{ tier: 'filecoin', encrypt: false }]);
 
         document.getElementById('btn-import').click();
         await delay(60);

@@ -361,7 +361,7 @@ function showExportModal() {
                         cursor: pointer;
                         transition: background 0.2s;
                     " onmouseover="this.style.background='var(--bg-primary)'" onmouseout="this.style.background='var(--bg-tertiary)'">
-                        <input type="radio" name="export-tier" value="LOCAL_ONLY" style="accent-color: var(--accent-color);">
+                        <input type="radio" name="export-tier" value="local" style="accent-color: var(--accent-color);">
                         <div>
                             <div style="font-weight: 500;">Local Only</div>
                             <div style="font-size: 0.8rem; color: var(--text-secondary);">Store in local cache (free)</div>
@@ -377,7 +377,7 @@ function showExportModal() {
                         cursor: pointer;
                         transition: background 0.2s;
                     " onmouseover="this.style.background='var(--bg-primary)'" onmouseout="this.style.background='var(--bg-tertiary)'">
-                        <input type="radio" name="export-tier" value="IPFS" checked style="accent-color: var(--accent-color);">
+                        <input type="radio" name="export-tier" value="ipfs" checked style="accent-color: var(--accent-color);">
                         <div>
                             <div style="font-weight: 500;">IPFS</div>
                             <div style="font-size: 0.8rem; color: var(--text-secondary);">Decentralized storage (recommended)</div>
@@ -393,7 +393,7 @@ function showExportModal() {
                         cursor: pointer;
                         transition: background 0.2s;
                     " onmouseover="this.style.background='var(--bg-primary)'" onmouseout="this.style.background='var(--bg-tertiary)'">
-                        <input type="radio" name="export-tier" value="FILECOIN" style="accent-color: var(--accent-color);">
+                        <input type="radio" name="export-tier" value="filecoin" style="accent-color: var(--accent-color);">
                         <div>
                             <div style="font-weight: 500;">Filecoin</div>
                             <div style="font-size: 0.8rem; color: var(--text-secondary);">Long-term archival storage</div>
@@ -427,7 +427,10 @@ function showExportModal() {
                 const tierInput = exportModal.querySelector('input[name="export-tier"]:checked');
                 const encryptInput = exportModal.querySelector('#export-encrypt');
 
-                const tier = tierInput?.value || 'IPFS';
+                // Tier tokens must match the endpoint allowlist (lowercase
+                // 'local' | 'ipfs' | 'filecoin'); uppercase values were
+                // rejected with HTTP 400 so no console export ever ran (#2872).
+                const tier = tierInput?.value || 'ipfs';
                 const encrypt = encryptInput?.checked ?? true;
 
                 try {
@@ -436,7 +439,14 @@ function showExportModal() {
                     try {
                         Toast.info('Starting export...');
                         const result = await API.exportSovereignty(tier, encrypt);
-                        Toast.success(result.message || 'Export completed successfully!');
+                        // A PARTIAL export (e.g. a requested off-host tier that
+                        // resolved to a local-only copy) must surface its
+                        // caveat, not a plain success toast (#2872).
+                        if (result && (result.status === 'partial' || result.error)) {
+                            Toast.warning(result.error || result.message || 'Export completed with warnings.');
+                        } else {
+                            Toast.success(result.message || 'Export completed successfully!');
+                        }
                         loadExports();
                     } catch (e) {
                         Toast.error(`Export failed: ${e.message}`);
