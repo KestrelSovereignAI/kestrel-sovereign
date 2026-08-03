@@ -13,6 +13,7 @@ import-light and these tests follow.
 from __future__ import annotations
 
 import importlib.util
+import io
 import sqlite3
 import subprocess
 import sys
@@ -39,6 +40,16 @@ def _load_module():
 
 
 verify = _load_module()
+
+
+class _StrictCp1252Writer(io.StringIO):
+    @property
+    def encoding(self) -> str:
+        return "cp1252"
+
+    def write(self, value: str) -> int:
+        value.encode(self.encoding, errors="strict")
+        return super().write(value)
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +326,25 @@ def test_run_captured_preserves_invalid_utf8_from_failed_child():
     assert result.returncode == 3
     assert result.stdout == "ready \\x9d"
     assert result.stderr == "failed \\x81"
+
+
+def test_captured_output_is_safe_for_strict_cp1252_streams():
+    script = (
+        "import sys; "
+        "sys.stdout.buffer.write(b'ready \\x9d \\xef\\xbf\\xbd'); "
+        "sys.stderr.buffer.write(b'failed \\x81 \\xe2\\x98\\x83'); "
+        "raise SystemExit(3)"
+    )
+    result = verify._run_captured([sys.executable, "-c", script])
+    stdout = _StrictCp1252Writer()
+    stderr = _StrictCp1252Writer()
+
+    verify._write_captured(stdout, result.stdout)
+    verify._write_captured(stderr, result.stderr)
+
+    assert result.returncode == 3
+    assert stdout.getvalue() == "ready \\x9d \\ufffd"
+    assert stderr.getvalue() == "failed \\x81 \\u2603"
 
 
 def test_kestrel_uses_current_interpreter_and_module_entrypoint(monkeypatch):
