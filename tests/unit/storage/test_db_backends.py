@@ -10,7 +10,6 @@ import aiosqlite
 import pytest
 from kestrel_sovereign.storage.db import (
     ConnectionError,
-    DatabaseBackend,
     SQLiteBackend,
     sqlite_to_postgres,
     postgres_to_sqlite,
@@ -19,6 +18,7 @@ from kestrel_sovereign.storage.db import (
 from tests.utils.aiosqlite_workers import (
     aiosqlite_worker,
     delay_aiosqlite_worker_exit,
+    wait_for_lifecycle_checkpoint,
     wait_until_aiosqlite_worker_exit_is_delayed,
 )
 
@@ -356,8 +356,10 @@ class TestSQLiteBackend:
         close_task = asyncio.create_task(backend.close())
 
         try:
-            await asyncio.wait_for(
-                wait_until_aiosqlite_worker_exit_is_delayed(worker_exit_delayed), timeout=1.0,
+            await wait_for_lifecycle_checkpoint(
+                wait_until_aiosqlite_worker_exit_is_delayed(worker_exit_delayed),
+                close_task,
+                description="the SQLite worker exit delay",
             )
             assert workers == [worker]
             assert not close_task.done()
@@ -389,11 +391,12 @@ class TestSQLiteBackend:
             close_task = asyncio.create_task(backend.close())
 
             try:
-                await asyncio.wait_for(
+                await wait_for_lifecycle_checkpoint(
                     wait_until_aiosqlite_worker_exit_is_delayed(
                         worker_exit_delayed,
                     ),
-                    timeout=1.0,
+                    close_task,
+                    description="the cancelled SQLite worker exit delay",
                 )
                 assert workers == [worker]
                 close_task.cancel()
@@ -455,8 +458,10 @@ class TestSQLiteBackend:
         with delay_aiosqlite_worker_exit(release_worker, worker_exit_delayed) as workers:
             backup_task = asyncio.create_task(backend.backup_to(str(tmp_path / "backup.db")))
             try:
-                await asyncio.wait_for(
-                    wait_until_aiosqlite_worker_exit_is_delayed(worker_exit_delayed), timeout=1.0,
+                await wait_for_lifecycle_checkpoint(
+                    wait_until_aiosqlite_worker_exit_is_delayed(worker_exit_delayed),
+                    backup_task,
+                    description="the backup worker exit delay",
                 )
                 assert len(workers) == 1
                 worker = workers[0]
@@ -489,9 +494,10 @@ class TestSQLiteBackend:
                 ) as workers:
                     read_task = asyncio.create_task(backend.fetch_all("SELECT id FROM t"))
                     try:
-                        await asyncio.wait_for(
+                        await wait_for_lifecycle_checkpoint(
                             wait_until_aiosqlite_worker_exit_is_delayed(worker_exit_delayed),
-                            timeout=1.0,
+                            read_task,
+                            description="the snapshot worker exit delay",
                         )
                         assert len(workers) == 1
                         worker = workers[0]
@@ -527,9 +533,10 @@ class TestSQLiteBackend:
             ):
                 open_task = asyncio.create_task(backend._open_snapshot_read_connection())
                 try:
-                    await asyncio.wait_for(
+                    await wait_for_lifecycle_checkpoint(
                         wait_until_aiosqlite_worker_exit_is_delayed(worker_exit_delayed),
-                        timeout=1.0,
+                        open_task,
+                        description="the failed snapshot worker exit delay",
                     )
                     assert len(workers) == 1
                     worker = workers[0]
@@ -587,13 +594,18 @@ class TestAsyncDatabase:
             close_task = asyncio.create_task(db.close())
 
             try:
-                await asyncio.wait_for(factory_disposal_started.wait(), timeout=1.0)
+                await wait_for_lifecycle_checkpoint(
+                    factory_disposal_started.wait(),
+                    close_task,
+                    description="SQLAlchemy factory disposal started",
+                )
                 close_task.cancel()
-                await asyncio.wait_for(
+                await wait_for_lifecycle_checkpoint(
                     wait_until_aiosqlite_worker_exit_is_delayed(
                         worker_exit_delayed,
                     ),
-                    timeout=1.0,
+                    close_task,
+                    description="primary SQLite worker exit was delayed",
                 )
                 assert workers == [worker]
                 assert not close_task.done()
@@ -715,11 +727,18 @@ class TestAsyncDatabase:
                 ):
                     close_task = asyncio.create_task(db.close())
 
-                    await asyncio.wait_for(
+                    # Unlike the other checkpoints, this drain is patched to
+                    # 0.01s and db.close() is *asserted* to raise below, so
+                    # close_task finishing first is an expected order rather
+                    # than a lifecycle regression.  The held worker still sets
+                    # the checkpoint on its way out.
+                    await wait_for_lifecycle_checkpoint(
                         wait_until_aiosqlite_worker_exit_is_delayed(
                             worker_exit_delayed,
                         ),
-                        timeout=1.0,
+                        close_task,
+                        description="the failed factory worker exit delay",
+                        require_live_lifecycle=False,
                     )
                     assert workers == [factory_worker]
                     assert factory_worker.is_alive()
@@ -826,11 +845,12 @@ class TestAsyncDatabase:
                 worker = aiosqlite_worker(connection)
                 close_task = asyncio.create_task(factory.close())
                 try:
-                    await asyncio.wait_for(
+                    await wait_for_lifecycle_checkpoint(
                         wait_until_aiosqlite_worker_exit_is_delayed(
                             worker_exit_delayed,
                         ),
-                        timeout=1.0,
+                        close_task,
+                        description="the SQLAlchemy worker exit delay",
                     )
                     assert workers == [worker]
                     assert not close_task.done()
@@ -875,11 +895,12 @@ class TestAsyncDatabase:
                 worker = aiosqlite_worker(connection)
                 close_task = asyncio.create_task(factory.close())
                 try:
-                    await asyncio.wait_for(
+                    await wait_for_lifecycle_checkpoint(
                         wait_until_aiosqlite_worker_exit_is_delayed(
                             worker_exit_delayed,
                         ),
-                        timeout=1.0,
+                        close_task,
+                        description="the cancelled SQLAlchemy worker exit delay",
                     )
                     assert workers == [worker]
                     close_task.cancel()
