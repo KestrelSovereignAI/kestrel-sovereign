@@ -29,6 +29,14 @@ prevention of a new one.
 Nothing here computes an embedding. The vectors were computed once at
 inception and are copied verbatim, so the copy is pure I/O and can safely be
 one transaction on the target.
+
+What is NOT copied: the ``conversation_history`` row inception writes when the
+genesis audit passes. The audit's authoritative receipt is the ``genesis_audit``
+property on the agent node, which ``agent/constitution.py`` reads and which does
+cross; the conversation row is a second, narrative witness. Carrying it would
+mean going through ``AsyncConversationStore.add_conversation``, which computes
+an embedding — putting model inference back inside this transaction, the one
+thing the design is built to avoid. Tracked on #2871 rather than done badly.
 """
 
 from __future__ import annotations
@@ -90,21 +98,12 @@ class ReplicationResult:
     edges: int = 0
     files: int = 0
     chunks: int = 0
-    #: Files the anchor claims this agent owns but whose bytes are not there —
-    #: a dangling ``file_owners`` row. Recorded rather than dropped: a partial
-    #: copy that reports success is the defect this module exists to remove.
-    #: (A file present but undecryptable raises instead; a wrong
-    #: ``KESTREL_DATA_KEY`` is not something to carry on past.)
-    skipped_files: List[str] = field(default_factory=list)
 
     def describe(self) -> str:
-        base = (
+        return (
             f"{self.nodes} nodes, {self.edges} edges, {self.files} files, "
             f"{self.chunks} chunks"
         )
-        if self.skipped_files:
-            base += f" ({len(self.skipped_files)} file(s) unreadable and skipped)"
-        return base
 
 
 def local_anchor_path(storage_path: Optional[str]) -> Optional[Path]:
@@ -148,12 +147,19 @@ async def diagnose_birth_record(
     Cheap enough to run on every boot: three lookups and two counts. Returns an
     empty divergence — the overwhelmingly common case — when the runtime
     database already holds the record.
+
+    Both stores are BOUND to the agent, so this measures exactly the set
+    :func:`replicate_birth_record` is able to write, and exactly the set the
+    running agent will later read through its own bound storage. An unbound
+    verifier sees rows with no ownership witness — which the bound copier
+    cannot produce — and would refuse the boot forever over a difference no
+    retry could close.
     """
     from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore
 
     divergence = BirthRecordDivergence()
 
-    anchor_graph = AsyncGraphStore(anchor_db)
+    anchor_graph = AsyncGraphStore(anchor_db, agent_id=agent_did)
     anchor_node = await anchor_graph.get_node(agent_did)
     if anchor_node is None:
         # No birth record in the anchor either. There is nothing to copy, and
@@ -161,7 +167,7 @@ async def diagnose_birth_record(
         # caller's refusal is what covers that.
         return divergence
 
-    runtime_graph = AsyncGraphStore(runtime_db)
+    runtime_graph = AsyncGraphStore(runtime_db, agent_id=agent_did)
     runtime_node = await runtime_graph.get_node(agent_did)
     if runtime_node is None:
         divergence.reasons.append("agent node absent from the runtime database")
@@ -199,8 +205,21 @@ async def diagnose_birth_record(
 
 
 async def _owned_chunk_count(db: "AsyncDatabase", agent_did: str) -> int:
+    """Count the chunks replication can actually move — and RAG can retrieve.
+
+    Joined through ``file_owners`` for the same reason the graph stores above
+    are bound: a chunk-owner row whose file this agent does not own is outside
+    ``AsyncRAGStore``'s tenant scope, so the copier will never write it and the
+    agent could never retrieve it. Counting it would make the post-copy check
+    demand a row nothing can produce.
+    """
     row = await db.fetchone(
-        "SELECT COUNT(*) FROM document_chunk_owners WHERE agent_id = ?",
+        "SELECT COUNT(*) FROM document_chunk_owners owners "
+        "JOIN document_chunks chunks ON chunks.chunk_id = owners.chunk_id "
+        "JOIN file_owners files "
+        "  ON files.content_hash = chunks.file_hash "
+        " AND files.agent_id = owners.agent_id "
+        "WHERE owners.agent_id = ?",
         (agent_did,),
     )
     return int(row[0]) if row else 0
@@ -250,6 +269,28 @@ async def replicate_birth_record(
         )
 
     edges = await anchor_graph.get_edges(agent_did, direction="out")
+    # A bound store only sees edges carrying this agent's ownership witness, so
+    # an anchor edge without one is invisible to the copier — it would commit an
+    # agent node whose ``constitution_hash`` names a node it never wrote, i.e.
+    # the "recorded but not governed" state #2867 exists to prevent, and no
+    # later boot would notice. Refuse with the reason instead. (The #2649
+    # ownership backfill skips edges it cannot prove a common owner for, so this
+    # is a shape a real anchor can carry.)
+    all_edges = {
+        (edge.source_id, edge.target_id, edge.label)
+        for edge in await AsyncGraphStore(anchor_db).get_edges(
+            agent_did, direction="out",
+        )
+    }
+    unwitnessed = all_edges - {(e.source_id, e.target_id, e.label) for e in edges}
+    if unwitnessed:
+        raise ValueError(
+            f"the local anchor holds outgoing edges for {agent_did} with no "
+            f"ownership witness for it ({sorted(l for _, _, l in unwitnessed)}); "
+            "replicating would record the agent without them. Repair the "
+            "anchor's graph_edge_owners rows before booting against another "
+            "database."
+        )
     # Read the whole record before opening the write transaction: the anchor is
     # a second connection to a second database, and a read on it inside the
     # target's transaction would hold that transaction open across it.
@@ -286,6 +327,16 @@ async def replicate_birth_record(
     payloads = []
     for content_hash, original_name in file_rows:
         content = await anchor_files.retrieve_file(content_hash)
+        if content is None:
+            # A file_owners row with no file bytes. The anchor cannot produce
+            # this part of the record and no later boot can either, so say so
+            # here — before a write transaction is opened — rather than
+            # committing a record whose chunks can never arrive.
+            raise ValueError(
+                f"the local anchor claims {agent_did} owns file {content_hash} "
+                f"({original_name}) but holds no bytes for it; the birth record "
+                "cannot be replicated from it."
+            )
         metadata = await anchor_files.get_file_metadata(content_hash) or {}
         chunks = await anchor_rag.read_indexed_chunks(content_hash)
         payloads.append((content_hash, original_name, content, metadata, chunks))
@@ -293,6 +344,26 @@ async def replicate_birth_record(
     result = ReplicationResult()
 
     async with runtime_db.transaction():
+        # Files BEFORE nodes, which is inception's order (store_file at
+        # inception_service.py:873, add_node at :977) and is load-bearing on a
+        # runtime database shared by more than one agent — the deployment
+        # PostgreSQL exists for. The constitution node is content-addressed, so
+        # every agent under the same constitution shares one row, and
+        # ``add_node`` admits a second tenant's ownership witness on a shared
+        # content node only if that tenant already owns the underlying file
+        # (``owns_content_reference``). Writing nodes first makes the second
+        # agent raise "Cannot overwrite a graph node owned by another agent",
+        # roll the whole copy back, and never boot.
+        for content_hash, original_name, content, metadata, _chunks in payloads:
+            # ``enc`` describes how the *source* row was stored. The target
+            # re-encrypts under its own configuration, so carrying the flag
+            # across would mark a plaintext row as encrypted.
+            metadata.pop("enc", None)
+            await runtime_files.store_file(
+                content, original_name or content_hash, metadata=metadata,
+            )
+            result.files += 1
+
         # The agent node and everything it is governed by land together. A
         # present agent node makes every later boot treat inception as done, so
         # an agent recorded without its governing edge is never repaired
@@ -319,27 +390,46 @@ async def replicate_birth_record(
                 )
             result.edges += 1
 
-        for content_hash, original_name, content, metadata, chunks in payloads:
-            if content is None:
-                result.skipped_files.append(content_hash)
-                logger.error(
-                    "Birth-record file %s (%s) could not be read from the local "
-                    "anchor; its chunks will not be replicated.",
-                    content_hash, original_name,
-                )
-                continue
-            # ``enc`` describes how the *source* row was stored. The target
-            # re-encrypts under its own configuration, so carrying the flag
-            # across would mark a plaintext row as encrypted.
-            metadata.pop("enc", None)
-            await runtime_files.store_file(
-                content, original_name or content_hash, metadata=metadata,
-            )
-            result.files += 1
-
+        # Chunks last: ``store_precomputed_chunks`` refuses a file outside the
+        # bound agent, so the file_owners rows written above are its precondition.
+        expected_chunks = 0
+        for content_hash, _original_name, _content, _metadata, chunks in payloads:
             if chunks:
+                expected_chunks += len(chunks)
                 result.chunks += await runtime_rag.store_precomputed_chunks(
                     content_hash, chunks,
                 )
+
+        # Verify BEFORE committing, against what was read from the anchor
+        # rather than by re-reading it, so nothing on the anchor is touched
+        # inside this transaction. A store can report a write it did not
+        # durably make — that is the whole defect class this issue belongs to —
+        # and half a birth record must not survive the check. Raising here
+        # rolls the copy back, so the next boot retries from a clean state
+        # instead of inheriting an agent node with no governing edge (#2867).
+        written = await runtime_graph.get_node(agent_did)
+        if written is None or is_fabricated_placeholder(written, agent_did):
+            raise ValueError(
+                f"the agent node for {agent_did} is not readable in the runtime "
+                "database after writing it"
+            )
+        written_edges = {
+            (edge.source_id, edge.target_id, edge.label)
+            for edge in await runtime_graph.get_edges(agent_did, direction="out")
+        }
+        missing = {
+            (edge.source_id, edge.target_id, edge.label) for edge in edges
+        } - written_edges
+        if missing:
+            raise ValueError(
+                f"edges missing after writing them: "
+                f"{sorted(label for _, _, label in missing)}"
+            )
+        landed = await _owned_chunk_count(runtime_db, agent_did)
+        if landed < expected_chunks:
+            raise ValueError(
+                f"{expected_chunks} chunks were written but only {landed} are "
+                "readable in the runtime database"
+            )
 
     return result

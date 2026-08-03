@@ -325,6 +325,65 @@ async def test_replication_converges_after_an_interrupted_pass(
 
 
 @pytest.mark.asyncio
+async def test_two_agents_replicate_into_one_shared_runtime_database(
+    tmp_path, hybrid_env,
+):
+    """PostgreSQL exists here to host many agents in one database, and the
+    constitution node is content-addressed — every agent under the same
+    constitution shares that one row.
+
+    ``AsyncGraphStore.add_node`` lets a second tenant attach its ownership
+    witness to a shared content node only when it already owns the underlying
+    file. So the file rows have to be written BEFORE the nodes, which is the
+    order inception uses. With nodes first, agent two cannot boot at all, and
+    no later boot repairs it.
+    """
+    a_dir, b_dir = tmp_path / "a", tmp_path / "b"
+    a_dir.mkdir()
+    b_dir.mkdir()
+    creds_a = await create_kestrel_identity_async(
+        str(a_dir), None, agent_name="Bird A",
+    )
+    creds_b = await create_kestrel_identity_async(
+        str(b_dir), None, agent_name="Bird B",
+    )
+    anchor_a = await AsyncDatabase.sqlite(str(a_dir / "kestrel_prime.db"))
+    anchor_b = await AsyncDatabase.sqlite(str(b_dir / "kestrel_prime.db"))
+    shared = await AsyncDatabase.sqlite(str(tmp_path / "shared_runtime.db"))
+    try:
+        hash_a = (
+            await AsyncGraphStore(anchor_a).get_node(creds_a.agent_did)
+        ).properties["constitution_hash"]
+        hash_b = (
+            await AsyncGraphStore(anchor_b).get_node(creds_b.agent_did)
+        ).properties["constitution_hash"]
+        assert hash_a == hash_b, "same constitution must be one shared node"
+
+        await replicate_birth_record(
+            runtime_db=shared, anchor_db=anchor_a, agent_did=creds_a.agent_did,
+        )
+        await replicate_birth_record(
+            runtime_db=shared, anchor_db=anchor_b, agent_did=creds_b.agent_did,
+        )
+
+        for did, name in ((creds_a.agent_did, "Bird A"), (creds_b.agent_did, "Bird B")):
+            node = await AsyncGraphStore(shared).get_node(did)
+            assert node is not None and node.label == name
+            assert await _chunk_count(shared, did) > 0
+        owners = {
+            row[0]
+            for row in await shared.fetchall(
+                "SELECT agent_id FROM graph_node_owners WHERE node_id = ?",
+                (hash_a,),
+            )
+        }
+        assert owners == {creds_a.agent_did, creds_b.agent_did}
+    finally:
+        for db in (anchor_a, anchor_b, shared):
+            await db.close()
+
+
+@pytest.mark.asyncio
 async def test_replication_carries_a_child_edge_without_claiming_the_parent(
     tmp_path, hybrid_env,
 ):
@@ -397,6 +456,123 @@ async def test_diagnose_is_silent_when_the_anchor_holds_no_record(
             anchor_db=anchor,
             agent_did=f"did:web:{TEST_DOMAIN}:no-anchor-record",
         )
+    finally:
+        await anchor.close()
+        await runtime.close()
+
+
+# ---------------------------------------------------------------------------
+# Damaged anchors: refuse with the reason, never commit half a record
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_file_row_without_bytes_refuses_and_commits_nothing(
+    tmp_path, hybrid_env,
+):
+    """A ``file_owners`` row whose file is gone cannot be replicated by this or
+    any later boot. Say that, rather than committing a record whose chunks can
+    never arrive and letting the post-copy check reject it with a vaguer
+    reason."""
+    creds, anchor = await _incept(tmp_path, name="Dangling Bird")
+    runtime = await _fresh_runtime(tmp_path)
+    try:
+        await anchor.execute("DELETE FROM files", ())
+
+        with pytest.raises(ValueError, match="holds no bytes"):
+            await replicate_birth_record(
+                runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
+            )
+
+        # Nothing half-written: no agent node, no chunks.
+        assert await AsyncGraphStore(runtime).get_node(creds.agent_did) is None
+        assert await _chunk_count(runtime, creds.agent_did) == 0
+    finally:
+        await anchor.close()
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_an_edge_without_an_ownership_witness_refuses(tmp_path, hybrid_env):
+    """The copier writes through a bound store, so an anchor edge with no
+    ownership witness is invisible to it. Copying the rest would record the
+    agent with a ``constitution_hash`` naming a node that was never written —
+    "recorded but not governed" (#2867), and silent. Refuse instead."""
+    creds, anchor = await _incept(tmp_path, name="Unwitnessed Bird")
+    runtime = await _fresh_runtime(tmp_path)
+    try:
+        await anchor.execute("DELETE FROM graph_edge_owners", ())
+
+        with pytest.raises(ValueError, match="no ownership witness"):
+            await replicate_birth_record(
+                runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
+            )
+        assert await AsyncGraphStore(runtime).get_node(creds.agent_did) is None
+    finally:
+        await anchor.close()
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_diagnosis_measures_only_what_replication_can_write(
+    tmp_path, hybrid_env,
+):
+    """Verifier and copier must agree on the row set. A chunk-owner row whose
+    file this agent does not own is outside the RAG store's tenant scope, so
+    replication can never move it — counting it would demand a row nothing can
+    produce and refuse the boot on every future attempt."""
+    creds, anchor = await _incept(tmp_path, name="Scoped Bird")
+    runtime = await _fresh_runtime(tmp_path)
+    try:
+        await replicate_birth_record(
+            runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
+        )
+        assert not await diagnose_birth_record(
+            runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
+        )
+
+        # An orphan chunk-owner row on the anchor: owned chunk, unowned file.
+        await anchor.execute(
+            "INSERT INTO document_chunks (file_hash, content) VALUES (?, ?)",
+            ("a-file-this-agent-does-not-own", "orphan"),
+        )
+        row = await anchor.fetchone("SELECT last_insert_rowid()")
+        await anchor.execute(
+            "INSERT INTO document_chunk_owners (chunk_id, agent_id) VALUES (?, ?)",
+            (int(row[0]), creds.agent_did),
+        )
+
+        assert not await diagnose_birth_record(
+            runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
+        ), "an unreachable chunk must not produce a refusal no retry can clear"
+    finally:
+        await anchor.close()
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_a_write_that_did_not_land_rolls_the_whole_copy_back(
+    tmp_path, hybrid_env, monkeypatch,
+):
+    """Verify before committing, not after. A store that reports a write it did
+    not make is this defect class exactly, so the copy re-reads its own work
+    inside the transaction — and half a birth record must not survive."""
+    creds, anchor = await _incept(tmp_path, name="Silent Bird")
+    runtime = await _fresh_runtime(tmp_path)
+    try:
+        async def _swallow_the_edge(self, *args, **kwargs):
+            return None
+
+        monkeypatch.setattr(AsyncGraphStore, "add_edge", _swallow_the_edge)
+
+        with pytest.raises(Exception, match="edges missing after writing them"):
+            await replicate_birth_record(
+                runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
+            )
+
+        # Not "agent recorded but not governed" (#2867) — nothing at all.
+        assert await AsyncGraphStore(runtime).get_node(creds.agent_did) is None
+        assert await _chunk_count(runtime, creds.agent_did) == 0
     finally:
         await anchor.close()
         await runtime.close()
@@ -666,6 +842,38 @@ async def test_precomputed_chunks_replace_rather_than_accumulate(tmp_path):
         assert [c.content for c in await rag.read_indexed_chunks(file_hash)] == [
             "alpha", "beta",
         ]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_precomputed_chunks_store_text_when_there_is_no_vector(tmp_path):
+    """Inception on a host with no embedding service produces chunks with no
+    vectors. Those still have to cross — the text is what BM25 and the
+    in-Python fallback search."""
+    db = await AsyncDatabase.sqlite(str(tmp_path / "chunks.db"))
+    try:
+        from kestrel_sovereign.storage.async_file_store import AsyncFileStore
+
+        agent = f"did:web:{TEST_DOMAIN}:unembedded"
+        files = AsyncFileStore(db, agent_id=agent)
+        file_hash = await files.store_file(b"plain text only", "doc.md")
+        rag = AsyncRAGStore(db, agent_id=agent)
+
+        written = await rag.store_precomputed_chunks(
+            file_hash, [IndexedChunk("alpha"), IndexedChunk("beta")],
+        )
+        assert written == 2
+
+        read_back = await rag.read_indexed_chunks(file_hash)
+        assert [c.content for c in read_back] == ["alpha", "beta"]
+        assert [c.embedding for c in read_back] == [[], []]
+        row = await db.fetchone(
+            "SELECT COUNT(*) FROM document_chunks "
+            "WHERE file_hash = ? AND embedding IS NULL",
+            (file_hash,),
+        )
+        assert int(row[0]) == 2
     finally:
         await db.close()
 

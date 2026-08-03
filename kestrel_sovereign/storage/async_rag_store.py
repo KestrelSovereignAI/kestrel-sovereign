@@ -423,22 +423,38 @@ class AsyncRAGStore:
         migration hasn't created the column yet on this DB, in which
         case the legacy ``embedding`` column is already written and
         search degrades to the in-Python fallback.
+
+        Each attempt runs in its own ``transaction()`` so "non-fatal"
+        stays true when a CALLER holds a transaction open. PostgreSQL
+        aborts the whole transaction on any failed statement, so an
+        unwrapped failure here would poison the caller's transaction:
+        every later statement raises, both fallbacks below are
+        swallowed at debug level, and the caller commits nothing while
+        being told it succeeded. Reproduced on a live PostgreSQL where
+        ``embedding_vec`` was deferred (``migrations.py`` skips the
+        column until the table has an embedded row, which is exactly a
+        fresh runtime database): 47 chunks reported written, 0
+        committed. A nested ``transaction()`` is a savepoint on
+        PostgreSQL (#1726) and a no-op yield on SQLite, so this
+        contains the damage without changing either backend's
+        semantics.
         """
         backend_type = getattr(self.db, "backend_type", None)
         try:
-            if backend_type == "postgres":
-                vec_text = "[" + ",".join(repr(float(v)) for v in embedding) + "]"
-                await self.db.execute(
-                    "UPDATE document_chunks SET embedding_vec = ?::vector, "
-                    "embedding_profile_id = ? WHERE chunk_id = ?",
-                    (vec_text, profile_id, chunk_id),
-                )
-            else:
-                await self.db.execute(
-                    "UPDATE document_chunks SET embedding_vec = ?, "
-                    "embedding_profile_id = ? WHERE chunk_id = ?",
-                    (_serialize_embedding(embedding), profile_id, chunk_id),
-                )
+            async with self.db.transaction():
+                if backend_type == "postgres":
+                    vec_text = "[" + ",".join(repr(float(v)) for v in embedding) + "]"
+                    await self.db.execute(
+                        "UPDATE document_chunks SET embedding_vec = ?::vector, "
+                        "embedding_profile_id = ? WHERE chunk_id = ?",
+                        (vec_text, profile_id, chunk_id),
+                    )
+                else:
+                    await self.db.execute(
+                        "UPDATE document_chunks SET embedding_vec = ?, "
+                        "embedding_profile_id = ? WHERE chunk_id = ?",
+                        (_serialize_embedding(embedding), profile_id, chunk_id),
+                    )
             return
         except Exception as e:
             # Partial-migration shape (only one of the two new columns
@@ -451,23 +467,24 @@ class AsyncRAGStore:
                 "trying each column independently.", chunk_id, e,
             )
 
-        # Best-effort vec-only write.
+        # Best-effort vec-only write. Own savepoint, same reason as above.
         try:
-            if backend_type == "postgres":
-                vec_text = "[" + ",".join(
-                    repr(float(v)) for v in embedding
-                ) + "]"
-                await self.db.execute(
-                    "UPDATE document_chunks SET embedding_vec = ?::vector "
-                    "WHERE chunk_id = ?",
-                    (vec_text, chunk_id),
-                )
-            else:
-                await self.db.execute(
-                    "UPDATE document_chunks SET embedding_vec = ? "
-                    "WHERE chunk_id = ?",
-                    (_serialize_embedding(embedding), chunk_id),
-                )
+            async with self.db.transaction():
+                if backend_type == "postgres":
+                    vec_text = "[" + ",".join(
+                        repr(float(v)) for v in embedding
+                    ) + "]"
+                    await self.db.execute(
+                        "UPDATE document_chunks SET embedding_vec = ?::vector "
+                        "WHERE chunk_id = ?",
+                        (vec_text, chunk_id),
+                    )
+                else:
+                    await self.db.execute(
+                        "UPDATE document_chunks SET embedding_vec = ? "
+                        "WHERE chunk_id = ?",
+                        (_serialize_embedding(embedding), chunk_id),
+                    )
         except Exception as e2:
             logger.debug(
                 "document_chunks.embedding_vec write failed for chunk "
@@ -479,11 +496,12 @@ class AsyncRAGStore:
         # chunk when only the Phase-2 column is missing.
         if profile_id is not None:
             try:
-                await self.db.execute(
-                    "UPDATE document_chunks SET embedding_profile_id = ? "
-                    "WHERE chunk_id = ?",
-                    (profile_id, chunk_id),
-                )
+                async with self.db.transaction():
+                    await self.db.execute(
+                        "UPDATE document_chunks SET embedding_profile_id = ? "
+                        "WHERE chunk_id = ?",
+                        (profile_id, chunk_id),
+                    )
             except Exception as e3:
                 logger.debug(
                     "document_chunks.embedding_profile_id write failed "
