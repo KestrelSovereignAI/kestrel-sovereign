@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from kestrel_sovereign.knowledge.registry import (
+    MANIFEST_RESOURCE,
     DuplicateNamespaceError,
     ExperimentalCapabilityError,
     ImportCycleError,
@@ -163,6 +164,108 @@ def test_missing_package_resource_is_rejected():
 
     with pytest.raises(MissingPackageResourceError, match="package resource is missing"):
         registry.verify_resources()
+
+
+def test_digest_pinned_resources_force_lf_checkout_bytes():
+    """Git must not rewrite immutable semantic resources on Windows."""
+    repository = Path(__file__).resolve().parents[2]
+    registry = load_knowledge_registry()
+    manifest_paths = {
+        Path("kestrel_sovereign") / resource.package_resource
+        for resource in registry.resources
+    }
+    manifest_paths.add(Path("kestrel_sovereign") / MANIFEST_RESOURCE)
+
+    # Assert the whole tracked tree, not only the manifest entries. Two tracked
+    # files under data/semantic are byte-pinned without appearing in
+    # registry.toml: tests/unit/test_knowledge_rdf_codec.py compares
+    # fixtures/rdf11-direct-language.nt byte-for-byte against codec output and
+    # reads its golden digests from fixtures/rdf11-projection-digests.txt. A
+    # glob narrowed to the manifest's own directories would satisfy every
+    # manifest entry and still corrupt those two on a CRLF checkout, so the
+    # rule — and this assertion — are pinned to the directory.
+    tracked = subprocess.run(
+        ["git", "ls-files", "--", "kestrel_sovereign/data/semantic"],
+        cwd=repository,
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        check=True,
+    )
+    tracked_paths = {Path(line) for line in tracked.stdout.splitlines() if line}
+    assert manifest_paths <= tracked_paths
+    assert Path(
+        "kestrel_sovereign/data/semantic/fixtures/rdf11-direct-language.nt"
+    ) in tracked_paths
+    resource_paths = sorted(tracked_paths)
+
+    check = subprocess.run(
+        [
+            "git",
+            "check-attr",
+            "text",
+            "eol",
+            "--",
+            *(path.as_posix() for path in resource_paths),
+        ],
+        cwd=repository,
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        check=True,
+    )
+    attributes: dict[tuple[str, str], str] = {}
+    for line in check.stdout.splitlines():
+        path, attribute, value = line.rsplit(": ", 2)
+        attributes[(path, attribute)] = value
+
+    for path in resource_paths:
+        relative = path.as_posix()
+        assert attributes[(relative, "text")] == "set"
+        assert attributes[(relative, "eol")] == "lf"
+
+
+def test_autocrlf_checkout_preserves_registered_resource_digests(tmp_path):
+    """A Windows-style checkout must retain every pinned resource byte."""
+    repository = Path(__file__).resolve().parents[2]
+    registry = load_knowledge_registry()
+    resource_paths = [
+        Path("kestrel_sovereign") / resource.package_resource
+        for resource in registry.resources
+    ]
+    manifest_path = Path("kestrel_sovereign") / MANIFEST_RESOURCE
+    checkout = tmp_path / "autocrlf-checkout"
+    checkout.mkdir()
+
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "core.autocrlf=true",
+            "checkout-index",
+            "--force",
+            f"--prefix={checkout.as_posix()}/",
+            "--",
+            manifest_path.as_posix(),
+            *(path.as_posix() for path in resource_paths),
+        ],
+        cwd=repository,
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        check=True,
+    )
+
+    assert (checkout / manifest_path).read_bytes() == (
+        repository / manifest_path
+    ).read_bytes()
+    resources_by_path = {
+        Path("kestrel_sovereign") / resource.package_resource: resource
+        for resource in registry.resources
+    }
+    for path, resource in resources_by_path.items():
+        digest = hashlib.sha256((checkout / path).read_bytes()).hexdigest()
+        assert digest == resource.sha256
 
 
 def test_incompatible_import_version_is_rejected():

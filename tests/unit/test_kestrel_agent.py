@@ -32,6 +32,7 @@ from kestrel_sovereign.features.privacy.feature import PrivacyTransitionDecision
 from tests.utils.aiosqlite_workers import (
     aiosqlite_worker,
     delay_aiosqlite_worker_exit,
+    wait_for_lifecycle_checkpoint,
     wait_until_aiosqlite_worker_exit_is_delayed,
 )
 
@@ -2314,12 +2315,17 @@ class TestLifecycle:
                 agent.storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
 
                 shutdown_task = asyncio.create_task(agent.shutdown())
-                await asyncio.wait_for(factory_disposal_started.wait(), timeout=1.0)
-                await asyncio.wait_for(
+                await wait_for_lifecycle_checkpoint(
+                    factory_disposal_started.wait(),
+                    shutdown_task,
+                    description="SQLAlchemy factory disposal started",
+                )
+                await wait_for_lifecycle_checkpoint(
                     wait_until_aiosqlite_worker_exit_is_delayed(
                         worker_exit_delayed,
                     ),
-                    timeout=1.0,
+                    shutdown_task,
+                    description="SQLite worker exit was delayed",
                 )
                 assert workers == [worker]
                 assert not shutdown_task.done()
@@ -2418,12 +2424,17 @@ class TestLifecycle:
                 0.01,
             ):
                 shutdown_task = asyncio.create_task(agent.shutdown())
-                await asyncio.wait_for(factory_created.wait(), timeout=1.0)
-                await asyncio.wait_for(
+                await wait_for_lifecycle_checkpoint(
+                    factory_created.wait(),
+                    shutdown_task,
+                    description="late SQLAlchemy factory was created",
+                )
+                await wait_for_lifecycle_checkpoint(
                     wait_until_aiosqlite_worker_exit_is_delayed(
                         worker_exit_delayed,
                     ),
-                    timeout=1.0,
+                    shutdown_task,
+                    description="late SQLAlchemy worker exit was delayed",
                 )
                 assert factory_worker is not None
                 assert workers == [factory_worker]

@@ -1,0 +1,4 @@
+# Semantic registry resources are verified byte-for-byte against immutable
+# SHA-256 pins.  Preserve their repository bytes on Windows instead of letting
+# core.autocrlf rewrite LF to CRLF during checkout or wheel construction.
+/kestrel_sovereign/data/semantic/** text eol=lf
