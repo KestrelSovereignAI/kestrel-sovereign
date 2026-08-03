@@ -501,6 +501,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         self._remote_inflight = 0
         self._remote_accepting = False
         self._remote_capabilities: frozenset[str] = frozenset()
+        self._remote_touch_lease = None
 
         # Observability store for logging LLM calls (A2A-compatible)
         # Set via set_observability_store() after initialization

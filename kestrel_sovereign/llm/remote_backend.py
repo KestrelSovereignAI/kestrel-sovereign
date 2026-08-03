@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -29,6 +29,8 @@ from kestrel_sovereign.kestrel_config.constants import (
 )
 
 logger = logging.getLogger(__name__)
+
+InferenceLeaseTouch = Callable[[str], Awaitable[InferenceLease]]
 
 # The OpenAI client requires a non-empty value even for deliberately
 # unauthenticated private-network endpoints. A provider-supplied Authorization
@@ -106,6 +108,7 @@ class RemoteBackendMixin:
         lease: InferenceLease,
         *,
         capabilities: Sequence[str] = (),
+        touch_lease: InferenceLeaseTouch,
     ) -> None:
         """Atomically activate a ready, OpenAI-compatible private route."""
 
@@ -190,6 +193,7 @@ class RemoteBackendMixin:
                 ):
                     self._remote_lease = lease
                     self._remote_capabilities = frozenset(capabilities)
+                    self._remote_touch_lease = touch_lease
                     return
 
         client = openai.AsyncOpenAI(
@@ -228,6 +232,7 @@ class RemoteBackendMixin:
                 self._remote_lease = lease
                 self._remote_client = client
                 self._remote_capabilities = frozenset(capabilities)
+                self._remote_touch_lease = touch_lease
                 self._remote_accepting = True
                 self._backend = BackendType.REMOTE_GPU
                 self._last_remote_error = None
@@ -283,6 +288,7 @@ class RemoteBackendMixin:
             self._remote_client = None
             self._remote_lease = None
             self._remote_capabilities = frozenset()
+            self._remote_touch_lease = None
 
         if client is not None:
             await self._close_remote_client(client, lease_id=lease_id)
@@ -301,6 +307,8 @@ class RemoteBackendMixin:
         from .service import LLMServiceError
 
         snapshot: RemoteRouteSnapshot | None = None
+        selected_lease_id: str | None = None
+        touch_lease: InferenceLeaseTouch | None = None
         async with self._remote_route_condition:
             lease = self._remote_lease
             client = self._remote_client
@@ -332,6 +340,55 @@ class RemoteBackendMixin:
                     raise LLMServiceError(
                         "private inference lease expired; reconcile or release it "
                         "before another LLM request"
+                    )
+                touch_lease = self._remote_touch_lease
+                if touch_lease is None:
+                    raise LLMServiceError(
+                        "private inference route has no idle-deadline renewal "
+                        "handler; no cloud fallback was attempted"
+                    )
+                selected_lease_id = lease.lease_id
+
+        if selected_lease_id is not None:
+            assert touch_lease is not None
+            touched: InferenceLease | None = None
+            try:
+                touched = await touch_lease(selected_lease_id)
+            except Exception as exc:  # noqa: BLE001 - provider boundary
+                self._raise_managed_remote_failure(exc)
+            if (
+                not isinstance(touched, InferenceLease)
+                or touched.lease_id != selected_lease_id
+                or touched.state is not InferenceLeaseState.READY
+            ):
+                raise LLMServiceError(
+                    "private inference lease is no longer ready; no cloud "
+                    "fallback was attempted"
+                )
+
+            # Touch runs outside the route condition because it may refresh
+            # credentials through ``activate_inference_lease``. Re-check every
+            # invariant before pinning: an owner release may have won the race
+            # after touch completed, in which case this call fails closed.
+            async with self._remote_route_condition:
+                lease = self._remote_lease
+                client = self._remote_client
+                if (
+                    lease is None
+                    or lease.lease_id != selected_lease_id
+                    or self._backend is not BackendType.REMOTE_GPU
+                    or not self._remote_accepting
+                    or client is None
+                ):
+                    raise LLMServiceError(
+                        "private inference route is draining or unavailable; no "
+                        "cloud fallback was attempted"
+                    )
+                if datetime.now(UTC) >= lease.expires_at:
+                    self._remote_accepting = False
+                    raise LLMServiceError(
+                        "private inference lease expired during renewal; no cloud "
+                        "fallback was attempted"
                     )
                 self._remote_inflight += 1
                 snapshot = RemoteRouteSnapshot(
@@ -371,4 +428,9 @@ class RemoteBackendMixin:
         }
 
 
-__all__ = ["BackendType", "RemoteBackendMixin", "RemoteRouteSnapshot"]
+__all__ = [
+    "BackendType",
+    "InferenceLeaseTouch",
+    "RemoteBackendMixin",
+    "RemoteRouteSnapshot",
+]

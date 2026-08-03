@@ -1147,6 +1147,9 @@ class TestInvocationBoundary:
         llm_service._backend = BackendType.REMOTE_GPU
         llm_service._remote_client = AsyncMock()
         llm_service._remote_lease = _ready_remote_lease()
+        llm_service._remote_touch_lease = AsyncMock(
+            return_value=llm_service._remote_lease
+        )
         llm_service._remote_accepting = True
         llm_service._remote_capabilities = frozenset(
             {"chat", "streaming", "tools", "structured_output", "vision"}
@@ -2354,6 +2357,9 @@ class TestEdgeCases:
         """A selected private route never silently sends data to cloud."""
         llm_service._backend = BackendType.REMOTE_GPU
         llm_service._remote_lease = _ready_remote_lease()
+        llm_service._remote_touch_lease = AsyncMock(
+            return_value=llm_service._remote_lease
+        )
         llm_service._remote_client = AsyncMock()
         llm_service._remote_accepting = True
         llm_service._remote_capabilities = frozenset({"chat"})

@@ -37,9 +37,7 @@ class FakeRemoteClient:
             raise RuntimeError("private transport details")
         return SimpleNamespace(
             choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(content=self.response_text)
-                )
+                SimpleNamespace(message=SimpleNamespace(content=self.response_text))
             ]
         )
 
@@ -72,6 +70,17 @@ def _lease() -> InferenceLease:
     )
 
 
+def _touch_current(service: LLMService, calls: list[str] | None = None):
+    async def touch(lease_id: str) -> InferenceLease:
+        if calls is not None:
+            calls.append("touch")
+        lease = service._remote_lease
+        assert lease is not None and lease.lease_id == lease_id
+        return lease
+
+    return touch
+
+
 @pytest.mark.asyncio
 async def test_validated_lease_activates_and_releases(monkeypatch):
     client = FakeRemoteClient(response_text="gpu-ok")
@@ -84,6 +93,7 @@ async def test_validated_lease_activates_and_releases(monkeypatch):
         await service.activate_inference_lease(
             _lease(),
             capabilities=("chat", "streaming", "tools"),
+            touch_lease=_touch_current(service),
         )
 
         status = service.get_backend_status()
@@ -105,15 +115,18 @@ async def test_generate_uses_validated_private_route(monkeypatch):
         lambda **_kwargs: client,
     )
     service = LLMService()
+    calls: list[str] = []
     try:
         await service.activate_inference_lease(
             _lease(),
             capabilities=("chat",),
+            touch_lease=_touch_current(service, calls),
         )
 
         result = await service.generate(system_prompt="sys", user_prompt="hi")
 
         assert result == "gpu-ok"
+        assert calls == ["touch"]
         assert service.get_backend_status()["remote_active"] is True
     finally:
         await service.close()
@@ -131,6 +144,7 @@ async def test_private_route_failure_does_not_fall_back(monkeypatch):
         await service.activate_inference_lease(
             _lease(),
             capabilities=("chat",),
+            touch_lease=_touch_current(service),
         )
 
         with pytest.raises(LLMServiceError, match="no cloud fallback") as caught:

@@ -41,11 +41,24 @@ class _Host(RemoteBackendMixin):
         self._remote_inflight = 0
         self._remote_accepting = False
         self._remote_capabilities = frozenset()
+        self._remote_touch_lease = None
         self._last_remote_error = None
         self._mandate_preference = {"model": None, "vendor": None, "route": None}
 
     def _remote_first_allowed(self, model_override):
         return model_override is None or "/" not in model_override
+
+
+def _touch_current(host: _Host, events: list[str] | None = None):
+    async def touch(lease_id: str) -> InferenceLease:
+        if events is not None:
+            events.append("touch")
+        lease = host._remote_lease
+        assert lease is not None
+        assert lease.lease_id == lease_id
+        return lease
+
+    return touch
 
 
 def _lease(
@@ -100,7 +113,11 @@ async def test_activation_keeps_route_host_only_and_disables_sdk_retries(monkeyp
     host = _Host()
     lease = _lease()
 
-    await host.activate_inference_lease(lease, capabilities=("chat", "streaming"))
+    await host.activate_inference_lease(
+        lease,
+        capabilities=("chat", "streaming"),
+        touch_lease=_touch_current(host),
+    )
 
     assert clients[0].kwargs["max_retries"] == 0
     assert clients[0].kwargs["api_key"] == "route-secret"
@@ -128,7 +145,11 @@ async def test_custom_authorization_header_overrides_client_sentinel(monkeypatch
         headers={"Authorization": SecretStr("Bearer provider-token")},
     )
 
-    await host.activate_inference_lease(lease, capabilities=("chat",))
+    await host.activate_inference_lease(
+        lease,
+        capabilities=("chat",),
+        touch_lease=_touch_current(host),
+    )
 
     assert captured["default_headers"] == {"Authorization": "Bearer provider-token"}
     assert captured["api_key"] == "kestrel-private-route"
@@ -148,11 +169,16 @@ async def test_ready_reconciliation_rotates_the_host_only_client(monkeypatch):
         create_client,
     )
     host = _Host()
-    await host.activate_inference_lease(_lease(), capabilities=("chat",))
+    await host.activate_inference_lease(
+        _lease(),
+        capabilities=("chat",),
+        touch_lease=_touch_current(host),
+    )
 
     await host.activate_inference_lease(
         _lease(api_key="rotated-route-secret"),
         capabilities=("chat",),
+        touch_lease=_touch_current(host),
     )
 
     assert len(clients) == 2
@@ -177,7 +203,11 @@ async def test_unchanged_ready_poll_does_not_rebuild_or_drain_client(monkeypatch
     )
     host = _Host()
     original = _lease()
-    await host.activate_inference_lease(original, capabilities=("chat",))
+    await host.activate_inference_lease(
+        original,
+        capabilities=("chat",),
+        touch_lease=_touch_current(host),
+    )
 
     async with host._remote_route_attempt(
         force_local_only=False,
@@ -190,7 +220,11 @@ async def test_unchanged_ready_poll_does_not_rebuild_or_drain_client(monkeypatch
             updated_at=datetime.now(UTC),
             expires_at=original.expires_at + timedelta(minutes=5),
         )
-        await host.activate_inference_lease(refreshed, capabilities=("chat",))
+        await host.activate_inference_lease(
+            refreshed,
+            capabilities=("chat",),
+            touch_lease=_touch_current(host),
+        )
 
         assert len(clients) == 1
         assert clients[0].closed is False
@@ -206,7 +240,11 @@ async def test_route_attempt_requires_capabilities_and_never_falls_back(monkeypa
         lambda **kwargs: _Client(**kwargs),
     )
     host = _Host()
-    await host.activate_inference_lease(_lease(), capabilities=("chat",))
+    await host.activate_inference_lease(
+        _lease(),
+        capabilities=("chat",),
+        touch_lease=_touch_current(host),
+    )
 
     with pytest.raises(LLMServiceError, match="lacks required capabilities"):
         async with host._remote_route_attempt(
@@ -218,13 +256,116 @@ async def test_route_attempt_requires_capabilities_and_never_falls_back(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_route_attempt_touches_idle_deadline_before_pinning_traffic(monkeypatch):
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.remote_backend.openai.AsyncOpenAI",
+        lambda **kwargs: _Client(**kwargs),
+    )
+    events: list[str] = []
+    host = _Host()
+    await host.activate_inference_lease(
+        _lease(),
+        capabilities=("chat",),
+        touch_lease=_touch_current(host, events),
+    )
+
+    async with host._remote_route_attempt(
+        force_local_only=False,
+        model_override=None,
+        required_capabilities=("chat",),
+    ) as snapshot:
+        events.append("inference")
+        assert snapshot is not None
+        assert host._remote_inflight == 1
+
+    assert events == ["touch", "inference"]
+    assert host._remote_inflight == 0
+
+
+@pytest.mark.asyncio
+async def test_touch_failure_blocks_inference_without_cloud_fallback(monkeypatch):
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.remote_backend.openai.AsyncOpenAI",
+        lambda **kwargs: _Client(**kwargs),
+    )
+    host = _Host()
+
+    async def fail_touch(_lease_id: str) -> InferenceLease:
+        raise ConnectionError("private control-plane details")
+
+    await host.activate_inference_lease(
+        _lease(),
+        capabilities=("chat",),
+        touch_lease=fail_touch,
+    )
+
+    with pytest.raises(LLMServiceError, match="no cloud fallback") as caught:
+        async with host._remote_route_attempt(
+            force_local_only=False,
+            model_override=None,
+            required_capabilities=("chat",),
+        ):
+            pytest.fail("traffic must not run when renewal fails")
+
+    assert "control-plane" not in str(caught.value)
+    assert host._last_remote_error == "ConnectionError"
+    assert host._remote_inflight == 0
+
+
+@pytest.mark.asyncio
+async def test_release_winning_touch_to_pin_race_fails_closed(monkeypatch):
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.remote_backend.openai.AsyncOpenAI",
+        lambda **kwargs: _Client(**kwargs),
+    )
+    host = _Host()
+    touch_started = asyncio.Event()
+    finish_touch = asyncio.Event()
+
+    async def blocked_touch(lease_id: str) -> InferenceLease:
+        lease = host._remote_lease
+        assert lease is not None and lease.lease_id == lease_id
+        touch_started.set()
+        await finish_touch.wait()
+        return lease
+
+    await host.activate_inference_lease(
+        _lease(),
+        capabilities=("chat",),
+        touch_lease=blocked_touch,
+    )
+
+    async def attempt() -> None:
+        async with host._remote_route_attempt(
+            force_local_only=False,
+            model_override=None,
+            required_capabilities=("chat",),
+        ):
+            pytest.fail("a released route must not be pinned")
+
+    attempt_task = asyncio.create_task(attempt())
+    await touch_started.wait()
+    await host.deactivate_inference_lease("lease-1")
+    finish_touch.set()
+
+    with pytest.raises(LLMServiceError, match="no cloud fallback"):
+        await attempt_task
+    assert host._remote_lease is None
+    assert host._remote_inflight == 0
+
+
+@pytest.mark.asyncio
 async def test_release_drains_an_inflight_route_before_forgetting_secrets(monkeypatch):
     monkeypatch.setattr(
         "kestrel_sovereign.llm.remote_backend.openai.AsyncOpenAI",
         lambda **kwargs: _Client(**kwargs),
     )
     host = _Host()
-    await host.activate_inference_lease(_lease(), capabilities=("chat",))
+    await host.activate_inference_lease(
+        _lease(),
+        capabilities=("chat",),
+        touch_lease=_touch_current(host),
+    )
 
     async with host._remote_route_attempt(
         force_local_only=False,
@@ -252,6 +393,7 @@ async def test_expired_managed_route_fails_closed(monkeypatch):
     await host.activate_inference_lease(
         _lease(expires_at=datetime.now(UTC) - timedelta(seconds=1)),
         capabilities=("chat",),
+        touch_lease=_touch_current(host),
     )
 
     with pytest.raises(LLMServiceError, match="expired"):

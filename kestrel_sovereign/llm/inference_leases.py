@@ -247,7 +247,9 @@ def discover_inference_lease_providers() -> dict[str, InferenceLeaseProvider]:
             raise InferenceLeaseProviderDiscoveryError(
                 f"inference provider entry point {entry_point.name!r} could not load"
             ) from exc
-        if not isinstance(candidate, InferenceLeaseProvider):
+        if not isinstance(candidate, InferenceLeaseProvider) or not callable(
+            getattr(candidate, "touch", None)
+        ):
             raise InferenceLeaseProviderDiscoveryError(
                 f"inference provider entry point {entry_point.name!r} does not "
                 "implement the SDK contract"
@@ -398,6 +400,7 @@ class InferenceLeaseCoordinator:
             await self._llm_service.activate_inference_lease(
                 lease,
                 capabilities=record.request.capabilities,
+                touch_lease=self.touch,
             )
         elif lease.state in {
             InferenceLeaseState.FAILED,
@@ -565,6 +568,39 @@ class InferenceLeaseCoordinator:
                     f"inference provider {record.provider_name!r} could not report "
                     "lease status"
                 ) from exc
+            return await self._apply_provider_lease(record, lease)
+
+    async def touch(self, lease_id: str) -> InferenceLease:
+        """Renew a ready lease from real LLM traffic and persist the result.
+
+        The coordinator lock serializes touch with status and release. A
+        provider therefore cannot renew a lease after release has begun, while
+        durable state is updated before the caller sends inference traffic.
+        """
+
+        async with self._lock:
+            record = self._record_for_lease(lease_id)
+            previous = record.lease
+            assert previous is not None
+            if previous.state is not InferenceLeaseState.READY:
+                raise InferenceLeaseProvisioningError(
+                    "only a ready inference lease can be renewed"
+                )
+            provider = self._provider(record.provider_name)
+            try:
+                lease = await provider.touch(self._owner_id, lease_id)
+            except Exception as exc:
+                raise InferenceLeaseProvisioningError(
+                    f"inference provider {record.provider_name!r} could not "
+                    "renew the lease idle deadline"
+                ) from exc
+            if (
+                lease.state is InferenceLeaseState.READY
+                and lease.expires_at < previous.expires_at
+            ):
+                raise InferenceLeaseConstraintError(
+                    "provider shortened the inference lease during renewal"
+                )
             return await self._apply_provider_lease(record, lease)
 
     async def release(self, lease_id: str) -> InferenceLease:
