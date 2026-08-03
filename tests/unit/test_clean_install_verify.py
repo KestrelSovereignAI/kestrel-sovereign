@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib.util
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
@@ -299,6 +300,41 @@ def test_agent_port_lookup(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert verify._agent_port("Kestrel") == 8801
     assert verify._agent_port("Other") is None
+
+
+def test_run_captured_preserves_invalid_utf8_from_failed_child():
+    script = (
+        "import sys; "
+        "sys.stdout.buffer.write(b'ready \\x9d'); "
+        "sys.stderr.buffer.write(b'failed \\x81'); "
+        "raise SystemExit(3)"
+    )
+
+    result = verify._run_captured([sys.executable, "-c", script])
+
+    assert result.returncode == 3
+    assert result.stdout == "ready \\x9d"
+    assert result.stderr == "failed \\x81"
+
+
+def test_kestrel_uses_current_interpreter_and_module_entrypoint(monkeypatch):
+    captured: list[str] = []
+
+    def fake_run_captured(command):
+        captured.extend(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(verify, "_run_captured", fake_run_captured)
+
+    verify._kestrel("start", "Kestrel")
+
+    assert captured == [
+        sys.executable,
+        "-m",
+        "kestrel_sovereign.cli",
+        "start",
+        "Kestrel",
+    ]
 
 
 def test_main_dispatch_unknown_subcommand_exits():
