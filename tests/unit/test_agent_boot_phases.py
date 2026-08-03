@@ -25,6 +25,7 @@ import pytest
 
 from kestrel_sovereign.agent.boot import AgentBootError, BootContext, BootPhaseState
 from kestrel_sovereign.kestrel_agent import KestrelAgent
+from kestrel_sovereign.storage.async_database import AsyncDatabase
 
 
 # Phase method names in boot order — the injected-failure matrix patches one
@@ -823,19 +824,28 @@ async def test_storage_phase_uses_shared_postgres_pool(tmp_path):
     )
     assert agent.identity is not None
     ctx = BootContext()
+    # ``storage.db`` is a REAL database, not a MagicMock: this agent has an
+    # on-disk inception whose birth record lives in a different database, so
+    # the phase now reconciles it (#2871) and a duck-typed double would fail on
+    # the first await. The runtime database is deliberately a second file so
+    # the reconciliation path is the one production takes.
+    runtime_db = await AsyncDatabase.sqlite(str(tmp_path / "runtime.db"))
     with patch("kestrel_sovereign.kestrel_agent.AsyncStorage") as MockStorage, patch(
         "kestrel_sovereign.storage.db.postgres.PostgresBackend"
     ) as MockPGBackend:
         storage = AsyncMock()
         storage.initialize = AsyncMock()
         storage.get_node = AsyncMock(return_value=None)
-        storage.db = MagicMock()
+        storage.db = runtime_db
         storage.close = AsyncMock()
         MockStorage.return_value = storage
         pg_backend = MagicMock()
         MockPGBackend.from_pool.return_value = pg_backend
 
-        await agent._boot_phase_storage_privacy(ctx)
+        try:
+            await agent._boot_phase_storage_privacy(ctx)
+        finally:
+            await runtime_db.close()
 
         # The shared pool was adopted (not a fresh DSN connection).
         MockPGBackend.from_pool.assert_called_once_with(

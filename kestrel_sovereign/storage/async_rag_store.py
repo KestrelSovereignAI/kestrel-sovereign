@@ -26,12 +26,27 @@ See docs/architecture/MEMORY_SYSTEM.md for the full decision matrix.
 """
 import logging
 import struct
-from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional, Sequence, Tuple
 
 from .async_database import AsyncDatabase
 from .bm25_index import AsyncBM25Index, BM25_AVAILABLE
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class IndexedChunk:
+    """One stored chunk with the embedding already computed for it.
+
+    Carries the profile id alongside the vector because kNN filters by the
+    active embedding profile — a vector separated from the model that produced
+    it is not searchable, only storable.
+    """
+
+    content: str
+    embedding: List[float] = field(default_factory=list)
+    profile_id: Optional[str] = None
 
 
 def _get_embedding_service(llm_service: Optional[Any] = None):
@@ -270,6 +285,121 @@ class AsyncRAGStore:
         self._bm25_built = False  # Invalidate BM25 index
 
         return len(chunks)
+
+    async def read_indexed_chunks(self, file_hash: str) -> List[IndexedChunk]:
+        """Return this tenant's chunks for ``file_hash`` with their embeddings.
+
+        The counterpart to :meth:`store_precomputed_chunks`. Together they move
+        an already-indexed document between databases without re-running the
+        embedding model — the chunk text, its vector and the profile that
+        produced the vector are carried verbatim, so the copy retrieves
+        identically to the original.
+
+        ``embedding_profile_id`` predates #1477 on some databases; a database
+        without the column still yields chunks, with ``profile_id`` None.
+        """
+        owner_scope, owner_params = self._owner_scope()
+        columns = "content, embedding, embedding_profile_id"
+        try:
+            rows = await self.db.fetchall(
+                f"SELECT {columns} FROM document_chunks "
+                f"WHERE file_hash = ? AND {owner_scope} ORDER BY chunk_id",
+                (file_hash,) + owner_params,
+            )
+        except Exception as exc:
+            logger.info(
+                "document_chunks.embedding_profile_id unavailable (%s); "
+                "reading chunks for %s without it.", exc, file_hash,
+            )
+            rows = await self.db.fetchall(
+                "SELECT content, embedding FROM document_chunks "
+                f"WHERE file_hash = ? AND {owner_scope} ORDER BY chunk_id",
+                (file_hash,) + owner_params,
+            )
+
+        chunks: List[IndexedChunk] = []
+        for row in rows:
+            blob = row[1]
+            embedding = _deserialize_embedding(bytes(blob)) if blob else []
+            profile_id = row[2] if len(row) > 2 else None
+            chunks.append(
+                IndexedChunk(
+                    content=row[0],
+                    embedding=embedding,
+                    profile_id=profile_id,
+                )
+            )
+        return chunks
+
+    async def store_precomputed_chunks(
+        self, file_hash: str, chunks: Sequence[IndexedChunk],
+    ) -> int:
+        """Store chunks whose embeddings were computed elsewhere.
+
+        Unlike :meth:`chunk_document` this neither re-chunks the document nor
+        calls the embedding model: the caller already holds both, and
+        re-deriving them would silently produce a *different* index (chunk
+        boundaries depend on a ``chunk_size`` the rows do not record, and a
+        re-embed under a changed model yields vectors in another coordinate
+        space).
+
+        Idempotent: this tenant's existing chunks for ``file_hash`` are
+        replaced, so re-running after a partial or interrupted copy converges
+        on exactly ``len(chunks)`` chunks rather than accumulating duplicates.
+        """
+        if self.agent_id:
+            owned = await self.db.fetchone(
+                "SELECT 1 FROM file_owners "
+                "WHERE content_hash = ? AND agent_id = ?",
+                (file_hash, self.agent_id),
+            )
+            if not owned:
+                raise ValueError("Cannot index a file outside the bound agent")
+
+        await self.delete_chunks_for_file(file_hash)
+
+        written: List[Tuple[int, IndexedChunk]] = []
+        for chunk in chunks:
+            embedding_blob = (
+                _serialize_embedding(chunk.embedding) if chunk.embedding else None
+            )
+            async with self.db.transaction():
+                if self.db.backend_type == "postgres":
+                    row = await self.db.fetchone(
+                        "INSERT INTO document_chunks "
+                        "(file_hash, content, embedding) VALUES (?, ?, ?) "
+                        "RETURNING chunk_id",
+                        (file_hash, chunk.content, embedding_blob),
+                    )
+                else:
+                    await self.db.execute(
+                        "INSERT INTO document_chunks "
+                        "(file_hash, content, embedding) VALUES (?, ?, ?)",
+                        (file_hash, chunk.content, embedding_blob),
+                    )
+                    row = await self.db.fetchone("SELECT last_insert_rowid()")
+                if not row:
+                    raise RuntimeError("Could not resolve inserted RAG chunk id")
+                chunk_id = int(row[0])
+                if self.agent_id:
+                    await self.db.execute(
+                        "INSERT INTO document_chunk_owners "
+                        "(chunk_id, agent_id) VALUES (?, ?)",
+                        (chunk_id, self.agent_id),
+                    )
+            written.append((chunk_id, chunk))
+
+        # Same dual-write as chunk_document, and outside the insert loop for
+        # the same reason: the parallel column may not exist yet.
+        for chunk_id, chunk in written:
+            if chunk.embedding:
+                await self._write_embedding_vec(
+                    chunk_id, chunk.embedding, chunk.profile_id,
+                )
+
+        await self.db.commit()
+        self._bm25_built = False  # Invalidate BM25 index
+        return len(written)
 
     async def _write_embedding_vec(
         self,

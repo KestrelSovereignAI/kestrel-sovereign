@@ -1821,6 +1821,18 @@ class KestrelAgent(
         # Wrap storage with privacy-enforcing layer
         self.storage = PrivacyEnforcingStorage(self._raw_storage, self._privacy_mode)
 
+        # Bring the birth record into the database this runtime reads (#2871)
+        # BEFORE anything downstream consults the agent node. This position is
+        # not a preference: the very next block treats a missing node as a
+        # genuinely new identity and lets it establish a fresh constitution
+        # anchor, and the block after it reads the agent's name. Reconciling
+        # later would leave the agent anchored to the wrong constitution and
+        # running as "Unnamed Agent" even once its record had arrived. It also
+        # keeps the refusal ahead of every feature side effect and SESSION_START
+        # hook, so a host that cannot produce a valid birth record does no
+        # durable startup work before it stops.
+        await self._reconcile_birth_record_with_runtime_database()
+
         # Distinguish a genuinely new identity from a legacy identity that
         # merely lacks the new runtime-state row. Only a genuine first boot
         # may establish its initial constitution anchor automatically; a
@@ -2436,6 +2448,125 @@ class KestrelAgent(
         raise IdentityReadinessError(
             "birth_record", cause_type="BirthRecordDatabaseMismatch"
         )
+
+    async def _reconcile_birth_record_with_runtime_database(self) -> None:
+        """Copy inception's birth record into the runtime database (#2871).
+
+        ``kestrel create`` writes the birth record into the SQLite it opens in
+        the agent's directory. A host configured for PostgreSQL then boots the
+        agent against PostgreSQL, where the record does not exist — the agent
+        came up unnamed, with no ``bootstrap_state`` and nothing in
+        Constitutional RAG, while ``/health`` reported ok. The local file stays
+        (twelve places read its existence as the fact that a directory IS an
+        agent); the record is copied out of it into the database the runtime
+        actually reads.
+
+        Runs on every boot, and is a no-op on every ordinary SQLite deployment
+        because there the runtime database and the anchor are the same file.
+        When a copy IS needed it is idempotent, so an interrupted pass is
+        finished by the next boot instead of stranding a half-written record —
+        which is why this lives here and not inside inception, where a failed
+        copy would leave the anchor on disk, the next ``kestrel create``
+        refusing, and nothing left to retry.
+
+        If the record still does not agree with the anchor after a copy, boot
+        stops with ``IdentityReadinessError("birth_record")`` rather than
+        continuing on the claim that the copy happened.
+        """
+        if self.identity is None:
+            # No prior inception, so there is no birth record to copy. Node
+            # creation for a genuinely new agent is correct and happens later.
+            return
+
+        from kestrel_sovereign.identity.birth_record import (
+            diagnose_birth_record,
+            local_anchor_path,
+            replicate_birth_record,
+            runtime_database_is_the_anchor,
+        )
+
+        anchor = local_anchor_path(self.storage_path)
+        if anchor is None:
+            return
+        runtime_db = getattr(self._raw_storage, "db", None)
+        if runtime_db is None:
+            return
+        if runtime_database_is_the_anchor(runtime_db, anchor):
+            return
+
+        from kestrel_sovereign.identity.runtime_identity import (
+            IdentityReadinessError,
+        )
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+        anchor_db = None
+        try:
+            # Opening the anchor brings its schema up to date, exactly as a
+            # SQLite host would at every boot. Its birth record is only read.
+            anchor_db = await AsyncDatabase.sqlite(str(anchor))
+            divergence = await diagnose_birth_record(
+                runtime_db=runtime_db,
+                anchor_db=anchor_db,
+                agent_did=self.agent_id,
+            )
+            if not divergence:
+                return
+
+            logging.warning(
+                "Birth record for %s diverges from the local anchor %s: %s. "
+                "Replicating it into the configured runtime database "
+                "(backend=%s).",
+                self.agent_id,
+                anchor,
+                divergence.describe(),
+                self._db_backend,
+            )
+            result = await replicate_birth_record(
+                runtime_db=runtime_db,
+                anchor_db=anchor_db,
+                agent_did=self.agent_id,
+                llm_service=self.llm_service,
+            )
+            logging.info(
+                "Replicated birth record for %s into the runtime database: %s",
+                self.agent_id,
+                result.describe(),
+            )
+
+            # Verify rather than assume. A pass that reports success but left
+            # the record incomplete is precisely the failure this whole cluster
+            # of issues is about — a durable claim nobody observed.
+            remaining = await diagnose_birth_record(
+                runtime_db=runtime_db,
+                anchor_db=anchor_db,
+                agent_did=self.agent_id,
+            )
+            if remaining:
+                logging.error(
+                    "Birth record for %s is STILL incomplete after replication "
+                    "(%s). Refusing to boot an agent that cannot retrieve its "
+                    "own constitution.",
+                    self.agent_id,
+                    remaining.describe(),
+                )
+                raise IdentityReadinessError(
+                    "birth_record", cause_type="BirthRecordReplicationIncomplete"
+                )
+        except IdentityReadinessError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # Operator detail to the log; the readiness error stays public-safe.
+            logging.error(
+                "Could not replicate the birth record for %s from %s into the "
+                "configured runtime database (backend=%s): %s",
+                self.agent_id, anchor, self._db_backend, exc, exc_info=True,
+            )
+            raise IdentityReadinessError(
+                "birth_record", cause_type=type(exc).__name__
+            ) from None
+        finally:
+            if anchor_db is not None:
+                await anchor_db.close()
 
     async def _boot_phase_identity_constitution_features(self, ctx: BootContext) -> None:
         """Phase 4 — identity name, constitution overlay verification (BEFORE feature discovery), feature discovery/enablement/registration, the durable agent node, the startup constitution audit, and LLM payer policy."""
