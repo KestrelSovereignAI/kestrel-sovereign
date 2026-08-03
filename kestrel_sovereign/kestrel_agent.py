@@ -2359,6 +2359,84 @@ class KestrelAgent(
             logging.info("Sync service disabled by configuration")
 
 
+    async def _ensure_agent_node_present(self) -> "GraphNode":
+        """Return the agent's identity node, fabricating it only when correct.
+
+        A missing node in the runtime database is fabricated ONLY for a
+        genuinely new agent. If on-disk identity material is present, an
+        inception happened and its birth record is in a DIFFERENT database
+        (#2878) — fabricating a placeholder here would mask the real identity
+        (unnamed agent, no ``bootstrap_state``, nothing in Constitutional RAG)
+        while every health surface still reports ok. Refuse loudly instead.
+        """
+        logging.info(f"Getting agent node from storage (agent_id={self.agent_id})")
+        agent_node = await self.storage.get_node(self.agent_id)
+        logging.info(f"Agent node retrieved: {agent_node is not None}")
+        if agent_node is not None:
+            return agent_node
+
+        self._refuse_if_birth_record_in_another_database()
+
+        from kestrel_sovereign.storage import GraphNode
+        from kestrel_sovereign.storage.privacy_wrapper import (
+            acquire_control_plane_capability,
+        )
+        agent_node = GraphNode(
+            node_id=self.agent_id,
+            node_type="agent",
+            label=f"Agent {self.agent_id}",
+            properties={"initialBalance": "100.0"},
+        )
+        # Trusted control-plane write: agent identity node. The capability
+        # admits the durable identity write in a volatile mode (#2672).
+        await self.storage.add_node(
+            agent_node, capability=acquire_control_plane_capability()
+        )
+        logging.info("Agent node created")
+        return agent_node
+
+    def _refuse_if_birth_record_in_another_database(self) -> None:
+        """Refuse to fabricate an agent node when inception's birth record is
+        in a database the runtime is not reading (#2878).
+
+        The runtime just proved this agent's DID by loading its on-disk identity
+        material (keys + DID document). Those artifacts ARE the evidence that an
+        inception happened. If that inception's agent node is nonetheless absent
+        from the runtime's database, the birth record was written elsewhere —
+        classically a PostgreSQL host whose ``kestrel create`` wrote to the
+        per-agent SQLite file the runtime never opens. Fabricating a placeholder
+        node here would boot the agent unnamed, with no ``bootstrap_state`` and
+        nothing in Constitutional RAG, while ``/health`` still reports ok. Fail
+        loudly instead.
+
+        A genuinely new agent — no prior inception, so ``self.identity`` is None
+        — is unaffected: creating its node is correct, and this returns.
+        """
+        if self.identity is None:
+            return
+        agent_dir = (
+            str(Path(self.storage_path).parent) if self.storage_path else "(unknown)"
+        )
+        # Detailed operator context (directory + backend) goes to the log, not
+        # into the public-safe IdentityReadinessError message.
+        logging.error(
+            "Birth record missing from the configured runtime database "
+            "(backend=%s) for agent %s: on-disk identity material is present in "
+            "%s but its agent node is absent from the runtime database. "
+            "Inception wrote the birth record to a different database. Refusing "
+            "to boot with a fabricated placeholder identity.",
+            self._db_backend,
+            self.agent_id,
+            agent_dir,
+        )
+        from kestrel_sovereign.identity.runtime_identity import (
+            IdentityReadinessError,
+        )
+
+        raise IdentityReadinessError(
+            "birth_record", cause_type="BirthRecordDatabaseMismatch"
+        )
+
     async def _boot_phase_identity_constitution_features(self, ctx: BootContext) -> None:
         """Phase 4 — identity name, constitution overlay verification (BEFORE feature discovery), feature discovery/enablement/registration, the durable agent node, the startup constitution audit, and LLM payer policy."""
         # Resolve agent name BEFORE features so features can use it
@@ -2489,27 +2567,9 @@ class KestrelAgent(
                 HookEvent.SESSION_START, hook_input
             )
 
-        # Ensure agent graph node exists
-        logging.info(f"Getting agent node from storage (agent_id={self.agent_id})")
-        agent_node = await self.storage.get_node(self.agent_id)
-        logging.info(f"Agent node retrieved: {agent_node is not None}")
-        if agent_node is None:
-            from kestrel_sovereign.storage import GraphNode
-            from kestrel_sovereign.storage.privacy_wrapper import (
-                acquire_control_plane_capability,
-            )
-            agent_node = GraphNode(
-                node_id=self.agent_id,
-                node_type="agent",
-                label=f"Agent {self.agent_id}",
-                properties={"initialBalance": "100.0"}
-            )
-            # Trusted control-plane write: agent identity node. The capability
-            # admits the durable identity write in a volatile mode (#2672).
-            await self.storage.add_node(
-                agent_node, capability=acquire_control_plane_capability()
-            )
-            logging.info("Agent node created")
+        # Ensure agent graph node exists (fabricates only for a genuinely new
+        # agent; refuses when a birth record exists in another database — #2878).
+        agent_node = await self._ensure_agent_node_present()
 
         # A missing durable row or an audit older than 24 hours must be
         # resolved before initialize() can make this agent visible as
