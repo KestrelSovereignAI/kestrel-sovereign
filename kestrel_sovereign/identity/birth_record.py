@@ -153,7 +153,7 @@ async def read_embedding_profiles(
     rows: List[tuple] = []
     if not profile_ids:
         return rows
-    if not await anchor_db._column_exists("embedding_profiles", "id"):
+    if not await anchor_db.table_exists("embedding_profiles"):
         return rows
     for profile_id in sorted(profile_ids):
         row = await anchor_db.fetchone(
@@ -692,13 +692,27 @@ async def replicate_birth_record(
                 # verifies, boot reports complete, and the first read of the
                 # constitution raises DecryptionError long afterwards with
                 # nothing pointing back here.
-                runtime_bytes = await AsyncFileStore(runtime_db).retrieve_file(
-                    content_hash
-                )
-                if (
-                    runtime_bytes is None
-                    or hashlib.sha256(runtime_bytes).hexdigest() != content_hash
-                ):
+                try:
+                    # Unbound on purpose: a bound read is owner-joined, so it
+                    # returns None for an ownerless row by construction and
+                    # could never verify anything.
+                    runtime_bytes = await AsyncFileStore(runtime_db).retrieve_file(
+                        content_hash
+                    )
+                    verified = (
+                        hashlib.sha256(runtime_bytes).hexdigest() == content_hash
+                    )
+                except Exception as exc:
+                    # A row written under a previous KESTREL_DATA_KEY raises
+                    # here rather than returning bytes, so the hash test alone
+                    # would never see it. Same verdict, named properly.
+                    raise ValueError(
+                        f"the runtime database holds an unowned file row for "
+                        f"{content_hash[:12]}… whose bytes cannot be read back "
+                        f"({type(exc).__name__}); refusing to claim it for "
+                        f"{agent_did}."
+                    ) from exc
+                if not verified:
                     raise ValueError(
                         f"the runtime database holds an unowned file row for "
                         f"{content_hash[:12]}… whose bytes do not verify "

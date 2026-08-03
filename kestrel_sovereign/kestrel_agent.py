@@ -1077,6 +1077,7 @@ class KestrelAgent(
         # no retry can supply (#2871). Surfaced by the ``birth_record`` health
         # check; empty on every healthy agent.
         self._birth_record_shortfall: List[str] = []
+        self._birth_record_shortfall_retryable = False
         self._database_url = database_url or os.environ.get("KESTREL_DATABASE_URL")
         # ``_database_url`` is deliberately the resolved storage setting, but
         # a shared pool has an independent advisory-lock pool.  Preserve the
@@ -2518,6 +2519,7 @@ class KestrelAgent(
             return
 
         anchor_db = None
+        copy_committed = False
         try:
             # Opening the anchor brings its schema up to date, exactly as a
             # SQLite host would at every boot. Its birth record is only read.
@@ -2561,6 +2563,7 @@ class KestrelAgent(
                 anchor_db=anchor_db,
                 agent_did=self.agent_id,
             )
+            copy_committed = True
             logging.info(
                 "Replicated birth record for %s into the runtime database: %s",
                 self.agent_id,
@@ -2600,12 +2603,24 @@ class KestrelAgent(
                 "configured runtime database (backend=%s): %s",
                 self.agent_id, anchor, self._db_backend, exc, exc_info=True,
             )
-            self._record_birth_record_shortfall(shortfall)
+            # ``shortfall`` is the pre-replication diagnosis. It is exact for a
+            # raise inside the copy's transaction, which rolled back; for one
+            # after the commit it can name something already repaired, so
+            # re-diagnose when the copy is known to have landed.
+            verdict = shortfall
+            if copy_committed:
+                try:
+                    verdict = await diagnose_runtime_birth_record(
+                        runtime_db=runtime_db, agent_did=self.agent_id,
+                    )
+                except Exception:  # noqa: BLE001 - keep the older, safe verdict
+                    pass
+            self._record_birth_record_shortfall(verdict, retryable=True)
         finally:
             if anchor_db is not None:
                 await anchor_db.close()
 
-    def _record_birth_record_shortfall(self, divergence) -> None:
+    def _record_birth_record_shortfall(self, divergence, *, retryable=False) -> None:
         """Decide the verdict on WHAT is short, and leave a trace either way.
 
         ``identity`` — no agent node, or a fabricated placeholder — is #2878's
@@ -2624,15 +2639,28 @@ class KestrelAgent(
         verb to fix it. It is recorded instead, so ``/health/detailed`` names
         the loss. #2871's defect was that this loss was SILENT; naming it is
         the fix.
+
+        ``retryable`` distinguishes the two ways a capability can be short. A
+        completed pass that could not supply it means the anchor does not have
+        it and no restart will change that. A pass that DIED — a dropped
+        connection, a locked file — is usually transient, and telling the
+        operator it is unrepairable sends them to rebuild an anchor when a
+        restart would have fixed it.
         """
         self._birth_record_shortfall = list(getattr(divergence, "capability", []))
+        self._birth_record_shortfall_retryable = bool(retryable)
         if self._birth_record_shortfall:
             logging.error(
-                "Birth record for %s is still incomplete after replication "
-                "(%s). The agent will boot, but this capability is absent and "
-                "no retry can supply it — see /health/detailed.",
+                "Birth record for %s is still incomplete (%s). The agent will "
+                "boot without it. %s",
                 self.agent_id,
                 "; ".join(self._birth_record_shortfall),
+                (
+                    "The copy failed this pass; a restart may complete it."
+                    if retryable
+                    else "The local anchor cannot supply it, so no retry will "
+                    "— see /health/detailed."
+                ),
             )
         identity_failures = list(getattr(divergence, "identity", []))
         if identity_failures:

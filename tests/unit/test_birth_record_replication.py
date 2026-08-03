@@ -466,9 +466,10 @@ async def test_an_unowned_files_row_is_adopted_not_refused_forever(
 
     ``file_exists`` is owner-scoped, so a ``files`` row with no owner at all is
     invisible and ``store_file`` raises "Cannot claim an unowned legacy file"
-    on every boot. Files are content addressed, so the anchor's bytes hashing
-    to the same ``content_hash`` prove what the row holds — taking the witness
-    is the repair.
+    on every boot. The repair is to take the witness — but only after the
+    RUNTIME row's own bytes verify against the hash, which is what
+    ``test_an_unowned_files_row_whose_bytes_do_not_verify_is_refused`` pins.
+    The anchor's bytes say nothing about what the runtime holds under that id.
     """
     creds, anchor = await _incept(tmp_path, name="Orphan File Bird")
     runtime = await _fresh_runtime(tmp_path)
@@ -497,6 +498,82 @@ async def test_an_unowned_files_row_is_adopted_not_refused_forever(
         node = await AsyncGraphStore(runtime).get_node(creds.agent_did)
         assert node is not None and node.label == "Orphan File Bird"
         assert await _chunk_count(runtime, creds.agent_did) > 0
+    finally:
+        await anchor.close()
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_an_unowned_files_row_whose_bytes_do_not_verify_is_refused(
+    tmp_path, hybrid_env,
+):
+    """Adoption claims a row this agent cannot otherwise see, so the bytes have
+    to be proved first. The anchor's bytes hashing to the id say nothing about
+    what the RUNTIME holds under it — and an unverified claim surfaces much
+    later as a DecryptionError with nothing pointing back here."""
+    creds, anchor = await _incept(tmp_path, name="Impostor Row Bird")
+    runtime = await _fresh_runtime(tmp_path)
+    try:
+        constitution_hash = (
+            await AsyncGraphStore(anchor).get_node(creds.agent_did)
+        ).properties["constitution_hash"]
+        # Right id, wrong bytes, no owner.
+        await runtime.execute(
+            "INSERT INTO files (content_hash, original_name, content, metadata) "
+            "VALUES (?, ?, ?, ?)",
+            (constitution_hash, "KESTREL_CONSTITUTION.md", b"not the constitution", None),
+        )
+
+        with pytest.raises(Exception, match="do not verify"):
+            await replicate_birth_record(
+                runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
+            )
+
+        owners = await runtime.fetchone(
+            "SELECT COUNT(*) FROM file_owners WHERE content_hash = ?",
+            (constitution_hash,),
+        )
+        assert int(owners[0]) == 0, "the impostor row must not have been claimed"
+    finally:
+        await anchor.close()
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_embedding_profile_rows_cross_with_the_birth_record(
+    tmp_path, hybrid_env,
+):
+    """The registry row is what makes a copied vector attributable — without it
+    the embeddings audit reports every chunk as an unknown profile. Covered here
+    on SQLite as well as PostgreSQL because CI runs only this file."""
+    creds, anchor = await _incept(tmp_path, name="Profiled Bird")
+    runtime = await _fresh_runtime(tmp_path)
+    try:
+        constitution_hash = (
+            await AsyncGraphStore(anchor).get_node(creds.agent_did)
+        ).properties["constitution_hash"]
+        await anchor.execute(
+            "INSERT INTO embedding_profiles "
+            "(id, provider, model, dim, space_id, normalized) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("profile-x", "ollama", "nomic-embed-text", 3, "space-a", 1),
+        )
+        await AsyncRAGStore(
+            anchor, agent_id=creds.agent_did,
+        ).store_precomputed_chunks(
+            constitution_hash, [IndexedChunk("alpha", [0.5, 0.25, 0.0], "profile-x")],
+        )
+
+        await replicate_birth_record(
+            runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
+        )
+
+        row = await runtime.fetchone(
+            "SELECT provider, model, dim FROM embedding_profiles WHERE id = ?",
+            ("profile-x",),
+        )
+        assert row is not None, "the registry row did not cross"
+        assert row[0] == "ollama" and row[2] == 3
     finally:
         await anchor.close()
         await runtime.close()
@@ -1097,6 +1174,46 @@ async def test_a_failed_copy_is_judged_by_what_the_runtime_is_short_of(
 
         assert agent._agent_name == "Interrupted Copy Bird"
         assert agent._birth_record_shortfall
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_copy_still_refuses_when_the_identity_is_missing(
+    tmp_path, hybrid_env,
+):
+    """The safety half of "judge a failed copy by what the runtime is short of".
+
+    Booting degraded on a failed copy is only defensible while an IDENTITY gap
+    still refuses. Without this, narrowing the except back to a bare record —
+    which is what turns a PostgreSQL host with no agent node into a silently
+    unnamed agent — ships green.
+    """
+    from unittest.mock import patch
+
+    from kestrel_sovereign.agent.boot import BootContext
+    from kestrel_sovereign.identity.runtime_identity import IdentityReadinessError
+
+    creds, agent, runtime, storage = await _storage_phase_agent(
+        tmp_path, "Doomed Copy Bird",
+    )
+    try:
+        assert await AsyncGraphStore(runtime).get_node(creds.agent_did) is None
+
+        async def _boom(**_kwargs):
+            raise ConnectionResetError("the database went away mid-copy")
+
+        with patch("kestrel_sovereign.kestrel_agent.AsyncStorage", return_value=storage), \
+                patch("kestrel_sovereign.storage.db.postgres.PostgresBackend"), \
+                patch(
+                    "kestrel_sovereign.identity.birth_record.replicate_birth_record",
+                    _boom,
+                ):
+            with pytest.raises(IdentityReadinessError) as exc_info:
+                await agent._boot_phase_storage_privacy(BootContext())
+
+        assert exc_info.value.failure == "birth_record"
+        assert exc_info.value.cause_type == "BirthRecordIdentityMissing"
     finally:
         await runtime.close()
 

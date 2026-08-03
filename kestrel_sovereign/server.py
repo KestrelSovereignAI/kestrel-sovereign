@@ -3244,25 +3244,18 @@ async def _agent_detailed_health(agent) -> dict:
             return result
         return {"status": "unhealthy", "checks": []}
 
-    # Fallback: run checks directly without the feature.
-    from kestrel_sovereign.features.health.checks import (
-        check_bootstrap_state, check_context_budget, check_database,
-        check_disk_space, check_llm_service, check_memory_system,
-        check_signal_audit_log,
-    )
+    # Fallback: run checks directly without the feature. Shares HealthFeature's
+    # list rather than repeating it — the two copies had already drifted, and a
+    # check missing here reports `healthy` for a state the other calls a
+    # warning. HealthFeature is not mandatory, so this path is reachable by
+    # design.
+    from kestrel_sovereign.features.health.checks import run_standard_checks
+
     db = None
     if hasattr(agent, 'storage') and agent.storage:
         db = getattr(agent.storage, 'db', None)
 
-    checks = [
-        await check_database(db),
-        await check_llm_service(agent),
-        await check_memory_system(agent),
-        await check_disk_space(),
-        await check_context_budget(agent),
-        await check_bootstrap_state(agent),
-        await check_signal_audit_log(agent),
-    ]
+    checks = await run_standard_checks(agent, db)
     statuses = [c.get("status") for c in checks]
     if "fail" in statuses:
         overall = "unhealthy"
