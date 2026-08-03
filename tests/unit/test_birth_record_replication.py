@@ -459,6 +459,98 @@ async def test_an_unowned_constitution_row_is_adopted_not_refused_forever(
 
 
 @pytest.mark.asyncio
+async def test_an_unowned_files_row_is_adopted_not_refused_forever(
+    tmp_path, hybrid_env,
+):
+    """The same permanent brick as the unowned graph node, one table earlier.
+
+    ``file_exists`` is owner-scoped, so a ``files`` row with no owner at all is
+    invisible and ``store_file`` raises "Cannot claim an unowned legacy file"
+    on every boot. Files are content addressed, so the anchor's bytes hashing
+    to the same ``content_hash`` prove what the row holds — taking the witness
+    is the repair.
+    """
+    creds, anchor = await _incept(tmp_path, name="Orphan File Bird")
+    runtime = await _fresh_runtime(tmp_path)
+    try:
+        constitution_hash = (
+            await AsyncGraphStore(anchor).get_node(creds.agent_did)
+        ).properties["constitution_hash"]
+        # The bytes are present in the runtime, owned by nobody.
+        row = await anchor.fetchone(
+            "SELECT original_name, content, metadata FROM files WHERE content_hash = ?",
+            (constitution_hash,),
+        )
+        await runtime.execute(
+            "INSERT INTO files (content_hash, original_name, content, metadata) "
+            "VALUES (?, ?, ?, ?)",
+            (constitution_hash, row[0], row[1], row[2]),
+        )
+
+        await replicate_birth_record(
+            runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
+        )
+
+        assert not await diagnose_runtime_birth_record(
+            runtime_db=runtime, agent_did=creds.agent_did,
+        )
+        node = await AsyncGraphStore(runtime).get_node(creds.agent_did)
+        assert node is not None and node.label == "Orphan File Bird"
+        assert await _chunk_count(runtime, creds.agent_did) > 0
+    finally:
+        await anchor.close()
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_a_pruned_governing_edge_is_not_refilled_from_the_anchor(
+    tmp_path, hybrid_env,
+):
+    """A reanchor that pruned the old edge and died before writing the new one.
+
+    The runtime node anchors H2 and has NO governing edge — which is itself a
+    repair trigger, so this is the case the skip most needs to cover. Writing
+    the anchor's H1 edge here would attach the agent to the superseded
+    constitution and leave the node and the edge disagreeing, which ``doctor``
+    calls anchor drift and safe-modes the agent for.
+    """
+    creds, anchor = await _incept(tmp_path, name="Interrupted Bird")
+    runtime = await _fresh_runtime(tmp_path)
+    try:
+        await replicate_birth_record(
+            runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
+        )
+        graph = AsyncGraphStore(runtime, agent_id=creds.agent_did)
+        node = await graph.get_node(creds.agent_did)
+        old_hash = node.properties["constitution_hash"]
+
+        from kestrel_sovereign.storage.async_file_store import AsyncFileStore
+
+        new_hash = await AsyncFileStore(
+            runtime, agent_id=creds.agent_did,
+        ).store_file(b"AMENDED CONSTITUTION", "KESTREL_CONSTITUTION.md")
+        node.properties["constitution_hash"] = new_hash
+        await graph.add_node(node)
+        await graph.delete_edge(creds.agent_did, old_hash, "governed_by")
+
+        await replicate_birth_record(
+            runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
+        )
+
+        governing = {
+            edge.target_id
+            for edge in await graph.get_edges(creds.agent_did, direction="out")
+            if edge.label == "governed_by"
+        }
+        assert old_hash not in governing, (
+            "the superseded constitution must not be re-attached"
+        )
+    finally:
+        await anchor.close()
+        await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_a_stale_unwitnessed_edge_does_not_refuse_a_healthy_agent(
     tmp_path, hybrid_env,
 ):
@@ -902,6 +994,88 @@ async def test_unrelated_chunks_do_not_satisfy_the_constitution_check(
 
 
 @pytest.mark.asyncio
+async def test_a_shortfall_the_anchor_cannot_supply_does_not_brick_the_agent(
+    tmp_path, hybrid_env,
+):
+    """The state every pre-#2871 PostgreSQL host is in — a real identity, no
+    constitution chunks — and which boots TODAY.
+
+    If the anchor cannot resupply them (its chunk-owner rows are gone, as on a
+    pre-#2649 database), replication writes nothing and no retry ever will.
+    Refusing there converts a degraded agent into one that can never boot
+    again, with no operator verb to fix it. Missing retrieval is a capability
+    loss to surface loudly, not an identity failure to refuse.
+    """
+    from unittest.mock import patch
+
+    from kestrel_sovereign.agent.boot import BootContext
+
+    creds, agent, runtime, storage = await _storage_phase_agent(
+        tmp_path, "Chunkless Bird",
+    )
+    anchor = await AsyncDatabase.sqlite(str(tmp_path / "kestrel_prime.db"))
+    try:
+        await replicate_birth_record(
+            runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
+        )
+        constitution_hash = (
+            await AsyncGraphStore(runtime).get_node(creds.agent_did)
+        ).properties["constitution_hash"]
+        # Chunks gone from the runtime, and unobtainable from the anchor.
+        await AsyncRAGStore(
+            runtime, agent_id=creds.agent_did,
+        ).delete_chunks_for_file(constitution_hash)
+        await anchor.execute("DELETE FROM document_chunk_owners", ())
+
+        shortfall = await diagnose_runtime_birth_record(
+            runtime_db=runtime, agent_did=creds.agent_did,
+        )
+        assert shortfall, "the shortfall is real and must be reported"
+
+        with patch("kestrel_sovereign.kestrel_agent.AsyncStorage", return_value=storage), \
+                patch("kestrel_sovereign.storage.db.postgres.PostgresBackend"):
+            await agent._boot_phase_storage_privacy(BootContext())
+
+        # Booted, and knows who it is.
+        assert agent._agent_name == "Chunkless Bird"
+    finally:
+        await anchor.close()
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_an_absent_identity_still_refuses_with_or_without_an_anchor(
+    tmp_path, hybrid_env,
+):
+    """The refusal that matters is #2878's: on-disk identity material present,
+    no real agent node in the runtime. That must not depend on whether a local
+    anchor happens to exist — identical damage cannot boot in one case and
+    refuse in the other."""
+    from unittest.mock import patch
+
+    from kestrel_sovereign.agent.boot import BootContext
+    from kestrel_sovereign.identity.runtime_identity import IdentityReadinessError
+
+    creds, agent, runtime, storage = await _storage_phase_agent(
+        tmp_path, "Nameless Bird",
+    )
+    try:
+        # An anchor that exists but holds nothing to copy.
+        (tmp_path / "kestrel_prime.db").unlink()
+        empty = await AsyncDatabase.sqlite(str(tmp_path / "kestrel_prime.db"))
+        await empty.close()
+        assert await AsyncGraphStore(runtime).get_node(creds.agent_did) is None
+
+        with patch("kestrel_sovereign.kestrel_agent.AsyncStorage", return_value=storage), \
+                patch("kestrel_sovereign.storage.db.postgres.PostgresBackend"):
+            with pytest.raises(IdentityReadinessError) as exc_info:
+                await agent._boot_phase_storage_privacy(BootContext())
+        assert exc_info.value.failure == "birth_record"
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_a_complete_runtime_record_never_opens_the_anchor(
     tmp_path, hybrid_env,
 ):
@@ -939,6 +1113,48 @@ async def test_a_complete_runtime_record_never_opens_the_anchor(
         assert agent._agent_name == "Independent Bird"
     finally:
         await runtime.close()
+
+
+# ---------------------------------------------------------------------------
+# The loss is loud, not silent
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_health_check_names_a_capability_the_anchor_could_not_supply():
+    """A degraded boot must be visible where operators look.
+
+    #2871's defect was not that a capability was missing — it was that
+    ``/health`` reported ok while it was. Booting degraded is only defensible
+    if the degradation is named.
+    """
+    from kestrel_sovereign.features.health.checks import check_birth_record
+
+    healthy = type("A", (), {"_birth_record_shortfall": []})()
+    result = await check_birth_record(healthy)
+    assert result["status"] == "pass"
+    assert result["name"] == "birth_record"
+
+    degraded = type(
+        "A", (), {"_birth_record_shortfall": ["no retrievable chunks for abc…"]},
+    )()
+    result = await check_birth_record(degraded)
+    assert result["status"] == "warn"
+    assert "no retrievable chunks" in result["message"]
+    assert result["details"]["missing"] == ["no retrievable chunks for abc…"]
+
+
+@pytest.mark.asyncio
+async def test_health_check_does_not_invent_a_loss_for_a_duck_typed_agent():
+    """Third-party agents and test doubles implement the health protocol, not
+    this accounting. A MagicMock's auto-created attribute is truthy — reporting
+    a loss that did not happen is the same failure as hiding one that did."""
+    from unittest.mock import MagicMock
+
+    from kestrel_sovereign.features.health.checks import check_birth_record
+
+    assert (await check_birth_record(MagicMock()))["status"] == "pass"
+    assert (await check_birth_record(object()))["status"] == "pass"
 
 
 # ---------------------------------------------------------------------------
@@ -1080,8 +1296,13 @@ async def test_storage_phase_reconciles_before_the_agent_node_is_read(
 async def test_storage_phase_refuses_when_replication_leaves_it_incomplete(
     tmp_path, hybrid_env,
 ):
-    """Boot must not proceed on the claim that a copy happened. With
-    replication neutered, the post-copy re-check has to stop the boot."""
+    """Boot must not proceed on the claim that a copy happened.
+
+    With replication neutered, the agent node never arrives — an IDENTITY
+    shortfall, which is refused whether or not an anchor could have supplied
+    it. (A capability shortfall is deliberately not refused; see
+    ``test_a_shortfall_the_anchor_cannot_supply_does_not_brick_the_agent``.)
+    """
     from unittest.mock import patch
 
     from kestrel_sovereign.agent.boot import BootContext
@@ -1105,7 +1326,7 @@ async def test_storage_phase_refuses_when_replication_leaves_it_incomplete(
                 await agent._boot_phase_storage_privacy(BootContext())
 
         assert exc_info.value.failure == "birth_record"
-        assert exc_info.value.cause_type == "BirthRecordReplicationIncomplete"
+        assert exc_info.value.cause_type == "BirthRecordIdentityMissing"
     finally:
         await runtime.close()
 

@@ -299,28 +299,26 @@ class AsyncRAGStore:
         without the column still yields chunks, with ``profile_id`` None.
         """
         owner_scope, owner_params = self._owner_scope()
-        columns = "content, embedding, embedding_profile_id"
-        try:
-            # Own transaction for the same reason as ``_write_embedding_vec``:
-            # PostgreSQL aborts the whole transaction on a failed statement, so
-            # probing for a column by letting the SELECT fail would destroy a
-            # caller's open unit of work.
-            async with self.db.transaction():
-                rows = await self.db.fetchall(
-                    f"SELECT {columns} FROM document_chunks "
-                    f"WHERE file_hash = ? AND {owner_scope} ORDER BY chunk_id",
-                    (file_hash,) + owner_params,
-                )
-        except Exception as exc:
-            logger.info(
-                "document_chunks.embedding_profile_id unavailable (%s); "
-                "reading chunks for %s without it.", exc, file_hash,
-            )
-            rows = await self.db.fetchall(
-                "SELECT content, embedding FROM document_chunks "
-                f"WHERE file_hash = ? AND {owner_scope} ORDER BY chunk_id",
-                (file_hash,) + owner_params,
-            )
+        # Ask whether the column exists rather than letting a SELECT fail to
+        # find out. A failed statement aborts the whole transaction on
+        # PostgreSQL, so probing by exception would destroy a caller's open
+        # unit of work — the defect fixed in ``_write_embedding_vec`` — and a
+        # blanket ``except`` would also swallow a transient error and silently
+        # drop every chunk's profile id, dropping them all out of
+        # profile-filtered kNN.
+        has_profile_id = await self.db._column_exists(
+            "document_chunks", "embedding_profile_id",
+        )
+        columns = (
+            "content, embedding, embedding_profile_id"
+            if has_profile_id
+            else "content, embedding"
+        )
+        rows = await self.db.fetchall(
+            f"SELECT {columns} FROM document_chunks "
+            f"WHERE file_hash = ? AND {owner_scope} ORDER BY chunk_id",
+            (file_hash,) + owner_params,
+        )
 
         chunks: List[IndexedChunk] = []
         for row in rows:

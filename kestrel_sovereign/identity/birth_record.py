@@ -80,12 +80,41 @@ def is_fabricated_placeholder(node: Optional["GraphNode"], agent_did: str) -> bo
 
 @dataclass
 class BirthRecordDivergence:
-    """What the runtime database is missing relative to the local anchor."""
+    """What the runtime database is missing, split by what it costs.
 
-    reasons: List[str] = field(default_factory=list)
+    The distinction is load-bearing, and getting it wrong is how a fix for a
+    degraded agent becomes a brick.
+
+    ``identity`` — the runtime cannot say who this agent is: no agent node, or
+    a boot-fabricated placeholder standing in for one. This is #2878's
+    condition exactly, and boot refuses on it whether or not a local anchor
+    exists to repair it from. It is also the only condition this module widens
+    nothing for: an agent that boots today keeps booting.
+
+    ``capability`` — the record exists but something it should carry does not:
+    no governing edge, a governing edge naming an unreadable node, no
+    retrievable constitution chunks. Replication repairs these whenever the
+    anchor can supply them. When it cannot — a pre-#2649 anchor whose chunk
+    ownership was never provable, a constitution the anchor never held —
+    refusing would convert an agent that boots today into one that can never
+    boot again, with no operator verb to fix it. So these are reported loudly
+    (log + ``/health/detailed``) and the agent boots degraded.
+
+    That is not a retreat to the original bug. #2871's defect was that the loss
+    was SILENT while ``/health`` said ok. Naming it is the fix; refusing on it
+    is a policy change with no recovery path, and belongs to whoever decides
+    an ungoverned agent must not run at all.
+    """
+
+    identity: List[str] = field(default_factory=list)
+    capability: List[str] = field(default_factory=list)
+
+    @property
+    def reasons(self) -> List[str]:
+        return [*self.identity, *self.capability]
 
     def __bool__(self) -> bool:
-        return bool(self.reasons)
+        return bool(self.identity or self.capability)
 
     def describe(self) -> str:
         return "; ".join(self.reasons)
@@ -105,6 +134,78 @@ class ReplicationResult:
             f"{self.nodes} nodes, {self.edges} edges, {self.files} files, "
             f"{self.chunks} chunks"
         )
+
+
+async def _carry_embedding_profiles(
+    *, anchor_db: "AsyncDatabase", runtime_db: "AsyncDatabase", payloads,
+) -> None:
+    """Copy the ``embedding_profiles`` rows the carried vectors refer to.
+
+    A chunk's ``embedding_profile_id`` is a foreign key in spirit: kNN filters
+    by the active profile, and the operator audit resolves it to a provider,
+    model and dimension. Carrying vectors without their registry row leaves
+    them searchable but unattributable.
+
+    Best-effort by design: the registry is #1477 and later, so a database that
+    predates it has no such table, and losing operator metadata must never fail
+    an identity repair. Never write a row that is already there — a co-owner's
+    profile description is theirs.
+    """
+    profile_ids = {
+        chunk.profile_id
+        for *_head, chunks in payloads
+        for chunk in chunks
+        if chunk.profile_id
+    }
+    if not profile_ids:
+        return
+    columns = "id, provider, model, dim, space_id, normalized"
+    for profile_id in sorted(profile_ids):
+        try:
+            row = await anchor_db.fetchone(
+                f"SELECT {columns} FROM embedding_profiles WHERE id = ?",
+                (profile_id,),
+            )
+            if row is None:
+                continue
+            existing = await runtime_db.fetchone(
+                "SELECT 1 FROM embedding_profiles WHERE id = ?", (profile_id,),
+            )
+            if existing:
+                continue
+            insert = (
+                f"INSERT INTO embedding_profiles ({columns}) "
+                "VALUES (?, ?, ?, ?, ?, ?)"
+            )
+            insert += (
+                " ON CONFLICT (id) DO NOTHING"
+                if runtime_db.backend_type == "postgres"
+                else ""
+            )
+            if runtime_db.backend_type != "postgres":
+                insert = insert.replace("INSERT INTO", "INSERT OR IGNORE INTO", 1)
+            await runtime_db.execute(insert, tuple(row))
+        except Exception as exc:  # pragma: no cover - registry is optional
+            logger.info(
+                "Could not carry embedding profile %s into the runtime "
+                "database (%s); copied chunks keep their vectors but will "
+                "report an unknown profile in the embeddings audit.",
+                profile_id, exc,
+            )
+            return
+
+
+def _insert_file_owner_sql(db: "AsyncDatabase") -> str:
+    """Insert-if-absent for a ``file_owners`` witness, both backends."""
+    if db.backend_type == "postgres":
+        return (
+            "INSERT INTO file_owners (content_hash, agent_id, original_name, "
+            "metadata) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING"
+        )
+    return (
+        "INSERT OR IGNORE INTO file_owners (content_hash, agent_id, "
+        "original_name, metadata) VALUES (?, ?, ?, ?)"
+    )
 
 
 def local_anchor_path(storage_path: Optional[str]) -> Optional[Path]:
@@ -171,9 +272,9 @@ async def diagnose_runtime_birth_record(
 
     node = await graph.get_node(agent_did)
     if node is None:
-        divergence.reasons.append("agent node absent from the runtime database")
+        divergence.identity.append("agent node absent from the runtime database")
     elif is_fabricated_placeholder(node, agent_did):
-        divergence.reasons.append(
+        divergence.identity.append(
             "runtime agent node is a boot-fabricated placeholder"
         )
 
@@ -183,11 +284,13 @@ async def diagnose_runtime_birth_record(
         if edge.label == GOVERNED_BY
     ]
     if not governing:
-        divergence.reasons.append("no governed_by edge in the runtime database")
+        divergence.capability.append(
+            "no governed_by edge in the runtime database"
+        )
     else:
         for edge in governing:
             if await graph.get_node(edge.target_id) is None:
-                divergence.reasons.append(
+                divergence.capability.append(
                     f"governed_by names {edge.target_id[:12]}… but no such node "
                     "is readable in the runtime database"
                 )
@@ -198,7 +301,7 @@ async def diagnose_runtime_birth_record(
     # original symptom, signed off by the check added to catch it.
     for governing_hash in governing_document_hashes(node, governing):
         if await _owned_chunk_count(runtime_db, agent_did, governing_hash) == 0:
-            divergence.reasons.append(
+            divergence.capability.append(
                 f"no retrievable chunks for the governing constitution "
                 f"{governing_hash[:12]}… in the runtime database"
             )
@@ -271,9 +374,9 @@ async def diagnose_birth_record(
     runtime_graph = AsyncGraphStore(runtime_db, agent_id=agent_did)
     runtime_node = await runtime_graph.get_node(agent_did)
     if runtime_node is None:
-        divergence.reasons.append("agent node absent from the runtime database")
+        divergence.identity.append("agent node absent from the runtime database")
     elif is_fabricated_placeholder(runtime_node, agent_did):
-        divergence.reasons.append(
+        divergence.identity.append(
             "runtime agent node is a boot-fabricated placeholder"
         )
 
@@ -289,16 +392,29 @@ async def diagnose_birth_record(
         missing = anchor_edges - runtime_edges
         if missing:
             labels = sorted({label for _, _, label in missing})
-            divergence.reasons.append(
+            divergence.capability.append(
                 f"edges missing from the runtime database: {', '.join(labels)}"
             )
 
-    anchor_chunks = await _owned_chunk_count(anchor_db, agent_did)
-    if anchor_chunks:
-        runtime_chunks = await _owned_chunk_count(runtime_db, agent_did)
+    # Per governing document, not the tenant total: a whole-tenant comparison
+    # cannot fall short once the agent owns unrelated chunks, so it would say
+    # "no rows missing" in the very log line that reports a repair in progress.
+    for governing_hash in governing_document_hashes(
+        runtime_node or anchor_node,
+        [e for e in await anchor_graph.get_edges(agent_did, direction="out")
+         if e.label == GOVERNED_BY],
+    ):
+        anchor_chunks = await _owned_chunk_count(
+            anchor_db, agent_did, governing_hash,
+        )
+        if not anchor_chunks:
+            continue
+        runtime_chunks = await _owned_chunk_count(
+            runtime_db, agent_did, governing_hash,
+        )
         if runtime_chunks < anchor_chunks:
-            divergence.reasons.append(
-                f"constitution chunks: anchor has {anchor_chunks}, "
+            divergence.capability.append(
+                f"chunks for {governing_hash[:12]}…: anchor has {anchor_chunks}, "
                 f"runtime database has {runtime_chunks}"
             )
 
@@ -341,7 +457,8 @@ async def replicate_birth_record(
     runtime_db: "AsyncDatabase",
     anchor_db: "AsyncDatabase",
     agent_did: str,
-    llm_service: Any = None,
+    # Deliberately no ``llm_service``: nothing here computes an embedding, and
+    # threading one in would invite a caller to assume otherwise.
 ) -> ReplicationResult:
     """Copy the agent's birth record from the anchor into the runtime database.
 
@@ -369,7 +486,7 @@ async def replicate_birth_record(
     runtime_graph = AsyncGraphStore(runtime_db, agent_id=agent_did)
     runtime_files = AsyncFileStore(runtime_db, agent_id=agent_did)
     runtime_rag = AsyncRAGStore(
-        runtime_db, llm_service=llm_service, agent_id=agent_did
+        runtime_db, agent_id=agent_did
     )
 
     agent_node = await anchor_graph.get_node(agent_did)
@@ -515,6 +632,25 @@ async def replicate_birth_record(
         for content_hash, original_name, content, metadata, _chunks in payloads:
             if await runtime_files.file_exists(content_hash):
                 continue
+            unowned_row = await runtime_db.fetchone(
+                "SELECT 1 FROM files f WHERE f.content_hash = ? AND NOT EXISTS ("
+                "  SELECT 1 FROM file_owners o WHERE o.content_hash = f.content_hash"
+                ")",
+                (content_hash,),
+            )
+            if unowned_row:
+                # The bytes are there with no owner at all, so the owner-scoped
+                # ``file_exists`` cannot see them and ``store_file`` would raise
+                # "Cannot claim an unowned legacy file" on every boot, forever
+                # — the same permanent brick the node adoption below avoids.
+                # Files are content addressed, so the anchor's bytes hashing to
+                # this same content_hash IS the proof of what the row holds.
+                await runtime_db.execute(
+                    _insert_file_owner_sql(runtime_db),
+                    (content_hash, agent_did, original_name or content_hash, None),
+                )
+                result.files += 1
+                continue
             # ``enc`` describes how the *source* row was stored. The target
             # re-encrypts under its own configuration, so carrying the flag
             # across would mark a plaintext row as encrypted.
@@ -534,10 +670,23 @@ async def replicate_birth_record(
                 # The row is there but this agent has no ownership witness for
                 # it, so the bound read cannot see it. ``add_node`` would raise
                 # "Cannot claim or overwrite an unowned graph node" on every
-                # boot, forever. Taking the witness is the repair: the file
-                # rows written above already prove this agent owns the content
-                # this node addresses, which is the same condition ``add_node``
-                # itself uses to admit a co-owner of a shared content node.
+                # boot, forever. Taking the witness is the repair — but only on
+                # the same proof ``add_node`` itself requires to admit a
+                # co-owner of a shared content node: this agent owns the file
+                # the node addresses. Asserted rather than assumed, because
+                # "the file rows above already prove it" is false whenever the
+                # anchor listed no files.
+                owns_content = await runtime_db.fetchone(
+                    "SELECT 1 FROM file_owners WHERE content_hash = ? AND agent_id = ?",
+                    (node.node_id, agent_did),
+                )
+                if not owns_content:
+                    raise ValueError(
+                        f"{node.node_id[:12]}… exists in the runtime database "
+                        f"with no ownership witness for {agent_did}, and this "
+                        "agent does not own the file it addresses; refusing to "
+                        "claim another tenant's node."
+                    )
                 from kestrel_sovereign.storage.async_graph_store import (
                     record_graph_node_owner,
                 )
@@ -570,9 +719,6 @@ async def replicate_birth_record(
             if runtime_node_now
             else None
         )
-        runtime_governing = {
-            edge.target_id for edge in runtime_edges if edge.label == GOVERNED_BY
-        }
         # The edges this pass means the runtime to end up holding — what the
         # verification below is entitled to demand. An edge deliberately not
         # replicated must not then be reported missing.
@@ -582,10 +728,14 @@ async def replicate_birth_record(
             if triple in present_edges:
                 intended.add(triple)
                 continue
+            # Regardless of whether a governing edge is currently present. The
+            # case that matters most is the one where it is ABSENT — a reanchor
+            # that pruned the old edge and died before writing the new one — and
+            # requiring a present edge would let exactly that case re-attach the
+            # superseded constitution.
             if (
                 edge.label == GOVERNED_BY
                 and runtime_anchored_hash
-                and runtime_anchored_hash in runtime_governing
                 and edge.target_id != runtime_anchored_hash
             ):
                 logger.info(
@@ -611,6 +761,14 @@ async def replicate_birth_record(
                     properties=edge.properties,
                 )
             result.edges += 1
+
+        # The registry row for every profile the copied vectors were stamped
+        # with. Without it ``kestrel embeddings audit`` reports them as
+        # "unknown — not in embedding_profiles registry": the vectors would be
+        # searchable but unattributable to the model that made them.
+        await _carry_embedding_profiles(
+            anchor_db=anchor_db, runtime_db=runtime_db, payloads=payloads,
+        )
 
         # Chunks last: ``store_precomputed_chunks`` refuses a file outside the
         # bound agent, so the file_owners rows written above are its precondition.

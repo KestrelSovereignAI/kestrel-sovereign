@@ -24,6 +24,7 @@ Run against any throwaway PostgreSQL:
 Skipped when that is not set, so CI (which has no PostgreSQL) stays green.
 """
 
+import contextlib
 import os
 import uuid
 
@@ -81,10 +82,17 @@ async def _purge_agent(db, agent_did: str) -> None:
     await db.execute(
         "DELETE FROM document_chunk_owners WHERE agent_id = $1", (agent_did,)
     )
-    for content_hash in owned_files:
-        await db.execute(
-            "DELETE FROM document_chunks WHERE file_hash = $1", (content_hash,)
-        )
+    # Only chunks nobody else still claims. The constitution is shared, so an
+    # unconditional delete by file_hash would destroy a co-owner's chunks and
+    # leave their owner rows pointing at nothing — a cleanup manufacturing the
+    # exact damage this suite exists to catch, against a database whose DSN
+    # comes from KESTREL_DATABASE_URL, i.e. possibly a live one.
+    await db.execute(
+        "DELETE FROM document_chunks WHERE NOT EXISTS ("
+        "  SELECT 1 FROM document_chunk_owners o WHERE o.chunk_id = "
+        "document_chunks.chunk_id)",
+        (),
+    )
     await db.execute("DELETE FROM file_owners WHERE agent_id = $1", (agent_did,))
     for content_hash in owned_files:
         # Only if nobody else still claims it — a co-owner's data must survive.
@@ -109,13 +117,31 @@ async def _purge_agent(db, agent_did: str) -> None:
             )
 
 
-async def _drop_embedding_vec(db) -> None:
+@contextlib.asynccontextmanager
+async def _without_embedding_vec(db):
     """Put document_chunks in the state a fresh PostgreSQL runtime is in.
 
     The Phase-2 migration skips the column while the table has no embedded
     rows, so a first boot always finds it missing.
+
+    Restored on the way out. Left dropped, the next `_migrate_pg_table` run
+    recreates it by sniffing the dimension from the first non-NULL `embedding`
+    row — so an interrupted run leaving this test's 3-float vectors behind
+    would pin the whole database's column to `vector(3)`.
     """
-    await db.execute("ALTER TABLE document_chunks DROP COLUMN IF EXISTS embedding_vec", ())
+    had_column = await db._column_exists("document_chunks", "embedding_vec")
+    await db.execute(
+        "ALTER TABLE document_chunks DROP COLUMN IF EXISTS embedding_vec", ()
+    )
+    try:
+        yield
+    finally:
+        if had_column:
+            await db.execute(
+                "ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS "
+                "embedding_vec vector",
+                (),
+            )
 
 
 async def test_precomputed_chunks_commit_when_the_vector_column_is_missing(pg):
@@ -128,38 +154,42 @@ async def test_precomputed_chunks_commit_when_the_vector_column_is_missing(pg):
     from kestrel_sovereign.storage.async_file_store import AsyncFileStore
     from kestrel_sovereign.storage.async_rag_store import AsyncRAGStore, IndexedChunk
 
-    await _drop_embedding_vec(pg)
     agent = f"did:web:test.invalid:vec-{uuid.uuid4().hex[:8]}"
     try:
-        files = AsyncFileStore(pg, agent_id=agent)
-        file_hash = await files.store_file(
-            f"vector column probe {agent}".encode(), "probe.md",
-        )
-        rag = AsyncRAGStore(pg, agent_id=agent)
-        payload = [
-            IndexedChunk("one", [0.5, 0.25, 0.125], "profile-x"),
-            IndexedChunk("two", [1.0, 0.0, -1.0], "profile-x"),
-        ]
+        async with _without_embedding_vec(pg):
+            files = AsyncFileStore(pg, agent_id=agent)
+            file_hash = await files.store_file(
+                f"vector column probe {agent}".encode(), "probe.md",
+            )
+            rag = AsyncRAGStore(pg, agent_id=agent)
+            payload = [
+                IndexedChunk("one", [0.5, 0.25, 0.125], "profile-x"),
+                IndexedChunk("two", [1.0, 0.0, -1.0], "profile-x"),
+            ]
 
-        # The shape replicate_birth_record uses: one transaction on the target.
-        async with pg.transaction():
-            written = await rag.store_precomputed_chunks(file_hash, payload)
-        assert written == 2
+            # The shape replicate_birth_record uses: one transaction on the
+            # target.
+            async with pg.transaction():
+                written = await rag.store_precomputed_chunks(file_hash, payload)
+            assert written == 2
 
-        row = await pg.fetchone(
-            "SELECT COUNT(*) FROM document_chunks WHERE file_hash = $1",
-            (file_hash,),
-        )
-        assert int(row[0]) == 2, "the copy reported success but committed nothing"
+            row = await pg.fetchone(
+                "SELECT COUNT(*) FROM document_chunks WHERE file_hash = $1",
+                (file_hash,),
+            )
+            assert int(row[0]) == 2, (
+                "the copy reported success but committed nothing"
+            )
 
-        # The legacy embedding column carries the vectors even with the
-        # parallel column absent, so retrieval still has something to work with.
-        read_back = await rag.read_indexed_chunks(file_hash)
-        assert [c.content for c in read_back] == ["one", "two"]
-        assert read_back[0].embedding == pytest.approx([0.5, 0.25, 0.125])
-        # The profile-id-only fallback ran rather than being swallowed by an
-        # aborted transaction.
-        assert [c.profile_id for c in read_back] == ["profile-x", "profile-x"]
+            # The legacy embedding column carries the vectors even with the
+            # parallel column absent, so retrieval still has something to work
+            # with.
+            read_back = await rag.read_indexed_chunks(file_hash)
+            assert [c.content for c in read_back] == ["one", "two"]
+            assert read_back[0].embedding == pytest.approx([0.5, 0.25, 0.125])
+            # The profile-id-only fallback ran rather than being swallowed by
+            # an aborted transaction.
+            assert [c.profile_id for c in read_back] == ["profile-x", "profile-x"]
     finally:
         await _purge_agent(pg, agent)
 
@@ -181,7 +211,6 @@ async def test_birth_record_replicates_into_postgres_with_vectors(pg, tmp_path):
 
     os.environ.setdefault("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
     os.environ.setdefault(DID_WEB_DOMAIN_ENV, "agents.kestrel-sovereign.test")
-    await _drop_embedding_vec(pg)
 
     creds = await create_kestrel_identity_async(
         str(tmp_path), None, agent_name="Postgres Bird",

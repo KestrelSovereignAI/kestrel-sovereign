@@ -1073,6 +1073,10 @@ class KestrelAgent(
 
         # Determine database backend
         self._db_backend = db_backend or os.environ.get("KESTREL_DB_BACKEND", "sqlite")
+        # Birth-record capability the runtime database could not be given and
+        # no retry can supply (#2871). Surfaced by the ``birth_record`` health
+        # check; empty on every healthy agent.
+        self._birth_record_shortfall: List[str] = []
         self._database_url = database_url or os.environ.get("KESTREL_DATABASE_URL")
         # ``_database_url`` is deliberately the resolved storage setting, but
         # a shared pool has an independent advisory-lock pool.  Preserve the
@@ -2521,15 +2525,16 @@ class KestrelAgent(
             if not await anchor_holds_birth_record(
                 anchor_db=anchor_db, agent_did=self.agent_id
             ):
-                # Nothing to copy. Not the same as saying the runtime record is
-                # fine — ``_ensure_agent_node_present``'s refusal (#2878) is
-                # what covers a record that is absent everywhere.
+                # Nothing to copy. The verdict is decided by WHAT is short, not
+                # by whether an anchor happens to exist — identical damage must
+                # not boot on one host and refuse on another.
                 logging.warning(
                     "Birth record for %s is incomplete in the runtime database "
                     "(%s) and the local anchor %s holds no record to repair it "
                     "from.",
                     self.agent_id, shortfall.describe(), anchor,
                 )
+                self._record_birth_record_shortfall(shortfall)
                 return
 
             # The shortfall drives the repair; this comparison is for the
@@ -2555,7 +2560,6 @@ class KestrelAgent(
                 runtime_db=runtime_db,
                 anchor_db=anchor_db,
                 agent_did=self.agent_id,
-                llm_service=self.llm_service,
             )
             logging.info(
                 "Replicated birth record for %s into the runtime database: %s",
@@ -2575,17 +2579,7 @@ class KestrelAgent(
             remaining = await diagnose_runtime_birth_record(
                 runtime_db=runtime_db, agent_did=self.agent_id,
             )
-            if remaining:
-                logging.error(
-                    "Birth record for %s is STILL incomplete after replication "
-                    "(%s). Refusing to boot an agent that cannot retrieve its "
-                    "own constitution.",
-                    self.agent_id,
-                    remaining.describe(),
-                )
-                raise IdentityReadinessError(
-                    "birth_record", cause_type="BirthRecordReplicationIncomplete"
-                )
+            self._record_birth_record_shortfall(remaining)
         except IdentityReadinessError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -2601,6 +2595,51 @@ class KestrelAgent(
         finally:
             if anchor_db is not None:
                 await anchor_db.close()
+
+    def _record_birth_record_shortfall(self, divergence) -> None:
+        """Decide the verdict on WHAT is short, and leave a trace either way.
+
+        ``identity`` — no agent node, or a fabricated placeholder — is #2878's
+        condition, and boot refuses on it here rather than fifty lines later in
+        ``_ensure_agent_node_present``, which only ever inspects the node's
+        presence. Refusing here also keeps it ahead of every feature side
+        effect, and makes the verdict independent of whether a local anchor
+        exists: identical damage must not boot on one host and refuse on
+        another.
+
+        ``capability`` — no governing edge, an unreadable governing target, no
+        retrievable constitution chunks — is NOT refused. Replication has
+        already repaired whatever the anchor could supply; what is left is
+        unobtainable, and every retry produces the same result. Refusing would
+        turn an agent that boots today into one that never boots again, with no
+        verb to fix it. It is recorded instead, so ``/health/detailed`` names
+        the loss. #2871's defect was that this loss was SILENT; naming it is
+        the fix.
+        """
+        self._birth_record_shortfall = list(getattr(divergence, "capability", []))
+        if self._birth_record_shortfall:
+            logging.error(
+                "Birth record for %s is still incomplete after replication "
+                "(%s). The agent will boot, but this capability is absent and "
+                "no retry can supply it — see /health/detailed.",
+                self.agent_id,
+                "; ".join(self._birth_record_shortfall),
+            )
+        identity_failures = list(getattr(divergence, "identity", []))
+        if identity_failures:
+            from kestrel_sovereign.identity.runtime_identity import (
+                IdentityReadinessError,
+            )
+
+            logging.error(
+                "Birth record for %s does not establish its identity in the "
+                "configured runtime database (%s). Refusing to boot.",
+                self.agent_id,
+                "; ".join(identity_failures),
+            )
+            raise IdentityReadinessError(
+                "birth_record", cause_type="BirthRecordIdentityMissing"
+            )
 
     async def _boot_phase_identity_constitution_features(self, ctx: BootContext) -> None:
         """Phase 4 — identity name, constitution overlay verification (BEFORE feature discovery), feature discovery/enablement/registration, the durable agent node, the startup constitution audit, and LLM payer policy."""

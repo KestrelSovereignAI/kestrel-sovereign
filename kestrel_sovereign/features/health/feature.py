@@ -48,6 +48,7 @@ from .checks import (
     check_disk_space,
     check_llm_service,
     check_memory_system,
+    check_birth_record,
     check_signal_audit_log,
 )
 
@@ -450,6 +451,7 @@ class HealthFeature(Feature):
         checks.append(await check_context_budget(self.agent))
         checks.append(await check_bootstrap_state(self.agent))
         checks.append(await check_signal_audit_log(self.agent))
+        checks.append(await check_birth_record(self.agent))
 
         overall_status = _derive_overall_status(checks)
         overall_healthy = overall_status == "healthy"
