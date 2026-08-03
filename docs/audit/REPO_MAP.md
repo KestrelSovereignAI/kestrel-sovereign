@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-08-02
-**Scope:** 2294 tracked files (1532 `.py`, 345 `.md`, 417 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-08-03
+**Scope:** 2296 tracked files (1534 `.py`, 345 `.md`, 417 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -2962,6 +2962,8 @@ Repo entry points and standard project files.
   - `def test_adapter_family_maps_to_identity_substrate(vendor, route, model, family, …)`; `def test_composite_preference_selects_matching_route()`; `def test_heterogeneous_route_uses_active_model_family(vendor, model, expected)`; `def test_heterogeneous_route_keeps_explicit_fallback_when_model_is_auto(vendor, expected)`; `def test_plugin_family_is_preserved_without_framework_vendor_branch()`; `def test_missing_runtime_is_explicit_unknown()`; `async def test_exporter_uses_its_agent_llm_service_not_process_global_config()`
 - **tests/unit/test_implicit_sessions.py** — Tests for implicit session_id derivation in AsyncConversationStore.
   - `async def store()`; `class TestImplicitSessionDerivation`; `class TestSessionGapBoundary`; `class TestSessionIdRetrieval`; `class TestErrorIsolation`; `class TestSessionGapMinutesCentralized`; `class TestSearchHistorySessionScoping`
+- **tests/unit/test_inception_atomicity.py** — Inception must record an agent atomically with its governing edge (#2867).
+  - `async def external_db(tmp_path)`; `async def test_constitution_agent_and_edge_all_commit(external_db, tmp_path)`; `async def test_failure_between_agent_node_and_edge_leaves_no_agent_node(external_db, tmp_path, monkeypatch)`; `async def test_rag_and_embedding_work_stays_outside_the_transaction_span(external_db, tmp_path, monkeypatch)`
 - **tests/unit/test_inception_cli_args.py** — —
   - `def test_inception_cli_accepts_output_alias()`; `def test_inception_cli_disallows_abbrev_prefixes()`
 - **tests/unit/test_inception_emancipation.py** — Inception-level tests for Amendment VIII substitution (#1109).
@@ -3208,6 +3210,8 @@ Repo entry points and standard project files.
   - `async def test_tool_turn_evidence_matches_across_transports(monkeypatch)`; `async def test_narration_check_fires_identically_on_both_transports(monkeypatch)`; `async def test_no_tool_turn_evidence_matches_and_stays_empty(monkeypatch)`; `async def test_nonstreaming_multi_iteration_tool_evidence_ordered(monkeypatch)`; `async def test_inline_codex_get_response_preserves_marker_bound_pre_tool_prose()`; `async def test_inline_codex_streaming_and_nonstreaming_snapshot_same_boundary()`; `async def test_inline_codex_tool_turn_narration_caught_on_nonstreaming(monkeypatch)`
 - **tests/unit/test_post_response_pipeline.py** — Unit tests for post-response memory tagging pipeline (#565).
   - `class TestMemorySystemTagMessage`; `class TestMemoryManagerTagExchange`; `class TestUpdateMessageMetadataAtomicMerge`; `class TestEpisodeCreationThreshold`; `class TestPostResponsePipeline`
+- **tests/unit/test_postgres_birth_record.py** — #2878 — boot must refuse (never fabricate a placeholder) when on-disk identity material is present but the agent node is absent from the runtime database.
+  - `def hybrid_env(monkeypatch)`; `async def test_boot_refuses_when_identity_present_but_node_absent(tmp_path, hybrid_env)`; `async def test_boot_fabricates_node_for_genuinely_new_agent(tmp_path, hybrid_env)`; `async def test_boot_returns_existing_node_without_refusing(tmp_path, hybrid_env)`; `def test_birth_record_refusal_message_is_public_safe(tmp_path, hybrid_env)`
 - **tests/unit/test_privacy_active_session_contracts.py** — Active-session privacy transition contracts.
   - `async def test_privacy_transition_waits_for_active_stream_before_switching_modes()`; `async def test_streaming_omits_briefing_after_session_was_briefed()`
 - **tests/unit/test_privacy_add_conversation_signature_contract.py** — Contract test: PrivacyAgent.add_conversation must accept every keyword that the storage-layer add_conversation accepts.
