@@ -2583,15 +2583,24 @@ class KestrelAgent(
         except IdentityReadinessError:
             raise
         except Exception as exc:  # noqa: BLE001
-            # Operator detail to the log; the readiness error stays public-safe.
+            # A failed copy is judged by the same rule as a completed one: what
+            # is the runtime database actually short of? Every raise site in
+            # replicate_birth_record is an ANCHOR-integrity problem — an
+            # unwitnessed edge, a file row with no bytes, the anchor failing to
+            # open — and so is a transient fault mid-copy. Refusing on all of
+            # them unconditionally would brick an agent whose own identity is
+            # intact and which boots on origin/main today, and would tell its
+            # operator to "re-incept against this backend", which for a dropped
+            # connection is destructive advice.
+            #
+            # ``shortfall`` is the pre-replication diagnosis, so it describes
+            # the runtime as this pass found it. Identity gaps still refuse.
             logging.error(
                 "Could not replicate the birth record for %s from %s into the "
                 "configured runtime database (backend=%s): %s",
                 self.agent_id, anchor, self._db_backend, exc, exc_info=True,
             )
-            raise IdentityReadinessError(
-                "birth_record", cause_type=type(exc).__name__
-            ) from None
+            self._record_birth_record_shortfall(shortfall)
         finally:
             if anchor_db is not None:
                 await anchor_db.close()

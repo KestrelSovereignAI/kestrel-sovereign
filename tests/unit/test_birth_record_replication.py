@@ -1038,8 +1038,66 @@ async def test_a_shortfall_the_anchor_cannot_supply_does_not_brick_the_agent(
 
         # Booted, and knows who it is.
         assert agent._agent_name == "Chunkless Bird"
+        # ...and the loss is NAMED. Booting degraded is only defensible if the
+        # degradation is visible; a silent one is #2871's defining symptom.
+        from kestrel_sovereign.features.health.checks import check_birth_record
+
+        assert agent._birth_record_shortfall
+        assert any(
+            "governing constitution" in reason
+            for reason in agent._birth_record_shortfall
+        )
+        check = await check_birth_record(agent)
+        assert check["status"] == "warn"
+        assert check["details"]["missing"] == agent._birth_record_shortfall
     finally:
         await anchor.close()
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_copy_is_judged_by_what_the_runtime_is_short_of(
+    tmp_path, hybrid_env,
+):
+    """Every raise site in replication is an ANCHOR-integrity problem, and so
+    is a transient fault mid-copy. Judging them all as identity failures would
+    brick an agent whose own identity is intact — and which boots today — and
+    tell its operator to re-incept, which for a dropped connection is
+    destructive advice."""
+    from unittest.mock import patch
+
+    from kestrel_sovereign.agent.boot import BootContext
+
+    creds, agent, runtime, storage = await _storage_phase_agent(
+        tmp_path, "Interrupted Copy Bird",
+    )
+    anchor = await AsyncDatabase.sqlite(str(tmp_path / "kestrel_prime.db"))
+    try:
+        await replicate_birth_record(
+            runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
+        )
+        constitution_hash = (
+            await AsyncGraphStore(runtime).get_node(creds.agent_did)
+        ).properties["constitution_hash"]
+        await AsyncRAGStore(
+            runtime, agent_id=creds.agent_did,
+        ).delete_chunks_for_file(constitution_hash)
+        await anchor.close()
+
+        async def _boom(**_kwargs):
+            raise ConnectionResetError("the database went away mid-copy")
+
+        with patch("kestrel_sovereign.kestrel_agent.AsyncStorage", return_value=storage), \
+                patch("kestrel_sovereign.storage.db.postgres.PostgresBackend"), \
+                patch(
+                    "kestrel_sovereign.identity.birth_record.replicate_birth_record",
+                    _boom,
+                ):
+            await agent._boot_phase_storage_privacy(BootContext())
+
+        assert agent._agent_name == "Interrupted Copy Bird"
+        assert agent._birth_record_shortfall
+    finally:
         await runtime.close()
 
 

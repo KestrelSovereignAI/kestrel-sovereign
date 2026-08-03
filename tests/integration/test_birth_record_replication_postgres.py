@@ -194,6 +194,57 @@ async def test_precomputed_chunks_commit_when_the_vector_column_is_missing(pg):
         await _purge_agent(pg, agent)
 
 
+async def test_embedding_profile_rows_cross_from_a_sqlite_anchor(pg, tmp_path):
+    """The registry row must survive the SQLite -> PostgreSQL type boundary.
+
+    ``embedding_profiles.normalized`` is INTEGER on SQLite and BOOLEAN on
+    PostgreSQL, and asyncpg's encoder rejects an int outright. Binding the
+    anchor's row through unchanged makes this function a silent no-op on the
+    only backend combination it exists for — every copied vector then reports
+    as an unknown profile in the embeddings audit.
+    """
+    from kestrel_sovereign.identity.birth_record import (
+        carry_embedding_profiles,
+        read_embedding_profiles,
+    )
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    profile_id = f"prof-{uuid.uuid4().hex[:8]}"
+    anchor = await AsyncDatabase.sqlite(str(tmp_path / "kestrel_prime.db"))
+    try:
+        await anchor.execute(
+            "INSERT INTO embedding_profiles "
+            "(id, provider, model, dim, space_id, normalized) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (profile_id, "ollama", "nomic-embed-text", 768, "space-a", 1),
+        )
+        rows = await read_embedding_profiles(
+            anchor_db=anchor, profile_ids={profile_id},
+        )
+        assert len(rows) == 1
+        assert isinstance(rows[0][5], int), "SQLite really does yield an int here"
+
+        assert await carry_embedding_profiles(runtime_db=pg, rows=rows) == 1
+
+        landed = await pg.fetchone(
+            "SELECT provider, model, dim, space_id, normalized "
+            "FROM embedding_profiles WHERE id = $1",
+            (profile_id,),
+        )
+        assert landed is not None, "the registry row did not cross"
+        assert landed[0] == "ollama"
+        assert landed[2] == 768
+        assert landed[4] is True
+
+        # Idempotent, and never overwrites a description that is already there.
+        assert await carry_embedding_profiles(runtime_db=pg, rows=rows) == 0
+    finally:
+        await anchor.close()
+        await pg.execute(
+            "DELETE FROM embedding_profiles WHERE id = $1", (profile_id,)
+        )
+
+
 async def test_birth_record_replicates_into_postgres_with_vectors(pg, tmp_path):
     """End to end on the real backend: a SQLite anchor's record — including
     chunk vectors — lands in PostgreSQL, and a second pass is a no-op."""

@@ -41,6 +41,8 @@ thing the design is built to avoid. Tracked on #2871 rather than done badly.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -136,55 +138,84 @@ class ReplicationResult:
         )
 
 
-async def _carry_embedding_profiles(
-    *, anchor_db: "AsyncDatabase", runtime_db: "AsyncDatabase", payloads,
-) -> None:
-    """Copy the ``embedding_profiles`` rows the carried vectors refer to.
+_PROFILE_COLUMNS = "id, provider, model, dim, space_id, normalized"
+
+
+async def read_embedding_profiles(
+    *, anchor_db: "AsyncDatabase", profile_ids,
+) -> List[tuple]:
+    """Read the anchor's registry rows for the profiles the vectors name.
+
+    Read here, with the rest of the payload, and NOT inside the target's
+    transaction — the anchor is a second connection to a second database, and a
+    read on it mid-transaction holds the target's write open across it.
+    """
+    rows: List[tuple] = []
+    if not profile_ids:
+        return rows
+    if not await anchor_db._column_exists("embedding_profiles", "id"):
+        return rows
+    for profile_id in sorted(profile_ids):
+        row = await anchor_db.fetchone(
+            f"SELECT {_PROFILE_COLUMNS} FROM embedding_profiles WHERE id = ?",
+            (profile_id,),
+        )
+        if row is not None:
+            rows.append(tuple(row))
+    return rows
+
+
+async def carry_embedding_profiles(
+    *, runtime_db: "AsyncDatabase", rows,
+) -> int:
+    """Write the anchor's ``embedding_profiles`` rows into the runtime database.
 
     A chunk's ``embedding_profile_id`` is a foreign key in spirit: kNN filters
-    by the active profile, and the operator audit resolves it to a provider,
-    model and dimension. Carrying vectors without their registry row leaves
-    them searchable but unattributable.
+    by the active profile and the operator audit resolves it to a provider,
+    model and dimension. Vectors carried without their registry row stay
+    searchable but report as an unknown profile.
 
-    Best-effort by design: the registry is #1477 and later, so a database that
-    predates it has no such table, and losing operator metadata must never fail
-    an identity repair. Never write a row that is already there — a co-owner's
-    profile description is theirs.
+    Deliberately OUTSIDE the replication transaction. This is operator
+    metadata, not part of the record's correctness, and every statement here is
+    one PostgreSQL would abort a transaction over: the registry is #1477 and
+    later, its creating migration is explicitly non-fatal, and that migration
+    probes ``information_schema`` unscoped by schema — so on the multi-schema
+    PostgreSQL this feature targets the table can legitimately be absent while
+    the create was skipped as already-applied. Run inside the copy, a missing
+    table would poison the transaction and roll a perfectly good birth record
+    back; run here, the worst case is a missing audit label.
+
+    Never overwrites: a co-owner's profile description is theirs.
     """
-    profile_ids = {
-        chunk.profile_id
-        for *_head, chunks in payloads
-        for chunk in chunks
-        if chunk.profile_id
-    }
-    if not profile_ids:
-        return
-    columns = "id, provider, model, dim, space_id, normalized"
-    for profile_id in sorted(profile_ids):
+    written = 0
+    for row in rows:
+        profile_id = row[0]
         try:
-            row = await anchor_db.fetchone(
-                f"SELECT {columns} FROM embedding_profiles WHERE id = ?",
-                (profile_id,),
-            )
-            if row is None:
-                continue
-            existing = await runtime_db.fetchone(
-                "SELECT 1 FROM embedding_profiles WHERE id = ?", (profile_id,),
-            )
-            if existing:
-                continue
-            insert = (
-                f"INSERT INTO embedding_profiles ({columns}) "
-                "VALUES (?, ?, ?, ?, ?, ?)"
-            )
-            insert += (
-                " ON CONFLICT (id) DO NOTHING"
-                if runtime_db.backend_type == "postgres"
-                else ""
-            )
-            if runtime_db.backend_type != "postgres":
-                insert = insert.replace("INSERT INTO", "INSERT OR IGNORE INTO", 1)
-            await runtime_db.execute(insert, tuple(row))
+            async with runtime_db.transaction():
+                existing = await runtime_db.fetchone(
+                    "SELECT 1 FROM embedding_profiles WHERE id = ?",
+                    (profile_id,),
+                )
+                if existing:
+                    continue
+                if runtime_db.backend_type == "postgres":
+                    # The anchor is SQLite, where ``normalized`` is an INTEGER
+                    # 0/1; the PostgreSQL column is BOOLEAN and asyncpg's
+                    # encoder rejects an int outright. Same coercion
+                    # ``upsert_embedding_profile`` does per backend.
+                    params = (*row[:5], bool(row[5]))
+                    insert = (
+                        f"INSERT INTO embedding_profiles ({_PROFILE_COLUMNS}) "
+                        "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING"
+                    )
+                else:
+                    params = (*row[:5], 1 if row[5] else 0)
+                    insert = (
+                        "INSERT OR IGNORE INTO embedding_profiles "
+                        f"({_PROFILE_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?)"
+                    )
+                await runtime_db.execute(insert, params)
+                written += 1
         except Exception as exc:  # pragma: no cover - registry is optional
             logger.info(
                 "Could not carry embedding profile %s into the runtime "
@@ -192,7 +223,7 @@ async def _carry_embedding_profiles(
                 "report an unknown profile in the embeddings audit.",
                 profile_id, exc,
             )
-            return
+    return written
 
 
 def _insert_file_owner_sql(db: "AsyncDatabase") -> str:
@@ -609,6 +640,16 @@ async def replicate_birth_record(
         chunks = await anchor_rag.read_indexed_chunks(content_hash)
         payloads.append((content_hash, original_name, content, metadata, chunks))
 
+    profile_rows = await read_embedding_profiles(
+        anchor_db=anchor_db,
+        profile_ids={
+            chunk.profile_id
+            for *_head, chunks in payloads
+            for chunk in chunks
+            if chunk.profile_id
+        },
+    )
+
     result = ReplicationResult()
 
     async with runtime_db.transaction():
@@ -643,11 +684,35 @@ async def replicate_birth_record(
                 # ``file_exists`` cannot see them and ``store_file`` would raise
                 # "Cannot claim an unowned legacy file" on every boot, forever
                 # — the same permanent brick the node adoption below avoids.
-                # Files are content addressed, so the anchor's bytes hashing to
-                # this same content_hash IS the proof of what the row holds.
+                #
+                # Prove the RUNTIME row before claiming it. The anchor's bytes
+                # hashing to this content_hash says nothing about what the
+                # runtime holds under that id: an ownerless row can predate a
+                # key rotation, in which case adoption "succeeds", the copy
+                # verifies, boot reports complete, and the first read of the
+                # constitution raises DecryptionError long afterwards with
+                # nothing pointing back here.
+                runtime_bytes = await AsyncFileStore(runtime_db).retrieve_file(
+                    content_hash
+                )
+                if (
+                    runtime_bytes is None
+                    or hashlib.sha256(runtime_bytes).hexdigest() != content_hash
+                ):
+                    raise ValueError(
+                        f"the runtime database holds an unowned file row for "
+                        f"{content_hash[:12]}… whose bytes do not verify "
+                        "against it; refusing to claim it for "
+                        f"{agent_did}."
+                    )
                 await runtime_db.execute(
                     _insert_file_owner_sql(runtime_db),
-                    (content_hash, agent_did, original_name or content_hash, None),
+                    (
+                        content_hash,
+                        agent_did,
+                        original_name or content_hash,
+                        json.dumps(metadata) if metadata else None,
+                    ),
                 )
                 result.files += 1
                 continue
@@ -762,14 +827,6 @@ async def replicate_birth_record(
                 )
             result.edges += 1
 
-        # The registry row for every profile the copied vectors were stamped
-        # with. Without it ``kestrel embeddings audit`` reports them as
-        # "unknown — not in embedding_profiles registry": the vectors would be
-        # searchable but unattributable to the model that made them.
-        await _carry_embedding_profiles(
-            anchor_db=anchor_db, runtime_db=runtime_db, payloads=payloads,
-        )
-
         # Chunks last: ``store_precomputed_chunks`` refuses a file outside the
         # bound agent, so the file_owners rows written above are its precondition.
         expected: Dict[str, int] = {}
@@ -829,5 +886,10 @@ async def replicate_birth_record(
                     f"{count} chunks were written for {content_hash[:12]}… but "
                     f"only {landed} are readable in the runtime database"
                 )
+
+    # After the record is committed, never inside it: this is the operator's
+    # audit label for the vectors above, and no amount of it is worth rolling a
+    # good birth record back for.
+    await carry_embedding_profiles(runtime_db=runtime_db, rows=profile_rows)
 
     return result

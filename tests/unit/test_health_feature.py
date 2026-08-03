@@ -514,6 +514,11 @@ class TestHeartbeatCheck:
         assert "disk_space" in check_names
         assert "context_budget" in check_names
         assert "bootstrap_state" in check_names
+        # #2871 — a birth record the runtime database could not be given is a
+        # capability the agent boots WITHOUT. Registration here is what makes
+        # that loss visible; unregistered, it is silent again, which was the
+        # original defect.
+        assert "birth_record" in check_names
 
     @pytest.mark.asyncio
     async def test_persists_to_db(self, feature):
