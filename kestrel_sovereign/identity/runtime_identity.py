@@ -103,6 +103,14 @@ class IdentityReadinessError(RuntimeError):
             "identity material does not bind to the configured agent DID; "
             "restore the matching agent home and restart without re-incepting"
         ),
+        "birth_record": (
+            "on-disk identity material is present but the agent's birth record "
+            "is absent or incomplete in the configured runtime database (it was "
+            "written to a different database, or a fabricated placeholder / "
+            "partial write is missing its constitution). Point the runtime at "
+            "the database inception used, or re-incept against this backend — do "
+            "not boot with a fabricated placeholder identity"
+        ),
     }
 
     def __init__(self, failure: str, *, cause_type: Optional[str] = None):
