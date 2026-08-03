@@ -55,6 +55,60 @@ async def pg():
         await db.close()
 
 
+async def _purge_agent(db, agent_did: str) -> None:
+    """Remove every row a run left behind, including the shared ones.
+
+    The constitution is content-addressed, so its ``files`` and ``graph_nodes``
+    rows are shared by every agent under it. Deleting only the *owner* rows
+    leaves them ownerless, and the next run's ``store_file`` then raises
+    "Cannot claim an unowned legacy file" — the suite would fail in setup
+    instead of reporting a regression, having itself created the shape that
+    bricks a real agent.
+    """
+    owned_files = [
+        row[0]
+        for row in await db.fetchall(
+            "SELECT content_hash FROM file_owners WHERE agent_id = $1",
+            (agent_did,),
+        )
+    ]
+    governed = [
+        row[0]
+        for row in await db.fetchall(
+            "SELECT target_id FROM graph_edges WHERE source_id = $1", (agent_did,),
+        )
+    ]
+    await db.execute(
+        "DELETE FROM document_chunk_owners WHERE agent_id = $1", (agent_did,)
+    )
+    for content_hash in owned_files:
+        await db.execute(
+            "DELETE FROM document_chunks WHERE file_hash = $1", (content_hash,)
+        )
+    await db.execute("DELETE FROM file_owners WHERE agent_id = $1", (agent_did,))
+    for content_hash in owned_files:
+        # Only if nobody else still claims it — a co-owner's data must survive.
+        remaining = await db.fetchone(
+            "SELECT COUNT(*) FROM file_owners WHERE content_hash = $1",
+            (content_hash,),
+        )
+        if not int(remaining[0]):
+            await db.execute(
+                "DELETE FROM files WHERE content_hash = $1", (content_hash,)
+            )
+    await db.execute("DELETE FROM graph_edge_owners WHERE agent_id = $1", (agent_did,))
+    await db.execute("DELETE FROM graph_edges WHERE source_id = $1", (agent_did,))
+    await db.execute("DELETE FROM graph_node_owners WHERE agent_id = $1", (agent_did,))
+    for node_id in [agent_did, *governed]:
+        remaining = await db.fetchone(
+            "SELECT COUNT(*) FROM graph_node_owners WHERE node_id = $1", (node_id,)
+        )
+        if not int(remaining[0]):
+            await db.execute(
+                "DELETE FROM graph_nodes WHERE node_id = $1", (node_id,)
+            )
+
+
 async def _drop_embedding_vec(db) -> None:
     """Put document_chunks in the state a fresh PostgreSQL runtime is in.
 
@@ -107,10 +161,7 @@ async def test_precomputed_chunks_commit_when_the_vector_column_is_missing(pg):
         # aborted transaction.
         assert [c.profile_id for c in read_back] == ["profile-x", "profile-x"]
     finally:
-        await pg.execute(
-            "DELETE FROM document_chunk_owners WHERE agent_id = $1", (agent,),
-        )
-        await pg.execute("DELETE FROM file_owners WHERE agent_id = $1", (agent,))
+        await _purge_agent(pg, agent)
 
 
 async def test_birth_record_replicates_into_postgres_with_vectors(pg, tmp_path):
@@ -174,12 +225,4 @@ async def test_birth_record_replicates_into_postgres_with_vectors(pg, tmp_path):
         )
     finally:
         await anchor.close()
-        did = creds.agent_did
-        await pg.execute(
-            "DELETE FROM document_chunk_owners WHERE agent_id = $1", (did,),
-        )
-        await pg.execute("DELETE FROM file_owners WHERE agent_id = $1", (did,))
-        await pg.execute("DELETE FROM graph_edge_owners WHERE agent_id = $1", (did,))
-        await pg.execute("DELETE FROM graph_edges WHERE source_id = $1", (did,))
-        await pg.execute("DELETE FROM graph_node_owners WHERE agent_id = $1", (did,))
-        await pg.execute("DELETE FROM graph_nodes WHERE node_id = $1", (did,))
+        await _purge_agent(pg, creds.agent_did)

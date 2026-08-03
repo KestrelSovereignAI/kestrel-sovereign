@@ -336,7 +336,156 @@ async def test_repair_never_reverts_durable_post_inception_state(
         assert after.properties["avatar_hash"] == "deadbeef"
         assert after.properties["constitution_reanchor"] == {"receipt": "signed"}
         # ...and the thing that was actually missing did get repaired.
-        assert await _chunk_count(runtime, creds.agent_did) == 47
+        assert await _chunk_count(runtime, creds.agent_did) == await _chunk_count(
+            anchor, creds.agent_did,
+        )
+    finally:
+        await anchor.close()
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_repair_does_not_re_add_a_superseded_governing_edge(
+    tmp_path, hybrid_env,
+):
+    """A reanchor updates the runtime node and prunes the old governing edge;
+    the anchor keeps the original. Re-adding it would leave the agent with two
+    governing constitutions — which ``doctor`` reports and only a signed
+    ``constitution reanchor --force`` can clear."""
+    creds, anchor = await _incept(tmp_path, name="Reanchored Bird")
+    runtime = await _fresh_runtime(tmp_path)
+    try:
+        await replicate_birth_record(
+            runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
+        )
+        graph = AsyncGraphStore(runtime, agent_id=creds.agent_did)
+        node = await graph.get_node(creds.agent_did)
+        old_hash = node.properties["constitution_hash"]
+
+        # What a reanchor leaves in the runtime: a new governing document,
+        # the node anchored to it, the stale edge pruned.
+        from kestrel_sovereign.storage.async_file_store import AsyncFileStore
+
+        new_hash = await AsyncFileStore(
+            runtime, agent_id=creds.agent_did,
+        ).store_file(b"AMENDED CONSTITUTION", "KESTREL_CONSTITUTION.md")
+        await graph.add_node(
+            GraphNode(
+                node_id=new_hash,
+                node_type="document",
+                label="KESTREL_CONSTITUTION",
+                properties={"hash": new_hash, "type": "Constitution"},
+            )
+        )
+        await graph.add_edge(creds.agent_did, new_hash, "governed_by")
+        await graph.delete_edge(creds.agent_did, old_hash, "governed_by")
+        node.properties["constitution_hash"] = new_hash
+        await graph.add_node(node)
+        await AsyncRAGStore(
+            runtime, agent_id=creds.agent_did,
+        ).store_precomputed_chunks(new_hash, [IndexedChunk("amended text")])
+
+        # Any shortfall the anchor can answer re-triggers a repair pass.
+        await AsyncRAGStore(
+            runtime, agent_id=creds.agent_did,
+        ).delete_chunks_for_file(new_hash)
+        assert await diagnose_runtime_birth_record(
+            runtime_db=runtime, agent_did=creds.agent_did,
+        )
+
+        await replicate_birth_record(
+            runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
+        )
+
+        governing = {
+            edge.target_id
+            for edge in await graph.get_edges(creds.agent_did, direction="out")
+            if edge.label == "governed_by"
+        }
+        assert governing == {new_hash}, (
+            "the anchor's superseded constitution must not be re-attached"
+        )
+        assert (
+            await graph.get_node(creds.agent_did)
+        ).properties["constitution_hash"] == new_hash
+    finally:
+        await anchor.close()
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_an_unowned_constitution_row_is_adopted_not_refused_forever(
+    tmp_path, hybrid_env,
+):
+    """A constitution row present in the runtime with no ownership witness for
+    this agent is invisible to its bound reads, so ``add_node`` would raise
+    "Cannot claim or overwrite an unowned graph node" on every boot, forever.
+    The agent owns the underlying content file, so taking the witness is the
+    repair — a refusal here would be permanent and unactionable."""
+    creds, anchor = await _incept(tmp_path, name="Orphan Row Bird")
+    runtime = await _fresh_runtime(tmp_path)
+    try:
+        await replicate_birth_record(
+            runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
+        )
+        constitution_hash = (
+            await AsyncGraphStore(runtime).get_node(creds.agent_did)
+        ).properties["constitution_hash"]
+
+        # Strip the witness, keep the row — and force a repair pass.
+        await runtime.execute(
+            "DELETE FROM graph_node_owners WHERE node_id = ?", (constitution_hash,),
+        )
+        await AsyncRAGStore(
+            runtime, agent_id=creds.agent_did,
+        ).delete_chunks_for_file(constitution_hash)
+        assert await diagnose_runtime_birth_record(
+            runtime_db=runtime, agent_did=creds.agent_did,
+        )
+
+        await replicate_birth_record(
+            runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
+        )
+
+        assert not await diagnose_runtime_birth_record(
+            runtime_db=runtime, agent_did=creds.agent_did,
+        )
+        assert await AsyncGraphStore(
+            runtime, agent_id=creds.agent_did,
+        ).get_node(constitution_hash) is not None
+    finally:
+        await anchor.close()
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_a_stale_unwitnessed_edge_does_not_refuse_a_healthy_agent(
+    tmp_path, hybrid_env,
+):
+    """The unwitnessed-edge guard exists to stop a silently UNGOVERNED agent.
+    An anchor carrying a witnessed current governing edge plus a stale
+    unwitnessed one — what a pre-atomic reanchor leaves, and what the #2649
+    backfill declines to heal — is not that, and refusing it would be a
+    permanent boot failure for an agent whose record is complete and copyable.
+    """
+    creds, anchor = await _incept(tmp_path, name="Stale Edge Bird")
+    runtime = await _fresh_runtime(tmp_path)
+    try:
+        await anchor.execute(
+            "INSERT INTO graph_edges (source_id, target_id, label, properties) "
+            "VALUES (?, ?, ?, ?)",
+            (creds.agent_did, "0" * 64, "governed_by", None),
+        )
+
+        await replicate_birth_record(
+            runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
+        )
+
+        node = await AsyncGraphStore(runtime).get_node(creds.agent_did)
+        assert node is not None and node.label == "Stale Edge Bird"
+        assert not await diagnose_runtime_birth_record(
+            runtime_db=runtime, agent_did=creds.agent_did,
+        )
     finally:
         await anchor.close()
         await runtime.close()
@@ -704,6 +853,55 @@ async def test_runtime_diagnosis_catches_a_governing_edge_with_no_target(
 
 
 @pytest.mark.asyncio
+async def test_unrelated_chunks_do_not_satisfy_the_constitution_check(
+    tmp_path, hybrid_env,
+):
+    """The completeness gate must count chunks OF THE GOVERNING DOCUMENT.
+
+    An agent that has indexed anything else — a note, an upload — would
+    otherwise satisfy a whole-tenant count while holding zero constitution
+    chunks. That is #2871's exact symptom, signed off by the check added to
+    catch it, and it would also stop the anchor from ever being consulted.
+    """
+    from kestrel_sovereign.storage.async_file_store import AsyncFileStore
+
+    creds, anchor = await _incept(tmp_path, name="Distracted Bird")
+    runtime = await _fresh_runtime(tmp_path)
+    try:
+        await replicate_birth_record(
+            runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
+        )
+        constitution_hash = (
+            await AsyncGraphStore(runtime).get_node(creds.agent_did)
+        ).properties["constitution_hash"]
+
+        # Some other document the agent legitimately owns and has indexed.
+        notes = await AsyncFileStore(
+            runtime, agent_id=creds.agent_did,
+        ).store_file(b"shopping list", "notes.md")
+        await AsyncRAGStore(
+            runtime, agent_id=creds.agent_did,
+        ).store_precomputed_chunks(notes, [IndexedChunk("milk")])
+
+        # Now lose the constitution's chunks the way a partial copy would.
+        await AsyncRAGStore(
+            runtime, agent_id=creds.agent_did,
+        ).delete_chunks_for_file(constitution_hash)
+        assert await _chunk_count(runtime, creds.agent_did) > 0, (
+            "the tenant total is non-zero — that is the trap"
+        )
+
+        shortfall = await diagnose_runtime_birth_record(
+            runtime_db=runtime, agent_did=creds.agent_did,
+        )
+        assert shortfall, "zero constitution chunks must not read as complete"
+        assert "governing constitution" in shortfall.describe()
+    finally:
+        await anchor.close()
+        await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_a_complete_runtime_record_never_opens_the_anchor(
     tmp_path, hybrid_env,
 ):
@@ -711,7 +909,7 @@ async def test_a_complete_runtime_record_never_opens_the_anchor(
     no longer reads. Opening the anchor runs its migrations and ownership
     backfills, so a corrupt or read-only one would refuse a boot that is
     entirely fine — the file deciding whether the database may start."""
-    from unittest.mock import AsyncMock, MagicMock, patch
+    from unittest.mock import patch
 
     from kestrel_sovereign.agent.boot import BootContext
 

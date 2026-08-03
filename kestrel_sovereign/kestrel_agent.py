@@ -2479,6 +2479,7 @@ class KestrelAgent(
             return
 
         from kestrel_sovereign.identity.birth_record import (
+            anchor_holds_birth_record,
             diagnose_birth_record,
             diagnose_runtime_birth_record,
             local_anchor_path,
@@ -2517,21 +2518,37 @@ class KestrelAgent(
             # Opening the anchor brings its schema up to date, exactly as a
             # SQLite host would at every boot. Its birth record is only read.
             anchor_db = await AsyncDatabase.sqlite(str(anchor))
+            if not await anchor_holds_birth_record(
+                anchor_db=anchor_db, agent_did=self.agent_id
+            ):
+                # Nothing to copy. Not the same as saying the runtime record is
+                # fine — ``_ensure_agent_node_present``'s refusal (#2878) is
+                # what covers a record that is absent everywhere.
+                logging.warning(
+                    "Birth record for %s is incomplete in the runtime database "
+                    "(%s) and the local anchor %s holds no record to repair it "
+                    "from.",
+                    self.agent_id, shortfall.describe(), anchor,
+                )
+                return
+
+            # The shortfall drives the repair; this comparison is for the
+            # operator, naming which rows the anchor can supply. Gating on it
+            # instead would silently skip the one condition only the runtime
+            # check detects — a governing edge whose node is unreadable.
             divergence = await diagnose_birth_record(
                 runtime_db=runtime_db,
                 anchor_db=anchor_db,
                 agent_did=self.agent_id,
             )
-            if not divergence:
-                return
-
             logging.warning(
-                "Birth record for %s diverges from the local anchor %s: %s. "
-                "Replicating it into the configured runtime database "
+                "Birth record for %s is incomplete in the runtime database "
+                "(%s); against the local anchor %s: %s. Replicating "
                 "(backend=%s).",
                 self.agent_id,
+                shortfall.describe(),
                 anchor,
-                divergence.describe(),
+                divergence.describe() or "no rows missing",
                 self._db_backend,
             )
             result = await replicate_birth_record(

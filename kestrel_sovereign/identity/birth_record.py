@@ -192,12 +192,50 @@ async def diagnose_runtime_birth_record(
                     "is readable in the runtime database"
                 )
 
-    if await _owned_chunk_count(runtime_db, agent_did) == 0:
-        divergence.reasons.append(
-            "no retrievable constitution chunks in the runtime database"
-        )
+    # Scoped to the governing document, never the tenant total. Any other
+    # indexed file — a note, an upload — would otherwise satisfy this and
+    # report an agent with ZERO constitution chunks as complete: #2871's
+    # original symptom, signed off by the check added to catch it.
+    for governing_hash in governing_document_hashes(node, governing):
+        if await _owned_chunk_count(runtime_db, agent_did, governing_hash) == 0:
+            divergence.reasons.append(
+                f"no retrievable chunks for the governing constitution "
+                f"{governing_hash[:12]}… in the runtime database"
+            )
 
     return divergence
+
+
+def governing_document_hashes(
+    node: Optional["GraphNode"], governing_edges: List[Any],
+) -> List[str]:
+    """Return the document(s) whose chunks are this agent's constitution.
+
+    The agent node's ``constitution_hash`` is authoritative when present — it
+    is what ``agent/constitution.py`` verifies against and what a reanchor
+    updates. The ``governed_by`` targets are the fallback for a node predating
+    that property. Returns empty only when neither exists, in which case there
+    is no constitution to demand chunks for.
+    """
+    anchored = (node.properties or {}).get("constitution_hash") if node else None
+    if isinstance(anchored, str) and anchored:
+        return [anchored]
+    return [edge.target_id for edge in governing_edges]
+
+
+async def anchor_holds_birth_record(
+    *, anchor_db: "AsyncDatabase", agent_did: str,
+) -> bool:
+    """Return whether the anchor has an agent node this agent can copy.
+
+    Separate from :func:`diagnose_birth_record` because that function returns
+    an empty divergence for two opposite situations — "the anchor has nothing"
+    and "everything already matches" — and the caller must tell them apart.
+    """
+    from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore
+
+    graph = AsyncGraphStore(anchor_db, agent_id=agent_did)
+    return await graph.get_node(agent_did) is not None
 
 
 async def diagnose_birth_record(
@@ -355,24 +393,35 @@ async def replicate_birth_record(
             agent_did, direction="out",
         )
     }
-    unwitnessed = {
-        (source, target, label)
-        for source, target, label in all_edges - {
-            (e.source_id, e.target_id, e.label) for e in edges
-        }
-        # Scoped to the birth record's own edges. An unwitnessed edge of some
-        # other kind is a gap in the #2649 backfill, not a reason to refuse an
-        # identity — this guard exists to stop a SILENTLY ungoverned agent, not
-        # to audit the anchor's whole graph.
-        if label in (GOVERNED_BY, SPAWNED_BY)
-    }
-    if unwitnessed:
+    # Scoped to the birth record's own edges AND to the ones that actually
+    # matter. An unwitnessed edge of another kind is a gap in the #2649
+    # backfill; a stale unwitnessed ``governed_by`` alongside a witnessed
+    # current one is what a pre-atomic reanchor leaves behind, and `doctor`
+    # treats it as a warning. This guard exists to stop a SILENTLY ungoverned
+    # agent, not to audit the anchor's whole graph — so it fires only when the
+    # relation the agent actually needs has no witness at all.
+    witnessed = {(e.source_id, e.target_id, e.label) for e in edges}
+    anchored_hash = (agent_node.properties or {}).get("constitution_hash")
+    unwitnessed_labels = set()
+    for _source, target, label in all_edges - witnessed:
+        if label == GOVERNED_BY:
+            witnessed_governing = {t for _s, t, l in witnessed if l == GOVERNED_BY}
+            if anchored_hash in witnessed_governing or (
+                not anchored_hash and witnessed_governing
+            ):
+                continue  # the current governing edge IS witnessed; this is stale
+            unwitnessed_labels.add(label)
+        elif label == SPAWNED_BY:
+            if any(l == SPAWNED_BY for _s, _t, l in witnessed):
+                continue
+            unwitnessed_labels.add(label)
+    if unwitnessed_labels:
         raise ValueError(
-            f"the local anchor holds {sorted(l for _, _, l in unwitnessed)} "
-            f"edges for {agent_did} with no ownership witness for it; "
-            "replicating would record the agent without them. Repair the "
-            "anchor's graph_edge_owners rows before booting against another "
-            "database."
+            f"the local anchor holds {sorted(unwitnessed_labels)} edges for "
+            f"{agent_did} with no ownership witness for it, and no witnessed "
+            "one to use instead; replicating would record the agent without "
+            "them. Repair the anchor's graph_edge_owners rows before booting "
+            "against another database."
         )
     # Read the whole record before opening the write transaction: the anchor is
     # a second connection to a second database, and a read on it inside the
@@ -417,8 +466,13 @@ async def replicate_birth_record(
         copyable.add(edge.target_id)
         targets.append(target)
 
+    # Ordered so every agent under one constitution takes the shared ``files``
+    # and ``graph_nodes`` row locks in the same sequence. Unordered, the lock
+    # order is whatever the anchor's scan returns, which is how concurrent
+    # replications into one PostgreSQL would deadlock against each other.
     file_rows = await anchor_db.fetchall(
-        "SELECT content_hash, original_name FROM file_owners WHERE agent_id = ?",
+        "SELECT content_hash, original_name FROM file_owners "
+        "WHERE agent_id = ? ORDER BY content_hash",
         (agent_did,),
     )
     payloads = []
@@ -471,9 +525,27 @@ async def replicate_birth_record(
             result.files += 1
 
         for node in targets:
-            if await runtime_graph.get_node(node.node_id) is None:
-                await runtime_graph.add_node(node)
+            if await runtime_graph.get_node(node.node_id) is not None:
+                continue
+            existing_row = await runtime_db.fetchone(
+                "SELECT 1 FROM graph_nodes WHERE node_id = ?", (node.node_id,),
+            )
+            if existing_row:
+                # The row is there but this agent has no ownership witness for
+                # it, so the bound read cannot see it. ``add_node`` would raise
+                # "Cannot claim or overwrite an unowned graph node" on every
+                # boot, forever. Taking the witness is the repair: the file
+                # rows written above already prove this agent owns the content
+                # this node addresses, which is the same condition ``add_node``
+                # itself uses to admit a co-owner of a shared content node.
+                from kestrel_sovereign.storage.async_graph_store import (
+                    record_graph_node_owner,
+                )
+                await record_graph_node_owner(runtime_db, node.node_id, agent_did)
                 result.nodes += 1
+                continue
+            await runtime_graph.add_node(node)
+            result.nodes += 1
 
         runtime_node = await runtime_graph.get_node(agent_did)
         if runtime_node is None or is_fabricated_placeholder(runtime_node, agent_did):
@@ -483,13 +555,47 @@ async def replicate_birth_record(
         # The governing edge is written whenever it is missing, even when the
         # node was already present: "agent recorded but not governed" is the
         # #2867 state, and it is only ever repaired here.
+        runtime_edges = await runtime_graph.get_edges(agent_did, direction="out")
         present_edges = {
-            (edge.source_id, edge.target_id, edge.label)
-            for edge in await runtime_graph.get_edges(agent_did, direction="out")
+            (edge.source_id, edge.target_id, edge.label) for edge in runtime_edges
         }
+        # What the RUNTIME currently says governs this agent. A reanchor
+        # updates the runtime node and prunes the old edge; the anchor keeps
+        # the original. Re-adding the anchor's stale target would leave two
+        # governing constitutions — which `doctor` reports and only a signed
+        # `constitution reanchor --force` can clear.
+        runtime_node_now = await runtime_graph.get_node(agent_did)
+        runtime_anchored_hash = (
+            (runtime_node_now.properties or {}).get("constitution_hash")
+            if runtime_node_now
+            else None
+        )
+        runtime_governing = {
+            edge.target_id for edge in runtime_edges if edge.label == GOVERNED_BY
+        }
+        # The edges this pass means the runtime to end up holding — what the
+        # verification below is entitled to demand. An edge deliberately not
+        # replicated must not then be reported missing.
+        intended: set = set()
         for edge in edges:
-            if (edge.source_id, edge.target_id, edge.label) in present_edges:
+            triple = (edge.source_id, edge.target_id, edge.label)
+            if triple in present_edges:
+                intended.add(triple)
                 continue
+            if (
+                edge.label == GOVERNED_BY
+                and runtime_anchored_hash
+                and runtime_anchored_hash in runtime_governing
+                and edge.target_id != runtime_anchored_hash
+            ):
+                logger.info(
+                    "Not replicating the anchor's governed_by edge to %s… for "
+                    "%s: the runtime database is already governed by %s…, "
+                    "which is what its agent node anchors.",
+                    edge.target_id[:12], agent_did, runtime_anchored_hash[:12],
+                )
+                continue
+            intended.add(triple)
             if edge.target_id == agent_did or edge.target_id in copyable:
                 await runtime_graph.add_edge(
                     edge.source_id,
@@ -538,9 +644,7 @@ async def replicate_birth_record(
             (edge.source_id, edge.target_id, edge.label)
             for edge in await runtime_graph.get_edges(agent_did, direction="out")
         }
-        missing = {
-            (edge.source_id, edge.target_id, edge.label) for edge in edges
-        } - written_edges
+        missing = intended - written_edges
         if missing:
             raise ValueError(
                 f"edges missing after writing them: "
@@ -550,14 +654,14 @@ async def replicate_birth_record(
         # returns None for a node with no ownership witness as well as for one
         # that does not exist, so an edge can land while its target does not —
         # committing "recorded but not governed" and then reporting healthy.
-        for edge in edges:
-            if edge.target_id == agent_did:
+        for _source, target, label in intended:
+            if target == agent_did:
                 continue
-            if edge.label != GOVERNED_BY and edge.target_id not in copyable:
+            if label != GOVERNED_BY and target not in copyable:
                 continue  # a spawned_by parent lives in another tenant by design
-            if await runtime_graph.get_node(edge.target_id) is None:
+            if await runtime_graph.get_node(target) is None:
                 raise ValueError(
-                    f"{edge.label} names {edge.target_id[:12]}… but that node is "
+                    f"{label} names {target[:12]}… but that node is "
                     "not readable in the runtime database after writing it"
                 )
         for content_hash, count in expected.items():
