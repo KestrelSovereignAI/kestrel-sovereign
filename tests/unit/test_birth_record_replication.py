@@ -23,6 +23,7 @@ Mutation traps this file is written against:
 import pytest
 
 from kestrel_sovereign.identity.birth_record import (
+    diagnose_runtime_birth_record,
     diagnose_birth_record,
     is_fabricated_placeholder,
     local_anchor_path,
@@ -283,6 +284,59 @@ async def test_replication_is_idempotent_against_a_populated_target(
         ) == first_edges
         node = await AsyncGraphStore(runtime).get_node(creds.agent_did)
         assert node.label == "Twice Bird"
+    finally:
+        await anchor.close()
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_repair_never_reverts_durable_post_inception_state(
+    tmp_path, hybrid_env,
+):
+    """The anchor is frozen at inception; the runtime node keeps living.
+
+    A completed genesis audit, a reanchored ``constitution_hash``, an avatar
+    hash — all are written to the runtime node after inception and none of them
+    exist in the anchor. Replication repairs what is MISSING; it must never
+    copy the anchor's stale snapshot over a node that is already a genuine
+    birth record, or a boot whose only complaint was a chunk count would undo a
+    signed constitutional amendment.
+    """
+    creds, anchor = await _incept(tmp_path, name="Living Bird")
+    runtime = await _fresh_runtime(tmp_path)
+    try:
+        await replicate_birth_record(
+            runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
+        )
+        graph = AsyncGraphStore(runtime, agent_id=creds.agent_did)
+        live = await graph.get_node(creds.agent_did)
+        assert live.properties.get("genesis_audit", {}).get("status") == "pending"
+
+        # What the runtime legitimately accumulates after inception.
+        live.properties["genesis_audit"] = {"status": "passed", "audited": True}
+        live.properties["avatar_hash"] = "deadbeef"
+        live.properties["constitution_reanchor"] = {"receipt": "signed"}
+        await graph.add_node(live)
+
+        # Any divergence at all re-triggers repair — a chunk shortfall is enough.
+        constitution_hash = live.properties["constitution_hash"]
+        await AsyncRAGStore(
+            runtime, agent_id=creds.agent_did,
+        ).delete_chunks_for_file(constitution_hash)
+        assert await diagnose_birth_record(
+            runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
+        )
+
+        await replicate_birth_record(
+            runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
+        )
+
+        after = await graph.get_node(creds.agent_did)
+        assert after.properties["genesis_audit"] == {"status": "passed", "audited": True}
+        assert after.properties["avatar_hash"] == "deadbeef"
+        assert after.properties["constitution_reanchor"] == {"receipt": "signed"}
+        # ...and the thing that was actually missing did get repaired.
+        assert await _chunk_count(runtime, creds.agent_did) == 47
     finally:
         await anchor.close()
         await runtime.close()
@@ -575,6 +629,117 @@ async def test_a_write_that_did_not_land_rolls_the_whole_copy_back(
         assert await _chunk_count(runtime, creds.agent_did) == 0
     finally:
         await anchor.close()
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_a_dangling_governing_target_is_refused_not_committed(
+    tmp_path, hybrid_env, monkeypatch,
+):
+    """The edge is not the record — the node it names is.
+
+    A bound ``get_node`` returns None for a node with no ownership witness as
+    well as for one that does not exist, so a target can be skipped while its
+    edge still lands (``add_trusted_cross_agent_edge`` needs only the source).
+    That commits an agent whose ``constitution_hash`` points at nothing, and a
+    check that only counted edges would then call it healthy forever.
+    """
+    creds, anchor = await _incept(tmp_path, name="Dangling Target Bird")
+    runtime = await _fresh_runtime(tmp_path)
+    try:
+        real_add_node = AsyncGraphStore.add_node
+
+        async def _lose_the_document_row(self, node, *args, **kwargs):
+            # Report the write, keep the ownership witness, lose the row —
+            # a store claiming a write it did not durably make.
+            await real_add_node(self, node, *args, **kwargs)
+            if node.node_type == "document":
+                await self.db.execute(
+                    "DELETE FROM graph_nodes WHERE node_id = ?", (node.node_id,),
+                )
+
+        monkeypatch.setattr(AsyncGraphStore, "add_node", _lose_the_document_row)
+
+        with pytest.raises(Exception, match="not readable in the runtime database"):
+            await replicate_birth_record(
+                runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
+            )
+        assert await AsyncGraphStore(runtime).get_node(creds.agent_did) is None
+    finally:
+        await anchor.close()
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_diagnosis_catches_a_governing_edge_with_no_target(
+    tmp_path, hybrid_env,
+):
+    """The same damage, already committed by an older build, must be reported
+    as incomplete so it gets repaired rather than blessed."""
+    creds, anchor = await _incept(tmp_path, name="Blessed Bird")
+    runtime = await _fresh_runtime(tmp_path)
+    try:
+        await replicate_birth_record(
+            runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
+        )
+        assert not await diagnose_runtime_birth_record(
+            runtime_db=runtime, agent_did=creds.agent_did,
+        )
+
+        constitution_hash = (
+            await AsyncGraphStore(runtime).get_node(creds.agent_did)
+        ).properties["constitution_hash"]
+        await runtime.execute(
+            "DELETE FROM graph_nodes WHERE node_id = ?", (constitution_hash,),
+        )
+
+        shortfall = await diagnose_runtime_birth_record(
+            runtime_db=runtime, agent_did=creds.agent_did,
+        )
+        assert shortfall
+        assert "no such node is readable" in shortfall.describe()
+    finally:
+        await anchor.close()
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_a_complete_runtime_record_never_opens_the_anchor(
+    tmp_path, hybrid_env,
+):
+    """A healthy PostgreSQL host must not depend on a leftover SQLite file it
+    no longer reads. Opening the anchor runs its migrations and ownership
+    backfills, so a corrupt or read-only one would refuse a boot that is
+    entirely fine — the file deciding whether the database may start."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from kestrel_sovereign.agent.boot import BootContext
+
+    creds, agent, runtime, storage = await _storage_phase_agent(
+        tmp_path, "Independent Bird",
+    )
+    try:
+        anchor = await AsyncDatabase.sqlite(str(tmp_path / "kestrel_prime.db"))
+        try:
+            await replicate_birth_record(
+                runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
+            )
+        finally:
+            await anchor.close()
+
+        # Corrupt the anchor: opening it now raises.
+        (tmp_path / "kestrel_prime.db").write_bytes(b"not a database at all")
+
+        with patch("kestrel_sovereign.kestrel_agent.AsyncStorage", return_value=storage), \
+                patch("kestrel_sovereign.storage.db.postgres.PostgresBackend"), \
+                patch(
+                    "kestrel_sovereign.identity.birth_record.diagnose_birth_record"
+                ) as anchor_diagnose:
+            await agent._boot_phase_storage_privacy(BootContext())
+
+        anchor_diagnose.assert_not_called()
+        assert agent._agent_name == "Independent Bird"
+    finally:
         await runtime.close()
 
 

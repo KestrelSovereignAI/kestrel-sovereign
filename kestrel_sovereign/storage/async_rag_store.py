@@ -301,11 +301,16 @@ class AsyncRAGStore:
         owner_scope, owner_params = self._owner_scope()
         columns = "content, embedding, embedding_profile_id"
         try:
-            rows = await self.db.fetchall(
-                f"SELECT {columns} FROM document_chunks "
-                f"WHERE file_hash = ? AND {owner_scope} ORDER BY chunk_id",
-                (file_hash,) + owner_params,
-            )
+            # Own transaction for the same reason as ``_write_embedding_vec``:
+            # PostgreSQL aborts the whole transaction on a failed statement, so
+            # probing for a column by letting the SELECT fail would destroy a
+            # caller's open unit of work.
+            async with self.db.transaction():
+                rows = await self.db.fetchall(
+                    f"SELECT {columns} FROM document_chunks "
+                    f"WHERE file_hash = ? AND {owner_scope} ORDER BY chunk_id",
+                    (file_hash,) + owner_params,
+                )
         except Exception as exc:
             logger.info(
                 "document_chunks.embedding_profile_id unavailable (%s); "

@@ -2480,6 +2480,7 @@ class KestrelAgent(
 
         from kestrel_sovereign.identity.birth_record import (
             diagnose_birth_record,
+            diagnose_runtime_birth_record,
             local_anchor_path,
             replicate_birth_record,
             runtime_database_is_the_anchor,
@@ -2498,6 +2499,18 @@ class KestrelAgent(
             IdentityReadinessError,
         )
         from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+        # Ask the runtime database first, and open the anchor only if it has
+        # something to answer. Opening the anchor runs its migrations and
+        # ownership backfills, so a corrupt, read-only or half-deleted
+        # kestrel_prime.db would otherwise refuse a boot whose runtime record is
+        # complete — a file this host does not need any more deciding whether it
+        # may start.
+        shortfall = await diagnose_runtime_birth_record(
+            runtime_db=runtime_db, agent_did=self.agent_id,
+        )
+        if not shortfall:
+            return
 
         anchor_db = None
         try:
@@ -2536,10 +2549,14 @@ class KestrelAgent(
             # Verify rather than assume. A pass that reports success but left
             # the record incomplete is precisely the failure this whole cluster
             # of issues is about — a durable claim nobody observed.
-            remaining = await diagnose_birth_record(
-                runtime_db=runtime_db,
-                anchor_db=anchor_db,
-                agent_did=self.agent_id,
+            #
+            # Asked of the runtime alone, deliberately: the question is whether
+            # this agent can now be who it is, not whether it matches a frozen
+            # snapshot. Re-comparing against the anchor would refuse forever
+            # over differences replication correctly declines to make — a
+            # reanchored constitution, chunks already indexed here.
+            remaining = await diagnose_runtime_birth_record(
+                runtime_db=runtime_db, agent_did=self.agent_id,
             )
             if remaining:
                 logging.error(
