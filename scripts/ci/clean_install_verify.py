@@ -199,6 +199,16 @@ def _agent_port(agent_name: str) -> int | None:
     return ((multi_agent.get("agents") or {}).get(agent_name) or {}).get("port")
 
 
+def _run_captured(command: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run a command with locale-independent, loss-preserving text capture."""
+    return subprocess.run(
+        command,
+        capture_output=True,
+        encoding="utf-8",
+        errors="backslashreplace",
+    )
+
+
 def _kestrel(*args: str) -> subprocess.CompletedProcess[str]:
     """Invoke the kestrel CLI via the current Python interpreter.
 
@@ -207,10 +217,8 @@ def _kestrel(*args: str) -> subprocess.CompletedProcess[str]:
     ``kestrel`` on Unix and ``kestrel.exe`` on Windows; the module
     invocation is identical on every OS.
     """
-    return subprocess.run(
+    return _run_captured(
         [sys.executable, "-m", "kestrel_sovereign.cli", *args],
-        capture_output=True,
-        text=True,
     )
 
 
