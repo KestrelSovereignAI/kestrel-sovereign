@@ -45,8 +45,11 @@ holds the birth record (#2871) while every governance read the agent performs
 goes to PostgreSQL. Resolving the write target the same way boot does — from
 the process environment — is what makes a reanchor land where the agent will
 read it (#2890). The local anchor is deliberately *not* rewritten in that
-case: it records what the agent was born under, and #2871 keeps it
-byte-for-byte while replicating additively into the runtime database.
+case: it records what the agent was born under, and #2871 replicates it
+additively into the runtime database rather than moving it. The birth *record*
+is left alone; the file itself is still opened read/write to read this agent's
+DID, which checkpoints a WAL anchor. Nothing in-tree hashes or signs the anchor
+file, so that is a storage detail, not a governance one.
 """
 
 from __future__ import annotations

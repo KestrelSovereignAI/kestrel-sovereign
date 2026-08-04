@@ -61,6 +61,18 @@ CONSTITUTION_V2 = b"""# Kestrel Constitution (PG target test, v2 - AMENDED)
 Honesty. Sovereignty. Transparency. Calibrated uncertainty.
 """ * 6
 
+#: A THIRD constitution, for the neighbouring tenant. Seeding the neighbour
+#: with the same document as the subject makes a cross-tenant read
+#: indistinguishable from a correct one — their ``governed_by`` targets are
+#: then the same hash, so dropping ``WHERE source_id = ?`` changes nothing an
+#: assertion can see. Mutation testing found exactly that.
+CONSTITUTION_NEIGHBOUR = b"""# Kestrel Constitution (PG target test, neighbour)
+
+## Book I: Universal Values
+
+Honesty. Sovereignty. Transparency. A different governing document.
+""" * 6
+
 _SUITE = Secp256k1Suite()
 _ROOT_KEYPAIR = _SUITE.generate_keypair()
 _ROOT_DID = "did:pkh:eip155:1:0x0000000000000000000000000000000000002890"
@@ -210,8 +222,13 @@ async def _runtime_state(db, agent_did: str = AGENT_DID) -> tuple[str, list[str]
 def _make_local_anchor(agent_dir: Path, agent_did: str = AGENT_DID) -> bytes:
     """A real, non-empty ``kestrel_prime.db`` — the birth record #2871 keeps.
 
-    Byte-equality after the run is the assertion that matters: it proves the
-    reanchor never even opened the file, let alone wrote it.
+    Byte-equality after the run asserts the *record* is unchanged, not that
+    the file was never opened. It always is: ``resolve_reanchor_target`` reads
+    this agent's DID out of it through ``_get_agent_did(..., INITIALIZATION)``,
+    which opens ``mode=rw`` on every backend so SQLite can replay a WAL. On a
+    WAL anchor that checkpoints — the bytes change while the record does not.
+    This fixture is journal-mode ``delete``, so byte-equality is reachable
+    here; do not read it as a promise about production anchors.
     """
     import sqlite3
 
@@ -383,7 +400,13 @@ async def test_reanchor_touches_only_the_named_agent_on_a_shared_database(
     for.
     """
     v1_hash = await _seed_runtime_agent(CONSTITUTION_V1, AGENT_DID)
-    other_v1_hash = await _seed_runtime_agent(CONSTITUTION_V1, OTHER_DID)
+    other_v1_hash = await _seed_runtime_agent(
+        CONSTITUTION_NEIGHBOUR, OTHER_DID
+    )
+    assert other_v1_hash != v1_hash, (
+        "the neighbour must be governed by a DIFFERENT document, or a "
+        "cross-tenant read is indistinguishable from a correct one"
+    )
     agent_dir = tmp_path / "agent_data" / "PgTargetAgent"
     _make_local_anchor(agent_dir, AGENT_DID)
 
@@ -407,6 +430,15 @@ async def test_reanchor_touches_only_the_named_agent_on_a_shared_database(
 
     assert result.error is None, result.error
     assert result.old_hash == v1_hash
+    # The subject's drift was computed from ITS OWN edges: its previous
+    # anchor is legitimately stale, and nothing else is. With the
+    # ``source_id`` filter dropped, this read also returns the neighbour's
+    # governance and reports the neighbour's constitution as a target to
+    # remove — which is why the neighbour must hold a DIFFERENT document for
+    # this assertion to be able to fail.
+    assert result.stale_edge_targets == (v1_hash,)
+    assert other_v1_hash not in result.stale_edge_targets
+    assert OTHER_DID not in result.stale_edge_targets
 
     # The named agent moved.
     assert await _runtime_state(pg, AGENT_DID) == (v2_hash, [v2_hash])
@@ -621,3 +653,42 @@ async def test_reanchor_reads_drift_from_postgres_not_from_the_anchor(
     assert result.unchanged is True
     assert result.old_hash == v2_hash
     assert result.target_backend == "postgres"
+
+
+async def test_only_governed_by_edges_count_as_governance(pg, tmp_path, monkeypatch):
+    """Real agents have several outgoing edges that are not governance:
+    ``spawned_by`` on every spawned child, plus ``retired_via``,
+    ``migrated_via``, ``has_avatar``. Without the ``label`` filter on the
+    edge read, a reanchor treats them all as governing constitutions and
+    reports the spawn parent's DID as a stale target to remove — permanently,
+    because ``_write_reanchor`` keeps its own filter and so can never clear
+    what the reader invented.
+    """
+    v1_hash = await _seed_runtime_agent(CONSTITUTION_V1, AGENT_DID)
+    async with AsyncStorage(backend="postgres", dsn=POSTGRES_URL) as storage:
+        storage.graph.bind_agent(AGENT_DID)
+        await storage.graph.add_trusted_cross_agent_edge(
+            AGENT_DID, OTHER_DID, "spawned_by"
+        )
+
+    agent_dir = tmp_path / "agent_data" / "PgTargetAgent"
+    _make_local_anchor(agent_dir, AGENT_DID)
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V2)
+    import kestrel_sovereign.config as ks_config
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
+
+    result = await reanchor_constitution(
+        agent_name="PgTargetAgent",
+        agent_dir=agent_dir,
+        canonical_path=constitution_path,
+        force=False,
+        runtime_backend="postgres",
+        runtime_dsn=POSTGRES_URL,
+    )
+
+    assert result.error is None, result.error
+    # Only the previous constitution is stale. The spawn parent is not a
+    # governing document and must never be offered up for deletion.
+    assert result.stale_edge_targets == (v1_hash,)
+    assert OTHER_DID not in result.stale_edge_targets

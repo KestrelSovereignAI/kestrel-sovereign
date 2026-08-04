@@ -945,7 +945,15 @@ def cmd_constitution_reanchor(args) -> int:
     # agent could write PostgreSQL from one shell and the local anchor from
     # another — and on a PostgreSQL host the anchor is a database the runtime
     # never reads (#2890). ``setdefault`` semantics keep a genuinely-exported
-    # value authoritative, matching every other target-aware CLI path.
+    # value authoritative.
+    #
+    # NOT ``_apply_target_data_key_custody``: that generates a data key when
+    # the home has none, which is an inception concern and wrong for a repair.
+    # The trade-off is real — this seeds a persisted ``KESTREL_DATA_KEY``
+    # without detecting an exported⇄persisted conflict (#2468), so an operator
+    # with a stale exported key can still write a constitution blob the agent
+    # cannot decrypt. That hazard predates this change; what changes is that
+    # the key now gets loaded at all.
     _load_target_env(project_dir)
 
     multi_agent = MultiAgentConfig.load(

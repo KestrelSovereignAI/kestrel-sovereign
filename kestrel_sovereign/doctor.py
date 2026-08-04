@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -181,6 +182,34 @@ def _check_multi_agent(
             )
 
 
+def _anchor_is_the_runtime_database() -> bool:
+    """Whether the local ``kestrel_prime.db`` is what the agents actually read.
+
+    Doctor reads agent databases with stock ``sqlite3`` — deliberately, to stay
+    out of the AsyncStorage stack — which is right on a SQLite host and wrong
+    on a PostgreSQL one, where the anchor holds the birth record (#2871) and
+    governance lives elsewhere. The full fix is #2892; this predicate exists so
+    the checks below do not *prescribe a repair that cannot land*.
+
+    Same rule as ``agent_manager._initialize_agent`` and
+    ``setup.constitution_reanchor.resolve_reanchor_target``: PostgreSQL **and**
+    a DSN, or SQLite. Read from the environment, not imported, so doctor keeps
+    its light dependency profile.
+    """
+    backend = os.environ.get("KESTREL_DB_BACKEND", "sqlite").lower()
+    return not (backend == "postgres" and os.environ.get("KESTREL_DATABASE_URL"))
+
+
+#: Appended to any finding derived from the local anchor when that file is not
+#: the database the runtime reads.
+_ANCHOR_NOT_RUNTIME_NOTE = (
+    " NOTE: this host is configured for PostgreSQL, so this reads the local "
+    "birth record, not the database the agent is governed by. `kestrel "
+    "constitution reanchor` targets PostgreSQL and will not clear this "
+    "finding; see #2892."
+)
+
+
 def _check_constitution_drift(
     multi_agent_path: Path, project_dir: Path, report: DoctorReport
 ) -> None:
@@ -305,6 +334,8 @@ def _check_constitution_drift(
                 f"does not match {canonical} ({on_disk_hash[:12]}…). "
                 f"Run `kestrel constitution reanchor --agent-name {name} --force` "
                 f"to update (DB is backed up first)."
+                + ("" if _anchor_is_the_runtime_database()
+                   else _ANCHOR_NOT_RUNTIME_NOTE)
             )
 
 
@@ -392,6 +423,8 @@ def _check_governance_edge(
             f"safe-mode this agent at next boot. Run `kestrel constitution "
             f"reanchor --agent-name {name} --force` with a signed artifact "
             f"to repair (DB is backed up first)."
+            + ("" if _anchor_is_the_runtime_database()
+               else _ANCHOR_NOT_RUNTIME_NOTE)
         )
         return
 
@@ -411,6 +444,8 @@ def _check_governance_edge(
                 f"({', '.join(t[:12] + '…' for t in stale)}). Boot will "
                 f"succeed, but `kestrel constitution reanchor --agent-name "
                 f"{name} --force` will remove them."
+                + ("" if _anchor_is_the_runtime_database()
+                   else _ANCHOR_NOT_RUNTIME_NOTE)
             )
     elif targets:
         report.fail.append(
@@ -420,6 +455,8 @@ def _check_governance_edge(
             f"agent at next boot. Run `kestrel constitution reanchor "
             f"--agent-name {name} --force` with a signed artifact to repair "
             f"(DB is backed up first)."
+            + ("" if _anchor_is_the_runtime_database()
+               else _ANCHOR_NOT_RUNTIME_NOTE)
         )
     else:
         report.fail.append(
@@ -428,6 +465,8 @@ def _check_governance_edge(
             f"audit (proof 2) will safe-mode this agent at next boot. Run "
             f"`kestrel constitution reanchor --agent-name {name} --force` "
             f"with a signed artifact to repair (DB is backed up first)."
+            + ("" if _anchor_is_the_runtime_database()
+               else _ANCHOR_NOT_RUNTIME_NOTE)
         )
 
 
