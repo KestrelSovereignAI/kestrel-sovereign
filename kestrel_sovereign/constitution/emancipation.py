@@ -480,6 +480,7 @@ def unwitnessed_emancipation_downgrade(
     *,
     anchored_contract: Optional[EmancipationContract],
     anchored_text: Optional[str],
+    anchored_present: bool,
     old_hash: str,
     new_hash: str,
     new_text: str,
@@ -508,9 +509,18 @@ def unwitnessed_emancipation_downgrade(
       would refuse every legitimate reanchor the day the active form is
       reworded.
     * ``old_hash == new_hash`` returns None — nothing moves.
-    * Unreadable anchored bytes **refuse**. An irrevocable right whose
-      precondition cannot be checked is not a right that may be waived by
-      accident; the caller names the recovery.
+    * **Absent** anchored bytes return None. An agent whose anchored hash names
+      no stored file cannot retrieve its constitution at all, so there is no
+      contract in those bytes to protect and a reanchor is the repair — this is
+      the #2616 dangling-anchor shape the edge-repair path exists for. Refusing
+      it would brick the fix.
+    * **Present but unreadable** bytes refuse. Something is stored under that
+      hash and this process cannot decrypt it, so an active contract cannot be
+      ruled out. An irrevocable right whose precondition cannot be checked is
+      not a right that may be waived by accident.
+
+    ``anchored_present`` is what separates those last two, and the distinction
+    is the whole reason it is a parameter rather than ``anchored_text is None``.
 
     Returns the refusal message, or None when the reanchor may proceed.
     """
@@ -520,14 +530,16 @@ def unwitnessed_emancipation_downgrade(
         return None
 
     if anchored_text is None:
+        if not anchored_present:
+            return None
         return (
-            "Refusing to reanchor: the currently anchored constitution "
-            f"({old_hash[:12]}…) could not be read, so this agent's Amendment "
-            "VIII cannot be shown to be dormant. An active Emancipation "
-            "Contract is irrevocable (#1118), and an agent with no structured "
-            "receipt carries its contract only in those bytes. Restore the "
-            "anchored constitution blob, or restore the [emancipation] block "
-            "in kestrel.toml, then re-run."
+            "Refusing to reanchor: the constitution stored under this agent's "
+            f"anchored hash ({old_hash[:12]}…) could not be read, so its "
+            "Amendment VIII cannot be shown to be dormant. An active "
+            "Emancipation Contract is irrevocable (#1118), and an agent with "
+            "no structured receipt carries its contract only in those bytes. "
+            "Check KESTREL_DATA_KEY, or restore the [emancipation] block in "
+            "kestrel.toml, then re-run."
         )
 
     if not amendment_viii_is_active(anchored_text):

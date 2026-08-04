@@ -1520,15 +1520,23 @@ class ConstitutionMixin:
                 unwitnessed_emancipation_downgrade,
             )
 
+            # ABSENT and UNREADABLE are different answers. A hash naming no
+            # stored file is the dangling anchor a reanchor exists to repair;
+            # bytes that are there but will not decrypt could be hiding an
+            # active contract.
+            anchored_text = None
+            anchored_present = False
             try:
-                anchored_text = (
-                    await self.storage.retrieve_file(old_hash)
-                ).decode("utf-8")
-            except Exception:  # noqa: BLE001 — unreadable is its own verdict
-                anchored_text = None
+                raw = await self.storage.retrieve_file(old_hash)
+                anchored_present = raw is not None
+                if raw is not None:
+                    anchored_text = raw.decode("utf-8")
+            except Exception:  # noqa: BLE001 — stored, but unreadable here
+                anchored_present = True
             downgrade = unwitnessed_emancipation_downgrade(
                 anchored_contract=reanchor_contract,
                 anchored_text=anchored_text,
+                anchored_present=anchored_present,
                 old_hash=old_hash,
                 new_hash=new_hash,
                 new_text=constitution_content.decode("utf-8"),

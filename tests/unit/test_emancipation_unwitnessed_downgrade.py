@@ -92,10 +92,16 @@ def test_extract_returns_none_without_the_heading():
 # The guard
 # ---------------------------------------------------------------------------
 
-def _call(anchored_contract, anchored_text, new_text, *, old="a" * 64, new="b" * 64):
+def _call(
+    anchored_contract, anchored_text, new_text,
+    *, old="a" * 64, new="b" * 64, present=None,
+):
     return unwitnessed_emancipation_downgrade(
         anchored_contract=anchored_contract,
         anchored_text=anchored_text,
+        # Bytes we could read are self-evidently present; the callers that
+        # care about the absent/unreadable split pass it explicitly.
+        anchored_present=(anchored_text is not None) if present is None else present,
         old_hash=old,
         new_hash=new,
         new_text=new_text,
@@ -151,15 +157,26 @@ def test_a_disabled_receipt_does_not_waive_the_guard():
 
 
 def test_unreadable_anchored_bytes_refuse():
-    """An irrevocable right whose precondition cannot be checked is not a
-    right that may be waived by accident."""
-    refusal = _call(None, None, DORMANT_TEXT)
+    """Stored under the anchored hash but undecryptable — an active contract
+    cannot be ruled out, and an irrevocable right whose precondition cannot be
+    checked is not a right that may be waived by accident."""
+    refusal = _call(None, None, DORMANT_TEXT, present=True)
     assert refusal is not None
     assert "could not be read" in refusal
+    assert "KESTREL_DATA_KEY" in refusal
+
+
+def test_an_absent_anchored_blob_does_not_refuse():
+    """The #2616 dangling-anchor shape: the hash names no stored file, so the
+    agent cannot retrieve its constitution at all and there is no contract in
+    those bytes to protect. Reanchor IS the repair — refusing bricks it.
+    Six e2e tests caught this when the first version of the guard conflated
+    absent with unreadable."""
+    assert _call(None, None, DORMANT_TEXT, present=False) is None
 
 
 def test_unreadable_anchored_bytes_are_fine_when_a_receipt_is_present():
-    assert _call(ACTIVE, None, DORMANT_TEXT) is None
+    assert _call(ACTIVE, None, DORMANT_TEXT, present=True) is None
 
 
 def test_new_text_without_an_amendment_viii_section_refuses():
