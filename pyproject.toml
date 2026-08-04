@@ -1,6 +1,6 @@
 [project]
 name = "kestrel_sovereign"
-version = "0.49.8"
+version = "0.50.0"
 description = "Kestrel Sovereign AI Agent Framework - Constitutional AI with cryptographic identity"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -81,10 +81,13 @@ dependencies = [
     # 0.34.0 floor: provider-neutral, owner-scoped private inference request,
     # quote, route, lifecycle, and entry-point contracts. Core consumes these
     # contracts without importing any Runpod/Vast/Vertex implementation.
+    # 0.35.0 floor: owner-scoped idle renewal plus the absolute lease-lifetime
+    # ceiling used to reject provider acquisition/touch results that outlive
+    # the request's readiness deadline and expected session.
     # Release cascade: Frinz and the observability fleet must publish/test
     # constraints that admit this line before Core is released. Do not weaken
     # Core's safety floor to make an older downstream resolver succeed.
-    "kestrel-sovereign-sdk[tracing]>=0.34.0,<0.35",
+    "kestrel-sovereign-sdk[tracing]>=0.35.0,<1",
     # Core web framework
     "fastapi==0.136.3",
     "uvicorn==0.48.0",
@@ -262,7 +265,7 @@ observability = [
     "opentelemetry-sdk>=1.20.0",
     "opentelemetry-instrumentation-fastapi>=0.41b0",
     "opentelemetry-exporter-otlp-proto-grpc>=1.20.0",
-    "kestrel-sovereign-sdk[metrics,tracing]>=0.34.0,<0.35",
+    "kestrel-sovereign-sdk[metrics,tracing]>=0.35.0,<1",
 ]
 # Host-supervised Arize Phoenix trace backend (OTel pivot, #2570). Installing
 # this extra is the ONLY step needed to get traces flowing: on host start the

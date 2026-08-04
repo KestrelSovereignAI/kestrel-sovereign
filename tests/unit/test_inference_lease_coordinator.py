@@ -425,6 +425,57 @@ async def test_touch_rejects_a_shortened_ready_deadline():
 
 
 @pytest.mark.asyncio
+async def test_touch_rejects_expiry_beyond_request_deadline_without_side_effects():
+    class _OverextendingProvider(_Provider):
+        async def touch(self, owner_id: str, lease_id: str) -> InferenceLease:
+            self.events.append("provider.touch")
+            self.touch_calls += 1
+            assert self.last_request is not None
+            assert self.last_quote is not None
+            latest_expiry = self.last_request.requested_at + timedelta(
+                seconds=(
+                    self.last_request.ready_deadline_seconds
+                    + self.last_request.expected_session_seconds
+                )
+            )
+            lease = _lease(
+                self.last_request,
+                self.last_quote,
+                state=InferenceLeaseState.READY,
+                updated_at=latest_expiry - timedelta(seconds=1),
+                expires_at=latest_expiry + timedelta(seconds=1),
+            )
+            lease.assert_owner(owner_id)
+            assert lease.lease_id == lease_id
+            return lease
+
+    events: list[str] = []
+    provider = _OverextendingProvider(
+        "runpod", total="0.20", ready_seconds=10, events=events
+    )
+    provider.acquire_state = InferenceLeaseState.READY
+    llm = _LLMService(events)
+    coordinator, persisted = _coordinator(
+        {"runpod": provider},
+        llm_service=llm,
+        events=events,
+    )
+    ready = await coordinator.acquire(_request())
+    persisted_before_touch = list(persisted)
+    events.clear()
+
+    with pytest.raises(InferenceLeaseConstraintError, match="session deadline"):
+        await coordinator.touch(ready.lease_id)
+
+    assert provider.touch_calls == 1
+    assert events == ["provider.touch"]
+    assert persisted == persisted_before_touch
+    assert coordinator.current_record is not None
+    assert coordinator.current_record.lease is ready
+    assert llm.activated is ready
+
+
+@pytest.mark.asyncio
 async def test_release_deactivates_and_persists_before_provider_mutation():
     events: list[str] = []
     provider = _Provider("runpod", total="0.20", ready_seconds=10, events=events)
