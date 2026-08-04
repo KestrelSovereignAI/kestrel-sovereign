@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-08-03
-**Scope:** 2296 tracked files (1534 `.py`, 345 `.md`, 417 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-08-04
+**Scope:** 2298 tracked files (1535 `.py`, 345 `.md`, 418 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -44,6 +44,7 @@ Repo entry points and standard project files.
 - **.env.example** — —
 - **.env.test.example** — —
 - **.gcloudignore** — —
+- **.gitattributes** — —
 - **.gitignore** — —
 - **.kestrel-host-features.toml.example** — —
 - **.windsurfrules** — —
@@ -2394,6 +2395,8 @@ Repo entry points and standard project files.
   - `async def legacy_db(tmp_path)`; `async def test_init_schema_backfills_missing_columns(legacy_db)`; `async def test_store_key_roundtrips_after_migration(legacy_db)`; `async def test_migration_is_idempotent(legacy_db)`; `async def test_fresh_db_already_has_columns(tmp_path)`
 - **tests/unit/test_agent_soul_resources.py** — —
   - `def data_key(monkeypatch)`; `async def test_soul_resource_round_trip_is_encrypted(tmp_path)`; `async def test_soul_resource_versions_select_current_and_keep_provenance(tmp_path)`; `async def test_context_builder_loads_canonical_soul_over_seed(tmp_path)`
+- **tests/unit/test_aiosqlite_worker_utils.py** — Tests for aiosqlite worker-lifecycle synchronization helpers.
+  - `async def test_lifecycle_checkpoint_wins_without_waiting_for_owner()`; `async def test_lifecycle_checkpoint_rejects_premature_completion()`; `async def test_lifecycle_checkpoint_fails_closed_when_both_are_ready()`; `async def test_lifecycle_checkpoint_reports_owner_failure()`; `async def test_lifecycle_checkpoint_reports_owner_cancellation()`; `async def test_lifecycle_checkpoint_tolerates_contracted_owner_failure()`; `async def test_lifecycle_checkpoint_has_finite_deadlock_guard()`
 - **tests/unit/test_anthropic_cache_control.py** — Unit tests for Anthropic cache_control markers (issue #705).
   - `def test_attach_cache_control_returns_copy()`; `def test_system_as_cacheable_array_wraps_string()`; `def test_tools_with_final_cache_marker_marks_last_only()`; `def test_tools_with_final_cache_marker_empty_list_passthrough()`; `def test_messages_with_penultimate_marker_marks_second_to_last()`; `def test_messages_with_penultimate_marker_no_history()`; `def test_messages_with_penultimate_marker_list_content_preserved()`; `def test_messages_with_trailing_system_marks_last_stable_turn()`; `…`
 - **tests/unit/test_anthropic_inline_system_gate.py** — The inline mid-conversation system-message gate is a capability matrix (#2846).
@@ -3676,7 +3679,7 @@ Repo entry points and standard project files.
   - `class MockHandler`; `def make_agent_card(name, skills)`; `def db_path()`; `async def task_manager(db_path)`; `async def task_feature(task_manager)`; `class TestRunWorkflow`; `class TestRunWorkflowSemanticHonesty`; `class TestListAvailableSkills`
 - **tests/utils/__init__.py** — Test utilities for Kestrel test suite.
 - **tests/utils/aiosqlite_workers.py** — Failure injection helpers for aiosqlite worker-lifecycle tests.
-  - `def aiosqlite_worker(connection)`; `def delay_aiosqlite_worker_exit(release_worker, worker_exit_delayed)`; `async def wait_until_aiosqlite_worker_exit_is_delayed(worker_exit_delayed)`
+  - `def aiosqlite_worker(connection)`; `def delay_aiosqlite_worker_exit(release_worker, worker_exit_delayed)`; `async def wait_until_aiosqlite_worker_exit_is_delayed(worker_exit_delayed)`; `async def wait_for_lifecycle_checkpoint(checkpoint, lifecycle_task)`
 - **tests/utils/async_waits.py** — Async wait utilities to replace hardcoded sleep statements.
   - `class WaitTimeoutError`; `async def wait_until(condition, timeout, interval, message)`; `async def wait_for_value(getter, expected, timeout, interval, …)`; `async def wait_for_not_none(getter, timeout, interval, message)`; `async def wait_for_http_ready(client, url, timeout, interval, …)`; `async def wait_for_db_connection(connect_func, timeout, interval)`; `async def wait_for_process_ready(process, check_func, timeout, interval)`; `async def poll_with_backoff(func, check, timeout, initial_interval, …)`
 - **tests/utils/feedback_bridge.py** — Test Result Feedback Bridge.
