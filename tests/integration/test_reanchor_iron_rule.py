@@ -519,3 +519,86 @@ async def test_reanchor_allows_byte_equal_active_no_op(tmp_path):
     assert result.unchanged, f"Byte-equal block should be unchanged: {result}"
     post = await _read_anchored_constitution_bytes(db_path)
     assert post == pre
+
+
+# ---------------------------------------------------------------------------
+# #2465 — the offline CLI shares the guard
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_offline_reanchor_refuses_to_erase_an_unwitnessed_active_contract(
+    tmp_path,
+):
+    """The #2465 hole on the offline path.
+
+    Active-form bytes anchored, no ``emancipation_contract`` receipt, and no
+    ``[emancipation]`` block in kestrel.toml — so ``anchored_contract`` reads
+    as None, the resolver renders the dormant canonical text, and a genuine
+    Sovereign-signed artifact over *those* bytes authorizes erasing the
+    Sovereign's own terms. The CLI's sidecar backfill cannot help: it only
+    fires when a block supplies a candidate.
+    """
+    from kestrel_sovereign.storage import AsyncStorage
+
+    agent_dir, db_path = await _setup_active_agent(tmp_path)
+
+    # The legacy shape: active bytes, receipt dropped.
+    async with AsyncStorage(str(db_path)) as storage:
+        agents = await storage.graph.get_nodes_by_type("agent")
+        agents[0].properties.pop("emancipation_contract", None)
+        await storage.graph.add_node(agents[0])
+    pre = await _read_anchored_constitution_bytes(db_path)
+    assert SENTINEL_TERMS in pre.decode("utf-8")
+
+    dormant = resolve_governing_constitution_bytes(
+        None, constitution_path=str(CANONICAL)
+    )
+    artifact_path, trust_root_path = _write_reanchor_authority(tmp_path, dormant)
+
+    result = await reanchor_constitution(
+        agent_name="RefusalAgent", agent_dir=agent_dir,
+        canonical_path=CANONICAL, force=True,
+        amendment_artifact_path=artifact_path,
+        sovereign_trust_root_path=trust_root_path,
+    )
+
+    assert result.error is not None
+    assert "Iron Rule violation" in result.error
+    assert result.iron_rule_violation is not None
+    assert not result.reanchored
+    # The Sovereign's terms are still anchored.
+    post = await _read_anchored_constitution_bytes(db_path)
+    assert SENTINEL_TERMS in post.decode("utf-8")
+    assert post == pre
+
+
+@pytest.mark.asyncio
+async def test_offline_reanchor_reads_the_anchored_bytes_to_decide(tmp_path):
+    """A dormant agent reanchors normally — proving the guard's verdict comes
+    from the anchored bytes rather than from refusing everything receiptless.
+    Without the read, the test above cannot fail."""
+    agent_dir = tmp_path / "agent_data" / "DormantAgent"
+    creds = await create_kestrel_identity_async(
+        output_dir=str(agent_dir),
+        constitution_path=str(CANONICAL),
+        agent_name="DormantAgent",
+        is_test_instance=True,
+    )
+    db_path = Path(creds.db_path)
+    pre = await _read_anchored_constitution_bytes(db_path)
+    assert SENTINEL_TERMS not in pre.decode("utf-8")
+
+    dormant = resolve_governing_constitution_bytes(
+        None, constitution_path=str(CANONICAL)
+    )
+    artifact_path, trust_root_path = _write_reanchor_authority(tmp_path, dormant)
+
+    result = await reanchor_constitution(
+        agent_name="DormantAgent", agent_dir=agent_dir,
+        canonical_path=CANONICAL, force=True,
+        amendment_artifact_path=artifact_path,
+        sovereign_trust_root_path=trust_root_path,
+    )
+
+    assert result.iron_rule_violation is None
+    assert result.error is None or "Iron Rule" not in result.error

@@ -748,3 +748,30 @@ async def test_governing_constitution_does_not_read_disk_when_hash_exists():
     mock_open.assert_not_called()
     agent.storage.retrieve_file.assert_called_once_with(FAKE_HASH)
     assert constitution == FAKE_CONSTITUTION.decode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_reanchor_proceeds_when_the_anchored_blob_is_simply_absent(
+    tmp_path,
+):
+    """ABSENT is not UNREADABLE (#2465). A hash naming no stored file is the
+    #2616 dangling anchor a reanchor exists to repair; treating it as
+    "might be hiding an active contract" bricks the fix. ``retrieve_file``
+    returns None for a missing row and raises for a failed decrypt, which is
+    what separates the two."""
+    v2_bytes = _DORMANT_BYTES + b"\n\n## Book III\n\nNew in v2.\n"
+    v2_digest = hashlib.sha256(v2_bytes).hexdigest()
+    agent, node = _make_agent(stored_hash=_DORMANT_DIGEST, anchored=None)
+    agent.storage.retrieve_file = AsyncMock(return_value=None)
+    agent.storage.store_file = AsyncMock(return_value=v2_digest)
+    artifact_path = _write_artifact(tmp_path, constitution_hash=v2_digest)
+
+    with patch("builtins.open", create=True) as mock_open:
+        mock_open.side_effect = _open_handles(v2_bytes, artifact_path.read_bytes())
+        result = await agent.reanchor_constitution(
+            authorization="sovereign",
+            amendment_artifact_path=str(artifact_path),
+        )
+
+    assert "re-anchored successfully" in result.lower(), result
+    assert node.properties["constitution_hash"] == v2_digest
