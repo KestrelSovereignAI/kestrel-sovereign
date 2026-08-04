@@ -41,12 +41,31 @@ def _no_ambient_backend(monkeypatch):
     monkeypatch.delenv("KESTREL_DATABASE_URL", raising=False)
 
 
+AGENT_DID = "did:pkh:eip155:1:0x0000000000000000000000000000000000002890"
+
+
 @pytest.fixture
 def reanchor_env(tmp_path):
-    """Project tree with one multi_agent agent + a stub kestrel_prime.db."""
+    """Project tree with one multi_agent agent + a readable kestrel_prime.db.
+
+    The anchor holds a real agent root because the reanchor path reads this
+    agent's DID out of it — a directory that cannot name its tenant is refused
+    on every backend, so an opaque stub would make every test a refusal test.
+    """
+    import sqlite3
+
     agent_dir = tmp_path / "agent_data" / "Test"
     agent_dir.mkdir(parents=True)
-    (agent_dir / "kestrel_prime.db").write_bytes(b"stub")
+    with sqlite3.connect(str(agent_dir / "kestrel_prime.db")) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS graph_nodes "
+            "(node_id TEXT PRIMARY KEY, node_type TEXT, label TEXT, properties TEXT)"
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO graph_nodes VALUES (?, 'agent', 'Test', '{}')",
+            (AGENT_DID,),
+        )
+        conn.commit()
 
     multi_agent = {
         "host": {"port": 8888, "bind": "0.0.0.0"},
@@ -397,9 +416,16 @@ def test_reanchor_reads_the_agent_homes_env_not_the_operators_shell(
     resolved ``agent_dir / "kestrel_prime.db"``, wrote it, and reported
     success — against a database the running agent never opens.
 
-    With no DSN to name, the only honest outcome is a refusal.
+    The DSN here points at a closed port, so "it tried PostgreSQL" is provable
+    from the failure. A run that had ignored the ``.env`` would have read the
+    local anchor and reported drift instead.
     """
-    (reanchor_env / ".env").write_text("KESTREL_DB_BACKEND=postgres\n")
+    (reanchor_env / ".env").write_text(
+        "KESTREL_DB_BACKEND=postgres\n"
+        "KESTREL_DATABASE_URL=postgresql://u:p@127.0.0.1:1/none\n"
+    )
+    anchor = reanchor_env / "agent_data" / "Test" / "kestrel_prime.db"
+    before = anchor.read_bytes()
     args = _parse([
         "constitution", "reanchor", "--agent-name", "Test", "--force",
         "--signed-artifact", "/secure/reanchor.signed.json",
@@ -411,10 +437,11 @@ def test_reanchor_reads_the_agent_homes_env_not_the_operators_shell(
 
     assert rc == 1
     err = capsys.readouterr().err
-    assert "KESTREL_DATABASE_URL" in err
+    assert "postgres" in err
+    assert "Nothing was written" in err
+    assert "u:p@" not in err
     # And it did not quietly rewrite the anchor on the way past.
-    anchor = reanchor_env / "agent_data" / "Test" / "kestrel_prime.db"
-    assert anchor.read_bytes() == b"stub"
+    assert anchor.read_bytes() == before
     assert not list(anchor.parent.glob("*.backup-*"))
 
 
@@ -507,6 +534,34 @@ def test_unforced_drift_on_postgres_does_not_promise_a_file_backup(
     out = capsys.readouterr().out
     assert "backed up to" not in out
     assert "Snapshot that database first" in out
+
+
+def test_anchor_overlay_reads_the_agent_homes_env_too(
+    reanchor_env, restore_environ, capsys,
+):
+    """``anchor-overlay`` shares the target rule, so it must share the env
+    load. The overlay hash authorizes DANGEROUS Amendment IX grants; writing
+    it to the local file on a PostgreSQL host leaves every grant denied while
+    reporting success."""
+    (reanchor_env / ".env").write_text(
+        "KESTREL_DB_BACKEND=postgres\n"
+        "KESTREL_DATABASE_URL=postgresql://u:p@127.0.0.1:1/none\n"
+    )
+    agent_dir = reanchor_env / "agent_data" / "Test"
+    (agent_dir / "CONSTITUTION.md").write_bytes(b"# Overlay\n")
+    before = (agent_dir / "kestrel_prime.db").read_bytes()
+    args = _parse(["constitution", "anchor-overlay", "--agent-name", "Test"])
+
+    with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
+         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False):
+        rc = cmd_constitution(args)
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "postgres" in err
+    assert "Nothing was written" in err
+    assert "u:p@" not in err
+    assert (agent_dir / "kestrel_prime.db").read_bytes() == before
 
 
 # ---------------------------------------------------------------------------

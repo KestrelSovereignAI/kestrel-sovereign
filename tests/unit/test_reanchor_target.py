@@ -1,19 +1,25 @@
-"""Which database ``kestrel constitution reanchor`` reads and writes (#2890).
+"""Which database — and whose agent — ``kestrel constitution reanchor`` writes (#2890).
 
 Governance lives in the database the *runtime* opens. On a host configured
-with ``KESTREL_DB_BACKEND=postgres`` that is not the local
-``kestrel_prime.db`` — the anchor holds the birth record (#2871) and nothing
-the agent reads at runtime. A reanchor that resolves the anchor unconditionally
+with ``KESTREL_DB_BACKEND=postgres`` plus a DSN that is not the local
+``kestrel_prime.db``: the anchor holds the birth record (#2871) and nothing the
+agent reads at runtime. A reanchor that resolves the anchor unconditionally
 reports success and changes nothing the agent is governed by.
 
-These tests pin the resolution itself. The end-to-end write against a real
-PostgreSQL runtime is in
+The same database also holds *every* local agent on a PostgreSQL host, so
+"which database" is only half the question. An unbound ``AsyncGraphStore``
+scopes to ``1 = 1``, which makes "the agent node" whichever row comes back
+first.
+
+These tests pin the resolution. The end-to-end write against a real PostgreSQL
+runtime, including the two-agent case, is in
 ``tests/integration/test_constitution_reanchor_postgres.py``.
 """
 
 from __future__ import annotations
 
 import os
+import sqlite3
 
 import pytest
 
@@ -24,12 +30,35 @@ from kestrel_sovereign.setup.constitution_reanchor import (
     resolve_reanchor_target,
 )
 
+AGENT_DID = "did:pkh:eip155:1:0x0000000000000000000000000000000000002890"
+OTHER_DID = "did:pkh:eip155:1:0x0000000000000000000000000000000000009999"
+
+
+def _write_anchor(path, *dids):
+    """A ``kestrel_prime.db`` holding the given agent roots.
+
+    Not an opaque stub: ``resolve_reanchor_target`` reads the DID out of this
+    file through the same reader the host uses (``_get_agent_did``), so the
+    fixture has to be the shape that reader accepts.
+    """
+    with sqlite3.connect(str(path)) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS graph_nodes "
+            "(node_id TEXT PRIMARY KEY, node_type TEXT, label TEXT, properties TEXT)"
+        )
+        for did in dids:
+            conn.execute(
+                "INSERT OR REPLACE INTO graph_nodes VALUES (?, 'agent', 'Test', '{}')",
+                (did,),
+            )
+        conn.commit()
+
 
 @pytest.fixture
 def agent_dir(tmp_path):
     d = tmp_path / "agent_data" / "Test"
     d.mkdir(parents=True)
-    (d / "kestrel_prime.db").write_bytes(b"stub")
+    _write_anchor(d / "kestrel_prime.db", AGENT_DID)
     return d
 
 
@@ -41,63 +70,115 @@ def _no_ambient_backend(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Resolution
+# Resolution — copied from agent_manager._initialize_agent, not invented
 # ---------------------------------------------------------------------------
 
-def test_default_target_is_the_local_anchor(agent_dir):
-    target = resolve_reanchor_target(agent_dir)
+@pytest.mark.asyncio
+async def test_default_target_is_the_local_anchor(agent_dir):
+    target = await resolve_reanchor_target(agent_dir)
     assert target.backend == "sqlite"
     assert target.writes_to_anchor is True
     assert target.anchor_path == agent_dir / "kestrel_prime.db"
+    assert target.agent_did == AGENT_DID
 
 
-def test_postgres_environment_targets_postgres_not_the_anchor(agent_dir, monkeypatch):
+@pytest.mark.asyncio
+async def test_postgres_with_a_dsn_targets_postgres_not_the_anchor(
+    agent_dir, monkeypatch
+):
     """The regression: on a PostgreSQL host the write must not go to the file."""
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://u:p@db.internal:5432/kestrel")
+    monkeypatch.setenv(
+        "KESTREL_DATABASE_URL", "postgresql://u:p@db.internal:5432/kestrel"
+    )
 
-    target = resolve_reanchor_target(agent_dir)
+    target = await resolve_reanchor_target(agent_dir)
 
     assert target.backend == "postgres"
     assert target.writes_to_anchor is False
     assert target.dsn == "postgresql://u:p@db.internal:5432/kestrel"
+    assert target.agent_did == AGENT_DID
 
 
-def test_backend_is_case_and_whitespace_insensitive(agent_dir, monkeypatch):
+@pytest.mark.asyncio
+async def test_postgres_without_a_dsn_is_a_sqlite_host(agent_dir, monkeypatch):
+    """``agent_manager._initialize_agent`` starts an agent on PostgreSQL only
+    when ``KESTREL_DB_BACKEND=postgres`` **and** ``KESTREL_DATABASE_URL`` are
+    both set; otherwise it hands ``KestrelAgent`` the local file. Refusing this
+    host — or targeting a PostgreSQL that nothing reads — would break a
+    reanchor that works today, and there is no flag to override it."""
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+
+    target = await resolve_reanchor_target(agent_dir)
+
+    assert target.backend == "sqlite"
+    assert target.anchor_path == agent_dir / "kestrel_prime.db"
+
+
+@pytest.mark.asyncio
+async def test_backend_is_case_and_whitespace_insensitive(agent_dir, monkeypatch):
     monkeypatch.setenv("KESTREL_DB_BACKEND", "  PostgreS \n")
     monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://h/db")
-    assert resolve_reanchor_target(agent_dir).backend == "postgres"
+    target = await resolve_reanchor_target(agent_dir)
+    assert target.backend == "postgres"
 
 
-def test_explicit_arguments_override_the_environment(agent_dir, monkeypatch):
+@pytest.mark.asyncio
+async def test_explicit_arguments_override_the_environment(agent_dir, monkeypatch):
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
     monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://h/env")
 
-    target = resolve_reanchor_target(
+    target = await resolve_reanchor_target(
         agent_dir, backend="postgres", dsn="postgresql://h/explicit"
     )
 
     assert target.dsn == "postgresql://h/explicit"
 
 
-def test_postgres_without_a_dsn_refuses(agent_dir, monkeypatch):
-    """``main.build_storage`` requires KESTREL_DATABASE_URL for a PostgreSQL
-    runtime. An agent configured that way has no database we can name, and
-    falling back to the anchor is exactly the silent no-op."""
-    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-
-    with pytest.raises(ReanchorTargetError) as exc:
-        resolve_reanchor_target(agent_dir)
-
-    assert "KESTREL_DATABASE_URL" in str(exc.value)
-    assert "kestrel_prime.db" in str(exc.value)
-
-
-def test_unsupported_backend_refuses(agent_dir, monkeypatch):
+@pytest.mark.asyncio
+async def test_unsupported_backend_refuses(agent_dir, monkeypatch):
     monkeypatch.setenv("KESTREL_DB_BACKEND", "mysql")
     with pytest.raises(ReanchorTargetError) as exc:
-        resolve_reanchor_target(agent_dir)
+        await resolve_reanchor_target(agent_dir)
     assert "mysql" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Identity — the anchor names the tenant, on every backend
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_missing_anchor_refuses_on_postgres_too(agent_dir, monkeypatch):
+    """The anchor is not merely the SQLite write target. It is the only
+    artifact that says *which* agent this reanchor is for, and boot reads it on
+    a PostgreSQL host for exactly that reason."""
+    (agent_dir / "kestrel_prime.db").unlink()
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://h/db")
+
+    with pytest.raises(ReanchorTargetError) as exc:
+        await resolve_reanchor_target(agent_dir)
+
+    assert "Cannot identify the agent" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_two_agent_roots_in_one_anchor_refuse(agent_dir):
+    """``_get_agent_did`` refuses rather than picking by row order. Inheriting
+    that refusal is the point of reusing it."""
+    _write_anchor(agent_dir / "kestrel_prime.db", AGENT_DID, OTHER_DID)
+
+    with pytest.raises(ReanchorTargetError) as exc:
+        await resolve_reanchor_target(agent_dir)
+
+    assert "Cannot identify the agent" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_the_open_storage_binds_the_agent(agent_dir):
+    target = await resolve_reanchor_target(agent_dir)
+    storage = target.open_storage()
+    assert storage.agent_id == AGENT_DID
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +193,9 @@ def test_sqlite_target_is_not_redirected_by_the_ambient_environment(
     backend explicitly so an exported variable cannot change where an
     already-decided reanchor lands."""
     target = ReanchorTarget(
-        anchor_path=agent_dir / "kestrel_prime.db", backend="sqlite"
+        anchor_path=agent_dir / "kestrel_prime.db",
+        backend="sqlite",
+        agent_did=AGENT_DID,
     )
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
     monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://h/db")
@@ -127,6 +210,7 @@ def test_target_describe_redacts_the_dsn_password(agent_dir):
     target = ReanchorTarget(
         anchor_path=agent_dir / "kestrel_prime.db",
         backend="postgres",
+        agent_did=AGENT_DID,
         dsn="postgresql://kestrel:sup3rs3cret@db.internal:5432/kestrel",
     )
 
@@ -137,8 +221,26 @@ def test_target_describe_redacts_the_dsn_password(agent_dir):
     assert "db.internal:5432/kestrel" in described
 
 
-def test_sqlite_target_describe_names_the_file(agent_dir):
-    target = resolve_reanchor_target(agent_dir)
+def test_target_describe_survives_an_unparseable_dsn(agent_dir):
+    """``urlsplit`` parses lazily — an invalid port raises from ``.port``, not
+    from the split. ``describe()`` runs on every outcome, so an unguarded read
+    turns a typo into a traceback out of the CLI."""
+    target = ReanchorTarget(
+        anchor_path=agent_dir / "kestrel_prime.db",
+        backend="postgres",
+        agent_did=AGENT_DID,
+        dsn="postgresql://u:p@h:notaport/db",
+    )
+
+    described = target.describe()
+
+    assert "unparseable" in described
+    assert "p@" not in described
+
+
+@pytest.mark.asyncio
+async def test_sqlite_target_describe_names_the_file(agent_dir):
+    target = await resolve_reanchor_target(agent_dir)
     assert target.describe() == f"sqlite:{agent_dir / 'kestrel_prime.db'}"
 
 
@@ -147,55 +249,34 @@ def test_sqlite_target_describe_names_the_file(agent_dir):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_reanchor_refuses_rather_than_writing_the_anchor_on_postgres(
+async def test_an_unreachable_postgres_is_an_error_not_a_traceback(
     agent_dir, tmp_path, monkeypatch
 ):
-    """A PostgreSQL host with no DSN must produce an error, not a successful
-    reanchor of a database the runtime never opens."""
+    """Opening the runtime database is the first step here that touches the
+    network."""
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-    before = (agent_dir / "kestrel_prime.db").read_bytes()
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://u:p@127.0.0.1:1/none")
+    canonical = tmp_path / "KESTREL_CONSTITUTION.md"
+    canonical.write_bytes(b"# Constitution\n")
+    import kestrel_sovereign.config as ks_config
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(canonical))
 
     result = await reanchor_constitution(
         agent_name="Test",
         agent_dir=agent_dir,
-        canonical_path=tmp_path / "KESTREL_CONSTITUTION.md",
+        canonical_path=canonical,
         force=True,
     )
 
     assert result.error is not None
-    assert "KESTREL_DATABASE_URL" in result.error
-    assert result.reanchored is False
-    assert (agent_dir / "kestrel_prime.db").read_bytes() == before
+    assert "Could not read this agent's governance" in result.error
+    assert "Nothing was written" in result.error
+    assert "p@" not in result.error  # the DSN password is not in the message
     assert not list(agent_dir.glob("*.backup-*"))
 
 
 @pytest.mark.asyncio
-async def test_missing_anchor_is_not_a_gate_on_a_postgres_host(
-    agent_dir, tmp_path, monkeypatch
-):
-    """The anchor's existence is the "this directory is an agent" proxy and
-    the write target — but only when the runtime reads it. Requiring the file
-    before writing PostgreSQL would gate on a fact the write does not need."""
-    (agent_dir / "kestrel_prime.db").unlink()
-    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://127.0.0.1:1/none")
-
-    result = await reanchor_constitution(
-        agent_name="Test",
-        agent_dir=agent_dir,
-        canonical_path=tmp_path / "missing-constitution.md",
-        force=False,
-    )
-
-    # It fails on the canonical source it was actually given, not on the
-    # absence of a local file this write does not use.
-    assert result.error is not None
-    assert "Agent database not found" not in result.error
-    assert result.target_backend == "postgres"
-
-
-@pytest.mark.asyncio
-async def test_missing_anchor_still_refuses_on_a_sqlite_host(agent_dir, tmp_path):
+async def test_missing_anchor_refuses_on_a_sqlite_host(agent_dir, tmp_path):
     (agent_dir / "kestrel_prime.db").unlink()
 
     result = await reanchor_constitution(
@@ -206,8 +287,7 @@ async def test_missing_anchor_still_refuses_on_a_sqlite_host(agent_dir, tmp_path
     )
 
     assert result.error is not None
-    assert "Agent database not found" in result.error
-    assert result.target_backend == "sqlite"
+    assert "Cannot identify the agent" in result.error
 
 
 @pytest.mark.asyncio
@@ -226,31 +306,30 @@ async def test_every_result_names_the_database_it_describes(agent_dir, tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_overlay_anchor_refuses_a_postgres_host_with_no_dsn(
-    agent_dir, monkeypatch
-):
+async def test_overlay_anchor_refuses_an_unidentifiable_agent(agent_dir):
     """``anchor-overlay`` writes the property that authorizes DANGEROUS
-    Amendment IX grants. Landing it in a database the runtime never opens
-    reports success and denies every grant."""
+    Amendment IX grants. Landing it on the wrong tenant, or in a database the
+    runtime never opens, must not be possible."""
     from kestrel_sovereign.setup.overlay_anchor import anchor_overlay
 
     (agent_dir / "CONSTITUTION.md").write_bytes(b"# Overlay\n")
-    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-    before = (agent_dir / "kestrel_prime.db").read_bytes()
+    (agent_dir / "kestrel_prime.db").unlink()
 
     result = await anchor_overlay(agent_name="Test", agent_dir=agent_dir)
 
     assert result.error is not None
-    assert "KESTREL_DATABASE_URL" in result.error
-    assert (agent_dir / "kestrel_prime.db").read_bytes() == before
+    assert "Cannot identify the agent" in result.error
 
 
-def test_environment_is_read_at_call_time_not_import_time(agent_dir, monkeypatch):
+@pytest.mark.asyncio
+async def test_environment_is_read_at_call_time_not_import_time(
+    agent_dir, monkeypatch
+):
     """Boot resolves its backend from ``os.environ`` when the agent is
     constructed. Caching the answer at import would make a CLI that loads the
     agent home's .env after import resolve the wrong database."""
-    assert resolve_reanchor_target(agent_dir).backend == "sqlite"
+    assert (await resolve_reanchor_target(agent_dir)).backend == "sqlite"
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
     monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://h/db")
-    assert resolve_reanchor_target(agent_dir).backend == "postgres"
+    assert (await resolve_reanchor_target(agent_dir)).backend == "postgres"
     assert os.environ["KESTREL_DB_BACKEND"] == "postgres"

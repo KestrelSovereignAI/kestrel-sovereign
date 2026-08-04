@@ -65,6 +65,7 @@ _SUITE = Secp256k1Suite()
 _ROOT_KEYPAIR = _SUITE.generate_keypair()
 _ROOT_DID = "did:pkh:eip155:1:0x0000000000000000000000000000000000002890"
 AGENT_DID = "did:pkh:eip155:1:0x000000000000000000000000000000000000a890"
+OTHER_DID = "did:pkh:eip155:1:0x000000000000000000000000000000000000b890"
 
 
 @pytest.fixture(autouse=True)
@@ -86,14 +87,16 @@ async def pg():
 
     db = await AsyncDatabase.postgres(POSTGRES_URL)
     try:
-        await _purge_agent(db)
+        for did in (AGENT_DID, OTHER_DID):
+            await _purge_agent(db, did)
         yield db
     finally:
-        await _purge_agent(db)
+        for did in (AGENT_DID, OTHER_DID):
+            await _purge_agent(db, did)
         await db.close()
 
 
-async def _purge_agent(db) -> None:
+async def _purge_agent(db, agent_did: str = AGENT_DID) -> None:
     """Remove every row this module's agent owns, shared rows included.
 
     Content-addressed ``files`` / ``graph_nodes`` rows are shared across
@@ -105,20 +108,20 @@ async def _purge_agent(db) -> None:
     owned_files = [
         row[0]
         for row in await db.fetchall(
-            "SELECT content_hash FROM file_owners WHERE agent_id = $1", (AGENT_DID,)
+            "SELECT content_hash FROM file_owners WHERE agent_id = $1", (agent_did,)
         )
     ]
     owned_nodes = [
         row[0]
         for row in await db.fetchall(
-            "SELECT node_id FROM graph_node_owners WHERE agent_id = $1", (AGENT_DID,)
+            "SELECT node_id FROM graph_node_owners WHERE agent_id = $1", (agent_did,)
         )
     ]
     await db.execute_commit(
-        "DELETE FROM graph_edge_owners WHERE agent_id = $1", (AGENT_DID,)
+        "DELETE FROM graph_edge_owners WHERE agent_id = $1", (agent_did,)
     )
     await db.execute_commit(
-        "DELETE FROM graph_edges WHERE source_id = $1", (AGENT_DID,)
+        "DELETE FROM graph_edges WHERE source_id = $1", (agent_did,)
     )
     for content_hash in owned_files:
         await db.execute_commit(
@@ -158,12 +161,12 @@ def _write_authority_files(tmp_path: Path, content: bytes) -> tuple[Path, Path]:
     return artifact_path, root_path
 
 
-async def _seed_runtime_agent(constitution: bytes) -> str:
+async def _seed_runtime_agent(constitution: bytes, agent_did: str = AGENT_DID) -> str:
     """Put a governed agent into PostgreSQL — the state boot would leave."""
     constitution_hash = hashlib.sha256(constitution).hexdigest()
     async with AsyncStorage(backend="postgres", dsn=POSTGRES_URL) as storage:
-        storage.graph.bind_agent(AGENT_DID)
-        storage.files.bind_agent(AGENT_DID)
+        storage.graph.bind_agent(agent_did)
+        storage.files.bind_agent(agent_did)
         await storage.files.store_file(constitution, "KESTREL_CONSTITUTION.md")
         await storage.graph.add_node(
             GraphNode(
@@ -175,7 +178,7 @@ async def _seed_runtime_agent(constitution: bytes) -> str:
         )
         await storage.graph.add_node(
             GraphNode(
-                node_id=AGENT_DID,
+                node_id=agent_did,
                 node_type="agent",
                 label="PgTargetAgent",
                 properties={
@@ -184,13 +187,13 @@ async def _seed_runtime_agent(constitution: bytes) -> str:
                 },
             )
         )
-        await storage.graph.add_edge(AGENT_DID, constitution_hash, "governed_by")
+        await storage.graph.add_edge(agent_did, constitution_hash, "governed_by")
     return constitution_hash
 
 
-async def _runtime_state(db) -> tuple[str, list[str]]:
+async def _runtime_state(db, agent_did: str = AGENT_DID) -> tuple[str, list[str]]:
     row = await db.fetchone(
-        "SELECT properties FROM graph_nodes WHERE node_id = $1", (AGENT_DID,)
+        "SELECT properties FROM graph_nodes WHERE node_id = $1", (agent_did,)
     )
     properties = row[0] if isinstance(row[0], dict) else json.loads(row[0])
     edges = [
@@ -198,13 +201,13 @@ async def _runtime_state(db) -> tuple[str, list[str]]:
         for r in await db.fetchall(
             "SELECT target_id FROM graph_edges "
             "WHERE source_id = $1 AND label = 'governed_by'",
-            (AGENT_DID,),
+            (agent_did,),
         )
     ]
     return properties.get("constitution_hash"), sorted(edges)
 
 
-def _make_local_anchor(agent_dir: Path) -> bytes:
+def _make_local_anchor(agent_dir: Path, agent_did: str = AGENT_DID) -> bytes:
     """A real, non-empty ``kestrel_prime.db`` — the birth record #2871 keeps.
 
     Byte-equality after the run is the assertion that matters: it proves the
@@ -215,9 +218,13 @@ def _make_local_anchor(agent_dir: Path) -> bytes:
     agent_dir.mkdir(parents=True, exist_ok=True)
     path = agent_dir / "kestrel_prime.db"
     with sqlite3.connect(str(path)) as conn:
-        conn.execute("CREATE TABLE IF NOT EXISTS birth (did TEXT, note TEXT)")
         conn.execute(
-            "INSERT INTO birth VALUES (?, ?)", (AGENT_DID, "birth record — do not edit")
+            "CREATE TABLE IF NOT EXISTS graph_nodes "
+            "(node_id TEXT PRIMARY KEY, node_type TEXT, label TEXT, properties TEXT)"
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO graph_nodes VALUES (?, 'agent', 'PgTargetAgent', '{}')",
+            (agent_did,),
         )
         conn.commit()
     return path.read_bytes()
@@ -228,7 +235,7 @@ async def test_reanchor_writes_postgres_and_leaves_the_anchor_untouched(
 ):
     v1_hash = await _seed_runtime_agent(CONSTITUTION_V1)
     agent_dir = tmp_path / "agent_data" / "PgTargetAgent"
-    anchor_bytes = _make_local_anchor(agent_dir)
+    anchor_bytes = _make_local_anchor(agent_dir, AGENT_DID)
 
     constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
     constitution_path.write_bytes(CONSTITUTION_V2)
@@ -270,7 +277,7 @@ async def test_no_file_backup_is_claimed_for_a_postgres_target(
     reanchor."""
     await _seed_runtime_agent(CONSTITUTION_V1)
     agent_dir = tmp_path / "agent_data" / "PgTargetAgent"
-    _make_local_anchor(agent_dir)
+    _make_local_anchor(agent_dir, AGENT_DID)
 
     constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
     constitution_path.write_bytes(CONSTITUTION_V2)
@@ -295,6 +302,260 @@ async def test_no_file_backup_is_claimed_for_a_postgres_target(
     assert not list(agent_dir.glob("*.backup-*"))
 
 
+async def test_a_neighbours_agent_node_is_never_mistaken_for_this_one(
+    pg, tmp_path, monkeypatch,
+):
+    """Deterministic probe for the tenant binding.
+
+    Only the *neighbour* has an agent node in PostgreSQL; the agent being
+    reanchored has none. A bound read asks for its own DID and finds nothing.
+    An unbound one takes ``get_nodes_by_type("agent")[0]`` and can only return
+    the neighbour — no row-ordering assumption required, which is what makes
+    this able to observe the failure at all. The two-agent test below is the
+    realistic shape; this one is the one that cannot pass by luck.
+    """
+    other_hash = await _seed_runtime_agent(CONSTITUTION_V1, OTHER_DID)
+    agent_dir = tmp_path / "agent_data" / "PgTargetAgent"
+    _make_local_anchor(agent_dir, AGENT_DID)
+
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V2)
+    import kestrel_sovereign.config as ks_config
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
+
+    result = await reanchor_constitution(
+        agent_name="PgTargetAgent",
+        agent_dir=agent_dir,
+        canonical_path=constitution_path,
+        force=False,
+        runtime_backend="postgres",
+        runtime_dsn=POSTGRES_URL,
+    )
+
+    assert result.error is not None
+    assert "no constitution_hash property" in result.error
+    assert result.old_hash is None
+    # The tell: an unbound read reports the neighbour's anchor as this one's.
+    assert result.old_hash != other_hash
+    assert other_hash not in (result.error or "")
+
+
+async def test_overlay_anchor_never_writes_a_neighbours_agent_node(pg, tmp_path):
+    """Same deterministic probe for ``anchor-overlay``. An unbound read here
+    grants the neighbour a DANGEROUS Amendment IX overlay."""
+    from kestrel_sovereign.setup.overlay_anchor import (
+        OVERLAY_HASH_PROPERTY,
+        anchor_overlay,
+    )
+
+    await _seed_runtime_agent(CONSTITUTION_V1, OTHER_DID)
+    agent_dir = tmp_path / "agent_data" / "PgTargetAgent"
+    _make_local_anchor(agent_dir, AGENT_DID)
+    (agent_dir / "CONSTITUTION.md").write_bytes(b"# Overlay\n\nshell granted.\n")
+
+    result = await anchor_overlay(
+        agent_name="PgTargetAgent",
+        agent_dir=agent_dir,
+        runtime_backend="postgres",
+        runtime_dsn=POSTGRES_URL,
+    )
+
+    assert result.error is not None
+    assert "no agent identity node" in result.error
+    row = await pg.fetchone(
+        "SELECT properties FROM graph_nodes WHERE node_id = $1", (OTHER_DID,)
+    )
+    neighbour = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+    assert OVERLAY_HASH_PROPERTY not in neighbour
+
+
+async def test_reanchor_touches_only_the_named_agent_on_a_shared_database(
+    pg, tmp_path, monkeypatch,
+):
+    """One PostgreSQL, two local agents — the configuration
+    ``agent_manager._initialize_agent`` produces for every agent on the host.
+
+    An unbound ``AsyncGraphStore`` scopes to ``1 = 1``, and
+    ``get_nodes_by_type("agent")`` has no ORDER BY, so "the agent node" is
+    whichever row the database hands back. Reanchoring one agent would then
+    move the other's ``governed_by`` edge, supersede its genesis receipt, and
+    stamp its ``constitution_reanchor`` record — and print the name you asked
+    for.
+    """
+    v1_hash = await _seed_runtime_agent(CONSTITUTION_V1, AGENT_DID)
+    other_v1_hash = await _seed_runtime_agent(CONSTITUTION_V1, OTHER_DID)
+    agent_dir = tmp_path / "agent_data" / "PgTargetAgent"
+    _make_local_anchor(agent_dir, AGENT_DID)
+
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V2)
+    v2_hash = hashlib.sha256(CONSTITUTION_V2).hexdigest()
+    import kestrel_sovereign.config as ks_config
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
+    artifact_path, root_path = _write_authority_files(tmp_path, CONSTITUTION_V2)
+
+    result = await reanchor_constitution(
+        agent_name="PgTargetAgent",
+        agent_dir=agent_dir,
+        canonical_path=constitution_path,
+        force=True,
+        amendment_artifact_path=artifact_path,
+        sovereign_trust_root_path=root_path,
+        runtime_backend="postgres",
+        runtime_dsn=POSTGRES_URL,
+    )
+
+    assert result.error is None, result.error
+    assert result.old_hash == v1_hash
+
+    # The named agent moved.
+    assert await _runtime_state(pg, AGENT_DID) == (v2_hash, [v2_hash])
+    # The other one did not — not its hash, not its edge, not its receipt.
+    assert await _runtime_state(pg, OTHER_DID) == (other_v1_hash, [other_v1_hash])
+    row = await pg.fetchone(
+        "SELECT properties FROM graph_nodes WHERE node_id = $1", (OTHER_DID,)
+    )
+    other = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+    assert "constitution_reanchor" not in other
+    assert "genesis_audit" not in other
+
+
+async def test_overlay_anchor_touches_only_the_named_agent(pg, tmp_path):
+    """The overlay hash authorizes DANGEROUS Amendment IX grants. Anchoring it
+    onto a neighbouring tenant is a privilege grant to the wrong agent."""
+    from kestrel_sovereign.setup.overlay_anchor import (
+        OVERLAY_HASH_PROPERTY,
+        anchor_overlay,
+    )
+
+    await _seed_runtime_agent(CONSTITUTION_V1, AGENT_DID)
+    await _seed_runtime_agent(CONSTITUTION_V1, OTHER_DID)
+    agent_dir = tmp_path / "agent_data" / "PgTargetAgent"
+    _make_local_anchor(agent_dir, AGENT_DID)
+    overlay = agent_dir / "CONSTITUTION.md"
+    overlay.write_bytes(b"# Overlay\n\nshell_execution_host granted.\n")
+    overlay_hash = hashlib.sha256(overlay.read_bytes()).hexdigest()
+
+    result = await anchor_overlay(
+        agent_name="PgTargetAgent",
+        agent_dir=agent_dir,
+        runtime_backend="postgres",
+        runtime_dsn=POSTGRES_URL,
+    )
+
+    assert result.error is None, result.error
+    for did, expected in ((AGENT_DID, overlay_hash), (OTHER_DID, None)):
+        row = await pg.fetchone(
+            "SELECT properties FROM graph_nodes WHERE node_id = $1", (did,)
+        )
+        properties = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+        assert properties.get(OVERLAY_HASH_PROPERTY) == expected
+
+
+async def test_reusing_one_signed_artifact_across_agents_refuses_legibly(
+    pg, tmp_path, monkeypatch,
+):
+    """A signed artifact is content-addressed, so one file is one graph node
+    for the whole database. The second agent cannot claim a node the first
+    owns — ``add_node`` allows a foreign-owned content node only for the
+    constitution document, and the artifact node carries ``source_path``,
+    which the privacy boundary does not treat as content-free.
+
+    That limitation is real (#2893). What must not happen is the operator
+    seeing an opaque mid-write rollback: the first agent's reanchor committed,
+    the second one's did not, and nothing said why or what to do.
+    """
+    await _seed_runtime_agent(CONSTITUTION_V1, AGENT_DID)
+    other_v1 = await _seed_runtime_agent(CONSTITUTION_V1, OTHER_DID)
+    v2_hash = hashlib.sha256(CONSTITUTION_V2).hexdigest()
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V2)
+    import kestrel_sovereign.config as ks_config
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
+    artifact_path, root_path = _write_authority_files(tmp_path, CONSTITUTION_V2)
+
+    results = {}
+    for did, name in ((AGENT_DID, "First"), (OTHER_DID, "Second")):
+        agent_dir = tmp_path / "agent_data" / name
+        _make_local_anchor(agent_dir, did)
+        results[name] = await reanchor_constitution(
+            agent_name=name,
+            agent_dir=agent_dir,
+            canonical_path=constitution_path,
+            force=True,
+            amendment_artifact_path=artifact_path,
+            sovereign_trust_root_path=root_path,
+            runtime_backend="postgres",
+            runtime_dsn=POSTGRES_URL,
+        )
+
+    assert results["First"].error is None, results["First"].error
+    assert await _runtime_state(pg, AGENT_DID) == (v2_hash, [v2_hash])
+
+    refusal = results["Second"].error
+    assert refusal is not None
+    assert "already anchored" in refusal
+    assert AGENT_DID in refusal
+    assert "Sign a separate artifact" in refusal
+    assert "#2893" in refusal
+    # Refused before the write, not rolled back after a partial one.
+    assert "Cannot overwrite a graph node" not in refusal
+    assert results["Second"].backup_path is None
+    assert await _runtime_state(pg, OTHER_DID) == (other_v1, [other_v1])
+
+
+async def test_a_per_agent_artifact_reanchors_the_second_agent(
+    pg, tmp_path, monkeypatch,
+):
+    """The documented way through: the same constitution hash signed into a
+    byte-distinct artifact. The authorization is identical; only the record is
+    per-agent."""
+    await _seed_runtime_agent(CONSTITUTION_V1, AGENT_DID)
+    await _seed_runtime_agent(CONSTITUTION_V1, OTHER_DID)
+    v2_hash = hashlib.sha256(CONSTITUTION_V2).hexdigest()
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V2)
+    import kestrel_sovereign.config as ks_config
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
+
+    for did, name, reason in (
+        (AGENT_DID, "First", "for First"),
+        (OTHER_DID, "Second", "for Second"),
+    ):
+        root_path = tmp_path / "sovereign-root.did.json"
+        root_path.write_text(
+            json.dumps(
+                did_document_from_legacy_public_key(
+                    _ROOT_DID, _ROOT_KEYPAIR.public_key
+                )
+            ),
+            encoding="utf-8",
+        )
+        artifact = build_legacy_signed_reanchor_artifact(
+            signer_did=_ROOT_DID,
+            constitution_sha256=v2_hash,
+            private_key=_ROOT_KEYPAIR.private_key,
+            reason=reason,
+        )
+        artifact_path = tmp_path / f"reanchor-{name}.signed.json"
+        artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+
+        agent_dir = tmp_path / "agent_data" / name
+        _make_local_anchor(agent_dir, did)
+        result = await reanchor_constitution(
+            agent_name=name,
+            agent_dir=agent_dir,
+            canonical_path=constitution_path,
+            force=True,
+            amendment_artifact_path=artifact_path,
+            sovereign_trust_root_path=root_path,
+            runtime_backend="postgres",
+            runtime_dsn=POSTGRES_URL,
+        )
+        assert result.error is None, f"{name}: {result.error}"
+        assert await _runtime_state(pg, did) == (v2_hash, [v2_hash])
+
+
 async def test_overlay_anchor_lands_in_the_database_the_runtime_reads(
     pg, tmp_path, monkeypatch,
 ):
@@ -308,7 +569,7 @@ async def test_overlay_anchor_lands_in_the_database_the_runtime_reads(
 
     await _seed_runtime_agent(CONSTITUTION_V1)
     agent_dir = tmp_path / "agent_data" / "PgTargetAgent"
-    anchor_bytes = _make_local_anchor(agent_dir)
+    anchor_bytes = _make_local_anchor(agent_dir, AGENT_DID)
     overlay = agent_dir / "CONSTITUTION.md"
     overlay.write_bytes(b"# Overlay\n\nshell_execution_host granted.\n")
     overlay_hash = hashlib.sha256(overlay.read_bytes()).hexdigest()
@@ -340,7 +601,7 @@ async def test_reanchor_reads_drift_from_postgres_not_from_the_anchor(
     ``constitution_hash`` here."""
     v2_hash = await _seed_runtime_agent(CONSTITUTION_V2)
     agent_dir = tmp_path / "agent_data" / "PgTargetAgent"
-    _make_local_anchor(agent_dir)
+    _make_local_anchor(agent_dir, AGENT_DID)
 
     constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
     constitution_path.write_bytes(CONSTITUTION_V2)

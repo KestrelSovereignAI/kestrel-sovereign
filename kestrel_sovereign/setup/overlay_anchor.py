@@ -75,7 +75,7 @@ async def anchor_overlay(
     new_hash = hashlib.sha256(overlay_path.read_bytes()).hexdigest()
 
     try:
-        target = resolve_reanchor_target(
+        target = await resolve_reanchor_target(
             agent_dir, backend=runtime_backend, dsn=runtime_dsn
         )
     except ReanchorTargetError as exc:
@@ -84,24 +84,51 @@ async def anchor_overlay(
             overlay_path=overlay_path, new_hash=new_hash,
         )
 
-    if target.writes_to_anchor and not target.anchor_path.exists():
+    try:
+        return await _anchor_overlay_in(
+            target,
+            agent_name=agent_name,
+            overlay_path=overlay_path,
+            new_hash=new_hash,
+        )
+    except Exception as exc:  # noqa: BLE001 — surfaced verbatim to the operator
+        logger.exception("Overlay anchor against %s failed", target.describe())
         return OverlayAnchorResult(
             agent_name=agent_name,
-            error=f"agent DB not found at {target.anchor_path}",
+            error=(
+                f"Could not anchor the overlay in {target.describe()}: "
+                f"{exc!r}. Nothing was written."
+            ),
             overlay_path=overlay_path, new_hash=new_hash,
             target_label=target.describe(),
         )
 
+
+async def _anchor_overlay_in(
+    target,
+    *,
+    agent_name: str,
+    overlay_path: Path,
+    new_hash: str,
+) -> OverlayAnchorResult:
+    """Write the overlay hash into ``target``, bound to its agent."""
     async with target.open_storage() as storage:
-        agent_nodes = await storage.graph.get_nodes_by_type("agent")
-        if not agent_nodes:
+        # ``open_storage`` binds every store to this agent; the lookup is by
+        # DID for the same reason the runtime's own is. One PostgreSQL
+        # database holds every local agent, and an unbound read here would
+        # anchor a DANGEROUS-capability overlay onto whichever tenant came
+        # back first.
+        node = await storage.graph.get_node(target.agent_did)
+        if node is None or node.node_type != "agent":
             return OverlayAnchorResult(
                 agent_name=agent_name,
-                error=f"no agent identity node in {target.describe()}",
+                error=(
+                    f"no agent identity node for {target.agent_did} in "
+                    f"{target.describe()}"
+                ),
                 overlay_path=overlay_path, new_hash=new_hash,
                 target_label=target.describe(),
             )
-        node = agent_nodes[0]
         old_hash = node.properties.get(OVERLAY_HASH_PROPERTY)
         if old_hash == new_hash:
             return OverlayAnchorResult(

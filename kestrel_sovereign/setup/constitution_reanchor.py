@@ -91,16 +91,25 @@ class ReanchorTargetError(Exception):
 
 @dataclass(frozen=True)
 class ReanchorTarget:
-    """The database a reanchor writes, and what a file backup can protect.
+    """The database a reanchor writes, whose agent it writes, and what a file
+    backup can protect.
 
     ``anchor_path`` is always the agent's local ``kestrel_prime.db``. It is
     how a directory is known to be an agent (twelve existence checks across
-    seven modules — see #2843) and where the birth record lives. It is the
-    *write* target only when the runtime reads it, i.e. on a SQLite host.
+    seven modules — see #2843), where the birth record lives, and — on every
+    backend — where this agent's DID is read from. It is the *write* target
+    only when the runtime reads it, i.e. on a SQLite host.
+
+    ``agent_did`` is not decoration. A PostgreSQL host holds every local
+    agent in one ``graph_nodes`` table, and an unbound
+    ``AsyncGraphStore`` scopes to ``1 = 1``, so "the agent node" is whichever
+    row the database returns first. Binding is what makes a reanchor of Emma a
+    reanchor of Emma.
     """
 
     anchor_path: Path
     backend: str
+    agent_did: str
     dsn: str | None = None
 
     @property
@@ -113,24 +122,34 @@ class ReanchorTarget:
         return f"{self.backend}:{_redacted_dsn(self.dsn)}"
 
     def open_storage(self) -> AsyncStorage:
-        """Open the runtime database.
+        """Open the runtime database, bound to this agent.
 
         The backend is passed **explicitly** in both branches. ``AsyncStorage``
         falls back to ``KESTREL_DB_BACKEND`` when it is not, which is how a
         SQLite path argument could silently be redirected to PostgreSQL (and
         vice versa) depending on the operator's shell — the ambiguity #2890 is
         about. Deciding once, here, and reporting the decision is the fix.
+
+        ``agent_id`` is passed in both branches too, exactly as boot does
+        (``kestrel_agent.py`` binds ``agent_id=self.did`` on SQLite *and*
+        PostgreSQL). An offline tool that reads wider than the runtime can
+        answer a question about the wrong tenant.
         """
         if self.writes_to_anchor:
-            return AsyncStorage(str(self.anchor_path), backend="sqlite")
-        return AsyncStorage(backend=self.backend, dsn=self.dsn)
+            return AsyncStorage(
+                str(self.anchor_path), backend="sqlite", agent_id=self.agent_did
+            )
+        return AsyncStorage(
+            backend=self.backend, dsn=self.dsn, agent_id=self.agent_did
+        )
 
 
 def _redacted_dsn(dsn: str | None) -> str:
     """Render a DSN safe to print: scheme, host, and database only.
 
     Reanchor output is pasted into tickets and CI logs; a DSN carries a
-    password.
+    password. ``urlsplit`` parses lazily — an invalid port raises from
+    ``parts.port``, not from the split — so the whole read is guarded.
     """
     if not dsn:
         return "(from environment)"
@@ -138,62 +157,87 @@ def _redacted_dsn(dsn: str | None) -> str:
 
     try:
         parts = urlsplit(dsn)
+        if not parts.hostname:
+            return "(non-URL DSN)"
+        host = parts.hostname
+        if parts.port:
+            host = f"{host}:{parts.port}"
+        return f"{parts.scheme}://{host}{parts.path}"
     except ValueError:
         return "(unparseable DSN)"
-    if not parts.hostname:
-        return "(non-URL DSN)"
-    host = parts.hostname
-    if parts.port:
-        host = f"{host}:{parts.port}"
-    return f"{parts.scheme}://{host}{parts.path}"
 
 
-def resolve_reanchor_target(
+async def resolve_reanchor_target(
     agent_dir: Path,
     *,
     backend: str | None = None,
     dsn: str | None = None,
 ) -> ReanchorTarget:
-    """Resolve the database the *runtime* would open for this agent.
+    """Resolve the database the *runtime* would open for this agent, and the
+    tenant it would bind.
 
-    Reads the same environment boot reads (``KestrelAgent.__init__`` →
-    ``KESTREL_DB_BACKEND``, ``main.build_storage`` → ``KESTREL_DATABASE_URL``)
-    so an offline reanchor and the running agent can never disagree about
-    which database holds governance. Callers that already know the agent's
-    configuration pass it in; ``None`` means "ask the environment", which is
-    what the runtime itself does.
+    The backend rule is copied from the host that actually starts these agents
+    — ``agent_manager._initialize_agent``:
+
+    .. code-block:: python
+
+        if db_backend.lower() == "postgres" and database_url:
+
+    PostgreSQL **and** a DSN, or SQLite at the anchor. Being stricter than that
+    is not caution: a host with ``KESTREL_DB_BACKEND=postgres`` and no DSN runs
+    its agents on the local SQLite file, so refusing it would refuse a reanchor
+    that ``main`` performs correctly, with no flag to override.
+
+    The DID comes from the local anchor through the same reader the host uses
+    (``agent_manager._get_agent_did``), which refuses a directory holding more
+    than one agent root rather than picking by incidental row order.
 
     Raises:
-        ReanchorTargetError: If the backend is unsupported, or PostgreSQL is
-            configured without a DSN. ``main.build_storage`` requires
-            ``KESTREL_DATABASE_URL`` for a PostgreSQL runtime, so an agent
-            configured that way has no database to reanchor and we must not
-            invent one — silently falling back to ``PGHOST``-style discovery
-            or to the local anchor is how a governance write lands somewhere
-            nobody reads.
+        ReanchorTargetError: Unsupported backend, or the anchor cannot name
+            exactly one agent. The anchor is required on *every* backend: it
+            is the only artifact that says which tenant this reanchor is for,
+            and boot requires it too.
     """
-    resolved = (backend or os.environ.get("KESTREL_DB_BACKEND", "sqlite")).strip().lower()
+    resolved = (
+        backend or os.environ.get("KESTREL_DB_BACKEND", "sqlite")
+    ).strip().lower()
     if resolved not in ("sqlite", "postgres"):
         raise ReanchorTargetError(
             f"Unsupported KESTREL_DB_BACKEND {resolved!r}: expected "
             f"'sqlite' or 'postgres'."
         )
-    if resolved == "sqlite":
-        return ReanchorTarget(anchor_path=agent_dir / "kestrel_prime.db", backend="sqlite")
+
+    anchor_path = agent_dir / "kestrel_prime.db"
+    # Deferred: agent_manager pulls in the whole agent runtime. Reusing its
+    # reader rather than re-implementing one keeps identity resolution to a
+    # single authority — duplicating it is how two tools come to disagree
+    # about who an agent is.
+    from kestrel_sovereign.multi_agent.agent_manager import (
+        _AgentDIDLookupMode,
+        _get_agent_did,
+    )
+
+    try:
+        agent_did = await _get_agent_did(
+            str(agent_dir), mode=_AgentDIDLookupMode.INITIALIZATION
+        )
+    except ValueError as exc:
+        raise ReanchorTargetError(
+            f"Cannot identify the agent in {agent_dir}: {exc}. The local "
+            f"{anchor_path.name} names the tenant this reanchor is for, on "
+            f"every backend."
+        ) from exc
 
     resolved_dsn = dsn or os.environ.get("KESTREL_DATABASE_URL")
-    if not resolved_dsn:
-        raise ReanchorTargetError(
-            "KESTREL_DB_BACKEND=postgres but KESTREL_DATABASE_URL is not set. "
-            "The agent's governance lives in that database; reanchoring the "
-            "local kestrel_prime.db instead would report success and change "
-            "nothing the agent reads. Set KESTREL_DATABASE_URL in the agent "
-            "home's .env (the same value the runtime uses) and re-run."
+    if resolved == "postgres" and resolved_dsn:
+        return ReanchorTarget(
+            anchor_path=anchor_path,
+            backend="postgres",
+            agent_did=agent_did,
+            dsn=resolved_dsn,
         )
     return ReanchorTarget(
-        anchor_path=agent_dir / "kestrel_prime.db",
-        backend="postgres",
-        dsn=resolved_dsn,
+        anchor_path=anchor_path, backend="sqlite", agent_did=agent_did
     )
 
 
@@ -302,7 +346,7 @@ async def reanchor_constitution(
     """
     db_path = agent_dir / "kestrel_prime.db"
     try:
-        target = resolve_reanchor_target(
+        target = await resolve_reanchor_target(
             agent_dir, backend=runtime_backend, dsn=runtime_dsn
         )
     except ReanchorTargetError as exc:
@@ -331,17 +375,6 @@ async def reanchor_constitution(
             target_backend=target.backend,
             target_label=target.describe(),
             **kwargs,
-        )
-
-    # The anchor's existence is the "this directory is an agent" proxy (#2843)
-    # AND the write target — but only on a SQLite host. On a PostgreSQL host
-    # the runtime never opens that file, so requiring it before writing a
-    # database that does not depend on it would be a gate on the wrong fact.
-    if target.writes_to_anchor and not db_path.exists():
-        return _result(
-            old_hash=None,
-            new_hash=None,
-            error=f"Agent database not found at {db_path}",
         )
 
     # Pre-flight the canonical source so an unreadable path returns a clean
@@ -378,12 +411,27 @@ async def reanchor_constitution(
             ),
         )
 
-    (
-        old_hash,
-        agent_did,
-        anchored_contract_json,
-        governed_by_targets,
-    ) = await _read_agent_anchor(target)
+    # Opening the runtime database is the first thing here that can reach the
+    # network. A PostgreSQL host that is down, or a DSN with the wrong
+    # password, must produce a ReanchorResult error like every other refusal,
+    # not a traceback out of the CLI.
+    try:
+        (
+            old_hash,
+            agent_did,
+            anchored_contract_json,
+            governed_by_targets,
+        ) = await _read_agent_anchor(target)
+    except Exception as exc:  # noqa: BLE001 — surfaced verbatim to the operator
+        logger.exception("Could not read the anchor from %s", target.describe())
+        return _result(
+            old_hash=None,
+            new_hash=None,
+            error=(
+                f"Could not read this agent's governance from "
+                f"{target.describe()}: {exc!r}. Nothing was written."
+            ),
+        )
     if old_hash is None:
         return _result(
             old_hash=None,
@@ -535,6 +583,35 @@ async def reanchor_constitution(
             error=str(exc),
         )
 
+    # A signed amendment artifact is content-addressed, so one fleet-wide
+    # artifact is ONE graph node id for every agent under it. On a shared
+    # PostgreSQL host the first agent to anchor it owns that node, and
+    # ``add_node`` refuses a foreign-owned node for anything but the
+    # constitution document — deliberately: the artifact node carries
+    # ``source_path``, which the privacy boundary does not treat as
+    # content-free, so sharing it would expose one tenant's operator paths to
+    # another. Detect it here rather than letting the write roll back with
+    # "Cannot overwrite a graph node owned by another agent", which names
+    # neither the artifact nor the way out.
+    artifact_conflict = await _foreign_artifact_owner(
+        target, hashlib.sha256(amendment_artifact_bytes).hexdigest()
+    )
+    if artifact_conflict is not None:
+        return _result(
+            old_hash=old_hash,
+            new_hash=new_hash,
+            error=(
+                f"This signed amendment artifact is already anchored in "
+                f"{target.describe()} by {artifact_conflict}. A signed artifact "
+                f"is content-addressed, so one file is one record for the whole "
+                f"database, and it cannot yet be shared across agents on a "
+                f"PostgreSQL host (#2893). Sign a separate artifact for "
+                f"{agent_name} — the constitution hash is the same, so the "
+                f"authorization is unchanged — or reanchor this agent before "
+                f"the others."
+            ),
+        )
+
     # The file-level backup is the OUTER safety net; the write transaction is
     # the inner one. A PostgreSQL runtime has no file to copy, and copying the
     # local anchor there would be worse than taking none — it would name a
@@ -626,12 +703,19 @@ async def _read_agent_anchor(
     targets feed the drift decision (#2616): integrity proof 2 requires a
     ``governed_by`` edge at the anchored hash, so the caller must not
     declare "unchanged" on the hash comparison alone.
+
+    ``open_storage`` binds every store to ``target.agent_did``, which is what
+    stops a PostgreSQL host — one table holding every local agent — from
+    answering this question about a neighbour. The lookup is by DID rather
+    than ``get_nodes_by_type("agent")[0]`` for the same reason the runtime's
+    own ``_get_or_create_agent_node`` is: scoping and naming are different
+    guarantees, and only the second one survives an agent that owns more than
+    one agent-typed node.
     """
     async with target.open_storage() as storage:
-        agent_nodes = await storage.graph.get_nodes_by_type("agent")
-        if not agent_nodes:
+        agent = await storage.graph.get_node(target.agent_did)
+        if agent is None or agent.node_type != "agent":
             return None, "", None, ()
-        agent = agent_nodes[0]
         edges = await storage.graph.get_edges(agent.node_id, direction="out")
         governed_by_targets = tuple(
             edge.target_id for edge in edges if edge.label == "governed_by"
@@ -642,6 +726,33 @@ async def _read_agent_anchor(
             agent.properties.get("emancipation_contract"),
             governed_by_targets,
         )
+
+
+async def _foreign_artifact_owner(
+    target: ReanchorTarget, artifact_hash: str
+) -> str | None:
+    """Return another agent's DID already owning this artifact node, or None.
+
+    Read-only and best-effort in one direction only: a missing owners table on
+    a very old database returns None and the write proceeds exactly as it does
+    today. It never returns a DID that is not really there, which is the
+    direction that matters — this decides whether to refuse.
+    """
+    async with target.open_storage() as storage:
+        try:
+            rows = await storage.db.fetchall(
+                "SELECT agent_id FROM graph_node_owners "
+                "WHERE node_id = ? AND agent_id <> ?",
+                (artifact_hash, target.agent_did),
+            )
+        except Exception:  # noqa: BLE001 — absence of the table is not a conflict
+            logger.debug(
+                "Could not inspect artifact node ownership for %s", artifact_hash,
+                exc_info=True,
+            )
+            return None
+    owners = sorted(row[0] for row in rows)
+    return owners[0] if owners else None
 
 
 async def _write_reanchor(
@@ -803,11 +914,13 @@ async def _write_reanchor(
                 )
                 await storage.rag.delete_chunks_for_file(old_hash)
 
-            # 5. Update the agent's pointer + audit record.
-            agent_nodes = await storage.graph.get_nodes_by_type("agent")
-            if not agent_nodes:
+            # 5. Update the agent's pointer + audit record. By DID, not by
+            # "the first agent-typed node": the bind above already scopes this
+            # store, but naming the tenant is what makes that a stated
+            # invariant rather than a property of the current query.
+            agent = await storage.graph.get_node(agent_did)
+            if agent is None or agent.node_type != "agent":
                 raise RuntimeError("Agent node disappeared mid-reanchor")
-            agent = agent_nodes[0]
             agent.properties["constitution_hash"] = new_hash
             if old_hash != new_hash:
                 from kestrel_sovereign.constitution.genesis_audit import (
