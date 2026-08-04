@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
@@ -84,8 +85,10 @@ def _lease(
     *,
     state: InferenceLeaseState,
     updated_at: datetime | None = None,
+    expires_at: datetime | None = None,
 ) -> InferenceLease:
     created = request.requested_at
+    updated = updated_at or created
     route = None
     if state is InferenceLeaseState.READY:
         route = InferenceRoute(
@@ -98,11 +101,12 @@ def _lease(
         if state is InferenceLeaseState.FAILED
         else None
     )
-    expires_at = (
-        created + timedelta(microseconds=1)
-        if state is InferenceLeaseState.EXPIRED
-        else created + timedelta(seconds=request.expected_session_seconds)
-    )
+    if expires_at is None:
+        expires_at = (
+            created + timedelta(microseconds=1)
+            if state is InferenceLeaseState.EXPIRED
+            else updated + timedelta(seconds=request.idle_ttl_seconds)
+        )
     return InferenceLease(
         lease_id=f"lease-{request.request_id}",
         quote_id=quote.quote_id,
@@ -114,7 +118,7 @@ def _lease(
         runtime=request.runtime,
         privacy=quote.privacy,
         created_at=created,
-        updated_at=updated_at or created,
+        updated_at=updated,
         expires_at=expires_at,
         region=quote.region,
         hourly_cost_usd=quote.hourly_cost_usd,
@@ -141,6 +145,7 @@ class _Provider:
         self.status_state = InferenceLeaseState.READY
         self.acquire_calls = 0
         self.status_calls = 0
+        self.touch_calls = 0
         self.release_calls = 0
         self.last_request: InferenceLeaseRequest | None = None
         self.last_quote: InferenceLeaseQuote | None = None
@@ -192,6 +197,21 @@ class _Provider:
         assert lease.lease_id == lease_id
         return lease
 
+    async def touch(self, owner_id: str, lease_id: str) -> InferenceLease:
+        self.events.append("provider.touch")
+        self.touch_calls += 1
+        assert self.last_request is not None
+        assert self.last_quote is not None
+        lease = _lease(
+            self.last_request,
+            self.last_quote,
+            state=InferenceLeaseState.READY,
+            updated_at=_now(),
+        )
+        lease.assert_owner(owner_id)
+        assert lease.lease_id == lease_id
+        return lease
+
     async def release(self, owner_id: str, lease_id: str) -> InferenceLease:
         self.events.append("provider.release")
         self.release_calls += 1
@@ -213,16 +233,19 @@ class _LLMService:
         self.events = events if events is not None else []
         self.activated: InferenceLease | None = None
         self.capabilities: tuple[str, ...] = ()
+        self.touch_lease = None
 
-    async def activate_inference_lease(self, lease, *, capabilities=()):
+    async def activate_inference_lease(self, lease, *, capabilities=(), touch_lease):
         self.events.append("llm.activate")
         self.activated = lease
         self.capabilities = tuple(capabilities)
+        self.touch_lease = touch_lease
 
     async def deactivate_inference_lease(self, lease_id, *, require_active=True):
         self.events.append("llm.deactivate")
         if self.activated is not None and self.activated.lease_id == lease_id:
             self.activated = None
+            self.touch_lease = None
 
 
 def _coordinator(
@@ -293,6 +316,7 @@ async def test_pending_status_activates_ready_route_without_public_secrets():
     assert ready.state is InferenceLeaseState.READY
     assert llm.activated is ready
     assert llm.capabilities == ("chat", "streaming", "tools")
+    assert llm.touch_lease == coordinator.touch
     public = ready.to_public_dict()
     assert public["route"] == {
         "model": "qwen3:8b",
@@ -302,6 +326,171 @@ async def test_pending_status_activates_ready_route_without_public_secrets():
     }
     assert "private.example" not in repr(public)
     assert "route-secret" not in repr(public)
+
+
+@pytest.mark.asyncio
+async def test_touch_renews_and_persists_before_next_inference_call():
+    events: list[str] = []
+    provider = _Provider("runpod", total="0.20", ready_seconds=10, events=events)
+    provider.acquire_state = InferenceLeaseState.READY
+    llm = _LLMService(events)
+    coordinator, persisted = _coordinator(
+        {"runpod": provider},
+        llm_service=llm,
+        events=events,
+    )
+    ready = await coordinator.acquire(_request())
+    events.clear()
+
+    touched = await coordinator.touch(ready.lease_id)
+
+    assert touched.state is InferenceLeaseState.READY
+    assert touched.expires_at >= ready.expires_at
+    assert provider.touch_calls == 1
+    assert events[:3] == ["provider.touch", "persist", "llm.activate"]
+    assert persisted[-1]["lease"]["expires_at"] == touched.expires_at.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_touch_and_release_are_serialized_without_lease_resurrection():
+    events: list[str] = []
+    touch_started = asyncio.Event()
+    finish_touch = asyncio.Event()
+
+    class _BlockingTouchProvider(_Provider):
+        async def touch(self, owner_id: str, lease_id: str) -> InferenceLease:
+            events.append("provider.touch.start")
+            touch_started.set()
+            await finish_touch.wait()
+            events.append("provider.touch.finish")
+            return await super().touch(owner_id, lease_id)
+
+    provider = _BlockingTouchProvider(
+        "runpod", total="0.20", ready_seconds=10, events=events
+    )
+    provider.acquire_state = InferenceLeaseState.READY
+    coordinator, _persisted = _coordinator(
+        {"runpod": provider},
+        events=events,
+    )
+    ready = await coordinator.acquire(_request())
+    events.clear()
+
+    touch_task = asyncio.create_task(coordinator.touch(ready.lease_id))
+    await touch_started.wait()
+    release_task = asyncio.create_task(coordinator.release(ready.lease_id))
+    await asyncio.sleep(0)
+    assert release_task.done() is False
+    assert provider.release_calls == 0
+
+    finish_touch.set()
+    await touch_task
+    released = await release_task
+
+    assert released.state is InferenceLeaseState.RELEASED
+    assert events.index("provider.touch.finish") < events.index("provider.release")
+    with pytest.raises(InferenceLeaseProvisioningError, match="only a ready"):
+        await coordinator.touch(ready.lease_id)
+
+
+@pytest.mark.asyncio
+async def test_touch_adopts_a_shortened_ready_deadline():
+    """A provider that renews to a NEARER expiry is authoritative, not wrong.
+
+    Nothing in the SDK contract makes expires_at monotonic across touch, and a
+    provider modelling its idle deadline as min(now + idle_ttl, authorized_cap)
+    returns a nearer expiry on its first renewal. Shortening tightens the
+    authorization envelope, so it must be adopted rather than rejected -
+    rejecting it would leave the coordinator advertising an expiry the provider
+    no longer honours. Extension, the direction that actually threatens the
+    envelope, is covered by
+    test_touch_rejects_expiry_beyond_request_deadline_without_side_effects.
+    """
+
+    class _ShorteningProvider(_Provider):
+        async def touch(self, owner_id: str, lease_id: str) -> InferenceLease:
+            assert self.last_request is not None
+            assert self.last_quote is not None
+            current = _lease(
+                self.last_request,
+                self.last_quote,
+                state=InferenceLeaseState.READY,
+            )
+            shortened = _lease(
+                self.last_request,
+                self.last_quote,
+                state=InferenceLeaseState.READY,
+                updated_at=current.updated_at + timedelta(seconds=1),
+                expires_at=current.expires_at - timedelta(seconds=1),
+            )
+            shortened.assert_owner(owner_id)
+            assert shortened.lease_id == lease_id
+            return shortened
+
+    provider = _ShorteningProvider("runpod", total="0.20", ready_seconds=10)
+    provider.acquire_state = InferenceLeaseState.READY
+    coordinator, persisted = _coordinator({"runpod": provider})
+    ready = await coordinator.acquire(_request())
+
+    renewed = await coordinator.touch(ready.lease_id)
+
+    assert renewed.state is InferenceLeaseState.READY
+    assert renewed.expires_at < ready.expires_at
+    # The shorter expiry is what gets persisted, so a restart cannot resurrect
+    # the longer one the provider has stopped honouring.
+    assert persisted[-1] is not None
+    assert persisted[-1]["lease"]["expires_at"] == renewed.expires_at.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_touch_rejects_expiry_beyond_request_deadline_without_side_effects():
+    class _OverextendingProvider(_Provider):
+        async def touch(self, owner_id: str, lease_id: str) -> InferenceLease:
+            self.events.append("provider.touch")
+            self.touch_calls += 1
+            assert self.last_request is not None
+            assert self.last_quote is not None
+            latest_expiry = self.last_request.requested_at + timedelta(
+                seconds=(
+                    self.last_request.ready_deadline_seconds
+                    + self.last_request.expected_session_seconds
+                )
+            )
+            lease = _lease(
+                self.last_request,
+                self.last_quote,
+                state=InferenceLeaseState.READY,
+                updated_at=latest_expiry - timedelta(seconds=1),
+                expires_at=latest_expiry + timedelta(seconds=1),
+            )
+            lease.assert_owner(owner_id)
+            assert lease.lease_id == lease_id
+            return lease
+
+    events: list[str] = []
+    provider = _OverextendingProvider(
+        "runpod", total="0.20", ready_seconds=10, events=events
+    )
+    provider.acquire_state = InferenceLeaseState.READY
+    llm = _LLMService(events)
+    coordinator, persisted = _coordinator(
+        {"runpod": provider},
+        llm_service=llm,
+        events=events,
+    )
+    ready = await coordinator.acquire(_request())
+    persisted_before_touch = list(persisted)
+    events.clear()
+
+    with pytest.raises(InferenceLeaseConstraintError, match="session deadline"):
+        await coordinator.touch(ready.lease_id)
+
+    assert provider.touch_calls == 1
+    assert events == ["provider.touch"]
+    assert persisted == persisted_before_touch
+    assert coordinator.current_record is not None
+    assert coordinator.current_record.lease is ready
+    assert llm.activated is ready
 
 
 @pytest.mark.asyncio
@@ -378,6 +567,11 @@ async def test_restore_ready_reference_refetches_host_only_route():
     assert restored.state is InferenceLeaseState.READY
     assert provider.status_calls == 1
     assert llm.activated is restored
+    assert llm.touch_lease == second.touch
+
+    touched = await llm.touch_lease(restored.lease_id)
+    assert touched.state is InferenceLeaseState.READY
+    assert provider.touch_calls == 1
 
 
 @pytest.mark.asyncio
@@ -570,6 +764,55 @@ def test_discovery_rejects_entry_point_name_mismatch(monkeypatch):
 def test_invalid_provider_protocol_is_rejected(monkeypatch):
     entry_points = _EntryPoints(
         (_EntryPoint("broken", "a:Provider", object(), "package-a"),)
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.inference_leases.importlib_metadata.entry_points",
+        lambda: entry_points,
+    )
+
+    with pytest.raises(InferenceLeaseProviderDiscoveryError, match="SDK contract"):
+        discover_inference_lease_providers()
+
+
+@pytest.mark.parametrize("declare_touch_as_none", [False, True])
+def test_provider_without_idle_renewal_is_rejected_at_discovery(
+    monkeypatch, declare_touch_as_none
+):
+    """Discovery rejects a provider that cannot renew a lease from traffic.
+
+    Both shapes are the SDK protocol's job, not ours: contract 6 made ``touch``
+    a required member of the runtime-checkable ``InferenceLeaseProvider``, so a
+    0.34-era provider that omits it entirely and one that declares it as
+    ``None`` both fail ``isinstance``. Discovery must not re-implement that
+    check, and this test exists to prove the SDK-owned one is load-bearing.
+    """
+
+    class _LegacyProvider:
+        provider_name = "legacy"
+
+        def capabilities(self):
+            return ()
+
+        def is_available(self):
+            return True
+
+        async def quote(self, request):
+            raise NotImplementedError
+
+        async def acquire(self, request, quote):
+            raise NotImplementedError
+
+        async def status(self, owner_id, lease_id):
+            raise NotImplementedError
+
+        async def release(self, owner_id, lease_id):
+            raise NotImplementedError
+
+    if declare_touch_as_none:
+        _LegacyProvider.touch = None
+
+    entry_points = _EntryPoints(
+        (_EntryPoint("legacy", "legacy:Provider", _LegacyProvider(), "legacy"),)
     )
     monkeypatch.setattr(
         "kestrel_sovereign.llm.inference_leases.importlib_metadata.entry_points",
