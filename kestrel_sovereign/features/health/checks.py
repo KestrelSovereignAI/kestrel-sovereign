@@ -14,7 +14,7 @@ import logging
 import shutil
 import time
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
@@ -452,6 +452,83 @@ async def check_signal_audit_log(agent) -> Dict[str, Any]:
         "duration_ms": _elapsed(start),
         "details": details,
     }
+
+
+async def check_birth_record(agent) -> Dict[str, Any]:
+    """Report birth-record capability the runtime database does not have (#2871).
+
+    On a host whose runtime database is not the one inception wrote to, boot
+    copies the birth record across. Whatever the local anchor cannot supply —
+    a constitution it never held, chunk ownership a pre-#2649 database could
+    not prove — stays missing, and no retry will change that.
+
+    The agent still boots: refusing would convert a degraded agent into one
+    that can never boot again, with no operator verb to fix it, and identity
+    failures (no agent node, a fabricated placeholder) are refused at boot
+    already. But the loss must not be silent — #2871's whole defect was an
+    agent with zero constitution chunks while ``/health`` reported ok.
+
+    ``warn`` rather than ``fail``: the agent serves correctly, and the thing it
+    cannot do is constitutional retrieval. It does not clear on its own.
+    """
+    start = time.monotonic()
+
+    # Duck-typed like the sibling checks: third-party agents and test doubles
+    # implement the health protocol, not this accounting. Require a real
+    # non-empty list of strings before claiming a loss — reporting one that did
+    # not happen is the same failure as hiding one that did.
+    shortfall = getattr(agent, "_birth_record_shortfall", None)
+    if not isinstance(shortfall, list) or not shortfall:
+        return {
+            "name": "birth_record",
+            "status": "pass",
+            "message": "Birth record complete in the runtime database",
+            "duration_ms": _elapsed(start),
+        }
+    reasons = [str(reason) for reason in shortfall]
+    # A completed pass that could not supply this means the anchor does not
+    # have it; a pass that DIED is usually transient. Telling an operator a
+    # dropped connection is unrepairable sends them to rebuild an anchor when
+    # a restart would have fixed it.
+    retryable = bool(getattr(agent, "_birth_record_shortfall_retryable", False))
+
+    return {
+        "name": "birth_record",
+        "status": "warn",
+        "message": (
+            "Birth record incomplete in the runtime database; "
+            + (
+                "the copy failed this pass and a restart may complete it: "
+                if retryable
+                else "the local anchor cannot supply it: "
+            )
+            + "; ".join(reasons)
+        ),
+        "duration_ms": _elapsed(start),
+        "details": {"missing": reasons, "retryable": retryable},
+    }
+
+
+async def run_standard_checks(agent, db) -> List[Dict[str, Any]]:
+    """The checks every health surface runs, in one place.
+
+    There are two callers — ``HealthFeature._run_health`` and the fallback in
+    ``server.py`` for agents without the feature, which is not mandatory and so
+    is reachable by design. They were two hand-maintained lists, and they had
+    already drifted: a check added to one left the other reporting ``healthy``
+    for a state the first calls a warning. Sharing the list is what stops the
+    next one drifting.
+    """
+    return [
+        await check_database(db),
+        await check_llm_service(agent),
+        await check_memory_system(agent),
+        await check_disk_space(),
+        await check_context_budget(agent),
+        await check_bootstrap_state(agent),
+        await check_signal_audit_log(agent),
+        await check_birth_record(agent),
+    ]
 
 
 def _elapsed(start: float) -> float:

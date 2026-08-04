@@ -41,15 +41,7 @@ from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
-from .checks import (
-    check_bootstrap_state,
-    check_context_budget,
-    check_database,
-    check_disk_space,
-    check_llm_service,
-    check_memory_system,
-    check_signal_audit_log,
-)
+from .checks import run_standard_checks
 
 logger = logging.getLogger(__name__)
 
@@ -442,14 +434,10 @@ class HealthFeature(Feature):
         check_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
 
-        checks = []
-        checks.append(await check_database(self._db))
-        checks.append(await check_llm_service(self.agent))
-        checks.append(await check_memory_system(self.agent))
-        checks.append(await check_disk_space())
-        checks.append(await check_context_budget(self.agent))
-        checks.append(await check_bootstrap_state(self.agent))
-        checks.append(await check_signal_audit_log(self.agent))
+        # Shared with server.py's no-feature fallback so the two lists cannot
+        # drift; a check present in one and absent from the other reports
+        # `healthy` for a state its sibling calls a warning.
+        checks = await run_standard_checks(self.agent, self._db)
 
         overall_status = _derive_overall_status(checks)
         overall_healthy = overall_status == "healthy"
