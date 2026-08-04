@@ -582,3 +582,121 @@ async def test_shutdown_during_client_construction_closes_the_built_client(
     assert host._remote_lease is None
     assert host._remote_client is None
     assert host._backend is BackendType.CLOUD
+
+
+@pytest.mark.asyncio
+async def test_release_draining_behind_a_pinned_call_still_fails_closed(monkeypatch):
+    """The post-touch route re-check, isolated from the epoch guard.
+
+    ``deactivate_inference_lease`` bumps the epoch AFTER its drain loop, so
+    while it is blocked draining an already-pinned call the epoch is unchanged
+    and the epoch guard passes. This re-check is then the only thing standing
+    between a renewing call and a route the owner has already released.
+
+    Without it the call pins behind the drain, sends agent data over a released
+    route, and ``deactivate`` blocks a further HTTP_TIMEOUT_MEDIUM or raises
+    "timed out draining".
+    """
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.remote_backend.openai.AsyncOpenAI",
+        lambda **kwargs: _Client(**kwargs),
+    )
+    host = _Host()
+    touch_started = asyncio.Event()
+    finish_touch = asyncio.Event()
+    touches = {"count": 0}
+
+    async def touch(lease_id: str) -> InferenceLease:
+        touches["count"] += 1
+        if touches["count"] == 1:
+            return host._remote_lease  # the first call proceeds normally
+        touch_started.set()
+        await finish_touch.wait()
+        return host._remote_lease
+
+    await host.activate_inference_lease(
+        _lease(), capabilities=("chat",), touch_lease=touch
+    )
+
+    async with host._remote_route_attempt(
+        force_local_only=False,
+        model_override=None,
+        required_capabilities=("chat",),
+    ) as pinned:
+        assert pinned is not None
+        assert host._remote_inflight == 1
+
+        async def renewing_call() -> None:
+            async with host._remote_route_attempt(
+                force_local_only=False,
+                model_override=None,
+                required_capabilities=("chat",),
+            ):
+                pytest.fail("must not pin behind a draining release")
+
+        renewal = asyncio.create_task(renewing_call())
+        await touch_started.wait()
+
+        epoch_before = host._remote_route_epoch
+        release = asyncio.create_task(host.deactivate_inference_lease("lease-1"))
+        while host._remote_accepting:
+            await asyncio.sleep(0)
+        # The release is blocked in its drain loop, so the epoch has NOT moved.
+        assert host._remote_route_epoch == epoch_before
+
+        finish_touch.set()
+        with pytest.raises(LLMServiceError, match="draining or unavailable"):
+            await renewal
+        assert host._remote_inflight == 1
+
+    await release
+    assert host._remote_lease is None
+
+
+@pytest.mark.asyncio
+async def test_lease_expiring_during_renewal_fails_closed(monkeypatch):
+    """The post-touch expiry re-check — the consequence of adopting a shortening.
+
+    ``touch`` deliberately ADOPTS a nearer expiry, because the provider no
+    longer honours the longer one. That makes this re-check load-bearing rather
+    than incidental: the pre-touch check passed against the OLD deadline, and
+    only this one sees the renewed lease. Without it, traffic goes to leased
+    capacity past its expiry, which the provider is entitled to have reclaimed.
+    """
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.remote_backend.openai.AsyncOpenAI",
+        lambda **kwargs: _Client(**kwargs),
+    )
+    host = _Host()
+
+    async def touch(lease_id: str) -> InferenceLease:
+        current = host._remote_lease
+        assert current is not None
+        # A provider that models its idle deadline as min(now + ttl, cap) can
+        # return an expiry that has already passed by the time we see it.
+        shortened = replace(
+            current, expires_at=datetime.now(UTC) - timedelta(seconds=1)
+        )
+        await host.activate_inference_lease(
+            shortened, capabilities=("chat",), touch_lease=touch
+        )
+        return shortened
+
+    # created_at is min(now, expires_at - 10min), so a 5-minute expiry puts it
+    # 5 minutes in the past and leaves room for a shortened-but-valid deadline.
+    await host.activate_inference_lease(
+        _lease(expires_at=datetime.now(UTC) + timedelta(minutes=5)),
+        capabilities=("chat",),
+        touch_lease=touch,
+    )
+
+    with pytest.raises(LLMServiceError, match="expired during renewal"):
+        async with host._remote_route_attempt(
+            force_local_only=False,
+            model_override=None,
+            required_capabilities=("chat",),
+        ):
+            pytest.fail("expired capacity must not receive traffic")
+
+    assert host._remote_inflight == 0
+    assert host._remote_accepting is False
