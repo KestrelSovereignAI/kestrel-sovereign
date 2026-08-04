@@ -77,6 +77,29 @@ _ROOT_KEYPAIR = _SUITE.generate_keypair()
 _ROOT_DID = "did:pkh:eip155:1:0x0000000000000000000000000000000000001118"
 
 
+@pytest.fixture(autouse=True)
+def _no_operator_trust_root(monkeypatch):
+    """Keep the developer's real Sovereign trust root out of these tests.
+
+    ``tests/conftest.py``'s ``pytest_configure`` loads the **main repo's**
+    ``.env`` into the test process — deliberately, and it follows
+    ``git-common-dir`` so worktrees inherit it too. On a machine where the
+    Sovereign trust root is configured, that exports
+    ``KESTREL_SOVEREIGN_TRUST_ROOT_PATH``, and every test here also passes its
+    own ``sovereign_trust_root_path``. Two sources naming different files is
+    exactly what ``load_sovereign_trust_root`` refuses:
+
+        Ambiguous external Sovereign trust-root configuration: explicit
+        trust-root path=… vs KESTREL_SOVEREIGN_TRUST_ROOT_PATH=…
+
+    That refusal is correct behaviour — rotation and incident recovery must
+    not silently prefer one root. The bug is the leak, which made these two
+    tests fail for anyone with a real trust root while passing in CI, where no
+    ``.env`` exists. They were long recorded as "environmental"; they are not.
+    """
+    monkeypatch.delenv("KESTREL_SOVEREIGN_TRUST_ROOT_PATH", raising=False)
+
+
 def _write_reanchor_authority(tmp_path: Path, content: bytes) -> tuple[Path, Path]:
     root_document = did_document_from_legacy_public_key(
         _ROOT_DID,

@@ -198,14 +198,24 @@ async def resolve_reanchor_target(
             is the only artifact that says which tenant this reanchor is for,
             and boot requires it too.
     """
-    resolved = (
-        backend or os.environ.get("KESTREL_DB_BACKEND", "sqlite")
-    ).strip().lower()
+    # ``.lower()`` and nothing else. ``_initialize_agent`` does not strip, so
+    # ``KESTREL_DB_BACKEND="postgres "`` starts the agent on SQLite; stripping
+    # here would point the reanchor at PostgreSQL instead — #2890 again with
+    # the two databases exchanged. Copying the rule means copying it exactly.
+    resolved = (backend or os.environ.get("KESTREL_DB_BACKEND", "sqlite")).lower()
     if resolved not in ("sqlite", "postgres"):
-        raise ReanchorTargetError(
-            f"Unsupported KESTREL_DB_BACKEND {resolved!r}: expected "
-            f"'sqlite' or 'postgres'."
+        # The runtime does not validate this either — ``_initialize_agent``
+        # tests `== "postgres"` and falls through to SQLite for anything else,
+        # so an agent configured `mysql` really is running on the local file
+        # and that is what a reanchor must target. Refusing would be stricter
+        # than the thing being repaired. Name it rather than fail on it.
+        logger.warning(
+            "KESTREL_DB_BACKEND=%r is not a backend this runtime supports; "
+            "agents configured this way run on the local SQLite anchor, so "
+            "that is what will be reanchored.",
+            resolved,
         )
+        resolved = "sqlite"
 
     anchor_path = agent_dir / "kestrel_prime.db"
     # Deferred: agent_manager pulls in the whole agent runtime. Reusing its
@@ -218,6 +228,15 @@ async def resolve_reanchor_target(
     )
 
     try:
+        # INITIALIZATION, which opens the anchor ``mode=rw`` so SQLite can
+        # replay a WAL before reading. That is a write — it checkpoints the
+        # file and clears its sidecars — during what the caller thinks is a
+        # read, and COLD_READ_ONLY would avoid it. But COLD_READ_ONLY *refuses*
+        # an anchor with live WAL state, and leftover sidecars after an unclean
+        # stop are ordinary. Refusing there would brick the #2616 edge repair
+        # for exactly the agents most likely to need it, to protect a
+        # file-mtime property nothing depends on. Checkpointing preserves the
+        # record; it only settles how it is stored.
         agent_did = await _get_agent_did(
             str(agent_dir), mode=_AgentDIDLookupMode.INITIALIZATION
         )
@@ -593,9 +612,26 @@ async def reanchor_constitution(
     # another. Detect it here rather than letting the write roll back with
     # "Cannot overwrite a graph node owned by another agent", which names
     # neither the artifact nor the way out.
-    artifact_conflict = await _foreign_artifact_owner(
-        target, hashlib.sha256(amendment_artifact_bytes).hexdigest()
-    )
+    try:
+        artifact_conflict = await _foreign_artifact_owner(
+            target, hashlib.sha256(amendment_artifact_bytes).hexdigest()
+        )
+    except Exception as exc:  # noqa: BLE001 — opening a connection can fail
+        # Same boundary as the anchor read. This opens its own connection to
+        # the runtime database, so a host that dropped between the two would
+        # otherwise escape as a traceback — the round-1 defect, on a path added
+        # after round 1 fixed it.
+        logger.exception(
+            "Could not check artifact ownership in %s", target.describe()
+        )
+        return _result(
+            old_hash=old_hash,
+            new_hash=new_hash,
+            error=(
+                f"Could not check this artifact against {target.describe()}: "
+                f"{exc!r}. Nothing was written."
+            ),
+        )
     if artifact_conflict is not None:
         return _result(
             old_hash=old_hash,
@@ -716,10 +752,25 @@ async def _read_agent_anchor(
         agent = await storage.graph.get_node(target.agent_did)
         if agent is None or agent.node_type != "agent":
             return None, "", None, ()
-        edges = await storage.graph.get_edges(agent.node_id, direction="out")
-        governed_by_targets = tuple(
-            edge.target_id for edge in edges if edge.label == "governed_by"
+        # Read the governance edges through the privileged maintenance
+        # connection, NOT the bound graph store. This repair path exists to
+        # heal PRE-LEDGER drift (#2616), and stale edges are unowned by
+        # construction — pre-ledger writers left no ``graph_edge_owners`` row —
+        # so an ownership-scoped read filters out exactly the edges the repair
+        # is looking for. It would report no stale targets, short-circuit to
+        # ``unchanged=True``, and leave `doctor` prescribing a `--force`
+        # reanchor that answers "nothing to do" while the agent stays
+        # safe-moded on integrity proof 2. ``_write_reanchor`` reads the same
+        # set the same way and already carries this reasoning.
+        #
+        # Still tenant-scoped: ``source_id`` is this agent's DID, and no
+        # caller-supplied value is interpolated into the SQL.
+        edge_rows = await storage.db.fetchall(
+            "SELECT target_id FROM graph_edges "
+            "WHERE source_id = ? AND label = 'governed_by'",
+            (agent.node_id,),
         )
+        governed_by_targets = tuple(row[0] for row in edge_rows)
         return (
             agent.properties.get("constitution_hash"),
             agent.node_id,

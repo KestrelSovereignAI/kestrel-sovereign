@@ -116,11 +116,27 @@ async def test_postgres_without_a_dsn_is_a_sqlite_host(agent_dir, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_backend_is_case_and_whitespace_insensitive(agent_dir, monkeypatch):
-    monkeypatch.setenv("KESTREL_DB_BACKEND", "  PostgreS \n")
+async def test_backend_is_case_insensitive(agent_dir, monkeypatch):
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "PostgreS")
     monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://h/db")
     target = await resolve_reanchor_target(agent_dir)
     assert target.backend == "postgres"
+
+
+@pytest.mark.asyncio
+async def test_surrounding_whitespace_is_not_stripped(agent_dir, monkeypatch):
+    """``_initialize_agent`` compares ``db_backend.lower() == "postgres"`` with
+    no strip, so ``"postgres "`` starts the agent on **SQLite**. Stripping here
+    would send the reanchor to PostgreSQL instead — this very issue with the
+    two databases exchanged. Copying a rule means copying it exactly,
+    including the parts that look like bugs."""
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres ")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://h/db")
+
+    target = await resolve_reanchor_target(agent_dir)
+
+    assert target.backend == "sqlite"
+    assert target.anchor_path == agent_dir / "kestrel_prime.db"
 
 
 @pytest.mark.asyncio
@@ -136,11 +152,20 @@ async def test_explicit_arguments_override_the_environment(agent_dir, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_unsupported_backend_refuses(agent_dir, monkeypatch):
+async def test_unsupported_backend_lands_where_the_runtime_lands(
+    agent_dir, monkeypatch, caplog,
+):
+    """``_initialize_agent`` tests ``== "postgres"`` and falls through to
+    SQLite for anything else, so an agent configured ``mysql`` really is
+    running on the local file. Refusing here would be stricter than the thing
+    being repaired; the honest move is to follow it and say so."""
     monkeypatch.setenv("KESTREL_DB_BACKEND", "mysql")
-    with pytest.raises(ReanchorTargetError) as exc:
-        await resolve_reanchor_target(agent_dir)
-    assert "mysql" in str(exc.value)
+
+    with caplog.at_level("WARNING"):
+        target = await resolve_reanchor_target(agent_dir)
+
+    assert target.backend == "sqlite"
+    assert "mysql" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +203,23 @@ async def test_two_agent_roots_in_one_anchor_refuse(agent_dir):
 async def test_the_open_storage_binds_the_agent(agent_dir):
     target = await resolve_reanchor_target(agent_dir)
     storage = target.open_storage()
+    assert storage.agent_id == AGENT_DID
+
+
+@pytest.mark.asyncio
+async def test_the_postgres_branch_binds_the_agent_too(agent_dir, monkeypatch):
+    """Both branches, separately. Deleting ``agent_id`` from the PostgreSQL
+    branch alone left the whole suite green — the probe tests were carried by
+    the by-DID lookup, not the binding — and PostgreSQL is the only backend
+    where the binding does anything, because it is the only one that holds
+    more than one agent."""
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://u:p@h:5432/db")
+
+    target = await resolve_reanchor_target(agent_dir)
+    storage = target.open_storage()
+
+    assert target.backend == "postgres"
     assert storage.agent_id == AGENT_DID
 
 
