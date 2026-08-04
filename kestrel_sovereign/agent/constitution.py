@@ -1508,6 +1508,35 @@ class ConstitutionMixin:
                 f"does not start with expected prefix '{expected_hash}'."
             )
 
+        # Amendment VIII on an agent with NO structured receipt (#2465). Its
+        # anchored bytes are the only record of the contract, so ``reanchor_
+        # contract`` above is None and the resolver just rendered the dormant
+        # canonical text — which a Sovereign-signed artifact over those exact
+        # bytes would then authorize, erasing the authored terms. Refuse before
+        # any crypto or write. Shared with the offline CLI so the two entry
+        # points cannot diverge on this.
+        if old_hash != "none":
+            from kestrel_sovereign.constitution.emancipation import (
+                unwitnessed_emancipation_downgrade,
+            )
+
+            try:
+                anchored_text = (
+                    await self.storage.retrieve_file(old_hash)
+                ).decode("utf-8")
+            except Exception:  # noqa: BLE001 — unreadable is its own verdict
+                anchored_text = None
+            downgrade = unwitnessed_emancipation_downgrade(
+                anchored_contract=reanchor_contract,
+                anchored_text=anchored_text,
+                old_hash=old_hash,
+                new_hash=new_hash,
+                new_text=constitution_content.decode("utf-8"),
+            )
+            if downgrade is not None:
+                logging.critical("REANCHOR REJECTED: %s", downgrade)
+                return f"Error: {downgrade}"
+
         from kestrel_sovereign.constitution.trust_root import (
             SovereignTrustRootError,
         )

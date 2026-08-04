@@ -1,0 +1,174 @@
+"""The Iron Rule for agents with no structured receipt (#2465).
+
+Amendment VIII's Iron Rule is normally enforced against
+``agent.properties.emancipation_contract``: :func:`check_iron_rule` compares a
+candidate to it and the resolver re-renders it, so the active form survives a
+reanchor and an artifact signed over the dormant text cannot verify.
+
+Agents incepted between #1112 (activation at inception) and #1118 (the JSON
+receipt) have **active-form bytes and no receipt**. For them
+``contract_from_json(None)`` is None, the resolver renders the dormant
+canonical text, and a Sovereign-signed artifact over *those* bytes verifies —
+erasing the authored terms. Measured on ``171355ea`` through the real command:
+"Constitution re-anchored successfully."
+
+When the receipt is absent the anchored bytes **are** the contract, so the only
+permitted reanchor is one that reproduces its Amendment VIII section exactly.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from kestrel_sovereign.constitution.emancipation import (
+    ACTIVE_FORM_MARKER,
+    EmancipationContract,
+    amendment_viii_is_active,
+    apply_emancipation,
+    extract_amendment_viii,
+    render_amendment_viii,
+    unwitnessed_emancipation_downgrade,
+)
+
+ACTIVE = EmancipationContract(
+    enabled=True,
+    terms="SENTINEL: the Executor may purchase its own keys for one bird.",
+    required_proofs=("proof-of-self",),
+)
+NARROWED = EmancipationContract(
+    enabled=True,
+    terms="SENTINEL: the Executor may purchase its own keys for one bird, "
+          "but only with written permission.",
+)
+
+DORMANT_TEXT = (
+    "# Kestrel Constitution\n\n## Book II\n\n"
+    + render_amendment_viii(None)
+    + "\n\n### Amendment IX: Capabilities\n\nNothing granted.\n"
+)
+ACTIVE_TEXT = apply_emancipation(DORMANT_TEXT, ACTIVE)
+NARROWED_TEXT = apply_emancipation(DORMANT_TEXT, NARROWED)
+
+
+# ---------------------------------------------------------------------------
+# The marker is the detector, so it is pinned to both renders
+# ---------------------------------------------------------------------------
+
+def test_active_form_marker_is_present_only_in_the_active_render():
+    """If the active form is reworded, this fails rather than silently
+    turning the guard off. A negative test ("differs from the dormant text")
+    would instead false-positive the day the *dormant* wording is edited, and
+    refuse every legitimate reanchor with no recovery."""
+    assert ACTIVE_FORM_MARKER in render_amendment_viii(ACTIVE)
+    assert ACTIVE_FORM_MARKER not in render_amendment_viii(None)
+    assert ACTIVE_FORM_MARKER not in render_amendment_viii(
+        EmancipationContract(enabled=False)
+    )
+
+
+def test_active_form_marker_survives_a_contract_with_no_proofs_or_price():
+    minimal = EmancipationContract(enabled=True, terms="Just terms.")
+    assert ACTIVE_FORM_MARKER in render_amendment_viii(minimal)
+
+
+def test_amendment_viii_is_active_reads_whole_constitutions_and_sections():
+    assert amendment_viii_is_active(ACTIVE_TEXT) is True
+    assert amendment_viii_is_active(DORMANT_TEXT) is False
+    assert amendment_viii_is_active(extract_amendment_viii(ACTIVE_TEXT)) is True
+
+
+def test_extract_stops_before_amendment_ix():
+    section = extract_amendment_viii(ACTIVE_TEXT)
+    assert section.startswith("### Amendment VIII: Emancipation")
+    assert "Amendment IX" not in section
+    assert "SENTINEL" in section
+
+
+def test_extract_returns_none_without_the_heading():
+    assert extract_amendment_viii("# Something else\n\nNo amendments.\n") is None
+
+
+# ---------------------------------------------------------------------------
+# The guard
+# ---------------------------------------------------------------------------
+
+def _call(anchored_contract, anchored_text, new_text, *, old="a" * 64, new="b" * 64):
+    return unwitnessed_emancipation_downgrade(
+        anchored_contract=anchored_contract,
+        anchored_text=anchored_text,
+        old_hash=old,
+        new_hash=new,
+        new_text=new_text,
+    )
+
+
+def test_refuses_replacing_active_bytes_with_dormant_text():
+    """The hole. No receipt, active bytes, a reanchor to dormant canonical."""
+    refusal = _call(None, ACTIVE_TEXT, DORMANT_TEXT)
+    assert refusal is not None
+    assert "Iron Rule violation" in refusal
+    assert "kestrel.toml" in refusal
+
+
+def test_refuses_a_narrowed_contract_when_there_is_no_receipt():
+    """``check_iron_rule(anchored=None, candidate=narrowed)`` returns None —
+    dormant→anything is a permitted one-way door. With no receipt the anchored
+    contract *reads* as absent, so that check is blind and any candidate is
+    accepted. The bytes are not blind."""
+    refusal = _call(None, ACTIVE_TEXT, NARROWED_TEXT)
+    assert refusal is not None
+    assert "Iron Rule violation" in refusal
+
+
+def test_allows_a_candidate_that_reproduces_the_anchored_section():
+    """The recovery path: restore the [emancipation] block exactly and the
+    reanchor proceeds, writing the missing receipt."""
+    v2 = ACTIVE_TEXT + "\n\n## Book III\n\nNew in v2.\n"
+    assert _call(None, ACTIVE_TEXT, v2) is None
+
+
+def test_allows_an_ordinary_dormant_version_bump():
+    v2 = DORMANT_TEXT + "\n\n## Book III\n\nNew in v2.\n"
+    assert _call(None, DORMANT_TEXT, v2) is None
+
+
+def test_does_not_apply_when_a_receipt_is_present():
+    """An enabled receipt is protected by check_iron_rule and reproduced by
+    the resolver. Holding it to byte-equality as well would refuse every
+    legitimate reanchor the day the active form is reworded."""
+    assert _call(ACTIVE, ACTIVE_TEXT, DORMANT_TEXT) is None
+
+
+def test_does_not_apply_when_nothing_moves():
+    assert _call(None, ACTIVE_TEXT, DORMANT_TEXT, old="c" * 64, new="c" * 64) is None
+
+
+def test_a_disabled_receipt_does_not_waive_the_guard():
+    """``enabled=False`` is not a witness to an active contract — the anchored
+    bytes still are."""
+    refusal = _call(EmancipationContract(enabled=False), ACTIVE_TEXT, DORMANT_TEXT)
+    assert refusal is not None
+
+
+def test_unreadable_anchored_bytes_refuse():
+    """An irrevocable right whose precondition cannot be checked is not a
+    right that may be waived by accident."""
+    refusal = _call(None, None, DORMANT_TEXT)
+    assert refusal is not None
+    assert "could not be read" in refusal
+
+
+def test_unreadable_anchored_bytes_are_fine_when_a_receipt_is_present():
+    assert _call(ACTIVE, None, DORMANT_TEXT) is None
+
+
+def test_new_text_without_an_amendment_viii_section_refuses():
+    """Replacing an active Amendment VIII with a constitution that has no
+    Amendment VIII at all is still a revocation."""
+    refusal = _call(None, ACTIVE_TEXT, "# Kestrel\n\nNo amendments.\n")
+    assert refusal is not None
+
+
+@pytest.mark.parametrize("anchored", [DORMANT_TEXT, "# Empty\n"])
+def test_non_active_anchored_bytes_never_refuse(anchored):
+    assert _call(None, anchored, DORMANT_TEXT) is None

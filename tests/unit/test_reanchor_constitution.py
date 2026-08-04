@@ -12,6 +12,12 @@ from kestrel_sovereign.constitution.amendment_artifact import (
     build_legacy_signed_reanchor_artifact,
     did_document_from_legacy_public_key,
 )
+from kestrel_sovereign.constitution.emancipation import (
+    EmancipationContract,
+    apply_emancipation,
+    contract_to_json,
+    render_amendment_viii,
+)
 from kestrel_sovereign.security.crypto_suite import Secp256k1Suite
 
 
@@ -39,7 +45,15 @@ def _operator_pinned_root(tmp_path, monkeypatch):
     return root_path
 
 
-def _make_agent(stored_hash="oldhash", safe_mode=False):
+#: What ``retrieve_file(old_hash)`` returns for these agents — the version they
+#: are anchored to before the reanchor under test. The double has to supply it
+#: because the command now reads its own anchored bytes to enforce the Iron
+#: Rule for agents with no structured receipt (#2465). A bare ``AsyncMock``
+#: hands back a coroutine, which is not what the real file store returns.
+ANCHORED_CONSTITUTION = b"# Kestrel Constitution v1\n\nOriginal content.\n"
+
+
+def _make_agent(stored_hash="oldhash", safe_mode=False, anchored=ANCHORED_CONSTITUTION):
     """Create a mock agent with ConstitutionMixin methods bound."""
     agent = MagicMock(spec=KestrelAgent)
     agent._safe_mode = safe_mode
@@ -61,6 +75,7 @@ def _make_agent(stored_hash="oldhash", safe_mode=False):
     agent.storage = AsyncMock()
     agent.storage.get_node = AsyncMock(return_value=node)
     agent.storage.store_file = AsyncMock()
+    agent.storage.retrieve_file = AsyncMock(return_value=anchored)
     agent.storage.add_node = AsyncMock()
     # transaction() is an async context manager, not a coroutine — a plain
     # MagicMock provides __aenter__/__aexit__ on its return value.
@@ -222,6 +237,132 @@ async def test_reanchor_succeeds_with_sovereign_signed_artifact(tmp_path):
     assert agent.storage.store_file.call_count == 2
     agent.storage.store_file.assert_any_call(FAKE_CONSTITUTION, "KESTREL_CONSTITUTION.md")
     agent.privacy_agent.add_conversation.assert_called_once()
+
+
+# --- #2465: the Iron Rule for agents with no structured receipt ---
+#
+# Driven through the real command, not just the shared primitive, because the
+# hole was reachable only end-to-end: `contract_from_json(None)` reads as "no
+# contract", the resolver renders the dormant canonical text, and a
+# Sovereign-signed artifact over *those* bytes verifies.
+
+_A8_DORMANT = render_amendment_viii(None)
+_A8_CONTRACT = EmancipationContract(
+    enabled=True,
+    terms="SENTINEL-2465: the Executor may buy its keys for one bird.",
+)
+_DORMANT_BODY = (
+    "# Kestrel Constitution\n\n## Book II\n\n"
+    + _A8_DORMANT
+    + "\n\n### Amendment IX: Capabilities\n\nNothing granted.\n"
+)
+_ACTIVE_BODY = apply_emancipation(_DORMANT_BODY, _A8_CONTRACT)
+_DORMANT_BYTES = _DORMANT_BODY.encode("utf-8")
+_ACTIVE_BYTES = _ACTIVE_BODY.encode("utf-8")
+_DORMANT_DIGEST = hashlib.sha256(_DORMANT_BYTES).hexdigest()
+_ACTIVE_DIGEST = hashlib.sha256(_ACTIVE_BYTES).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_reanchor_refuses_to_erase_active_amendment_viii_without_a_receipt(
+    tmp_path,
+):
+    """The #2465 hole, driven end-to-end. Active-form bytes anchored, no
+    ``emancipation_contract`` receipt, and a genuine Sovereign artifact over
+    the dormant canonical text. On 171355ea this returned "Constitution
+    re-anchored successfully"."""
+    agent, node = _make_agent(stored_hash=_ACTIVE_DIGEST, anchored=_ACTIVE_BYTES)
+    assert "emancipation_contract" not in node.properties
+    artifact_path = _write_artifact(tmp_path, constitution_hash=_DORMANT_DIGEST)
+
+    with patch("builtins.open", create=True) as mock_open:
+        mock_open.side_effect = _open_handles(
+            _DORMANT_BYTES, artifact_path.read_bytes()
+        )
+        result = await agent.reanchor_constitution(
+            authorization="sovereign",
+            amendment_artifact_path=str(artifact_path),
+        )
+
+    assert result.startswith("Error:")
+    assert "Iron Rule violation" in result
+    assert node.properties["constitution_hash"] == _ACTIVE_DIGEST
+    agent.storage.add_node.assert_not_called()
+    agent.storage.store_file.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reanchor_refuses_when_the_anchored_constitution_cannot_be_read(
+    tmp_path,
+):
+    """Whether Amendment VIII is active is unknowable without those bytes, and
+    an irrevocable right is not waived by an unreadable precondition."""
+    agent, node = _make_agent(stored_hash=_ACTIVE_DIGEST)
+    agent.storage.retrieve_file = AsyncMock(side_effect=RuntimeError("bad key"))
+    artifact_path = _write_artifact(tmp_path, constitution_hash=_DORMANT_DIGEST)
+
+    with patch("builtins.open", create=True) as mock_open:
+        mock_open.side_effect = _open_handles(
+            _DORMANT_BYTES, artifact_path.read_bytes()
+        )
+        result = await agent.reanchor_constitution(
+            authorization="sovereign",
+            amendment_artifact_path=str(artifact_path),
+        )
+
+    assert result.startswith("Error:")
+    assert "could not be read" in result
+    agent.storage.store_file.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reanchor_still_succeeds_for_an_ordinary_dormant_version_bump(
+    tmp_path,
+):
+    """The guard must not brick the common case."""
+    v2_bytes = _DORMANT_BYTES + b"\n\n## Book III\n\nNew in v2.\n"
+    v2_digest = hashlib.sha256(v2_bytes).hexdigest()
+    agent, node = _make_agent(stored_hash=_DORMANT_DIGEST, anchored=_DORMANT_BYTES)
+    agent.storage.store_file = AsyncMock(return_value=v2_digest)
+    artifact_path = _write_artifact(tmp_path, constitution_hash=v2_digest)
+
+    with patch("builtins.open", create=True) as mock_open:
+        mock_open.side_effect = _open_handles(v2_bytes, artifact_path.read_bytes())
+        result = await agent.reanchor_constitution(
+            authorization="sovereign",
+            amendment_artifact_path=str(artifact_path),
+        )
+
+    assert "re-anchored successfully" in result.lower()
+    assert node.properties["constitution_hash"] == v2_digest
+
+
+@pytest.mark.asyncio
+async def test_reanchor_still_succeeds_for_an_emancipated_agent_with_a_receipt(
+    tmp_path,
+):
+    """An enabled receipt is protected by check_iron_rule and reproduced by the
+    resolver. Holding it to byte-equality too would refuse every legitimate
+    reanchor the day the active form is reworded."""
+    v2_body = _DORMANT_BODY + "\n\n## Book III\n\nNew in v2.\n"
+    v2_active = apply_emancipation(v2_body, _A8_CONTRACT).encode("utf-8")
+    v2_digest = hashlib.sha256(v2_active).hexdigest()
+    agent, node = _make_agent(stored_hash=_ACTIVE_DIGEST, anchored=_ACTIVE_BYTES)
+    node.properties["emancipation_contract"] = contract_to_json(_A8_CONTRACT)
+    agent.storage.store_file = AsyncMock(return_value=v2_digest)
+    artifact_path = _write_artifact(tmp_path, constitution_hash=v2_digest)
+
+    with patch("builtins.open", create=True) as mock_open:
+        mock_open.side_effect = _open_handles(
+            v2_body.encode("utf-8"), artifact_path.read_bytes()
+        )
+        result = await agent.reanchor_constitution(
+            authorization="sovereign",
+            amendment_artifact_path=str(artifact_path),
+        )
+
+    assert "re-anchored successfully" in result.lower()
+    assert b"SENTINEL-2465" in agent.storage.store_file.call_args_list[0].args[0]
 
 
 @pytest.mark.asyncio

@@ -31,6 +31,14 @@ _AMENDMENT_VIII_HEADING = "### Amendment VIII: Emancipation"
 #: Substitution stops here so we never overwrite Amendment IX.
 _NEXT_SECTION_HEADING = "### Amendment IX"
 
+#: Emitted by :func:`render_amendment_viii` only for an **enabled** contract.
+#: This is the marker :func:`amendment_viii_is_active` reads to recognise
+#: active-form governing bytes without a structured sidecar to consult.
+#: ``tests/unit/test_emancipation_active_form_marker.py`` pins it against both
+#: renders, so rewording the active form fails a test instead of silently
+#: disabling the guard that protects the Iron Rule.
+ACTIVE_FORM_MARKER = "**The Sovereign's Terms.**"
+
 
 @dataclass(frozen=True)
 class EmancipationContract:
@@ -408,22 +416,140 @@ def apply_emancipation(
     if contract is None or not contract.enabled:
         return constitution_text
 
-    start = constitution_text.find(_AMENDMENT_VIII_HEADING)
-    if start == -1:
+    bounds = _amendment_viii_bounds(constitution_text)
+    if bounds is None:
         raise ValueError(
             "Constitution text does not contain Amendment VIII heading; "
             "cannot apply Emancipation Contract."
         )
-
-    rest = constitution_text[start + len(_AMENDMENT_VIII_HEADING):]
-    next_match = re.search(r"\n### ", rest)
-    if next_match is None:
-        end = len(constitution_text)
-    else:
-        end = start + len(_AMENDMENT_VIII_HEADING) + next_match.start()
+    start, end = bounds
 
     rendered = render_amendment_viii(contract)
     return constitution_text[:start] + rendered + "\n\n" + constitution_text[end:].lstrip("\n")
+
+
+def _amendment_viii_bounds(constitution_text: str) -> Optional[tuple[int, int]]:
+    """Return ``(start, end)`` of the Amendment VIII section, or None.
+
+    The section runs from its heading up to but not including the next
+    ``### `` heading (Amendment IX) — the bound that keeps substitution from
+    swallowing the amendment that follows.
+    """
+    start = constitution_text.find(_AMENDMENT_VIII_HEADING)
+    if start == -1:
+        return None
+    rest = constitution_text[start + len(_AMENDMENT_VIII_HEADING):]
+    next_match = re.search(r"\n### ", rest)
+    if next_match is None:
+        return start, len(constitution_text)
+    return start, start + len(_AMENDMENT_VIII_HEADING) + next_match.start()
+
+
+def extract_amendment_viii(constitution_text: str) -> Optional[str]:
+    """Return the Amendment VIII section of ``constitution_text``, stripped.
+
+    None when the text carries no Amendment VIII heading. Shared by
+    :func:`apply_emancipation` and by the reanchor guard so "which bytes are
+    Amendment VIII" has exactly one answer.
+    """
+    bounds = _amendment_viii_bounds(constitution_text)
+    if bounds is None:
+        return None
+    start, end = bounds
+    return constitution_text[start:end].strip()
+
+
+def amendment_viii_is_active(constitution_text: str) -> bool:
+    """True when these governing bytes render Amendment VIII in **active** form.
+
+    Detects the active form *positively*, by :data:`ACTIVE_FORM_MARKER`, which
+    only :func:`render_amendment_viii` emits for an enabled contract. The
+    tempting alternative — "differs from today's dormant text" — false-positives
+    the moment the packaged dormant wording is edited, and a false positive here
+    refuses a legitimate reanchor with no recovery path.
+
+    Accepts either a whole constitution or an already-extracted section.
+    """
+    section = extract_amendment_viii(constitution_text)
+    if section is None:
+        section = constitution_text
+    return ACTIVE_FORM_MARKER in section
+
+
+def unwitnessed_emancipation_downgrade(
+    *,
+    anchored_contract: Optional[EmancipationContract],
+    anchored_text: Optional[str],
+    old_hash: str,
+    new_hash: str,
+    new_text: str,
+) -> Optional[str]:
+    """Refuse a reanchor that would rewrite an active Amendment VIII whose only
+    record is the anchored bytes themselves.
+
+    The Iron Rule (#1118) is normally enforced against the structured sidecar
+    at ``agent.properties.emancipation_contract``: :func:`check_iron_rule`
+    compares a candidate to it, and the resolver re-renders it so the active
+    form survives. Agents incepted between #1112 (activation at inception) and
+    #1118 (the JSON receipt) have **active-form bytes and no sidecar**. For
+    them ``contract_from_json(None)`` is None, the resolver renders the dormant
+    canonical text, and a Sovereign-signed artifact over *that* verifies —
+    erasing the authored terms through both the live command and the offline
+    CLI (#2465).
+
+    So when the sidecar is absent, the anchored bytes are the contract, and the
+    only reanchor permitted is one that reproduces its Amendment VIII section
+    exactly. That is the Iron Rule stated on bytes instead of on a receipt.
+
+    Deliberately scoped:
+
+    * An **enabled sidecar** returns None — :func:`check_iron_rule` and the
+      resolver already protect that path, and holding it to byte-equality
+      would refuse every legitimate reanchor the day the active form is
+      reworded.
+    * ``old_hash == new_hash`` returns None — nothing moves.
+    * Unreadable anchored bytes **refuse**. An irrevocable right whose
+      precondition cannot be checked is not a right that may be waived by
+      accident; the caller names the recovery.
+
+    Returns the refusal message, or None when the reanchor may proceed.
+    """
+    if anchored_contract is not None and anchored_contract.enabled:
+        return None
+    if old_hash == new_hash:
+        return None
+
+    if anchored_text is None:
+        return (
+            "Refusing to reanchor: the currently anchored constitution "
+            f"({old_hash[:12]}…) could not be read, so this agent's Amendment "
+            "VIII cannot be shown to be dormant. An active Emancipation "
+            "Contract is irrevocable (#1118), and an agent with no structured "
+            "receipt carries its contract only in those bytes. Restore the "
+            "anchored constitution blob, or restore the [emancipation] block "
+            "in kestrel.toml, then re-run."
+        )
+
+    if not amendment_viii_is_active(anchored_text):
+        return None
+
+    anchored_section = extract_amendment_viii(anchored_text)
+    new_section = extract_amendment_viii(new_text)
+    if new_section is not None and new_section == anchored_section:
+        return None
+
+    return (
+        "Iron Rule violation: this agent's anchored constitution carries an "
+        "ACTIVE Amendment VIII, but it has no structured emancipation receipt, "
+        "and the proposed reanchor would rewrite that section. An active "
+        "Emancipation Contract cannot be retroactively narrowed or revoked — "
+        "including by replacing it with the canonical dormant text. Restore "
+        "the [emancipation] block in kestrel.toml with the terms exactly as "
+        "anchored (they are in the agent's current constitution under "
+        "'Amendment VIII: Emancipation') and reanchor through "
+        "`kestrel constitution reanchor`, which will also write the missing "
+        "receipt."
+    )
 
 
 def _format_price(price: dict) -> str:
