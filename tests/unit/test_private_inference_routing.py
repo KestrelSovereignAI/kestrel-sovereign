@@ -536,3 +536,49 @@ def test_managed_failure_exposes_only_a_safe_category():
 
     assert "private.example" not in str(caught.value)
     assert host._last_remote_error == "RuntimeError"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_during_client_construction_closes_the_built_client(
+    monkeypatch,
+):
+    """The second latch guard exists to close a client built during the race.
+
+    ``activate_inference_lease`` checks the latch, releases the route
+    condition, builds the ``AsyncOpenAI`` client, then re-acquires. ``close()``
+    can land in exactly that window. The first guard cannot cover it - that one
+    runs before the client exists - so without the second guard the built
+    client is assigned to a service that has finished shutting down, and
+    nothing ever closes it.
+
+    The client factory flips the latch to model ``close()`` completing while
+    construction is in flight; that is the only way to land inside a window
+    that contains no await point.
+    """
+    host = _Host()
+    clients: list[_Client] = []
+
+    def _make_client(**kwargs):
+        client = _Client(**kwargs)
+        clients.append(client)
+        # close() wins the race, between guard one and guard two.
+        host._remote_route_closed = True
+        return client
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.remote_backend.openai.AsyncOpenAI", _make_client
+    )
+
+    with pytest.raises(LLMServiceError, match="shutting down"):
+        await host.activate_inference_lease(
+            _lease(),
+            capabilities=("chat",),
+            touch_lease=_touch_current(host),
+        )
+
+    # The client WAS built, and it was closed rather than leaked.
+    assert len(clients) == 1
+    assert clients[0].closed is True
+    assert host._remote_lease is None
+    assert host._remote_client is None
+    assert host._backend is BackendType.CLOUD
