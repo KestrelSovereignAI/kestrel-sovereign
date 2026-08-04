@@ -53,7 +53,7 @@ SECURITY_FLOORS = {
 # must never silently lower its declared/locked line to accommodate an older
 # Frinz or observability constraint. Their compatible releases remain a
 # documented release-cascade prerequisite in README.md.
-SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.35.0"), ("<", "1")})
+SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.35.0"), ("<", "0.36")})
 SDK_RELEASE_CASCADE_CONTRACTS = {
     "base": frozenset({"tracing"}),
     "observability": frozenset({"metrics", "tracing"}),
@@ -62,8 +62,8 @@ SDK_RELEASE_CASCADE_DOWNSTREAM_REQUIREMENTS = {
     # These are release prerequisites, not declarations about sibling repos'
     # current branches. Each downstream must publish/test this line before a
     # Core release can be cut.
-    "frinz": ">=0.35.0,<1",
-    "observability fleet": ">=0.35.0,<1",
+    "frinz": ">=0.35.0,<0.36",
+    "observability fleet": ">=0.35.0,<0.36",
 }
 
 
@@ -260,11 +260,11 @@ def test_sdk_035_release_cascade_contract_is_locked():
         if requirement["name"] == "kestrel-sovereign-sdk"
     }
     assert locked_contracts == {
-        (SDK_RELEASE_CASCADE_CONTRACTS["base"], None, ">=0.35.0,<1"),
+        (SDK_RELEASE_CASCADE_CONTRACTS["base"], None, ">=0.35.0,<0.36"),
         (
             SDK_RELEASE_CASCADE_CONTRACTS["observability"],
             "extra == 'observability'",
-            ">=0.35.0,<1",
+            ">=0.35.0,<0.36",
         ),
     }
 
@@ -274,4 +274,4 @@ def test_sdk_035_release_cascade_contract_is_locked():
         if package["name"] == "kestrel-sovereign-sdk"
     ]
     assert sdk_versions
-    assert all(Version("0.35.0") <= version < Version("1") for version in sdk_versions)
+    assert all(Version("0.35.0") <= version < Version("0.36") for version in sdk_versions)

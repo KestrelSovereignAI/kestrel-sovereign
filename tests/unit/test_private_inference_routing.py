@@ -43,6 +43,8 @@ class _Host(RemoteBackendMixin):
         self._remote_capabilities = frozenset()
         self._remote_touch_lease = None
         self._last_remote_error = None
+        self._remote_route_epoch = 0
+        self._remote_route_closed = False
         self._mandate_preference = {"model": None, "vendor": None, "route": None}
 
     def _remote_first_allowed(self, model_override):
@@ -352,6 +354,113 @@ async def test_release_winning_touch_to_pin_race_fails_closed(monkeypatch):
         await attempt_task
     assert host._remote_lease is None
     assert host._remote_inflight == 0
+
+
+@pytest.mark.asyncio
+async def test_release_then_faithful_touch_reactivation_still_fails_closed(monkeypatch):
+    """The release/touch race, with a touch double that behaves like the real one.
+
+    ``coordinator.touch`` ends in ``_apply_provider_lease``, which calls
+    ``activate_inference_lease`` unconditionally for a READY lease. A double
+    that merely returns the lease cannot exercise the race at all: it leaves
+    the deactivated state in place, so the re-check trivially sees a missing
+    route. The dangerous case is the opposite one - the renewal REBUILDS a
+    route that compares equal to the one just torn down, and comparing
+    observable state cannot tell the difference. Only the route epoch can.
+    """
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.remote_backend.openai.AsyncOpenAI",
+        lambda **kwargs: _Client(**kwargs),
+    )
+    host = _Host()
+    touch_started = asyncio.Event()
+    finish_touch = asyncio.Event()
+
+    async def reactivating_touch(lease_id: str) -> InferenceLease:
+        touch_started.set()
+        await finish_touch.wait()
+        # This is what the real coordinator does on the way back.
+        lease = _lease(lease_id=lease_id)
+        await host.activate_inference_lease(
+            lease,
+            capabilities=("chat",),
+            touch_lease=reactivating_touch,
+        )
+        return lease
+
+    await host.activate_inference_lease(
+        _lease(),
+        capabilities=("chat",),
+        touch_lease=reactivating_touch,
+    )
+
+    async def attempt() -> None:
+        async with host._remote_route_attempt(
+            force_local_only=False,
+            model_override=None,
+            required_capabilities=("chat",),
+        ):
+            pytest.fail("a released route must not be pinned, even if rebuilt")
+
+    attempt_task = asyncio.create_task(attempt())
+    await touch_started.wait()
+    await host.deactivate_inference_lease("lease-1")
+    finish_touch.set()
+
+    with pytest.raises(LLMServiceError, match="released during renewal"):
+        await attempt_task
+    # The renewal did rebuild the route - which is exactly why comparing
+    # observable state would have passed the call through.
+    assert host._remote_lease is not None
+    assert host._remote_inflight == 0
+
+
+@pytest.mark.asyncio
+async def test_touch_cannot_reactivate_a_route_after_shutdown(monkeypatch):
+    """Renewal must not resurrect a route after ``close()`` has drained it.
+
+    ``LLMService.close()`` calls ``deactivate_inference_lease`` without the
+    coordinator lock and then returns. A renewal still in its provider
+    round-trip would otherwise call ``activate_inference_lease`` afterwards,
+    building an ``AsyncOpenAI`` client that nothing will ever close and
+    restoring ``_backend = REMOTE_GPU`` on a service that has finished shutting
+    down.
+    """
+    clients: list[_Client] = []
+
+    def _make_client(**kwargs):
+        client = _Client(**kwargs)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.remote_backend.openai.AsyncOpenAI", _make_client
+    )
+    host = _Host()
+    await host.activate_inference_lease(
+        _lease(),
+        capabilities=("chat",),
+        touch_lease=_touch_current(host),
+    )
+    assert len(clients) == 1
+
+    # Shutdown latches the flag, then drains and forgets the route.
+    async with host._remote_route_condition:
+        host._remote_route_closed = True
+    await host.deactivate_inference_lease("lease-1", require_active=False)
+    assert clients[0].closed is True
+
+    with pytest.raises(LLMServiceError, match="shutting down"):
+        await host.activate_inference_lease(
+            _lease(),
+            capabilities=("chat",),
+            touch_lease=_touch_current(host),
+        )
+
+    # No second client was built, so none was leaked.
+    assert len(clients) == 1
+    assert host._remote_lease is None
+    assert host._backend is BackendType.CLOUD
 
 
 @pytest.mark.asyncio

@@ -164,6 +164,14 @@ class RemoteBackendMixin:
             ),
         )
         async with self._remote_route_condition:
+            if self._remote_route_closed:
+                # ``close()`` has already drained this route and will not run
+                # again. Building a client here would leak it and would restore
+                # a route the host has finished tearing down.
+                raise LLMServiceError(
+                    "LLM service is shutting down; the private inference route "
+                    "cannot be activated"
+                )
             active = self._remote_lease
             if active is not None and active.lease_id == lease.lease_id:
                 active_route = active.route
@@ -207,7 +215,15 @@ class RemoteBackendMixin:
         old_client: openai.AsyncOpenAI | None = None
         activation_error: str | None = None
         async with self._remote_route_condition:
-            if self._remote_lease is not None:
+            if self._remote_route_closed:
+                # ``close()`` won the race while this client was being built.
+                # Fall through to the error path so the new client is closed
+                # rather than leaked.
+                activation_error = (
+                    "LLM service is shutting down; the private inference route "
+                    "cannot be activated"
+                )
+            elif self._remote_lease is not None:
                 if self._remote_lease.lease_id != lease.lease_id:
                     activation_error = (
                         "another inference lease is already active; release it first"
@@ -289,6 +305,7 @@ class RemoteBackendMixin:
             self._remote_lease = None
             self._remote_capabilities = frozenset()
             self._remote_touch_lease = None
+            self._remote_route_epoch += 1
 
         if client is not None:
             await self._close_remote_client(client, lease_id=lease_id)
@@ -309,6 +326,7 @@ class RemoteBackendMixin:
         snapshot: RemoteRouteSnapshot | None = None
         selected_lease_id: str | None = None
         touch_lease: InferenceLeaseTouch | None = None
+        selected_route_epoch: int | None = None
         async with self._remote_route_condition:
             lease = self._remote_lease
             client = self._remote_client
@@ -348,9 +366,11 @@ class RemoteBackendMixin:
                         "handler; no cloud fallback was attempted"
                     )
                 selected_lease_id = lease.lease_id
+                selected_route_epoch = self._remote_route_epoch
 
         if selected_lease_id is not None:
             assert touch_lease is not None
+            assert selected_route_epoch is not None
             touched: InferenceLease | None = None
             try:
                 touched = await touch_lease(selected_lease_id)
@@ -373,6 +393,17 @@ class RemoteBackendMixin:
             async with self._remote_route_condition:
                 lease = self._remote_lease
                 client = self._remote_client
+                if self._remote_route_epoch != selected_route_epoch:
+                    # The route was torn down while this call was renewing.
+                    # Comparing observable state is not enough: ``touch`` ends
+                    # in ``activate_inference_lease`` for a READY lease, which
+                    # rebuilds a route that looks identical to the one that was
+                    # just deactivated - including after ``close()`` has already
+                    # drained and returned. Refuse rather than resurrect it.
+                    raise LLMServiceError(
+                        "private inference route was released during renewal; no "
+                        "cloud fallback was attempted"
+                    )
                 if (
                     lease is None
                     or lease.lease_id != selected_lease_id

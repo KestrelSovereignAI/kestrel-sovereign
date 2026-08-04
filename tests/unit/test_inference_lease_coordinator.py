@@ -394,7 +394,19 @@ async def test_touch_and_release_are_serialized_without_lease_resurrection():
 
 
 @pytest.mark.asyncio
-async def test_touch_rejects_a_shortened_ready_deadline():
+async def test_touch_adopts_a_shortened_ready_deadline():
+    """A provider that renews to a NEARER expiry is authoritative, not wrong.
+
+    Nothing in the SDK contract makes expires_at monotonic across touch, and a
+    provider modelling its idle deadline as min(now + idle_ttl, authorized_cap)
+    returns a nearer expiry on its first renewal. Shortening tightens the
+    authorization envelope, so it must be adopted rather than rejected -
+    rejecting it would leave the coordinator advertising an expiry the provider
+    no longer honours. Extension, the direction that actually threatens the
+    envelope, is covered by
+    test_touch_rejects_expiry_beyond_request_deadline_without_side_effects.
+    """
+
     class _ShorteningProvider(_Provider):
         async def touch(self, owner_id: str, lease_id: str) -> InferenceLease:
             assert self.last_request is not None
@@ -417,11 +429,17 @@ async def test_touch_rejects_a_shortened_ready_deadline():
 
     provider = _ShorteningProvider("runpod", total="0.20", ready_seconds=10)
     provider.acquire_state = InferenceLeaseState.READY
-    coordinator, _persisted = _coordinator({"runpod": provider})
+    coordinator, persisted = _coordinator({"runpod": provider})
     ready = await coordinator.acquire(_request())
 
-    with pytest.raises(InferenceLeaseConstraintError, match="shortened"):
-        await coordinator.touch(ready.lease_id)
+    renewed = await coordinator.touch(ready.lease_id)
+
+    assert renewed.state is InferenceLeaseState.READY
+    assert renewed.expires_at < ready.expires_at
+    # The shorter expiry is what gets persisted, so a restart cannot resurrect
+    # the longer one the provider has stopped honouring.
+    assert persisted[-1] is not None
+    assert persisted[-1]["lease"]["expires_at"] == renewed.expires_at.isoformat()
 
 
 @pytest.mark.asyncio
@@ -756,7 +774,19 @@ def test_invalid_provider_protocol_is_rejected(monkeypatch):
         discover_inference_lease_providers()
 
 
-def test_provider_without_idle_renewal_is_rejected_at_discovery(monkeypatch):
+@pytest.mark.parametrize("declare_touch_as_none", [False, True])
+def test_provider_without_idle_renewal_is_rejected_at_discovery(
+    monkeypatch, declare_touch_as_none
+):
+    """Discovery rejects a provider that cannot renew a lease from traffic.
+
+    Both shapes are the SDK protocol's job, not ours: contract 6 made ``touch``
+    a required member of the runtime-checkable ``InferenceLeaseProvider``, so a
+    0.34-era provider that omits it entirely and one that declares it as
+    ``None`` both fail ``isinstance``. Discovery must not re-implement that
+    check, and this test exists to prove the SDK-owned one is load-bearing.
+    """
+
     class _LegacyProvider:
         provider_name = "legacy"
 
@@ -777,6 +807,9 @@ def test_provider_without_idle_renewal_is_rejected_at_discovery(monkeypatch):
 
         async def release(self, owner_id, lease_id):
             raise NotImplementedError
+
+    if declare_touch_as_none:
+        _LegacyProvider.touch = None
 
     entry_points = _EntryPoints(
         (_EntryPoint("legacy", "legacy:Provider", _LegacyProvider(), "legacy"),)

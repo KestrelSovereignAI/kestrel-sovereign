@@ -502,6 +502,16 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         self._remote_accepting = False
         self._remote_capabilities: frozenset[str] = frozenset()
         self._remote_touch_lease = None
+        # Bumped on every route teardown. A call that renews its lease outside
+        # the route condition cannot detect a teardown by comparing observable
+        # route state, because a concurrent re-activation restores state that
+        # compares equal. The epoch makes "this route was torn down while I was
+        # renewing" observable even when it was immediately rebuilt.
+        self._remote_route_epoch = 0
+        # Set once by ``close()``. Shutdown drains the route and then returns;
+        # any activation after that point would rebuild a client nothing will
+        # ever close.
+        self._remote_route_closed = False
 
         # Observability store for logging LLM calls (A2A-compatible)
         # Set via set_observability_store() after initialization
@@ -4685,6 +4695,11 @@ No other text or formatting.
         # Stop accepting remote calls and drain them before discarding route
         # credentials. Provider capacity is deliberately NOT released here:
         # the durable provider reconciler owns expiry/release after host death.
+        # Latch the closed flag first, under the route condition, so an
+        # in-flight traffic-driven renewal cannot re-activate the route behind
+        # the drain that is about to run.
+        async with self._remote_route_condition:
+            self._remote_route_closed = True
         if self._remote_lease is not None:
             try:
                 await self.deactivate_inference_lease(
