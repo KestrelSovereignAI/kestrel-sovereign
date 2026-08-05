@@ -930,7 +930,7 @@ def cmd_constitution_reanchor(args) -> int:
     # with a stale exported key can still write a constitution blob the agent
     # cannot decrypt. That hazard predates this change; what changes is that
     # the key now gets loaded at all.
-    _load_target_env(project_dir)
+    load_project_env(project_dir)
 
     multi_agent = MultiAgentConfig.load(
         project_dir / MULTI_AGENT_CONFIG_FILENAME, auto_discover_fallback=False,
@@ -1071,7 +1071,7 @@ def cmd_constitution_anchor_overlay(args) -> int:
     # database this anchor lands in. The overlay hash is read by the runtime,
     # so writing the local file on a PostgreSQL host leaves every Amendment IX
     # grant in the overlay permanently denied while reporting success.
-    _load_target_env(project_dir)
+    load_project_env(project_dir)
 
     multi_agent = MultiAgentConfig.load(
         project_dir / MULTI_AGENT_CONFIG_FILENAME, auto_discover_fallback=False,
