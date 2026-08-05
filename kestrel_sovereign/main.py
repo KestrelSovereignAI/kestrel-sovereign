@@ -12,6 +12,7 @@ from kestrel_sovereign.kestrel_agent import (
     await_agent_shutdown_completion,
 )
 from kestrel_sovereign.llm.service import LLMService
+from kestrel_sovereign.paths import load_project_env, project_dir
 import logging
 
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
@@ -75,6 +76,16 @@ async def get_agent_by_did(did: str) -> KestrelAgent:
     return agent
 
 async def main():
+    # This module is a process entry point (``python -m kestrel_sovereign.main``
+    # — the container's interactive shell, per ``docker_entrypoint.sh``), so it
+    # loads the project home's ``.env`` itself. It used to get one for free from
+    # ``LLMService.__init__``, which called ``load_dotenv()`` on every
+    # construction; that is removed in #2896 because a library constructor
+    # resurrecting deliberately-unset variables is not something the rest of the
+    # process can defend against. An entry point loading its own environment,
+    # once, before it reads any of it, is.
+    load_project_env(project_dir())
+
     parser = argparse.ArgumentParser(description="Kestrel Sovereign Agent Interface")
     parser.add_argument(
         "db_path",

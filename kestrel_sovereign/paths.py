@@ -91,6 +91,38 @@ def project_dir() -> Path:
     return _resolve_cached(explicit_home, str(cwd))
 
 
+def load_project_env(project_dir: Path, *, exclude: tuple[str, ...] = ()) -> None:
+    """Load a resolved project home's ``.env`` into ``os.environ``.
+
+    The one place a process may pull ``.env`` into its environment, and it
+    belongs to a *named* home rather than to whatever directory the process
+    happened to start in. Import-time and constructor-time loads have twice
+    been custody defects: ``inception_service`` seeded the wrong
+    ``KESTREL_DATA_KEY`` from the current directory (#2468), and
+    ``LLMService.__init__`` re-ran a bare ``load_dotenv()`` on every
+    construction, silently resurrecting variables a caller had deliberately
+    unset (#2896).
+
+    Uses python-dotenv's own parser (``dotenv_values``) — the same one the
+    runtime uses, so setup reads the identical byte string boot will see — and
+    ``setdefault`` semantics so a genuinely exported value stays authoritative
+    (equivalent to ``load_dotenv(override=False)``).
+
+    ``exclude`` names keys to skip. The data key is excluded when this runs
+    *before* custody resolution so that seeding the persisted value into
+    ``os.environ`` cannot mask an exported⇄persisted conflict (#2468).
+    """
+    env_path = project_dir / ".env"
+    if not env_path.exists():
+        return
+    from dotenv import dotenv_values
+
+    for key, value in dotenv_values(str(env_path)).items():
+        if value is None or key in exclude:
+            continue
+        os.environ.setdefault(key, value)
+
+
 def host_data_dir() -> Path:
     """Resolve the dedicated host-runtime root without source discovery.
 
