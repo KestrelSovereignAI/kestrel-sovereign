@@ -303,3 +303,26 @@ def test_the_marker_outside_a_locatable_section_is_not_an_active_contract():
 
     # And so the guard has an answer, rather than refusing forever.
     assert _call(None, book_level, DORMANT_TEXT) is None
+
+
+def test_a_crlf_constitution_still_has_a_locatable_amendment_viii():
+    """Line-anchoring the heading must not make line endings load-bearing.
+
+    ``$`` under ``(?m)`` matches before ``\\n``, so a CRLF document's heading
+    ends in a ``\\r`` that ``[ \\t]*`` will not consume. Without the ``\\r?``
+    such a document has no locatable section at all: the guard would permit
+    the erasure, and ``apply_emancipation`` would refuse to incept it. The
+    substring search this replaced did not care about line endings, so getting
+    it wrong would have been a regression rather than a new limitation.
+    """
+    crlf = ACTIVE_TEXT.replace("\n", "\r\n")
+    section = extract_amendment_viii(crlf)
+    assert section is not None
+    assert "SENTINEL" in section
+    assert "Amendment IX" not in section
+    assert amendment_viii_is_active(crlf) is True
+
+    # And the guard keeps working on it.
+    refusal = _call(None, crlf, DORMANT_TEXT)
+    assert refusal is not None
+    assert refusal.iron_rule_violation is True

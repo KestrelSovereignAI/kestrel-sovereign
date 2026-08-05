@@ -35,8 +35,14 @@ _AMENDMENT_VIII_HEADING = "### Amendment VIII: Emancipation"
 #: demoted, superseded, or dormant further down. The party who can author the
 #: candidate constitution is the party the Iron Rule binds, so this is exactly
 #: the adversary that matters.
+#: The ``\r?`` is load-bearing: with ``(?m)``, ``$`` matches before ``\n``, so
+#: a CRLF document's heading ends in a ``\r`` that ``[ \t]*`` will not eat.
+#: Without it a CRLF constitution has *no* locatable Amendment VIII — the
+#: guard would wave the erasure through and ``apply_emancipation`` would refuse
+#: to incept a perfectly good custom constitution. The old substring search did
+#: not care about line endings, so this would have been a regression.
 _AMENDMENT_VIII_HEADING_RE = re.compile(
-    r"(?m)^### Amendment VIII: Emancipation[ \t]*$"
+    r"(?m)^### Amendment VIII: Emancipation[ \t]*\r?$"
 )
 
 #: Heading that marks the section *after* Amendment VIII (Amendment IX).
@@ -434,6 +440,12 @@ def apply_emancipation(
         ValueError: If the constitution text doesn't contain an
             Amendment VIII section to substitute (refuses to silently
             no-op on a malformed canonical text).
+        AmbiguousAmendmentVIII: (a ``ValueError``) if it contains more than
+            one. Rewriting an arbitrary one of two sections is not a
+            defensible answer, and ``resolve_governing_constitution_bytes``
+            already documents that its callers fail closed on ``ValueError``
+            — an ambiguous governing source becomes an integrity failure and
+            Safe Mode, which is the correct destination for it (#2463).
     """
     if contract is None or not contract.enabled:
         return constitution_text
