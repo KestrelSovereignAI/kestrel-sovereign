@@ -11,6 +11,11 @@ This module establishes that anchor through a TRUSTED channel — the operator
 running ``kestrel constitution anchor-overlay`` against a *stopped* agent's DB,
 the same trust boundary as ``constitution_reanchor``. It must never be reachable
 from anything an attacker with mere file-write can drive.
+
+It also shares that module's target rule (#2890): the anchor property is read
+by the *runtime*, so it must be written to the database the runtime opens. On a
+PostgreSQL host, writing the local ``kestrel_prime.db`` reports success while
+the agent goes on denying every Amendment IX grant the overlay declares.
 """
 from __future__ import annotations
 
@@ -20,7 +25,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from kestrel_sovereign.storage import AsyncStorage
+from kestrel_sovereign.setup.constitution_reanchor import (
+    ReanchorTargetError,
+    resolve_reanchor_target,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,13 +44,26 @@ class OverlayAnchorResult:
     old_hash: Optional[str] = None
     new_hash: Optional[str] = None
     overlay_path: Optional[Path] = None
+    #: The database this run read and wrote, DSN credentials redacted. An
+    #: anchor that does not say where it landed cannot be trusted to have
+    #: landed anywhere the agent reads (#2890).
+    target_label: str = ""
 
 
-async def anchor_overlay(*, agent_name: str, agent_dir: Path) -> OverlayAnchorResult:
+async def anchor_overlay(
+    *,
+    agent_name: str,
+    agent_dir: Path,
+    runtime_backend: Optional[str] = None,
+    runtime_dsn: Optional[str] = None,
+) -> OverlayAnchorResult:
     """Anchor the agent's current CONSTITUTION.md overlay hash in its DB node.
 
     Returns an :class:`OverlayAnchorResult`. Idempotent: anchoring an already-
     anchored, unchanged overlay reports ``unchanged=True``.
+
+    ``runtime_backend`` / ``runtime_dsn`` name the database the agent's runtime
+    opens; ``None`` resolves them from the environment exactly as boot does.
     """
     overlay_path = agent_dir / OVERLAY_FILENAME
     if not overlay_path.exists():
@@ -53,33 +74,75 @@ async def anchor_overlay(*, agent_name: str, agent_dir: Path) -> OverlayAnchorRe
         )
     new_hash = hashlib.sha256(overlay_path.read_bytes()).hexdigest()
 
-    db_path = agent_dir / "kestrel_prime.db"
-    if not db_path.exists():
+    try:
+        target = await resolve_reanchor_target(
+            agent_dir, backend=runtime_backend, dsn=runtime_dsn
+        )
+    except ReanchorTargetError as exc:
         return OverlayAnchorResult(
-            agent_name=agent_name, error=f"agent DB not found at {db_path}",
+            agent_name=agent_name, error=str(exc),
             overlay_path=overlay_path, new_hash=new_hash,
         )
 
-    async with AsyncStorage(str(db_path)) as storage:
-        agent_nodes = await storage.graph.get_nodes_by_type("agent")
-        if not agent_nodes:
+    try:
+        return await _anchor_overlay_in(
+            target,
+            agent_name=agent_name,
+            overlay_path=overlay_path,
+            new_hash=new_hash,
+        )
+    except Exception as exc:  # noqa: BLE001 — surfaced verbatim to the operator
+        logger.exception("Overlay anchor against %s failed", target.describe())
+        return OverlayAnchorResult(
+            agent_name=agent_name,
+            error=(
+                f"Could not anchor the overlay in {target.describe()}: "
+                f"{exc!r}. Nothing was written."
+            ),
+            overlay_path=overlay_path, new_hash=new_hash,
+            target_label=target.describe(),
+        )
+
+
+async def _anchor_overlay_in(
+    target,
+    *,
+    agent_name: str,
+    overlay_path: Path,
+    new_hash: str,
+) -> OverlayAnchorResult:
+    """Write the overlay hash into ``target``, bound to its agent."""
+    async with target.open_storage() as storage:
+        # ``open_storage`` binds every store to this agent; the lookup is by
+        # DID for the same reason the runtime's own is. One PostgreSQL
+        # database holds every local agent, and an unbound read here would
+        # anchor a DANGEROUS-capability overlay onto whichever tenant came
+        # back first.
+        node = await storage.graph.get_node(target.agent_did)
+        if node is None or node.node_type != "agent":
             return OverlayAnchorResult(
-                agent_name=agent_name, error="no agent identity node in DB",
+                agent_name=agent_name,
+                error=(
+                    f"no agent identity node for {target.agent_did} in "
+                    f"{target.describe()}"
+                ),
                 overlay_path=overlay_path, new_hash=new_hash,
+                target_label=target.describe(),
             )
-        node = agent_nodes[0]
         old_hash = node.properties.get(OVERLAY_HASH_PROPERTY)
         if old_hash == new_hash:
             return OverlayAnchorResult(
                 agent_name=agent_name, unchanged=True,
                 old_hash=old_hash, new_hash=new_hash, overlay_path=overlay_path,
+                target_label=target.describe(),
             )
         node.properties[OVERLAY_HASH_PROPERTY] = new_hash
         await storage.graph.add_node(node)  # upsert
         logger.info(
-            "Anchored constitution overlay for %s: %s", agent_name, new_hash[:16],
+            "Anchored constitution overlay for %s in %s: %s",
+            agent_name, target.describe(), new_hash[:16],
         )
     return OverlayAnchorResult(
         agent_name=agent_name, old_hash=old_hash, new_hash=new_hash,
-        overlay_path=overlay_path,
+        overlay_path=overlay_path, target_label=target.describe(),
     )

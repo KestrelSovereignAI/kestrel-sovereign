@@ -937,6 +937,25 @@ def cmd_constitution_reanchor(args) -> int:
     )
 
     project_dir = _get_project_dir()
+
+    # Load the *target home's* environment before anything resolves a
+    # database. The agent's backend, its DSN, and its data key all live in
+    # that .env; without this the reanchor target is decided by whatever the
+    # operator happens to have exported, so the same command against the same
+    # agent could write PostgreSQL from one shell and the local anchor from
+    # another — and on a PostgreSQL host the anchor is a database the runtime
+    # never reads (#2890). ``setdefault`` semantics keep a genuinely-exported
+    # value authoritative.
+    #
+    # NOT ``_apply_target_data_key_custody``: that generates a data key when
+    # the home has none, which is an inception concern and wrong for a repair.
+    # The trade-off is real — this seeds a persisted ``KESTREL_DATA_KEY``
+    # without detecting an exported⇄persisted conflict (#2468), so an operator
+    # with a stale exported key can still write a constitution blob the agent
+    # cannot decrypt. That hazard predates this change; what changes is that
+    # the key now gets loaded at all.
+    _load_target_env(project_dir)
+
     multi_agent = MultiAgentConfig.load(
         project_dir / MULTI_AGENT_CONFIG_FILENAME, auto_discover_fallback=False,
     )
@@ -981,13 +1000,33 @@ def cmd_constitution_reanchor(args) -> int:
         )
     )
 
+    # Every outcome names the database it describes. A reanchor that does not
+    # say where it read or wrote is the ambiguity #2890 is about.
+    target = f"  Target:  {result.target_label}"
+    if result.backup_path is not None:
+        backup_line = f"  Backup:  {result.backup_path}"
+    else:
+        backup_line = f"  Backup:  {result.backup_unavailable_reason or '(none)'}"
+    if result.target_backend == "sqlite":
+        planned_backup = (
+            f"The DB will be backed up to "
+            f"{result.db_path.name}.backup-<timestamp> before any write."
+        )
+    else:
+        planned_backup = (
+            f"Governance for this agent lives in {result.target_label}; there "
+            f"is no local file to back up. Snapshot that database first if you "
+            f"want to be able to undo a successful reanchor."
+        )
+
     if result.error:
         print(f"error: {result.error}", file=sys.stderr)
         return 1
     if result.unchanged:
         print(
             f"{result.agent_name}: already anchored to current constitution "
-            f"({result.new_hash[:12]}…) — nothing to do."
+            f"({result.new_hash[:12]}…) — nothing to do.\n"
+            f"{target}"
         )
         return 0
     if result.drift_unforced:
@@ -1000,21 +1039,20 @@ def cmd_constitution_reanchor(args) -> int:
                 f"{result.agent_name}: governance-edge drift detected.\n"
                 f"  Anchor: {result.new_hash[:12]}… (current)\n"
                 f"  governed_by edge(s): {stale or '(none)'}\n"
+                f"{target}\n"
                 f"\n"
                 f"The fail-closed integrity audit (proof 2) will safe-mode "
                 f"this agent at next boot. Re-run with --force to repair the "
-                f"governance edge. The DB will be backed up to "
-                f"{result.db_path.name}.backup-<timestamp> before any write."
+                f"governance edge. {planned_backup}"
             )
             return 1
         print(
             f"{result.agent_name}: constitution drift detected.\n"
             f"  Stored: {result.old_hash[:12]}…\n"
             f"  File:   {result.new_hash[:12]}… ({result.canonical_path})\n"
+            f"{target}\n"
             f"\n"
-            f"Re-run with --force to update the agent's anchor. "
-            f"The DB will be backed up to "
-            f"{result.db_path.name}.backup-<timestamp> before any write."
+            f"Re-run with --force to update the agent's anchor. {planned_backup}"
         )
         return 1
     # Reanchored (or same-hash governance repair).
@@ -1024,7 +1062,8 @@ def cmd_constitution_reanchor(args) -> int:
             f"  Anchor:  {result.new_hash[:12]}… (unchanged)\n"
             f"  Removed: {', '.join(f'{t[:12]}…' for t in result.stale_edge_targets) or '(none)'}\n"
             f"  Source:  {result.canonical_path}\n"
-            f"  Backup:  {result.backup_path}"
+            f"{target}\n"
+            f"{backup_line}"
         )
         return 0
     print(
@@ -1032,7 +1071,8 @@ def cmd_constitution_reanchor(args) -> int:
         f"  Old: {result.old_hash[:12]}…\n"
         f"  New: {result.new_hash[:12]}…\n"
         f"  Source:  {result.canonical_path}\n"
-        f"  Backup:  {result.backup_path}"
+        f"{target}\n"
+        f"{backup_line}"
     )
     return 0
 
@@ -1051,6 +1091,12 @@ def cmd_constitution_anchor_overlay(args) -> int:
     from kestrel_sovereign.setup.overlay_anchor import anchor_overlay
 
     project_dir = _get_project_dir()
+    # Same rule as reanchor (#2890): the agent's own .env decides which
+    # database this anchor lands in. The overlay hash is read by the runtime,
+    # so writing the local file on a PostgreSQL host leaves every Amendment IX
+    # grant in the overlay permanently denied while reporting success.
+    _load_target_env(project_dir)
+
     multi_agent = MultiAgentConfig.load(
         project_dir / MULTI_AGENT_CONFIG_FILENAME, auto_discover_fallback=False,
     )
@@ -1083,14 +1129,16 @@ def cmd_constitution_anchor_overlay(args) -> int:
     if result.unchanged:
         print(
             f"{result.agent_name}: overlay already anchored "
-            f"({result.new_hash[:12]}…) — nothing to do."
+            f"({result.new_hash[:12]}…) — nothing to do.\n"
+            f"  Target:  {result.target_label}"
         )
         return 0
     print(
         f"{result.agent_name}: constitution overlay anchored.\n"
         f"  Old: {(result.old_hash[:12] + '…') if result.old_hash else '(none)'}\n"
         f"  New: {result.new_hash[:12]}…\n"
-        f"  Overlay: {result.overlay_path}"
+        f"  Overlay: {result.overlay_path}\n"
+        f"  Target:  {result.target_label}"
     )
     return 0
 

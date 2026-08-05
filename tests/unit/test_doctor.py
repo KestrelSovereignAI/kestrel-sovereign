@@ -935,3 +935,28 @@ def test_doctor_accepts_openrouter_management_key_only(tmp_path):
     report = diagnose(tmp_path)
     assert report.ready, f"fail={report.fail}"
     assert not any("OPENROUTER_API_KEY" in m for m in report.fail)
+
+
+def test_doctor_flags_findings_it_cannot_prescribe_a_fix_for(monkeypatch, tmp_path):
+    """On a PostgreSQL host, doctor reads the local birth record while the
+    agent is governed by PostgreSQL, and `kestrel constitution reanchor` now
+    correctly targets PostgreSQL. Without saying so, doctor prescribes a repair
+    that answers "nothing to do" — a finding the operator can never clear.
+    The real fix is #2892; not misleading them is this change's job."""
+    from kestrel_sovereign.doctor import (
+        _ANCHOR_NOT_RUNTIME_NOTE,
+        _anchor_is_the_runtime_database,
+    )
+
+    monkeypatch.delenv("KESTREL_DB_BACKEND", raising=False)
+    monkeypatch.delenv("KESTREL_DATABASE_URL", raising=False)
+    assert _anchor_is_the_runtime_database() is True
+
+    # Same rule as agent_manager._initialize_agent: postgres AND a DSN.
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    assert _anchor_is_the_runtime_database() is True, "no DSN -> the runtime is SQLite"
+
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://h/db")
+    assert _anchor_is_the_runtime_database() is False
+    assert "#2892" in _ANCHOR_NOT_RUNTIME_NOTE
+    assert "will not clear this finding" in _ANCHOR_NOT_RUNTIME_NOTE
