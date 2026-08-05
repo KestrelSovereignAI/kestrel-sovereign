@@ -36,16 +36,13 @@ from kestrel_sovereign.spawn.mandate import SpawnMandate, sign_mandate
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
 
+from kestrel_sovereign.identity.local_anchor import (
+    AgentDIDLookupMode,
+    read_anchor_agent_did,
+)
 from .config import LocalAgentConfig, MultiAgentConfig
 
 logger = logging.getLogger(__name__)
-
-
-class _AgentDIDLookupMode(str, Enum):
-    """Whether identity lookup is cold scheduler discovery or real startup."""
-
-    COLD_READ_ONLY = "cold_read_only"
-    INITIALIZATION = "initialization"
 
 
 @dataclass(frozen=True)
@@ -148,106 +145,6 @@ def _loaded_agent_did(agent: object) -> Optional[str]:
         if isinstance(value, str) and value:
             return value
     return None
-
-
-async def _get_agent_did(
-    storage_dir: str,
-    *,
-    mode: _AgentDIDLookupMode = _AgentDIDLookupMode.COLD_READ_ONLY,
-) -> str:
-    """Read a local agent DID with an explicit cold-vs-startup safety mode.
-
-    ``AsyncStorage.initialize()`` is deliberately write-capable: on a missing
-    SQLite path it creates the database, WAL, audit tables, and schema.  Cold
-    scheduler discovery is only a lookup and must never turn an unincepted
-    configuration entry into a blank identity that blocks later inception.
-
-    ``COLD_READ_ONLY`` uses SQLite immutable read-only mode and refuses WAL
-    sidecars, because a scheduler authority decision must never ignore pending
-    identity state or alter the cold agent directory. ``INITIALIZATION`` is
-    used only by normal agent startup: it still refuses a missing database,
-    but opens it read/write so SQLite can replay a legitimate interrupted WAL
-    before the real agent storage opens. The connection is created and closed
-    in the worker thread so no descriptor survives a lookup failure.
-    """
-    if not isinstance(mode, _AgentDIDLookupMode):
-        raise ValueError(f"Unknown agent identity lookup mode: {mode!r}")
-    db_path = Path(storage_dir) / "kestrel_prime.db"
-
-    def _lookup() -> str:
-        if not db_path.is_file():
-            raise ValueError(
-                f"No agent found in {storage_dir}. "
-                "Run inception first: kestrel create <name>"
-            )
-
-        sidecars = (
-            Path(f"{db_path}-wal"),
-            Path(f"{db_path}-shm"),
-        )
-        cold_read_only = mode is _AgentDIDLookupMode.COLD_READ_ONLY
-        # A normal ``mode=ro`` connection can still create SQLite's shared
-        # memory and WAL sidecars when it opens a WAL-mode database.  Besides
-        # violating a cold lookup's read-only contract, ``immutable=1`` would
-        # ignore a pre-existing WAL and could authorize an old identity.
-        # Startup intentionally takes the opposite path: it must let SQLite
-        # recover a real WAL after a crash before the agent opens its storage.
-        if cold_read_only and any(sidecar.exists() for sidecar in sidecars):
-            raise ValueError(
-                f"Could not safely read local agent identity from {storage_dir}: "
-                "SQLite WAL state is present"
-            )
-
-        connection = None
-        try:
-            # ``Path.as_uri`` handles spaces and platform path escaping. Cold
-            # discovery accepts only a checkpointed identity and cannot create
-            # sidecars; normal initialization opens an existing DB read/write
-            # so SQLite can recover its own WAL state. ``mode=rw`` still
-            # refuses an unincepted/missing database.
-            uri_flags = "mode=ro&immutable=1" if cold_read_only else "mode=rw"
-            connection = sqlite3.connect(
-                f"{db_path.resolve().as_uri()}?{uri_flags}",
-                uri=True,
-            )
-            rows = connection.execute(
-                "SELECT node_id FROM graph_nodes "
-                "WHERE node_type = ? ORDER BY node_id",
-                ("agent",),
-            ).fetchall()
-        except sqlite3.Error as exc:
-            raise ValueError(
-                f"Could not read local agent identity from {storage_dir}"
-            ) from exc
-        finally:
-            if connection is not None:
-                connection.close()
-
-        # Catch a writer that raced the pre-open cold sidecar check. An
-        # immutable reader deliberately ignores WAL data, so returning a DID
-        # after this transition would be a stale-identity authorization
-        # decision. Startup has deliberately consumed the normal SQLite path.
-        if cold_read_only and any(sidecar.exists() for sidecar in sidecars):
-            raise ValueError(
-                f"Could not safely read local agent identity from {storage_dir}: "
-                "SQLite WAL state appeared during lookup"
-            )
-
-        if not rows:
-            raise ValueError(
-                f"No agent found in {storage_dir}. "
-                "Run inception first: kestrel create <name>"
-            )
-        if len(rows) != 1 or not isinstance(rows[0][0], str) or not rows[0][0]:
-            # Multiple roots are an identity-integrity failure.  Picking one by
-            # incidental SQLite order would authorize the wrong tenant.
-            raise ValueError(
-                f"Local identity database in {storage_dir} has an invalid "
-                "agent root set"
-            )
-        return rows[0][0]
-
-    return await asyncio.to_thread(_lookup)
 
 
 class AgentManager:
@@ -863,9 +760,9 @@ class AgentManager:
             raise ValueError(f"Agent '{name}' validation failed: {'; '.join(errors)}")
 
         # Get DID from the agent's database
-        agent_did = await _get_agent_did(
+        agent_did = await read_anchor_agent_did(
             str(resolved_dir),
-            mode=_AgentDIDLookupMode.INITIALIZATION,
+            mode=AgentDIDLookupMode.INITIALIZATION,
         )
 
         # Check database backend
@@ -1419,11 +1316,11 @@ class AgentManager:
                     # seeded. Explicitly cold entries remain immutable-read-only
                     # until a scheduler cold wake is authorized to initialize.
                     lookup_mode = (
-                        _AgentDIDLookupMode.INITIALIZATION
+                        AgentDIDLookupMode.INITIALIZATION
                         if agent_config.autostart
-                        else _AgentDIDLookupMode.COLD_READ_ONLY
+                        else AgentDIDLookupMode.COLD_READ_ONLY
                     )
-                    agent_id = await _get_agent_did(
+                    agent_id = await read_anchor_agent_did(
                         str(resolved_dir),
                         mode=lookup_mode,
                     )
