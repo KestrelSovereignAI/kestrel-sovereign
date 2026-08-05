@@ -936,8 +936,14 @@ class _RuntimeAgentHarness(ConstitutionMixin):
     constitution code path is the production mixin under test.
     """
 
-    def __init__(self, storage, agent_did, trust_root_path):
+    def __init__(self, storage, agent_did, trust_root_path, raw_storage):
         self.storage = storage
+        # The ungoverned store beneath the privacy wrapper, exactly as
+        # KestrelAgent holds it. The Iron Rule guard reads the anchored
+        # constitution through this connection rather than through the
+        # bound facade, because an ownership-scoped read cannot tell an
+        # absent blob from an unowned one (#2465).
+        self._raw_storage = raw_storage
         self.agent_id = agent_did
         self.identity = None
         self.extension = None
@@ -990,7 +996,9 @@ async def test_runtime_reanchor_rolls_back_on_midprune_failure(
 
     async with AsyncStorage(str(db_path)) as raw_storage:
         storage = PrivacyEnforcingStorage(raw_storage)
-        agent = _RuntimeAgentHarness(storage, creds.agent_did, trust_root_path)
+        agent = _RuntimeAgentHarness(
+            storage, creds.agent_did, trust_root_path, raw_storage
+        )
 
         async def _failing_delete(source_id, target_id, label):
             raise RuntimeError("injected mid-prune failure")
@@ -1015,7 +1023,9 @@ async def test_runtime_reanchor_rolls_back_on_midprune_failure(
     # state converges to exactly one governed_by edge on the new anchor.
     async with AsyncStorage(str(db_path)) as raw_storage:
         storage = PrivacyEnforcingStorage(raw_storage)
-        agent = _RuntimeAgentHarness(storage, creds.agent_did, trust_root_path)
+        agent = _RuntimeAgentHarness(
+            storage, creds.agent_did, trust_root_path, raw_storage
+        )
         result = await agent.reanchor_constitution(
             amendment_artifact_path=str(artifact_path),
         )
@@ -1051,7 +1061,9 @@ async def test_runtime_unchanged_cleanup_rolls_back_on_midprune_failure(
 
     async with AsyncStorage(str(db_path)) as raw_storage:
         storage = PrivacyEnforcingStorage(raw_storage)
-        agent = _RuntimeAgentHarness(storage, creds.agent_did, trust_root_path)
+        agent = _RuntimeAgentHarness(
+            storage, creds.agent_did, trust_root_path, raw_storage
+        )
 
         real_delete = storage.delete_edge
         deleted_targets = []
@@ -1112,7 +1124,9 @@ async def test_runtime_unchanged_cleanup_preserves_document_node(
 
     async with AsyncStorage(str(db_path)) as raw_storage:
         storage = PrivacyEnforcingStorage(raw_storage)
-        agent = _RuntimeAgentHarness(storage, creds.agent_did, trust_root_path)
+        agent = _RuntimeAgentHarness(
+            storage, creds.agent_did, trust_root_path, raw_storage
+        )
         result = await agent.reanchor_constitution(
             amendment_artifact_path=str(artifact_path),
         )

@@ -45,12 +45,45 @@ def _operator_pinned_root(tmp_path, monkeypatch):
     return root_path
 
 
-#: What ``retrieve_file(old_hash)`` returns for these agents — the version they
-#: are anchored to before the reanchor under test. The double has to supply it
-#: because the command now reads its own anchored bytes to enforce the Iron
-#: Rule for agents with no structured receipt (#2465). A bare ``AsyncMock``
-#: hands back a coroutine, which is not what the real file store returns.
+#: What the agent is anchored to before the reanchor under test. The double has
+#: to supply it because the command now reads its own anchored bytes to enforce
+#: the Iron Rule for agents with no structured receipt (#2465).
 ANCHORED_CONSTITUTION = b"# Kestrel Constitution v1\n\nOriginal content.\n"
+
+#: Sentinel for "the row is there but this process cannot turn it into text".
+UNREADABLE = object()
+
+
+class _FakeFileRows:
+    """The one query the Iron Rule guard's unbound file read actually issues.
+
+    The guard reads the anchored constitution through the *ungoverned*
+    connection (``AsyncFileStore(db)`` with no ``agent_id``), because an
+    ownership-scoped read returns ``None`` for a blob that is sitting in
+    ``files`` with no ``file_owners`` row — indistinguishable from no row at
+    all, and the state of every pre-#2649 agent whose governance edge drifted.
+    So the double models the *row*, not ``retrieve_file``: an absent blob is a
+    missing row, and unreadable bytes are a row that will not decrypt. Get that
+    wrong and the test passes on a path production never takes.
+    """
+
+    def __init__(self, content_hash, anchored):
+        self._content_hash = content_hash
+        self._anchored = anchored
+
+    async def fetchone(self, query, params=()):
+        assert "FROM files" in query, query
+        assert "file_owners" not in query, (
+            "The Iron Rule guard must read the anchored constitution unbound; "
+            f"this query is ownership-scoped: {query}"
+        )
+        if self._anchored is None or params[0] != self._content_hash:
+            return None
+        if self._anchored is UNREADABLE:
+            # Marked encrypted, with bytes no key will open — exactly what a
+            # wrong KESTREL_DATA_KEY produces.
+            return b"\x00not-a-valid-token", json.dumps({"enc": True})
+        return self._anchored, None
 
 
 def _make_agent(stored_hash="oldhash", safe_mode=False, anchored=ANCHORED_CONSTITUTION):
@@ -75,8 +108,11 @@ def _make_agent(stored_hash="oldhash", safe_mode=False, anchored=ANCHORED_CONSTI
     agent.storage = AsyncMock()
     agent.storage.get_node = AsyncMock(return_value=node)
     agent.storage.store_file = AsyncMock()
-    agent.storage.retrieve_file = AsyncMock(return_value=anchored)
+    agent.storage.retrieve_file = AsyncMock(
+        return_value=None if anchored is UNREADABLE else anchored
+    )
     agent.storage.add_node = AsyncMock()
+    agent._raw_storage = SimpleNamespace(db=_FakeFileRows(stored_hash, anchored))
     # transaction() is an async context manager, not a coroutine — a plain
     # MagicMock provides __aenter__/__aexit__ on its return value.
     agent.storage.transaction = MagicMock()
@@ -296,9 +332,14 @@ async def test_reanchor_refuses_when_the_anchored_constitution_cannot_be_read(
     tmp_path,
 ):
     """Whether Amendment VIII is active is unknowable without those bytes, and
-    an irrevocable right is not waived by an unreadable precondition."""
-    agent, node = _make_agent(stored_hash=_ACTIVE_DIGEST)
-    agent.storage.retrieve_file = AsyncMock(side_effect=RuntimeError("bad key"))
+    an irrevocable right is not waived by an unreadable precondition.
+
+    ``UNREADABLE`` puts a row in ``files`` marked encrypted whose bytes no key
+    opens — a wrong ``KESTREL_DATA_KEY``, which is the real shape. Stubbing
+    ``agent.storage.retrieve_file`` to raise, as this test used to, proved
+    nothing once the guard stopped reading through that store.
+    """
+    agent, node = _make_agent(stored_hash=_ACTIVE_DIGEST, anchored=UNREADABLE)
     artifact_path = _write_artifact(tmp_path, constitution_hash=_DORMANT_DIGEST)
 
     with patch("builtins.open", create=True) as mock_open:

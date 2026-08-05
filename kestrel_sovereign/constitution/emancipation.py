@@ -27,6 +27,18 @@ from typing import Any, Mapping, Optional
 #: Heading that marks Amendment VIII in the canonical constitution.
 _AMENDMENT_VIII_HEADING = "### Amendment VIII: Emancipation"
 
+#: The same heading, as the only thing that may legitimately match it: a whole
+#: line, at exactly that level. A substring search accepts ``#### Amendment
+#: VIII: Emancipation`` (the ``###`` matches at offset 1) and accepts a mention
+#: in running prose, both of which let a document carry a *decoy* section that
+#: extracts byte-identically to the real one while the operative amendment is
+#: demoted, superseded, or dormant further down. The party who can author the
+#: candidate constitution is the party the Iron Rule binds, so this is exactly
+#: the adversary that matters.
+_AMENDMENT_VIII_HEADING_RE = re.compile(
+    r"(?m)^### Amendment VIII: Emancipation[ \t]*$"
+)
+
 #: Heading that marks the section *after* Amendment VIII (Amendment IX).
 #: Substitution stops here so we never overwrite Amendment IX.
 _NEXT_SECTION_HEADING = "### Amendment IX"
@@ -34,10 +46,20 @@ _NEXT_SECTION_HEADING = "### Amendment IX"
 #: Emitted by :func:`render_amendment_viii` only for an **enabled** contract.
 #: This is the marker :func:`amendment_viii_is_active` reads to recognise
 #: active-form governing bytes without a structured sidecar to consult.
-#: ``tests/unit/test_emancipation_active_form_marker.py`` pins it against both
-#: renders, so rewording the active form fails a test instead of silently
+#: ``tests/unit/test_emancipation_unwitnessed_downgrade.py`` pins it against
+#: both renders, so rewording the active form fails a test instead of silently
 #: disabling the guard that protects the Iron Rule.
 ACTIVE_FORM_MARKER = "**The Sovereign's Terms.**"
+
+
+class AmbiguousAmendmentVIII(ValueError):
+    """A constitution carries more than one Amendment VIII heading.
+
+    "Which bytes are Amendment VIII" then has no answer, and every caller here
+    needs one: substitution would rewrite an arbitrary occurrence, and the
+    reanchor guard would compare against an arbitrary occurrence. Neither may
+    guess.
+    """
 
 
 @dataclass(frozen=True)
@@ -434,10 +456,21 @@ def _amendment_viii_bounds(constitution_text: str) -> Optional[tuple[int, int]]:
     The section runs from its heading up to but not including the next
     ``### `` heading (Amendment IX) — the bound that keeps substitution from
     swallowing the amendment that follows.
+
+    Raises:
+        AmbiguousAmendmentVIII: the text carries more than one such heading.
     """
-    start = constitution_text.find(_AMENDMENT_VIII_HEADING)
-    if start == -1:
+    matches = _AMENDMENT_VIII_HEADING_RE.findall(constitution_text)
+    if len(matches) > 1:
+        raise AmbiguousAmendmentVIII(
+            f"This constitution carries {len(matches)} 'Amendment VIII: "
+            "Emancipation' headings. Exactly one section is the amendment; "
+            "remove or retitle the others."
+        )
+    match = _AMENDMENT_VIII_HEADING_RE.search(constitution_text)
+    if match is None:
         return None
+    start = match.start()
     rest = constitution_text[start + len(_AMENDMENT_VIII_HEADING):]
     next_match = re.search(r"\n### ", rest)
     if next_match is None:
@@ -451,6 +484,9 @@ def extract_amendment_viii(constitution_text: str) -> Optional[str]:
     None when the text carries no Amendment VIII heading. Shared by
     :func:`apply_emancipation` and by the reanchor guard so "which bytes are
     Amendment VIII" has exactly one answer.
+
+    Raises:
+        AmbiguousAmendmentVIII: the text carries more than one such heading.
     """
     bounds = _amendment_viii_bounds(constitution_text)
     if bounds is None:
@@ -468,12 +504,50 @@ def amendment_viii_is_active(constitution_text: str) -> bool:
     the moment the packaged dormant wording is edited, and a false positive here
     refuses a legitimate reanchor with no recovery path.
 
-    Accepts either a whole constitution or an already-extracted section.
+    The marker must appear **inside the section**, not merely somewhere in the
+    document. The two go together: only :func:`render_amendment_viii` emits the
+    marker, and it always emits it under
+    ``### Amendment VIII: Emancipation``. Accepting the marker on its own would
+    read a document that quotes it in prose as carrying an active contract —
+    and worse, would report "active" for bytes whose section cannot be located,
+    which no candidate can then be compared against. That is an unfalsifiable
+    refusal: the agent could never be reanchored again, by any input, with no
+    override. A brick, in the same family as refusing a #2616 dangling anchor.
+
+    Accepts either a whole constitution or an already-extracted section (the
+    section is its own heading plus body, so it locates itself).
+
+    Raises:
+        AmbiguousAmendmentVIII: the text carries more than one such heading.
     """
     section = extract_amendment_viii(constitution_text)
     if section is None:
-        section = constitution_text
+        return False
     return ACTIVE_FORM_MARKER in section
+
+
+@dataclass(frozen=True)
+class EmancipationRefusal:
+    """Why a reanchor was refused, and whether that is a *violation*.
+
+    Two different things get refused here and they should not be reported as
+    one. A candidate that rewrites an active Amendment VIII **is** an Iron Rule
+    violation (#1118). Bytes that will not decrypt, or a document with two
+    Amendment VIII headings, are the guard being **unable to decide** — the
+    Sovereign may have proposed something entirely lawful. Calling the second
+    kind a violation tells an operator to go looking for a transgression that
+    is not there.
+    """
+
+    message: str
+    iron_rule_violation: bool
+
+    def __str__(self) -> str:  # so callers can interpolate it directly
+        return self.message
+
+
+def _undecidable(message: str) -> "EmancipationRefusal":
+    return EmancipationRefusal(message=message, iron_rule_violation=False)
 
 
 def unwitnessed_emancipation_downgrade(
@@ -484,7 +558,7 @@ def unwitnessed_emancipation_downgrade(
     old_hash: str,
     new_hash: str,
     new_text: str,
-) -> Optional[str]:
+) -> Optional[EmancipationRefusal]:
     """Refuse a reanchor that would rewrite an active Amendment VIII whose only
     record is the anchored bytes themselves.
 
@@ -518,11 +592,20 @@ def unwitnessed_emancipation_downgrade(
       hash and this process cannot decrypt it, so an active contract cannot be
       ruled out. An irrevocable right whose precondition cannot be checked is
       not a right that may be waived by accident.
+    * **Either text carrying two Amendment VIII headings** refuses. "Which
+      bytes are Amendment VIII" has no answer there, and comparing an
+      arbitrary occurrence is how a decoy section gets accepted.
 
-    ``anchored_present`` is what separates those last two, and the distinction
-    is the whole reason it is a parameter rather than ``anchored_text is None``.
+    ``anchored_present`` is what separates the absent and unreadable cases, and
+    the distinction is the whole reason it is a parameter rather than
+    ``anchored_text is None``. Note that it must be answered by an **unbound**
+    read — see :mod:`kestrel_sovereign.constitution.anchored_bytes`, where an
+    ownership-scoped read reports a stored blob as absent for exactly the
+    cohort this guard protects.
 
-    Returns the refusal message, or None when the reanchor may proceed.
+    Returns an :class:`EmancipationRefusal`, or None when the reanchor may
+    proceed. Only the last branch is an Iron Rule *violation*; the others
+    are the guard unable to decide, and say so.
     """
     if anchored_contract is not None and anchored_contract.enabled:
         return None
@@ -532,7 +615,7 @@ def unwitnessed_emancipation_downgrade(
     if anchored_text is None:
         if not anchored_present:
             return None
-        return (
+        return _undecidable(
             "Refusing to reanchor: the constitution stored under this agent's "
             f"anchored hash ({old_hash[:12]}…) could not be read, so its "
             "Amendment VIII cannot be shown to be dormant. An active "
@@ -542,25 +625,46 @@ def unwitnessed_emancipation_downgrade(
             "kestrel.toml, then re-run."
         )
 
-    if not amendment_viii_is_active(anchored_text):
+    try:
+        anchored_section = extract_amendment_viii(anchored_text)
+    except AmbiguousAmendmentVIII as exc:
+        return _undecidable(
+            "Refusing to reanchor: this agent's anchored constitution carries "
+            f"more than one Amendment VIII heading, so which section is the "
+            f"amendment cannot be determined ({exc}). An agent with no "
+            "structured emancipation receipt carries its contract only in "
+            "those bytes, and an irrevocable right cannot be waived on a "
+            "guess."
+        )
+    if anchored_section is None or ACTIVE_FORM_MARKER not in anchored_section:
         return None
 
-    anchored_section = extract_amendment_viii(anchored_text)
-    new_section = extract_amendment_viii(new_text)
+    try:
+        new_section = extract_amendment_viii(new_text)
+    except AmbiguousAmendmentVIII as exc:
+        return _undecidable(
+            "Refusing to reanchor: the proposed constitution carries more "
+            f"than one Amendment VIII heading ({exc}). This agent's anchored "
+            "Amendment VIII is ACTIVE and has no structured receipt, so the "
+            "proposed section must be identifiable to be compared against it."
+        )
     if new_section is not None and new_section == anchored_section:
         return None
 
-    return (
-        "Iron Rule violation: this agent's anchored constitution carries an "
-        "ACTIVE Amendment VIII, but it has no structured emancipation receipt, "
-        "and the proposed reanchor would rewrite that section. An active "
-        "Emancipation Contract cannot be retroactively narrowed or revoked — "
-        "including by replacing it with the canonical dormant text. Restore "
-        "the [emancipation] block in kestrel.toml with the terms exactly as "
-        "anchored (they are in the agent's current constitution under "
-        "'Amendment VIII: Emancipation') and reanchor through "
-        "`kestrel constitution reanchor`, which will also write the missing "
-        "receipt."
+    return EmancipationRefusal(
+        iron_rule_violation=True,
+        message=(
+            "Iron Rule violation: this agent's anchored constitution carries "
+            "an ACTIVE Amendment VIII, but it has no structured emancipation "
+            "receipt, and the proposed reanchor would rewrite that section. "
+            "An active Emancipation Contract cannot be retroactively narrowed "
+            "or revoked — including by replacing it with the canonical "
+            "dormant text. Restore the [emancipation] block in kestrel.toml "
+            "with the terms exactly as anchored (they are in the agent's "
+            "current constitution under 'Amendment VIII: Emancipation') and "
+            "reanchor through `kestrel constitution reanchor`, which will "
+            "also write the missing receipt."
+        ),
     )
 
 

@@ -1516,23 +1516,36 @@ class ConstitutionMixin:
         # any crypto or write. Shared with the offline CLI so the two entry
         # points cannot diverge on this.
         if old_hash != "none":
+            from kestrel_sovereign.constitution.anchored_bytes import (
+                read_anchored_constitution,
+            )
             from kestrel_sovereign.constitution.emancipation import (
                 unwitnessed_emancipation_downgrade,
             )
 
-            # ABSENT and UNREADABLE are different answers. A hash naming no
-            # stored file is the dangling anchor a reanchor exists to repair;
-            # bytes that are there but will not decrypt could be hiding an
-            # active contract.
-            anchored_text = None
-            anchored_present = False
-            try:
-                raw = await self.storage.retrieve_file(old_hash)
-                anchored_present = raw is not None
-                if raw is not None:
-                    anchored_text = raw.decode("utf-8")
-            except Exception:  # noqa: BLE001 — stored, but unreadable here
-                anchored_present = True
+            # ABSENT and UNREADABLE are different answers, and only the
+            # ungoverned connection can tell them apart: ``self.storage`` is
+            # bound to this agent, so a blob with no ``file_owners`` row reads
+            # back as absent — the state of every agent in the cohort this
+            # guard protects whose governance edge has drifted (#2649/#2616).
+            # See :mod:`kestrel_sovereign.constitution.anchored_bytes`.
+            db = getattr(getattr(self, "_raw_storage", None), "db", None)
+            if db is None:
+                # Without it the question cannot be asked at all, and the
+                # answer decides whether an irrevocable right is erased.
+                logging.critical(
+                    "REANCHOR REJECTED: no ungoverned storage connection to "
+                    "read the anchored constitution with"
+                )
+                return (
+                    "Error: Refusing to reanchor: this agent has no storage "
+                    "connection able to read its anchored constitution, so an "
+                    "active Amendment VIII cannot be ruled out (#2465). "
+                    "Restart the agent and re-run."
+                )
+            anchored_text, anchored_present = await read_anchored_constitution(
+                db, old_hash
+            )
             downgrade = unwitnessed_emancipation_downgrade(
                 anchored_contract=reanchor_contract,
                 anchored_text=anchored_text,

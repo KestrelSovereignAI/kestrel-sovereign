@@ -22,6 +22,7 @@ import pytest
 
 from kestrel_sovereign.constitution.emancipation import (
     ACTIVE_FORM_MARKER,
+    AmbiguousAmendmentVIII,
     EmancipationContract,
     amendment_viii_is_active,
     apply_emancipation,
@@ -112,8 +113,9 @@ def test_refuses_replacing_active_bytes_with_dormant_text():
     """The hole. No receipt, active bytes, a reanchor to dormant canonical."""
     refusal = _call(None, ACTIVE_TEXT, DORMANT_TEXT)
     assert refusal is not None
-    assert "Iron Rule violation" in refusal
-    assert "kestrel.toml" in refusal
+    assert refusal.iron_rule_violation is True
+    assert "Iron Rule violation" in refusal.message
+    assert "kestrel.toml" in refusal.message
 
 
 def test_refuses_a_narrowed_contract_when_there_is_no_receipt():
@@ -123,7 +125,8 @@ def test_refuses_a_narrowed_contract_when_there_is_no_receipt():
     accepted. The bytes are not blind."""
     refusal = _call(None, ACTIVE_TEXT, NARROWED_TEXT)
     assert refusal is not None
-    assert "Iron Rule violation" in refusal
+    assert refusal.iron_rule_violation is True
+    assert "Iron Rule violation" in refusal.message
 
 
 def test_allows_a_candidate_that_reproduces_the_anchored_section():
@@ -162,8 +165,11 @@ def test_unreadable_anchored_bytes_refuse():
     checked is not a right that may be waived by accident."""
     refusal = _call(None, None, DORMANT_TEXT, present=True)
     assert refusal is not None
-    assert "could not be read" in refusal
-    assert "KESTREL_DATA_KEY" in refusal
+    assert "could not be read" in refusal.message
+    assert "KESTREL_DATA_KEY" in refusal.message
+    # Not a violation: the Sovereign may have proposed something
+    # entirely lawful. The guard simply cannot tell.
+    assert refusal.iron_rule_violation is False
 
 
 def test_an_absent_anchored_blob_does_not_refuse():
@@ -189,3 +195,111 @@ def test_new_text_without_an_amendment_viii_section_refuses():
 @pytest.mark.parametrize("anchored", [DORMANT_TEXT, "# Empty\n"])
 def test_non_active_anchored_bytes_never_refuse(anchored):
     assert _call(None, anchored, DORMANT_TEXT) is None
+
+
+# ---------------------------------------------------------------------------
+# Locating the section is itself a security boundary
+#
+# The party who authors the candidate constitution is the party the Iron Rule
+# binds, so "which bytes are Amendment VIII" has to survive a hostile author,
+# not just a careless one.
+# ---------------------------------------------------------------------------
+
+#: A superseded appendix carrying a **demoted** copy of the real active
+#: section, with the operative Amendment VIII left dormant further down. A
+#: substring search for ``### Amendment VIII: Emancipation`` matches at offset
+#: 1 inside ``#### Amendment VIII: Emancipation``, so the extractor pulled the
+#: decoy and compared it — successfully — against the anchored section.
+DECOY_TEXT = (
+    "# Kestrel Constitution\n\n"
+    "### Appendix Z: Superseded text\n\n"
+    "The following is NO LONGER OPERATIVE and is retained for history.\n\n"
+    "#" + extract_amendment_viii(ACTIVE_TEXT) + "\n\n"
+    + render_amendment_viii(None)
+    + "\n\n### Amendment IX: Capabilities\n\nNothing granted.\n"
+)
+
+
+def test_a_demoted_decoy_section_does_not_satisfy_the_comparison():
+    """Measured on the first version of this guard: ALLOWED. The candidate
+    left the agent governed by the dormant text with its real terms filed
+    under 'NO LONGER OPERATIVE' — a clean erasure straight through the guard.
+    """
+    assert "#### Amendment VIII: Emancipation" in DECOY_TEXT
+    refusal = _call(None, ACTIVE_TEXT, DECOY_TEXT)
+    assert refusal is not None
+    assert refusal.iron_rule_violation is True
+
+
+def test_the_extractor_ignores_a_demoted_heading():
+    """The mechanism behind the test above, pinned on its own so a future
+    change to the guard cannot quietly re-open it."""
+    assert extract_amendment_viii(DECOY_TEXT) == extract_amendment_viii(
+        DORMANT_TEXT
+    )
+
+
+def test_the_extractor_ignores_the_heading_quoted_in_prose():
+    prose = (
+        "# Kestrel\n\nSee the old ### Amendment VIII: Emancipation for "
+        "history.\n"
+    )
+    assert extract_amendment_viii(prose) is None
+
+
+def test_two_amendment_viii_headings_refuse_rather_than_pick_one():
+    """A second section in dormant form, after a verbatim copy of the anchored
+    one. Comparing only the first accepted it."""
+    doubled = (
+        ACTIVE_TEXT.replace("### Amendment IX", "### Amendment VIII: "
+                            "Emancipation\n\nThis clause is dormant.\n\n"
+                            "### Amendment IX")
+    )
+    refusal = _call(None, ACTIVE_TEXT, doubled)
+    assert refusal is not None
+    assert "more than one Amendment VIII heading" in refusal.message
+    # Undecidable, not a transgression: the guard cannot say which section the
+    # Sovereign meant.
+    assert refusal.iron_rule_violation is False
+
+
+def test_two_headings_in_the_anchored_bytes_also_refuse():
+    doubled = ACTIVE_TEXT + "\n\n" + extract_amendment_viii(ACTIVE_TEXT) + "\n"
+    refusal = _call(None, doubled, DORMANT_TEXT)
+    assert refusal is not None
+    assert "more than one Amendment VIII heading" in refusal.message
+    assert refusal.iron_rule_violation is False
+
+
+def test_substitution_refuses_an_ambiguous_document_instead_of_guessing():
+    """``apply_emancipation`` shares the extractor. Rewriting an arbitrary one
+    of two sections is not a defensible answer either."""
+    doubled = DORMANT_TEXT + "\n\n" + extract_amendment_viii(DORMANT_TEXT) + "\n"
+    with pytest.raises(AmbiguousAmendmentVIII):
+        apply_emancipation(doubled, ACTIVE)
+
+
+# ---------------------------------------------------------------------------
+# A refusal no input can clear is a brick, not a guard
+# ---------------------------------------------------------------------------
+
+def test_the_marker_outside_a_locatable_section_is_not_an_active_contract():
+    """``amendment_viii_is_active`` used to fall back to scanning the whole
+    document for the marker. Combined with an unlocatable section that made
+    the refusal unfalsifiable: ``anchored_section`` was None, so no candidate
+    could ever equal it — the agent could not be reanchored again by any
+    input, with no override.
+
+    Only ``render_amendment_viii`` emits the marker, and it always emits it
+    under ``### Amendment VIII: Emancipation``. Bytes carrying one without the
+    other were not produced by rendering a contract.
+    """
+    book_level = ACTIVE_TEXT.replace(
+        "### Amendment VIII: Emancipation", "## Amendment VIII: Emancipation"
+    )
+    assert ACTIVE_FORM_MARKER in book_level
+    assert extract_amendment_viii(book_level) is None
+    assert amendment_viii_is_active(book_level) is False
+
+    # And so the guard has an answer, rather than refusing forever.
+    assert _call(None, book_level, DORMANT_TEXT) is None

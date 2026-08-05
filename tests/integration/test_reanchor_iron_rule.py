@@ -601,4 +601,121 @@ async def test_offline_reanchor_reads_the_anchored_bytes_to_decide(tmp_path):
     )
 
     assert result.iron_rule_violation is None
-    assert result.error is None or "Iron Rule" not in result.error
+    # Not "no Iron Rule error" — that phrasing passes on any unrelated
+    # failure, so the control would silently stop controlling.
+    assert result.error is None, result.error
+
+
+@pytest.mark.asyncio
+async def test_a_blob_with_no_ownership_row_is_not_read_as_absent(tmp_path):
+    """The cohort this guard exists for is the cohort a scoped read is blind to.
+
+    ``file_owners`` arrived with #2649. Every agent incepted in the #1112→#1118
+    window stored its constitution before that, so its blob is claimed only by
+    the backfill — which requires a ``governed_by`` edge whose target equals
+    ``constitution_hash``, precisely the edge that has drifted in the #2616
+    population this command repairs. On such an agent an ownership-scoped
+    ``retrieve_file`` returns ``None`` for a constitution sitting in ``files``
+    byte-for-byte, the guard classifies it ABSENT — the branch that *permits*
+    the reanchor, because an absent blob is a dangling anchor — and the
+    Sovereign's terms are erased by the very repair meant to protect them.
+
+    So: strip the ownership row, keep the bytes, and the refusal must stand.
+    """
+    from kestrel_sovereign.storage import AsyncStorage
+
+    agent_dir, db_path = await _setup_active_agent(tmp_path)
+
+    async with AsyncStorage(str(db_path)) as storage:
+        agents = await storage.graph.get_nodes_by_type("agent")
+        agents[0].properties.pop("emancipation_contract", None)
+        await storage.graph.add_node(agents[0])
+        anchored_hash = agents[0].properties["constitution_hash"]
+        # The pre-#2649 shape: bytes present, unclaimed.
+        await storage.db.execute(
+            "DELETE FROM file_owners WHERE content_hash = ?", (anchored_hash,)
+        )
+        owners = await storage.db.fetchall(
+            "SELECT COUNT(*) FROM file_owners WHERE content_hash = ?",
+            (anchored_hash,),
+        )
+        blobs = await storage.db.fetchall(
+            "SELECT COUNT(*) FROM files WHERE content_hash = ?", (anchored_hash,)
+        )
+        assert owners[0][0] == 0, "the ownership row must be gone"
+        assert blobs[0][0] == 1, "the constitution itself must still be there"
+
+    dormant = resolve_governing_constitution_bytes(
+        None, constitution_path=str(CANONICAL)
+    )
+    artifact_path, trust_root_path = _write_reanchor_authority(tmp_path, dormant)
+
+    result = await reanchor_constitution(
+        agent_name="RefusalAgent", agent_dir=agent_dir,
+        canonical_path=CANONICAL, force=True,
+        amendment_artifact_path=artifact_path,
+        sovereign_trust_root_path=trust_root_path,
+    )
+
+    assert result.error is not None, (
+        "An unowned constitution blob was read as absent, so the guard "
+        "permitted the erasure it exists to prevent."
+    )
+    assert "Iron Rule violation" in result.error
+    assert not result.reanchored
+    post = await _read_anchored_constitution_bytes(db_path)
+    assert SENTINEL_TERMS in post.decode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_an_undecidable_refusal_is_not_reported_as_a_violation(tmp_path):
+    """An error, yes. A *violation*, no.
+
+    ``iron_rule_violation`` means the candidate really would narrow or revoke
+    an active contract. Anchored bytes the guard cannot adjudicate — two
+    Amendment VIII headings here, a blob that will not decrypt elsewhere — are
+    the guard unable to decide, and the Sovereign may have proposed something
+    entirely lawful. Stamping those as violations sends an operator hunting a
+    transgression that is not there.
+    """
+    from kestrel_sovereign.constitution.emancipation import (
+        extract_amendment_viii,
+    )
+    from kestrel_sovereign.storage import AsyncStorage
+
+    agent_dir, db_path = await _setup_active_agent(tmp_path)
+
+    async with AsyncStorage(str(db_path)) as storage:
+        agents = await storage.graph.get_nodes_by_type("agent")
+        node = agents[0]
+        node.properties.pop("emancipation_contract", None)
+        anchored = await storage.files.retrieve_file(
+            node.properties["constitution_hash"]
+        )
+        text = anchored.decode("utf-8")
+        doubled = (text + "\n\n" + extract_amendment_viii(text) + "\n").encode(
+            "utf-8"
+        )
+        node.properties["constitution_hash"] = await storage.files.store_file(
+            doubled, "KESTREL_CONSTITUTION.md"
+        )
+        await storage.graph.add_node(node)
+
+    dormant = resolve_governing_constitution_bytes(
+        None, constitution_path=str(CANONICAL)
+    )
+    artifact_path, trust_root_path = _write_reanchor_authority(tmp_path, dormant)
+
+    result = await reanchor_constitution(
+        agent_name="RefusalAgent", agent_dir=agent_dir,
+        canonical_path=CANONICAL, force=True,
+        amendment_artifact_path=artifact_path,
+        sovereign_trust_root_path=trust_root_path,
+    )
+
+    assert result.error is not None
+    assert "more than one Amendment VIII heading" in result.error
+    assert result.iron_rule_violation is None, (
+        "An undecidable refusal was labelled an Iron Rule violation."
+    )
+    assert not result.reanchored

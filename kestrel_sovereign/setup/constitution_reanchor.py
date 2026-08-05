@@ -63,6 +63,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from kestrel_sovereign.constitution.anchored_bytes import (
+    read_anchored_constitution,
+)
 from kestrel_sovereign.constitution.emancipation import (
     EmancipationConfigError,
     EmancipationContract,
@@ -269,8 +272,9 @@ class ReanchorResult:
     """Outcome of :func:`reanchor_constitution`.
 
     Exactly one of ``unchanged`` / ``drift_unforced`` / ``reanchored`` /
-    ``iron_rule_violation`` (set as ``error``) is True. The CLI dispatches
-    messaging on this.
+    ``error`` describes the outcome. ``iron_rule_violation`` is a *label* on
+    an error, not a fourth outcome: it marks the subset of refusals that are a
+    #1118 transgression rather than the guard being unable to decide.
     """
 
     agent_name: str
@@ -283,9 +287,11 @@ class ReanchorResult:
     drift_unforced: bool = False
     reanchored: bool = False
     error: str | None = None
-    #: When set, ``error`` is a #1118 Iron Rule refusal (not a generic
-    #: failure). The CLI uses this to print the diff-clause rather than
-    #: a stack trace.
+    #: When set, ``error`` is a #1118 Iron Rule refusal — the candidate really
+    #: would narrow or revoke an active Emancipation Contract. Deliberately
+    #: *not* set for refusals where the guard could not decide (unreadable
+    #: anchored bytes, an ambiguous Amendment VIII): those are also errors, but
+    #: calling them violations misnames what happened.
     iron_rule_violation: str | None = None
     #: True when pre-write inspection found the ``governed_by`` edge set
     #: inconsistent with the expected anchor — missing, mis-targeted, or
@@ -545,8 +551,14 @@ async def reanchor_constitution(
     if downgrade is not None:
         return _result(
             old_hash=old_hash, new_hash=new_hash,
-            error=downgrade,
-            iron_rule_violation=downgrade,
+            error=downgrade.message,
+            # Only stamp it when it IS one. Unreadable bytes and an ambiguous
+            # Amendment VIII are the guard unable to decide, not a Sovereign
+            # transgression, and reporting them as a violation sends an
+            # operator hunting for something that is not there.
+            iron_rule_violation=(
+                downgrade.message if downgrade.iron_rule_violation else None
+            ),
         )
 
     # #1118 sidecar backfill: if the agent has active-form bytes anchored
@@ -805,24 +817,17 @@ async def _read_agent_anchor(
         governed_by_targets = tuple(row[0] for row in edge_rows)
         anchored_hash = agent.properties.get("constitution_hash")
         anchored_text: str | None = None
-        # ABSENT and UNREADABLE are different answers (#2465). An anchored hash
-        # naming no stored file is the #2616 dangling-anchor shape reanchor
-        # exists to repair; bytes that are there but will not decrypt might be
-        # hiding an active Amendment VIII. ``retrieve_file`` already separates
-        # them — None for a missing row, raising for a failed decrypt.
+        # ABSENT and UNREADABLE are different answers (#2465), and telling them
+        # apart takes the privileged connection for the same reason the edge
+        # read above does: ``storage.files`` is bound, so a blob with no
+        # ``file_owners`` row reads back as absent — the state of every agent
+        # in the cohort this guard protects whose governance edge has drifted.
+        # See :mod:`kestrel_sovereign.constitution.anchored_bytes`.
         anchored_present = False
         if anchored_hash:
-            try:
-                raw = await storage.files.retrieve_file(anchored_hash)
-                anchored_present = raw is not None
-                if raw is not None:
-                    anchored_text = raw.decode("utf-8")
-            except Exception:  # noqa: BLE001 — stored, but unreadable here
-                anchored_present = True
-                logger.warning(
-                    "Could not read the anchored constitution %s from %s",
-                    anchored_hash[:12], target.describe(), exc_info=True,
-                )
+            anchored_text, anchored_present = await read_anchored_constitution(
+                storage.db, anchored_hash
+            )
         return (
             anchored_hash,
             agent.node_id,
