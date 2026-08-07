@@ -31,14 +31,33 @@ def _as_index(identifier: str) -> Optional[int]:
     return _ROMAN_TO_INT.get(ident)
 
 
+def _opens_a_unit(match: "re.Match") -> bool:
+    """Whether a heading opens a constitutional unit or merely sits inside one.
+
+    Every ``##`` heading is a unit — a Book or a framing section. A ``###``
+    heading is one only when it names a Chapter, Section, or Amendment: an
+    active Amendment VIII inlines the Sovereign's authored terms verbatim, and
+    those terms may carry their own sub-headings (``### Milestones``), which
+    are prose inside the Amendment rather than the start of a new one.
+    """
+    if len(match.group(1)) == 2:
+        return True
+    return _SUBUNIT_TITLE.match(match.group(2).strip()) is not None
+
+
 def _extent(text: str, headings: List["re.Match"], position: int, level: int) -> int:
     """Return the offset at which the unit opened at ``position`` ends.
 
-    A unit runs until the next heading of the same or higher level, so a Book
-    swallows its own Chapters/Sections/Amendments but stops at the next Book.
+    A unit runs until the next *unit* heading of the same or higher level, so a
+    Book swallows its own Chapters/Sections/Amendments but stops at the next
+    Book, and an Amendment keeps sub-headings that belong to its own body.
+
+    A ``##`` heading always ends the unit above it — that is the document's
+    grammar, and text that forges one inside an Amendment is treated as the
+    structure it claims to be rather than absorbed silently.
     """
     for later in headings[position + 1:]:
-        if len(later.group(1)) <= level:
+        if len(later.group(1)) <= level and _opens_a_unit(later):
             return later.start()
     return len(text)
 
@@ -170,13 +189,15 @@ class ConstitutionFeature(Feature):
     def _record_frame(self, title: str, body: str) -> None:
         """Key an unnumbered top-level section by the names people type.
 
-        Registers the full title, the part before any colon, and the
-        "the "-stripped form of each. Keying on the pre-colon head is what
-        lets an agent still anchored to an older constitution reach a section
-        by its short name — the parser is structural, so it addresses whatever
-        headings that agent's governing text actually carries.
+        Registers the full title, the parts on either side of any colon, and
+        the "the "-stripped form of each. Both halves matter for an agent still
+        anchored to an older constitution: its text says
+        ``## Article V: The Amendment Process``, so the head keeps its old
+        citation reachable while the tail lets it answer to the same
+        ``!constitution amendment process`` the tool now documents.
         """
-        for name in {title.lower(), title.split(":", 1)[0].strip().lower()}:
+        head, _, tail = title.partition(":")
+        for name in {title.lower(), head.strip().lower(), tail.strip().lower()}:
             if not name:
                 continue
             self.frame[name] = body

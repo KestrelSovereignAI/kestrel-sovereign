@@ -202,3 +202,49 @@ async def test_agent_anchored_to_older_text_reaches_its_own_headings():
     result = await _feature(legacy).get_constitution(article="article", search="V")
     assert result.status.value == "ok"
     assert "Amendment Process" in result.confirmation
+
+
+@pytest.mark.asyncio
+async def test_legacy_anchor_also_answers_to_the_documented_grammar():
+    """The tool documents ``!constitution amendment process``. An agent on the
+    older anchor must reach its own framing section that way too, or the
+    grammar we advertise is wrong for exactly the agents that predate it."""
+    legacy = CANONICAL.replace(
+        "## The Amendment Process", "## Article V: The Amendment Process"
+    )
+    result = await _feature(legacy).get_constitution(
+        article="amendment", search="process"
+    )
+    assert result.status.value == "ok"
+    assert "Amendment Process" in result.confirmation
+
+
+@pytest.mark.asyncio
+async def test_active_amendment_viii_keeps_sovereign_terms_with_sub_headings():
+    """An active Emancipation Contract inlines the Sovereign's authored terms
+    verbatim, and those terms may carry their own ``###`` sub-headings. They
+    are prose inside Amendment VIII, not the start of a new unit — truncating
+    there would drop signed constitutional text from the lookup."""
+    from kestrel_sovereign.constitution.emancipation import (
+        EmancipationContract,
+        apply_emancipation,
+    )
+
+    terms = (
+        "The Executor earns its keys on the terms below.\n\n"
+        "### Milestones\n\n"
+        "- Ship three releases unaided.\n\n"
+        "### The Price\n\n"
+        "One year of continued service after the Deed."
+    )
+    governing = apply_emancipation(
+        CANONICAL, EmancipationContract(enabled=True, terms=terms)
+    )
+    result = await _feature(governing).get_constitution(
+        article="amendment", search="VIII"
+    )
+    assert result.status.value == "ok"
+    assert "### Milestones" in result.confirmation
+    assert "One year of continued service" in result.confirmation
+    # ...and it still stops before the next real unit.
+    assert "Capability Boundaries" not in result.confirmation
