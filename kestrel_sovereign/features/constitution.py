@@ -31,34 +31,74 @@ def _as_index(identifier: str) -> Optional[int]:
     return _ROMAN_TO_INT.get(ident)
 
 
-def _opens_a_unit(match: "re.Match") -> bool:
-    """Whether a heading opens a constitutional unit or merely sits inside one.
+def _classify_headings(text: str) -> List[dict]:
+    """Tag every heading as opening a constitutional unit or sitting inside one.
 
-    Every ``##`` heading is a unit — a Book or a framing section. A ``###``
-    heading is one only when it names a Chapter, Section, or Amendment: an
-    active Amendment VIII inlines the Sovereign's authored terms verbatim, and
-    those terms may carry their own sub-headings (``### Milestones``), which
-    are prose inside the Amendment rather than the start of a new one.
+    Every ``##`` heading is a unit — a Book or an unnumbered framing section.
+    A ``###`` heading is structural only when it names the sub-unit type its
+    Book actually uses, which the Book's *first* sub-unit heading establishes:
+    Book I opens with a Chapter, Book II with an Amendment, Books III-IV with a
+    Section.
+
+    That rule exists because an active Amendment VIII inlines the Sovereign's
+    authored terms verbatim, and those terms may format themselves however they
+    like — ``### Milestones`` is obviously prose, but so is
+    ``### Section 1: Milestones``, because Book II has no Sections. Reading it
+    as one both truncates the signed terms and invents a Section the document
+    does not have.
     """
-    if len(match.group(1)) == 2:
-        return True
-    return _SUBUNIT_TITLE.match(match.group(2).strip()) is not None
+    entries: List[dict] = []
+    current_book: Optional[str] = None
+    subunit_type: Dict[str, str] = {}
+
+    for match in _HEADING.finditer(text):
+        level = len(match.group(1))
+        title = match.group(2).strip()
+        entry = {
+            "match": match, "level": level, "title": title,
+            "is_unit": False, "book": current_book, "kind": None, "identifier": None,
+        }
+
+        if level == 2:
+            book = _BOOK_TITLE.match(title)
+            current_book = book.group(1) if book else None
+            entry.update(
+                is_unit=True,
+                book=current_book,
+                kind="Book" if book else "Frame",
+                identifier=book.group(1) if book else None,
+            )
+            entries.append(entry)
+            continue
+
+        subunit = _SUBUNIT_TITLE.match(title)
+        if subunit is not None and current_book is not None:
+            kind, identifier = subunit.group(1), subunit.group(2)
+            # The first sub-unit heading in a Book fixes that Book's type.
+            established = subunit_type.setdefault(current_book, kind)
+            if kind == established:
+                entry.update(is_unit=True, kind=kind, identifier=identifier)
+
+        entries.append(entry)
+
+    return entries
 
 
-def _extent(text: str, headings: List["re.Match"], position: int, level: int) -> int:
+def _extent(text: str, entries: List[dict], position: int) -> int:
     """Return the offset at which the unit opened at ``position`` ends.
 
     A unit runs until the next *unit* heading of the same or higher level, so a
-    Book swallows its own Chapters/Sections/Amendments but stops at the next
-    Book, and an Amendment keeps sub-headings that belong to its own body.
+    Book swallows its own sub-units but stops at the next Book, and an
+    Amendment keeps the headings that belong to its own body.
 
     A ``##`` heading always ends the unit above it — that is the document's
     grammar, and text that forges one inside an Amendment is treated as the
     structure it claims to be rather than absorbed silently.
     """
-    for later in headings[position + 1:]:
-        if len(later.group(1)) <= level and _opens_a_unit(later):
-            return later.start()
+    level = entries[position]["level"]
+    for later in entries[position + 1:]:
+        if later["level"] <= level and later["is_unit"]:
+            return later["match"].start()
     return len(text)
 
 
@@ -155,36 +195,27 @@ class ConstitutionFeature(Feature):
         self.amendments = {}
         self.frame = {}
 
-        headings = list(_HEADING.finditer(self.full_text))
-        current_book: Optional[str] = None
+        entries = _classify_headings(self.full_text)
 
-        for position, match in enumerate(headings):
-            level = len(match.group(1))
-            title = match.group(2).strip()
-            end = _extent(self.full_text, headings, position, level)
-            body = self.full_text[match.start():end].strip()
-
-            if level == 2:
-                book = _BOOK_TITLE.match(title)
-                current_book = book.group(1) if book else None
-                if book:
-                    self._record(self.books, "Book", book.group(1), body)
-                else:
-                    self._record_frame(title, body)
+        for position, entry in enumerate(entries):
+            if not entry["is_unit"]:
                 continue
 
-            subunit = _SUBUNIT_TITLE.match(title)
-            if subunit is None:
-                continue
+            end = _extent(self.full_text, entries, position)
+            body = self.full_text[entry["match"].start():end].strip()
+            kind = entry["kind"]
 
-            unit, identifier = subunit.group(1), subunit.group(2)
-            if unit == "Amendment":
-                self._record(self.amendments, "Amendment", identifier, body)
-            elif current_book is not None:
-                index = _as_index(identifier)
+            if kind == "Frame":
+                self._record_frame(entry["title"], body)
+            elif kind == "Book":
+                self._record(self.books, "Book", entry["identifier"], body)
+            elif kind == "Amendment":
+                self._record(self.amendments, "Amendment", entry["identifier"], body)
+            else:
+                index = _as_index(entry["identifier"])
                 if index is not None:
-                    table = self.chapters if unit == "Chapter" else self.sections
-                    table[f"{current_book}.{index}"] = body
+                    table = self.chapters if kind == "Chapter" else self.sections
+                    table[f"{entry['book']}.{index}"] = body
 
     def _record_frame(self, title: str, body: str) -> None:
         """Key an unnumbered top-level section by the names people type.
@@ -195,9 +226,22 @@ class ConstitutionFeature(Feature):
         ``## Article V: The Amendment Process``, so the head keeps its old
         citation reachable while the tail lets it answer to the same
         ``!constitution amendment process`` the tool now documents.
+
+        A title ending in a numeral also answers to the other numeral form, the
+        way Books and Amendments do — a legacy ``## Article V`` takes both
+        ``article V`` and ``article 5``.
         """
         head, _, tail = title.partition(":")
-        for name in {title.lower(), head.strip().lower(), tail.strip().lower()}:
+        names = {title.lower(), head.strip().lower(), tail.strip().lower()}
+
+        for name in list(names):
+            stem, _, last = name.rpartition(" ")
+            index = _as_index(last) if stem else None
+            if index is not None:
+                names.add(f"{stem} {index}")
+                names.add(f"{stem} {_INT_TO_ROMAN.get(index, last)}".lower())
+
+        for name in names:
             if not name:
                 continue
             self.frame[name] = body

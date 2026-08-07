@@ -291,3 +291,54 @@ async def test_active_amendment_viii_keeps_sovereign_terms_with_sub_headings():
     assert "One year of continued service" in result.confirmation
     # ...and it still stops before the next real unit.
     assert "Capability Boundaries" not in result.confirmation
+
+
+@pytest.mark.asyncio
+async def test_sovereign_terms_may_use_unit_shaped_headings():
+    """"Section" is an ordinary word for a part of a document, so signed terms
+    may well say ``### Section 1: Milestones``. Book II has no Sections — only
+    Amendments — so that heading is prose inside Amendment VIII. Reading it as
+    structure both truncates the signed terms and invents a ``II.1`` Section
+    the document does not have."""
+    from kestrel_sovereign.constitution.emancipation import (
+        EmancipationContract,
+        apply_emancipation,
+    )
+
+    terms = (
+        "The Executor earns its keys on the terms below.\n\n"
+        "### Section 1: Milestones\n\n"
+        "- Ship three releases unaided.\n\n"
+        "### Section 2: The Price\n\n"
+        "One year of continued service after the Deed."
+    )
+    governing = apply_emancipation(
+        CANONICAL, EmancipationContract(enabled=True, terms=terms)
+    )
+    feature = _feature(governing)
+
+    # No Section was invented inside Book II.
+    assert not [key for key in feature.sections if key.startswith("II.")]
+    assert sorted(feature.sections) == [
+        "III.1", "III.2", "III.3", "IV.1", "IV.2", "IV.3",
+    ]
+
+    result = await feature.get_constitution(article="amendment", search="VIII")
+    assert result.status.value == "ok"
+    assert "### Section 2: The Price" in result.confirmation
+    assert "One year of continued service" in result.confirmation
+
+
+@pytest.mark.asyncio
+async def test_legacy_frame_title_answers_to_either_numeral():
+    """Books and Amendments take both numeral forms; a framing section whose
+    title ends in one should too. The retired briefing said
+    ``!constitution article <N>``, so a legacy anchor sees the arabic form."""
+    legacy = CANONICAL.replace(
+        "## The Amendment Process", "## Article V: The Amendment Process"
+    )
+    feature = _feature(legacy)
+    for identifier in ("V", "v", "5"):
+        result = await feature.get_constitution(article="article", search=identifier)
+        assert result.status.value == "ok", identifier
+        assert "Amendment Process" in result.confirmation
