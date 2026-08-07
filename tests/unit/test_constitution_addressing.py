@@ -220,6 +220,35 @@ async def test_legacy_anchor_also_answers_to_the_documented_grammar():
 
 
 @pytest.mark.asyncio
+async def test_session_briefing_only_teaches_grammar_the_feature_answers():
+    """The briefing told every SOUL-less agent to run ``!constitution article
+    <N>``. That command was already dead — the document had exactly one Article
+    — and this change retires the keyword entirely. Built-in guidance must not
+    walk agents into a failing command, so every keyword the briefing names is
+    executed here against the real dispatcher.
+
+    An unhandled keyword falls through to the bare-identifier path and reports
+    ``kind == "lookup"``, which is what distinguishes "the feature answers this
+    keyword" from "the feature has never heard of it".
+    """
+    from kestrel_sovereign.agent.context_builder import ContextBuilder
+
+    briefing = ContextBuilder(Mock()).get_session_briefing()
+    keywords = set(re.findall(r"`!constitution (\w+)", briefing))
+    assert keywords, "briefing no longer advertises any subcommand"
+
+    feature = _feature()
+    for keyword in sorted(keywords):
+        result = await feature.get_constitution(
+            article=keyword, search="does-not-exist"
+        )
+        assert result.data.get("kind") == keyword, (
+            f"briefing advertises `!constitution {keyword}` but the feature "
+            f"does not dispatch that keyword"
+        )
+
+
+@pytest.mark.asyncio
 async def test_active_amendment_viii_keeps_sovereign_terms_with_sub_headings():
     """An active Emancipation Contract inlines the Sovereign's authored terms
     verbatim, and those terms may carry their own ``###`` sub-headings. They
