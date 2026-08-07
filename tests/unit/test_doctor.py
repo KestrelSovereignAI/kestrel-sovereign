@@ -220,8 +220,21 @@ from kestrel_sovereign.doctor import (  # noqa: E402
     _NoAgentNode,
     _NoHashProperty,
     _UnreadableDB,
+    _GovernanceSource,
     _read_anchored_constitution_hash,
 )
+
+
+def _anchor(db_path) -> _GovernanceSource:
+    """A source that reads the local anchor — the SQLite host's shape.
+
+    The readers take a :class:`_GovernanceSource` rather than a path, because
+    on a PostgreSQL host the anchor holds the *birth record* and the live
+    governance is elsewhere (#2892). These helper-level tests are about the
+    SQLite reading itself, so they say which database they mean rather than
+    relying on a default.
+    """
+    return _GovernanceSource(anchor_path=db_path)
 
 
 # Sentinel default: "make the governed_by edge target the stored hash",
@@ -499,13 +512,13 @@ def test_read_hash_returns_string_on_happy_path(tmp_path):
             ("did:x", "x", json.dumps({"constitution_hash": "abc123"})),
         )
         conn.commit()
-    assert _read_anchored_constitution_hash(db) == "abc123"
+    assert _read_anchored_constitution_hash(_anchor(db)) == "abc123"
 
 
 def test_read_hash_handles_no_graph_nodes_table(tmp_path):
     db = tmp_path / "k.db"
     sqlite3.connect(str(db)).close()  # Empty DB.
-    assert isinstance(_read_anchored_constitution_hash(db), _UnreadableDB)
+    assert isinstance(_read_anchored_constitution_hash(_anchor(db)), _UnreadableDB)
 
 
 def test_read_hash_handles_no_agent_node(tmp_path):
@@ -517,7 +530,7 @@ def test_read_hash_handles_no_agent_node(tmp_path):
             );"""
         )
         conn.commit()
-    assert isinstance(_read_anchored_constitution_hash(db), _NoAgentNode)
+    assert isinstance(_read_anchored_constitution_hash(_anchor(db)), _NoAgentNode)
 
 
 def test_read_hash_handles_corrupt_properties_json(tmp_path):
@@ -533,7 +546,7 @@ def test_read_hash_handles_corrupt_properties_json(tmp_path):
             ("did:x", "x", "{not valid json"),
         )
         conn.commit()
-    assert isinstance(_read_anchored_constitution_hash(db), _NoHashProperty)
+    assert isinstance(_read_anchored_constitution_hash(_anchor(db)), _NoHashProperty)
 
 
 # ---------------------------------------------------------------------------
@@ -850,7 +863,7 @@ def test_read_agent_node_returns_id_and_properties(tmp_path):
             ("did:x", "x", json.dumps({"constitution_hash": "abc123"})),
         )
         conn.commit()
-    node_id, properties = _read_agent_node(db)
+    node_id, properties = _read_agent_node(_anchor(db))
     assert node_id == "did:x"
     assert properties == {"constitution_hash": "abc123"}
 
@@ -868,7 +881,7 @@ def test_read_agent_node_none_properties_on_corrupt_json(tmp_path):
             ("did:x", "x", "{not valid json"),
         )
         conn.commit()
-    node_id, properties = _read_agent_node(db)
+    node_id, properties = _read_agent_node(_anchor(db))
     assert node_id == "did:x"
     assert properties is None
 
@@ -876,7 +889,7 @@ def test_read_agent_node_none_properties_on_corrupt_json(tmp_path):
 def test_read_agent_node_sentinels(tmp_path):
     empty = tmp_path / "empty.db"
     sqlite3.connect(str(empty)).close()
-    assert isinstance(_read_agent_node(empty), _UnreadableDB)
+    assert isinstance(_read_agent_node(_anchor(empty)), _UnreadableDB)
 
     no_agent = tmp_path / "noagent.db"
     with sqlite3.connect(str(no_agent)) as conn:
@@ -886,7 +899,7 @@ def test_read_agent_node_sentinels(tmp_path):
             );"""
         )
         conn.commit()
-    assert isinstance(_read_agent_node(no_agent), _NoAgentNode)
+    assert isinstance(_read_agent_node(_anchor(no_agent)), _NoAgentNode)
 
 
 def test_read_governed_by_targets_filters_by_source_and_label(tmp_path):
@@ -906,13 +919,13 @@ def test_read_governed_by_targets_filters_by_source_and_label(tmp_path):
             ],
         )
         conn.commit()
-    assert _read_governed_by_targets(db, "did:x") == ("hash-a",)
+    assert _read_governed_by_targets(_anchor(db), "did:x") == ("hash-a",)
 
 
 def test_read_governed_by_targets_unreadable_without_table(tmp_path):
     db = tmp_path / "k.db"
     sqlite3.connect(str(db)).close()
-    assert isinstance(_read_governed_by_targets(db, "did:x"), _UnreadableDB)
+    assert isinstance(_read_governed_by_targets(_anchor(db), "did:x"), _UnreadableDB)
 
 
 def test_doctor_accepts_openrouter_management_key_only(tmp_path):
@@ -937,26 +950,182 @@ def test_doctor_accepts_openrouter_management_key_only(tmp_path):
     assert not any("OPENROUTER_API_KEY" in m for m in report.fail)
 
 
-def test_doctor_flags_findings_it_cannot_prescribe_a_fix_for(monkeypatch, tmp_path):
-    """On a PostgreSQL host, doctor reads the local birth record while the
-    agent is governed by PostgreSQL, and `kestrel constitution reanchor` now
-    correctly targets PostgreSQL. Without saying so, doctor prescribes a repair
-    that answers "nothing to do" — a finding the operator can never clear.
-    The real fix is #2892; not misleading them is this change's job."""
-    from kestrel_sovereign.doctor import (
-        _ANCHOR_NOT_RUNTIME_NOTE,
-        _anchor_is_the_runtime_database,
-    )
+def test_the_backend_rule_is_the_runtimes_rule(monkeypatch):
+    """Copied from ``agent_manager._initialize_agent``, and copied *exactly*.
+
+    `KESTREL_DB_BACKEND=postgres` with no DSN is a host whose agents really do
+    run on SQLite, so treating it as PostgreSQL would send doctor to a database
+    the agent never opens — the same defect with the two exchanged.
+    """
+    from kestrel_sovereign.doctor import _anchor_is_the_runtime_database
 
     monkeypatch.delenv("KESTREL_DB_BACKEND", raising=False)
     monkeypatch.delenv("KESTREL_DATABASE_URL", raising=False)
     assert _anchor_is_the_runtime_database() is True
 
-    # Same rule as agent_manager._initialize_agent: postgres AND a DSN.
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
     assert _anchor_is_the_runtime_database() is True, "no DSN -> the runtime is SQLite"
 
     monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://h/db")
     assert _anchor_is_the_runtime_database() is False
-    assert "#2892" in _ANCHOR_NOT_RUNTIME_NOTE
-    assert "will not clear this finding" in _ANCHOR_NOT_RUNTIME_NOTE
+
+
+# ---------------------------------------------------------------------------
+# On a PostgreSQL host the anchor is the birth record, not the governance
+# (#2892). Doctor has to read the database the agent is actually governed by,
+# or it reports birth-time state as current — permanently flagging drift after
+# any legitimate reanchor, and prescribing a repair that correctly answers
+# "nothing to do". Two governance tools contradicting each other is how
+# operators learn to ignore the one that cries wolf.
+# ---------------------------------------------------------------------------
+
+
+class _FakePostgres:
+    """Just enough psycopg2 to answer doctor's three queries.
+
+    Records every statement and its parameters, because *which* rows a shared
+    database returns is the thing that can go wrong: one PostgreSQL holds every
+    local agent, so an unscoped read answers about whichever tenant came back
+    first.
+    """
+
+    def __init__(self, rows_by_prefix: dict):
+        self._rows_by_prefix = rows_by_prefix
+        self.executed: list[tuple[str, tuple]] = []
+        self.closed = False
+
+    # -- module surface ----------------------------------------------------
+    def connect(self, dsn):
+        self.dsn = dsn
+        return self
+
+    # -- connection surface ------------------------------------------------
+    def cursor(self):
+        return self
+
+    def close(self):
+        self.closed = True
+
+    # -- cursor surface (used as a context manager) ------------------------
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=()):
+        self.executed.append((" ".join(sql.split()), tuple(params)))
+        self._rows = next(
+            (
+                rows
+                for prefix, rows in self._rows_by_prefix.items()
+                if prefix in " ".join(sql.split())
+            ),
+            [],
+        )
+
+    def fetchall(self):
+        return self._rows
+
+
+def _postgres_host(monkeypatch, fake):
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://durable.example/kestrel")
+    monkeypatch.setitem(__import__("sys").modules, "psycopg2", fake)
+
+
+def test_on_postgres_the_drift_verdict_comes_from_the_runtime_database(
+    tmp_path, monkeypatch
+):
+    """The anchor matches the canonical file; PostgreSQL does not.
+
+    Reading the anchor reports "anchored to current file" — a clean bill of
+    health for an agent that is governed by something else entirely.
+    """
+    stored = _seed_matching_anchor(tmp_path, monkeypatch)
+    drifted = hashlib.sha256(b"what postgres actually holds").hexdigest()
+    properties = json.dumps({"name": "Test", "constitution_hash": drifted})
+    fake = _FakePostgres(
+        {
+            # Column lists differ between the two node reads; a double that
+            # answers both with the same shape hands `properties` back where a
+            # `node_id` belongs and the check silently degrades to "older
+            # agent, no anchor". Keyed on the full projection for that reason.
+            "SELECT properties FROM graph_nodes": [(properties,)],
+            "SELECT node_id, properties FROM graph_nodes": [
+                ("did:web:test", properties)
+            ],
+            "FROM graph_edges": [(drifted,)],
+        }
+    )
+    _postgres_host(monkeypatch, fake)
+
+    report = diagnose(tmp_path)
+
+    assert any(
+        "constitution drift" in m and drifted[:12] in m for m in report.fail
+    ), f"expected drift against the PostgreSQL hash; got {report.fail} / {report.ok}"
+    assert not any(stored[:12] in m for m in report.ok)
+
+
+def test_the_runtime_read_is_scoped_to_this_agent(tmp_path, monkeypatch):
+    """One PostgreSQL holds every local agent, so the ``LIMIT 1`` that is
+    correct on a per-agent file would pick a neighbour by row order. The DID to
+    scope by comes from the anchor, which is where identity is born on every
+    backend (#2871, #2894)."""
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    fake = _FakePostgres(
+        {
+            "SELECT properties FROM graph_nodes": [],
+            "SELECT node_id, properties FROM graph_nodes": [],
+            "FROM graph_edges": [],
+        }
+    )
+    _postgres_host(monkeypatch, fake)
+
+    diagnose(tmp_path)
+
+    node_reads = [
+        (sql, params) for sql, params in fake.executed if "graph_nodes" in sql
+    ]
+    assert node_reads, "doctor never asked PostgreSQL anything"
+    for sql, params in node_reads:
+        assert "node_id = %s" in sql, sql
+        assert "LIMIT 1" not in sql, sql
+        assert params and params[0].startswith("did:"), params
+
+
+def test_a_postgres_host_whose_anchor_names_no_agent_is_skipped_not_guessed(
+    tmp_path, monkeypatch
+):
+    """Without a DID there is no tenant to scope to, and an unscoped read of a
+    shared database would answer about someone else. Skipping says so; guessing
+    would not."""
+    _seed_with_anchored_constitution(
+        tmp_path, constitution_text=b"# C\n", stored_hash=None
+    )
+    db_path = tmp_path / "agent_data" / "test" / "kestrel_prime.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DELETE FROM graph_nodes")
+    fake = _FakePostgres({})
+    _postgres_host(monkeypatch, fake)
+
+    report = diagnose(tmp_path)
+
+    assert any("names no agent" in m for m in report.warn), report.warn
+    assert not fake.executed, "doctor queried PostgreSQL without a tenant"
+
+
+def test_sqlite_hosts_never_reach_for_postgres(tmp_path, monkeypatch):
+    """The control. Without it, a test suite that only ever runs on SQLite
+    would pass with the dispatch wired backwards."""
+    monkeypatch.delenv("KESTREL_DB_BACKEND", raising=False)
+    monkeypatch.delenv("KESTREL_DATABASE_URL", raising=False)
+    stored = _seed_matching_anchor(tmp_path, monkeypatch)
+    fake = _FakePostgres({})
+    monkeypatch.setitem(__import__("sys").modules, "psycopg2", fake)
+
+    report = diagnose(tmp_path)
+
+    assert not fake.executed
+    assert any(stored[:12] in m for m in report.ok)

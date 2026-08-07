@@ -185,29 +185,121 @@ def _check_multi_agent(
 def _anchor_is_the_runtime_database() -> bool:
     """Whether the local ``kestrel_prime.db`` is what the agents actually read.
 
-    Doctor reads agent databases with stock ``sqlite3`` — deliberately, to stay
-    out of the AsyncStorage stack — which is right on a SQLite host and wrong
-    on a PostgreSQL one, where the anchor holds the birth record (#2871) and
-    governance lives elsewhere. The full fix is #2892; this predicate exists so
-    the checks below do not *prescribe a repair that cannot land*.
-
     Same rule as ``agent_manager._initialize_agent`` and
     ``setup.constitution_reanchor.resolve_reanchor_target``: PostgreSQL **and**
-    a DSN, or SQLite. Read from the environment, not imported, so doctor keeps
-    its light dependency profile.
+    a DSN, or SQLite. Copied rather than imported so doctor keeps its light
+    dependency profile — and copied *exactly*, with no ``.strip()`` and no
+    refusal on an unknown backend, because being stricter than the runtime is
+    the same bug with the databases exchanged.
     """
     backend = os.environ.get("KESTREL_DB_BACKEND", "sqlite").lower()
     return not (backend == "postgres" and os.environ.get("KESTREL_DATABASE_URL"))
 
 
-#: Appended to any finding derived from the local anchor when that file is not
-#: the database the runtime reads.
-_ANCHOR_NOT_RUNTIME_NOTE = (
-    " NOTE: this host is configured for PostgreSQL, so this reads the local "
-    "birth record, not the database the agent is governed by. `kestrel "
-    "constitution reanchor` targets PostgreSQL and will not clear this "
-    "finding; see #2892."
-)
+@dataclass(frozen=True)
+class _GovernanceSource:
+    """Where an agent's **current** governance lives, and how to read it.
+
+    Doctor reads agent databases without the AsyncStorage stack — deliberately,
+    so a diagnostic tool cannot fail because the thing it is diagnosing fails
+    to import. That was right on SQLite, where ``kestrel_prime.db`` *is* the
+    database the runtime reads, and wrong on a PostgreSQL host, where the
+    anchor holds the birth record (#2871) and the live governance is elsewhere.
+    Doctor then reported birth-time state as current — permanently flagging
+    drift after any legitimate reanchor, and prescribing a repair that
+    correctly answers "nothing to do" (#2892). Two governance tools
+    contradicting each other is how operators learn to ignore the one that
+    cries wolf.
+
+    Staying out of the stack costs nothing here: every property doctor reads is
+    plaintext JSON in ``graph_nodes.properties`` and every edge is a plain row,
+    so no ``KESTREL_DATA_KEY`` is involved on either backend, and
+    ``psycopg2`` — already a hard dependency — is a *synchronous* driver, so
+    there is no event loop to own.
+
+    ``agent_did`` is required for PostgreSQL and comes from the **anchor**,
+    which is where identity is born on every backend (#2871, #2894). One
+    PostgreSQL database holds every local agent, so the SQLite readers'
+    ``WHERE node_type='agent' LIMIT 1`` would pick a tenant by incidental row
+    order — the same class of mistake as everything else in this cluster.
+    """
+
+    anchor_path: Path
+    dsn: str | None = None
+    agent_did: str | None = None
+
+    @property
+    def reads_the_anchor(self) -> bool:
+        return self.dsn is None
+
+    def describe(self) -> str:
+        return str(self.anchor_path) if self.reads_the_anchor else "PostgreSQL"
+
+
+def _resolve_governance_source(anchor_path: Path):
+    """Resolve where to read this agent's governance from.
+
+    Returns a :class:`_GovernanceSource`, or an ``_UnreadableDB`` sentinel when
+    the host is on PostgreSQL and the anchor cannot name the tenant to scope
+    the read to. Refusing there is right: an unscoped read of a shared database
+    would answer about whichever agent came back first.
+    """
+    if _anchor_is_the_runtime_database():
+        return _GovernanceSource(anchor_path=anchor_path)
+
+    node = _read_agent_node(_GovernanceSource(anchor_path=anchor_path))
+    if isinstance(node, _UnreadableDB):
+        return node
+    if isinstance(node, _NoAgentNode):
+        return _UnreadableDB(
+            reason=(
+                f"host is on PostgreSQL and the local anchor {anchor_path} "
+                "names no agent, so there is no tenant to scope the read to"
+            )
+        )
+    node_id, _ = node
+    return _GovernanceSource(
+        anchor_path=anchor_path,
+        dsn=os.environ["KESTREL_DATABASE_URL"],
+        agent_did=node_id,
+    )
+
+
+def _fetch_rows(
+    source: "_GovernanceSource",
+    sqlite_sql: str,
+    postgres_sql: str,
+    sqlite_params: tuple = (),
+    postgres_params: tuple = (),
+) -> list:
+    """Run the backend's form of one read-only query and return its rows.
+
+    Raises the driver's own error type; every caller maps that to
+    ``_UnreadableDB``, the same shape it always did.
+
+    Query *and* parameters are given per backend rather than templated. The
+    placeholder style differs (``?`` vs ``%s``), and so does the scoping:
+    SQLite reads the one agent in the anchor, PostgreSQL has to name its
+    tenant. Spelling both out keeps that difference where a reader can see it.
+    """
+    if source.reads_the_anchor:
+        # ``isolation_level=None`` and ``uri=False`` are the defaults; we rely
+        # on them to avoid creating a transaction we won't commit.
+        with sqlite3.connect(str(source.anchor_path)) as conn:
+            return conn.execute(sqlite_sql, sqlite_params).fetchall()
+
+    import psycopg2
+
+    # A fresh connection per query: doctor makes a handful of reads per agent,
+    # is not a hot path, and a connection that closes with its query cannot
+    # outlive a diagnostic that fails halfway.
+    connection = psycopg2.connect(source.dsn)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(postgres_sql, postgres_params)
+            return cursor.fetchall()
+    finally:
+        connection.close()
 
 
 def _check_constitution_drift(
@@ -265,7 +357,14 @@ def _check_constitution_drift(
             # Already reported by _check_multi_agent; don't duplicate.
             continue
 
-        stored_hash = _read_anchored_constitution_hash(db_path)
+        source = _resolve_governance_source(db_path)
+        if isinstance(source, _UnreadableDB):
+            report.warn.append(
+                f"{name}: constitution drift check skipped — {source.reason}"
+            )
+            continue
+
+        stored_hash = _read_anchored_constitution_hash(source)
         if isinstance(stored_hash, _UnreadableDB):
             report.warn.append(
                 f"{name}: constitution drift check skipped — {stored_hash.reason}"
@@ -289,7 +388,7 @@ def _check_constitution_drift(
         # contract if it has one. Hashing raw package bytes here would false-flag
         # every emancipated agent as "drifted" and could not diagnose an active/
         # custom agent consistently with the runtime verifier.
-        contract_json = _read_anchored_emancipation_contract(db_path)
+        contract_json = _read_anchored_emancipation_contract(source)
         try:
             from kestrel_sovereign.constitution.emancipation import (
                 EmancipationConfigError,
@@ -334,8 +433,6 @@ def _check_constitution_drift(
                 f"does not match {canonical} ({on_disk_hash[:12]}…). "
                 f"Run `kestrel constitution reanchor --agent-name {name} --force` "
                 f"to update (DB is backed up first)."
-                + ("" if _anchor_is_the_runtime_database()
-                   else _ANCHOR_NOT_RUNTIME_NOTE)
             )
 
 
@@ -380,7 +477,12 @@ def _check_anchor_consistency(
             # Already a fail in _check_multi_agent; don't duplicate.
             continue
 
-        node = _read_agent_node(db_path)
+        source = _resolve_governance_source(db_path)
+        if isinstance(source, _UnreadableDB):
+            # Already warned by _check_constitution_drift.
+            continue
+
+        node = _read_agent_node(source)
         if isinstance(node, (_UnreadableDB, _NoAgentNode)):
             # Already warned by _check_constitution_drift.
             continue
@@ -390,13 +492,13 @@ def _check_anchor_consistency(
             # warns (missing constitution_hash); nothing verifiable here.
             continue
 
-        _check_governance_edge(name, db_path, node_id, properties, report)
+        _check_governance_edge(name, source, node_id, properties, report)
         _check_overlay_anchor(name, agent_dir, properties, report)
 
 
 def _check_governance_edge(
     name: str,
-    db_path: Path,
+    source: "_GovernanceSource",
     node_id: str,
     properties: dict,
     report: DoctorReport,
@@ -407,7 +509,7 @@ def _check_governance_edge(
         # No anchor to agree with; _check_constitution_drift already warns.
         return
 
-    targets = _read_governed_by_targets(db_path, node_id)
+    targets = _read_governed_by_targets(source, node_id)
     if isinstance(targets, _UnreadableDB):
         # FAIL, not warn: we could read the agent node moments ago, so the
         # DB is not sqlcipher-encrypted — the edges specifically cannot be
@@ -423,8 +525,6 @@ def _check_governance_edge(
             f"safe-mode this agent at next boot. Run `kestrel constitution "
             f"reanchor --agent-name {name} --force` with a signed artifact "
             f"to repair (DB is backed up first)."
-            + ("" if _anchor_is_the_runtime_database()
-               else _ANCHOR_NOT_RUNTIME_NOTE)
         )
         return
 
@@ -444,8 +544,6 @@ def _check_governance_edge(
                 f"({', '.join(t[:12] + '…' for t in stale)}). Boot will "
                 f"succeed, but `kestrel constitution reanchor --agent-name "
                 f"{name} --force` will remove them."
-                + ("" if _anchor_is_the_runtime_database()
-                   else _ANCHOR_NOT_RUNTIME_NOTE)
             )
     elif targets:
         report.fail.append(
@@ -455,8 +553,6 @@ def _check_governance_edge(
             f"agent at next boot. Run `kestrel constitution reanchor "
             f"--agent-name {name} --force` with a signed artifact to repair "
             f"(DB is backed up first)."
-            + ("" if _anchor_is_the_runtime_database()
-               else _ANCHOR_NOT_RUNTIME_NOTE)
         )
     else:
         report.fail.append(
@@ -465,8 +561,6 @@ def _check_governance_edge(
             f"audit (proof 2) will safe-mode this agent at next boot. Run "
             f"`kestrel constitution reanchor --agent-name {name} --force` "
             f"with a signed artifact to repair (DB is backed up first)."
-            + ("" if _anchor_is_the_runtime_database()
-               else _ANCHOR_NOT_RUNTIME_NOTE)
         )
 
 
@@ -573,6 +667,36 @@ def _canonical_constitution_path() -> Path:
     return Path(CONSTITUTION_PATH)
 
 
+#: The queries doctor issues, per backend. SQLite reads the one agent in the
+#: anchor; PostgreSQL holds every local agent, so it names its tenant — the
+#: ``LIMIT 1`` that is correct on a per-agent file would pick a neighbour by
+#: incidental row order on a shared database.
+_AGENT_PROPERTIES_SQLITE = (
+    "SELECT properties FROM graph_nodes WHERE node_type='agent' LIMIT 1"
+)
+_AGENT_PROPERTIES_PG = (
+    "SELECT properties FROM graph_nodes "
+    "WHERE node_id = %s AND node_type = 'agent'"
+)
+_AGENT_NODE_SQLITE = (
+    "SELECT node_id, properties FROM graph_nodes "
+    "WHERE node_type='agent' LIMIT 1"
+)
+_AGENT_NODE_PG = (
+    "SELECT node_id, properties FROM graph_nodes "
+    "WHERE node_id = %s AND node_type = 'agent'"
+)
+#: ``source_id`` is the agent's own DID, so this is already tenant-scoped.
+_GOVERNED_BY_SQLITE = (
+    "SELECT target_id FROM graph_edges "
+    "WHERE source_id=? AND label='governed_by'"
+)
+_GOVERNED_BY_PG = (
+    "SELECT target_id FROM graph_edges "
+    "WHERE source_id = %s AND label = 'governed_by'"
+)
+
+
 @dataclass(frozen=True)
 class _UnreadableDB:
     """Sentinel: the agent DB exists but stock sqlite3 can't open it."""
@@ -590,7 +714,7 @@ class _NoHashProperty:
     """Sentinel: agent node found but properties has no constitution_hash."""
 
 
-def _read_anchored_constitution_hash(db_path: Path):
+def _read_anchored_constitution_hash(source: "_GovernanceSource"):
     """Read the agent node's constitution_hash from a Kestrel DB.
 
     Returns:
@@ -602,23 +726,22 @@ def _read_anchored_constitution_hash(db_path: Path):
           ``constitution_hash`` property.
     """
     try:
-        # ``isolation_level=None`` and ``uri=False`` are the default; we
-        # rely on the default to avoid creating a transaction we won't commit.
-        with sqlite3.connect(str(db_path)) as conn:
-            row = conn.execute(
-                "SELECT properties FROM graph_nodes "
-                "WHERE node_type='agent' LIMIT 1"
-            ).fetchone()
+        rows = _fetch_rows(
+            source, _AGENT_PROPERTIES_SQLITE, _AGENT_PROPERTIES_PG,
+            postgres_params=(source.agent_did,),
+        )
     except sqlite3.DatabaseError as exc:
         # 'file is not a database' (sqlcipher-encrypted) lands here.
         return _UnreadableDB(reason=f"DB unreadable ({exc})")
     except sqlite3.Error as exc:
         return _UnreadableDB(reason=f"sqlite error ({exc})")
+    except Exception as exc:  # noqa: BLE001 — psycopg2 raises its own tree
+        return _UnreadableDB(reason=f"cannot read {source.describe()} ({exc})")
 
-    if row is None:
+    if not rows:
         return _NoAgentNode()
 
-    properties_raw = row[0]
+    properties_raw = rows[0][0]
     if properties_raw is None:
         return _NoHashProperty()
 
@@ -641,7 +764,7 @@ def _read_anchored_constitution_hash(db_path: Path):
     return stored_hash
 
 
-def _read_anchored_emancipation_contract(db_path: Path):
+def _read_anchored_emancipation_contract(source: "_GovernanceSource"):
     """Read the agent node's ``emancipation_contract`` property from a Kestrel DB.
 
     Returns the raw property value (typically a JSON string or dict, as anchored
@@ -652,22 +775,21 @@ def _read_anchored_emancipation_contract(db_path: Path):
     canonical bytes, which is the right expectation for a non-emancipated agent.
     """
     try:
-        with sqlite3.connect(str(db_path)) as conn:
-            row = conn.execute(
-                "SELECT properties FROM graph_nodes "
-                "WHERE node_type='agent' LIMIT 1"
-            ).fetchone()
-    except sqlite3.Error:
+        rows = _fetch_rows(
+            source, _AGENT_PROPERTIES_SQLITE, _AGENT_PROPERTIES_PG,
+            postgres_params=(source.agent_did,),
+        )
+    except Exception:  # noqa: BLE001 — failing soft to None is this reader's contract
         return None
 
-    if row is None or row[0] is None:
+    if not rows or rows[0][0] is None:
         return None
 
     try:
         properties = (
-            json.loads(row[0])
-            if isinstance(row[0], (str, bytes, bytearray))
-            else row[0]
+            json.loads(rows[0][0])
+            if isinstance(rows[0][0], (str, bytes, bytearray))
+            else rows[0][0]
         )
     except (TypeError, ValueError):
         return None
@@ -678,7 +800,7 @@ def _read_anchored_emancipation_contract(db_path: Path):
     return properties.get("emancipation_contract")
 
 
-def _read_agent_node(db_path: Path):
+def _read_agent_node(source: "_GovernanceSource"):
     """Read the agent node's id + properties from a Kestrel DB.
 
     Returns:
@@ -689,20 +811,21 @@ def _read_agent_node(db_path: Path):
           matching ``_read_anchored_constitution_hash``.
     """
     try:
-        with sqlite3.connect(str(db_path)) as conn:
-            row = conn.execute(
-                "SELECT node_id, properties FROM graph_nodes "
-                "WHERE node_type='agent' LIMIT 1"
-            ).fetchone()
+        rows = _fetch_rows(
+            source, _AGENT_NODE_SQLITE, _AGENT_NODE_PG,
+            postgres_params=(source.agent_did,),
+        )
     except sqlite3.DatabaseError as exc:
         return _UnreadableDB(reason=f"DB unreadable ({exc})")
     except sqlite3.Error as exc:
         return _UnreadableDB(reason=f"sqlite error ({exc})")
+    except Exception as exc:  # noqa: BLE001 — psycopg2 raises its own tree
+        return _UnreadableDB(reason=f"cannot read {source.describe()} ({exc})")
 
-    if row is None:
+    if not rows:
         return _NoAgentNode()
 
-    node_id, properties_raw = row
+    node_id, properties_raw = rows[0]
     if properties_raw is None:
         return node_id, None
 
@@ -721,7 +844,7 @@ def _read_agent_node(db_path: Path):
     return node_id, properties
 
 
-def _read_governed_by_targets(db_path: Path, source_id: str):
+def _read_governed_by_targets(source: "_GovernanceSource", source_id: str):
     """Return the targets of the agent's ``governed_by`` edges.
 
     Returns a tuple of target hashes (possibly empty), or
@@ -730,15 +853,17 @@ def _read_governed_by_targets(db_path: Path, source_id: str):
     ``graph_edges`` table.
     """
     try:
-        with sqlite3.connect(str(db_path)) as conn:
-            rows = conn.execute(
-                "SELECT target_id FROM graph_edges "
-                "WHERE source_id=? AND label='governed_by'",
-                (source_id,),
-            ).fetchall()
+        rows = _fetch_rows(
+            source, _GOVERNED_BY_SQLITE, _GOVERNED_BY_PG,
+            sqlite_params=(source_id,), postgres_params=(source_id,),
+        )
     except sqlite3.DatabaseError as exc:
         return _UnreadableDB(reason=f"cannot read graph_edges ({exc})")
     except sqlite3.Error as exc:
         return _UnreadableDB(reason=f"sqlite error reading graph_edges ({exc})")
+    except Exception as exc:  # noqa: BLE001 — psycopg2 raises its own tree
+        return _UnreadableDB(
+            reason=f"cannot read graph_edges in {source.describe()} ({exc})"
+        )
 
     return tuple(row[0] for row in rows if row[0])
