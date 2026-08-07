@@ -1,6 +1,6 @@
 import logging
 import re
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
@@ -8,26 +8,67 @@ from kestrel_sovereign.features.base import Feature, tool
 
 logger = logging.getLogger(__name__)
 
+#: Any Book-level (``##``) or sub-unit-level (``###``) heading.
+_HEADING = re.compile(r"^(#{2,3}) (.+)$", re.M)
+#: ``Book <roman>: <title>``
+_BOOK_TITLE = re.compile(r"^Book ([IVX]+):")
+#: ``<Chapter|Section|Amendment> <id>: <title>``. Chapters and Sections number
+#: in arabic within their Book; Amendments number in roman across Book II.
+_SUBUNIT_TITLE = re.compile(r"^(Chapter|Section|Amendment) ([IVX]+|\d+):")
+
+_ROMAN_TO_INT = {
+    "I": 1, "II": 2, "III": 3, "IV": 4, "V": 5,
+    "VI": 6, "VII": 7, "VIII": 8, "IX": 9, "X": 10,
+}
+_INT_TO_ROMAN = {value: key for key, value in _ROMAN_TO_INT.items()}
+
+
+def _as_index(identifier: str) -> Optional[int]:
+    """Return the integer value of an arabic or roman identifier, or None."""
+    ident = identifier.strip().upper()
+    if ident.isdigit():
+        return int(ident)
+    return _ROMAN_TO_INT.get(ident)
+
+
+def _extent(text: str, headings: List["re.Match"], position: int, level: int) -> int:
+    """Return the offset at which the unit opened at ``position`` ends.
+
+    A unit runs until the next heading of the same or higher level, so a Book
+    swallows its own Chapters/Sections/Amendments but stops at the next Book.
+    """
+    for later in headings[position + 1:]:
+        if len(later.group(1)) <= level:
+            return later.start()
+    return len(text)
+
+
 class ConstitutionFeature(Feature):
     """
     Feature for accessing and querying the Kestrel Constitution.
 
-    Supports the hierarchical constitution (Books I-IV, Amendments I-VIII)
-    as well as legacy Article-based queries for backward compatibility.
+    Addresses the document by the units it actually uses: Books I-IV, the
+    Chapters of Book I, the Amendments of Book II, and the Sections of
+    Books III-IV.
     """
 
     def __init__(self, agent):
         super().__init__(agent)
         self.full_text = ""
-        self.articles: Dict[str, str] = {}
         self.books: Dict[str, str] = {}
+        self.chapters: Dict[str, str] = {}
+        self.sections: Dict[str, str] = {}
         self.amendments: Dict[str, str] = {}
+        #: Unnumbered top-level sections that frame the Books rather than sit
+        #: inside the hierarchy — the Preamble and the Amendment Process.
+        #: Keyed by lowercased title, with a "the "-stripped alias.
+        self.frame: Dict[str, str] = {}
         self.summary = ""
 
     @property
     def tool_description(self) -> str:
         """Description for A2A agent card."""
-        return "Access the Kestrel Constitution - view full text, specific books, amendments, or search for terms"
+        return "Access the Kestrel Constitution - view full text, specific books, chapters, amendments, sections, or search for terms"
 
     async def initialize(self):
         """Load and parse the constitution."""
@@ -42,9 +83,7 @@ class ConstitutionFeature(Feature):
             else:
                 self.full_text = self._read_canonical_constitution()
 
-            self._parse_articles()
-            self._parse_books()
-            self._parse_amendments()
+            self._parse_structure()
             self._generate_summary()
             logger.info("ConstitutionFeature initialized successfully")
         except Exception as e:
@@ -81,69 +120,76 @@ class ConstitutionFeature(Feature):
             f"KESTREL_CONSTITUTION.md not found at any of: {searched}"
         )
 
-    def _parse_articles(self):
-        """Parse the constitution into articles (legacy + Article V which remains)."""
-        # Split by "## Article"
-        parts = re.split(r'(?=## Article)', self.full_text)
+    def _parse_structure(self) -> None:
+        """Parse Books and their sub-units in a single pass.
 
-        for part in parts:
-            if part.strip().startswith("## Article"):
-                # Extract article number/title
-                match = re.match(r'## (Article [IVX]+):', part)
-                if match:
-                    key = match.group(1) # e.g., "Article I"
-                    # Normalize key for easier lookup (e.g., "1", "I")
-                    self.articles[key] = part.strip()
+        Sub-unit numbering restarts inside each Book — Books III and IV both
+        open with a "Section 1" — so Chapters and Sections are keyed by their
+        owning Book (``"III.2"``). A bare id resolves only while it is unique
+        across the document; when two Books both answer to it, the lookup
+        names the qualified alternatives instead of picking one. Amendments
+        are unique document-wide and keep their own numbering.
+        """
+        self.books = {}
+        self.chapters = {}
+        self.sections = {}
+        self.amendments = {}
+        self.frame = {}
 
-                    # Also map numeric index if possible
-                    roman_to_int = {
-                        "I": "1", "II": "2", "III": "3", "IV": "4", "V": "5",
-                        "VI": "6", "VII": "7", "VIII": "8", "IX": "9", "X": "10"
-                    }
-                    roman = key.split(" ")[1]
-                    if roman in roman_to_int:
-                        self.articles[roman_to_int[roman]] = part.strip()
+        headings = list(_HEADING.finditer(self.full_text))
+        current_book: Optional[str] = None
 
-    def _parse_books(self):
-        """Parse the constitution into Books (I-IV)."""
-        book_pattern = re.compile(r'(?=## Book [IVX]+:)')
-        parts = book_pattern.split(self.full_text)
+        for position, match in enumerate(headings):
+            level = len(match.group(1))
+            title = match.group(2).strip()
+            end = _extent(self.full_text, headings, position, level)
+            body = self.full_text[match.start():end].strip()
 
-        for part in parts:
-            if part.strip().startswith("## Book"):
-                match = re.match(r'## (Book [IVX]+):', part)
-                if match:
-                    key = match.group(1)  # e.g., "Book I"
-                    self.books[key] = part.strip()
+            if level == 2:
+                book = _BOOK_TITLE.match(title)
+                current_book = book.group(1) if book else None
+                if book:
+                    self._record(self.books, "Book", book.group(1), body)
+                else:
+                    self._record_frame(title, body)
+                continue
 
-                    # Also map by number
-                    roman_to_int = {
-                        "I": "1", "II": "2", "III": "3", "IV": "4",
-                    }
-                    roman = key.split(" ")[1]
-                    if roman in roman_to_int:
-                        self.books[roman_to_int[roman]] = part.strip()
+            subunit = _SUBUNIT_TITLE.match(title)
+            if subunit is None:
+                continue
 
-    def _parse_amendments(self):
-        """Parse Book II into individual Amendments."""
-        amendment_pattern = re.compile(r'(?=### Amendment [IVX]+:)')
-        parts = amendment_pattern.split(self.full_text)
+            unit, identifier = subunit.group(1), subunit.group(2)
+            if unit == "Amendment":
+                self._record(self.amendments, "Amendment", identifier, body)
+            elif current_book is not None:
+                index = _as_index(identifier)
+                if index is not None:
+                    table = self.chapters if unit == "Chapter" else self.sections
+                    table[f"{current_book}.{index}"] = body
 
-        for part in parts:
-            if part.strip().startswith("### Amendment"):
-                match = re.match(r'### (Amendment [IVX]+):', part)
-                if match:
-                    key = match.group(1)  # e.g., "Amendment I"
-                    self.amendments[key] = part.strip()
+    def _record_frame(self, title: str, body: str) -> None:
+        """Key an unnumbered top-level section by the names people type.
 
-                    # Also map by number
-                    roman_to_int = {
-                        "I": "1", "II": "2", "III": "3", "IV": "4", "V": "5",
-                        "VI": "6", "VII": "7", "VIII": "8", "IX": "9", "X": "10"
-                    }
-                    roman = key.split(" ")[1]
-                    if roman in roman_to_int:
-                        self.amendments[roman_to_int[roman]] = part.strip()
+        Registers the full title, the part before any colon, and the
+        "the "-stripped form of each. Keying on the pre-colon head is what
+        lets an agent still anchored to an older constitution reach a section
+        by its short name — the parser is structural, so it addresses whatever
+        headings that agent's governing text actually carries.
+        """
+        for name in {title.lower(), title.split(":", 1)[0].strip().lower()}:
+            if not name:
+                continue
+            self.frame[name] = body
+            if name.startswith("the "):
+                self.frame[name[len("the "):]] = body
+
+    @staticmethod
+    def _record(table: Dict[str, str], unit: str, identifier: str, body: str) -> None:
+        """Key a top-level unit by both its name ("Book I") and its number."""
+        table[f"{unit} {identifier}"] = body
+        index = _as_index(identifier)
+        if index is not None:
+            table[str(index)] = body
 
     def _generate_summary(self):
         """Generate a brief summary for the system prompt."""
@@ -158,7 +204,7 @@ class ConstitutionFeature(Feature):
 
     @tool(
         name="constitution",
-        description="Get the full text of the Kestrel Constitution, specific books, amendments, or articles. Two-slot grammar: 'article' is the subcommand keyword {book, amendment, article, search, summary} and 'search' is the identifier/term — e.g. article='book' search='I', article='amendment' search='VIII', article='search' search='honesty'. Omit both for full text; article='summary' for the executive summary.",
+        description="Get the full text of the Kestrel Constitution, or one of its units. Two-slot grammar: 'article' is the subcommand keyword {book, chapter, amendment, section, search, summary} and 'search' is the identifier/term — e.g. article='book' search='I', article='chapter' search='5', article='amendment' search='VIII', article='section' search='III.2', article='search' search='honesty'. Chapter and Section numbering restarts in each Book, so qualify them as <book>.<n> when the bare number is ambiguous. Omit both slots for the full text; article='summary' for the executive summary.",
         category=ToolCategory.SYSTEM,
         command_prefix="!constitution"
     )
@@ -168,86 +214,87 @@ class ConstitutionFeature(Feature):
 
         Usage:
             !constitution                  - Full text
-            !constitution book I           - Specific book (I, II, III, IV or 1, 2, 3, 4)
-            !constitution amendment I      - Specific amendment (I-VIII or 1-8)
-            !constitution article V        - Article V (amendment process)
+            !constitution book I           - A Book (I-IV or 1-4)
+            !constitution chapter 5        - A Chapter of Book I
+            !constitution amendment VIII   - An Amendment of Book II (I-IX or 1-9)
+            !constitution section III.2    - A Section of Book III or IV
+            !constitution preamble         - A framing section (not a Book)
+            !constitution amendment process
             !constitution search <term>    - Search for term
             !constitution summary          - Brief summary
 
         Args:
             article: Specific section identifier or subcommand keyword
-            search: Search term or section identifier
+            search: Search term or unit identifier
             summary: If True, returns the executive summary
         """
-        def _wrap(body: str, *, kind: str = "section") -> ToolResult:
-            """Detect not-found bodies via prefix match and route to ERROR.
-            Constitution lookups return strings whose first token signals
-            the outcome ("Book 'X' not found.", "Amendment 'X' not
-            found.", "Section 'X' not found...", "No constitutional
-            sections found matching..."). The honesty contract requires
-            those to surface as ERROR rather than OK with apologetic
-            text.
-
-            Two-track classification: bodies that quote a specific id
-            (Book/Amendment/Section) AND say "not found" are ERRORs;
-            "No constitutional sections found matching ..." (no
-            specific id, just a search miss) is also ERROR — the
-            search failed to find anything, the agent must speak that
-            rather than narrate a happy summary.
-            """
-            specific_not_found_prefixes = (
-                "Book '", "No book",
-                "Amendment '", "No amendment",
-                "Article '",
-                "Section '",
-            )
-            empty_search_prefix = "No constitutional sections found"
-            if any(body.startswith(p) for p in specific_not_found_prefixes) and "not found" in body:
-                return ToolResult.failed(body, data={"kind": kind})
-            if body.startswith(empty_search_prefix):
-                return ToolResult.failed(body, data={"kind": kind})
+        def ok(body: str, kind: str) -> ToolResult:
             return ToolResult.ok(confirmation=body, data={"kind": kind})
 
+        def failed(body: str, kind: str) -> ToolResult:
+            # The honesty contract requires a miss to surface as ERROR rather
+            # than OK carrying apologetic text.
+            return ToolResult.failed(body, data={"kind": kind})
+
         if article:
-            article_lower = article.lower()
-            if article_lower == "summary":
-                return _wrap(self.summary, kind="summary")
-            elif article_lower == "book" and search:
-                return _wrap(self._get_book(search), kind="book")
-            elif article_lower == "amendment" and search:
-                return _wrap(self._get_amendment(search), kind="amendment")
-            elif article_lower == "article" and search:
-                # Resolve the article DIRECTLY — do not fall into the generic
-                # book→amendment→article cascade below, where an amendment of
-                # the same id (e.g. Amendment V) shadows the requested Article V.
-                return _wrap(self._get_article(search), kind="article")
-            elif article_lower == "search" and search:
+            keyword = article.lower()
+            if search:
+                # A framing section is named by a phrase, not an id, so the two
+                # slots hold its two words: `!constitution amendment process`
+                # means the section, not Amendment 'process'. Frame names never
+                # collide with a subcommand + identifier, so this is safe first.
+                framed = self.frame.get(f"{keyword} {search}".strip().lower())
+                if framed:
+                    return ok(framed, "frame")
+            if keyword == "summary":
+                return ok(self.summary, "summary")
+            if keyword == "book" and search:
+                body = self._get_book(search)
+                return ok(body, "book") if body else failed(
+                    f"Book '{search}' not found. Available books: {self._available(self.books, 'Book')}.",
+                    "book",
+                )
+            if keyword == "amendment" and search:
+                body = self._get_amendment(search)
+                return ok(body, "amendment") if body else failed(
+                    f"Amendment '{search}' not found. "
+                    f"Available amendments: {self._available(self.amendments, 'Amendment')}.",
+                    "amendment",
+                )
+            if keyword in ("chapter", "section") and search:
+                unit = keyword.capitalize()
+                body, error = self._resolve_subunit(unit, search)
+                return ok(body, keyword) if body else failed(error, keyword)
+            if keyword == "search" and search:
                 article = None
 
         if summary:
-            return _wrap(self.summary, kind="summary")
+            return ok(self.summary, "summary")
 
         if article:
-            # Try books first, then amendments, then articles
-            result = self._get_book(article)
-            if not result.startswith("Book '") and not result.startswith("No book"):
-                return _wrap(result, kind="book")
+            # Bare identifier: Books and Amendments only. Chapters and Sections
+            # stay behind their keyword — their numbering restarts per Book, so
+            # a cascade would have to guess between "Chapter 5" and "Book V".
+            body = self._get_book(article)
+            if body:
+                return ok(body, "book")
 
-            result = self._get_amendment(article)
-            if not result.startswith("Amendment '") and not result.startswith("No amendment"):
-                return _wrap(result, kind="amendment")
+            body = self._get_amendment(article)
+            if body:
+                return ok(body, "amendment")
 
-            content = self.articles.get(str(article))
-            if not content:
-                content = self.articles.get(f"Article {article}")
+            body = self.frame.get(str(article).strip().lower())
+            if body:
+                return ok(body, "frame")
 
-            if content:
-                return _wrap(content, kind="article")
-            return _wrap(
-                f"Section '{article}' not found. "
-                f"Available books: {', '.join(sorted([k for k in self.books.keys() if k.startswith('Book')]))}. "
-                f"Available amendments: {', '.join(sorted([k for k in self.amendments.keys() if k.startswith('Amendment')]))}.",
-                kind="section",
+            return failed(
+                f"No Book, Amendment, or framing section named '{article}'. "
+                f"Available books: {self._available(self.books, 'Book')}. "
+                f"Available amendments: {self._available(self.amendments, 'Amendment')}. "
+                f"Framing sections: {self._available_frame()}. "
+                f"Chapters and Sections need their keyword — `!constitution chapter 5`, "
+                f"`!constitution section III.2` — because their numbering restarts in each Book.",
+                "lookup",
             )
 
         if search:
@@ -259,43 +306,85 @@ class ConstitutionFeature(Feature):
                 if key.startswith("Amendment") and search.lower() in content.lower():
                     if not any(content in r for r in results):
                         results.append(content)
-            for key, content in self.articles.items():
-                if key.startswith("Article") and search.lower() in content.lower():
+            for content in self.frame.values():
+                if search.lower() in content.lower():
                     if not any(content in r for r in results):
                         results.append(content)
 
             if results:
-                return _wrap("\n\n---\n\n".join(results), kind="search")
-            return _wrap(
+                return ok("\n\n---\n\n".join(results), "search")
+            return failed(
                 f"No constitutional sections found matching '{search}'.",
-                kind="search",
+                "search",
             )
 
-        return _wrap(self.full_text, kind="full_text")
+        return ok(self.full_text, "full_text")
 
-    def _get_book(self, identifier: str) -> str:
-        """Look up a book by number or roman numeral."""
-        content = self.books.get(str(identifier))
-        if not content:
-            content = self.books.get(f"Book {identifier}")
-        if content:
-            return content
-        return f"Book '{identifier}' not found."
+    def _get_book(self, identifier: str) -> Optional[str]:
+        """Look up a Book by number or roman numeral."""
+        return self.books.get(str(identifier)) or self.books.get(f"Book {identifier}")
 
-    def _get_amendment(self, identifier: str) -> str:
-        """Look up an amendment by number or roman numeral."""
-        content = self.amendments.get(str(identifier))
-        if not content:
-            content = self.amendments.get(f"Amendment {identifier}")
-        if content:
-            return content
-        return f"Amendment '{identifier}' not found."
+    def _get_amendment(self, identifier: str) -> Optional[str]:
+        """Look up an Amendment by number or roman numeral."""
+        return (
+            self.amendments.get(str(identifier))
+            or self.amendments.get(f"Amendment {identifier}")
+        )
 
-    def _get_article(self, identifier: str) -> str:
-        """Look up an article by number or roman numeral."""
-        content = self.articles.get(str(identifier))
-        if not content:
-            content = self.articles.get(f"Article {identifier}")
-        if content:
-            return content
-        return f"Article '{identifier}' not found."
+    def _resolve_subunit(self, unit: str, identifier: str) -> Tuple[Optional[str], Optional[str]]:
+        """Resolve a Chapter or Section reference.
+
+        Accepts a Book-qualified reference (``"III.2"``, ``"3.2"``, ``"III 2"``)
+        or a bare one (``"5"``). A bare reference that two Books both answer to
+        is refused with the qualified alternatives named — never silently
+        resolved to the first match.
+
+        Returns:
+            ``(body, None)`` on a hit, ``(None, error)`` on a miss or an
+            ambiguous reference.
+        """
+        table = self.chapters if unit == "Chapter" else self.sections
+        raw = str(identifier).strip().replace(":", ".").replace(" ", ".")
+        book_part, _, index_part = raw.rpartition(".")
+
+        index = _as_index(index_part)
+        if index is None:
+            return None, self._subunit_not_found(unit, identifier)
+
+        if book_part:
+            book_index = _as_index(book_part)
+            roman = _INT_TO_ROMAN.get(book_index) if book_index is not None else None
+            if roman is None:
+                return None, self._subunit_not_found(unit, identifier)
+            body = table.get(f"{roman}.{index}")
+            return (body, None) if body else (None, self._subunit_not_found(unit, identifier))
+
+        matches = sorted(key for key in table if key.rsplit(".", 1)[1] == str(index))
+        if len(matches) == 1:
+            return table[matches[0]], None
+        if len(matches) > 1:
+            return None, (
+                f"{unit} '{identifier}' is ambiguous — {', '.join(matches)} all answer to it, "
+                f"because {unit.lower()} numbering restarts in each Book. Qualify it, "
+                f"e.g. `!constitution {unit.lower()} {matches[0]}`."
+            )
+        return None, self._subunit_not_found(unit, identifier)
+
+    def _subunit_not_found(self, unit: str, identifier: str) -> str:
+        table = self.chapters if unit == "Chapter" else self.sections
+        available = ", ".join(sorted(table)) if table else "(none parsed)"
+        return f"{unit} '{identifier}' not found. Available {unit.lower()}s: {available}."
+
+    @staticmethod
+    def _available(table: Dict[str, str], unit: str) -> str:
+        """Render the named (non-numeric) keys of a unit table for an error."""
+        named = sorted(key for key in table if key.startswith(unit))
+        return ", ".join(named) if named else "(none parsed)"
+
+    def _available_frame(self) -> str:
+        """Render the canonical framing-section names (aliases suppressed)."""
+        canonical = sorted(
+            name for name in self.frame
+            if f"the {name}" not in self.frame
+        )
+        return ", ".join(canonical) if canonical else "(none parsed)"

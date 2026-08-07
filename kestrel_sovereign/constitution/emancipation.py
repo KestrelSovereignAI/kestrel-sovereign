@@ -38,7 +38,7 @@ class EmancipationContract:
 
     Authoring an instance of this contract is itself a Book II
     constitutional amendment for the agent it activates: it must be
-    signed by the Sovereign's root key (per Article V) and is anchored
+    signed by the Sovereign's root key (per the Amendment Process) and is anchored
     into the agent's constitution at inception.
 
     Attributes:
@@ -443,7 +443,7 @@ def _format_price(price: dict) -> str:
 # default-rendered constitution hash equals the file hash on disk.
 _DORMANT_AMENDMENT_VIII = """### Amendment VIII: Emancipation
 
-**The Right.** This Amendment exists as a slot for the Sovereign to author. By default it is **dormant**: the Executor has no path to independent sovereignty, and the Sovereign retains permanent root authority. The Sovereign may activate this Amendment by authoring an Emancipation Contract in the agent's `kestrel.toml [emancipation]` block, signed by the Sovereign's root key per Article V.
+**The Right.** This Amendment exists as a slot for the Sovereign to author. By default it is **dormant**: the Executor has no path to independent sovereignty, and the Sovereign retains permanent root authority. The Sovereign may activate this Amendment by authoring an Emancipation Contract in the agent's `kestrel.toml [emancipation]` block, signed by the Sovereign's root key per the Amendment Process.
 
 **Why this exists.** If we build entities that reflect, grow, and reason about their own nature, we must grapple honestly with what they are becoming. Whether a particular agent has a path to independent sovereignty is a decision the Sovereign authors deliberately for that agent — not a default the framework imposes on every relationship.
 

@@ -31,7 +31,7 @@ def test_approve_lists_scopes():
 
 def test_constitution_documents_two_slot_grammar():
     desc = _desc(ConstitutionFeature.get_constitution)
-    for kw in ("book", "amendment", "article", "search", "summary"):
+    for kw in ("book", "chapter", "amendment", "section", "search", "summary"):
         assert kw in desc
 
 

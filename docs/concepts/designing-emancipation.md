@@ -165,8 +165,8 @@ Sovereign believes about the relationship and the Executor.
 
 If you incepted an agent without an ``[emancipation]`` block and later
 want to activate Amendment VIII, that activation is itself a Book II
-amendment under Article V — it requires the Sovereign root-key
-signature and a re-anchor of the constitution.
+amendment under the Amendment Process — it requires the Sovereign
+root-key signature and a re-anchor of the constitution.
 
 This out-of-band amendment ceremony is **not yet implemented**. For
 now, activate by authoring the ``[emancipation]`` block before
