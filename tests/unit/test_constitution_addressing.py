@@ -46,9 +46,23 @@ def test_amendment_process_governs_its_own_amendment():
     amendment clause at all; it was unamendable by omission."""
     body = _feature().frame["the amendment process"]
     assert "**The Preamble and this section**" in body
-    # Both gates, not either: the frame can widen every layer beneath it.
-    assert "consensus of the Kestrel governance body" in body
     assert "signed by the Sovereign's root private key" in body
+
+
+def test_no_clause_invokes_an_authority_the_system_cannot_verify():
+    """Every gate must name an authority the code can actually check.
+
+    Article V invoked "consensus of the Kestrel governance body" — a party
+    defined nowhere, with no membership, no convening rule, and no artifact.
+    ``verify_reanchor_artifact`` can verify exactly one authority: a signature
+    from the trusted Sovereign DID. A clause naming anything else states a
+    procedure the machinery cannot perform, which is the document lying about
+    itself in the one place it describes itself.
+    """
+    assert "governance body" not in CANONICAL
+    process = _feature().frame["the amendment process"]
+    for clause in ("1. **Book I**", "5. **The Preamble"):
+        assert clause in process
 
 
 def test_prior_constitution_changelog_is_gone():

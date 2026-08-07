@@ -244,10 +244,10 @@ Agents may be configured for specific roles:
 
 This Constitution can be amended according to the following rules:
 
-1. **Book I** amendments require consensus of the Kestrel governance body and are expected to be exceptionally rare. These represent universal values.
+1. **Book I** amendments are authored by the framework and are expected to be exceptionally rare. These represent universal values, adopted from upstream rather than composed here. A change reaches an agent only when a new release of the packaged constitution is anchored by that agent's Sovereign.
 2. **Book II** amendments require a declaration of intent cryptographically signed by the Sovereign's root private key, verified against the Genesis DID Document.
 3. **Book III** amendments follow the Castle governance process, validated against Books I and II.
 4. **Book IV** amendments are managed by the agent's Sovereign or delegated administrator, validated against all higher layers.
-5. **The Preamble and this section** — the Book hierarchy, the Iron Rule, and this amendment process itself — require **both** gates: consensus of the Kestrel governance body **and** a declaration of intent cryptographically signed by the Sovereign's root private key, verified against the Genesis DID Document. The frame can widen every layer beneath it, so under the Iron Rule it must clear the strictest gate any layer it governs requires.
+5. **The Preamble and this section** — the Book hierarchy, the Iron Rule, and this amendment process itself — require a declaration of intent cryptographically signed by the Sovereign's root private key, verified against the Genesis DID Document. The frame can widen every layer beneath it, so under the Iron Rule it must clear the strictest gate any layer it governs requires; that gate is the Sovereign's key, and no authority stands above it.
 
 All amendments must be stored immutably within the agent's anchored memory logs. The Genesis DID itself cannot be rotated; if key rotation is required, it must be achieved through the existing key rotation ceremony (`kestrel_sovereign/identity/rotation_ceremony.py`); emancipation is not a substitute for routine rotation and is only available when Amendment VIII is active for the agent.
