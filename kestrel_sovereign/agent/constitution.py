@@ -1508,6 +1508,71 @@ class ConstitutionMixin:
                 f"does not start with expected prefix '{expected_hash}'."
             )
 
+        # Amendment VIII on an agent with NO structured receipt (#2465). Its
+        # anchored bytes are the only record of the contract, so ``reanchor_
+        # contract`` above is None and the resolver just rendered the dormant
+        # canonical text — which a Sovereign-signed artifact over those exact
+        # bytes would then authorize, erasing the authored terms. Refuse before
+        # any crypto or write. Shared with the offline CLI so the two entry
+        # points cannot diverge on this.
+        if old_hash != "none":
+            from kestrel_sovereign.constitution.anchored_bytes import (
+                read_anchored_constitution,
+            )
+            from kestrel_sovereign.constitution.emancipation import (
+                unwitnessed_emancipation_downgrade,
+            )
+
+            # ABSENT and UNREADABLE are different answers, and only the
+            # ungoverned connection can tell them apart: ``self.storage`` is
+            # bound to this agent, so a blob with no ``file_owners`` row reads
+            # back as absent — the state of every agent in the cohort this
+            # guard protects whose governance edge has drifted (#2649/#2616).
+            # See :mod:`kestrel_sovereign.constitution.anchored_bytes`.
+            db = getattr(getattr(self, "_raw_storage", None), "db", None)
+            if db is None:
+                # Without it the question cannot be asked at all, and the
+                # answer decides whether an irrevocable right is erased.
+                logging.critical(
+                    "REANCHOR REJECTED: no ungoverned storage connection to "
+                    "read the anchored constitution with"
+                )
+                return (
+                    "Error: Refusing to reanchor: this agent has no storage "
+                    "connection able to read its anchored constitution, so an "
+                    "active Amendment VIII cannot be ruled out (#2465). "
+                    "Restart the agent and re-run."
+                )
+            try:
+                anchored_text, anchored_present = await read_anchored_constitution(
+                    db, old_hash
+                )
+            except Exception as exc:  # noqa: BLE001 — a database failure, not a key one
+                # Undecryptable bytes come back as UNREADABLE; anything that
+                # escapes is the storage layer itself failing, and that is a
+                # different message. Still fails closed — an active Amendment
+                # VIII cannot be ruled out either way.
+                logging.critical(
+                    "REANCHOR REJECTED: could not read the anchored "
+                    "constitution %s: %r", old_hash[:12], exc,
+                )
+                return (
+                    f"Error: Could not read this agent's anchored constitution "
+                    f"({old_hash[:12]}…): {exc!r}. An active Amendment VIII "
+                    "cannot be ruled out, so nothing was written (#2465)."
+                )
+            downgrade = unwitnessed_emancipation_downgrade(
+                anchored_contract=reanchor_contract,
+                anchored_text=anchored_text,
+                anchored_present=anchored_present,
+                old_hash=old_hash,
+                new_hash=new_hash,
+                new_text=constitution_content.decode("utf-8"),
+            )
+            if downgrade is not None:
+                logging.critical("REANCHOR REJECTED: %s", downgrade)
+                return f"Error: {downgrade}"
+
         from kestrel_sovereign.constitution.trust_root import (
             SovereignTrustRootError,
         )

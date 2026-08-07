@@ -63,6 +63,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from kestrel_sovereign.constitution.anchored_bytes import (
+    read_anchored_constitution,
+)
 from kestrel_sovereign.constitution.emancipation import (
     EmancipationConfigError,
     EmancipationContract,
@@ -70,6 +73,7 @@ from kestrel_sovereign.constitution.emancipation import (
     contract_from_json,
     contract_to_json,
     parse_emancipation_block,
+    unwitnessed_emancipation_downgrade,
 )
 from kestrel_sovereign.constitution.amendment_artifact import (
     AmendmentArtifactError,
@@ -268,8 +272,9 @@ class ReanchorResult:
     """Outcome of :func:`reanchor_constitution`.
 
     Exactly one of ``unchanged`` / ``drift_unforced`` / ``reanchored`` /
-    ``iron_rule_violation`` (set as ``error``) is True. The CLI dispatches
-    messaging on this.
+    ``error`` describes the outcome. ``iron_rule_violation`` is a *label* on
+    an error, not a fourth outcome: it marks the subset of refusals that are a
+    #1118 transgression rather than the guard being unable to decide.
     """
 
     agent_name: str
@@ -282,9 +287,11 @@ class ReanchorResult:
     drift_unforced: bool = False
     reanchored: bool = False
     error: str | None = None
-    #: When set, ``error`` is a #1118 Iron Rule refusal (not a generic
-    #: failure). The CLI uses this to print the diff-clause rather than
-    #: a stack trace.
+    #: When set, ``error`` is a #1118 Iron Rule refusal — the candidate really
+    #: would narrow or revoke an active Emancipation Contract. Deliberately
+    #: *not* set for refusals where the guard could not decide (unreadable
+    #: anchored bytes, an ambiguous Amendment VIII): those are also errors, but
+    #: calling them violations misnames what happened.
     iron_rule_violation: str | None = None
     #: True when pre-write inspection found the ``governed_by`` edge set
     #: inconsistent with the expected anchor — missing, mis-targeted, or
@@ -443,6 +450,8 @@ async def reanchor_constitution(
             agent_did,
             anchored_contract_json,
             governed_by_targets,
+            anchored_text,
+            anchored_present,
         ) = await _read_agent_anchor(target)
     except Exception as exc:  # noqa: BLE001 — surfaced verbatim to the operator
         logger.exception("Could not read the anchor from %s", target.describe())
@@ -513,14 +522,59 @@ async def reanchor_constitution(
     # Route through the single production resolver (#2463) so reanchor produces
     # byte-identical governing content to inception + verification, pointed at
     # the same ``canonical_path``.
-    new_content = resolve_governing_constitution_bytes(
-        effective_contract if (
-            effective_contract is not None and effective_contract.enabled
-        ) else None,
-        constitution_path=str(canonical_path),
-    )
+    # Every other refusal in here returns a ReanchorResult; ``cli.py`` calls
+    # this bare inside ``asyncio.run``, so anything that escapes is a traceback
+    # at an operator. The resolver is documented to raise so its callers fail
+    # closed — including ``AmbiguousAmendmentVIII`` for a governing source with
+    # two Amendment VIII headings — and failing closed here means saying so.
+    try:
+        new_content = resolve_governing_constitution_bytes(
+            effective_contract if (
+                effective_contract is not None and effective_contract.enabled
+            ) else None,
+            constitution_path=str(canonical_path),
+        )
+        new_text = new_content.decode("utf-8")
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        return _result(
+            old_hash=old_hash, new_hash=None,
+            error=(
+                f"Could not resolve the governing constitution from "
+                f"{canonical_path}: {exc}. Nothing was written."
+            ),
+        )
 
     new_hash = hashlib.sha256(new_content).hexdigest()
+
+    # #2465: the Iron Rule for an agent with NO structured receipt. The
+    # backfill below only fires when a ``kestrel.toml [emancipation]`` block
+    # supplies a candidate; with no block, ``anchored_contract`` is None, the
+    # resolver above just rendered the dormant canonical text, and a
+    # Sovereign-signed artifact over those exact bytes would authorize erasing
+    # the authored terms. The anchored bytes are the contract when nothing
+    # else witnesses it, so the only permitted reanchor is one that reproduces
+    # their Amendment VIII section. Shared with the live command so the two
+    # entry points cannot diverge on this.
+    downgrade = unwitnessed_emancipation_downgrade(
+        anchored_contract=anchored_contract,
+        anchored_text=anchored_text,
+        anchored_present=anchored_present,
+        old_hash=old_hash,
+        new_hash=new_hash,
+        new_text=new_text,
+    )
+    if downgrade is not None:
+        return _result(
+            old_hash=old_hash, new_hash=new_hash,
+            error=downgrade.message,
+            # Only stamp it when it IS one. Unreadable bytes and an ambiguous
+            # Amendment VIII are the guard unable to decide, not a Sovereign
+            # transgression, and reporting them as a violation sends an
+            # operator hunting for something that is not there.
+            iron_rule_violation=(
+                downgrade.message if downgrade.iron_rule_violation else None
+            ),
+        )
 
     # #1118 sidecar backfill: if the agent has active-form bytes anchored
     # (e.g. it was incepted between #1112 — which added activation at
@@ -731,12 +785,14 @@ async def reanchor_constitution(
 
 async def _read_agent_anchor(
     target: ReanchorTarget,
-) -> tuple[str | None, str, dict | None, tuple[str, ...]]:
+) -> tuple[str | None, str, dict | None, tuple[str, ...], str | None, bool]:
     """Return ``(constitution_hash, agent_did, emancipation_contract_json,
-    governed_by_targets)`` **from the database the runtime reads**.
+    governed_by_targets, anchored_text, anchored_present)`` **from the database the runtime
+    reads**.
 
     Read-only — safe to call before deciding whether to touch the DB.
-    Returns ``(None, "", None, ())`` if the agent node has no anchored hash.
+    Returns ``(None, "", None, (), None, False)`` if the agent node has no
+    anchored hash.
     The contract field is ``None`` for dormant agents and for legacy
     agents incepted before #1118 (no JSON receipt was written). The edge
     targets feed the drift decision (#2616): integrity proof 2 requires a
@@ -754,7 +810,7 @@ async def _read_agent_anchor(
     async with target.open_storage() as storage:
         agent = await storage.graph.get_node(target.agent_did)
         if agent is None or agent.node_type != "agent":
-            return None, "", None, ()
+            return None, "", None, (), None, False
         # Read the governance edges through the privileged maintenance
         # connection, NOT the bound graph store. This repair path exists to
         # heal PRE-LEDGER drift (#2616), and stale edges are unowned by
@@ -774,11 +830,26 @@ async def _read_agent_anchor(
             (agent.node_id,),
         )
         governed_by_targets = tuple(row[0] for row in edge_rows)
+        anchored_hash = agent.properties.get("constitution_hash")
+        anchored_text: str | None = None
+        # ABSENT and UNREADABLE are different answers (#2465), and telling them
+        # apart takes the privileged connection for the same reason the edge
+        # read above does: ``storage.files`` is bound, so a blob with no
+        # ``file_owners`` row reads back as absent — the state of every agent
+        # in the cohort this guard protects whose governance edge has drifted.
+        # See :mod:`kestrel_sovereign.constitution.anchored_bytes`.
+        anchored_present = False
+        if anchored_hash:
+            anchored_text, anchored_present = await read_anchored_constitution(
+                storage.db, anchored_hash
+            )
         return (
-            agent.properties.get("constitution_hash"),
+            anchored_hash,
             agent.node_id,
             agent.properties.get("emancipation_contract"),
             governed_by_targets,
+            anchored_text,
+            anchored_present,
         )
 
 
