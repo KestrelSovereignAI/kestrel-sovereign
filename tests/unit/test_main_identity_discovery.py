@@ -273,3 +273,86 @@ async def test_sqlite_refuses_a_directory_holding_two_agent_roots(tmp_path):
         await main_module.get_agent_did_async(
             str(agent_dir), db_backend="sqlite"
         )
+
+
+# ---------------------------------------------------------------------------
+# An anchor that is present but unreadable is not "no anchor"
+#
+# Only absence lets a caller answer from somewhere else. A corrupt file, a
+# permission denial, or two agent roots all mean an anchor IS there and this
+# process could not be told what it says — and falling through to the runtime
+# database there boots this directory as whichever agent that database holds.
+# On SQLite every one of these states is refused loudly; the PostgreSQL path
+# must not be weaker for exactly the failures the reader exists to catch.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_corrupt_anchor_refuses_rather_than_adopting_a_neighbour(
+    tmp_path, runtime_db
+):
+    """`kestrel start Nellie` where the anchor is truncated by a killed
+    inception, or root-owned from a `sudo kestrel create`. Nellie's process
+    must not boot as Emma."""
+    agent_dir = tmp_path / "agent_data" / "Nellie"
+    agent_dir.mkdir(parents=True)
+    (agent_dir / "kestrel_prime.db").write_bytes(b"this is not a database")
+    runtime_db(NEIGHBOUR_DID)
+
+    with pytest.raises(ValueError, match="Could not read local agent identity"):
+        await main_module.get_agent_did_async(
+            str(agent_dir), db_backend="postgres", database_url=DSN
+        )
+
+
+@pytest.mark.asyncio
+async def test_an_ambiguous_anchor_refuses_rather_than_adopting_a_neighbour(
+    tmp_path, runtime_db
+):
+    """Two agent roots is an integrity failure, not an absence. Answering from
+    the runtime database here would pick a third party entirely."""
+    agent_dir = tmp_path / "agent_data" / "Ambiguous"
+    _write_anchor(agent_dir, ANCHORED_DID, "did:web:agents.example.com:second")
+    runtime_db(NEIGHBOUR_DID)
+
+    with pytest.raises(ValueError, match="invalid agent root set"):
+        await main_module.get_agent_did_async(
+            str(agent_dir), db_backend="postgres", database_url=DSN
+        )
+
+
+@pytest.mark.asyncio
+async def test_only_a_genuinely_absent_anchor_defers_to_the_database(
+    tmp_path, runtime_db
+):
+    """The control: the ephemeral-container case still works, so the tests
+    above are pinning the distinction rather than a blanket refusal."""
+    runtime_db(NEIGHBOUR_DID)
+
+    did = await main_module.get_agent_did_async(
+        str(tmp_path / "never-incepted"), db_backend="postgres", database_url=DSN
+    )
+
+    assert did == NEIGHBOUR_DID
+
+
+@pytest.mark.asyncio
+async def test_the_conflict_message_names_a_remedy_that_exists(
+    tmp_path, runtime_db
+):
+    """The standalone launcher takes one host-wide KESTREL_DATABASE_URL — there
+    is no per-agent DSN to point anywhere. Telling an operator to point it at
+    this agent's own database is an instruction they cannot follow; the
+    in-process host is the one that runs a fleet against one PostgreSQL."""
+    agent_dir = tmp_path / "agent_data" / "Kite"
+    _write_anchor(agent_dir, ANCHORED_DID)
+    runtime_db(NEIGHBOUR_DID)
+
+    with pytest.raises(ValueError) as excinfo:
+        await main_module.get_agent_did_async(
+            str(agent_dir), db_backend="postgres", database_url=DSN
+        )
+
+    message = str(excinfo.value)
+    assert "kestrel start" in message
+    assert "#2843" in message

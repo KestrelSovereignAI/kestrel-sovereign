@@ -56,6 +56,7 @@ async def get_agent_did_async(
     """
     from kestrel_sovereign.identity.local_anchor import (
         AgentDIDLookupMode,
+        AnchorAbsent,
         read_anchor_agent_did,
     )
 
@@ -78,9 +79,13 @@ async def get_agent_did_async(
         anchored_did = await read_anchor_agent_did(
             storage_dir, mode=AgentDIDLookupMode.INITIALIZATION
         )
-    except ValueError as exc:
-        # No anchor, or one this process cannot read. Either is normal for a
-        # container that carries its identity only in the durable database.
+    except AnchorAbsent as exc:
+        # *Only* absence. A corrupt file, a permission denial, or two agent
+        # roots all mean an anchor is present and could not be read, and
+        # falling through to the runtime database there would boot this
+        # directory as whichever agent that database happens to hold. Those
+        # propagate. This branch is for the container whose disk genuinely
+        # carries no identity, which is the case #2472 added it for.
         logger.info(
             "No local identity anchor in %s (%s); asking the runtime database.",
             storage_dir, exc,
@@ -100,12 +105,20 @@ async def get_agent_did_async(
             # Booting either identity against the other's governance is the
             # "wrong database" failure this cluster is about; naming both is
             # the only safe answer.
+            # Naming a remedy the operator can actually reach: the standalone
+            # launcher takes one host-wide KESTREL_DATABASE_URL — there is no
+            # per-agent DSN to point anywhere (that is #2843). The in-process
+            # host runs a whole fleet against one PostgreSQL happily, because
+            # it resolves each agent's identity from its own anchor.
             raise ValueError(
                 f"Identity conflict: the local anchor in {storage_dir} names "
                 f"{anchored_did}, but the configured PostgreSQL database holds "
                 f"{', '.join(sorted(runtime_dids))}. Durable single-agent "
-                "custody requires a dedicated database per agent; point "
-                "KESTREL_DATABASE_URL at this agent's own database."
+                "custody requires a dedicated database per agent, and the "
+                "standalone launcher has only one host-wide "
+                "KESTREL_DATABASE_URL. Run the fleet in-process instead — "
+                "`kestrel start` with no agent name — or give this agent its "
+                "own database. Per-agent custody is #2843."
             )
         if len(runtime_dids) > 1:
             raise ValueError(

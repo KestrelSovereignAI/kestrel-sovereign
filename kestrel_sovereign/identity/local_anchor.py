@@ -28,6 +28,19 @@ class AgentDIDLookupMode(str, Enum):
     INITIALIZATION = "initialization"
 
 
+class AnchorAbsent(ValueError):
+    """This directory holds no birth record — there is nothing here to read.
+
+    Distinguished from every other failure of :func:`read_anchor_agent_did`
+    because it is the only one a caller may answer from somewhere else. A
+    corrupt file, a permission denial, two agent roots, or live WAL state
+    during a cold read are all cases where an anchor **is** present and this
+    process could not be told what it says. Treating those as "no anchor" lets
+    a caller fall through to another database and adopt a different agent's
+    identity — the #2871 rule inverted, since an identity gap must refuse.
+    """
+
+
 async def read_anchor_agent_did(
     storage_dir: str,
     *,
@@ -54,7 +67,7 @@ async def read_anchor_agent_did(
 
     def _lookup() -> str:
         if not db_path.is_file():
-            raise ValueError(
+            raise AnchorAbsent(
                 f"No agent found in {storage_dir}. "
                 "Run inception first: kestrel create <name>"
             )
@@ -112,7 +125,7 @@ async def read_anchor_agent_did(
             )
 
         if not rows:
-            raise ValueError(
+            raise AnchorAbsent(
                 f"No agent found in {storage_dir}. "
                 "Run inception first: kestrel create <name>"
             )
