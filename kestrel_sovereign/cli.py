@@ -385,6 +385,14 @@ def cmd_shell(args) -> int:
     for this agent; falls back to an in-process agent instance if not.
     """
     project_dir = _get_project_dir()
+    # The in-process fallback builds a whole agent here — its own LLMService,
+    # its own storage — so this command needs the home's environment, and it
+    # used to get it as a side effect of constructing that LLMService. That is
+    # exactly the accident #2896 removed. Without it `KESTREL_DATA_KEY` is
+    # absent (the key hierarchy has no `.env` fallback), the first encrypted
+    # read raises, and the shell reports a decryption problem for what is an
+    # env-loading regression.
+    load_project_env(project_dir)
     multi_agent = MultiAgentConfig.load(project_dir / MULTI_AGENT_CONFIG_FILENAME)
     local_agents = multi_agent.get_local_agents()
 

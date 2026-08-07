@@ -84,6 +84,12 @@ async def main():
     # resurrecting deliberately-unset variables is not something the rest of the
     # process can defend against. An entry point loading its own environment,
     # once, before it reads any of it, is.
+    #
+    # One deliberate consequence: ``db_path`` below falls back to
+    # ``KESTREL_DB_PATH``, which the old constructor-time load could never
+    # reach because it ran later. A home whose ``.env`` sets it now selects
+    # that agent instead of printing "path not specified". Inert in the
+    # container, which exports the variable already.
     load_project_env(project_dir())
 
     parser = argparse.ArgumentParser(description="Kestrel Sovereign Agent Interface")

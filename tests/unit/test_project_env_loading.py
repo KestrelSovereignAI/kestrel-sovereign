@@ -24,10 +24,23 @@ home, python-dotenv's own parser, and ``setdefault`` semantics.
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
 from kestrel_sovereign import paths
+
+
+@pytest.fixture(autouse=True)
+def restore_environ():
+    """``load_project_env`` mutates through ``os.environ.setdefault``, which
+    ``monkeypatch`` does not track — so a key it sets survives the test and
+    leaks into the rest of the session. This file is the reference example for
+    the helper, so it should not model the hazard it exists to document."""
+    before = dict(os.environ)
+    yield
+    os.environ.clear()
+    os.environ.update(before)
 
 
 @pytest.fixture
@@ -195,3 +208,71 @@ def test_load_project_env_is_a_no_op_when_the_home_has_no_dotenv(home, monkeypat
     paths.load_project_env(home)
 
     assert dict(os.environ) == before
+
+
+# ---------------------------------------------------------------------------
+# Entry points that were getting their environment by accident
+#
+# Removing the constructor-time load is only safe if every process that
+# depended on it now loads deliberately. These two did: they build an
+# LLMService and an agent, and nothing else on their path touches `.env`.
+# `KESTREL_DATA_KEY` in particular has no `.env` fallback anywhere in the key
+# hierarchy, so losing it is not a degraded mode — it is a decryption failure
+# reported as a decryption failure, for what is an env-loading regression.
+# ---------------------------------------------------------------------------
+
+
+def _dotenv_home(tmp_path, monkeypatch, **values):
+    lines = "".join(f"{k}={v}\n" for k, v in values.items())
+    (tmp_path / ".env").write_text(lines, encoding="utf-8")
+    monkeypatch.setenv("KESTREL_HOME", str(tmp_path))
+    paths.reset_cache()
+    for key in values:
+        monkeypatch.delenv(key, raising=False)
+    return tmp_path
+
+
+def test_kestrel_shell_loads_the_home_environment(tmp_path, monkeypatch):
+    """`kestrel shell <agent>` falls back to an in-process agent when no server
+    is running — the path the "no server running" message points users at."""
+    from kestrel_sovereign import cli
+
+    _dotenv_home(tmp_path, monkeypatch, KESTREL_TEST_TOKEN="from-dotenv")
+    monkeypatch.chdir(tmp_path)
+
+    # Stop right after the load; the rest of the command needs a real agent.
+    class _Stop(Exception):
+        pass
+
+    def _boom(*args, **kwargs):
+        raise _Stop
+
+    monkeypatch.setattr(cli.MultiAgentConfig, "load", staticmethod(_boom))
+
+    with pytest.raises(_Stop):
+        cli.cmd_shell(SimpleNamespace(name="Test"))
+
+    assert os.environ.get("KESTREL_TEST_TOKEN") == "from-dotenv"
+
+
+def test_kestrel_embeddings_loads_the_home_environment(tmp_path, monkeypatch):
+    """`reindex` builds an LLMService and re-embeds stored content, so it needs
+    provider credentials and the data key to decrypt what it re-embeds."""
+    from kestrel_sovereign import cli_embeddings
+
+    _dotenv_home(tmp_path, monkeypatch, KESTREL_TEST_TOKEN="from-dotenv")
+    monkeypatch.chdir(tmp_path)
+
+    captured = {}
+
+    def _capture(args):
+        captured["token"] = os.environ.get("KESTREL_TEST_TOKEN")
+        return ("stop here", None, None)
+
+    monkeypatch.setattr(cli_embeddings, "_resolve_db_target", _capture)
+
+    cli_embeddings.run(SimpleNamespace(embeddings_command="audit"))
+
+    assert captured.get("token") == "from-dotenv", (
+        "the environment was not loaded before the command read it"
+    )

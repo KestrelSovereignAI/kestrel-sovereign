@@ -1,6 +1,6 @@
 """Project-root and package-root resolution.
 
-Three questions, three answers:
+Four questions, four answers:
 
   1. **Where does the user's data live?** — agent DBs, ``multi_agent.toml``,
      ``kestrel.toml``, ``.env``, ``logs/``. Answered by :func:`project_dir`.
@@ -9,6 +9,8 @@ Three questions, three answers:
   3. **Where does implicit host-runtime state live?** — supervised services,
      fleet/host feature state, and other data that must not appear merely
      because Kestrel launched from a clone. Answered by :func:`host_data_dir`.
+  4. **How does that home's ``.env`` reach the process?** — deliberately, at an
+     entry point, naming the home. Answered by :func:`load_project_env`.
 
 The historical answer for the first two was the same:
 ``Path(__file__).parent.parent``.
@@ -91,7 +93,7 @@ def project_dir() -> Path:
     return _resolve_cached(explicit_home, str(cwd))
 
 
-def load_project_env(project_dir: Path, *, exclude: tuple[str, ...] = ()) -> None:
+def load_project_env(home: Path, *, exclude: tuple[str, ...] = ()) -> None:
     """Load a resolved project home's ``.env`` into ``os.environ``.
 
     The one place a process may pull ``.env`` into its environment, and it
@@ -104,15 +106,23 @@ def load_project_env(project_dir: Path, *, exclude: tuple[str, ...] = ()) -> Non
     unset (#2896).
 
     Uses python-dotenv's own parser (``dotenv_values``) — the same one the
-    runtime uses, so setup reads the identical byte string boot will see — and
-    ``setdefault`` semantics so a genuinely exported value stays authoritative
-    (equivalent to ``load_dotenv(override=False)``).
+    runtime uses, so a plain value is the identical byte string boot will see —
+    and ``setdefault`` semantics so a genuinely exported value stays
+    authoritative.
+
+    Equivalent to ``load_dotenv(override=False)`` for every value that does not
+    interpolate another variable. It is **not** equivalent for ``${VAR}``:
+    ``dotenv_values`` fixes ``override=True`` internally, so a reference
+    resolves against the file's own bindings where ``load_dotenv(override=
+    False)`` would prefer an exported one. No shipped ``.env`` template uses
+    interpolation, and ``server.py`` still boots through the other call, so the
+    two can disagree there until they are aligned.
 
     ``exclude`` names keys to skip. The data key is excluded when this runs
     *before* custody resolution so that seeding the persisted value into
     ``os.environ`` cannot mask an exported⇄persisted conflict (#2468).
     """
-    env_path = project_dir / ".env"
+    env_path = home / ".env"
     if not env_path.exists():
         return
     from dotenv import dotenv_values

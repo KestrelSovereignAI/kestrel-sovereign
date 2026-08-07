@@ -780,6 +780,17 @@ def run(args: argparse.Namespace) -> int:
         print("usage: kestrel embeddings {audit|reindex} ...", file=sys.stderr)
         return 2
 
+    # ``reindex`` constructs an LLMService and re-embeds stored content, so it
+    # needs provider credentials *and* ``KESTREL_DATA_KEY`` to decrypt what it
+    # is re-embedding — both of which it used to get as a side effect of that
+    # constructor (#2896). Loading here, before ``_resolve_db_target``, also
+    # makes this module's own claim true: it documents resolving the database
+    # "the same way the agent/server does", and ``server.py`` resolves it
+    # *after* loading the home's environment.
+    from kestrel_sovereign.paths import load_project_env, project_dir
+
+    load_project_env(project_dir())
+
     async def _runner() -> int:
         try:
             from kestrel_sovereign.storage.async_database import AsyncDatabase
