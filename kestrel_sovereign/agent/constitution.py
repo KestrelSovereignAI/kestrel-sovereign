@@ -1543,9 +1543,24 @@ class ConstitutionMixin:
                     "active Amendment VIII cannot be ruled out (#2465). "
                     "Restart the agent and re-run."
                 )
-            anchored_text, anchored_present = await read_anchored_constitution(
-                db, old_hash
-            )
+            try:
+                anchored_text, anchored_present = await read_anchored_constitution(
+                    db, old_hash
+                )
+            except Exception as exc:  # noqa: BLE001 — a database failure, not a key one
+                # Undecryptable bytes come back as UNREADABLE; anything that
+                # escapes is the storage layer itself failing, and that is a
+                # different message. Still fails closed — an active Amendment
+                # VIII cannot be ruled out either way.
+                logging.critical(
+                    "REANCHOR REJECTED: could not read the anchored "
+                    "constitution %s: %r", old_hash[:12], exc,
+                )
+                return (
+                    f"Error: Could not read this agent's anchored constitution "
+                    f"({old_hash[:12]}…): {exc!r}. An active Amendment VIII "
+                    "cannot be ruled out, so nothing was written (#2465)."
+                )
             downgrade = unwitnessed_emancipation_downgrade(
                 anchored_contract=reanchor_contract,
                 anchored_text=anchored_text,

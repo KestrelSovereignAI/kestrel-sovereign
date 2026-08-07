@@ -49,15 +49,22 @@ async def read_anchored_constitution(
     UTF-8. UNREADABLE.
     ``(text, True)``  — the anchored constitution.
     """
+    from kestrel_sovereign.security.encryption import DecryptionError
     from kestrel_sovereign.storage.async_file_store import AsyncFileStore
 
     # No agent_id: see the module docstring. This is the whole point.
     store = AsyncFileStore(db)
     try:
         raw = await store.retrieve_file(anchored_hash)
-    except Exception:  # noqa: BLE001 — stored, but not readable here
+    except DecryptionError:
+        # UNREADABLE means "the bytes are there and this process cannot open
+        # them" — a wrong KESTREL_DATA_KEY. Deliberately narrow: a dropped
+        # connection is not a key problem, and swallowing it here would tell
+        # the operator to go check their data key. Every caller already has a
+        # boundary that names a database failure for what it is, so those
+        # propagate to it.
         logger.warning(
-            "The constitution stored under %s could not be read",
+            "The constitution stored under %s could not be decrypted",
             anchored_hash[:12],
             exc_info=True,
         )

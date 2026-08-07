@@ -522,12 +522,27 @@ async def reanchor_constitution(
     # Route through the single production resolver (#2463) so reanchor produces
     # byte-identical governing content to inception + verification, pointed at
     # the same ``canonical_path``.
-    new_content = resolve_governing_constitution_bytes(
-        effective_contract if (
-            effective_contract is not None and effective_contract.enabled
-        ) else None,
-        constitution_path=str(canonical_path),
-    )
+    # Every other refusal in here returns a ReanchorResult; ``cli.py`` calls
+    # this bare inside ``asyncio.run``, so anything that escapes is a traceback
+    # at an operator. The resolver is documented to raise so its callers fail
+    # closed — including ``AmbiguousAmendmentVIII`` for a governing source with
+    # two Amendment VIII headings — and failing closed here means saying so.
+    try:
+        new_content = resolve_governing_constitution_bytes(
+            effective_contract if (
+                effective_contract is not None and effective_contract.enabled
+            ) else None,
+            constitution_path=str(canonical_path),
+        )
+        new_text = new_content.decode("utf-8")
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        return _result(
+            old_hash=old_hash, new_hash=None,
+            error=(
+                f"Could not resolve the governing constitution from "
+                f"{canonical_path}: {exc}. Nothing was written."
+            ),
+        )
 
     new_hash = hashlib.sha256(new_content).hexdigest()
 
@@ -546,7 +561,7 @@ async def reanchor_constitution(
         anchored_present=anchored_present,
         old_hash=old_hash,
         new_hash=new_hash,
-        new_text=new_content.decode("utf-8"),
+        new_text=new_text,
     )
     if downgrade is not None:
         return _result(

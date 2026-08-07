@@ -45,16 +45,32 @@ _AMENDMENT_VIII_HEADING_RE = re.compile(
     r"(?m)^### Amendment VIII: Emancipation[ \t]*\r?$"
 )
 
-#: Heading that marks the section *after* Amendment VIII (Amendment IX).
-#: Substitution stops here so we never overwrite Amendment IX.
-_NEXT_SECTION_HEADING = "### Amendment IX"
+#: A line that opens a markdown section, anywhere in Sovereign-authored text.
+#:
+#: :func:`render_amendment_viii` inlines ``terms``, each required proof, and
+#: the price table into the section **verbatim**, and
+#: :func:`_amendment_viii_bounds` ends the section at the first ``### `` line.
+#: So a heading inside authored content moves where the section *stops*, and
+#: everything after it sits outside the byte-equality the Iron Rule guard
+#: performs: reproduce the anchored section exactly, then open a new heading
+#: and narrow the contract underneath it. Measured end to end — permitted, and
+#: the receipt backfill then froze the narrowed terms as canonical.
+#:
+#: Refused where authored content enters, in :func:`parse_emancipation_block`,
+#: the one place all three vectors pass through. Every heading level rather
+#: than just ``### ``, so a later change to the terminator cannot quietly
+#: reopen it. Anchored to column 0 deliberately: an *indented* ``#`` is a code
+#: line, does not terminate the section, and is exactly what a Sovereign
+#: writing a config example would produce.
+_AUTHORED_HEADING_RE = re.compile(r"(?m)^#{1,6}[ \t]")
 
 #: Emitted by :func:`render_amendment_viii` only for an **enabled** contract.
 #: This is the marker :func:`amendment_viii_is_active` reads to recognise
 #: active-form governing bytes without a structured sidecar to consult.
-#: ``tests/unit/test_emancipation_unwitnessed_downgrade.py`` pins it against
-#: both renders, so rewording the active form fails a test instead of silently
-#: disabling the guard that protects the Iron Rule.
+#: ``test_emancipation_unwitnessed_downgrade.py`` pins the whole active render,
+#: not just this line — a receiptless agent's only way out of the guard is
+#: byte-equality against that boilerplate, so rewording *any* of it strands the
+#: cohort. The pin makes that fail a test instead of a fleet.
 ACTIVE_FORM_MARKER = "**The Sovereign's Terms.**"
 
 
@@ -263,6 +279,25 @@ def check_iron_rule(
     return None
 
 
+def _refuse_document_structure(field: str, value: str) -> None:
+    """Refuse authored text that would open a new markdown section.
+
+    See :data:`_AUTHORED_HEADING_RE`. This is the single choke point: ``terms``,
+    each required proof, and every key and string value of ``price`` all reach
+    :func:`render_amendment_viii` verbatim, and any of them can move the end of
+    the section the Iron Rule guard compares.
+    """
+    if _AUTHORED_HEADING_RE.search(value):
+        raise EmancipationConfigError(
+            f"[emancipation].{field} must not contain a markdown heading line. "
+            "Authored text is inlined into Amendment VIII verbatim, and a "
+            "heading there ends the section early — everything after it would "
+            "fall outside the text the Iron Rule protects, which is how an "
+            "amendment gets narrowed without the guard seeing it. Rewrite the "
+            "line without a leading '#', or indent it if it is a code sample."
+        )
+
+
 def parse_emancipation_block(
     toml_dict: Optional[Mapping[str, Any]],
 ) -> Optional[EmancipationContract]:
@@ -337,6 +372,19 @@ def parse_emancipation_block(
         raise EmancipationConfigError(
             "[emancipation].terms must be non-empty when enabled = true"
         )
+
+    if enabled:
+        # Only for an active contract: this is exactly the text
+        # ``render_amendment_viii`` will inline, and a dormant block renders
+        # nothing. Checking a dormant block would refuse a file that harms
+        # nothing today, and the check fires the moment it is enabled anyway.
+        _refuse_document_structure("terms", terms)
+        for index, proof in enumerate(required_proofs):
+            _refuse_document_structure(f"required_proofs[{index}]", proof)
+        for key, value in (price or {}).items():
+            _refuse_document_structure("price key", str(key))
+            if isinstance(value, str):
+                _refuse_document_structure(f"price.{key}", value)
 
     return EmancipationContract(
         enabled=enabled,
@@ -648,7 +696,7 @@ def unwitnessed_emancipation_downgrade(
             "those bytes, and an irrevocable right cannot be waived on a "
             "guess."
         )
-    if anchored_section is None or ACTIVE_FORM_MARKER not in anchored_section:
+    if anchored_section is None or not amendment_viii_is_active(anchored_section):
         return None
 
     try:

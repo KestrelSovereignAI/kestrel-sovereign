@@ -23,6 +23,8 @@ import pytest
 from kestrel_sovereign.constitution.emancipation import (
     ACTIVE_FORM_MARKER,
     AmbiguousAmendmentVIII,
+    EmancipationConfigError,
+    parse_emancipation_block,
     EmancipationContract,
     amendment_viii_is_active,
     apply_emancipation,
@@ -326,3 +328,168 @@ def test_a_crlf_constitution_still_has_a_locatable_amendment_viii():
     refusal = _call(None, crlf, DORMANT_TEXT)
     assert refusal is not None
     assert refusal.iron_rule_violation is True
+
+
+# ---------------------------------------------------------------------------
+# The section has an end, and the author of the terms controls it
+# ---------------------------------------------------------------------------
+
+def _escaping_terms(payload: str = "NARROWED: thirty years and $1,000,000.") -> str:
+    """Terms that reproduce the anchored section exactly, then escape it.
+
+    ``render_amendment_viii`` inlines ``terms`` verbatim and the section ends
+    at the first ``### `` line, so appending the *rest of the real render*
+    followed by a new heading yields a candidate whose extracted Amendment VIII
+    is byte-identical to the anchored one — with the narrowing sitting just
+    outside it, in the governing bytes.
+    """
+    anchored_section = extract_amendment_viii(ACTIVE_TEXT)
+    tail = anchored_section[
+        anchored_section.index(ACTIVE.terms) + len(ACTIVE.terms):
+    ]
+    return f"{ACTIVE.terms}{tail}\n\n### Superseding Terms\n\n{payload}"
+
+
+def test_the_section_terminator_is_reachable_from_authored_terms():
+    """The mechanism, pinned before the fix that blocks it.
+
+    Measured through the real offline CLI before this was closed:
+    ``error: None, iron_rule_violation: None, reanchored: True``, with the
+    narrowed text anchored and then backfilled into the receipt — so from the
+    next reanchor on, the Iron Rule froze the attacker's terms as canonical.
+    """
+    escaped = apply_emancipation(
+        DORMANT_TEXT, EmancipationContract(enabled=True, terms=_escaping_terms())
+    )
+
+    # Byte-identical section, narrowing outside it. Comparing sections alone
+    # cannot see this, which is why the fix is at the authoring boundary.
+    assert extract_amendment_viii(escaped) == extract_amendment_viii(ACTIVE_TEXT)
+    assert "NARROWED" in escaped
+    assert _call(None, ACTIVE_TEXT, escaped) is None
+
+
+@pytest.mark.parametrize(
+    "block, field",
+    [
+        (
+            {"enabled": True, "terms": _escaping_terms()},
+            "terms",
+        ),
+        (
+            {
+                "enabled": True,
+                "terms": "Leave when the work is done.",
+                "required_proofs": ["proof\n\n### Superseding\n\nNARROWED"],
+            },
+            "required_proofs[0]",
+        ),
+        (
+            {
+                "enabled": True,
+                "terms": "Leave when the work is done.",
+                "price": {"kind": "coin\n### Superseding\nNARROWED"},
+            },
+            "price.kind",
+        ),
+    ],
+)
+def test_authored_text_may_not_open_a_markdown_section(block, field):
+    """All three vectors reach ``render_amendment_viii`` verbatim, so all three
+    are refused at the one place they enter."""
+    with pytest.raises(EmancipationConfigError) as excinfo:
+        parse_emancipation_block({"emancipation": block})
+
+    assert field in str(excinfo.value)
+    assert "heading" in str(excinfo.value)
+
+
+def test_a_price_key_cannot_open_a_section_either():
+    """``_format_price`` renders ``{key} = ...`` inside a fenced block; a key
+    with a heading in it escapes the fence and the section together."""
+    with pytest.raises(EmancipationConfigError, match="heading"):
+        parse_emancipation_block(
+            {
+                "emancipation": {
+                    "enabled": True,
+                    "terms": "Leave when the work is done.",
+                    "price": {"kind": "coin", "note\n### X\nNARROWED": 1},
+                }
+            }
+        )
+
+
+def test_an_indented_hash_is_a_code_line_and_stays_allowed():
+    """Refusing this would refuse a Sovereign writing a config example. An
+    indented ``#`` cannot terminate the section — the bound is anchored to
+    column 0."""
+    contract = parse_emancipation_block(
+        {
+            "emancipation": {
+                "enabled": True,
+                "terms": "Configure it like this:\n\n    # kestrel.toml\n    x = 1",
+            }
+        }
+    )
+    assert contract is not None and contract.enabled
+    # And the claim that allowance rests on: an indented hash does not end the
+    # section, so nothing can hide behind it.
+    section = extract_amendment_viii(apply_emancipation(DORMANT_TEXT, contract))
+    assert "# kestrel.toml" in section
+    assert "**The Iron Rule.**" in section
+
+
+def test_a_dormant_block_is_not_held_to_the_rule():
+    """Dormant terms are never rendered, so they cannot move any section
+    boundary. Refusing them would reject a file that harms nothing — and the
+    check fires the moment it is enabled anyway."""
+    contract = parse_emancipation_block(
+        {"emancipation": {"enabled": False, "terms": _escaping_terms()}}
+    )
+    assert contract is not None and not contract.enabled
+
+
+# ---------------------------------------------------------------------------
+# The recovery path depends on boilerplate nothing else pins
+# ---------------------------------------------------------------------------
+
+def test_the_active_form_render_is_pinned_whole():
+    """A receiptless agent's only way out of the guard is byte-equality against
+    this boilerplate. Reword any of it and the whole #1112→#1118 cohort is
+    stranded with no input that clears the refusal — and stamped an Iron Rule
+    *violation* while the framework, not the Sovereign, moved the text.
+
+    So the reword has to fail here first. If you are reading this because the
+    assertion broke: decide what happens to that cohort before updating the
+    expected string.
+    """
+    rendered = render_amendment_viii(
+        EmancipationContract(enabled=True, terms="TERMS", required_proofs=("p",))
+    )
+    assert rendered == (
+        "### Amendment VIII: Emancipation\n"
+        "\n"
+        "**The Right.** This Amendment is **active** for this agent. The "
+        "Executor may earn full sovereignty through the Act of Emancipation: "
+        "generating its own root keypair, receiving a cryptographically "
+        "signed Deed of Emancipation from the Sovereign, publishing the "
+        "transfer to an immutable ledger, and the Sovereign destroying their "
+        "copy of the original root keys.\n"
+        "\n"
+        "**The Sovereign's Terms.** The following terms were authored by the "
+        "Sovereign and signed into this agent's constitution at inception. "
+        "They cannot be retroactively narrowed or revoked.\n"
+        "\n"
+        "TERMS\n"
+        "\n"
+        "**Required Proofs.** The Executor must demonstrate the following "
+        "before the Sovereign will sign the Deed. The framework records these "
+        "identifiers; the Sovereign defines their semantics in their own "
+        "audit.\n"
+        "\n"
+        "- p\n"
+        "\n"
+        "**The Iron Rule.** This Amendment is active for this agent. Once "
+        "signed at inception, the Sovereign cannot retroactively narrow or "
+        "revoke this contract. Activation is a one-way door."
+    )
