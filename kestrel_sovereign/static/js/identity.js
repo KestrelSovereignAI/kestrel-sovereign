@@ -7,6 +7,7 @@ import API from './api.js';
 import { state, PRIVACY_MODES, Toast, Modal, loadCommands, renderTextError } from './ui.js';
 import { renderIdentityDangerZone } from './identity-danger-zone.js';
 import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, refreshAgentThinkingDot, stopAgent, renderModelFooterHtml, appendMessagePart, renderSignalWakeChip, handleRestartStatus, renderAgentContentHtml, mountToolRenderers, messageAttachmentsHtml } from './chat.js';
+import { forceScrollToBottom } from './chat_scroll.js';
 import { generateIdenticon } from './identicon.js';
 // #2199: the standalone conversations pane is now a `mountConversations`
 // consumer — one list orchestrator (fetch / refresh / seq-guard / views /
@@ -2022,9 +2023,18 @@ window.loadConversation = async function(sessionId, options = {}) {
         // overflow:auto element; the pane is its child). Only sync if
         // this is the visible agent's pane — detached panes get scroll
         // restored on remount.
+        //
+        // #2909: a freshly loaded conversation follows its tail, and the pane's
+        // `followLive` / `unseenTail` already say so — `wipeAgentChatPane`
+        // above resets both, for the mounted and detached cases alike. What is
+        // NOT already done is the snap itself: this loader paints history
+        // straight into the pane element, so nothing here has told the
+        // controller where the tail moved to. Force it, which also clears any
+        // "Jump to latest" the PREVIOUS conversation had raised — that pill
+        // pointed at content the wipe just removed.
         const viewport = document.getElementById('chat-container');
         if (viewport && pane && pane.element.parentNode === viewport) {
-            viewport.scrollTop = viewport.scrollHeight;
+            forceScrollToBottom(viewport);
         } else if (pane) {
             pane.scrollPos = Number.MAX_SAFE_INTEGER;  // snap to bottom on mount
         }

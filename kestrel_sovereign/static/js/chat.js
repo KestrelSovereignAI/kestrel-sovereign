@@ -15,6 +15,15 @@ import {
     mountRenderers,
 } from './ui-ext/renderers.js';
 import { buildMessageKebab } from './message_kebab.js';
+import {
+    installScrollFollow,
+    getFollowState,
+    setFollowState,
+    maybeScrollToBottom,
+    forceScrollToBottom,
+    notePaneAppend,
+    notePaneUserAction,
+} from './chat_scroll.js';
 
 let _deps = {
     api: null,
@@ -1240,6 +1249,64 @@ function getChatContainer() {
 }
 
 /**
+ * #2909: the single seam every append in this module uses to tell the
+ * stick-to-bottom controller that content landed.
+ *
+ * There are two destinations and the caller does not have to know which.
+ * A write into the MOUNTED pane is the live scroll box's business, so it
+ * goes to `maybeScrollToBottom` / `forceScrollToBottom` and the box's own
+ * geometry decides. A write into a DETACHED pane — a backgrounded agent
+ * that is still streaming, a task notification pinned to the stream's
+ * agent, a history repaint into a conversation the reader switched away
+ * from — must not touch the box at all: that state belongs to whatever
+ * conversation is on screen, and moving it (or raising "Jump to latest"
+ * over it) would answer for content that is not in it. It is recorded on
+ * the detached pane's own record instead, so the announcement is waiting
+ * when the reader comes back rather than having never been made.
+ *
+ * `force` marks a user-originated write (their send, their queued
+ * follow-up): the user just acted, so following re-engages either way.
+ */
+function noteChatAppend(target, { force = false } = {}) {
+    const c = getChatContainer();
+    if (c && target && target.parentNode === c) {
+        if (force) forceScrollToBottom(c);
+        else maybeScrollToBottom(c);
+        return;
+    }
+    const pane = resolveDetachedPane(target, c);
+    if (!pane) return;
+    if (force) notePaneUserAction(pane);
+    else notePaneAppend(pane);
+}
+
+/**
+ * Find the pane record a detached write landed in, so `noteChatAppend`
+ * can record against the right conversation.
+ *
+ * Matched by element identity rather than the pane element's
+ * ``dataset.agent``, because the standalone null-key pane carries no
+ * dataset at all (see getOrCreateChatPane). Returns null for a write
+ * nested INSIDE the mounted pane: the container is the authority there
+ * and the pane's saved fields are stale until it detaches, so writing
+ * them would plant state that the next detach overwrites anyway.
+ */
+function resolveDetachedPane(target, container) {
+    if (!target) return null;
+    const panes = deps().state.chatPanes;
+    if (!panes || typeof panes.values !== 'function') return null;
+    for (const pane of panes.values()) {
+        const el = pane && pane.element;
+        if (!el) continue;
+        const hit = el === target
+            || (typeof el.contains === 'function' && el.contains(target));
+        if (!hit) continue;
+        return (container && el.parentNode === container) ? null : pane;
+    }
+    return null;
+}
+
+/**
  * Resolve the chat pane element a write should target. When called
  * with no arg, defaults to the currently-mounted agent's pane — this
  * is what no-arg consumers (e.g. the aside-reply pipe) rely on so a single
@@ -1297,6 +1364,16 @@ export function mountChatPane(agentName) {
         }
         if (current && current.element.parentNode === container) {
             current.scrollPos = container.scrollTop;
+            // #2909: follow state rides with the pane exactly like
+            // scrollPos — otherwise switching away from a scrolled-up
+            // conversation and back re-engages tail-following by accident.
+            // Both halves travel: `unseenTail` is the reader's unacknowledged
+            // "content arrived below you" (the Jump-to-latest pill), and
+            // dropping it would silently retract an announcement this
+            // conversation had already made.
+            const follow = getFollowState(container);
+            current.followLive = follow.following;
+            current.unseenTail = follow.unseenTail;
             current.element.remove();
         }
     }
@@ -1310,6 +1387,22 @@ export function mountChatPane(agentName) {
 
     // Restore scroll to where the user left this agent's conversation.
     container.scrollTop = target.scrollPos;
+    // #2909: and the follow state that went with it. A pane left at the
+    // tail comes back at the tail — content may have streamed in while it
+    // was detached, so the saved pixel offset is no longer the bottom.
+    // (`installScrollFollow` here rather than only in initChat: embedders
+    // mount panes into a container this module never wired otherwise.)
+    installScrollFollow(container);
+    if (target.followLive === false) {
+        setFollowState(container, {
+            following: false,
+            unseenTail: target.unseenTail === true,
+        });
+    } else {
+        // Following: the mount snaps to the tail, so by definition
+        // nothing is left unseen — force clears the flag for us.
+        forceScrollToBottom(container);
+    }
     if (messageInput) {
         messageInput.value = target.draftText || '';
         autosizeComposer();
@@ -1364,6 +1457,15 @@ export function wipeAgentChatPane(agentName, html = '') {
     pane.queuedMessage = null;
     pane.element.innerHTML = html;
     pane.scrollPos = 0;
+    // #2909: a cleared pane is a fresh conversation — follow its tail,
+    // with nothing unread behind the reader (the content the pill would
+    // have pointed at just went away with the innerHTML reset).
+    pane.followLive = true;
+    pane.unseenTail = false;
+    const container = getChatContainer();
+    if (container && pane.element.parentNode === container) {
+        setFollowState(container, { following: true });
+    }
 }
 
 // ============================================================================
@@ -1559,6 +1661,9 @@ export function initChat() {
         }
         chatContainer.appendChild(initialPane.element);
         deps().state.mountedChatAgent = initialAgent;
+        // #2909: the scroll listener that owns the stick-to-bottom flag.
+        // Standalone hosts never call mountChatPane, so wire it here too.
+        installScrollFollow(chatContainer);
     }
 
     // Event listeners
@@ -1849,12 +1954,13 @@ function scheduleReconnect() {
 /**
  * Show a task notification in the chat interface.
  *
- * Notifications target the visible (mounted) agent's pane — task
- * notifications come over a single SSE stream pinned to the selected
- * agent, so by definition the visible pane is the right destination.
- * Per-agent task notifications for non-visible agents would require
- * one SSE per loaded agent and is out of scope for the parallel-chat
- * change.
+ * Notifications target the pane of the agent the SSE stream was opened
+ * for (`notificationAgent`), NOT whatever pane is mounted now — switch
+ * agents mid-turn and the earlier agent's task results must keep landing
+ * in its own conversation. That pane is therefore frequently detached,
+ * which is why the append below goes through `noteChatAppend` rather than
+ * touching the viewport directly. Per-agent notification streams for every
+ * loaded agent remain out of scope for the parallel-chat change.
  */
 function showTaskNotification(message, type) {
     // Reset reconnect attempts on successful notification
@@ -1909,8 +2015,11 @@ function showTaskNotification(message, type) {
     `;
 
     paneElement.appendChild(div);
-    const c = getChatContainer();
-    if (c) c.scrollTop = c.scrollHeight;
+    // #2909: the notification stream is pinned to `notificationAgent`, which
+    // is NOT necessarily the mounted agent — the bubble above may have landed
+    // in a detached pane, whose follow state noteChatAppend records without
+    // touching the viewport the reader is actually watching.
+    noteChatAppend(paneElement);
 
     // Also show a Toast notification
     deps().toast.show(message, type === 'failed' ? 'error' : 'info');
@@ -1978,10 +2087,7 @@ export async function handleSignalCompleted(payload) {
 
     target.appendChild(div);
 
-    const c = getChatContainer();
-    if (c && target.parentNode === c) {
-        c.scrollTop = c.scrollHeight;
-    }
+    noteChatAppend(target);
 }
 
 /**
@@ -2202,8 +2308,11 @@ export function handleRestartStatus(payload, targetEl = null) {
     div.style.borderLeftColor = accent;
     renderRestartStatusBody(div, payload);
     target.appendChild(div);
-    const c = getChatContainer();
-    if (c) c.scrollTop = c.scrollHeight;
+    // #2909: `target` is the notification agent's pane (possibly detached)
+    // or an explicit `targetEl` from a history repaint — neither is
+    // necessarily what the reader is looking at, which is exactly the
+    // discrimination noteChatAppend makes.
+    noteChatAppend(target);
 }
 
 
@@ -2449,13 +2558,12 @@ function renderQueuedChip(pane, agentName, text) {
     pane.element.appendChild(chip);
     // Scroll the real viewport, not pane.element: `.chat-container-pane`
     // is `display: contents` so it has no scroll box. Mirror the
-    // addMessage/updateStreamingMessage pattern — only scroll when this
-    // pane is the one actually mounted into #chat-container, so a chip
-    // queued for a backgrounded agent doesn't yank the visible pane.
-    const c = getChatContainer();
-    if (c && pane.element.parentNode === c) {
-        c.scrollTop = c.scrollHeight;
-    }
+    // addMessage/updateStreamingMessage pattern — a chip queued for a
+    // backgrounded agent must not yank the visible pane. The chip is the
+    // user's OWN follow-up, so it forces (#2909): the user just acted, put
+    // them where the action landed — or, for a detached pane, make sure it
+    // is at that action when they return to it.
+    noteChatAppend(pane.element, { force: true });
 }
 
 /** Remove the queued-message chip from a pane, if present. */
@@ -3365,8 +3473,9 @@ function showContextWarning(warnings, paneElement = null) {
         <br><small>Use <code>!compact</code> to summarize older messages, or start fresh with <code>!new-session</code></small>
     `;
     target.appendChild(div);
-    const c = getChatContainer();
-    if (c) c.scrollTop = c.scrollHeight;
+    // #2909: same routing as the other renderers — an explicit `paneElement`
+    // may be detached, and only the mounted pane may move the viewport.
+    noteChatAppend(target);
 }
 
 /**
@@ -3797,6 +3906,13 @@ window.compactContext = async function() {
  * (mounted) agent's pane so single-agent and background-pane call sites
  * continue to work without modification. Scroll-syncs only when the
  * write lands on the currently-mounted pane.
+ *
+ * `role` is not decorative: voice/ui.js `ensureUserTurn` streams the
+ * USER's own turn through here (the "Transcribing..." bubble), so the
+ * same rule as addMessage applies — a user bubble is the user's own
+ * action and forces the tail back into view. Without that, speaking
+ * while scrolled up appends the reader's own words off-screen and
+ * announces them as unseen content.
  */
 export function addMessageStreaming(role, paneElement = null) {
     const target = resolvePaneElement(paneElement);
@@ -3810,10 +3926,7 @@ export function addMessageStreaming(role, paneElement = null) {
     div.appendChild(contentDiv);
     if (target) {
         target.appendChild(div);
-        const c = getChatContainer();
-        if (c && target.parentNode === c) {
-            c.scrollTop = c.scrollHeight;
-        }
+        noteChatAppend(target, { force: role === 'user' });
     }
 
     return div;
@@ -3893,12 +4006,10 @@ export function updateStreamingMessage(msgDiv, content, paneElement = null, thin
         mountToolRenderers(contentDiv);
 
         // Scroll-sync only when this msgDiv is in the live viewport;
-        // detached panes update their `scrollPos` lazily on remount.
+        // detached panes update their `scrollPos` lazily on remount, and
+        // their follow state through noteChatAppend.
         const target = paneElement || msgDiv.parentNode;
-        const c = getChatContainer();
-        if (c && target && target.parentNode === c) {
-            c.scrollTop = c.scrollHeight;
-        }
+        noteChatAppend(target);
     }
 }
 
@@ -3972,7 +4083,7 @@ export async function finalizeStreamingMessage(msgDiv, content, paneOrElement = 
         pane.hasUnrenderedMermaid = true;
     }
 
-    if (mounted && c) c.scrollTop = c.scrollHeight;
+    noteChatAppend(paneEl);
 }
 
 /**
@@ -4029,10 +4140,10 @@ export async function addMessage(role, content, paneElement = null, attachments 
     }
     if (target) target.appendChild(div);
 
-    const c = getChatContainer();
-    if (c && target && target.parentNode === c) {
-        c.scrollTop = c.scrollHeight;
-    }
+    // #2909: a user bubble is the user's own send — snap to it and re-engage
+    // following. Correct for history replay too: a freshly loaded pane starts
+    // engaged, so replay still ends at the bottom.
+    noteChatAppend(target, { force: role === 'user' });
     return div;
 }
 
@@ -4048,10 +4159,7 @@ export function addTextMessage(role, content, paneElement = null) {
     div.appendChild(contentDiv);
     if (target) target.appendChild(div);
 
-    const c = getChatContainer();
-    if (c && target && target.parentNode === c) {
-        c.scrollTop = c.scrollHeight;
-    }
+    noteChatAppend(target);
     return div;
 }
 
@@ -4147,10 +4255,7 @@ export function appendMessagePart(type, data, paneElement = null) {
     div.appendChild(contentDiv);
     if (target) target.appendChild(div);
 
-    const c = getChatContainer();
-    if (c && target && target.parentNode === c) {
-        c.scrollTop = c.scrollHeight;
-    }
+    noteChatAppend(target);
     return div;
 }
 
