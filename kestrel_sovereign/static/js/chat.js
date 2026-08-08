@@ -3906,6 +3906,13 @@ window.compactContext = async function() {
  * (mounted) agent's pane so single-agent and background-pane call sites
  * continue to work without modification. Scroll-syncs only when the
  * write lands on the currently-mounted pane.
+ *
+ * `role` is not decorative: voice/ui.js `ensureUserTurn` streams the
+ * USER's own turn through here (the "Transcribing..." bubble), so the
+ * same rule as addMessage applies — a user bubble is the user's own
+ * action and forces the tail back into view. Without that, speaking
+ * while scrolled up appends the reader's own words off-screen and
+ * announces them as unseen content.
  */
 export function addMessageStreaming(role, paneElement = null) {
     const target = resolvePaneElement(paneElement);
@@ -3919,7 +3926,7 @@ export function addMessageStreaming(role, paneElement = null) {
     div.appendChild(contentDiv);
     if (target) {
         target.appendChild(div);
-        noteChatAppend(target);
+        noteChatAppend(target, { force: role === 'user' });
     }
 
     return div;

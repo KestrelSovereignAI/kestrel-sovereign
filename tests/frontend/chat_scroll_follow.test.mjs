@@ -242,6 +242,47 @@ test('4. scrolled up, sending a message snaps to the bottom and re-engages', asy
     assert.equal(container.scrollTop, 90, 'an agent bubble must respect the flag');
 });
 
+test('4b. a STREAMING user bubble (a voice turn) forces the same way a send does', () => {
+    // `addMessageStreaming` is role-parameterized, and voice/ui.js's
+    // `ensureUserTurn` is the caller that passes 'user' — the "Transcribing..."
+    // bubble that opens a voice turn. That is the user acting on this
+    // conversation, so it must snap to the tail exactly like a typed send;
+    // treating it as ordinary streamed content appends the reader's own words
+    // off-screen and then announces them back as unread.
+    const pane = freshPane('voice-turn-agent');
+    box.grow(2000);
+    box.userScrollTo(95);
+    assert.equal(isFollowing(container), false);
+
+    addMessageStreaming('user', pane.element);
+    assert.equal(container.scrollTop, box.maxScroll, 'a voice turn must snap to the bottom');
+    assert.equal(isFollowing(container), true, 'and re-engage following');
+    assert.equal(pillShown(), false, 'the user is never unread content to themselves');
+
+    // The discriminating half: the AGENT's streaming bubble, opened from the
+    // same position, still respects the flag and announces itself instead.
+    box.userScrollTo(95);
+    assert.equal(isFollowing(container), false);
+    addMessageStreaming('agent', pane.element);
+    assert.equal(container.scrollTop, 95, "an agent's streaming bubble must not yank");
+    assert.equal(pillShown(), true, 'it raises the unseen tail rather than moving the reader');
+
+    // ...and off-screen, where a voice session keeps running after the reader
+    // switches agents: same contract, applied to the pane record.
+    const paneA = freshPane('voice-detached-A');
+    const msgA = addMessageStreaming('agent', paneA.element);
+    box.grow(2000);
+    box.userScrollTo(105);
+    agentAppend(paneA, msgA, 'unread content');
+    freshPane('voice-detached-B');
+    assert.equal(paneA.followLive, false, 'A detached scrolled up...');
+    assert.equal(paneA.unseenTail, true, '...with an unacknowledged tail');
+
+    addMessageStreaming('user', paneA.element);
+    assert.equal(paneA.followLive, true, 'a voice turn re-engages its own pane');
+    assert.equal(paneA.unseenTail, false, 'and acknowledges what was below it');
+});
+
 test('5. a few pixels off the bottom still counts as following', () => {
     // The slack must be real, not exact equality: device-pixel rounding,
     // fractional line heights and reflow while a bubble streams all leave a
