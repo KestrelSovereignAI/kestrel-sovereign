@@ -2023,19 +2023,20 @@ window.loadConversation = async function(sessionId, options = {}) {
         // overflow:auto element; the pane is its child). Only sync if
         // this is the visible agent's pane — detached panes get scroll
         // restored on remount.
+        //
+        // #2909: a freshly loaded conversation follows its tail, and the pane's
+        // `followLive` / `unseenTail` already say so — `wipeAgentChatPane`
+        // above resets both, for the mounted and detached cases alike. What is
+        // NOT already done is the snap itself: this loader paints history
+        // straight into the pane element, so nothing here has told the
+        // controller where the tail moved to. Force it, which also clears any
+        // "Jump to latest" the PREVIOUS conversation had raised — that pill
+        // pointed at content the wipe just removed.
         const viewport = document.getElementById('chat-container');
         if (viewport && pane && pane.element.parentNode === viewport) {
-            // #2909: a freshly loaded conversation follows its tail —
-            // force, so a reader who was scrolled up in the PREVIOUS
-            // conversation doesn't inherit a disengaged viewport (or its
-            // "Jump to latest" pill, which pointed at other content).
             forceScrollToBottom(viewport);
-            pane.followLive = true;
-            pane.unseenTail = false;
         } else if (pane) {
             pane.scrollPos = Number.MAX_SAFE_INTEGER;  // snap to bottom on mount
-            pane.followLive = true;
-            pane.unseenTail = false;
         }
 
         // Switch to chat panel

@@ -21,6 +21,8 @@ import {
     setFollowState,
     maybeScrollToBottom,
     forceScrollToBottom,
+    notePaneAppend,
+    notePaneUserAction,
 } from './chat_scroll.js';
 
 let _deps = {
@@ -1247,6 +1249,64 @@ function getChatContainer() {
 }
 
 /**
+ * #2909: the single seam every append in this module uses to tell the
+ * stick-to-bottom controller that content landed.
+ *
+ * There are two destinations and the caller does not have to know which.
+ * A write into the MOUNTED pane is the live scroll box's business, so it
+ * goes to `maybeScrollToBottom` / `forceScrollToBottom` and the box's own
+ * geometry decides. A write into a DETACHED pane — a backgrounded agent
+ * that is still streaming, a task notification pinned to the stream's
+ * agent, a history repaint into a conversation the reader switched away
+ * from — must not touch the box at all: that state belongs to whatever
+ * conversation is on screen, and moving it (or raising "Jump to latest"
+ * over it) would answer for content that is not in it. It is recorded on
+ * the detached pane's own record instead, so the announcement is waiting
+ * when the reader comes back rather than having never been made.
+ *
+ * `force` marks a user-originated write (their send, their queued
+ * follow-up): the user just acted, so following re-engages either way.
+ */
+function noteChatAppend(target, { force = false } = {}) {
+    const c = getChatContainer();
+    if (c && target && target.parentNode === c) {
+        if (force) forceScrollToBottom(c);
+        else maybeScrollToBottom(c);
+        return;
+    }
+    const pane = resolveDetachedPane(target, c);
+    if (!pane) return;
+    if (force) notePaneUserAction(pane);
+    else notePaneAppend(pane);
+}
+
+/**
+ * Find the pane record a detached write landed in, so `noteChatAppend`
+ * can record against the right conversation.
+ *
+ * Matched by element identity rather than the pane element's
+ * ``dataset.agent``, because the standalone null-key pane carries no
+ * dataset at all (see getOrCreateChatPane). Returns null for a write
+ * nested INSIDE the mounted pane: the container is the authority there
+ * and the pane's saved fields are stale until it detaches, so writing
+ * them would plant state that the next detach overwrites anyway.
+ */
+function resolveDetachedPane(target, container) {
+    if (!target) return null;
+    const panes = deps().state.chatPanes;
+    if (!panes || typeof panes.values !== 'function') return null;
+    for (const pane of panes.values()) {
+        const el = pane && pane.element;
+        if (!el) continue;
+        const hit = el === target
+            || (typeof el.contains === 'function' && el.contains(target));
+        if (!hit) continue;
+        return (container && el.parentNode === container) ? null : pane;
+    }
+    return null;
+}
+
+/**
  * Resolve the chat pane element a write should target. When called
  * with no arg, defaults to the currently-mounted agent's pane — this
  * is what no-arg consumers (e.g. the aside-reply pipe) rely on so a single
@@ -1898,9 +1958,9 @@ function scheduleReconnect() {
  * for (`notificationAgent`), NOT whatever pane is mounted now — switch
  * agents mid-turn and the earlier agent's task results must keep landing
  * in its own conversation. That pane is therefore frequently detached,
- * which is why the scroll below is gated on it being the mounted one.
- * Per-agent notification streams for every loaded agent remain out of
- * scope for the parallel-chat change.
+ * which is why the append below goes through `noteChatAppend` rather than
+ * touching the viewport directly. Per-agent notification streams for every
+ * loaded agent remain out of scope for the parallel-chat change.
  */
 function showTaskNotification(message, type) {
     // Reset reconnect attempts on successful notification
@@ -1957,14 +2017,9 @@ function showTaskNotification(message, type) {
     paneElement.appendChild(div);
     // #2909: the notification stream is pinned to `notificationAgent`, which
     // is NOT necessarily the mounted agent — the bubble above may have landed
-    // in a detached pane. Only tell the controller when this pane is the one
-    // in the scroll box, or a backgrounded agent's task result would scroll
-    // the visible conversation (or raise "Jump to latest" over content that
-    // isn't in it).
-    const c = getChatContainer();
-    if (c && paneElement.parentNode === c) {
-        maybeScrollToBottom(c);
-    }
+    // in a detached pane, whose follow state noteChatAppend records without
+    // touching the viewport the reader is actually watching.
+    noteChatAppend(paneElement);
 
     // Also show a Toast notification
     deps().toast.show(message, type === 'failed' ? 'error' : 'info');
@@ -2032,10 +2087,7 @@ export async function handleSignalCompleted(payload) {
 
     target.appendChild(div);
 
-    const c = getChatContainer();
-    if (c && target.parentNode === c) {
-        maybeScrollToBottom(c);
-    }
+    noteChatAppend(target);
 }
 
 /**
@@ -2258,12 +2310,9 @@ export function handleRestartStatus(payload, targetEl = null) {
     target.appendChild(div);
     // #2909: `target` is the notification agent's pane (possibly detached)
     // or an explicit `targetEl` from a history repaint — neither is
-    // necessarily what the reader is looking at. Same guard as the message
-    // renderers: the viewport only responds to its own pane's content.
-    const c = getChatContainer();
-    if (c && target.parentNode === c) {
-        maybeScrollToBottom(c);
-    }
+    // necessarily what the reader is looking at, which is exactly the
+    // discrimination noteChatAppend makes.
+    noteChatAppend(target);
 }
 
 
@@ -2509,15 +2558,12 @@ function renderQueuedChip(pane, agentName, text) {
     pane.element.appendChild(chip);
     // Scroll the real viewport, not pane.element: `.chat-container-pane`
     // is `display: contents` so it has no scroll box. Mirror the
-    // addMessage/updateStreamingMessage pattern — only scroll when this
-    // pane is the one actually mounted into #chat-container, so a chip
-    // queued for a backgrounded agent doesn't yank the visible pane.
-    // The chip is the user's OWN follow-up, so it forces (#2909): the
-    // user just acted, put them where the action landed.
-    const c = getChatContainer();
-    if (c && pane.element.parentNode === c) {
-        forceScrollToBottom(c);
-    }
+    // addMessage/updateStreamingMessage pattern — a chip queued for a
+    // backgrounded agent must not yank the visible pane. The chip is the
+    // user's OWN follow-up, so it forces (#2909): the user just acted, put
+    // them where the action landed — or, for a detached pane, make sure it
+    // is at that action when they return to it.
+    noteChatAppend(pane.element, { force: true });
 }
 
 /** Remove the queued-message chip from a pane, if present. */
@@ -3427,12 +3473,9 @@ function showContextWarning(warnings, paneElement = null) {
         <br><small>Use <code>!compact</code> to summarize older messages, or start fresh with <code>!new-session</code></small>
     `;
     target.appendChild(div);
-    // #2909: same guard as the other renderers — an explicit `paneElement`
+    // #2909: same routing as the other renderers — an explicit `paneElement`
     // may be detached, and only the mounted pane may move the viewport.
-    const c = getChatContainer();
-    if (c && target.parentNode === c) {
-        maybeScrollToBottom(c);
-    }
+    noteChatAppend(target);
 }
 
 /**
@@ -3876,10 +3919,7 @@ export function addMessageStreaming(role, paneElement = null) {
     div.appendChild(contentDiv);
     if (target) {
         target.appendChild(div);
-        const c = getChatContainer();
-        if (c && target.parentNode === c) {
-            maybeScrollToBottom(c);
-        }
+        noteChatAppend(target);
     }
 
     return div;
@@ -3959,12 +3999,10 @@ export function updateStreamingMessage(msgDiv, content, paneElement = null, thin
         mountToolRenderers(contentDiv);
 
         // Scroll-sync only when this msgDiv is in the live viewport;
-        // detached panes update their `scrollPos` lazily on remount.
+        // detached panes update their `scrollPos` lazily on remount, and
+        // their follow state through noteChatAppend.
         const target = paneElement || msgDiv.parentNode;
-        const c = getChatContainer();
-        if (c && target && target.parentNode === c) {
-            maybeScrollToBottom(c);
-        }
+        noteChatAppend(target);
     }
 }
 
@@ -4038,7 +4076,7 @@ export async function finalizeStreamingMessage(msgDiv, content, paneOrElement = 
         pane.hasUnrenderedMermaid = true;
     }
 
-    if (mounted) maybeScrollToBottom(c);
+    noteChatAppend(paneEl);
 }
 
 /**
@@ -4095,14 +4133,10 @@ export async function addMessage(role, content, paneElement = null, attachments 
     }
     if (target) target.appendChild(div);
 
-    const c = getChatContainer();
-    if (c && target && target.parentNode === c) {
-        // #2909: a user bubble is the user's own send — snap to it and
-        // re-engage following. Correct for history replay too: a freshly
-        // loaded pane starts engaged, so replay still ends at the bottom.
-        if (role === 'user') forceScrollToBottom(c);
-        else maybeScrollToBottom(c);
-    }
+    // #2909: a user bubble is the user's own send — snap to it and re-engage
+    // following. Correct for history replay too: a freshly loaded pane starts
+    // engaged, so replay still ends at the bottom.
+    noteChatAppend(target, { force: role === 'user' });
     return div;
 }
 
@@ -4118,10 +4152,7 @@ export function addTextMessage(role, content, paneElement = null) {
     div.appendChild(contentDiv);
     if (target) target.appendChild(div);
 
-    const c = getChatContainer();
-    if (c && target && target.parentNode === c) {
-        maybeScrollToBottom(c);
-    }
+    noteChatAppend(target);
     return div;
 }
 
@@ -4217,10 +4248,7 @@ export function appendMessagePart(type, data, paneElement = null) {
     div.appendChild(contentDiv);
     if (target) target.appendChild(div);
 
-    const c = getChatContainer();
-    if (c && target && target.parentNode === c) {
-        maybeScrollToBottom(c);
-    }
+    noteChatAppend(target);
     return div;
 }
 

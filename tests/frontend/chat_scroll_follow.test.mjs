@@ -65,8 +65,11 @@ const {
     mountChatPane,
     wipeAgentChatPane,
     addMessage,
+    addTextMessage,
     addMessageStreaming,
     updateStreamingMessage,
+    finalizeStreamingMessage,
+    appendMessagePart,
     handleRestartStatus,
     connectNotifications,
 } = chatModule;
@@ -528,6 +531,195 @@ test('11. a backgrounded agent\'s task notification does not touch the viewport'
         globalThis.EventSource = origES;
         setChatDeps({ toast: null });
     }
+});
+
+test('12. a DETACHED pane accumulates its own unread tail while it streams', async () => {
+    // The one that survives all the mounted-pane guards. A backgrounded agent
+    // does not stop streaming — chat.js keeps painting into its detached
+    // element on purpose. If the append is merely skipped (correct: it must
+    // not touch the visible box) and nothing else records it, the pane comes
+    // back with followLive=false and unseenTail=false: detached from a tail it
+    // never announces. The reader cannot tell new content from no content,
+    // which is the exact trap the pill exists to close.
+    const paneA = freshPane('detached-stream-A');
+    const msgA = addMessageStreaming('agent', paneA.element);
+    box.grow(2000);
+
+    // Scrolled up, but nothing has arrived yet — so no pill, by design.
+    box.userScrollTo(170);
+    assert.equal(isFollowing(container), false);
+    assert.equal(pillShown(), false);
+
+    // Walk away to another agent. A is now detached and scrolled up.
+    const paneB = freshPane('detached-stream-B');
+    assert.equal(paneA.followLive, false);
+    assert.equal(paneA.unseenTail, false, 'nothing had arrived before the switch');
+
+    // A keeps streaming into its detached element. Every route: the streaming
+    // bubble, a sealed bubble, a typed part, and a plain text line.
+    updateStreamingMessage(msgA, 'streamed while backgrounded', paneA.element);
+    await finalizeStreamingMessage(msgA, 'streamed while backgrounded', paneA);
+    await addMessage('agent', 'a whole new bubble', paneA.element);
+    addTextMessage('agent', 'a plain line', paneA.element);
+    appendMessagePart('unknown_part_type', { any: 'payload' }, paneA.element);
+
+    assert.equal(paneA.unseenTail, true,
+        'a detached pane must record the tail it grew while nobody watched');
+    assert.equal(paneA.followLive, false, 'and must still be detached from it');
+
+    // None of that may have leaked into the conversation on screen.
+    assert.equal(paneB.element.querySelectorAll('.message').length, 0);
+    assert.equal(pillShown(), false, "A's backgrounded stream is not B's news");
+    assert.equal(isFollowing(container), true, "nor may it disengage B's follow");
+
+    // Come back to A: the announcement is waiting, made in absentia.
+    box.grow(2000);
+    API.setHostAgent('detached-stream-A');
+    mountChatPane('detached-stream-A');
+    assert.equal(isFollowing(container), false, 'still parked in scrollback');
+    assert.equal(pillShown(), true, 'and told that content landed below');
+});
+
+test('13. a user write into a detached pane re-engages it', async () => {
+    // The force contract has no viewport to act on when the pane is not
+    // mounted, but it still has a meaning: the user acted on THIS
+    // conversation, so returning to it must land on what they did — never in
+    // scrollback above their own message.
+    const paneA = freshPane('detached-user-A');
+    const msgA = addMessageStreaming('agent', paneA.element);
+    box.grow(2000);
+    box.userScrollTo(130);
+    agentAppend(paneA, msgA, 'unread content');
+    assert.equal(pillShown(), true);
+
+    freshPane('detached-user-B');
+    assert.equal(paneA.followLive, false, 'A detached scrolled up...');
+    assert.equal(paneA.unseenTail, true, '...with an unacknowledged tail');
+
+    // The user sends to the backgrounded agent (queued follow-up / multi-agent
+    // send). That is an action on A, so A re-engages.
+    await addMessage('user', 'sent to the backgrounded agent', paneA.element);
+    assert.equal(paneA.followLive, true, "the user's own send re-engages the pane");
+    assert.equal(paneA.unseenTail, false, 'and acknowledges what was below them');
+
+    // Returning lands at the tail, silently — no stale pill over their own send.
+    box.grow(2000);
+    API.setHostAgent('detached-user-A');
+    mountChatPane('detached-user-A');
+    assert.equal(isFollowing(container), true);
+    assert.equal(container.scrollTop, box.maxScroll);
+    assert.equal(pillShown(), false);
+});
+
+test('14. a detached pane that was FOLLOWING stays following as it streams', async () => {
+    // The complement of 12, and the reason notePaneAppend is not simply
+    // "unseenTail = true". A pane left at the tail is re-snapped to the tail
+    // on mount, so content that arrived while it was away is on screen the
+    // moment it returns — announcing it would be pointing at what the reader
+    // is already looking at.
+    const paneA = freshPane('detached-follow-A');
+    const msgA = addMessageStreaming('agent', paneA.element);
+    assert.equal(paneA.followLive, true);
+
+    freshPane('detached-follow-B');
+    assert.equal(paneA.followLive, true, 'A was at its tail when it detached');
+
+    updateStreamingMessage(msgA, 'arrived while away', paneA.element);
+    assert.equal(paneA.unseenTail, false, 'a following pane has nothing unseen');
+
+    box.grow(2000);
+    API.setHostAgent('detached-follow-A');
+    mountChatPane('detached-follow-A');
+    assert.equal(isFollowing(container), true);
+    assert.equal(container.scrollTop, box.maxScroll, 'it comes back on the tail');
+    assert.equal(pillShown(), false, 'so there is nothing to announce');
+});
+
+test('15. a queued follow-up chip is the user acting, so it forces', async () => {
+    // #1257 queue mode: Enter while the agent is busy stashes the message and
+    // paints a chip. That chip is the user's own text — leaving them staring
+    // at scrollback above something they just typed is the same failure as a
+    // send that does not scroll.
+    const pane = freshPane('queued-agent');
+    box.grow(2000);
+    box.userScrollTo(110);
+    assert.equal(isFollowing(container), false);
+
+    pane.composerMode = 'queue';
+    state.waitingAgents.add('queued-agent');
+    try {
+        await chatModule.sendMessage('a follow-up typed mid-turn', 'queued-agent');
+    } finally {
+        state.waitingAgents.delete('queued-agent');
+    }
+
+    assert.equal(pane.queuedMessage, 'a follow-up typed mid-turn', 'the chip path ran');
+    assert.equal(container.scrollTop, box.maxScroll, "the user's own chip snaps to it");
+    assert.equal(isFollowing(container), true, 'and re-engages following');
+});
+
+test('16. loading a conversation from history lands at the tail, following', async () => {
+    // identity.js paints history straight into the pane element (no addMessage),
+    // so nothing on that path talks to the controller except the snap at the
+    // end. A reader scrolled up in the PREVIOUS conversation must not inherit a
+    // disengaged viewport — or a "Jump to latest" pill pointing at content that
+    // is no longer even in the pane.
+    await import('../../kestrel_sovereign/static/js/identity.js');
+
+    const pane = freshPane('history-agent');
+    const msgDiv = addMessageStreaming('agent', pane.element);
+    box.grow(2000);
+    box.userScrollTo(145);
+    agentAppend(pane, msgDiv, 'unread content in the OLD conversation');
+    assert.equal(isFollowing(container), false);
+    assert.equal(pillShown(), true);
+
+    const origGet = API.getConversation;
+    const origEvents = API.getRestartStatusEvents;
+    API.getConversation = async () => ({
+        messages: [
+            { id: 1, role: 'user', content: 'older question', created_at: '2026-08-08T10:00:00' },
+            { id: 2, role: 'assistant', content: 'older answer', created_at: '2026-08-08T10:00:01' },
+        ],
+    });
+    // Last await before identity.js's synchronous wipe-and-render, so growing
+    // here stands in for the layout the rendered history would produce: the
+    // box is taller than the viewport by the time the snap runs, and a snap
+    // that does not happen is therefore visible as a stale scrollTop.
+    API.getRestartStatusEvents = async () => { box.grow(3000); return { events: [] }; };
+    try {
+        await window.loadConversation('session-under-test', { force: true });
+    } finally {
+        API.getConversation = origGet;
+        API.getRestartStatusEvents = origEvents;
+    }
+
+    assert.equal(pane.element.querySelectorAll('.message').length, 2,
+        'the history actually rendered (otherwise this proves nothing)');
+    assert.equal(pane.followLive, true, 'a freshly loaded conversation follows');
+    assert.equal(pane.unseenTail, false, 'and carries no unread tail from the old one');
+    assert.equal(isFollowing(container), true, 'the live viewport follows too');
+    assert.equal(container.scrollTop, box.maxScroll, 'and sits at the tail');
+    assert.equal(pillShown(), false, "the old conversation's pill is gone");
+});
+
+test('a brand-new pane is born following, with nothing unread', () => {
+    // The pane factory's two follow fields are a SHAPE contract, not a
+    // behaviour: the controller's guards read `=== false`, so an absent field
+    // already behaves as "following". That is deliberate defensiveness, and it
+    // means nothing else in this file can observe the initializer — hence a
+    // structural assertion. It is load-bearing because the pane object is a
+    // documented interface other modules write to by name (identity.js's
+    // history load, wipeAgentChatPane, the detach/mount round-trip); a pane
+    // that ships `undefined` there hands every one of them a field whose
+    // meaning depends on a guard they cannot see.
+    const born = getOrCreateChatPane('never-mounted-agent');
+    assert.equal(born.followLive, true, 'a fresh conversation follows its tail');
+    assert.equal(born.unseenTail, false, 'and has nothing behind the reader');
+    assert.ok(Object.prototype.hasOwnProperty.call(born, 'followLive'),
+        'followLive must be an own field of the pane, not an implied default');
+    assert.ok(Object.prototype.hasOwnProperty.call(born, 'unseenTail'),
+        'unseenTail must be an own field of the pane, not an implied default');
 });
 
 test('the pill is styled in index.css, never inline', async () => {

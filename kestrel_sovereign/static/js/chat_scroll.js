@@ -22,6 +22,14 @@
  * fields (`following` and `unseenTail`) travel with the pane across an
  * agent switch, exactly like `scrollPos` does. `getFollowState` /
  * `setFollowState` are that seam; see `mountChatPane` in chat.js.
+ *
+ * Which means the box is only the authority while the conversation is
+ * mounted. Panes keep streaming after they are detached, so the same
+ * two decisions exist with no viewport to act on: `notePaneAppend` and
+ * `notePaneUserAction` apply them to the pane record directly. Routing a
+ * detached write through the container instead would answer for the
+ * wrong conversation — scrolling, or announcing unread content, in
+ * whichever pane the reader happens to be watching.
  */
 
 // Slack for "at the bottom". Exact equality is not usable: device-pixel
@@ -144,6 +152,34 @@ export function forceScrollToBottom(container) {
     s.unseenTail = false;
     container.scrollTop = container.scrollHeight;
     renderJumpToLatest(container);
+}
+
+/**
+ * Agent- or system-originated append into a pane the reader is NOT
+ * looking at (a backgrounded agent still streaming, a history repaint
+ * into a switched-away conversation). The scroll box belongs to a
+ * different conversation, so it must not be touched at all — but this
+ * one still has to remember that content landed below its reader, or it
+ * comes back detached with the tail silently unannounced.
+ *
+ * A pane that was following needs no record: its mount path snaps to the
+ * tail, so the new content is on screen the moment it returns.
+ */
+export function notePaneAppend(pane) {
+    if (!pane) return;
+    if (pane.followLive === false) pane.unseenTail = true;
+}
+
+/**
+ * User-originated write into a detached pane (their own send or queued
+ * follow-up landing in a backgrounded agent). Same contract as
+ * `forceScrollToBottom`, minus the scroll there is no viewport for: the
+ * pane re-engages, so returning to it lands on what the user just did.
+ */
+export function notePaneUserAction(pane) {
+    if (!pane) return;
+    pane.followLive = true;
+    pane.unseenTail = false;
 }
 
 /**
