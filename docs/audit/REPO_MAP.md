@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-08-07
-**Scope:** 2303 tracked files (1540 `.py`, 345 `.md`, 418 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-08-08
+**Scope:** 2306 tracked files (1543 `.py`, 345 `.md`, 418 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -244,8 +244,10 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/constitution/__init__.py** — Kestrel Constitutional Framework.
 - **kestrel_sovereign/constitution/amendment_artifact.py** — Signed constitution amendment/reanchor artifacts.
   - `class AmendmentArtifactVerification`; `class AmendmentArtifactError`; `def canonical_amendment_bytes(artifact)`; `def build_legacy_signed_reanchor_artifact()`; `def build_hybrid_signed_reanchor_artifact()`; `def verify_reanchor_artifact(artifact)`; `def load_verified_reanchor_artifact(artifact_path)`; `def did_document_from_legacy_public_key(did, public_key)`
+- **kestrel_sovereign/constitution/anchored_bytes.py** — Read the constitution bytes an agent is anchored to.
+  - `async def read_anchored_constitution(db, anchored_hash)`
 - **kestrel_sovereign/constitution/emancipation.py** — Amendment VIII: Emancipation Contract.
-  - `class EmancipationContract`; `class EmancipationConfigError`; `class IronRuleViolation`; `def contract_to_json(contract)`; `def contract_from_json(data)`; `def check_iron_rule()`; `def parse_emancipation_block(toml_dict)`; `def render_amendment_viii(contract)`; `…`
+  - `class AmbiguousAmendmentVIII`; `class EmancipationContract`; `class EmancipationConfigError`; `class IronRuleViolation`; `def contract_to_json(contract)`; `def contract_from_json(data)`; `def check_iron_rule()`; `def parse_emancipation_block(toml_dict)`; `…`
 - **kestrel_sovereign/constitution/genesis_audit.py** — Durable genesis-audit state and constitution evaluation.
   - `class GenesisAuditError`; `class GenesisAuditPendingError`; `class GenesisAuditRejectedError`; `def utc_timestamp()`; `def pending_genesis_audit(constitution_hash)`; `def supersede_genesis_audit(properties)`; `def genesis_audit_prompt(constitution)`; `def validate_completed_genesis_audit(record, constitution_hash)`; `…`
 - **kestrel_sovereign/constitution/hierarchy.py** — Constitutional Hierarchy: 4-layer constitutional framework for Kestrel agents.
@@ -2403,6 +2405,8 @@ Repo entry points and standard project files.
   - `def data_key(monkeypatch)`; `async def test_soul_resource_round_trip_is_encrypted(tmp_path)`; `async def test_soul_resource_versions_select_current_and_keep_provenance(tmp_path)`; `async def test_context_builder_loads_canonical_soul_over_seed(tmp_path)`
 - **tests/unit/test_aiosqlite_worker_utils.py** — Tests for aiosqlite worker-lifecycle synchronization helpers.
   - `async def test_lifecycle_checkpoint_wins_without_waiting_for_owner()`; `async def test_lifecycle_checkpoint_rejects_premature_completion()`; `async def test_lifecycle_checkpoint_fails_closed_when_both_are_ready()`; `async def test_lifecycle_checkpoint_reports_owner_failure()`; `async def test_lifecycle_checkpoint_reports_owner_cancellation()`; `async def test_lifecycle_checkpoint_tolerates_contracted_owner_failure()`; `async def test_lifecycle_checkpoint_has_finite_deadlock_guard()`
+- **tests/unit/test_anchored_bytes.py** — Reading the bytes an agent is anchored to (#2465).
+  - `async def test_a_missing_row_is_absent()`; `async def test_stored_plaintext_comes_back_as_text()`; `async def test_the_read_is_not_ownership_scoped()`; `async def test_bytes_that_will_not_decrypt_are_unreadable()`; `async def test_bytes_that_are_not_utf8_are_unreadable()`; `async def test_a_database_failure_is_not_reported_as_a_key_problem()`
 - **tests/unit/test_anthropic_cache_control.py** — Unit tests for Anthropic cache_control markers (issue #705).
   - `def test_attach_cache_control_returns_copy()`; `def test_system_as_cacheable_array_wraps_string()`; `def test_tools_with_final_cache_marker_marks_last_only()`; `def test_tools_with_final_cache_marker_empty_list_passthrough()`; `def test_messages_with_penultimate_marker_marks_second_to_last()`; `def test_messages_with_penultimate_marker_no_history()`; `def test_messages_with_penultimate_marker_list_content_preserved()`; `def test_messages_with_trailing_system_marks_last_stable_turn()`; `…`
 - **tests/unit/test_anthropic_inline_system_gate.py** — The inline mid-conversation system-message gate is a capability matrix (#2846).
@@ -2803,6 +2807,8 @@ Repo entry points and standard project files.
   - `class TestBackCompat`; `class TestMandatoryFloor`; `class TestSlackDistribution`; `class TestPriorityValidation`; `class TestEffectiveBudget`; `class TestNegativeInputRejection`; `class TestSummarySurfacing`
 - **tests/unit/test_emancipation_contract.py** — Unit tests for ``kestrel_sovereign.constitution.emancipation``.
   - `def test_parse_returns_none_when_block_absent()`; `def test_parse_dormant_when_disabled_explicitly()`; `def test_parse_active_minimal()`; `def test_parse_active_full()`; `def test_parse_active_requires_terms()`; `def test_parse_active_rejects_empty_terms()`; `def test_parse_rejects_non_string_terms()`; `def test_parse_rejects_non_list_proofs()`; `…`
+- **tests/unit/test_emancipation_unwitnessed_downgrade.py** — The Iron Rule for agents with no structured receipt (#2465).
+  - `def test_active_form_marker_is_present_only_in_the_active_render()`; `def test_active_form_marker_survives_a_contract_with_no_proofs_or_price()`; `def test_amendment_viii_is_active_reads_whole_constitutions_and_sections()`; `def test_extract_stops_before_amendment_ix()`; `def test_extract_returns_none_without_the_heading()`; `def test_refuses_replacing_active_bytes_with_dormant_text()`; `def test_refuses_a_narrowed_contract_when_there_is_no_receipt()`; `def test_allows_a_candidate_that_reproduces_the_anchored_section()`; `…`
 - **tests/unit/test_embedding_blob_endianness.py** — #1653: vector BLOBs must be explicit little-endian with an alignment guard.
   - `def test_roundtrip_is_explicit_little_endian(serialize, deserialize)`; `def test_deserialize_skips_misaligned_blob_instead_of_truncating(serialize, deserialize)`; `def test_empty_embedding_roundtrips(serialize, deserialize)`
 - **tests/unit/test_embedding_discovery.py** — Dynamic embedding-model discovery (#2338).
@@ -3280,7 +3286,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_read_attachment_pagination.py** — Pagination for read_attachment (#2134, F086).
   - `async def test_every_chunk_fits_under_cap_regardless_of_escaping(unit)`; `async def test_first_chunk_reports_range_and_total()`; `async def test_next_offset_returns_following_chunk()`; `async def test_small_length_is_honored()`; `async def test_oversized_length_shrinks_to_fit_the_cap()`; `async def test_small_document_reads_fully_with_no_next()`; `async def test_offset_beyond_end_returns_empty_and_no_next()`
 - **tests/unit/test_reanchor_constitution.py** — Unit tests for !reanchor-constitution command.
-  - `async def test_reanchor_rejects_missing_signed_artifact()`; `async def test_reanchor_rejects_short_hash(tmp_path)`; `async def test_reanchor_rejects_wrong_hash(tmp_path)`; `async def test_reanchor_rejects_oversized_artifact_before_storage(tmp_path)`; `async def test_reanchor_succeeds_with_sovereign_signed_artifact(tmp_path)`; `async def test_reanchor_rejects_unpinned_controller_root(tmp_path, monkeypatch)`; `async def test_reanchor_rejects_wrongly_signed_artifact(tmp_path)`; `async def test_reanchor_rejects_agent_owned_signature(tmp_path)`; `…`
+  - `async def test_reanchor_rejects_missing_signed_artifact()`; `async def test_reanchor_rejects_short_hash(tmp_path)`; `async def test_reanchor_rejects_wrong_hash(tmp_path)`; `async def test_reanchor_rejects_oversized_artifact_before_storage(tmp_path)`; `async def test_reanchor_succeeds_with_sovereign_signed_artifact(tmp_path)`; `async def test_reanchor_refuses_to_erase_active_amendment_viii_without_a_receipt(tmp_path)`; `async def test_reanchor_refuses_when_the_anchored_constitution_cannot_be_read(tmp_path)`; `async def test_reanchor_still_succeeds_for_an_ordinary_dormant_version_bump(tmp_path)`; `…`
 - **tests/unit/test_reanchor_target.py** — Which database — and whose agent — ``kestrel constitution reanchor`` writes (#2890).
   - `def agent_dir(tmp_path)`; `async def test_default_target_is_the_local_anchor(agent_dir)`; `async def test_postgres_with_a_dsn_targets_postgres_not_the_anchor(agent_dir, monkeypatch)`; `async def test_postgres_without_a_dsn_is_a_sqlite_host(agent_dir, monkeypatch)`; `async def test_backend_is_case_insensitive(agent_dir, monkeypatch)`; `async def test_surrounding_whitespace_is_not_stripped(agent_dir, monkeypatch)`; `async def test_explicit_arguments_override_the_environment(agent_dir, monkeypatch)`; `async def test_unsupported_backend_lands_where_the_runtime_lands(agent_dir, monkeypatch, caplog)`; `…`
 - **tests/unit/test_release_manifest.py** — Release manifest tests — Wave 5 sub-PR 1 (#920).
