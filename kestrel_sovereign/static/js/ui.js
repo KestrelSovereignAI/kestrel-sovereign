@@ -117,6 +117,11 @@ export async function loadCommands(apiModule, expectedAgent = apiModule?.getHost
 //     thinkingItems: Array,             // UI-only thought bubbles for current stream
 //     sessionId: string|null,
 //     scrollPos: number,
+//     followLive: boolean,              // #2909: stick-to-bottom engaged for this
+//                                        //   conversation. Saved on detach and
+//                                        //   restored on mount alongside scrollPos,
+//                                        //   so returning to a scrolled-up pane does
+//                                        //   not silently re-engage tail-following.
 //     hasUnrenderedMermaid: boolean,    // mermaid render deferred until mount
 //     pendingRevise: boolean,            // Wave 5C: server fired a `revising` SSE event;
 //                                        //   next chunk replaces (not appends) the bubble
@@ -212,6 +217,7 @@ export function getOrCreateChatPane(agentName) {
         thinkingItems: [],
         sessionId: null,
         scrollPos: 0,
+        followLive: true,
         draftText: '',
         micArmed: false,
         hasUnrenderedMermaid: false,

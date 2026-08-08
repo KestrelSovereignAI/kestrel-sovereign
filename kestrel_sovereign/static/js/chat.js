@@ -15,6 +15,14 @@ import {
     mountRenderers,
 } from './ui-ext/renderers.js';
 import { buildMessageKebab } from './message_kebab.js';
+import {
+    installScrollFollow,
+    isFollowing,
+    setFollowing,
+    maybeScrollToBottom,
+    forceScrollToBottom,
+    resetScrollFollow,
+} from './chat_scroll.js';
 
 let _deps = {
     api: null,
@@ -1297,6 +1305,10 @@ export function mountChatPane(agentName) {
         }
         if (current && current.element.parentNode === container) {
             current.scrollPos = container.scrollTop;
+            // #2909: follow state rides with the pane exactly like
+            // scrollPos — otherwise switching away from a scrolled-up
+            // conversation and back re-engages tail-following by accident.
+            current.followLive = isFollowing(container);
             current.element.remove();
         }
     }
@@ -1310,6 +1322,17 @@ export function mountChatPane(agentName) {
 
     // Restore scroll to where the user left this agent's conversation.
     container.scrollTop = target.scrollPos;
+    // #2909: and the follow state that went with it. A pane left at the
+    // tail comes back at the tail — content may have streamed in while it
+    // was detached, so the saved pixel offset is no longer the bottom.
+    // (`installScrollFollow` here rather than only in initChat: embedders
+    // mount panes into a container this module never wired otherwise.)
+    installScrollFollow(container);
+    if (target.followLive === false) {
+        setFollowing(container, false);
+    } else {
+        forceScrollToBottom(container);
+    }
     if (messageInput) {
         messageInput.value = target.draftText || '';
         autosizeComposer();
@@ -1364,6 +1387,12 @@ export function wipeAgentChatPane(agentName, html = '') {
     pane.queuedMessage = null;
     pane.element.innerHTML = html;
     pane.scrollPos = 0;
+    // #2909: a cleared pane is a fresh conversation — follow its tail.
+    pane.followLive = true;
+    const container = getChatContainer();
+    if (container && pane.element.parentNode === container) {
+        resetScrollFollow(container);
+    }
 }
 
 // ============================================================================
@@ -1559,6 +1588,9 @@ export function initChat() {
         }
         chatContainer.appendChild(initialPane.element);
         deps().state.mountedChatAgent = initialAgent;
+        // #2909: the scroll listener that owns the stick-to-bottom flag.
+        // Standalone hosts never call mountChatPane, so wire it here too.
+        installScrollFollow(chatContainer);
     }
 
     // Event listeners
@@ -1909,8 +1941,7 @@ function showTaskNotification(message, type) {
     `;
 
     paneElement.appendChild(div);
-    const c = getChatContainer();
-    if (c) c.scrollTop = c.scrollHeight;
+    maybeScrollToBottom(getChatContainer());
 
     // Also show a Toast notification
     deps().toast.show(message, type === 'failed' ? 'error' : 'info');
@@ -1980,7 +2011,7 @@ export async function handleSignalCompleted(payload) {
 
     const c = getChatContainer();
     if (c && target.parentNode === c) {
-        c.scrollTop = c.scrollHeight;
+        maybeScrollToBottom(c);
     }
 }
 
@@ -2202,8 +2233,7 @@ export function handleRestartStatus(payload, targetEl = null) {
     div.style.borderLeftColor = accent;
     renderRestartStatusBody(div, payload);
     target.appendChild(div);
-    const c = getChatContainer();
-    if (c) c.scrollTop = c.scrollHeight;
+    maybeScrollToBottom(getChatContainer());
 }
 
 
@@ -2452,9 +2482,11 @@ function renderQueuedChip(pane, agentName, text) {
     // addMessage/updateStreamingMessage pattern — only scroll when this
     // pane is the one actually mounted into #chat-container, so a chip
     // queued for a backgrounded agent doesn't yank the visible pane.
+    // The chip is the user's OWN follow-up, so it forces (#2909): the
+    // user just acted, put them where the action landed.
     const c = getChatContainer();
     if (c && pane.element.parentNode === c) {
-        c.scrollTop = c.scrollHeight;
+        forceScrollToBottom(c);
     }
 }
 
@@ -3365,8 +3397,7 @@ function showContextWarning(warnings, paneElement = null) {
         <br><small>Use <code>!compact</code> to summarize older messages, or start fresh with <code>!new-session</code></small>
     `;
     target.appendChild(div);
-    const c = getChatContainer();
-    if (c) c.scrollTop = c.scrollHeight;
+    maybeScrollToBottom(getChatContainer());
 }
 
 /**
@@ -3812,7 +3843,7 @@ export function addMessageStreaming(role, paneElement = null) {
         target.appendChild(div);
         const c = getChatContainer();
         if (c && target.parentNode === c) {
-            c.scrollTop = c.scrollHeight;
+            maybeScrollToBottom(c);
         }
     }
 
@@ -3897,7 +3928,7 @@ export function updateStreamingMessage(msgDiv, content, paneElement = null, thin
         const target = paneElement || msgDiv.parentNode;
         const c = getChatContainer();
         if (c && target && target.parentNode === c) {
-            c.scrollTop = c.scrollHeight;
+            maybeScrollToBottom(c);
         }
     }
 }
@@ -3972,7 +4003,7 @@ export async function finalizeStreamingMessage(msgDiv, content, paneOrElement = 
         pane.hasUnrenderedMermaid = true;
     }
 
-    if (mounted && c) c.scrollTop = c.scrollHeight;
+    if (mounted) maybeScrollToBottom(c);
 }
 
 /**
@@ -4031,7 +4062,11 @@ export async function addMessage(role, content, paneElement = null, attachments 
 
     const c = getChatContainer();
     if (c && target && target.parentNode === c) {
-        c.scrollTop = c.scrollHeight;
+        // #2909: a user bubble is the user's own send — snap to it and
+        // re-engage following. Correct for history replay too: a freshly
+        // loaded pane starts engaged, so replay still ends at the bottom.
+        if (role === 'user') forceScrollToBottom(c);
+        else maybeScrollToBottom(c);
     }
     return div;
 }
@@ -4050,7 +4085,7 @@ export function addTextMessage(role, content, paneElement = null) {
 
     const c = getChatContainer();
     if (c && target && target.parentNode === c) {
-        c.scrollTop = c.scrollHeight;
+        maybeScrollToBottom(c);
     }
     return div;
 }
@@ -4149,7 +4184,7 @@ export function appendMessagePart(type, data, paneElement = null) {
 
     const c = getChatContainer();
     if (c && target && target.parentNode === c) {
-        c.scrollTop = c.scrollHeight;
+        maybeScrollToBottom(c);
     }
     return div;
 }

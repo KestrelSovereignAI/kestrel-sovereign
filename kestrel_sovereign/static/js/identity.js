@@ -7,6 +7,7 @@ import API from './api.js';
 import { state, PRIVACY_MODES, Toast, Modal, loadCommands, renderTextError } from './ui.js';
 import { renderIdentityDangerZone } from './identity-danger-zone.js';
 import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, refreshAgentThinkingDot, stopAgent, renderModelFooterHtml, appendMessagePart, renderSignalWakeChip, handleRestartStatus, renderAgentContentHtml, mountToolRenderers, messageAttachmentsHtml } from './chat.js';
+import { forceScrollToBottom } from './chat_scroll.js';
 import { generateIdenticon } from './identicon.js';
 // #2199: the standalone conversations pane is now a `mountConversations`
 // consumer — one list orchestrator (fetch / refresh / seq-guard / views /
@@ -2024,9 +2025,14 @@ window.loadConversation = async function(sessionId, options = {}) {
         // restored on remount.
         const viewport = document.getElementById('chat-container');
         if (viewport && pane && pane.element.parentNode === viewport) {
-            viewport.scrollTop = viewport.scrollHeight;
+            // #2909: a freshly loaded conversation follows its tail —
+            // force, so a reader who was scrolled up in the PREVIOUS
+            // conversation doesn't inherit a disengaged viewport.
+            forceScrollToBottom(viewport);
+            pane.followLive = true;
         } else if (pane) {
             pane.scrollPos = Number.MAX_SAFE_INTEGER;  // snap to bottom on mount
+            pane.followLive = true;
         }
 
         // Switch to chat panel
