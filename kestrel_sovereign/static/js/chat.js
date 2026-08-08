@@ -17,11 +17,10 @@ import {
 import { buildMessageKebab } from './message_kebab.js';
 import {
     installScrollFollow,
-    isFollowing,
-    setFollowing,
+    getFollowState,
+    setFollowState,
     maybeScrollToBottom,
     forceScrollToBottom,
-    resetScrollFollow,
 } from './chat_scroll.js';
 
 let _deps = {
@@ -1308,7 +1307,13 @@ export function mountChatPane(agentName) {
             // #2909: follow state rides with the pane exactly like
             // scrollPos — otherwise switching away from a scrolled-up
             // conversation and back re-engages tail-following by accident.
-            current.followLive = isFollowing(container);
+            // Both halves travel: `unseenTail` is the reader's unacknowledged
+            // "content arrived below you" (the Jump-to-latest pill), and
+            // dropping it would silently retract an announcement this
+            // conversation had already made.
+            const follow = getFollowState(container);
+            current.followLive = follow.following;
+            current.unseenTail = follow.unseenTail;
             current.element.remove();
         }
     }
@@ -1329,8 +1334,13 @@ export function mountChatPane(agentName) {
     // mount panes into a container this module never wired otherwise.)
     installScrollFollow(container);
     if (target.followLive === false) {
-        setFollowing(container, false);
+        setFollowState(container, {
+            following: false,
+            unseenTail: target.unseenTail === true,
+        });
     } else {
+        // Following: the mount snaps to the tail, so by definition
+        // nothing is left unseen — force clears the flag for us.
         forceScrollToBottom(container);
     }
     if (messageInput) {
@@ -1387,11 +1397,14 @@ export function wipeAgentChatPane(agentName, html = '') {
     pane.queuedMessage = null;
     pane.element.innerHTML = html;
     pane.scrollPos = 0;
-    // #2909: a cleared pane is a fresh conversation — follow its tail.
+    // #2909: a cleared pane is a fresh conversation — follow its tail,
+    // with nothing unread behind the reader (the content the pill would
+    // have pointed at just went away with the innerHTML reset).
     pane.followLive = true;
+    pane.unseenTail = false;
     const container = getChatContainer();
     if (container && pane.element.parentNode === container) {
-        resetScrollFollow(container);
+        setFollowState(container, { following: true });
     }
 }
 
@@ -1881,12 +1894,13 @@ function scheduleReconnect() {
 /**
  * Show a task notification in the chat interface.
  *
- * Notifications target the visible (mounted) agent's pane — task
- * notifications come over a single SSE stream pinned to the selected
- * agent, so by definition the visible pane is the right destination.
- * Per-agent task notifications for non-visible agents would require
- * one SSE per loaded agent and is out of scope for the parallel-chat
- * change.
+ * Notifications target the pane of the agent the SSE stream was opened
+ * for (`notificationAgent`), NOT whatever pane is mounted now — switch
+ * agents mid-turn and the earlier agent's task results must keep landing
+ * in its own conversation. That pane is therefore frequently detached,
+ * which is why the scroll below is gated on it being the mounted one.
+ * Per-agent notification streams for every loaded agent remain out of
+ * scope for the parallel-chat change.
  */
 function showTaskNotification(message, type) {
     // Reset reconnect attempts on successful notification
@@ -1941,7 +1955,16 @@ function showTaskNotification(message, type) {
     `;
 
     paneElement.appendChild(div);
-    maybeScrollToBottom(getChatContainer());
+    // #2909: the notification stream is pinned to `notificationAgent`, which
+    // is NOT necessarily the mounted agent — the bubble above may have landed
+    // in a detached pane. Only tell the controller when this pane is the one
+    // in the scroll box, or a backgrounded agent's task result would scroll
+    // the visible conversation (or raise "Jump to latest" over content that
+    // isn't in it).
+    const c = getChatContainer();
+    if (c && paneElement.parentNode === c) {
+        maybeScrollToBottom(c);
+    }
 
     // Also show a Toast notification
     deps().toast.show(message, type === 'failed' ? 'error' : 'info');
@@ -2233,7 +2256,14 @@ export function handleRestartStatus(payload, targetEl = null) {
     div.style.borderLeftColor = accent;
     renderRestartStatusBody(div, payload);
     target.appendChild(div);
-    maybeScrollToBottom(getChatContainer());
+    // #2909: `target` is the notification agent's pane (possibly detached)
+    // or an explicit `targetEl` from a history repaint — neither is
+    // necessarily what the reader is looking at. Same guard as the message
+    // renderers: the viewport only responds to its own pane's content.
+    const c = getChatContainer();
+    if (c && target.parentNode === c) {
+        maybeScrollToBottom(c);
+    }
 }
 
 
@@ -3397,7 +3427,12 @@ function showContextWarning(warnings, paneElement = null) {
         <br><small>Use <code>!compact</code> to summarize older messages, or start fresh with <code>!new-session</code></small>
     `;
     target.appendChild(div);
-    maybeScrollToBottom(getChatContainer());
+    // #2909: same guard as the other renderers — an explicit `paneElement`
+    // may be detached, and only the mounted pane may move the viewport.
+    const c = getChatContainer();
+    if (c && target.parentNode === c) {
+        maybeScrollToBottom(c);
+    }
 }
 
 /**

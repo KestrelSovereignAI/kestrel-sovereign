@@ -122,6 +122,11 @@ export async function loadCommands(apiModule, expectedAgent = apiModule?.getHost
 //                                        //   restored on mount alongside scrollPos,
 //                                        //   so returning to a scrolled-up pane does
 //                                        //   not silently re-engage tail-following.
+//     unseenTail: boolean,              // #2909: content appended below the reader
+//                                        //   while following was disengaged, and they
+//                                        //   have not scrolled back to it — i.e. this
+//                                        //   conversation is showing "Jump to latest".
+//                                        //   Travels with followLive across a switch.
 //     hasUnrenderedMermaid: boolean,    // mermaid render deferred until mount
 //     pendingRevise: boolean,            // Wave 5C: server fired a `revising` SSE event;
 //                                        //   next chunk replaces (not appends) the bubble
@@ -218,6 +223,7 @@ export function getOrCreateChatPane(agentName) {
         sessionId: null,
         scrollPos: 0,
         followLive: true,
+        unseenTail: false,
         draftText: '',
         micArmed: false,
         hasUnrenderedMermaid: false,

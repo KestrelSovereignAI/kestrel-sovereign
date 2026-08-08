@@ -2027,12 +2027,15 @@ window.loadConversation = async function(sessionId, options = {}) {
         if (viewport && pane && pane.element.parentNode === viewport) {
             // #2909: a freshly loaded conversation follows its tail —
             // force, so a reader who was scrolled up in the PREVIOUS
-            // conversation doesn't inherit a disengaged viewport.
+            // conversation doesn't inherit a disengaged viewport (or its
+            // "Jump to latest" pill, which pointed at other content).
             forceScrollToBottom(viewport);
             pane.followLive = true;
+            pane.unseenTail = false;
         } else if (pane) {
             pane.scrollPos = Number.MAX_SAFE_INTEGER;  // snap to bottom on mount
             pane.followLive = true;
+            pane.unseenTail = false;
         }
 
         // Switch to chat panel

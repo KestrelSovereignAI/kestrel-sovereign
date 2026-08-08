@@ -14,8 +14,14 @@
  * it. Because a programmatic scroll-to-bottom also fires `scroll`, the
  * flag self-heals — there is no "ignore my own scroll" bookkeeping. The
  * two writers outside that listener are deliberate and explicit:
- * `forceScrollToBottom` (user action re-engages) and `setFollowing`
- * (a remounted pane restoring its saved `followLive`).
+ * `forceScrollToBottom` (a user action re-engages) and `setFollowState`
+ * (a pane re-seeding state on mount or wipe).
+ *
+ * The state is keyed on the scroll BOX because that is what the live
+ * listener can observe, but it describes a CONVERSATION — so both
+ * fields (`following` and `unseenTail`) travel with the pane across an
+ * agent switch, exactly like `scrollPos` does. `getFollowState` /
+ * `setFollowState` are that seam; see `mountChatPane` in chat.js.
  */
 
 // Slack for "at the bottom". Exact equality is not usable: device-pixel
@@ -34,7 +40,7 @@ const _boxes = new WeakMap();
 function stateFor(container) {
     let s = _boxes.get(container);
     if (!s) {
-        s = { following: true, pendingContent: false, pill: null, installed: false };
+        s = { following: true, unseenTail: false, pill: null, installed: false };
         _boxes.set(container, s);
     }
     return s;
@@ -51,22 +57,42 @@ export function isAtBottom(container) {
     return gap <= STICK_TO_BOTTOM_THRESHOLD_PX;
 }
 
+/**
+ * Read the full follow state so a pane can save it on detach. Returns a
+ * plain snapshot, not the live record — the caller stores these on the
+ * pane object next to `scrollPos`. An unknown box follows and has
+ * nothing unread: a console nobody has scrolled yet must track its
+ * stream.
+ */
+export function getFollowState(container) {
+    if (!container) return { following: true, unseenTail: false };
+    const s = stateFor(container);
+    return { following: s.following !== false, unseenTail: s.unseenTail === true };
+}
+
 /** Is tail-following currently engaged for this scroll box? */
 export function isFollowing(container) {
-    if (!container) return true;
-    return stateFor(container).following !== false;
+    return getFollowState(container).following;
 }
 
 /**
- * Seed the follow flag without moving the viewport. Only the pane
- * mount/restore path uses this — everything else goes through the
- * scroll listener or forceScrollToBottom.
+ * Seed the follow state without moving the viewport. Used by the pane
+ * mount/restore path (restoring a saved `followLive` / `unseenTail`)
+ * and by the pane wipe (a cleared pane is a fresh conversation that
+ * follows its tail with nothing unread behind it).
+ *
+ * `unseenTail` must be passed explicitly and defaults to false, because
+ * the *default* answer at a re-seed is "nothing has appended since the
+ * reader got here" — in particular whatever the PREVIOUS pane had
+ * queued up is not this conversation's news. The mount path overrides
+ * it with the value this pane itself saved on detach, so a pill the
+ * reader never acknowledged is still waiting when they come back.
  */
-export function setFollowing(container, following) {
+export function setFollowState(container, { following, unseenTail = false } = {}) {
     if (!container) return;
     const s = stateFor(container);
     s.following = !!following;
-    if (s.following) s.pendingContent = false;
+    s.unseenTail = !!unseenTail;
     renderJumpToLatest(container);
 }
 
@@ -84,7 +110,7 @@ export function installScrollFollow(container) {
         s.following = atBottom;
         // Coming back to the tail acknowledges whatever arrived while
         // the reader was away, so the pill has nothing left to announce.
-        if (atBottom) s.pendingContent = false;
+        if (atBottom) s.unseenTail = false;
         renderJumpToLatest(container);
     });
 }
@@ -98,7 +124,7 @@ export function maybeScrollToBottom(container) {
     if (!container) return false;
     const s = stateFor(container);
     if (s.following === false) {
-        s.pendingContent = true;
+        s.unseenTail = true;
         renderJumpToLatest(container);
         return false;
     }
@@ -115,53 +141,51 @@ export function forceScrollToBottom(container) {
     if (!container) return;
     const s = stateFor(container);
     s.following = true;
-    s.pendingContent = false;
+    s.unseenTail = false;
     container.scrollTop = container.scrollHeight;
     renderJumpToLatest(container);
 }
 
 /**
- * Reset a scroll box to a fresh conversation's state: following, with
- * nothing pending. Used by the pane wipe path.
- */
-export function resetScrollFollow(container) {
-    if (!container) return;
-    const s = stateFor(container);
-    s.following = true;
-    s.pendingContent = false;
-    renderJumpToLatest(container);
-}
-
-/** The pill element for this container, or null if none has been built. */
-export function getJumpToLatestPill(container) {
-    if (!container) return null;
-    return stateFor(container).pill;
-}
-
-/**
- * Build (or re-attach) the "Jump to latest" pill and set its visibility.
+ * Reflect follow state in the "Jump to latest" affordance.
  *
- * The pill is a direct child of the scroll box and `position: sticky`
- * in CSS, so it pins to the bottom of the scrollport without assuming
- * anything about the container's ancestors (embedders supply their own
- * chat chrome). `mountChatPane` empties the container on every agent
- * switch, hence the re-attach.
+ * The pill shows ONLY when following is disengaged AND content has
+ * appended since it disengaged — drifting off the tail in an idle
+ * conversation is not news, and a chat that silently stops following
+ * with nothing to announce needs no affordance.
  *
- * It shows ONLY when following is disengaged AND content has appended
- * since — drifting off the tail in an idle conversation is not news.
+ * It is built lazily, at the moment it first has to be visible, and
+ * never merely to be hidden. That is not just an optimization: the
+ * hidden case is the streaming hot path (every token calls
+ * `maybeScrollToBottom`), and constructing a view in order to
+ * immediately hide it would put DOM work on it, and would add a
+ * permanent non-pane child to a container whose contract elsewhere in
+ * `chat.js` is "holds the mounted pane".
+ *
+ * The pill is a child of the scroll box and `position: sticky` in CSS,
+ * so it pins to the bottom of the scrollport without requiring a
+ * positioned ancestor — this module cannot assume anything about
+ * `#chat-container`'s ancestors, since embedders (`chat.mount()`)
+ * supply their own chat chrome. `mountChatPane` empties the container
+ * on every agent switch, hence the re-attach on show.
  */
 function renderJumpToLatest(container) {
     const s = stateFor(container);
-    if (typeof document === 'undefined' || !container.appendChild) return;
+    const shouldShow = s.following === false && s.unseenTail;
+    if (!shouldShow) {
+        if (s.pill) s.pill.hidden = true;
+        return;
+    }
+    if (typeof document === 'undefined' || typeof container.appendChild !== 'function') return;
     if (!s.pill) {
+        // No aria-label: the visible text is the button's accessible name.
         const pill = document.createElement('button');
         pill.type = 'button';
         pill.className = JUMP_TO_LATEST_CLASS;
         pill.textContent = 'Jump to latest';
-        pill.setAttribute('aria-label', 'Jump to the latest message');
         pill.addEventListener('click', () => forceScrollToBottom(container));
         s.pill = pill;
     }
     if (s.pill.parentNode !== container) container.appendChild(s.pill);
-    s.pill.hidden = !(s.following === false && s.pendingContent);
+    s.pill.hidden = false;
 }
