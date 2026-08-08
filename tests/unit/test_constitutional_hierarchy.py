@@ -62,7 +62,7 @@ Each agent has a persona and role.
 
 ---
 
-## Article V: The Amendment Process
+## The Amendment Process
 
 Amendments follow specific rules.
 """

@@ -308,7 +308,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
-| `constitution` | `!constitution` | `system` | `article`, `search`, `summary` | 214 | `enabled` |
+| `constitution` | `!constitution` | `system` | `article`, `search`, `summary` | 259 | `enabled` |
 
 ### `context` (ContextFeature)
 
@@ -967,7 +967,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!shell` | `computer_use` | `<command> [timeout]` | Run a shell command. Deny-listed binaries hard-refuse; auto-approved binaries run without a prompt; everything else routes through the ApprovalQueue. |
 | `!consent-log` | `consent` | `[limit]` | View recent consent records showing the agent's perspective on past changes. |
 | `!consent-stats` | `consent` |  | View consent statistics grouped by action type and sentiment. |
-| `!constitution` | `constitution` | `[article] [search] [summary]` | Get the full text of the Kestrel Constitution, specific books, amendments, or articles. Two-slot grammar: 'article' is the subcommand keyword {book, amendment, article, search, summary} and 'search' is the identifier/term — e.g. article='book' search='I', article='amendment' search='VIII', article='search' search='honesty'. Omit both for full text; article='summary' for the executive summary. |
+| `!constitution` | `constitution` | `[article] [search] [summary]` | Get the full text of the Kestrel Constitution, or one of its units. Two-slot grammar: 'article' is the subcommand keyword {book, chapter, amendment, section, search, summary} and 'search' is the identifier/term — e.g. article='book' search='I', article='chapter' search='5', article='amendment' search='VIII', article='section' search='III.2', article='search' search='honesty'. Chapter and Section numbering restarts in each Book, so qualify them as <book>.<n> when the bare number is ambiguous. Omit both slots for the full text; article='summary' for the executive summary. |
 | `!context compact` | `context` | `[keep_recent] [force] [dry_run]` | Compact context by summarizing older messages. Use when context utilization is high and you need space for new information. |
 | `!context compact hierarchical` | `context` | `[chunk_size] [keep_recent] [max_depth]` | Compact context using hierarchical tree-structured summarization (RLM-inspired). Better preserves structure than linear compaction. |
 | `!context exclude` | `context` | `<target> <reason>` | Exclude messages from context window (they remain in storage but won't be included in context). Use for redundant, superseded, or irrelevant content. |
@@ -1137,6 +1137,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!wellness-history` | `wellness` | `[limit]` | View wellness trends over time |
 
 <!-- END AUTO-GENERATED FEATURE INVENTORY -->
+
 
 
 
