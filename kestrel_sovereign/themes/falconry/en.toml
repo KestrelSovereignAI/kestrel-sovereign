@@ -38,7 +38,6 @@ loading_trash = "Loading trash…"
 loading_identity = "Loading identity..."
 
 # Chat panel
-chat_welcome_message = "Hello! I am your Kestrel agent, bound by the Kestrel Constitution to be your truthful and honorable companion. The mews is open — how can I help?"
 chat_thinking = "Hunting..."
 # Dynamic thinking-status words, falconry-themed: shown in place of
 # "Hunting..." as the bird's stream phase changes.

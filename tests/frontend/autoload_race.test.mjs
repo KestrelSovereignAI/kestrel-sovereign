@@ -74,7 +74,7 @@ globalThis.kicon = () => '';
 globalThis.CSS = { escape: (s) => String(s) };
 
 const { state, getOrCreateChatPane } = await import('../../kestrel_sovereign/static/js/ui.js');
-const { mountChatPane } = await import('../../kestrel_sovereign/static/js/chat.js');
+const { mountChatPane, wipeAgentChatPane, setPaneAwaitingNewSession } = await import('../../kestrel_sovereign/static/js/chat.js');
 const apiModule = await import('../../kestrel_sovereign/static/js/api.js');
 
 // Stub API.getConversation so we can hold the auto-load in-flight while
@@ -159,4 +159,93 @@ test('user-explicit click (no auto flag) skips the defense-in-depth check', asyn
 
     assert.equal(pane.generation, genBefore + 1,
         'explicit click must wipe (bump generation) regardless of pane busyness');
+});
+
+
+// A deliberate wipe leaves the pane EMPTY, so every "is this pane cold"
+// check based on DOM emptiness passes and a racing auto-load repaints the
+// history the user just cleared. This used to be masked: each wipe path
+// (New Chat, new conversation, trashing the open one) left a placeholder
+// card behind, which made the pane non-empty by accident. With the panes
+// genuinely empty, `expectedGeneration` is what carries the invalidation —
+// the same pane-local counter a stream dispatch gates its DOM writes on.
+test('auto-load drops when the pane was deliberately wiped during the fetch', async () => {
+    const pane = getOrCreateChatPane('wiped-A');
+    apiModule.default.setHostAgent('wiped-A');
+    mountChatPane('wiped-A');
+
+    // Fire the auto-load the way maybeAutoLoadMostRecent does, pinning the
+    // pane context it decided to load against.
+    const autoLoadPromise = window.loadConversation('stale-sess', {
+        auto: true,
+        expectedGeneration: pane.generation,
+    });
+
+    // The user clicks New Chat while getConversation is still in flight.
+    wipeAgentChatPane('wiped-A');
+    const genAfterWipe = pane.generation;
+
+    releaseGetConv();
+    await autoLoadPromise;
+
+    assert.equal(pane.generation, genAfterWipe,
+        'auto-load must not wipe a pane the user already cleared');
+    assert.equal(pane.element.children.length, 0,
+        'the cleared pane must stay empty — stale history must not repaint');
+});
+
+
+// The generation pin only invalidates an auto-load that was DECIDED before
+// the wipe. A conversation-list refresh that resolves just after New Chat
+// decides afterwards, reads the post-wipe generation as current, and finds an
+// empty session-less pane — every emptiness-based check passes and the
+// history the user just cleared repaints, staying put if the new-session POST
+// then fails. `awaitingNewSession` is what marks the pane as spoken for while
+// its session is still being minted.
+test('auto-load refuses a pane whose new session is still being minted', async () => {
+    const pane = getOrCreateChatPane('claimed-A');
+    apiModule.default.setHostAgent('claimed-A');
+    mountChatPane('claimed-A');
+
+    // New Chat: the pane is wiped and claimed, and the mint is in flight.
+    setPaneAwaitingNewSession('claimed-A', true);
+    wipeAgentChatPane('claimed-A');
+    const genAfterWipe = pane.generation;
+
+    // The in-flight list refresh now resolves and decides to auto-load,
+    // pinning the CURRENT (post-wipe) generation — so the pin cannot help.
+    const autoLoadPromise = window.loadConversation('stale-sess', {
+        auto: true,
+        expectedGeneration: pane.generation,
+    });
+    releaseGetConv();
+    await autoLoadPromise;
+
+    assert.equal(pane.generation, genAfterWipe,
+        'auto-load must not claim a pane whose new session is pending');
+    assert.equal(pane.element.children.length, 0,
+        'the cleared pane must stay empty until its own session lands');
+
+    // And once the mint completes, the pane is available again.
+    setPaneAwaitingNewSession('claimed-A', false);
+});
+
+
+test('auto-load still proceeds when the pinned generation is unchanged', async () => {
+    // The guard must invalidate on a wipe WITHOUT breaking the normal
+    // boot/agent-select path that passes a still-current generation.
+    const pane = getOrCreateChatPane('pinned-A');
+    apiModule.default.setHostAgent('pinned-A');
+    mountChatPane('pinned-A');
+
+    const genBefore = pane.generation;
+    const autoLoadPromise = window.loadConversation('pinned-sess', {
+        auto: true,
+        expectedGeneration: genBefore,
+    });
+    releaseGetConv();
+    await autoLoadPromise;
+
+    assert.equal(pane.generation, genBefore + 1,
+        'an uncontested auto-load must still load (generation bumps)');
 });

@@ -156,6 +156,33 @@ def test_theme_picker_js_is_loaded_in_index_html(html_text):
     assert "js/theme_picker.js" in html_text, "index.html must include js/theme_picker.js"
 
 
+def test_chat_container_ships_empty(html_text):
+    """#chat-container must ship with no baked-in transcript content.
+
+    index.html used to bake a welcome card ("Hello! I am your Kestrel AI
+    agent...") into the container. It bought nothing the user didn't
+    already know, and initChat's pane migration swapped it out on the
+    first frame, so it read as a flicker rather than a greeting.
+
+    It also had a non-obvious second effect: #714's auto-load only fires
+    when the target pane has zero children, so a decoration mounted into
+    the boot pane silently suppressed auto-load in standalone. Any markup
+    restored here would re-introduce both problems, so assert the
+    container is literally empty rather than merely free of that one
+    string.
+    """
+    match = re.search(
+        r'<div[^>]*\bid="chat-container"[^>]*>(.*?)</div>',
+        html_text,
+        re.DOTALL,
+    )
+    assert match, "index.html must contain a #chat-container element"
+    assert match.group(1).strip() == "", (
+        "#chat-container must ship empty — the transcript is built from "
+        f"real turns only. Found: {match.group(1).strip()[:200]!r}"
+    )
+
+
 def test_inline_style_block_extracted(html_text):
     """The ~1,200-line inline <style> block was extracted into index.css
     (epic #994). Reverting that change inflates index.html past 2,000
@@ -314,7 +341,7 @@ def test_no_orphan_label_keys_in_legacy_theme(html_text, legacy_labels):
         "tab_identity", "tab_chat", "tab_constitution", "tab_memories",
         "tab_tasks", "tab_sovereignty", "tab_resources", "tab_metrics",
         "tab_features", "tab_security",
-        "sidebar_agents", "chat_welcome_message", "chat_thinking",
+        "sidebar_agents", "chat_thinking",
         "chat_input_placeholder",
         "constitution_title", "memories_title", "tasks_title",
         "tasks_view_tasks", "tasks_view_activity",

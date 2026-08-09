@@ -388,13 +388,34 @@ test.describe('Chat Panel - Conversation', () => {
         await expect(page.locator('#panel-chat')).toBeVisible();
     });
 
-    test('shows welcome message on initial load', async ({ page }) => {
+    test('New Chat leaves the transcript empty — no canned greeting, no placeholder', async ({ page }) => {
         await page.goto(BASE_URL);
         const chatTab = page.locator('.nav-tab').filter({ hasText: /chat/i });
         await chatTab.click();
 
-        const welcomeMessage = page.locator('.agent-message').first();
-        await expect(welcomeMessage).toContainText(/Kestrel|Constitution|help/i);
+        // Drive a New Chat rather than asserting on initial load: this suite
+        // runs against persistent live state, so the boot transcript may hold
+        // a legitimately auto-loaded conversation (#714) whose real turns can
+        // contain any phrase at all — including "Say hello", which
+        // test_session_context_loading.spec.cjs sends to this same host. A
+        // freshly-wiped pane is the only deterministic moment at which
+        // "nothing is rendered" is the correct expectation.
+        // clearChat() wipes synchronously and then fires the new-conversation
+        // request from an unawaited dynamic-import continuation, so asserting
+        // straight after the click would only prove the intermediate frame is
+        // empty. Wait for the page-side flow to actually finish: the success
+        // toast is raised after the response body is parsed AND the session is
+        // adopted, so by then anything the async tail would render — a
+        // restored placeholder, a stale auto-load repaint — is in the DOM.
+        // (waitForResponse alone resolves on headers, ahead of both.)
+        await page.locator('#new-chat-btn').click();
+        await expect(
+            page.locator('.toast-item', { hasText: 'New conversation started' }),
+        ).toBeVisible();
+
+        const chat = page.locator('#chat-container');
+        await expect(chat.locator('.message')).toHaveCount(0);
+        await expect(chat).toHaveText('');
     });
 
     test('message input and send button are visible', async ({ page }) => {
