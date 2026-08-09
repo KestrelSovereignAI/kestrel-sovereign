@@ -403,14 +403,15 @@ test.describe('Chat Panel - Conversation', () => {
         // clearChat() wipes synchronously and then fires the new-conversation
         // request from an unawaited dynamic-import continuation, so asserting
         // straight after the click would only prove the intermediate frame is
-        // empty. Wait for the mint to land: anything the async tail renders —
-        // a restored placeholder, a stale auto-load repaint — is in the DOM by
-        // then.
-        const minted = page.waitForResponse(
-            (res) => res.url().includes('/api/conversations/new'),
-        );
+        // empty. Wait for the page-side flow to actually finish: the success
+        // toast is raised after the response body is parsed AND the session is
+        // adopted, so by then anything the async tail would render — a
+        // restored placeholder, a stale auto-load repaint — is in the DOM.
+        // (waitForResponse alone resolves on headers, ahead of both.)
         await page.locator('#new-chat-btn').click();
-        await minted;
+        await expect(
+            page.locator('.toast-item', { hasText: 'New conversation started' }),
+        ).toBeVisible();
 
         const chat = page.locator('#chat-container');
         await expect(chat.locator('.message')).toHaveCount(0);

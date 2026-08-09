@@ -18,6 +18,7 @@ import { state, Toast } from './ui.js';
 import {
     updateContextStatus,
     wipeAgentChatPane,
+    setPaneAwaitingNewSession,
 } from './chat.js';
 
 // ============================================================================
@@ -64,6 +65,13 @@ window.toggleEncryptionView = async function() {
 };
 
 window.startNewConversation = async function() {
+    // Claim the pane for the whole mint. In the fallback path below the wipe
+    // only happens AFTER the request returns, so until then the pane still
+    // looks like whatever it was; in the pane path clearChat may already have
+    // emptied it. Either way an auto-load landing mid-mint would be filling a
+    // pane the user has already spoken for.
+    const claimedHost = API.getHostAgent();
+    setPaneAwaitingNewSession(claimedHost, true);
     try {
         // #2222: when the shared conversations pane is mounted for this host,
         // route through its component-owned new-conversation action so the New
@@ -110,6 +118,10 @@ window.startNewConversation = async function() {
         Toast.success('New conversation started');
     } catch (e) {
         Toast.error(`Failed to start new conversation: ${e.message}`);
+    } finally {
+        // Released on both outcomes: a failed mint leaves the pane genuinely
+        // unclaimed, and holding the claim would mute auto-load for good.
+        setPaneAwaitingNewSession(claimedHost, false);
     }
 };
 

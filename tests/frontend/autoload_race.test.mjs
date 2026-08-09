@@ -74,7 +74,7 @@ globalThis.kicon = () => '';
 globalThis.CSS = { escape: (s) => String(s) };
 
 const { state, getOrCreateChatPane } = await import('../../kestrel_sovereign/static/js/ui.js');
-const { mountChatPane, wipeAgentChatPane } = await import('../../kestrel_sovereign/static/js/chat.js');
+const { mountChatPane, wipeAgentChatPane, setPaneAwaitingNewSession } = await import('../../kestrel_sovereign/static/js/chat.js');
 const apiModule = await import('../../kestrel_sovereign/static/js/api.js');
 
 // Stub API.getConversation so we can hold the auto-load in-flight while
@@ -192,6 +192,42 @@ test('auto-load drops when the pane was deliberately wiped during the fetch', as
         'auto-load must not wipe a pane the user already cleared');
     assert.equal(pane.element.children.length, 0,
         'the cleared pane must stay empty — stale history must not repaint');
+});
+
+
+// The generation pin only invalidates an auto-load that was DECIDED before
+// the wipe. A conversation-list refresh that resolves just after New Chat
+// decides afterwards, reads the post-wipe generation as current, and finds an
+// empty session-less pane — every emptiness-based check passes and the
+// history the user just cleared repaints, staying put if the new-session POST
+// then fails. `awaitingNewSession` is what marks the pane as spoken for while
+// its session is still being minted.
+test('auto-load refuses a pane whose new session is still being minted', async () => {
+    const pane = getOrCreateChatPane('claimed-A');
+    apiModule.default.setHostAgent('claimed-A');
+    mountChatPane('claimed-A');
+
+    // New Chat: the pane is wiped and claimed, and the mint is in flight.
+    setPaneAwaitingNewSession('claimed-A', true);
+    wipeAgentChatPane('claimed-A');
+    const genAfterWipe = pane.generation;
+
+    // The in-flight list refresh now resolves and decides to auto-load,
+    // pinning the CURRENT (post-wipe) generation — so the pin cannot help.
+    const autoLoadPromise = window.loadConversation('stale-sess', {
+        auto: true,
+        expectedGeneration: pane.generation,
+    });
+    releaseGetConv();
+    await autoLoadPromise;
+
+    assert.equal(pane.generation, genAfterWipe,
+        'auto-load must not claim a pane whose new session is pending');
+    assert.equal(pane.element.children.length, 0,
+        'the cleared pane must stay empty until its own session lands');
+
+    // And once the mint completes, the pane is available again.
+    setPaneAwaitingNewSession('claimed-A', false);
 });
 
 

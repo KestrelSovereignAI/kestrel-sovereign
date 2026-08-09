@@ -231,6 +231,12 @@ export function getOrCreateChatPane(agentName) {
         reviseConsumedRequestId: null,
         composerMode: 'interrupt',
         queuedMessage: null,
+        // The user asked for a new conversation and its session is still
+        // being minted. Such a pane is CLAIMED even though it is empty and
+        // carries no session id yet — #714's auto-load must not read that
+        // emptiness as "cold" and fill it with history. See chat.js
+        // `setPaneAwaitingNewSession`.
+        awaitingNewSession: false,
     };
     chatPanes.set(agentName, pane);
     return pane;

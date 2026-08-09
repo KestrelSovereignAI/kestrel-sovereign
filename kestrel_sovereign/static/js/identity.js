@@ -6,7 +6,7 @@
 import API from './api.js';
 import { state, PRIVACY_MODES, Toast, Modal, loadCommands, renderTextError } from './ui.js';
 import { renderIdentityDangerZone } from './identity-danger-zone.js';
-import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, refreshAgentThinkingDot, stopAgent, renderModelFooterHtml, appendMessagePart, renderSignalWakeChip, handleRestartStatus, renderAgentContentHtml, mountToolRenderers, messageAttachmentsHtml } from './chat.js';
+import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, setPaneAwaitingNewSession, refreshAgentThinkingDot, stopAgent, renderModelFooterHtml, appendMessagePart, renderSignalWakeChip, handleRestartStatus, renderAgentContentHtml, mountToolRenderers, messageAttachmentsHtml } from './chat.js';
 import { forceScrollToBottom } from './chat_scroll.js';
 import { generateIdenticon } from './identicon.js';
 // #2199: the standalone conversations pane is now a `mountConversations`
@@ -1256,9 +1256,16 @@ function maybeAutoLoadMostRecent(conversations, autoTargetAgent, view) {
     // With that card gone the boot pane is genuinely empty, so standalone now
     // reopens on the most recent conversation the way an agent select always
     // has.
+    //
+    // `awaitingNewSession` is the other half: a pane the user just cleared is
+    // ALSO empty and session-less, so emptiness alone cannot tell "nobody has
+    // claimed this" from "the user claimed it and the mint is still in
+    // flight". Auto-loading into the latter drops the previous conversation
+    // back on top of the New Chat they asked for.
     const autoTargetPane = state.chatPanes.get(autoTargetAgent);
     const paneIsCold = autoTargetPane
         && !autoTargetPane.streamingMsgDiv
+        && !autoTargetPane.awaitingNewSession
         && autoTargetPane.element.children.length === 0;
     if (!state.currentSessionId
         && !state.waitingAgents.has(autoTargetAgent)
@@ -1301,12 +1308,20 @@ async function handleSidebarConversationMutation(action, conv) {
     if (action === 'trash') {
         // Immediately create a fresh backend session so downstream state
         // (context-status footer, auto-load logic) doesn't point at a
-        // vanished session.
-        const fresh = await API.newConversation();
-        wipeAgentChatPane(host);
-        state.currentSessionId = fresh.session_id;
-        activeConversationId = fresh.session_id;
-        activeConversationIdsByAgent.set(host, fresh.session_id);
+        // vanished session. Claimed across the mint: the conversation the
+        // pane was showing is on its way to the trash, and an auto-load
+        // landing here would reinstate a neighbouring one behind the user's
+        // back.
+        setPaneAwaitingNewSession(host, true);
+        try {
+            const fresh = await API.newConversation();
+            wipeAgentChatPane(host);
+            state.currentSessionId = fresh.session_id;
+            activeConversationId = fresh.session_id;
+            activeConversationIdsByAgent.set(host, fresh.session_id);
+        } finally {
+            setPaneAwaitingNewSession(host, false);
+        }
     } else {
         wipeAgentChatPane(host);
         state.currentSessionId = null;
@@ -1328,25 +1343,34 @@ async function handleSidebarConversationMutation(action, conv) {
 // one `API.newConversation()` call.
 async function startNewConversationForPane() {
     const host = API.getHostAgent();
-    const result = await API.newConversation();
-    wipeAgentChatPane(host);
-    const sid = result && result.session_id;
-    if (sid) {
-        state.currentSessionId = sid;
-        activeConversationId = sid;
-        activeConversationIdsByAgent.set(host, sid);
-        // #2248: anchor the host agent's chat pane to the freshly-minted
-        // session EXPLICITLY. wipeAgentChatPane() above just nulled
-        // pane.sessionId, and the send path reads pane.sessionId directly
-        // (chat.js). Without this the first turn goes up with session_id=null
-        // and only lands in the new session via the implicit last-message
-        // derive race — any interleaved conversation row would misfile it. Set
-        // it so the first turn is unambiguously anchored to the minted session.
-        const pane = state.chatPanes.get(host);
-        if (pane) pane.sessionId = sid;
+    // Claimed for the duration of the mint — see chat.js
+    // `setPaneAwaitingNewSession`. Released in the finally so a failed mint
+    // doesn't leave auto-load muted on this pane.
+    setPaneAwaitingNewSession(host, true);
+    try {
+        const result = await API.newConversation();
+        wipeAgentChatPane(host);
+        const sid = result && result.session_id;
+        if (sid) {
+            state.currentSessionId = sid;
+            activeConversationId = sid;
+            activeConversationIdsByAgent.set(host, sid);
+            // #2248: anchor the host agent's chat pane to the freshly-minted
+            // session EXPLICITLY. wipeAgentChatPane() above just nulled
+            // pane.sessionId, and the send path reads pane.sessionId directly
+            // (chat.js). Without this the first turn goes up with
+            // session_id=null and only lands in the new session via the
+            // implicit last-message derive race — any interleaved conversation
+            // row would misfile it. Set it so the first turn is unambiguously
+            // anchored to the minted session.
+            const pane = state.chatPanes.get(host);
+            if (pane) pane.sessionId = sid;
+        }
+        if (typeof updateContextStatus === 'function') updateContextStatus();
+        return result;
+    } finally {
+        setPaneAwaitingNewSession(host, false);
     }
-    if (typeof updateContextStatus === 'function') updateContextStatus();
-    return result;
 }
 
 // Mount the shared conversation PANE unit into the sidebar exactly once, then
@@ -1794,8 +1818,12 @@ window.loadConversation = async function(sessionId, options = {}) {
         // intent to switch conversations is overriding.
         if (options.auto) {
             const pane = state.chatPanes.get(currentAgent);
+            // `awaitingNewSession` catches the claim that arrives DURING these
+            // awaits without a wipe to bump the generation — the fallback
+            // new-conversation path wipes only after its POST returns.
             const paneIsCold = pane
                 && !pane.streamingMsgDiv
+                && !pane.awaitingNewSession
                 && pane.element.children.length === 0;
             const userBusy = state.waitingAgents.has(currentAgent);
             const sessionAlreadySet = !!state.currentSessionId;

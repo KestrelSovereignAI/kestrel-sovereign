@@ -1428,6 +1428,27 @@ export function mountChatPane(agentName) {
 }
 
 /**
+ * Mark (or unmark) a pane as awaiting the session of a new conversation the
+ * user just asked for.
+ *
+ * An empty pane is ambiguous: it is either cold — nothing has claimed it, so
+ * #714 may auto-load the most recent conversation into it — or freshly
+ * cleared by the user, whose new session is still being minted. Those look
+ * identical in the DOM, and they only ever behaved differently because every
+ * new-conversation path left a placeholder card behind, making the pane
+ * non-empty by accident. This flag says which one it is, so the answer does
+ * not depend on decoration.
+ *
+ * Set it before the mint request goes out and clear it once the session is
+ * adopted or the attempt fails — a flag left set would suppress auto-load on
+ * that pane for the rest of the session.
+ */
+export function setPaneAwaitingNewSession(agentName, awaiting) {
+    const pane = deps().getOrCreateChatPane(agentName);
+    pane.awaitingNewSession = !!awaiting;
+}
+
+/**
  * Wipe ONE agent's pane and bump that agent's pane-local generation.
  * Used for within-agent context changes — clear chat, new chat,
  * conversation switch, soft/hard delete of the active conversation.
@@ -4814,10 +4835,18 @@ function selectHighlightedCommand() {
 function clearChat() {
     if (!chatContainer) return;
 
+    const host = deps().api.getHostAgent();
+    // Claim the pane from this instant, not from when the mint starts: the
+    // delegation below crosses a dynamic import, and a conversation-list
+    // refresh resolving in that gap would find an empty, session-less pane
+    // and auto-load history straight back into the chat the user just
+    // cleared. Whoever mints the session owns clearing this.
+    setPaneAwaitingNewSession(host, true);
+
     // Clear ONLY the visible agent's pane and bump that agent's
     // pane-local generation. Other agents' panes (and their in-flight
     // streams) are untouched. The pane is left empty — no placeholder.
-    wipeAgentChatPane(deps().api.getHostAgent());
+    wipeAgentChatPane(host);
 
     // Clear message input
     if (messageInput) {
@@ -4829,10 +4858,19 @@ function clearChat() {
     // Optionally start a new conversation in the backend
     import('./history.js').then(module => {
         if (window.startNewConversation) {
+            // Owns the claim from here — it clears it when the session lands
+            // or the mint fails.
             window.startNewConversation();
+        } else {
+            // Nothing will mint a session, so nothing else will clear the
+            // claim; releasing it here keeps auto-load from being suppressed
+            // on this pane for the rest of the session.
+            setPaneAwaitingNewSession(host, false);
         }
     }).catch(() => {
-        // history.js not loaded, that's OK
+        // history.js not loaded, that's OK — but the claim must not outlive
+        // the attempt.
+        setPaneAwaitingNewSession(host, false);
     });
 
     deps().toast.success('Chat cleared');
