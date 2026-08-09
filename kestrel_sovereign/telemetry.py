@@ -237,6 +237,15 @@ except Exception:  # pragma: no cover - openinference optional
 # agent lane in Phoenix instead of "(none)" (issue #2699).
 KESTREL_AGENT_NAME = "kestrel.agent_name"
 
+# Attribute key naming the conversation session a span belongs to. The fleet
+# Timeline's ``sessionKeyOf`` reads only ``kestrel.session_id`` / ``session.id``
+# / ``kestrel.run_id`` — the agent runtime's long-standing ``agent.session_id``
+# is in none of them, so its turns grouped by trace id instead (one band per
+# turn, a staircase lane). Stamp this ALONGSIDE ``agent.session_id`` (issue
+# #2916); never stamp it empty, since an absent attribute and an empty one read
+# the same to the consumer but only one of them is noise.
+KESTREL_SESSION_ID = "kestrel.session_id"
+
 
 def _resolved_otlp_endpoint() -> Optional[str]:
     """Return the configured OTLP endpoint (traces-specific wins), or None."""

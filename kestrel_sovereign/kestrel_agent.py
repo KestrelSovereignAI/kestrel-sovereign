@@ -89,6 +89,7 @@ from kestrel_sovereign.security.input_guardrails import (
 )
 from kestrel_sovereign.telemetry import (
     KESTREL_AGENT_NAME,
+    KESTREL_SESSION_ID,
     OI_SPAN_KIND,
     OI_SPAN_KIND_CHAIN,
     optional_span,
@@ -4913,6 +4914,10 @@ Expected Duration: {expected_duration}
                 KESTREL_AGENT_NAME: self.agent_name,
                 "agent.did": self.did,
                 "agent.session_id": session_id or "",
+                # #2916: the key the fleet Timeline actually groups on. Omitted
+                # (None, not "") when the turn has no session, so a sessionless
+                # turn stays absent rather than carrying an empty attribute.
+                KESTREL_SESSION_ID: session_id or None,
                 "agent.input_length": len(user_input),
             }) as _otel_span:
                 # Lifecycle is already entered; call the locked body directly.

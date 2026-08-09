@@ -51,6 +51,7 @@ from kestrel_sovereign.agent.streaming import (
 from kestrel_sovereign.security.input_guardrails import validate_tool_arguments
 from kestrel_sovereign.telemetry import (
     KESTREL_AGENT_NAME,
+    KESTREL_SESSION_ID,
     OI_SPAN_KIND,
     OI_SPAN_KIND_CHAIN,
     optional_span,
@@ -81,6 +82,21 @@ _DEFAULT_ORCHESTRATOR_CONTEXT_LIMIT = 131072
 ORCHESTRATOR_TURN_TIMEOUT_SECS = float(
     os.environ.get("KESTREL_ORCHESTRATOR_TURN_TIMEOUT_SECS", "180")
 )
+
+# The dispatch path's ``session_id`` parameter doubles as a source tag: callers
+# that have no conversation session pass a sentinel ("orchestrator" is the
+# parameter default, "original" comes from the re-entrant chat path) rather than
+# a session UUID. Anything that records the session — the a2a dispatch row, the
+# ``agent.feature_dispatch`` span (#2916) — must agree on which of those is a
+# real session, so the test lives here once instead of at each consumer.
+_SESSION_ID_SENTINELS = ("", "original", "orchestrator")
+
+
+def real_session_id(session_id: Optional[str]) -> Optional[str]:
+    """Return ``session_id`` when it names an actual session, else ``None``."""
+    if session_id in _SESSION_ID_SENTINELS:
+        return None
+    return session_id
 
 
 CONTINUATION_INTENT_RE = re.compile(
@@ -1254,6 +1270,12 @@ class OrchestratorEngineMixin:
                 # stamping never turns into a hard dependency that crashes an
                 # otherwise-valid dispatch.
                 KESTREL_AGENT_NAME: getattr(self, "agent_name", None),
+                # #2916: group the dispatch under the same session band as the
+                # turn span that drove it. ``real_session_id`` drops the
+                # sentinels this parameter also carries, and ``optional_span``
+                # then drops the None.
+                KESTREL_SESSION_ID: real_session_id(session_id),
+                "agent.session_id": real_session_id(session_id),
                 "feature.name": getattr(feature, "tool_name", feature_name),
                 "tool.source": source,
             }):
@@ -1699,9 +1721,7 @@ class OrchestratorEngineMixin:
         if log_dispatch is None:
             return
         try:
-            normalized_session_id = session_id
-            if normalized_session_id in ("", "original", "orchestrator"):
-                normalized_session_id = None
+            normalized_session_id = real_session_id(session_id)
             await log_dispatch(
                 ToolDispatchEntry(
                     agent_did=self.did,
@@ -1801,6 +1821,10 @@ class OrchestratorEngineMixin:
                 # Defensive read — minimal mixin hosts may lack ``agent_name``;
                 # ``optional_span`` drops the None (matches the site above).
                 KESTREL_AGENT_NAME: getattr(self, "agent_name", None),
+                # #2916: same session band as the driving turn span (matches
+                # the ``_execute_named_subagent`` site above).
+                KESTREL_SESSION_ID: real_session_id(session_id),
+                "agent.session_id": real_session_id(session_id),
                 "feature.name": f.tool_name,
             }):
                 r = await f.execute_as_subagent(
