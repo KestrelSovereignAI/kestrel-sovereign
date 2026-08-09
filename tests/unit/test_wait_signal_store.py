@@ -182,6 +182,46 @@ async def test_start_watch_preserves_existing_fields(make_store):
 
 
 @pytest.mark.asyncio
+async def test_start_watch_records_origin_session(make_store):
+    """The watch remembers the chat session it was registered from (#2877) so
+    the reconciler can wake back into it."""
+    store = await make_store()
+    await store.start_watch("task", "task-1", origin_session_id="sess-1")
+    assert (await store.get("task", "task-1")).origin_session_id == "sess-1"
+    # A watch with no session records none rather than inventing one.
+    await store.start_watch("task", "task-2")
+    assert (await store.get("task", "task-2")).origin_session_id is None
+
+
+@pytest.mark.asyncio
+async def test_origin_session_writes_are_sticky(make_store):
+    """A later session-less write must never orphan a handle that already has
+    an originating session — otherwise the wake loses its thread (#2877)."""
+    store = await make_store()
+    await store.start_watch("task", "task-1", origin_session_id="sess-1")
+    # Re-watch from a session-less context (cron/CLI).
+    await store.start_watch("task", "task-1")
+    assert (await store.get("task", "task-1")).origin_session_id == "sess-1"
+    # And an emit that resolved no session leaves it alone too.
+    await store.record_pending(
+        "task", "task-1", signal_id="s1", target="done", attempts=1,
+    )
+    assert (await store.get("task", "task-1")).origin_session_id == "sess-1"
+
+
+@pytest.mark.asyncio
+async def test_record_pending_can_seed_origin_session(make_store):
+    """The implicit auto-wake path never registers a watch, so record_pending
+    is where a provider-supplied session first reaches the ledger."""
+    store = await make_store()
+    await store.record_pending(
+        "talon", "job-1", signal_id="s1", target="done", attempts=1,
+        origin_session_id="sess-9",
+    )
+    assert (await store.get("talon", "job-1")).origin_session_id == "sess-9"
+
+
+@pytest.mark.asyncio
 async def test_stop_watch_clears_flag(make_store):
     store = await make_store()
     await store.start_watch("task", "task-1")

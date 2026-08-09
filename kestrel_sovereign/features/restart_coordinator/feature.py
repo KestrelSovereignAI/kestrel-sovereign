@@ -38,6 +38,7 @@ from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.session_origin import resolve_origin_session_id
 
 from .event_store import (
     ensure_restart_status_events_table,
@@ -583,20 +584,12 @@ class RestartCoordinatorFeature(Feature):
             getattr(self.agent, "_current_request_id", "") or ""
         )
         # Capture the chat session this request was filed from so the
-        # post-restart wake lands in the SAME window (#1809). Prefer the agent's
-        # authoritative per-turn ``_active_session_id`` (set by both the
-        # streaming and non-streaming turn bodies from the effective session,
-        # incl. the JSON-body session the primary chat path uses). Fall back to
-        # the logging ``session_id_var`` (set only from a query param / header).
-        # Empty for CLI/system-filed requests with no session — those wake
+        # post-restart wake lands in the SAME window (#1809). Shared resolver
+        # (#2877) so restart, watched waits, and Talon dispatch cannot drift
+        # apart on what "the originating session" means. Empty for
+        # CLI/system-filed requests with no session — those wake
         # system-initiated, as before.
-        origin_session_id = getattr(self.agent, "_active_session_id", "") or ""
-        if not origin_session_id:
-            try:
-                from kestrel_sovereign.logging_config import session_id_var
-                origin_session_id = session_id_var.get() or ""
-            except Exception:
-                origin_session_id = ""
+        origin_session_id = resolve_origin_session_id(self.agent)
         req = await insert_request(
             self._db,
             requested_by_agent=str(agent_id),

@@ -209,10 +209,14 @@ async def test_records_ok_as_delivered_and_locks_outcome(make_agent):
     assert t2.data["signals_emitted"] == 1
     row = await rec._store.get("fake", "h1")
     assert row.last_signaled_outcome == "done"
-    assert row.last_delivery_status == "ok"
+    # No originating session was ever recorded for this handle, so the wake
+    # went out UNBOUND — the conversation store picked its destination and the
+    # reconciler never learns which (#2877). The ledger says that, rather than
+    # a clean "ok" it cannot vouch for.
+    assert row.last_delivery_status == "ok_unbound"
     assert row.last_delivery_attempts == 1
     assert row.pending_signal_id is None
-    assert t2.data["transitions"][0]["delivery_status"] == "ok"
+    assert t2.data["transitions"][0]["delivery_status"] == "ok_unbound"
 
 
 @pytest.mark.asyncio
@@ -228,7 +232,8 @@ async def test_coalesced_counts_as_delivered(make_agent):
     assert t.data["signals_emitted"] == 1
     row = await rec._store.get("fake", "h1")
     assert row.last_signaled_outcome == "done"
-    assert row.last_delivery_status == "coalesced"
+    # Session-less handle → delivered, but emitted unbound (#2877).
+    assert row.last_delivery_status == "coalesced_unbound"
 
 
 @pytest.mark.asyncio
@@ -302,7 +307,8 @@ async def test_soft_fail_does_not_lock_and_retries_with_fresh_attempt(make_agent
     assert harvest.data["signals_emitted"] == 1
     row = await rec._store.get("fake", "h1")
     assert row.last_signaled_outcome == "done"
-    assert row.last_delivery_status == "ok"
+    # Session-less handle → delivered, but emitted unbound (#2877).
+    assert row.last_delivery_status == "ok_unbound"
 
 
 @pytest.mark.asyncio

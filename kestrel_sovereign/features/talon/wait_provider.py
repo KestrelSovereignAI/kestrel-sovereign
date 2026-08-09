@@ -89,6 +89,12 @@ class TalonWaitable:
             "completed_at": info.get("completed_at", ""),
             "test_evidence": info.get("test_evidence", ""),
             "ci_status": info.get("ci_status", ""),
+            # The chat session this job was dispatched from (#2877). NOT a
+            # prompt field: the reconciler lifts it onto the wake signal's
+            # ENVELOPE (Signal.session_id) and strips it from the payload, so
+            # the cognition turn resumes the Sovereign's thread instead of
+            # minting a fresh implicit session an hour after dispatch.
+            "origin_session_id": info.get("origin_session_id", ""),
         }
 
         if status == "complete":
@@ -130,8 +136,13 @@ class TalonWaitable:
         is a cheap no-op.
 
         Scoped to ``cli_background`` jobs: those are the ones the retired
-        talon_monitor cron drove; the a2a path has its own resumption rail
-        (a2a.task_complete).
+        talon_monitor cron drove. A2A jobs are NOT auto-woken here — their rows
+        live only in the coordinator's in-memory map, so an a2a handle has no
+        durable record to poll after a restart. They remain reachable through an
+        explicit ``wait(target, mode="signal")`` watch (the watched-handle loop
+        polls any provider), which is also where their session binding comes
+        from. Because of that gap, ``talon_claim`` routes claims filed from a
+        chat session down the cli_background rail (#2877).
         """
         feature = self._feature
         feature._reload_persisted_jobs()

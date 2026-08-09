@@ -72,6 +72,7 @@ from kestrel_sovereign.features.talon.verification import (
     VerificationEvidence,
     VerificationState,
 )
+from kestrel_sovereign.session_origin import resolve_origin_session_id
 from kestrel_sovereign.waits.engine import MAX_HANDLE_WAIT_SECONDS
 
 logger = logging.getLogger(__name__)
@@ -967,6 +968,18 @@ class TalonCoordinatorFeature(Feature):
             # durable cli_background job — A2A jobs are in-memory only
             # and their wait refs die with the process.
             and not _FORCE_CLI_DISPATCH.get()
+            # Same durability argument, one step further (#2877): a claim
+            # filed FROM a chat session has to wake that session when it
+            # finishes, and only the cli_background rail can deliver that.
+            # A2A rows never reach ``_persist_jobs`` (so the binding would not
+            # survive the restart a multi-hour job usually spans) and are
+            # excluded from ``TalonWaitable.active_handles`` (so nothing polls
+            # them for an auto-wake at all). Routing a session-bound claim
+            # there would silently strand its completion outside the thread
+            # the Sovereign is watching — the exact #2877 failure. Session-less
+            # callers (cron, CLI, system) have no thread to strand and keep the
+            # A2A-preferred path unchanged.
+            and not resolve_origin_session_id(self.agent)
         )
         if use_a2a:
             a2a_result = await self._dispatch_via_a2a(repo, issue)
@@ -4194,6 +4207,14 @@ class TalonCoordinatorFeature(Feature):
             await asyncio.to_thread(
                 lambda: urllib.request.urlopen(req, timeout=10).read()
             )
+            # No ``origin_session_id`` here, deliberately (#2877). This row is
+            # in-memory only (``_persist_jobs`` writes cli_background rows) and
+            # a2a handles are excluded from ``TalonWaitable.active_handles``,
+            # so there is no auto-wake on this rail to bind a session to — a
+            # field written here would be read by nothing and would advertise
+            # coverage that does not exist. ``talon_claim`` instead sends
+            # session-bound claims down the cli_background rail; see the
+            # ``use_a2a`` gate.
             self._jobs[task_id] = {
                 "repo": repo, "issue": issue_number,
                 "status": "dispatched", "method": "a2a",
@@ -4732,6 +4753,13 @@ class TalonCoordinatorFeature(Feature):
             "started_at": datetime.now(timezone.utc).isoformat(),
             "log_path": str(log_path),
             "exit_path": str(exit_path),
+            # The chat session this job was dispatched from (#2877). A Talon
+            # job routinely outlives the 30-minute implicit-session window, so
+            # without this the completion wake mints a brand-new session and
+            # the whole autonomous loop walks away from the thread the
+            # Sovereign is watching. TalonWaitable.poll hands it back to the
+            # reconciler, which binds it to the wake envelope.
+            "origin_session_id": resolve_origin_session_id(self.agent),
             "process": proc,
         }
         if extra_meta:
