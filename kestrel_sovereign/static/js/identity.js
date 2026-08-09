@@ -1255,8 +1255,7 @@ function maybeAutoLoadMostRecent(conversations, autoTargetAgent, view) {
     // before the list ever loaded and #714 never ran outside multi_agent.
     // With that card gone the boot pane is genuinely empty, so standalone now
     // reopens on the most recent conversation the way an agent select always
-    // has. Anything mounted into a pane as decoration will silently suppress
-    // this again — keep panes free of non-turn content.
+    // has.
     const autoTargetPane = state.chatPanes.get(autoTargetAgent);
     const paneIsCold = autoTargetPane
         && !autoTargetPane.streamingMsgDiv
@@ -1270,9 +1269,20 @@ function maybeAutoLoadMostRecent(conversations, autoTargetAgent, view) {
             // ``expectedAgent`` is pinned to the agent the LIST was fetched for —
             // loadConversation drops the load if the host has since switched
             // (#1358).
+            //
+            // ``expectedGeneration`` pins the pane's context the same way a
+            // stream dispatch does (chat.js `dispatchGeneration`). Every
+            // deliberate wipe — New Chat, a new conversation, trashing the open
+            // one, another load — bumps it, so a wipe that lands during this
+            // load's awaits invalidates it. Emptiness alone cannot carry that:
+            // a wipe leaves the pane empty, which is indistinguishable from
+            // the cold boot this fires on. It was only ever safe because every
+            // wipe path left a placeholder behind, which is exactly the
+            // decoration this change removed.
             window.loadConversation(mostRecent.session_id, {
                 auto: true,
                 expectedAgent: autoTargetAgent,
+                expectedGeneration: autoTargetPane.generation,
             });
         }
     }
@@ -1789,7 +1799,14 @@ window.loadConversation = async function(sessionId, options = {}) {
                 && pane.element.children.length === 0;
             const userBusy = state.waitingAgents.has(currentAgent);
             const sessionAlreadySet = !!state.currentSessionId;
-            if (!paneIsCold || userBusy || sessionAlreadySet) {
+            // A deliberate wipe during these awaits bumps the pane generation
+            // and re-empties the pane, so the three checks above all pass and
+            // this stale history would repaint over an explicitly-cleared
+            // pane — and stay there if minting the new session then fails.
+            // The generation is the only signal that survives a wipe.
+            const paneReset = Object.prototype.hasOwnProperty.call(options, 'expectedGeneration')
+                && (!pane || pane.generation !== options.expectedGeneration);
+            if (!paneIsCold || userBusy || sessionAlreadySet || paneReset) {
                 // User started a turn while auto-load was in flight. Drop the
                 // auto-load — the in-flight stream is what the user actually
                 // wants to see. Nothing to roll back: the selection commit is

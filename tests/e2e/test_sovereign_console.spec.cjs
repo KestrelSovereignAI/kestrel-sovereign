@@ -400,7 +400,18 @@ test.describe('Chat Panel - Conversation', () => {
         // test_session_context_loading.spec.cjs sends to this same host. A
         // freshly-wiped pane is the only deterministic moment at which
         // "nothing is rendered" is the correct expectation.
+        // clearChat() wipes synchronously and then fires the new-conversation
+        // request from an unawaited dynamic-import continuation, so asserting
+        // straight after the click would only prove the intermediate frame is
+        // empty. Wait for the mint to land: anything the async tail renders —
+        // a restored placeholder, a stale auto-load repaint — is in the DOM by
+        // then.
+        const minted = page.waitForResponse(
+            (res) => res.url().includes('/api/conversations/new'),
+        );
         await page.locator('#new-chat-btn').click();
+        await minted;
+
         const chat = page.locator('#chat-container');
         await expect(chat.locator('.message')).toHaveCount(0);
         await expect(chat).toHaveText('');
