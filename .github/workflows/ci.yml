@@ -264,7 +264,19 @@ jobs:
         # that fail are the by-name existence checks in TestJsonPathIndexes.
         # See #2798. The integration tier does exclude benchmarks; below.
         run: uv run pytest tests/unit/ -n auto -v --tb=short -x --timeout=60
-        timeout-minutes: 10
+        # 10 was too tight and started killing PASSING runs. The tier was
+        # measured at 7:43 on the 2-core runner (#2795) and has since grown —
+        # #2465, #2890 and #2902 added ~1.2k lines of tests in one week. The
+        # median push still lands at 5.6-6.7 min, but the distribution now
+        # crosses 10 and which side you land on is runner luck: 0.51.0's
+        # release PR timed out twice on a tree whose `main` push had passed in
+        # 6.4 min, stalling at 97% and then 88% — different points, so not a
+        # hung test.
+        #
+        # This does not mask a hang. Per-test `--timeout=60` above is what
+        # catches those; the job wall clock only decides how much passing work
+        # gets thrown away. Runner sizing — the real fix — stays in #2795.
+        timeout-minutes: 20
         env:
           KESTREL_AUDIT_MODE: skip
 

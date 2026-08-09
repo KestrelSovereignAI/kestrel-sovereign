@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-08-08
-**Scope:** 2306 tracked files (1543 `.py`, 345 `.md`, 418 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-08-09
+**Scope:** 2309 tracked files (1543 `.py`, 345 `.md`, 421 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -1151,6 +1151,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/static/js/app.js** — (js asset)
 - **kestrel_sovereign/static/js/approvals.js** — (js asset)
 - **kestrel_sovereign/static/js/chat.js** — (js asset)
+- **kestrel_sovereign/static/js/chat_scroll.js** — (js asset)
 - **kestrel_sovereign/static/js/conversations.js** — (js asset)
 - **kestrel_sovereign/static/js/database.js** — (js asset)
 - **kestrel_sovereign/static/js/explorers.js** — (js asset)
@@ -1951,6 +1952,7 @@ Repo entry points and standard project files.
 - **tests/e2e/test_approval_popup.spec.cjs** — —
 - **tests/e2e/test_avatar_display.spec.cjs** — —
 - **tests/e2e/test_chat_and_models.spec.cjs** — —
+- **tests/e2e/test_chat_scroll_follow.spec.cjs** — —
 - **tests/e2e/test_clarification_workflow.py** — End-to-end tests for GitHub clarification workflow using Playwright.
   - `def run_gh_command(args)`; `def create_test_issue(title, body, labels)`; `def close_test_issue(issue_number)`; `def get_issue_comments(issue_number)`; `def get_issue_labels(issue_number)`; `def run_agent_on_issue(issue_number)`; `class TestClarificationWorkflow`; `class TestClarificationUI`; `…`
 - **tests/e2e/test_conversation_highlight.spec.cjs** — —
@@ -1988,6 +1990,7 @@ Repo entry points and standard project files.
 - **tests/frontend/chat_header_action_xss.test.mjs** — (mjs asset)
 - **tests/frontend/chat_restart_status_dedupe.test.mjs** — (mjs asset)
 - **tests/frontend/chat_revising_event.test.mjs** — (mjs asset)
+- **tests/frontend/chat_scroll_follow.test.mjs** — (mjs asset)
 - **tests/frontend/chat_typed_parts.test.mjs** — (mjs asset)
 - **tests/frontend/chat_ui_generation.test.mjs** — (mjs asset)
 - **tests/frontend/code_copy_button.test.mjs** — (mjs asset)
@@ -2647,8 +2650,8 @@ Repo entry points and standard project files.
   - `async def consent_feature()`; `class TestConsentRecordModel`; `class TestConsentAction`; `class TestRequestConsent`; `class TestConsentLog`; `class TestConsentStats`; `class TestSentimentParsing`; `class TestToolDiscovery`
 - **tests/unit/test_consent_timeout.py** — Unit Tests for Consent Protocol Strict Timeout.
   - `async def consent_feature()`; `class TestConsentTimeoutProceeds`; `class TestConsentTimeoutRecorded`; `class TestConsentDurationTracked`; `class TestConsentFailOpenOnError`; `class TestConsentStatsIncludesMetrics`; `class TestIntegrationPointsFailOpen`; `class TestConsentTimeoutConstant`
-- **tests/unit/test_constitution_article_lookup.py** — F146: `!constitution article V` must return Article V (Amendment Process), not Amendment V (Right of Exit), which shadowed it in the generic cascade.
-  - `async def test_article_subcommand_returns_article_not_amendment()`; `async def test_amendment_subcommand_still_returns_amendment()`; `async def test_missing_article_surfaces_error_not_unrelated_match()`
+- **tests/unit/test_constitution_addressing.py** — #2902: how the Constitution is addressed after the "Article V" stump retired.
+  - `def test_canonical_text_carries_no_article_unit()`; `def test_amendment_process_is_unnumbered()`; `def test_amendment_process_governs_its_own_amendment()`; `def test_no_clause_invokes_an_authority_the_system_cannot_verify()`; `def test_prior_constitution_changelog_is_gone()`; `def test_docs_mirror_body_matches_packaged_text()`; `def test_parse_finds_every_unit_of_the_real_document()`; `def test_no_article_table_remains()`; `…`
 - **tests/unit/test_constitution_audit.py** — Unit tests for periodic constitution audit enforcement.
   - `async def mock_agent()`; `async def test_audit_triggers_after_exactly_audit_interval()`; `async def test_audit_triggers_after_24_hours()`; `async def test_counter_resets_after_audit()`; `async def test_safe_mode_activates_on_integrity_failure()`; `async def test_audit_respects_custom_interval()`; `async def test_audit_does_not_trigger_before_interval()`; `async def test_multiple_audits_over_time()`; `…`
 - **tests/unit/test_constitution_canary.py** — Unit tests for the constitutional echo-canary primitive.
