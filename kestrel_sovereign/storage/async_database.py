@@ -614,6 +614,12 @@ CREATE INDEX IF NOT EXISTS idx_pending_a2a_questions_sweep
 --                            is poll-only (not MonitorableWaitable), so EVERY
 --                            async waitable is wakeable without auto-waking all
 --                            tasks (which would self-wake on inbound work)
+--   - origin_session_id      the chat session the work was registered from
+--                            (#2877). The reconciler puts it on the wake
+--                            signal envelope so the cognition turn resumes THAT
+--                            session instead of minting a fresh implicit one.
+--                            NULL means system-initiated with no observer
+--                            thread, and the wake is reported unsurfaced
 --
 -- ``agent_id`` scopes rows to the OWNING agent for shared-backend isolation,
 -- exactly like pending_a2a_questions above.
@@ -630,6 +636,7 @@ CREATE TABLE IF NOT EXISTS wait_signal_state (
     pending_signaled_target TEXT,
     pending_signal_enqueued_at TIMESTAMP,
     watching INTEGER NOT NULL DEFAULT 0,
+    origin_session_id TEXT,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (agent_id, kind, handle)
 );
@@ -1016,6 +1023,14 @@ class AsyncDatabase:
         )
         await self._migrate_add_column(
             "agent_service_keys", "is_active", "INTEGER DEFAULT 1"
+        )
+        # Session-bound wakes (#2877): the wait ledger records the chat session
+        # the watched work was registered from, so the reconciler can route the
+        # completion wake back into that session instead of letting the
+        # conversation store mint a fresh implicit one. Legacy rows are NULL
+        # (system-initiated), which the reconciler reports as unsurfaced.
+        await self._migrate_add_column(
+            "wait_signal_state", "origin_session_id", "TEXT DEFAULT NULL"
         )
         if await self._column_exists("conversation_history", "deleted_at"):
             await self._backend.execute(

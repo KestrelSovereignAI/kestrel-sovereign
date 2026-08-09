@@ -33,6 +33,7 @@ from kestrel_sovereign._async_process import (
     terminate_process_tree,
 )
 from kestrel_sovereign._bounded_subprocess import run_bounded_subprocess
+from kestrel_sovereign.agent.origin_session import resolve_origin_session_id
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.cli.terminal import redact_secrets
 from kestrel_sovereign.features.talon.wait_provider import TalonWaitable
@@ -4197,6 +4198,10 @@ class TalonCoordinatorFeature(Feature):
             self._jobs[task_id] = {
                 "repo": repo, "issue": issue_number,
                 "status": "dispatched", "method": "a2a",
+                # Same session binding as the CLI path (#2877) — the a2a rail
+                # has its own resumption path, but the job record is the one
+                # place the originating session is knowable at dispatch.
+                "origin_session_id": resolve_origin_session_id(self.agent),
             }
             return {
                 "dispatched": True, "method": "a2a",
@@ -4732,6 +4737,13 @@ class TalonCoordinatorFeature(Feature):
             "started_at": datetime.now(timezone.utc).isoformat(),
             "log_path": str(log_path),
             "exit_path": str(exit_path),
+            # The chat session this job was dispatched from (#2877). A Talon
+            # job routinely outlives the 30-minute implicit-session window, so
+            # without this the completion wake mints a brand-new session and
+            # the whole autonomous loop walks away from the thread the
+            # Sovereign is watching. TalonWaitable.poll hands it back to the
+            # reconciler, which binds it to the wake envelope.
+            "origin_session_id": resolve_origin_session_id(self.agent),
             "process": proc,
         }
         if extra_meta:

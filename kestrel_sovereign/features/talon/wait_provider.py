@@ -89,6 +89,12 @@ class TalonWaitable:
             "completed_at": info.get("completed_at", ""),
             "test_evidence": info.get("test_evidence", ""),
             "ci_status": info.get("ci_status", ""),
+            # The chat session this job was dispatched from (#2877). NOT a
+            # prompt field: the reconciler lifts it onto the wake signal's
+            # ENVELOPE (Signal.session_id) and strips it from the payload, so
+            # the cognition turn resumes the Sovereign's thread instead of
+            # minting a fresh implicit session an hour after dispatch.
+            "origin_session_id": info.get("origin_session_id", ""),
         }
 
         if status == "complete":

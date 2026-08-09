@@ -28,6 +28,26 @@ The dedup/delivery ledger lives in the ``wait_signal_state`` table
 talon_monitor stashed inside ``jobs.json``. The reconciler instance is held
 as a singleton on the agent (``agent._wait_reconciler``) so the in-memory
 ``_pending_signal_tasks`` map survives across cron ticks.
+
+Session binding (#2877)
+-----------------------
+A wake that carries no ``session_id`` does not land nowhere — it lands in a
+session the conversation store invents. ``_derive_implicit_session_id`` reuses
+the previous message's session only when it is less than 30 minutes old and
+otherwise mints a fresh UUID, so an hour-long Talon job woke into a two-message
+orphan session while the user's thread sat idle. Each hop of a multi-attempt
+loop walked one session further from the observer.
+
+So the reconciler binds every wake to the session the work was registered from:
+the ledger's ``origin_session_id`` (recorded by ``wait(mode="signal")``), or the
+provider's own ``WaitStatus.data["origin_session_id"]`` (recorded by the Talon
+coordinator at dispatch). The binding rides the signal ENVELOPE, not the
+payload, and the dispatcher forwards it to ``process_input``.
+
+When no origin session exists the wake still runs, but the delivery is recorded
+as ``<status>_unsurfaced`` rather than a bare ``ok``: the turn was persisted,
+not surfaced to any observer, and reporting those as identical is what made the
+defect invisible for a month.
 """
 
 from __future__ import annotations
@@ -41,7 +61,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from kestrel_sdk.signals import Signal, SignalMode
 from kestrel_sdk.tools import MonitorableWaitable, ToolResult
 
-from kestrel_sovereign.storage.async_wait_signal_store import WaitSignalStore
+from kestrel_sovereign.agent.origin_session import resolve_origin_session_id
+
+from kestrel_sovereign.storage.async_wait_signal_store import (
+    WaitSignalState,
+    WaitSignalStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +79,19 @@ MAX_DELIVERY_ATTEMPTS = 10
 # Dispatcher result statuses, classified exactly as talon_monitor did.
 _DELIVERED_STATES = {"ok", "coalesced"}
 _HARD_FAIL_STATES = {"dropped_validation", "dropped_cycle"}
+
+# Suffix appended to a delivered status when the wake carried no originating
+# session (#2877). The cognition turn ran and was persisted, but it landed in
+# whatever session the conversation store derived rather than one an observer
+# is watching. Distinct from plain ``ok`` so a stranded turn is legible in the
+# ledger instead of being reported as a clean delivery.
+UNSURFACED_SUFFIX = "_unsurfaced"
+
+# Payload key a provider uses to declare the session its handle was registered
+# from. The reconciler lifts it onto the signal envelope and REMOVES it from
+# the payload — routing state belongs on the envelope, and prompt templates
+# should never render it.
+ORIGIN_SESSION_KEY = "origin_session_id"
 
 
 class WaitReconciler:
@@ -184,10 +222,27 @@ class WaitReconciler:
             self._pending_signal_tasks.pop((kind, handle), None)
 
             if status_value in _DELIVERED_STATES:
+                # Delivered to the dispatcher — but "delivered" is not
+                # "surfaced" (#2877). A wake that carried no originating
+                # session ran into whatever session the conversation store
+                # derived, which nobody is watching. Record that distinctly
+                # instead of reporting it as a clean ``ok``.
+                origin_session_id = (
+                    state.origin_session_id if state else None
+                ) or ""
+                recorded_status = status_value
+                if not origin_session_id:
+                    recorded_status += UNSURFACED_SUFFIX
+                    logger.warning(
+                        "wait_reconcile: wake for %s:%s was persisted but not "
+                        "surfaced — no originating session was recorded, so "
+                        "the cognition turn landed outside any observed "
+                        "thread", kind, handle,
+                    )
                 # Lock the transition so we don't re-emit it.
                 await store.record_delivery(
                     kind, handle,
-                    delivery_status=status_value,
+                    delivery_status=recorded_status,
                     delivery_error=delivery_error,
                     signaled_outcome=target,
                     attempt_at=now,
@@ -195,7 +250,8 @@ class WaitReconciler:
                 signals_delivered += 1
                 transitions.append({
                     "kind": kind, "handle": handle, "outcome": target,
-                    "delivery_status": status_value,
+                    "delivery_status": recorded_status,
+                    "origin_session_id": origin_session_id,
                 })
             elif status_value in _HARD_FAIL_STATES:
                 # Permanent rejection — lock signaled to stop re-emit loops.
@@ -398,7 +454,10 @@ class WaitReconciler:
             return
 
         attempts = attempts_so_far + 1
-        signal = self._build_signal(provider, kind, handle, status, attempts)
+        origin_session_id = self._resolve_origin_session(state, status)
+        signal = self._build_signal(
+            provider, kind, handle, status, attempts, origin_session_id,
+        )
 
         if dispatcher is None or not hasattr(dispatcher, "enqueue_signal"):
             # Without a dispatcher we have NOT woken anyone — don't record
@@ -413,6 +472,11 @@ class WaitReconciler:
             target=signaled_token,
             attempts=attempts,
             attempt_at=now,
+            # Persist the session THIS emit is bound to, so the next tick's
+            # harvest can tell a surfaced delivery from a merely persisted
+            # one (#2877). Sticky in the store: an empty value never clears
+            # a session a watch already recorded.
+            origin_session_id=origin_session_id or None,
         )
 
         try:
@@ -434,6 +498,30 @@ class WaitReconciler:
 
         self._pending_signal_tasks[(kind, handle)] = handle_obj
         counters["signals_enqueued"] += 1
+
+    @staticmethod
+    def _resolve_origin_session(
+        state: Optional[WaitSignalState], status: Any,
+    ) -> str:
+        """Return the chat session this handle's wake should resume (#2877).
+
+        Two sources, in precedence order:
+
+          1. the ledger row's ``origin_session_id`` — recorded by
+             ``wait(target, mode="signal")`` at watch registration. This is the
+             explicit, caller-stated binding, so it wins;
+          2. the provider's ``WaitStatus.data["origin_session_id"]`` — recorded
+             by the provider at dispatch (TalonWaitable reads it off the durable
+             job record). This covers the IMPLICIT auto-wake path, where nobody
+             ever registered a watch.
+
+        Empty string means genuinely session-less (a cron- or system-dispatched
+        handle). The wake still fires; it is just reported unsurfaced rather
+        than pretending an observer saw it.
+        """
+        if state is not None and state.origin_session_id:
+            return str(state.origin_session_id)
+        return str((status.data or {}).get(ORIGIN_SESSION_KEY) or "")
 
     @staticmethod
     def _signaled_token(status: Any) -> str:
@@ -474,6 +562,7 @@ class WaitReconciler:
         handle: str,
         status: Any,
         attempts: int,
+        origin_session_id: str = "",
     ) -> Signal:
         """Build a COGNITION signal envelope for a terminal transition.
 
@@ -482,6 +571,12 @@ class WaitReconciler:
         generic ``wait.complete`` source. The provider's WaitStatus.data is
         spread underneath the generic kind/handle/outcome/summary keys so
         kind-specific templates (talon's) still find their fields.
+
+        ``origin_session_id`` rides the ENVELOPE, not the payload (#2877): the
+        dispatcher forwards ``Signal.session_id`` into ``process_input`` so the
+        woken turn resumes that session instead of the conversation store
+        minting a fresh implicit one. It is stripped from the payload so no
+        prompt template renders routing state back at the model.
         """
         source = getattr(provider, "signal", None) or "wait.complete"
         payload: Dict[str, Any] = {
@@ -491,6 +586,7 @@ class WaitReconciler:
             "outcome": status.outcome.value,
             "summary": status.summary,
         }
+        payload.pop(ORIGIN_SESSION_KEY, None)
         target_agent = (
             getattr(self._agent, "did", None)
             or getattr(self._agent, "agent_id", None)
@@ -502,6 +598,10 @@ class WaitReconciler:
             mode=SignalMode.COGNITION,
             payload=payload,
             target_agent=str(target_agent),
+            # The session the watched work was registered from (#2877). None
+            # for genuinely session-less work, which keeps the prior
+            # system-initiated behavior.
+            session_id=origin_session_id or None,
             # Unique per attempt so a retry after a soft failure isn't
             # swallowed by the dispatcher's coalescing window as COALESCED
             # against the prior failed attempt (talon_monitor codex round 1
@@ -638,5 +738,12 @@ async def register_wait_watch(agent: Any, ref: str) -> None:
             f"(the {kind!r} provider does not own it){hint}"
         )
 
+    # Capture the chat session the watch was registered from so the completion
+    # wake resumes it instead of landing in a fresh implicit session (#2877).
+    # Empty for CLI/system-initiated waits with no observer thread.
+    origin_session_id = resolve_origin_session_id(agent)
+
     reconciler = _get_reconciler(agent)
-    await reconciler._store.start_watch(kind, handle)
+    await reconciler._store.start_watch(
+        kind, handle, origin_session_id=origin_session_id or None,
+    )

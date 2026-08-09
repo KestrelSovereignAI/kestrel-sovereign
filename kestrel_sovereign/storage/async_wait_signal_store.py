@@ -13,6 +13,9 @@ one row per ``(agent_id, kind, handle)`` the reconciler has observed, tracking
   - ``pending_signal_*`` — the two-phase harvest set: a signal we enqueued
     but have not yet confirmed delivered. ``record_pending`` sets them;
     ``record_delivery``/``clear_pending`` clear them.
+  - ``origin_session_id`` — the chat session the watched work was registered
+    from (#2877), so the reconciler can bind the wake signal to it. Writes are
+    *sticky*: a caller that has no session never clears one already recorded.
 
 Like :class:`PendingA2AQuestionStore`, every query is filtered by
 ``agent_id`` so a shared backend (e.g. Postgres) cannot leak rows between
@@ -37,6 +40,17 @@ logger = logging.getLogger(__name__)
 
 # Accept either a datetime or an ISO string for any timestamp argument.
 TimeArg = Union[datetime, str, None]
+
+# Every read returns the same projection in the same order, so the three
+# queries below and :meth:`WaitSignalStore._row_to_dc` cannot drift apart when
+# a column is added.
+_SELECT_COLUMNS = """
+    kind, handle, last_signaled_outcome, last_delivery_status,
+    last_delivery_error, last_delivery_attempts,
+    last_delivery_attempt_at, pending_signal_id,
+    pending_signaled_target, pending_signal_enqueued_at,
+    watching, origin_session_id
+"""
 
 
 def _coerce_ts(value: TimeArg) -> Optional[datetime]:
@@ -79,6 +93,9 @@ class WaitSignalState:
     pending_signaled_target: Optional[str]
     pending_signal_enqueued_at: Optional[str]
     watching: int
+    # The chat session this handle's wake should resume (#2877). None/empty
+    # means the work was registered with no observer thread.
+    origin_session_id: Optional[str] = None
 
 
 class WaitSignalStore:
@@ -105,12 +122,8 @@ class WaitSignalStore:
 
     async def get(self, kind: str, handle: str) -> Optional[WaitSignalState]:
         rows = await self._db.fetchall(
-            """
-            SELECT kind, handle, last_signaled_outcome, last_delivery_status,
-                   last_delivery_error, last_delivery_attempts,
-                   last_delivery_attempt_at, pending_signal_id,
-                   pending_signaled_target, pending_signal_enqueued_at,
-                   watching
+            f"""
+            SELECT {_SELECT_COLUMNS}
             FROM wait_signal_state
             WHERE agent_id = ? AND kind = ? AND handle = ?
             """,
@@ -124,12 +137,8 @@ class WaitSignalStore:
         """All rows with an un-harvested enqueued signal for THIS agent —
         the reconciler's Phase-0 harvest input set."""
         rows = await self._db.fetchall(
-            """
-            SELECT kind, handle, last_signaled_outcome, last_delivery_status,
-                   last_delivery_error, last_delivery_attempts,
-                   last_delivery_attempt_at, pending_signal_id,
-                   pending_signaled_target, pending_signal_enqueued_at,
-                   watching
+            f"""
+            SELECT {_SELECT_COLUMNS}
             FROM wait_signal_state
             WHERE agent_id = ? AND pending_signal_id IS NOT NULL
             """,
@@ -181,6 +190,7 @@ class WaitSignalStore:
         target: str,
         attempts: int,
         attempt_at: TimeArg = None,
+        origin_session_id: Optional[str] = None,
     ) -> None:
         """Stash an enqueued (but not yet confirmed) signal.
 
@@ -189,18 +199,29 @@ class WaitSignalStore:
         record, not a confirmed delivery). Upsert via try-UPDATE / fallback
         INSERT so an existing row keeps its prior ``last_signaled_outcome``
         instead of an ``INSERT OR REPLACE`` blowing it away.
+
+        ``origin_session_id`` records the session the emitted wake is bound to
+        (#2877) so the harvest can tell a *surfaced* delivery from a merely
+        persisted one. Sticky: an empty value leaves any recorded session
+        alone rather than orphaning a handle that already had one.
         """
         attempt_dt = _coerce_ts(attempt_at) or datetime.now(timezone.utc).replace(
             tzinfo=None
         )
+        session_sql = (
+            ", origin_session_id = ?" if origin_session_id else ""
+        )
+        session_params = (
+            (origin_session_id,) if origin_session_id else ()
+        )
         rowcount = await self._db.execute(
-            """
+            f"""
             UPDATE wait_signal_state
             SET pending_signal_id = ?,
                 pending_signaled_target = ?,
                 pending_signal_enqueued_at = ?,
                 last_delivery_attempts = ?,
-                last_delivery_attempt_at = ?,
+                last_delivery_attempt_at = ?{session_sql},
                 updated_at = CURRENT_TIMESTAMP
             WHERE agent_id = ? AND kind = ? AND handle = ?
             """,
@@ -210,6 +231,7 @@ class WaitSignalStore:
                 attempt_dt,
                 int(attempts),
                 attempt_dt,
+                *session_params,
                 self._agent_id,
                 kind,
                 handle,
@@ -221,8 +243,9 @@ class WaitSignalStore:
                 INSERT INTO wait_signal_state
                     (agent_id, kind, handle, last_delivery_attempts,
                      last_delivery_attempt_at, pending_signal_id,
-                     pending_signaled_target, pending_signal_enqueued_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     pending_signaled_target, pending_signal_enqueued_at,
+                     origin_session_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     self._agent_id,
@@ -233,6 +256,7 @@ class WaitSignalStore:
                     signal_id,
                     target,
                     attempt_dt,
+                    origin_session_id or None,
                 ),
             )
 
@@ -349,7 +373,13 @@ class WaitSignalStore:
     # Explicit watched handles (wait mode="signal")
     # ------------------------------------------------------------------
 
-    async def start_watch(self, kind: str, handle: str) -> None:
+    async def start_watch(
+        self,
+        kind: str,
+        handle: str,
+        *,
+        origin_session_id: Optional[str] = None,
+    ) -> None:
         """Register an explicit watch on ``(kind, handle)`` (set watching=1).
 
         Upsert that PRESERVES any existing delivery/signaled/pending fields:
@@ -357,24 +387,35 @@ class WaitSignalStore:
         if no row, INSERT a fresh one with watching=1 and zeroed counters.
         This is the durable half of ``wait(target, mode="signal")`` — the
         reconciler polls watched rows so even a poll-only provider is wakeable.
+
+        ``origin_session_id`` is the chat session the watch was registered from
+        (#2877); the reconciler binds the completion wake to it so the turn
+        lands in the window that asked for it. Sticky: re-watching from a
+        session-less context never clears an already-recorded session.
         """
+        session_sql = (
+            ", origin_session_id = ?" if origin_session_id else ""
+        )
+        session_params = (
+            (origin_session_id,) if origin_session_id else ()
+        )
         rowcount = await self._db.execute(
-            """
+            f"""
             UPDATE wait_signal_state
-            SET watching = 1,
+            SET watching = 1{session_sql},
                 updated_at = CURRENT_TIMESTAMP
             WHERE agent_id = ? AND kind = ? AND handle = ?
             """,
-            (self._agent_id, kind, handle),
+            (*session_params, self._agent_id, kind, handle),
         )
         if rowcount == 0:
             await self._db.execute(
                 """
                 INSERT INTO wait_signal_state
-                    (agent_id, kind, handle, watching)
-                VALUES (?, ?, ?, 1)
+                    (agent_id, kind, handle, watching, origin_session_id)
+                VALUES (?, ?, ?, 1, ?)
                 """,
-                (self._agent_id, kind, handle),
+                (self._agent_id, kind, handle, origin_session_id or None),
             )
 
     async def stop_watch(self, kind: str, handle: str) -> None:
@@ -397,12 +438,8 @@ class WaitSignalStore:
         application-level dedup the active_handles loop applies.
         """
         rows = await self._db.fetchall(
-            """
-            SELECT kind, handle, last_signaled_outcome, last_delivery_status,
-                   last_delivery_error, last_delivery_attempts,
-                   last_delivery_attempt_at, pending_signal_id,
-                   pending_signaled_target, pending_signal_enqueued_at,
-                   watching
+            f"""
+            SELECT {_SELECT_COLUMNS}
             FROM wait_signal_state
             WHERE agent_id = ? AND watching = 1
                   AND last_signaled_outcome IS NULL
@@ -429,4 +466,5 @@ class WaitSignalStore:
             pending_signaled_target=str(r[8]) if r[8] is not None else None,
             pending_signal_enqueued_at=str(r[9]) if r[9] is not None else None,
             watching=int(r[10]) if r[10] is not None else 0,
+            origin_session_id=str(r[11]) if r[11] else None,
         )
