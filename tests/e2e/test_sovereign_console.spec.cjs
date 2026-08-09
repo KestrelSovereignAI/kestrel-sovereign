@@ -388,13 +388,14 @@ test.describe('Chat Panel - Conversation', () => {
         await expect(page.locator('#panel-chat')).toBeVisible();
     });
 
-    test('shows welcome message on initial load', async ({ page }) => {
+    test('starts with an empty transcript on initial load', async ({ page }) => {
         await page.goto(BASE_URL);
         const chatTab = page.locator('.nav-tab').filter({ hasText: /chat/i });
         await chatTab.click();
 
-        const welcomeMessage = page.locator('.agent-message').first();
-        await expect(welcomeMessage).toContainText(/Kestrel|Constitution|help/i);
+        // No welcome card, no placeholder — a fresh conversation shows
+        // nothing until there is a real message.
+        await expect(page.locator('#chat-container .message')).toHaveCount(0);
     });
 
     test('message input and send button are visible', async ({ page }) => {

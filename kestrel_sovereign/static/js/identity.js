@@ -1284,12 +1284,7 @@ async function handleSidebarConversationMutation(action, conv) {
         // (context-status footer, auto-load logic) doesn't point at a
         // vanished session.
         const fresh = await API.newConversation();
-        wipeAgentChatPane(host, `
-            <div style="text-align: center; padding: 2rem; color: var(--text-secondary);">
-                <span style="font-size: 2rem;">\u{2728}</span>
-                <p style="margin-top: 0.5rem;">New conversation started. Say hello!</p>
-            </div>
-        `);
+        wipeAgentChatPane(host);
         state.currentSessionId = fresh.session_id;
         activeConversationId = fresh.session_id;
         activeConversationIdsByAgent.set(host, fresh.session_id);
@@ -1315,12 +1310,7 @@ async function handleSidebarConversationMutation(action, conv) {
 async function startNewConversationForPane() {
     const host = API.getHostAgent();
     const result = await API.newConversation();
-    wipeAgentChatPane(host, `
-        <div style="text-align: center; padding: 2rem; color: var(--text-secondary);">
-            <span style="font-size: 2rem;">\u{2728}</span>
-            <p style="margin-top: 0.5rem;">New conversation started. Say hello!</p>
-        </div>
-    `);
+    wipeAgentChatPane(host);
     const sid = result && result.session_id;
     if (sid) {
         state.currentSessionId = sid;

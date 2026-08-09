@@ -96,12 +96,7 @@ window.startNewConversation = async function() {
         // previous (now-replaced) session gates out. Other agents are
         // unaffected. Then write currentSessionId via the property,
         // which writes into the visible agent's pane.
-        wipeAgentChatPane(API.getHostAgent(), `
-            <div style="text-align: center; padding: 2rem; color: var(--text-secondary);">
-                <span style="font-size: 2rem;">\u{2728}</span>
-                <p style="margin-top: 0.5rem;">New conversation started. Say hello!</p>
-            </div>
-        `);
+        wipeAgentChatPane(API.getHostAgent());
         state.currentSessionId = result.session_id;
 
         // Signal the shared pane owner (identity.js) to reconcile its list.

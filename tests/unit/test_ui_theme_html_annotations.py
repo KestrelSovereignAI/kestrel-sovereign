@@ -314,7 +314,7 @@ def test_no_orphan_label_keys_in_legacy_theme(html_text, legacy_labels):
         "tab_identity", "tab_chat", "tab_constitution", "tab_memories",
         "tab_tasks", "tab_sovereignty", "tab_resources", "tab_metrics",
         "tab_features", "tab_security",
-        "sidebar_agents", "chat_welcome_message", "chat_thinking",
+        "sidebar_agents", "chat_thinking",
         "chat_input_placeholder",
         "constitution_title", "memories_title", "tasks_title",
         "tasks_view_tasks", "tasks_view_activity",

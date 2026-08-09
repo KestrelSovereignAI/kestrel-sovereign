@@ -4816,14 +4816,8 @@ function clearChat() {
 
     // Clear ONLY the visible agent's pane and bump that agent's
     // pane-local generation. Other agents' panes (and their in-flight
-    // streams) are untouched.
-    wipeAgentChatPane(deps().api.getHostAgent(), `
-        <div class="message agent-message">
-            <div class="message-content">
-                <p>Hello! I am your Kestrel AI agent, bound by the Kestrel Constitution to be your truthful and honorable assistant. How can I help you today?</p>
-            </div>
-        </div>
-    `);
+    // streams) are untouched. The pane is left empty — no placeholder.
+    wipeAgentChatPane(deps().api.getHostAgent());
 
     // Clear message input
     if (messageInput) {
