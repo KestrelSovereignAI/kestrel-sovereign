@@ -63,8 +63,8 @@ class SovereigntyFeature(Feature):
             ToolResult.ok with CID + tier + size on a clean export, PARTIAL
             when a non-local tier produced no IPFS CID (backup hashed
             locally but not actually pushed to the network), or
-            ToolResult.failed when a paid storage tier cannot be accounted
-            for through a wallet.
+            ToolResult.failed when requested encryption cannot be honoured
+            or a paid storage tier cannot be accounted for through a wallet.
         """
         # Validate storage_tier explicitly. The old code resolved this via
         # ``tier_map.get(storage_tier.lower(), StorageTier.IPFS)``, so a
@@ -104,8 +104,30 @@ class SovereigntyFeature(Feature):
             )
         tier_enum = tier_map[tier_key]
 
-        # Don't encrypt for local storage (no point, and complicates retrieval)
-        encrypt = encrypt and tier_enum != StorageTier.LOCAL_ONLY
+        # Fail before creating a backup if the requested encryption contract
+        # cannot be honoured.  Local sovereignty exports deliberately do not
+        # have an encrypted retrieval path, while remote encryption requires
+        # the same master key that FilecoinAdapter consumes.  The previous
+        # local-tier coercion silently changed ``encrypt=True`` to ``False``.
+        if encrypt and tier_enum == StorageTier.LOCAL_ONLY:
+            return ToolResult.failed(
+                error=(
+                    "encrypt=True cannot be honoured for storage_tier='local'; "
+                    "no sovereignty backup was created. Re-run with "
+                    "encrypt=False or choose an encrypted remote tier."
+                )
+            )
+        if encrypt:
+            from kestrel_sovereign.security.encryption import get_master_key_bytes
+
+            if not get_master_key_bytes():
+                return ToolResult.failed(
+                    error=(
+                        "encrypt=True requires KESTREL_DATA_KEY, but no master "
+                        "encryption key is configured; no sovereignty backup "
+                        "was created."
+                    )
+                )
 
         wallet = getattr(self.agent, "wallet", None)
 

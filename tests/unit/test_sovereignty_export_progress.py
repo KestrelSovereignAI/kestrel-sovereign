@@ -3,8 +3,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kestrel_sovereign.storage.providers.base import StorageResult, StorageTier
+from kestrel_sdk.tools.result import ToolResultStatus
+
 from kestrel_sovereign.features.sovereignty.feature import SovereigntyFeature
+from kestrel_sovereign.privacy import PrivacyMode
+from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+from kestrel_sovereign.storage.providers.base import StorageResult, StorageTier
 
 
 class _FakeStorage:
@@ -28,6 +32,17 @@ class _FakeAgent:
 
     async def emit_event(self, event_type, data):
         self.events.append((event_type, data))
+
+
+class _BackupCallRecorder:
+    """Underlying store proving an export did not reach blob creation."""
+
+    def __init__(self):
+        self.backup_calls = 0
+
+    async def create_backup_blob(self, include_db=True):
+        self.backup_calls += 1
+        raise AssertionError("encryption preflight must run before blob creation")
 
 
 @pytest.mark.asyncio
@@ -77,9 +92,6 @@ async def test_export_sovereignty_reports_upload_progress():
     assert progress_events[-1]["percent"] == 100
 
 
-from kestrel_sdk.tools.result import ToolResultStatus
-
-
 @pytest.mark.asyncio
 async def test_export_sovereignty_unknown_tier_is_failed():
     """An unknown/typo'd storage_tier must FAIL loudly, not silently
@@ -96,6 +108,57 @@ async def test_export_sovereignty_unknown_tier_is_failed():
     assert "ipsf" in result.error
     # Validation fired BEFORE any backup blob / network attempt.
     assert not hasattr(agent.storage, "receipt")
+
+
+@pytest.mark.asyncio
+async def test_encrypted_local_export_fails_before_real_privacy_storage_side_effects():
+    underlying = _BackupCallRecorder()
+    storage = PrivacyEnforcingStorage(underlying, PrivacyMode.NORMAL)
+    agent = _FakeAgent()
+    agent.storage = storage
+
+    with patch(
+        "kestrel_sovereign.features.sovereignty.feature.FilecoinAdapter"
+    ) as adapter:
+        result = await SovereigntyFeature(agent).export_sovereignty(
+            storage_tier="local",
+            encrypt=True,
+        )
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "encrypt=True cannot be honoured" in result.error
+    assert "storage_tier='local'" in result.error
+    assert "no sovereignty backup was created" in result.error
+    assert underlying.backup_calls == 0
+    adapter.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_encrypted_remote_export_without_master_key_fails_before_backup():
+    underlying = _BackupCallRecorder()
+    storage = PrivacyEnforcingStorage(underlying, PrivacyMode.NORMAL)
+    agent = _FakeAgent()
+    agent.storage = storage
+
+    with (
+        patch(
+            "kestrel_sovereign.security.encryption.get_master_key_bytes",
+            return_value=None,
+        ),
+        patch(
+            "kestrel_sovereign.features.sovereignty.feature.FilecoinAdapter"
+        ) as adapter,
+    ):
+        result = await SovereigntyFeature(agent).export_sovereignty(
+            storage_tier="ipfs",
+            encrypt=True,
+        )
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "encrypt=True requires KESTREL_DATA_KEY" in result.error
+    assert "no sovereignty backup was created" in result.error
+    assert underlying.backup_calls == 0
+    adapter.assert_not_called()
 
 
 @pytest.mark.asyncio
