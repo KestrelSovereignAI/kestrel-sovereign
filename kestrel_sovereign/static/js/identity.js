@@ -1248,6 +1248,15 @@ function maybeAutoLoadMostRecent(conversations, autoTargetAgent, view) {
     // generation, and gate out the in-flight stream — which surfaces
     // user-side as "the agent keeps stopping mid-answer." The {auto: true}
     // flag makes window.loadConversation re-check pane coldness post-await.
+    //
+    // NOTE: the DOM half of "cold" means literally empty. Standalone used to
+    // fail it for an incidental reason — index.html shipped a welcome card
+    // that initChat migrated into the boot pane, so the pane had a child
+    // before the list ever loaded and #714 never ran outside multi_agent.
+    // With that card gone the boot pane is genuinely empty, so standalone now
+    // reopens on the most recent conversation the way an agent select always
+    // has. Anything mounted into a pane as decoration will silently suppress
+    // this again — keep panes free of non-turn content.
     const autoTargetPane = state.chatPanes.get(autoTargetAgent);
     const paneIsCold = autoTargetPane
         && !autoTargetPane.streamingMsgDiv

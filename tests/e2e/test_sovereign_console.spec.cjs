@@ -388,14 +388,18 @@ test.describe('Chat Panel - Conversation', () => {
         await expect(page.locator('#panel-chat')).toBeVisible();
     });
 
-    test('starts with an empty transcript on initial load', async ({ page }) => {
+    test('renders no canned greeting or placeholder on initial load', async ({ page }) => {
         await page.goto(BASE_URL);
         const chatTab = page.locator('.nav-tab').filter({ hasText: /chat/i });
         await chatTab.click();
 
-        // No welcome card, no placeholder — a fresh conversation shows
-        // nothing until there is a real message.
-        await expect(page.locator('#chat-container .message')).toHaveCount(0);
+        // The transcript carries real turns only. Asserting on the absent
+        // strings rather than an empty container on purpose: a host with
+        // prior conversations legitimately auto-loads the most recent one
+        // (#714), and that content is exactly what this test must tolerate.
+        const chat = page.locator('#chat-container');
+        await expect(chat).not.toContainText(/I am your Kestrel/i);
+        await expect(chat).not.toContainText(/Say hello/i);
     });
 
     test('message input and send button are visible', async ({ page }) => {
