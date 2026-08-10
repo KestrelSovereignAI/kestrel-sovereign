@@ -326,15 +326,32 @@ class _HostOwnedFacadeOperation:
         if target is None or self.done():
             return
         if self._foreign_loop:
-            # Cancellation, like result consumption, belongs exclusively to
-            # the source loop.  A stopped/closing loop cannot acknowledge this
-            # request, so leave the durable owner fenced instead of queuing
-            # unbounded work or pretending cancellation was delivered.
-            self._dispatch_to_foreign_loop(
-                self._cancel_and_observe_source_in_owner_loop
-            )
+            self.retry_owner_loop_cancellation_and_observation()
             return
         target.cancel()
+
+    def retry_owner_loop_cancellation_and_observation(self) -> bool:
+        """Retry foreign cancellation and outcome observation on its owner loop.
+
+        A lifecycle owner can retain this exact operation while its foreign
+        loop is stopped.  Once that loop restarts, a later cleanup pass must
+        be able to re-request cancellation and acknowledgement without ever
+        calling the facade again.  Both owner-loop actions are idempotent:
+        cancellation ignores an already-settled source and settlement
+        acknowledgement is guarded by ``_foreign_settlement_acknowledged``.
+
+        ``False`` means the loop remains stopped or closed (or this operation
+        has already settled), so callers stay fail-closed and retain ownership.
+        """
+
+        if not self._foreign_loop or self.done():
+            return False
+        # Cancellation, like result consumption, belongs exclusively to the
+        # source loop.  A stopped/closing loop cannot acknowledge this request,
+        # so leave the durable owner fenced instead of queuing work there.
+        return self._dispatch_to_foreign_loop(
+            self._cancel_and_observe_source_in_owner_loop
+        )
 
     def add_done_callback(
         self, callback: Callable[["_HostOwnedFacadeOperation"], None]
@@ -2920,6 +2937,12 @@ class ProxyFeature(Feature):
             if marked_client is client or (
                 ownership.client_ref is None and ownership.client_id == id(client)
             ):
+                if task.foreign_loop:
+                    # This exact operation may have been retained while its
+                    # owner loop was stopped.  Retry cancellation and outcome
+                    # acknowledgement on a loop that has since restarted;
+                    # never issue a second facade ``stop()`` beside it.
+                    task.retry_owner_loop_cancellation_and_observation()
                 running = True
             retained_tasks.append(ownership)
         self._terminal_lifecycle_tasks = retained_tasks

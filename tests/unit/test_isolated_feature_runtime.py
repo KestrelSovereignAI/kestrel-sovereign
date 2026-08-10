@@ -8473,6 +8473,95 @@ async def test_precompleted_foreign_future_is_consumed_only_by_owner_after_resum
 
 
 @pytest.mark.asyncio
+async def test_terminal_retirement_retries_stopped_foreign_operation_after_owner_restarts(
+    monkeypatch, tmp_path
+):
+    """A retained foreign stop is retried on restart without another facade stop."""
+
+    foreign_loop = asyncio.new_event_loop()
+    foreign_running = threading.Event()
+    state = {"result_threads": []}
+
+    class OwnerThreadFuture(asyncio.Future):
+        def result(self):
+            state["result_threads"].append(threading.get_ident())
+            assert threading.get_ident() == state["owner_thread"]
+            return super().result()
+
+    foreign_stop = OwnerThreadFuture(loop=foreign_loop)
+
+    class CrossLoopStopClient(FakeIsolatedClient):
+        def __init__(self):
+            super().__init__()
+            self.stop_calls = 0
+            self.stopped = False
+
+        def stop(self):
+            self.stop_calls += 1
+            if self.stop_calls == 1:
+                return foreign_stop
+            self.stopped = True
+            return None
+
+    def run_foreign_loop():
+        asyncio.set_event_loop(foreign_loop)
+        state["owner_thread"] = threading.get_ident()
+        foreign_running.set()
+        foreign_loop.run_forever()
+        foreign_loop.close()
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    client = CrossLoopStopClient()
+    feature._retain_terminal_retirement_client(client)
+
+    foreign_thread = None
+    try:
+        # Initial retirement fences the exact source because its owner loop is
+        # stopped.  The source's result must not be consumed from this thread.
+        assert await feature._retire_terminal_clients() is False
+        assert client.stop_calls == 1
+        assert len(feature._terminal_lifecycle_tasks) == 1
+        operation = feature._terminal_lifecycle_tasks[0].task
+        assert operation.done() is False
+        assert state["result_threads"] == []
+
+        foreign_thread = threading.Thread(target=run_foreign_loop)
+        foreign_thread.start()
+        assert foreign_running.wait(timeout=1)
+
+        # The next cleanup retries cancellation plus observation on the same
+        # retained operation.  It remains fenced for this pass, never issuing
+        # a duplicate facade stop while owner-loop acknowledgement is pending.
+        assert await feature._retire_terminal_clients() is False
+        assert client.stop_calls == 1
+
+        for _ in range(100):
+            if not feature._terminal_lifecycle_tasks:
+                break
+            await asyncio.sleep(0)
+        assert feature._terminal_lifecycle_tasks == []
+        assert operation.foreign_settlement_disposition == "cancelled"
+        assert state["result_threads"] == [state["owner_thread"]]
+        assert feature._terminal_retirement_clients == [client]
+
+        # A cancelled foreign stop leaves the client fail-closed, but after
+        # acknowledgement a bounded later retirement may make the one retry.
+        assert await feature._retire_terminal_clients() is True
+        assert client.stop_calls == 2
+        assert client.stopped is True
+        assert feature._terminal_retirement_clients == []
+    finally:
+        if foreign_thread is not None and foreign_thread.is_alive():
+            foreign_loop.call_soon_threadsafe(foreign_loop.stop)
+            await asyncio.to_thread(foreign_thread.join)
+        elif not foreign_loop.is_closed():
+            foreign_loop.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ("result", "exception"))
 async def test_foreign_terminal_source_is_detached_when_host_delivery_is_stranded(
     monkeypatch, caplog, outcome
