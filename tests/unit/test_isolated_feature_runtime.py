@@ -8400,16 +8400,18 @@ async def test_foreign_facade_stopped_or_closed_loop_remains_durably_fenced(
     assert stopped.done() is False
     assert stopped_dispatches == []
 
-    # Even an already-completed foreign Future is not terminal to the host
-    # until its owner loop has consumed the outcome; no host-side result read
-    # is permitted merely because its raw done bit is true.
+    # A terminal asyncio Future has immutable outcome state.  It is consumed
+    # immediately even though its owner loop is stopped, so this exact facade
+    # cannot remain retained forever waiting for a loop turn that will never
+    # happen.
     completed_source = stopped_loop.create_future()
     completed_source.set_result(None)
     completed = isolated_runtime._create_host_owned_facade_task(
         completed_source, name="completed-stopped-foreign-facade"
     )
     completed.cancel()
-    assert completed.done() is False
+    assert completed.done() is True
+    assert completed.foreign_settlement_disposition == "succeeded"
     assert stopped_dispatches == []
 
     closed_loop = asyncio.new_event_loop()
@@ -8421,6 +8423,38 @@ async def test_foreign_facade_stopped_or_closed_loop_remains_durably_fenced(
     closed.cancel()
     assert closed.done() is False
     stopped_loop.close()
+
+
+@pytest.mark.asyncio
+async def test_precompleted_foreign_failure_on_stopped_loop_is_consumed_without_restart(
+    caplog,
+):
+    """A stopped owner loop cannot strand a terminal secret-bearing Future."""
+
+    foreign_loop = asyncio.new_event_loop()
+    source = foreign_loop.create_future()
+    secret = "STOPPED-FOREIGN-FUTURE-SECRET-2755"
+
+    class ForeignStoppedError(RuntimeError):
+        pass
+
+    source.set_exception(ForeignStoppedError(secret))
+    operation = isolated_runtime._create_host_owned_facade_task(
+        source, name="precompleted-stopped-foreign-failure"
+    )
+    notified = asyncio.Event()
+    operation.add_done_callback(lambda _completed: notified.set())
+    try:
+        await asyncio.wait_for(notified.wait(), timeout=1)
+        assert operation.done() is True
+        assert operation.foreign_settlement_disposition == "failed"
+        assert source._log_traceback is False
+    finally:
+        foreign_loop.close()
+
+    del operation
+    gc.collect()
+    assert secret not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -8629,8 +8663,9 @@ async def test_terminal_health_failure_after_cancel_does_not_abort_retirement(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("child_cancels_first", (False, True))
+@pytest.mark.parametrize("cancel_count", (1, 2))
 async def test_lifecycle_parent_cancellation_payload_wins_same_turn_as_child(
-    child_cancels_first,
+    child_cancels_first, cancel_count
 ):
     """A child CancelledError never supplies a same-turn parent reason."""
 
@@ -8640,7 +8675,8 @@ async def test_lifecycle_parent_cancellation_payload_wins_same_turn_as_child(
         if child_cancels_first:
             asyncio.current_task().cancel()
         owner_ref["owner"].cancel("first parent cancellation")
-        owner_ref["owner"].cancel("later parent cancellation")
+        if cancel_count == 2:
+            owner_ref["owner"].cancel("later parent cancellation")
         if not child_cancels_first:
             asyncio.current_task().cancel()
         await asyncio.sleep(0)
@@ -8658,12 +8694,15 @@ async def test_lifecycle_parent_cancellation_payload_wins_same_turn_as_child(
         await asyncio.wait_for(owner, timeout=1)
 
     assert cancelled.value.args == ("first parent cancellation",)
+    assert owner.cancelled() is True
+    assert owner.cancelling() == cancel_count
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("child_cancels_first", (False, True))
+@pytest.mark.parametrize("cancel_count", (1, 2))
 async def test_health_parent_cancellation_payload_wins_same_turn_as_child(
-    child_cancels_first,
+    child_cancels_first, cancel_count
 ):
     """Health retains ordinary child classification absent an accepted parent."""
 
@@ -8673,7 +8712,8 @@ async def test_health_parent_cancellation_payload_wins_same_turn_as_child(
         if child_cancels_first:
             asyncio.current_task().cancel()
         owner_ref["owner"].cancel("first health parent cancellation")
-        owner_ref["owner"].cancel("later health parent cancellation")
+        if cancel_count == 2:
+            owner_ref["owner"].cancel("later health parent cancellation")
         if not child_cancels_first:
             asyncio.current_task().cancel()
         await asyncio.sleep(0)
@@ -8692,6 +8732,8 @@ async def test_health_parent_cancellation_payload_wins_same_turn_as_child(
         await asyncio.wait_for(owner, timeout=1)
 
     assert cancelled.value.args == ("first health parent cancellation",)
+    assert owner.cancelled() is True
+    assert owner.cancelling() == cancel_count
 
 
 @pytest.mark.asyncio
@@ -8906,6 +8948,45 @@ async def test_cross_loop_health_task_fails_closed_and_consumes_late_error():
 
 
 @pytest.mark.asyncio
+async def test_terminal_cleanup_never_stops_beside_unacknowledged_foreign_health(
+    monkeypatch, tmp_path
+):
+    """A cross-loop health fence remains terminally incomplete, never retried."""
+
+    foreign_loop = asyncio.new_event_loop()
+    foreign_probe = foreign_loop.create_future()
+
+    class StopCountingClient(FakeIsolatedClient):
+        def __init__(self):
+            super().__init__()
+            self.stop_calls = 0
+
+        async def stop(self):
+            self.stop_calls += 1
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    client = StopCountingClient()
+    feature._client = client
+    probe = isolated_runtime._create_host_owned_facade_task(
+        foreign_probe, name="unacknowledged-foreign-terminal-health"
+    )
+    feature._own_health_probe_task(probe)
+
+    try:
+        with pytest.raises(RuntimeError, match="terminal retirement is incomplete"):
+            await asyncio.wait_for(feature.shutdown(), timeout=1)
+        assert client.stop_calls == 0
+        assert feature._terminal_cleanup_uncertain is True
+        assert feature._terminal_health_probe_task is probe
+        assert probe.done() is False
+    finally:
+        foreign_loop.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("nonweak_facade", (False, True))
 @pytest.mark.parametrize("foreign_outcome", ("success", "error", "cancel"))
 async def test_cross_loop_facade_task_is_retained_fenced_and_released_before_retry(
@@ -9020,6 +9101,66 @@ async def test_cross_loop_facade_task_is_retained_fenced_and_released_before_ret
             await asyncio.to_thread(foreign_thread.join)
         if not feature._stopping:
             await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_foreign_success_keeps_terminal_stop_owned_until_host_disposition_runs(
+    monkeypatch, tmp_path
+):
+    """A host cleanup between owner acknowledgement and callback cannot re-stop."""
+
+    foreign_loop = asyncio.new_event_loop()
+    foreign_stop = foreign_loop.create_future()
+
+    class DeferredForeignStopClient(FakeIsolatedClient):
+        def __init__(self):
+            super().__init__()
+            self.stop_calls = 0
+
+        def stop(self):
+            self.stop_calls += 1
+            if self.stop_calls == 1:
+                return foreign_stop
+            pytest.fail("terminal cleanup issued a duplicate foreign stop")
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    client = DeferredForeignStopClient()
+    feature._retain_terminal_retirement_client(client)
+
+    try:
+        with pytest.raises(isolated_runtime._CrossLoopFacadeOperationError):
+            await isolated_runtime._await_owned_facade_lifecycle_operation(
+                client.stop(),
+                name="foreign-success-host-disposition-gap",
+                on_completed=lambda: feature._release_terminal_retirement_client(client),
+                on_timeout=lambda: feature._fence_terminal_retirement_timeout(client),
+                on_late_task=lambda task: feature._retain_terminal_lifecycle_task(
+                    task, client
+                ),
+            )
+        operation = feature._terminal_lifecycle_tasks[0].task
+
+        # Model the source loop consuming its successful result just before
+        # the host handles its queued disposition callback.  No host turn is
+        # allowed between these two assertions.
+        foreign_stop.set_result(None)
+        operation._observe_foreign_source_settlement(foreign_stop)
+        assert operation.done() is True
+        assert operation.settlement_delivery_complete is False
+
+        assert await feature._retire_terminal_clients() is False
+        assert client.stop_calls == 1
+
+        for _ in range(4):
+            await asyncio.sleep(0)
+        assert feature._terminal_lifecycle_tasks == []
+        assert feature._terminal_retirement_clients == []
+        assert client.stop_calls == 1
+    finally:
+        foreign_loop.close()
 
 
 @pytest.mark.asyncio

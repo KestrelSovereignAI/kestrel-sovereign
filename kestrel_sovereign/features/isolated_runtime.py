@@ -232,6 +232,12 @@ class _HostOwnedFacadeOperation:
         # or traceback, so host lifecycle ownership can distinguish success.
         self._foreign_settlement_disposition: str | None = None
         self._settlement_notified = False
+        # ``done()`` for a foreign source means its owner loop has safely
+        # consumed the private result.  It does *not* mean the host lifecycle
+        # callbacks which release/fence the exact client have run yet.  Keep
+        # that final host-side delivery state explicit so a fresh shutdown
+        # cannot discard lifecycle ownership in the gap.
+        self._settlement_callbacks_pending = 0
 
         if isinstance(operation, asyncio.Future):
             self._source = operation
@@ -337,22 +343,35 @@ class _HostOwnedFacadeOperation:
             # Notification has already drained the registration list.  Queue
             # this one callback through the same delivery path; do not retain
             # it in the list (or invoke it synchronously during reentrancy).
-            self._schedule_host_callback(callback)
+            self._schedule_settlement_callback(callback)
             return
         self._done_callbacks.append(callback)
 
-    def _schedule_host_callback(
+    @property
+    def settlement_delivery_complete(self) -> bool:
+        """Whether host lifecycle callbacks have consumed settlement state."""
+
+        return self._settlement_notified and self._settlement_callbacks_pending == 0
+
+    def _schedule_settlement_callback(
         self, callback: Callable[["_HostOwnedFacadeOperation"], None]
     ) -> None:
-        """Schedule one post-settlement callback without reviving a closed loop."""
+        """Deliver a settlement callback and account for its host-side fence."""
+
+        self._settlement_callbacks_pending += 1
+
+        def deliver() -> None:
+            try:
+                callback(self)
+            finally:
+                self._settlement_callbacks_pending -= 1
 
         try:
-            self._host_loop.call_soon(callback, self)
+            self._host_loop.call_soon(deliver)
         except RuntimeError:
-            # The host loop is closing.  Its lifecycle owner cannot resume, so
-            # retaining/retrying this facade would be less safe than dropping
-            # this best-effort notification.
-            pass
+            # A closing host loop cannot make another lifecycle attempt.  Do
+            # not claim a callback was delivered when it was not.
+            self._settlement_callbacks_pending -= 1
 
     def _dispatch_to_foreign_loop(self, callback: Callable[[], None]) -> bool:
         """Request owner-loop work only while that loop can acknowledge it.
@@ -445,11 +464,22 @@ class _HostOwnedFacadeOperation:
                 pass
 
         if self._foreign_loop:
-            # ``self`` holds the exact source before this fallible dispatch.
-            # A failed dispatch leaves the record deliberately unsettled for a
-            # durable lifecycle owner instead of leaking a RuntimeError before
-            # that owner can retain it.
-            self._dispatch_to_foreign_loop(self._observe_foreign_source_in_owner_loop)
+            # A terminal asyncio Future has immutable result state.  Reading
+            # that state does not require another owner-loop turn, while
+            # ``add_done_callback`` would: an owner loop which has already
+            # stopped would otherwise strand the exact source forever.  Do
+            # this only after ``done()``; pending futures remain owner-loop
+            # owned and fail closed when dispatch cannot be acknowledged.
+            if source.done():
+                self._observe_foreign_source_settlement(source)
+            else:
+                # ``self`` holds the exact source before this fallible
+                # dispatch. A failed dispatch leaves the record deliberately
+                # unsettled for a durable lifecycle owner instead of leaking
+                # a RuntimeError before that owner can retain it.
+                self._dispatch_to_foreign_loop(
+                    self._observe_foreign_source_in_owner_loop
+                )
         else:
             source.add_done_callback(observed)
 
@@ -462,7 +492,7 @@ class _HostOwnedFacadeOperation:
             # Each callback gets its own loop handle, matching asyncio's
             # callback isolation: one consumer failure must not strand a
             # later lifecycle-release callback or retain this facade.
-            self._schedule_host_callback(callback)
+            self._schedule_settlement_callback(callback)
 
 
 def _consume_late_lifecycle_task_outcome(
@@ -470,10 +500,11 @@ def _consume_late_lifecycle_task_outcome(
 ) -> None:
     """Consume a fenced operation's eventual result without retaining failure."""
 
-    # Cross-loop results are retrieved by ``observed`` in their source loop.
-    # Calling ``Future.result()`` here would appear to work after completion,
-    # but violates asyncio loop ownership and can retain secret-bearing errors
-    # on a host-side traceback.
+    # Cross-loop results are normally retrieved by ``observed`` in their
+    # source loop.  The only exception is an already-terminal source at
+    # construction time, whose immutable outcome is consumed there so a
+    # stopped owner loop cannot strand it.  Do not retrieve a later foreign
+    # result here: that would retain secret-bearing errors on host traceback.
     if isinstance(operation, _HostOwnedFacadeOperation) and operation.foreign_loop:
         return
     try:
@@ -500,12 +531,23 @@ async def _capture_parent_cancellation_args(
     owner = asyncio.current_task()
     if owner is None or owner.cancelling() == 0:
         return tuple(observed.args)
+    # ``uncancel`` is public asyncio API, but it removes one accepted request
+    # from ``cancelling()``.  The checkpoint below needs that temporary
+    # removal to receive a pending parent payload rather than a child
+    # CancelledError; restore it before returning so callers retain asyncio's
+    # observable cancellation-count contract.
     owner.uncancel()
     try:
         await asyncio.sleep(0)
     except asyncio.CancelledError as parent:
-        return tuple(parent.args)
-    return tuple(observed.args)
+        cancellation_args = tuple(parent.args)
+    else:
+        cancellation_args = tuple(observed.args)
+    # The restored request can be observed by an outer lifecycle boundary
+    # before this task exits, so carry the same first payload rather than
+    # manufacturing an arg-less cancellation which could replace it.
+    owner.cancel(*cancellation_args)
+    return cancellation_args
 
 
 def _create_host_owned_facade_task(
@@ -2841,6 +2883,13 @@ class ProxyFeature(Feature):
                 raise
             except asyncio.TimeoutError:
                 continue
+            except _CrossLoopFacadeOperationError:
+                # A foreign health Future can only be settled by its owner
+                # loop.  Its cancellation request is merely best effort until
+                # that owner acknowledges settlement, so no terminal client
+                # stop may race the still-retained health operation.
+                self._terminal_cleanup_uncertain = True
+                return False
             except BaseException:  # noqa: BLE001 - terminal probe outcome stays private
                 # The cancellation request settled the exact probe, but a
                 # facade may then publish an ordinary terminal failure instead
@@ -2860,6 +2909,27 @@ class ProxyFeature(Feature):
         for ownership in self._terminal_lifecycle_tasks:
             task = ownership.task
             if task.done():
+                if (
+                    task.foreign_loop
+                    and not task.settlement_delivery_complete
+                ):
+                    # Owner-loop acknowledgement has safely classified the
+                    # foreign result, but the host callback which releases a
+                    # successful client or fences a failed one has not run.
+                    # Retaining this exact record closes the window in which a
+                    # new shutdown could issue a duplicate ``stop()``.
+                    marked_client = (
+                        ownership.client_ref()
+                        if ownership.client_ref is not None
+                        else None
+                    )
+                    if marked_client is client or (
+                        ownership.client_ref is None
+                        and ownership.client_id == id(client)
+                    ):
+                        running = True
+                    retained_tasks.append(ownership)
+                    continue
                 _consume_late_lifecycle_task_outcome(task)
                 continue
             marked_client = (
