@@ -585,7 +585,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
 | `check_sovereignty_status` | `!check-sovereignty-status` | `system` |  | 20 | `enabled` |
-| `export_sovereignty` | `!export-sovereignty` | `system` | `storage_tier`, `encrypt`, `on_progress` | 179 | `enabled` |
+| `export_sovereignty` | `!export-sovereignty` | `system` | `storage_tier`, `encrypt`, `on_progress` | 182 | `enabled` |
 | `import_sovereignty` | `!import-sovereignty` | `system` | `cid` | 100 | `enabled` |
 
 ### `spawn` (SpawnFeature)

@@ -756,7 +756,7 @@ PY
 )
 ```
 
-Encryption is transparent on read/write. Remote backups (the IPFS/Filecoin export tiers) are encrypted by default, deriving their key from the same `KESTREL_DATA_KEY` master key — there is no separate backup key, and the export fails if `KESTREL_DATA_KEY` is unset. Local exports (`storage_tier="local"`) are written **unencrypted**. For production, set `KESTREL_DATA_KEY` from an env/KMS secret rather than the dev placeholder.
+Encryption is transparent on read/write. Sovereignty exports are encrypted by default on **every** storage tier — local included — deriving their key from the same `KESTREL_DATA_KEY` master key; there is no separate backup key. An export requested with `encrypt=True` is refused outright when `KESTREL_DATA_KEY` is unset, never silently downgraded to plaintext; pass `encrypt=False` to deliberately accept an unencrypted backup. For production, set `KESTREL_DATA_KEY` from an env/KMS secret rather than the dev placeholder.
 
 What is actually encrypted at rest today:
 
@@ -770,7 +770,7 @@ What is actually encrypted at rest today:
 | RAG document-chunk bodies (`document_chunks.content`) | **No** — plaintext column | Same gap — [#2677](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2677) |
 | Embeddings (vectors) | No | Numeric vectors, not reversible ciphertext — their presence is not encryption |
 | Remote backups (IPFS/Filecoin export) | Yes, by default | Encrypted from the `KESTREL_DATA_KEY` master key; export fails if the key is unset |
-| Local export (`storage_tier="local"`) | **No** — written unencrypted | — |
+| Local export (`storage_tier="local"`) | Yes, by default | Same portable per-content key as the remote tiers; `encrypt=False` opts out, and `encrypt=True` with no key is refused rather than downgraded |
 | Identity export packages | N/A — not storage-at-rest encryption | Signed, permissioned continuity packages — see [Identity export custody](docs/architecture/security/IDENTITY_EXPORT_CUSTODY.md) |
 | Whole database file (SQLCipher) | **No** — not wired in this release | `KESTREL_DB_KEY` is not read by the runtime today; the SQLite backend opens plain (`aiosqlite`) databases |
 

@@ -4,7 +4,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kestrel_sovereign.storage.providers.base import StorageResult, StorageTier
-from kestrel_sovereign.features.sovereignty.feature import SovereigntyFeature
+from kestrel_sovereign.features.sovereignty.feature import (
+    REFUSAL_ENCRYPTION_KEY_UNAVAILABLE,
+    SovereigntyFeature,
+)
 
 
 class _FakeStorage:
@@ -28,6 +31,17 @@ class _FakeAgent:
 
     async def emit_event(self, event_type, data):
         self.events.append((event_type, data))
+
+
+class _BackupCallRecorder:
+    """Underlying store proving an export did not reach blob creation."""
+
+    def __init__(self):
+        self.backup_calls = 0
+
+    async def create_backup_blob(self, include_db=True):
+        self.backup_calls += 1
+        raise AssertionError("encryption preflight must run before blob creation")
 
 
 @pytest.mark.asyncio
@@ -153,6 +167,114 @@ async def test_export_sovereignty_cloud_tier_is_rejected(cloud_tier):
     assert cloud_tier in result.error
     # No store / receipt / wallet charge happened.
     assert not hasattr(agent.storage, "receipt")
+
+
+@pytest.mark.asyncio
+async def test_encrypted_local_export_is_honoured_not_downgraded():
+    """``encrypt=True`` on the local tier must reach the adapter as True.
+
+    The old code coerced it to False and wrote a plaintext copy of the whole
+    database to disk (#2872). ``FilecoinAdapter`` encrypts before it branches
+    on tier and re-derives the portable per-content key on retrieval, so the
+    local tier has nothing special about it.
+    """
+    agent = _FakeAgent()
+    feature = SovereigntyFeature(agent)
+    captured = {}
+
+    def fake_store_content(*args, **kwargs):
+        captured["encrypt"] = kwargs.get("encrypt")
+        return StorageResult(
+            content_hash="hashlocal",
+            cid=None,
+            tier=StorageTier.LOCAL_ONLY,
+            provider="local",
+            encrypted=True,
+            encryption_key_hash="hashlocal",
+            size_bytes=1024,
+        )
+
+    with patch(
+        "kestrel_sovereign.features.sovereignty.feature.FilecoinAdapter.store_content",
+        side_effect=fake_store_content,
+    ):
+        result = await feature.export_sovereignty(storage_tier="local", encrypt=True)
+
+    assert result.status is ToolResultStatus.OK
+    assert captured["encrypt"] is True
+    assert result.data["encrypted"] is True
+    assert result.data["tier"] == "local_only"
+    assert agent.storage.receipt.properties["encrypted"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tier", ["local", "ipfs"])
+async def test_encrypted_export_without_master_key_is_refused_before_backup(tier):
+    """No master key means ``encrypt=True`` cannot be honoured on ANY tier.
+
+    The refusal fires before blob creation, adapter construction, and any
+    wallet debit, and carries a typed refusal code so the HTTP layer can
+    answer 4xx instead of a catch-all 500 (#2918).
+    """
+    from kestrel_sovereign.privacy import PrivacyMode
+    from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+
+    underlying = _BackupCallRecorder()
+    agent = _FakeAgent()
+    agent.storage = PrivacyEnforcingStorage(underlying, PrivacyMode.NORMAL)
+
+    with (
+        patch(
+            "kestrel_sovereign.security.encryption.get_master_key_bytes",
+            return_value=None,
+        ),
+        patch(
+            "kestrel_sovereign.features.sovereignty.feature.FilecoinAdapter"
+        ) as adapter,
+    ):
+        result = await SovereigntyFeature(agent).export_sovereignty(
+            storage_tier=tier,
+            encrypt=True,
+        )
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["refusal"] == REFUSAL_ENCRYPTION_KEY_UNAVAILABLE
+    assert "encrypt=True requires KESTREL_DATA_KEY" in result.error
+    assert "no sovereignty backup was created" in result.error
+    assert underlying.backup_calls == 0
+    adapter.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_unencrypted_export_needs_no_master_key():
+    """``encrypt=False`` is a deliberate plaintext backup — never refused."""
+    agent = _FakeAgent()
+    feature = SovereigntyFeature(agent)
+
+    def fake_store_content(*args, **kwargs):
+        return StorageResult(
+            content_hash="hashlocal",
+            cid=None,
+            tier=StorageTier.LOCAL_ONLY,
+            provider="local",
+            encrypted=False,
+            size_bytes=1024,
+        )
+
+    with (
+        patch(
+            "kestrel_sovereign.security.encryption.get_master_key_bytes",
+            return_value=None,
+        ),
+        patch(
+            "kestrel_sovereign.features.sovereignty.feature.FilecoinAdapter.store_content",
+            side_effect=fake_store_content,
+        ),
+    ):
+        result = await feature.export_sovereignty(storage_tier="local", encrypt=False)
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["encrypted"] is False
 
 
 def test_endpoint_allowlist_matches_feature_tier_map():
