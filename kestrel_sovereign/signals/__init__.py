@@ -39,7 +39,10 @@ from kestrel_sovereign.signals.dispatcher import (
     DEFAULT_COALESCING_WINDOW,
     DEFAULT_TTL,
     DispatcherAgent,
+    DurableAdmissionDisposition,
+    DurableAdmissionResult,
     SignalDispatcher,
+    SignalDispatchHandle,
     SignalLogWriteFailure,
 )
 from kestrel_sovereign.signals.durable import (
@@ -94,6 +97,8 @@ __all__ = [
     # Runtime
     "DEFAULT_COALESCING_WINDOW",
     "DEFAULT_TTL",
+    "DurableAdmissionDisposition",
+    "DurableAdmissionResult",
     "DispatcherAgent",
     "DurableConsumerRegistration",
     "DurableDelivery",
@@ -113,6 +118,7 @@ __all__ = [
     "RegistrationPolicy",
     "RegistrationState",
     "SignalDispatcher",
+    "SignalDispatchHandle",
     "SignalLogStore",
     "SignalLogWriteFailure",
     "RETRY",

@@ -13,12 +13,19 @@ Covers:
 """
 
 import json
-import pytest
-import pytest_asyncio
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+import pytest_asyncio
+from kestrel_sdk.channels import ChannelMessage as SDKChannelMessage
+
+from kestrel_sovereign.features.channels.adapter import ChannelAdapter
+from kestrel_sovereign.features.channels.feature import (
+    ChannelFeature,
+    InboundAdmissionDisposition,
+)
 from kestrel_sovereign.features.channels.models import (
     ChannelConfig,
     ChannelMessage,
@@ -26,11 +33,11 @@ from kestrel_sovereign.features.channels.models import (
     DeliveryStatus,
     MessageDirection,
 )
-from kestrel_sovereign.features.channels.adapter import ChannelAdapter
 from kestrel_sovereign.features.channels.registry import ChannelRegistry
-from kestrel_sovereign.features.channels.feature import ChannelFeature
-from kestrel_sdk.channels import ChannelMessage as SDKChannelMessage
-
+from kestrel_sovereign.signals.dispatcher import (
+    DurableAdmissionDisposition,
+    DurableAdmissionResult,
+)
 
 # ============================================================================
 # Helpers
@@ -614,7 +621,14 @@ class TestChannelFeature:
         agent = _make_agent(db=db)
         agent.did = "did:test:channels"
         agent.dispatcher = MagicMock()
-        agent.dispatcher.enqueue_signal = AsyncMock()
+        handle = MagicMock()
+        handle.wait_for_durable_admission = AsyncMock(
+            return_value=DurableAdmissionResult(
+                disposition=DurableAdmissionDisposition.COMMITTED,
+                signal_id="signal-1",
+            )
+        )
+        agent.dispatcher.enqueue_signal = AsyncMock(return_value=handle)
 
         feat = ChannelFeature(agent)
         await feat.initialize()
@@ -629,7 +643,7 @@ class TestChannelFeature:
             recipient="bot",
             content="hi there",
         )
-        await feat.handle_inbound(msg)
+        admission = await feat.handle_inbound(msg)
 
         agent.dispatcher.enqueue_signal.assert_awaited_once()
         signal = agent.dispatcher.enqueue_signal.await_args.args[0]
@@ -637,6 +651,36 @@ class TestChannelFeature:
         assert signal.payload["content"] == "hi there"
         assert agent.dispatcher.enqueue_signal.await_args.kwargs["source_event_id"] == msg.id
         router.assert_not_awaited()
+        assert admission.disposition is InboundAdmissionDisposition.DURABLY_ADMITTED
+
+    @pytest.mark.asyncio
+    async def test_handle_inbound_does_not_treat_background_dispatch_as_durable(self):
+        """A legacy/background dispatcher result cannot advance a channel cursor."""
+
+        db = _make_db()
+        agent = _make_agent(db=db)
+        agent.dispatcher = MagicMock()
+        # This models the released SDK SignalHandle: it has eventual completion,
+        # but no durable-admission receipt.
+        agent.dispatcher.enqueue_signal = AsyncMock(return_value=MagicMock())
+        feat = ChannelFeature(agent)
+        await feat.initialize()
+        router = AsyncMock()
+        feat.registry.set_inbound_router(router)
+        feat.registry.register(StubAdapter(channel="telegram"))
+
+        message = ChannelMessage(
+            channel_type="telegram",
+            direction=MessageDirection.INBOUND,
+            sender="alice",
+            recipient="bot",
+            content="durability first",
+        )
+
+        admission = await feat.handle_inbound(message)
+
+        assert admission.disposition is InboundAdmissionDisposition.LEGACY_ROUTED
+        router.assert_awaited_once_with(message)
 
     @pytest.mark.asyncio
     async def test_handle_inbound_blocked_sender(self, feature):
@@ -700,6 +744,32 @@ class TestChannelFeature:
         )
         await feature.handle_inbound(msg)
         assert msg.agent_id == "test-agent"
+
+    @pytest.mark.asyncio
+    async def test_handle_inbound_overwrites_child_supplied_foreign_agent_scope(self):
+        """An isolated child cannot write or dispatch an inbound message as another tenant."""
+
+        db = _make_db()
+        agent = _make_agent(db=db)
+        agent.did = "did:authoritative-agent"
+        feature = ChannelFeature(agent)
+        await feature.initialize()
+        feature.registry.register(StubAdapter(channel="telegram"))
+        message = ChannelMessage(
+            channel_type="telegram",
+            direction=MessageDirection.INBOUND,
+            sender="alice",
+            recipient="bot",
+            content="cross-tenant attempt",
+            agent_id="did:other-agent",
+        )
+
+        await feature.handle_inbound(message)
+
+        assert message.agent_id == "did:authoritative-agent"
+        inserts = _insert_calls(db)
+        assert len(inserts) == 1
+        assert inserts[0].args[1][1] == "did:authoritative-agent"
 
     # ----------------------------------------------------------------
     # Tool discovery

@@ -13,17 +13,17 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-
 from kestrel_sdk.isolated_feature import (
+    MAX_HOST_INGRESS_PAYLOAD_BYTES,
     ConfigTransitionError,
     ConfigTransitionResult,
     HostIngressCapabilities,
     HostIngressError,
     HostIngressUnknownNameError,
     HostIngressUnsupportedError,
-    MAX_HOST_INGRESS_PAYLOAD_BYTES,
 )
 from kestrel_sdk.tools.result import ToolResultStatus
+
 from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
 from kestrel_sovereign.features import isolated_runtime
 from kestrel_sovereign.features.isolated_runtime import (
@@ -42,7 +42,6 @@ from kestrel_sovereign.features.scheduler.runner import (
 )
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
-
 
 _TEST_AGENT_DID = "did:test:isolated-runtime"
 _TEST_CONFIG_NODE_ID = f"feature_config:v2:{_TEST_AGENT_DID}:TestFeature"
@@ -443,6 +442,7 @@ class FakeChannelFeature:
 
     async def handle_inbound(self, message):
         self.inbound.append(message)
+        return SimpleNamespace(durably_admitted=True)
 
 
 def _isolated_runtime():
@@ -889,7 +889,9 @@ async def test_proxy_send_maps_failure_receipt(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_proxy_send_maps_toolresult_envelopes(monkeypatch, tmp_path):
     """ToolResult wire shapes (status=error/partial) must not read as success."""
-    from kestrel_sovereign.features.isolated_runtime import _delivery_receipt_from_result
+    from kestrel_sovereign.features.isolated_runtime import (
+        _delivery_receipt_from_result,
+    )
 
     # status=error wrapped as a successful transport call must be a FAILURE
     err = _delivery_receipt_from_result(
@@ -1620,10 +1622,10 @@ async def test_supported_transition_failure_keeps_old_config_and_service(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_external_ingress_quiesce_precedes_gate_close_and_replays_only_after_resume(
+async def test_external_ingress_gate_closes_before_quiesce_and_replays_only_after_resume(
     monkeypatch, tmp_path
 ):
-    """An opted-in producer cannot emit into Core's former close-before-hook gap."""
+    """Lifecycle bypass quiesces only after ordinary data admission is closed."""
 
     old_config = {"enabled": True, "revision": "old"}
     next_config = {"enabled": True, "revision": "next"}
@@ -1645,11 +1647,13 @@ async def test_external_ingress_quiesce_precedes_gate_close_and_replays_only_aft
         async def call_host_ingress(self, name, payload=None):
             self.ingress_calls.append((name, payload))
             if name == "external-ingress-quiesce":
-                assert feature._traffic_gate.closed is False
+                assert feature._traffic_gate.closed is True
                 self.quiesced = True
                 return {"status": "ok", "http_status": 200, "state": "quiesced"}
             assert name == "external-ingress-resume"
-            assert feature._traffic_gate.closed is False
+            # Resume is an owned finalizer: deferred work cannot replay until
+            # this exact source has resumed and Core reopens admission.
+            assert feature._traffic_gate.closed is True
             self.quiesced = False
             for event in self.pending_events:
                 await self.event_handler(event)
@@ -1670,7 +1674,19 @@ async def test_external_ingress_quiesce_precedes_gate_close_and_replays_only_aft
             # emitting it into a closed gate.
             assert feature._traffic_gate.closed is True
             await self.emit_external_update(
-                {"type": "channel.inbound", "payload": {"id": "late-update"}}
+                {
+                    "type": "channel.inbound",
+                    "payload": {
+                        "message": {
+                            "id": "late-update",
+                            "metadata": {"dedupe_key": "late-update"},
+                        },
+                        "_host_ingress_ack": {
+                            "name": "telegram-polling-ack",
+                            "payload": {"dedupe_key": "late-update"},
+                        },
+                    },
+                }
             )
             return ConfigTransitionResult.applied()
 
@@ -1687,11 +1703,12 @@ async def test_external_ingress_quiesce_precedes_gate_close_and_replays_only_aft
 
     async def record(event):
         delivered.append(event)
+        return True
 
     try:
         await feature.persist_config(old_config)
         await feature.initialize()
-        feature._handle_event_admitted = record  # type: ignore[method-assign]
+        feature._route_inbound = record  # type: ignore[method-assign]
 
         await feature.set_config(next_config)
 
@@ -1699,7 +1716,13 @@ async def test_external_ingress_quiesce_precedes_gate_close_and_replays_only_aft
             "external-ingress-quiesce",
             "external-ingress-resume",
         ]
-        assert delivered == [{"type": "channel.inbound", "payload": {"id": "late-update"}}]
+        for _ in range(20):
+            if delivered:
+                break
+            await asyncio.sleep(0)
+        assert delivered == [
+            {"id": "late-update", "metadata": {"dedupe_key": "late-update"}}
+        ]
         assert clients[0].pending_events == []
         assert feature._traffic_gate.closed is False
         assert feature._host_config == next_config
@@ -1709,7 +1732,7 @@ async def test_external_ingress_quiesce_precedes_gate_close_and_replays_only_aft
 
 @pytest.mark.asyncio
 async def test_external_ingress_resumes_after_failed_transition_rollback(monkeypatch, tmp_path):
-    """A failed staged transition reopens Core admission before resuming polling."""
+    """A failed staged transition resumes polling before reopening Core admission."""
 
     old_config = {"enabled": True, "revision": "old"}
     rejected_config = {"enabled": True, "revision": "rejected"}
@@ -1731,7 +1754,7 @@ async def test_external_ingress_resumes_after_failed_transition_rollback(monkeyp
                 self.quiesced = True
                 return {"status": "ok", "http_status": 200, "state": "quiesced"}
             assert name == "external-ingress-resume"
-            assert feature._traffic_gate.closed is False
+            assert feature._traffic_gate.closed is True
             self.quiesced = False
             return {"status": "ok", "http_status": 200, "state": "resumed"}
 
@@ -1767,7 +1790,7 @@ async def test_external_ingress_resumes_after_failed_transition_rollback(monkeyp
 
 @pytest.mark.asyncio
 async def test_external_ingress_resumes_after_cancelled_transition_rollback(monkeypatch, tmp_path):
-    """Cancellation during pre-gate quiesce releases the exact producer."""
+    """Cancellation after admission closes releases the exact producer."""
 
     old_config = {"enabled": True, "revision": "old"}
     pending_config = {"enabled": True, "revision": "pending"}
@@ -1793,7 +1816,7 @@ async def test_external_ingress_resumes_after_cancelled_transition_rollback(monk
                 await release_quiesce.wait()
                 return {"status": "ok", "http_status": 200, "state": "quiesced"}
             assert name == "external-ingress-resume"
-            assert feature._traffic_gate.closed is False
+            assert feature._traffic_gate.closed is True
             self.quiesced = False
             return {"status": "ok", "http_status": 200, "state": "resumed"}
 
@@ -4023,7 +4046,7 @@ async def test_stale_equal_config_reconciles_only_after_external_ingress_fence(
         async def call_host_ingress(self, name, payload=None):
             self.ingress_calls.append((name, payload))
             if name == "external-ingress-quiesce":
-                assert stale._traffic_gate.closed is False
+                assert stale._traffic_gate.closed is True
                 self.quiesced = True
                 return {"status": "ok", "http_status": 200, "state": "quiesced"}
             raise AssertionError("a retired child must not be resumed")
@@ -5395,6 +5418,7 @@ async def test_channel_inbound_acknowledges_exact_source_only_after_host_deliver
             delivery_started.set()
             await release_delivery.wait()
             delivered.append(message.id)
+            return SimpleNamespace(durably_admitted=True)
 
     class AcknowledgingClient(FakeIsolatedClient):
         def __init__(self, **kwargs):
@@ -5482,6 +5506,7 @@ async def test_current_replacement_acknowledged_event_waits_for_reopened_gate(
     class ChannelFeature:
         async def handle_inbound(self, message):
             delivered.append(message.id)
+            return SimpleNamespace(durably_admitted=True)
 
     class AckClient(FakeIsolatedClient):
         def __init__(self, **kwargs):
@@ -5533,6 +5558,424 @@ async def test_current_replacement_acknowledged_event_waits_for_reopened_gate(
         await asyncio.wait_for(acknowledged.wait(), timeout=1)
         assert delivered == [dedupe_key]
     finally:
+        await feature.shutdown()
+
+
+def _acknowledged_telegram_event(dedupe_key: str) -> dict:
+    """Build the exact private ingress envelope shared by polling and hosted dedupe."""
+
+    return {
+        "type": "channel.inbound",
+        "payload": {
+            "message": {
+                "channel_type": "telegram",
+                "direction": "inbound",
+                "sender": "555",
+                "recipient": "42",
+                "content": "hello",
+                "id": dedupe_key,
+                "metadata": {"dedupe_key": dedupe_key},
+            },
+            "_host_ingress_ack": {
+                "name": "telegram-polling-ack",
+                "payload": {"dedupe_key": dedupe_key},
+            },
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_ack_bearing_ingress_never_acknowledges_legacy_router_fallback(monkeypatch, tmp_path):
+    """A legacy/non-durable ChannelFeature result leaves the provider cursor intact."""
+
+    dedupe_key = "telegram:v2:bot:42:update:201"
+
+    class LegacyChannelFeature:
+        async def handle_inbound(self, message):
+            return SimpleNamespace(durably_admitted=False)
+
+    class AckClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack",)
+            )
+            self.acknowledgements = []
+
+        async def call_host_ingress(self, name, payload=None):
+            self.acknowledgements.append((name, payload))
+            return {"status": "ok", "http_status": 200, "state": "acknowledged"}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": LegacyChannelFeature()})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=AckClient)
+    try:
+        await feature.initialize()
+        client = feature._client
+        await client.event_handler(_acknowledged_telegram_event(dedupe_key))
+        await asyncio.sleep(0)
+        assert client.acknowledgements == []
+        assert feature._event_ack_tasks == set()
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_retired_source_event_is_rejected_under_traffic_admission(monkeypatch, tmp_path):
+    """A late callback from a retired child cannot route or ACK after replacement."""
+
+    dedupe_key = "telegram:v2:bot:42:update:202"
+    delivered = []
+
+    class ChannelFeature:
+        async def handle_inbound(self, message):
+            delivered.append(message.id)
+            return SimpleNamespace(durably_admitted=True)
+
+    class AckClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack",)
+            )
+            self.acknowledgements = []
+
+        async def call_host_ingress(self, name, payload=None):
+            self.acknowledgements.append((name, payload))
+            return {"status": "ok", "http_status": 200, "state": "acknowledged"}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": ChannelFeature()})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=AckClient)
+    old_client = None
+    try:
+        await feature.initialize()
+        old_client = feature._client
+        # The callback closure still carries old_client, while publication has
+        # moved to the replacement. Identity is checked *inside* admission.
+        replacement = AckClient()
+        feature._client = replacement
+        await old_client.event_handler(_acknowledged_telegram_event(dedupe_key))
+        await asyncio.sleep(0)
+        assert delivered == []
+        assert old_client.acknowledgements == []
+        assert replacement.acknowledgements == []
+    finally:
+        if old_client is not None:
+            await old_client.stop()
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_deferred_acknowledged_ingress_uses_detached_k1_snapshot(monkeypatch, tmp_path):
+    """Sol regression: mutating a queued k1 envelope to k2 cannot redirect delivery/ACK."""
+
+    k1 = "telegram:v2:bot:42:update:203"
+    k2 = "telegram:v2:bot:42:update:204"
+    delivered = []
+    acknowledged = []
+
+    class ChannelFeature:
+        async def handle_inbound(self, message):
+            delivered.append(message.id)
+            return SimpleNamespace(durably_admitted=True)
+
+    class AckClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack",)
+            )
+
+        async def call_host_ingress(self, name, payload=None):
+            acknowledged.append((name, payload))
+            return {"status": "ok", "http_status": 200, "state": "acknowledged"}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": ChannelFeature()})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=AckClient)
+    try:
+        await feature.initialize()
+        event = _acknowledged_telegram_event(k1)
+        await feature._close_traffic_gate()
+        await feature._client.event_handler(event)
+        # This is the caller-owned graph Sol mutated after Core deferred it.
+        event["payload"]["message"]["id"] = k2
+        event["payload"]["message"]["metadata"]["dedupe_key"] = k2
+        event["payload"]["_host_ingress_ack"]["payload"]["dedupe_key"] = k2
+
+        await feature._reopen_traffic_gate()
+        for _ in range(20):
+            if acknowledged:
+                break
+            await asyncio.sleep(0)
+        assert delivered == [k1]
+        assert acknowledged == [("telegram-polling-ack", {"dedupe_key": k1})]
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_ack_workers_are_bounded_to_one_per_source_under_1000_events(monkeypatch, tmp_path):
+    """Sol regression: 1,000 post-delivery events cannot create 1,000 ACK tasks."""
+
+    release_ack = asyncio.Event()
+    ack_started = asyncio.Event()
+    delivered = []
+
+    class ChannelFeature:
+        async def handle_inbound(self, message):
+            delivered.append(message.id)
+            return SimpleNamespace(durably_admitted=True)
+
+    class SlowAckClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack",)
+            )
+            self.acknowledgements = []
+
+        async def call_host_ingress(self, name, payload=None):
+            self.acknowledgements.append((name, payload))
+            ack_started.set()
+            await release_ack.wait()
+            return {"status": "ok", "http_status": 200, "state": "acknowledged"}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": ChannelFeature()})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=SlowAckClient)
+    try:
+        await feature.initialize()
+        client = feature._client
+        for update_id in range(1_000):
+            await client.event_handler(
+                _acknowledged_telegram_event(f"telegram:v2:bot:42:update:{1_000 + update_id}")
+            )
+        await asyncio.wait_for(ack_started.wait(), timeout=1)
+        assert len(delivered) == 1_000
+        assert len(feature._event_ack_tasks) == 1
+        assert len(client.acknowledgements) == 1
+        release_ack.set()
+    finally:
+        release_ack.set()
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_rejected_ack_retries_then_terminally_retires_exact_source(monkeypatch, tmp_path):
+    """A rejected polling ACK retries idempotently, then leaves Telegram's cursor for restart."""
+
+    monkeypatch.setattr(isolated_runtime, "_EVENT_INGRESS_ACK_BACKOFF", 0)
+    dedupe_key = "telegram:v2:bot:42:update:205"
+
+    class ChannelFeature:
+        async def handle_inbound(self, message):
+            return SimpleNamespace(durably_admitted=True)
+
+    class RejectingAckClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack",)
+            )
+            self.acknowledgements = []
+
+        async def call_host_ingress(self, name, payload=None):
+            self.acknowledgements.append((name, payload))
+            return {"status": "error", "http_status": 409, "error": "still pending"}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": ChannelFeature()})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=RejectingAckClient)
+    try:
+        await feature.initialize()
+        client = feature._client
+        await client.event_handler(_acknowledged_telegram_event(dedupe_key))
+        for _ in range(50):
+            if feature._terminal_lifecycle_latched and client.stopped:
+                break
+            await asyncio.sleep(0)
+        assert client.acknowledgements == [
+            ("telegram-polling-ack", {"dedupe_key": dedupe_key})
+        ] * 3
+        assert feature._terminal_lifecycle_latched is True
+        assert client.stopped is True
+        assert feature._client is None
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_hung_ack_times_out_with_bounded_retries_then_retires_source(
+    monkeypatch, tmp_path
+):
+    """A never-completing ACK is fenced; it cannot retain an unbounded task swarm."""
+
+    monkeypatch.setattr(isolated_runtime, "_EVENT_INGRESS_ACK_TIMEOUT", 0.01)
+    monkeypatch.setattr(isolated_runtime, "_EVENT_INGRESS_ACK_CANCELLATION_GRACE", 0.01)
+    monkeypatch.setattr(isolated_runtime, "_EVENT_INGRESS_ACK_BACKOFF", 0)
+    dedupe_key = "telegram:v2:bot:42:update:208"
+
+    class ChannelFeature:
+        async def handle_inbound(self, message):
+            return SimpleNamespace(durably_admitted=True)
+
+    class HungAckClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack",)
+            )
+            self.acknowledgements = []
+
+        async def call_host_ingress(self, name, payload=None):
+            self.acknowledgements.append((name, payload))
+            await asyncio.Event().wait()
+
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": ChannelFeature()})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=HungAckClient)
+    try:
+        await feature.initialize()
+        client = feature._client
+        await client.event_handler(_acknowledged_telegram_event(dedupe_key))
+        for _ in range(100):
+            if feature._terminal_lifecycle_latched and client.stopped:
+                break
+            await asyncio.sleep(0.01)
+        assert client.acknowledgements == [
+            ("telegram-polling-ack", {"dedupe_key": dedupe_key})
+        ] * 3
+        assert feature._terminal_lifecycle_latched is True
+        assert client.stopped is True
+        assert feature._event_ack_tasks == set()
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_terminal_owner_joins_ack_and_deferred_workers_and_blocks_new_ack(
+    monkeypatch, tmp_path
+):
+    """Terminal success is fenced until both detached ingress worker kinds settle."""
+
+    ack_started = asyncio.Event()
+    release_ack = asyncio.Event()
+
+    class ChannelFeature:
+        async def handle_inbound(self, message):
+            return SimpleNamespace(durably_admitted=True)
+
+    class SlowAckClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack",)
+            )
+
+        async def call_host_ingress(self, name, payload=None):
+            ack_started.set()
+            await release_ack.wait()
+            return {"status": "ok", "http_status": 200, "state": "acknowledged"}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": ChannelFeature()})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=SlowAckClient)
+    try:
+        await feature.initialize()
+        client = feature._client
+        first = _acknowledged_telegram_event("telegram:v2:bot:42:update:206")
+        await client.event_handler(first)
+        await asyncio.wait_for(ack_started.wait(), timeout=1)
+        await feature._close_traffic_gate()
+        await client.event_handler(_acknowledged_telegram_event("telegram:v2:bot:42:update:207"))
+        assert feature._event_ack_tasks
+        assert feature._deferred_acknowledged_event_tasks
+
+        feature._latch_terminal_lifecycle()
+        release_ack.set()
+        await feature._complete_terminal_cleanup()
+        assert feature._event_ack_tasks == set()
+        assert feature._deferred_acknowledged_event_tasks == set()
+        request = feature._event_ingress_acknowledgement(first)
+        assert request is not None
+        feature._schedule_event_ingress_acknowledgement(client, request)
+        assert feature._event_ack_tasks == set()
+        assert client.stopped is True
+    finally:
+        release_ack.set()
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_exact_lifecycle_rpc_bypasses_closed_data_plane_and_waits_for_drain(
+    monkeypatch, tmp_path
+):
+    """A slow already-admitted send cannot consume Core's quiesce lifecycle budget."""
+
+    tool_started = asyncio.Event()
+    release_tool = asyncio.Event()
+    lifecycle_calls = []
+
+    class SlowToolClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("external-ingress-quiesce", "external-ingress-resume")
+            )
+
+        async def call_tool(self, name, args):
+            tool_started.set()
+            await release_tool.wait()
+            return {"echo": args}
+
+        async def call_host_ingress(self, name, payload=None):
+            lifecycle_calls.append((name, payload))
+            state = "quiesced" if name == "external-ingress-quiesce" else "resumed"
+            return {"status": "ok", "http_status": 200, "state": state}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=SlowToolClient)
+    tool_task = None
+    try:
+        await feature.initialize()
+        tool_task = asyncio.create_task(feature.call_isolated_tool("ping", {}))
+        await asyncio.wait_for(tool_started.wait(), timeout=1)
+        quiesce = feature._new_external_ingress_quiesce()
+        assert quiesce is not None
+        await feature._close_traffic_gate_admission()
+        assert await asyncio.wait_for(feature._quiesce_external_ingress(quiesce), timeout=1) is None
+        assert not tool_task.done()
+        assert lifecycle_calls == [
+            ("external-ingress-quiesce", {"transition_id": quiesce.transition_id})
+        ]
+        release_tool.set()
+        await tool_task
+        await feature._drain_traffic_gate()
+        await feature._resume_external_ingress(quiesce)
+        await feature._reopen_traffic_gate()
+    finally:
+        release_tool.set()
+        if tool_task is not None and not tool_task.done():
+            await tool_task
         await feature.shutdown()
 
 

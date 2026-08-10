@@ -76,8 +76,8 @@ enforces this for the whole repo.
 from __future__ import annotations
 
 import asyncio
-import copy
 import contextvars
+import copy
 import hashlib
 import inspect
 import logging
@@ -87,7 +87,9 @@ import time
 from collections import deque
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
-from datetime import datetime, time as dtime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
+from datetime import time as dtime
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Coroutine, List, Optional, Protocol
 from zoneinfo import ZoneInfo
@@ -104,6 +106,8 @@ from kestrel_sdk.signals import (
     Status,
     Visibility,
 )
+
+from kestrel_sovereign.features.storage_access import resolve_agent_privacy_config
 from kestrel_sovereign.signals.constitution_canary import (
     CanaryStatus,
     build_canary_instruction,
@@ -114,24 +118,23 @@ from kestrel_sovereign.signals.constitution_metrics import (
     record_echo_missing,
     record_echo_verified,
 )
-from kestrel_sovereign.features.storage_access import resolve_agent_privacy_config
-from kestrel_sovereign.storage.privacy_wrapper import (
-    _resolve_transition_lock,
-    optional_transition_lock,
-)
-from kestrel_sovereign.signals.lock_manager import OrderedLockManager
-from kestrel_sovereign.signals.registry import SourceRegistry
 from kestrel_sovereign.signals.durable import (
     FAILED,
     DurableConsumerRegistration,
     DurableDelivery,
     DurableSignalStore,
 )
+from kestrel_sovereign.signals.lock_manager import OrderedLockManager
+from kestrel_sovereign.signals.registry import SourceRegistry
 from kestrel_sovereign.signals.store import SignalLogStore
 from kestrel_sovereign.storage.db.write_audit import (
     capture_write_queries,
     requested_handler_write_audit_callback,
     suppress_write_audit,
+)
+from kestrel_sovereign.storage.privacy_wrapper import (
+    _resolve_transition_lock,
+    optional_transition_lock,
 )
 from kestrel_sovereign.telemetry import (
     KESTREL_AGENT_NAME,
@@ -159,6 +162,48 @@ class _DurableDeliveryShuttingDownError(RuntimeError):
     can safely retry against a replacement dispatcher, while a dispatch maps
     it to its normal ``SignalResult`` failure contract.
     """
+
+
+class DurableAdmissionDisposition(str, Enum):
+    """The durable-ledger disposition an ingress producer may checkpoint."""
+
+    COMMITTED = "committed"
+    DUPLICATE = "duplicate"
+    TERMINAL = "terminal"
+    NOT_ADMITTED = "not_admitted"
+
+
+@dataclass(frozen=True)
+class DurableAdmissionResult:
+    """An explicit durable-admission result for one enqueued signal."""
+
+    disposition: DurableAdmissionDisposition
+    signal_id: str
+
+    @property
+    def acknowledged(self) -> bool:
+        """Whether an external source may advance its stable cursor."""
+
+        return self.disposition in {
+            DurableAdmissionDisposition.COMMITTED,
+            DurableAdmissionDisposition.DUPLICATE,
+            DurableAdmissionDisposition.TERMINAL,
+        }
+
+
+@dataclass
+class SignalDispatchHandle(SignalHandle):
+    """SDK terminal handle plus the earlier durable-admission receipt.
+
+    ``SignalHandle.wait()`` remains the released SDK 0.35.1 terminal dispatch
+    contract.  ACK-bearing Core ingress uses this explicit receipt instead of
+    mistaking background-task creation for a durable commit.
+    """
+
+    durable_admission: asyncio.Future[DurableAdmissionResult]
+
+    async def wait_for_durable_admission(self) -> DurableAdmissionResult:
+        return await asyncio.shield(self.durable_admission)
 
 
 # ---------------------------------------------------------------------------
@@ -673,7 +718,11 @@ class SignalDispatcher:
         )
 
     async def dispatch_signal(
-        self, signal: Signal, *, source_event_id: Optional[str] = None
+        self,
+        signal: Signal,
+        *,
+        source_event_id: Optional[str] = None,
+        _durable_admission: asyncio.Future[DurableAdmissionResult] | None = None,
     ) -> SignalResult:
         """Awaits the full lifecycle. Used by callers that need the result
         (scheduler, heartbeat). Always returns a `SignalResult` — failures
@@ -700,7 +749,25 @@ class SignalDispatcher:
                         if source_event_id is not None
                         else getattr(signal, "source_event_id", None)
                     ),
+                    durable_admission=_durable_admission,
                 )
+                if (
+                    _durable_admission is not None
+                    and not _durable_admission.done()
+                ):
+                    # A validation/cycle refusal is a proven terminal no-op for
+                    # this exact signal.  Every other unresolved outcome,
+                    # notably persistence failure, leaves the source cursor
+                    # unchanged.
+                    disposition = (
+                        DurableAdmissionDisposition.TERMINAL
+                        if result.status
+                        in {Status.DROPPED_VALIDATION, Status.DROPPED_CYCLE}
+                        else DurableAdmissionDisposition.NOT_ADMITTED
+                    )
+                    _durable_admission.set_result(
+                        DurableAdmissionResult(disposition, signal.id)
+                    )
                 # The public dispatch contract returns only after its own
                 # outcome entry has reached a terminal write result.  The task
                 # remains separately admitted so a caller cancellation in
@@ -726,19 +793,40 @@ class SignalDispatcher:
                 error=f"{type(e).__name__}: {e}",
             )
         finally:
+            if _durable_admission is not None and not _durable_admission.done():
+                # Cancellation and unexpected pipeline failure are not a
+                # durable receipt.  Resolve the waiter so its source can retry
+                # rather than waiting forever on an abandoned task.
+                _durable_admission.set_result(
+                    DurableAdmissionResult(
+                        DurableAdmissionDisposition.NOT_ADMITTED,
+                        signal.id,
+                    )
+                )
             reset_current_signal(ctx_token)
 
     async def enqueue_signal(
         self, signal: Signal, *, source_event_id: Optional[str] = None
-    ) -> SignalHandle:
+    ) -> SignalDispatchHandle:
         """Returns immediately with a tracked handle. The dispatch runs as
         an agent-owned background task; exceptions are logged not swallowed,
         and the task is cancellable via the agent's shutdown path."""
-        coro = self.dispatch_signal(signal, source_event_id=source_event_id)
+        durable_admission: asyncio.Future[DurableAdmissionResult] = (
+            asyncio.get_running_loop().create_future()
+        )
+        coro = self.dispatch_signal(
+            signal,
+            source_event_id=source_event_id,
+            _durable_admission=durable_admission,
+        )
         task = self._agent._track_background_task(
             coro, name=f"signal_dispatch:{signal.source}:{signal.id}"
         )
-        return SignalHandle(signal_id=signal.id, task=task)
+        return SignalDispatchHandle(
+            signal_id=signal.id,
+            task=task,
+            durable_admission=durable_admission,
+        )
 
     async def initialize_durable_delivery(self) -> None:
         """Initialize the durable consumer ledger exactly once.
@@ -1432,6 +1520,7 @@ class SignalDispatcher:
         start: float,
         *,
         source_event_id: Optional[str],
+        durable_admission: asyncio.Future[DurableAdmissionResult] | None = None,
     ) -> SignalResult:
         # Step 1: validation
         registration = self._registry.get(signal.source)
@@ -1715,6 +1804,18 @@ class SignalDispatcher:
                 error=f"Durable signal persistence failed: {type(exc).__name__}: {exc}",
                 registration=registration,
             )
+        if durable_admission is not None and not durable_admission.done():
+            durable_admission.set_result(
+                DurableAdmissionResult(
+                    (
+                        DurableAdmissionDisposition.COMMITTED
+                        if persisted.created
+                        else DurableAdmissionDisposition.DUPLICATE
+                    ),
+                    signal.id,
+                )
+            )
+
         if not persisted.created:
             return self._fail(
                 signal,

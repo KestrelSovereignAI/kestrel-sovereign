@@ -14,7 +14,12 @@ DB tables (created on initialize):
 import json
 import logging
 import uuid
+from dataclasses import dataclass
+from enum import Enum
 from typing import Dict, Optional
+
+from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import (
@@ -29,8 +34,10 @@ from kestrel_sovereign.security.encryption import (
     get_agent_fernet,
     get_fernet,
 )
-from kestrel_sdk.tools.base import ToolCategory
-from kestrel_sdk.tools.result import ToolResult
+from kestrel_sovereign.signals.sources.channels import (
+    build_channel_message_registration,
+    build_signal_for_channel_message,
+)
 
 from .models import (
     ChannelMessage,
@@ -39,10 +46,6 @@ from .models import (
     MessageDirection,
 )
 from .registry import ChannelRegistry
-from kestrel_sovereign.signals.sources.channels import (
-    build_channel_message_registration,
-    build_signal_for_channel_message,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +55,30 @@ logger = logging.getLogger(__name__)
 # so channel content matches the conversation_history encryption
 # guarantee (#2096 / F112).
 CHANNEL_KEY_VERSION = 1
+
+
+class InboundAdmissionDisposition(str, Enum):
+    """What the channel feature proved about one inbound message."""
+
+    DURABLY_ADMITTED = "durably_admitted"
+    LEGACY_ROUTED = "legacy_routed"
+    REJECTED = "rejected"
+
+
+@dataclass(frozen=True)
+class InboundAdmission:
+    """Explicit ingress result consumed by ACK-bearing isolated channels.
+
+    Legacy routing intentionally has a different disposition: it may preserve
+    compatibility for a non-dispatcher host, but it is not a durable receipt
+    and therefore can never advance an external provider cursor.
+    """
+
+    disposition: InboundAdmissionDisposition
+
+    @property
+    def durably_admitted(self) -> bool:
+        return self.disposition is InboundAdmissionDisposition.DURABLY_ADMITTED
 
 # SQL for the two tables managed by this feature.
 CHANNEL_TABLES_SQL = """
@@ -118,6 +145,12 @@ class ChannelFeature(Feature):
         self._agent_id = (
             getattr(storage, "agent_id", "")
             or getattr(getattr(storage, "_storage", None), "agent_id", "")
+        )
+        agent_did = getattr(self.agent, "did", None)
+        self._authoritative_agent_id = (
+            agent_did
+            if isinstance(agent_did, str) and agent_did.strip()
+            else self._agent_id
         )
 
         # Encryption-at-rest keys for channel_messages content. Same key
@@ -532,7 +565,7 @@ class ChannelFeature(Feature):
     # Inbound message handling (called by adapters)
     # ------------------------------------------------------------------
 
-    async def handle_inbound(self, message: ChannelMessage) -> None:
+    async def handle_inbound(self, message: ChannelMessage) -> InboundAdmission:
         """
         Process an inbound message from a channel adapter.
 
@@ -551,16 +584,17 @@ class ChannelFeature(Feature):
                     message.sender,
                     message.channel_type,
                 )
-                return
+                return InboundAdmission(InboundAdmissionDisposition.REJECTED)
 
-        # Set agent_id if not already set
-        if not message.agent_id:
-            message.agent_id = self._agent_id
+        # A child transport is never an authority for the message tenant. Bind
+        # every inbound row and signal to this host feature's resolved agent,
+        # including a non-empty child-supplied value.
+        message.agent_id = self._authoritative_agent_id
 
         # Log inbound message
         await self._log_message(message, status="received")
 
-        dispatched_signal = False
+        durable_admission = False
         dispatcher = getattr(self.agent, "dispatcher", None)
         if dispatcher is not None:
             try:
@@ -571,15 +605,35 @@ class ChannelFeature(Feature):
                 # Provider retries reuse the channel message ID.  Pass it as
                 # the durable source-event key so a retry cannot wake a
                 # workflow consumer twice after process restart.
-                await dispatcher.enqueue_signal(signal, source_event_id=message.id)
-                dispatched_signal = True
+                handle = await dispatcher.enqueue_signal(
+                    signal, source_event_id=message.id
+                )
+                wait_for_durable_admission = getattr(
+                    handle, "wait_for_durable_admission", None
+                )
+                if not callable(wait_for_durable_admission):
+                    logger.error(
+                        "Channel dispatcher returned no durable-admission receipt "
+                        "for message id=%s",
+                        message.id,
+                    )
+                else:
+                    receipt = await wait_for_durable_admission()
+                    durable_admission = (
+                        getattr(receipt, "acknowledged", False) is True
+                    )
             except Exception:
                 logger.exception(
-                    "Failed to enqueue channel.message signal for message id=%s",
+                    "Failed to durably admit channel.message signal for message id=%s",
                     message.id,
                 )
 
-        if not dispatched_signal:
-            # Legacy adapter/router path remains as fallback when the
-            # dispatcher is unavailable or rejected the signal.
+        if durable_admission:
+            return InboundAdmission(InboundAdmissionDisposition.DURABLY_ADMITTED)
+
+        # A legacy adapter/router path remains available for hosts without the
+        # dispatcher contract, but is deliberately not reported as a durable
+        # admission. ACK-bearing providers must retain their cursor and retry.
+        if not durable_admission:
             await self.registry.route_message(message)
+            return InboundAdmission(InboundAdmissionDisposition.LEGACY_ROUTED)
