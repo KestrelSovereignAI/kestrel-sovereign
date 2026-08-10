@@ -221,6 +221,13 @@ class _HostOwnedFacadeOperation:
         self._host_task: asyncio.Task[Any] | None = None
         self._foreign_loop = False
         self._done_callbacks: list[Callable[["_HostOwnedFacadeOperation"], None]] = []
+        # A foreign Future may only be consumed by its owning loop.  Until that
+        # loop has run our observer, its raw ``done()`` bit is not a safe
+        # lifecycle settlement signal: a stopped (but open) loop otherwise
+        # strands both the observer and a requested cancellation forever while
+        # the host retries beside the original facade operation.
+        self._foreign_settlement_acknowledged = False
+        self._settlement_notified = False
 
         if isinstance(operation, asyncio.Future):
             self._source = operation
@@ -258,10 +265,16 @@ class _HostOwnedFacadeOperation:
         return self.wait().__await__()
 
     def done(self) -> bool:
+        if self._foreign_loop:
+            return self._foreign_settlement_acknowledged
         target = self._source if self._source is not None else self._host_task
         return target is not None and target.done()
 
     def cancelled(self) -> bool:
+        # Do not inspect a foreign Future's terminal outcome from the host
+        # loop.  Foreign callers fail closed before they need this distinction.
+        if self._foreign_loop:
+            return False
         target = self._source if self._source is not None else self._host_task
         return target is not None and target.cancelled()
 
@@ -294,13 +307,14 @@ class _HostOwnedFacadeOperation:
         """Cancel the real facade operation, including before an observer runs."""
 
         target = self._source if self._source is not None else self._host_task
-        if target is None or target.done():
+        if target is None or self.done():
             return
         if self._foreign_loop:
-            source_loop = self._source_loop
-            if source_loop is None or source_loop.is_closed():
-                return
-            source_loop.call_soon_threadsafe(target.cancel)
+            # Cancellation, like result consumption, belongs exclusively to
+            # the source loop.  A stopped/closing loop cannot acknowledge this
+            # request, so leave the durable owner fenced instead of queuing
+            # unbounded work or pretending cancellation was delivered.
+            self._dispatch_to_foreign_loop(self._cancel_source_in_owner_loop)
             return
         target.cancel()
 
@@ -309,9 +323,56 @@ class _HostOwnedFacadeOperation:
     ) -> None:
         """Run ``callback`` in the host loop after the authoritative settles."""
 
+        if self._settlement_notified:
+            # Notification has already drained the registration list.  Queue
+            # this one callback through the same delivery path; do not retain
+            # it in the list (or invoke it synchronously during reentrancy).
+            self._schedule_host_callback(callback)
+            return
         self._done_callbacks.append(callback)
-        if self.done():
+
+    def _schedule_host_callback(
+        self, callback: Callable[["_HostOwnedFacadeOperation"], None]
+    ) -> None:
+        """Schedule one post-settlement callback without reviving a closed loop."""
+
+        try:
             self._host_loop.call_soon(callback, self)
+        except RuntimeError:
+            # The host loop is closing.  Its lifecycle owner cannot resume, so
+            # retaining/retrying this facade would be less safe than dropping
+            # this best-effort notification.
+            pass
+
+    def _dispatch_to_foreign_loop(self, callback: Callable[[], None]) -> bool:
+        """Request owner-loop work only while that loop can acknowledge it.
+
+        ``is_running`` avoids putting observer/cancel handles onto an already
+        stopped-open loop.  The check and dispatch necessarily race loop
+        shutdown; a ``RuntimeError`` or a handle stranded by that race leaves
+        this record durably unsettled, which is the fail-closed ownership
+        state consumed by lifecycle retention.
+        """
+
+        source_loop = self._source_loop
+        if (
+            source_loop is None
+            or source_loop.is_closed()
+            or not source_loop.is_running()
+        ):
+            return False
+        try:
+            source_loop.call_soon_threadsafe(callback)
+        except RuntimeError:
+            return False
+        return True
+
+    def _cancel_source_in_owner_loop(self) -> None:
+        """Cancel the source only from the loop which owns it."""
+
+        source = self._source
+        if source is not None and not source.done():
+            source.cancel()
 
     def _install_source_settlement_observer(self) -> None:
         source = self._source
@@ -323,19 +384,40 @@ class _HostOwnedFacadeOperation:
             # before this record drops the last strong reference to it.
             if self._foreign_loop:
                 _consume_late_lifecycle_task_outcome(source)
-            self._host_loop.call_soon_threadsafe(self._notify_settled)
+                # This acknowledgement is deliberately made in the owner loop
+                # after outcome consumption.  Only it authorizes a future
+                # retry/re-enable; a completed-but-unobserved foreign Future
+                # remains durably owned and fail-closed.
+                self._foreign_settlement_acknowledged = True
+            try:
+                self._host_loop.call_soon_threadsafe(self._notify_settled)
+            except RuntimeError:
+                # Host shutdown cannot turn an unobserved foreign outcome into
+                # a retry.  The acknowledgement above remains the only safe
+                # terminal state, and retained owners may prune it later.
+                pass
 
         if self._foreign_loop:
-            source_loop = self._source_loop
-            if source_loop is not None and not source_loop.is_closed():
-                source_loop.call_soon_threadsafe(source.add_done_callback, observed)
+            # ``self`` holds the exact source before this fallible dispatch.
+            # A failed dispatch leaves the record deliberately unsettled for a
+            # durable lifecycle owner instead of leaking a RuntimeError before
+            # that owner can retain it.
+            self._dispatch_to_foreign_loop(
+                lambda: source.add_done_callback(observed)
+            )
         else:
             source.add_done_callback(observed)
 
     def _notify_settled(self, _: asyncio.Future[Any] | None = None) -> None:
+        if self._settlement_notified:
+            return
+        self._settlement_notified = True
         callbacks, self._done_callbacks = self._done_callbacks, []
         for callback in callbacks:
-            callback(self)
+            # Each callback gets its own loop handle, matching asyncio's
+            # callback isolation: one consumer failure must not strand a
+            # later lifecycle-release callback or retain this facade.
+            self._schedule_host_callback(callback)
 
 
 def _consume_late_lifecycle_task_outcome(
@@ -343,6 +425,12 @@ def _consume_late_lifecycle_task_outcome(
 ) -> None:
     """Consume a fenced operation's eventual result without retaining failure."""
 
+    # Cross-loop results are retrieved by ``observed`` in their source loop.
+    # Calling ``Future.result()`` here would appear to work after completion,
+    # but violates asyncio loop ownership and can retain secret-bearing errors
+    # on a host-side traceback.
+    if isinstance(operation, _HostOwnedFacadeOperation) and operation.foreign_loop:
+        return
     try:
         operation.result()
     except BaseException:  # noqa: BLE001 - terminal facade outcomes stay private
@@ -659,19 +747,35 @@ async def _await_owned_health_probe(
         on_late_task = None
         raise asyncio.TimeoutError()
 
+    child_cancelled = False
     try:
         return await asyncio.wait_for(
             task.shield(), timeout=_HEALTH_PROBE_TIMEOUT
         )
     except asyncio.CancelledError as exc:
-        # Parent cancellation must not flow through the facade call: retain
-        # the exact task first if the facade refuses this explicit cancellation.
-        task.cancel()
-        if task.done():
+        # A shielded child can cancel itself (or be returned already
+        # cancelled) without cancelling this supervisor.  That is an ordinary
+        # failed health probe, not a terminal supervisor interruption: raising
+        # CancelledError here would skip the restart policy entirely.
+        owner = asyncio.current_task()
+        if (
+            (owner is None or not owner.cancelling())
+            and task.done()
+            and task.cancelled()
+        ):
             _consume_late_lifecycle_task_outcome(task)
+            child_cancelled = True
         else:
-            on_late_task(task)
-        replay_parent_cancellation(exc)
+            # Parent cancellation must not flow through the facade call:
+            # retain the exact task first if the facade refuses this explicit
+            # cancellation.
+            task.cancel()
+            if task.done():
+                _consume_late_lifecycle_task_outcome(task)
+            else:
+                on_late_task(task)
+            replay_parent_cancellation(exc)
+
     except asyncio.TimeoutError:
         task.cancel()
         loop = asyncio.get_running_loop()
@@ -747,6 +851,16 @@ async def _await_owned_health_probe(
             replay_parent_cancellation(exc)
         _consume_late_lifecycle_task_outcome(task)
         raise_authoritative_timeout()
+
+    if child_cancelled:
+        # Raise after leaving the CancelledError handler so neither its
+        # traceback nor any facade state becomes context for the ordinary
+        # supervisor-visible probe failure.
+        operation = None
+        task = None
+        on_started = None
+        on_late_task = None
+        raise RuntimeError("isolated facade health probe was cancelled")
 
 
 class _TrafficGate:
@@ -1492,12 +1606,22 @@ _CHILD_SDK_PROBE = (
 def _venv_sdk_version(python_path: Path) -> str:
     """The kestrel-sdk version resolved *inside* the feature venv (may differ
     from the host when the feature pins the dependency)."""
+    # Reuse the exact child-launch environment.  A bare version probe that
+    # inherits host PYTHONPATH/PYTHONHOME/VIRTUAL_ENV can report the host SDK,
+    # causing stale/mismatch decisions to stamp the wrong wire contract.
+    bin_dir = python_path.parent
+    venv_path = (
+        bin_dir.parent
+        if bin_dir.name in {"bin", "Scripts"}
+        else None
+    )
     try:
         res = subprocess.run(
             [str(python_path), "-c", _CHILD_SDK_PROBE],
             check=True,
             capture_output=True,
             text=True,
+            env=_isolated_child_env(venv_path),
         )
         return res.stdout.strip() or "unknown"
     except Exception:  # noqa: BLE001

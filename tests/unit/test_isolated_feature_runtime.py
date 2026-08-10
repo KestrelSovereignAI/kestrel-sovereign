@@ -1214,6 +1214,33 @@ def test_build_client_passes_stripped_env(monkeypatch, tmp_path):
     assert "PYTHONPATH" not in captured["env"]
 
 
+def test_venv_sdk_version_uses_canonical_isolated_child_env(monkeypatch, tmp_path):
+    """The version probe cannot resolve the host SDK through hostile env vars."""
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    venv = tmp_path / "feature-venv"
+    python = venv / "bin" / "python"
+    monkeypatch.setenv("PYTHONPATH", "/host/site-packages")
+    monkeypatch.setenv("PYTHONHOME", "/host/python")
+    monkeypatch.setenv("PYTHONSTARTUP", "/host/startup.py")
+    monkeypatch.setenv("VIRTUAL_ENV", "/host/venv")
+    captured = {}
+
+    def fake_run(*_args, **kwargs):
+        captured.update(kwargs)
+        return ir.subprocess.CompletedProcess([], 0, stdout="0.35.1\n")
+
+    monkeypatch.setattr(ir.subprocess, "run", fake_run)
+
+    assert ir._venv_sdk_version(python) == "0.35.1"
+    env = captured["env"]
+    assert "PYTHONPATH" not in env
+    assert "PYTHONHOME" not in env
+    assert "PYTHONSTARTUP" not in env
+    assert env["VIRTUAL_ENV"] == str(venv)
+    assert env["PATH"].split(os.pathsep)[0] == str(venv / "bin")
+
+
 def test_build_client_preserves_explicit_empty_config(tmp_path):
     """An effective empty config is sent as ``{}``, not omitted as ``None``."""
 
@@ -8286,6 +8313,265 @@ async def test_owned_health_probe_accepts_pending_future_and_task(awaitable_kind
         release.set()
     assert await owner == {"healthy": True}
     assert started_tasks[0].get_name() == "test-pending-facade-health-awaitable"
+
+
+@pytest.mark.asyncio
+async def test_host_owned_facade_callbacks_deliver_each_registration_once():
+    """Settlement has one callback path across registration timing and reentry."""
+
+    loop = asyncio.get_running_loop()
+    source = loop.create_future()
+    operation = isolated_runtime._create_host_owned_facade_task(
+        source, name="callback-once"
+    )
+    delivered = []
+
+    def duplicate(completed):
+        delivered.append(("duplicate", completed))
+
+    def reentrant(completed):
+        delivered.append(("reentrant", completed))
+        completed.add_done_callback(lambda settled: delivered.append(("nested", settled)))
+
+    # Multiple registrations of the same callback retain asyncio's one-call
+    # per registration contract; none may be redelivered by _notify_settled.
+    operation.add_done_callback(duplicate)
+    operation.add_done_callback(duplicate)
+    operation.add_done_callback(reentrant)
+    source.set_result(None)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert [name for name, _ in delivered] == [
+        "duplicate",
+        "duplicate",
+        "reentrant",
+        "nested",
+    ]
+    assert all(completed is operation for _, completed in delivered)
+    assert operation._done_callbacks == []
+
+    # Registration after notification is queued once and not retained.
+    operation.add_done_callback(lambda completed: delivered.append(("post", completed)))
+    await asyncio.sleep(0)
+    assert [name for name, _ in delivered].count("post") == 1
+    assert operation._done_callbacks == []
+
+
+@pytest.mark.asyncio
+async def test_host_owned_facade_pre_settled_callback_is_not_delivered_twice():
+    """A source settled before facade construction still has one callback path."""
+
+    source = asyncio.get_running_loop().create_future()
+    source.set_result(None)
+    operation = isolated_runtime._create_host_owned_facade_task(
+        source, name="pre-settled-callback"
+    )
+    delivered = []
+    operation.add_done_callback(delivered.append)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert delivered == [operation]
+    assert operation._done_callbacks == []
+
+
+@pytest.mark.asyncio
+async def test_foreign_facade_stopped_or_closed_loop_remains_durably_fenced(
+    monkeypatch,
+):
+    """No cross-thread observer/cancel is queued onto stopped or closed loops."""
+
+    stopped_loop = asyncio.new_event_loop()
+    stopped_source = stopped_loop.create_future()
+    stopped_dispatches = []
+    monkeypatch.setattr(
+        stopped_loop,
+        "call_soon_threadsafe",
+        lambda *args: stopped_dispatches.append(args),
+    )
+    stopped = isolated_runtime._create_host_owned_facade_task(
+        stopped_source, name="stopped-foreign-facade"
+    )
+    stopped.cancel()
+    assert stopped.done() is False
+    assert stopped_dispatches == []
+
+    # Even an already-completed foreign Future is not terminal to the host
+    # until its owner loop has consumed the outcome; no host-side result read
+    # is permitted merely because its raw done bit is true.
+    completed_source = stopped_loop.create_future()
+    completed_source.set_result(None)
+    completed = isolated_runtime._create_host_owned_facade_task(
+        completed_source, name="completed-stopped-foreign-facade"
+    )
+    completed.cancel()
+    assert completed.done() is False
+    assert stopped_dispatches == []
+
+    closed_loop = asyncio.new_event_loop()
+    closed_source = closed_loop.create_future()
+    closed_loop.close()
+    closed = isolated_runtime._create_host_owned_facade_task(
+        closed_source, name="closed-foreign-facade"
+    )
+    closed.cancel()
+    assert closed.done() is False
+    stopped_loop.close()
+
+
+@pytest.mark.asyncio
+async def test_foreign_facade_dispatch_race_fails_closed_without_escaping(monkeypatch):
+    """A loop that closes between inspection and dispatch cannot lose ownership."""
+
+    foreign_loop = asyncio.new_event_loop()
+    source = foreign_loop.create_future()
+    original_is_running = foreign_loop.is_running
+    monkeypatch.setattr(foreign_loop, "is_running", lambda: True)
+    monkeypatch.setattr(
+        foreign_loop,
+        "call_soon_threadsafe",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("loop is closing")),
+    )
+    operation = isolated_runtime._create_host_owned_facade_task(
+        source, name="racing-foreign-facade"
+    )
+
+    operation.cancel()
+    assert operation.done() is False
+    monkeypatch.setattr(foreign_loop, "is_running", original_is_running)
+    foreign_loop.close()
+
+
+@pytest.mark.asyncio
+async def test_foreign_facade_owner_loop_consumes_secret_error_before_release(caplog):
+    """Foreign failure consumption happens in its owner loop with no warning leak."""
+
+    foreign_loop = asyncio.new_event_loop()
+    ready = threading.Event()
+    state = {}
+    secret = "FOREIGN-FACADE-SECRET-2755"
+
+    class ForeignFacadeError(RuntimeError):
+        pass
+
+    def run_foreign_loop():
+        asyncio.set_event_loop(foreign_loop)
+
+        def create_source():
+            state["source"] = foreign_loop.create_future()
+            ready.set()
+
+        foreign_loop.call_soon(create_source)
+        foreign_loop.run_forever()
+        foreign_loop.close()
+
+    foreign_thread = threading.Thread(target=run_foreign_loop)
+    foreign_thread.start()
+    assert ready.wait(timeout=1)
+    operation = isolated_runtime._create_host_owned_facade_task(
+        state["source"], name="foreign-secret-consumption"
+    )
+    notified = asyncio.Event()
+    operation.add_done_callback(lambda _completed: notified.set())
+
+    def fail_source():
+        state["source"].set_exception(ForeignFacadeError(secret))
+        foreign_loop.call_soon(foreign_loop.stop)
+
+    foreign_loop.call_soon_threadsafe(fail_source)
+    try:
+        await asyncio.wait_for(notified.wait(), timeout=1)
+        await asyncio.wait_for(asyncio.to_thread(foreign_thread.join), timeout=1)
+        assert operation.done() is True
+    finally:
+        if foreign_thread.is_alive():
+            foreign_loop.call_soon_threadsafe(foreign_loop.stop)
+            await asyncio.to_thread(foreign_thread.join)
+
+    state.clear()
+    del operation
+    gc.collect()
+    assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_owned_health_probe_child_cancellation_is_an_ordinary_failure():
+    """A self-cancelled facade health task must not cancel its supervisor."""
+
+    async def cancelled_health():
+        asyncio.current_task().cancel()
+        await asyncio.sleep(0)
+
+    with pytest.raises(RuntimeError, match="health probe was cancelled") as failed:
+        await isolated_runtime._await_owned_health_probe(
+            cancelled_health(),
+            name="self-cancelled-health",
+            on_started=lambda _task: None,
+            on_late_task=lambda _task: pytest.fail("settled child must not detach"),
+        )
+
+    assert failed.value.__context__ is None
+
+
+@pytest.mark.asyncio
+async def test_supervisor_restarts_after_child_cancelled_health_probe(monkeypatch, tmp_path):
+    """A child cancellation follows normal health recovery rather than terminal unwind."""
+
+    first_health = asyncio.Event()
+    restarted = asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    class ChildCancelledHealthClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.health_calls = 0
+            self.stop_calls = 0
+            self.start_calls = 0
+
+        async def health(self):
+            self.health_calls += 1
+            if self.health_calls == 1:
+                first_health.set()
+                asyncio.current_task().cancel()
+                await real_sleep(0)
+            return True
+
+        async def stop(self):
+            self.stop_calls += 1
+            self.stopped = True
+
+        async def start(self):
+            self.start_calls += 1
+            self.started = True
+            restarted.set()
+
+    async def immediate_sleep(_delay):
+        await real_sleep(0)
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    monkeypatch.setattr(isolated_runtime.asyncio, "sleep", immediate_sleep)
+    client = ChildCancelledHealthClient()
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    feature._client = client
+    supervisor = asyncio.create_task(feature._supervise())
+    feature._supervision_task = supervisor
+    try:
+        await asyncio.wait_for(first_health.wait(), timeout=1)
+        await asyncio.wait_for(restarted.wait(), timeout=1)
+        assert client.stop_calls == 1
+        assert client.start_calls == 1
+        assert feature._traffic_gate.sealed is False
+    finally:
+        feature._stopping = True
+        if not supervisor.done():
+            supervisor.cancel()
+        await asyncio.gather(supervisor, return_exceptions=True)
 
 
 @pytest.mark.asyncio
