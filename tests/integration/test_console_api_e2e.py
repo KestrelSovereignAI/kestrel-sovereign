@@ -295,7 +295,12 @@ class TestSovereigntyAPI:
         assert isinstance(data["exports"], list)
 
     def test_export_creates_receipt(self, client: TestClient):
-        """POST to sovereignty export creates a receipt."""
+        """POST to sovereignty export creates a receipt, encryption honoured.
+
+        ``encrypt=True`` on the local tier used to be silently coerced to
+        ``encrypted: False`` (#2872), so a 200 alone did not prove the export
+        did what the caller asked. The reported flag is asserted too.
+        """
         # Trigger export
         response = client.post(
             "/api/sovereignty/export",
@@ -306,6 +311,32 @@ class TestSovereigntyAPI:
         assert response.status_code == 200
         data = response.json()
         assert data.get("success") is True or "message" in data
+        assert data["data"]["encrypted"] is True
+
+    def test_export_honours_unencrypted_request(self, client: TestClient):
+        """``encrypt=False`` is a deliberate plaintext backup and succeeds."""
+        response = client.post(
+            "/api/sovereignty/export",
+            json={"tier": "local", "encrypt": False}
+        )
+
+        assert response.status_code == 200
+        assert response.json()["data"]["encrypted"] is False
+
+    def test_export_refuses_encryption_without_master_key(
+        self, client: TestClient, monkeypatch
+    ):
+        """No master key -> 409, not a 500 that looks like a server fault."""
+        monkeypatch.delenv("KESTREL_DATA_KEY", raising=False)
+        monkeypatch.delenv("KESTREL_DATA_KEY_FILE", raising=False)
+
+        response = client.post(
+            "/api/sovereignty/export",
+            json={"tier": "local", "encrypt": True}
+        )
+
+        assert response.status_code == 409
+        assert "KESTREL_DATA_KEY" in response.json()["detail"]
 
     def test_import_requires_cid(self, client: TestClient):
         """Import endpoint requires a CID."""

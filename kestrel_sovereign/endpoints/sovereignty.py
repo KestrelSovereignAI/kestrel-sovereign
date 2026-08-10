@@ -49,6 +49,35 @@ ALLOWED_TIERS = {"local", "ipfs", "filecoin"}
 CID_PATTERN = re.compile(r'^[a-zA-Z0-9]+$')
 
 
+def _export_error_status(envelope, err: str) -> int:
+    """Map an ERROR export envelope to an HTTP status code.
+
+    A refusal — the caller asking for something this host cannot honour —
+    carries an explicit ``data["refusal"]`` code from the feature layer, so it
+    resolves to a 4xx instead of falling through to the catch-all 500 that made
+    "I asked for something impossible" indistinguishable from "the server
+    broke" (#2918). An unset ``KESTREL_DATA_KEY`` is a host-configuration
+    conflict the caller cannot fix by changing parameters, hence 409 rather
+    than 400. Anything without a known refusal code stays a 500; the legacy
+    ``Insufficient funds`` substring check is kept as a fallback for envelopes
+    minted without the typed code.
+    """
+    from kestrel_sovereign.features.sovereignty.feature import (
+        REFUSAL_ENCRYPTION_KEY_UNAVAILABLE,
+        REFUSAL_INSUFFICIENT_FUNDS,
+    )
+
+    refusal_status = {
+        REFUSAL_ENCRYPTION_KEY_UNAVAILABLE: 409,
+        REFUSAL_INSUFFICIENT_FUNDS: 402,
+    }
+    data = envelope.data if isinstance(envelope.data, dict) else {}
+    status_code = refusal_status.get(data.get("refusal"))
+    if status_code is not None:
+        return status_code
+    return 402 if "Insufficient funds" in err else 500
+
+
 def _read_metadata_file(meta_path: Path):
     with open(meta_path, 'r') as f:
         content = f.read().strip()
@@ -229,10 +258,11 @@ async def trigger_sovereignty_export(request: Request):
         from kestrel_sdk.tools.result import ToolResultStatus
         if envelope.status is ToolResultStatus.ERROR:
             err = envelope.error or "Export failed"
-            # Wallet-affordability refusal -> 402 Payment Required.
-            # Everything else (provider blow-ups, etc.) -> 500.
-            status_code = 402 if "Insufficient funds" in err else 500
-            raise HTTPException(status_code=status_code, detail=err)
+            # Typed refusals -> 4xx (402 wallet, 409 unsatisfiable
+            # encryption); genuine faults (provider blow-ups, etc.) -> 500.
+            raise HTTPException(
+                status_code=_export_error_status(envelope, err), detail=err
+            )
         message = envelope.confirmation or envelope.error or ""
         body: Dict[str, Any] = {
             "success": True,
