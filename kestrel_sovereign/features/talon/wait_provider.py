@@ -89,6 +89,13 @@ class TalonWaitable:
             "completed_at": info.get("completed_at", ""),
             "test_evidence": info.get("test_evidence", ""),
             "ci_status": info.get("ci_status", ""),
+            # The session this job was dispatched from (#2877). The reconciler
+            # lifts it off the payload onto ``Signal.session_id`` so the wake
+            # turn resumes that chat window instead of minting a new session.
+            # Empty for unattended dispatch and for pre-#2877 job records
+            # reloaded from the durable registry — both keep waking
+            # system-initiated, as before.
+            "origin_session_id": info.get("origin_session_id", ""),
         }
 
         if status == "complete":

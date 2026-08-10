@@ -28,7 +28,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from kestrel_sdk.signals import Status
+from kestrel_sdk.signals import Status, Visibility
 from kestrel_sdk.tools import Outcome, WaitStatus
 
 from kestrel_sovereign.waits.engine import WaitRegistry
@@ -481,6 +481,68 @@ async def test_provider_signal_name_routes_source(make_agent):
 
 
 @pytest.mark.asyncio
+async def test_origin_session_binds_the_wake_to_that_session(make_agent):
+    """A provider that reports an origin session binds the wake to it (#2877).
+
+    Without this the wake dispatched with no session, ``process_input`` opened
+    a fresh one, and the turn became message 1 of an orphan session that the
+    originating chat window never rendered.
+    """
+    provider = _FakeProvider(signal="talon.job_complete")
+    provider.set(
+        "job-7", Outcome.DONE, data={"origin_session_id": "sess-abc"},
+    )
+    dispatcher = _CapturingDispatcher()
+    agent = await make_agent(provider, dispatcher)
+    rec = WaitReconciler(agent)
+
+    await rec.reconcile()
+    sig = dispatcher.signals[0]
+    assert sig.session_id == "sess-abc"
+    # Still carried in the payload so the prompt template can render it.
+    assert sig.payload["origin_session_id"] == "sess-abc"
+    # ...and USER_VISIBLE, or the dispatcher log-only's it and the chat window
+    # it was just bound to still shows nothing until a manual refresh.
+    assert sig.visibility == Visibility.USER_VISIBLE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("origin", ["", "   ", None, 12345])
+async def test_missing_origin_session_stays_system_initiated(make_agent, origin):
+    """No usable origin → session_id None → a fresh session, as before (#2877).
+
+    Unattended dispatch (cron/CLI) and pre-#2877 job records reloaded from the
+    durable registry both land here; neither may inherit someone's window.
+    """
+    provider = _FakeProvider(signal="talon.job_complete")
+    provider.set("job-8", Outcome.DONE, data={"origin_session_id": origin})
+    dispatcher = _CapturingDispatcher()
+    agent = await make_agent(provider, dispatcher)
+    rec = WaitReconciler(agent)
+
+    await rec.reconcile()
+    assert dispatcher.signals[0].session_id is None
+    # Unbound → INTERNAL, so an unattended wake is never broadcast into
+    # whichever chat pane happens to be open (the notifications SSE stream is
+    # pinned to the agent, not filtered by session).
+    assert dispatcher.signals[0].visibility == Visibility.INTERNAL
+
+
+@pytest.mark.asyncio
+async def test_provider_without_origin_field_is_unchanged(make_agent):
+    """Providers that report no origin at all keep waking system-initiated."""
+    provider = _FakeProvider(signal="wait.complete")
+    provider.set("h1", Outcome.DONE, data={"x": 1})
+    dispatcher = _CapturingDispatcher()
+    agent = await make_agent(provider, dispatcher)
+    rec = WaitReconciler(agent)
+
+    await rec.reconcile()
+    assert dispatcher.signals[0].session_id is None
+    assert dispatcher.signals[0].visibility == Visibility.INTERNAL
+
+
+@pytest.mark.asyncio
 async def test_poll_only_provider_is_skipped(make_agent):
     """A provider that is NOT a MonitorableWaitable (no active_handles) must
     be skipped by enumeration — it stays valid as a blocking-wait provider."""
@@ -657,3 +719,190 @@ async def test_run_wait_reconcile_caches_singleton(make_agent):
     assert agent._wait_reconciler is rec1
     row = await rec1._store.get("fake", "h1")
     assert row.last_signaled_outcome == "done"
+
+
+
+# ---------------------------------------------------------------------------
+# Origin-session binding end to end (#2877)
+# ---------------------------------------------------------------------------
+
+
+async def _real_talon_rail(db, job_info):
+    """Wire the REAL talon wake rail over a job record and return the agent.
+
+    Real ``TalonWaitable`` over a real coordinator registry, the real
+    ``talon.job_complete`` registration, and a real ``SignalDispatcher`` — so
+    these tests assert what ``process_input`` actually receives rather than
+    what a fake dispatcher was handed.
+
+    The agent double exposes ``emit_event`` because that is the second half of
+    the delivery contract: landing the turn in the right session is invisible
+    unless the dispatcher also emits ``signal_completed``. An agent double
+    without it would silently skip that branch and hide the gap.
+    """
+    from unittest.mock import MagicMock
+
+    from kestrel_sovereign.features.talon.coordinator import (
+        TalonCoordinatorFeature,
+    )
+    from kestrel_sovereign.features.talon.wait_provider import TalonWaitable
+    from kestrel_sovereign.signals import (
+        OrderedLockManager,
+        SignalDispatcher,
+        SignalLogStore,
+        SourceRegistry,
+    )
+    from kestrel_sovereign.signals.sources.talon import (
+        build_talon_job_complete_registration,
+    )
+
+    class _Agent:
+        did = "did:test:agent"
+        agent_id = "did:test:agent"
+
+        def __init__(self):
+            self._raw_storage = SimpleNamespace(db=db)
+            self.process_input_sessions: list = []
+            self.wait_registry = WaitRegistry()
+            self.dispatcher = None
+            self.background_tasks: list = []
+            self.emitted: list = []
+
+        async def process_input(self, prompt: str, session_id=None, **kwargs):
+            self.process_input_sessions.append(session_id)
+            return "PR #42 is green; merged."
+
+        async def emit_event(self, event_type: str, data: dict) -> None:
+            self.emitted.append((event_type, data))
+
+        def _track_background_task(self, coro, *, name: str):
+            task = asyncio.create_task(coro, name=name)
+            self.background_tasks.append(task)
+            return task
+
+        async def drain_background_tasks(self):
+            while True:
+                pending = [t for t in self.background_tasks if not t.done()]
+                if not pending:
+                    return
+                await asyncio.gather(*pending, return_exceptions=True)
+
+    agent = _Agent()
+
+    coordinator = TalonCoordinatorFeature(MagicMock())
+    coordinator._reload_persisted_jobs = MagicMock()
+    coordinator._reap_cli_job = MagicMock(return_value=False)
+    coordinator._tail_job_log = MagicMock(return_value="")
+    coordinator._jobs = {"job-1": job_info}
+    agent.wait_registry.register(TalonWaitable(coordinator))
+
+    store = SignalLogStore(db)
+    await store.initialize()
+    registry = SourceRegistry()
+    registry.register(build_talon_job_complete_registration())
+    agent.dispatcher = SignalDispatcher(
+        agent=agent,
+        registry=registry,
+        lock_manager=OrderedLockManager(),
+        store=store,
+    )
+    return agent
+
+
+@pytest.mark.asyncio
+async def test_talon_wake_resumes_the_dispatching_session_end_to_end(
+    tmp_path, sqlite_database_factory,
+):
+    """A talon job dispatched from a chat session wakes IN that session.
+
+    Before #2877 the job record carried no session at all, so the wake became
+    message 1 of a brand-new session the originating window never rendered —
+    while the reconciler still reported ``delivery_status: ok``.
+    """
+    db = await sqlite_database_factory(tmp_path / "agent.db")
+    agent = await _real_talon_rail(db, {
+        "method": "cli_background",
+        "status": "complete",
+        "returncode": 0,
+        "repo": "org/repo",
+        "issue": 7,
+        "origin_session_id": "chat-7",
+    })
+
+    rec = WaitReconciler(agent)
+    result = await rec.reconcile()
+    assert result.data["signals_enqueued"] == 1
+    for handle in list(rec._pending_signal_tasks.values()):
+        await handle.task
+    await agent.drain_background_tasks()
+
+    assert agent.process_input_sessions == ["chat-7"]
+
+
+@pytest.mark.asyncio
+async def test_talon_wake_emits_signal_completed_for_the_open_chat(
+    tmp_path, sqlite_database_factory,
+):
+    """Landing in the right session is only half of it — the open chat pane
+    also needs the ``signal_completed`` SSE event to paint the turn live.
+
+    The frontend's ``handleSignalCompleted`` drops anything that isn't
+    ``visibility == "user_visible"`` with ``mode == "cognition"`` and a
+    non-empty ``result_summary``. Assert all three off the REAL dispatcher's
+    emit, plus the originating session on the envelope.
+    """
+    db = await sqlite_database_factory(tmp_path / "agent.db")
+    agent = await _real_talon_rail(db, {
+        "method": "cli_background",
+        "status": "complete",
+        "returncode": 0,
+        "repo": "org/repo",
+        "issue": 7,
+        "origin_session_id": "chat-7",
+    })
+
+    rec = WaitReconciler(agent)
+    await rec.reconcile()
+    for handle in list(rec._pending_signal_tasks.values()):
+        await handle.task
+    await agent.drain_background_tasks()
+
+    events = [e for e in agent.emitted if e[0] == "signal_completed"]
+    assert len(events) == 1, agent.emitted
+    payload = events[0][1]
+    assert payload["source"] == "talon.job_complete"
+    assert payload["visibility"] == "user_visible"
+    assert payload["mode"] == "cognition"
+    assert payload["session_id"] == "chat-7"
+    # The woken turn's own response body — what the pane renders.
+    assert payload["result_summary"] == "PR #42 is green; merged."
+
+
+@pytest.mark.asyncio
+async def test_unattended_talon_wake_stays_system_initiated_end_to_end(
+    tmp_path, sqlite_database_factory,
+):
+    """The same rail with no origin on the record still wakes into a fresh
+    session (``session_id=None``) — unattended CLI/scheduler dispatch and
+    pre-#2877 job records are unchanged.
+
+    It also stays INTERNAL: with no originating window there is nothing to
+    surface into, and the notifications SSE stream is pinned to the agent
+    rather than to a session, so an emit would paint an unattended wake into
+    whichever pane happened to be open.
+    """
+    db = await sqlite_database_factory(tmp_path / "agent.db")
+    agent = await _real_talon_rail(db, {
+        "method": "cli_background",
+        "status": "complete",
+        "returncode": 0,
+    })
+
+    rec = WaitReconciler(agent)
+    await rec.reconcile()
+    for handle in list(rec._pending_signal_tasks.values()):
+        await handle.task
+    await agent.drain_background_tasks()
+
+    assert agent.process_input_sessions == [None]
+    assert [e for e in agent.emitted if e[0] == "signal_completed"] == []

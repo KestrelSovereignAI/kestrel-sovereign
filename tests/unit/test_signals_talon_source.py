@@ -69,3 +69,32 @@ def test_schema_injects_defaults_for_prompt_template_placeholders():
         "log_path", "log_tail", "started_at", "completed_at",
     ):
         assert key in payload, f"schema should default-fill {key}"
+
+
+def test_schema_defaults_origin_session_id():
+    """#2877: pre-#2877 job records and every unattended dispatch carry no
+    origin. Those payloads must stay VALID (defaulted, not required) so the
+    wake still fires — system-initiated, as before."""
+    reg = build_talon_job_complete_registration()
+    payload = reg.schema({"job_id": "abc", "status": "complete"})
+    assert payload["origin_session_id"] == ""
+
+
+def test_registration_has_result_summary_for_the_ui_side_channel():
+    """#2877: the frontend's ``handleSignalCompleted`` drops any event whose
+    ``result_summary`` is empty. Without the callback this rail emitted
+    metadata only, so a session-bound wake still painted nothing in the open
+    chat — persisted in the right place, invisible anyway.
+
+    For a COGNITION dispatch the body is the agent's own response string.
+    """
+    reg = build_talon_job_complete_registration()
+    assert reg.result_summary is not None
+    assert reg.result_summary("PR #42 is green; merged.") == (
+        "PR #42 is green; merged."
+    )
+    # A handler that returned nothing must not blow up the log write.
+    assert reg.result_summary(None) == ""
+    # Non-str bodies are stringified rather than raising (the store caps the
+    # result at MAX_RESULT_SUMMARY_BYTES either way).
+    assert reg.result_summary({"a": 1}) == "{'a': 1}"

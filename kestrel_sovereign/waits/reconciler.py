@@ -38,7 +38,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from kestrel_sdk.signals import Signal, SignalMode
+from kestrel_sdk.signals import Signal, SignalMode, Visibility
 from kestrel_sdk.tools import MonitorableWaitable, ToolResult
 
 from kestrel_sovereign.storage.async_wait_signal_store import WaitSignalStore
@@ -482,6 +482,29 @@ class WaitReconciler:
         generic ``wait.complete`` source. The provider's WaitStatus.data is
         spread underneath the generic kind/handle/outcome/summary keys so
         kind-specific templates (talon's) still find their fields.
+
+        A provider that records which session registered the work reports it
+        as ``origin_session_id`` in its poll data; that is lifted onto
+        ``Signal.session_id`` here so the dispatcher resumes THAT session
+        rather than opening a fresh one for the wake turn (#2877). Providers
+        that don't report an origin are unchanged — ``None`` keeps the wake
+        system-initiated, the prior behavior for every source.
+
+        Binding the session is only half of "the user can see it". A bound
+        wake is also built ``USER_VISIBLE`` so the dispatcher emits the
+        ``signal_completed`` SSE event after the turn logs; at the default
+        ``INTERNAL`` the dispatcher log-only's it and the open chat stays
+        blank until a manual refresh — the persisted-but-unsurfaced half of
+        the same bug. Pairs with the source's ``result_summary`` callback,
+        which supplies the body the frontend paints (both are required by
+        ``handleSignalCompleted``). Same construction restart.completed has
+        used since #1809.
+
+        An origin-less wake stays ``INTERNAL``: unattended cron/CLI dispatch
+        has no chat window to surface into, and broadcasting it to whichever
+        pane happens to be open would paint a turn the viewer never asked
+        for (the notifications SSE stream is pinned to the agent, not to a
+        session, so an emit is not session-filtered downstream).
         """
         source = getattr(provider, "signal", None) or "wait.complete"
         payload: Dict[str, Any] = {
@@ -496,12 +519,23 @@ class WaitReconciler:
             or getattr(self._agent, "agent_id", None)
             or ""
         )
+        origin_session_id = payload.get("origin_session_id")
+        if not isinstance(origin_session_id, str) or not origin_session_id.strip():
+            origin_session_id = None
+        else:
+            origin_session_id = origin_session_id.strip()
         return Signal(
             source=source,
             kind="inbound",
             mode=SignalMode.COGNITION,
             payload=payload,
             target_agent=str(target_agent),
+            session_id=origin_session_id,
+            visibility=(
+                Visibility.USER_VISIBLE
+                if origin_session_id
+                else Visibility.INTERNAL
+            ),
             # Unique per attempt so a retry after a soft failure isn't
             # swallowed by the dispatcher's coalescing window as COALESCED
             # against the prior failed attempt (talon_monitor codex round 1

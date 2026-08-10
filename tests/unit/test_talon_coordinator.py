@@ -1,5 +1,6 @@
 """Tests for TalonCoordinatorFeature."""
 
+import asyncio
 import json
 import urllib.error
 import urllib.request
@@ -2347,6 +2348,8 @@ class TestVerifyPipelineCI:
 
         sig = MagicMock()
         sig.session_id = "run-1"
+        # session_id is only a run id on a workflow.stage envelope (#2877).
+        sig.kind = "workflow.stage"
         monkeypatch.setattr(ctx, "get_current_signal", lambda: sig)
 
         # --- process 1: dispatch stamps the run→job binding on the persisted
@@ -2386,6 +2389,7 @@ class TestVerifyPipelineCI:
 
         sig = MagicMock()
         sig.session_id = "run-42"
+        sig.kind = "workflow.stage"
         monkeypatch.setattr(ctx, "get_current_signal", lambda: sig)
 
         feature._record_pipeline_run_job({"dispatched": True, "job_id": "job-99"})
@@ -2393,3 +2397,215 @@ class TestVerifyPipelineCI:
         # A non-dispatched result records nothing.
         feature._record_pipeline_run_job({"dispatched": False, "job_id": "x"})
         assert "x" not in feature._pipeline_run_jobs.values()
+
+    @pytest.mark.asyncio
+    async def test_chat_session_signal_is_not_a_workflow_run_id(self, monkeypatch):
+        """A wake that carries a CHAT session must not bind the run→job map.
+
+        ``talon.job_complete`` carries the dispatching chat session since #2877
+        (and ``restart.completed`` since #1809). Only a ``workflow.stage``
+        envelope's session_id is a run id — otherwise a wake turn's dispatch
+        would bind a user's session into the map and let ``verify_pipeline_ci``
+        resolve a job for a run that never dispatched one.
+        """
+        feature = self._feature()
+        import kestrel_sovereign.signals.context as ctx
+
+        sig = MagicMock()
+        sig.session_id = "chat-session-abc"
+        sig.kind = "inbound"
+        monkeypatch.setattr(ctx, "get_current_signal", lambda: sig)
+
+        assert feature._current_workflow_run_id() is None
+        feature._record_pipeline_run_job({"dispatched": True, "job_id": "job-1"})
+        assert "chat-session-abc" not in feature._pipeline_run_jobs
+
+
+class TestOriginSessionCapture:
+    """The dispatching chat session is captured so the completion wake resumes
+    it instead of minting a fresh session (#2877).
+
+    Exercises the REAL turn lifecycle (``TurnLifecycleMixin`` + its task-local
+    turn-id ContextVar), not a mock of it: the capture is gated on actually
+    being inside a turn, and a mock would conceal whether that gate holds under
+    the production contract.
+    """
+
+    @staticmethod
+    def _turn_agent():
+        """An agent exposing the REAL turn lifecycle over a stub base."""
+        from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
+
+        class _Agent(TurnLifecycleMixin):
+            def __init__(self):
+                self.agent_name = "kestrel"
+                self._features = []
+                self._active_session_id = None
+
+        return _Agent()
+
+    @pytest.mark.asyncio
+    async def test_captures_the_session_of_the_turn_it_was_dispatched_from(self):
+        agent = self._turn_agent()
+        feature = TalonCoordinatorFeature(agent)
+
+        async with agent._turn_lifecycle():
+            # What process_input does at the top of the turn body.
+            agent._active_session_id = "sess-live"
+            assert feature._origin_session_id() == "sess-live"
+
+    @pytest.mark.asyncio
+    async def test_turn_exit_clears_the_capture(self):
+        """The lifecycle clears the session on exit, so a later out-of-turn
+        dispatch cannot inherit a stale window."""
+        agent = self._turn_agent()
+        feature = TalonCoordinatorFeature(agent)
+
+        async with agent._turn_lifecycle():
+            agent._active_session_id = "sess-live"
+        assert feature._origin_session_id() == ""
+
+    @pytest.mark.asyncio
+    async def test_dispatch_outside_a_turn_captures_nothing(self):
+        """A cron/ACTION dispatch running CONCURRENTLY with a chat turn must not
+        adopt that turn's session.
+
+        ``_active_session_id`` is a plain agent attribute, so it is readable
+        from any task; the turn-id ContextVar is task-local and is what makes
+        this honest. Without the gate an unattended job would wake into an
+        unrelated user's window.
+        """
+        agent = self._turn_agent()
+        feature = TalonCoordinatorFeature(agent)
+        seen = {}
+
+        async def _chat_turn(started, release):
+            async with agent._turn_lifecycle():
+                agent._active_session_id = "sess-chat"
+                started.set()
+                await release.wait()
+
+        async def _cron_dispatch(started):
+            await started.wait()
+            # A different task: the chat turn's session is visible on the
+            # agent attribute, but this task is not inside a turn.
+            seen["attr"] = agent._active_session_id
+            seen["captured"] = feature._origin_session_id()
+
+        started, release = asyncio.Event(), asyncio.Event()
+        turn = asyncio.create_task(_chat_turn(started, release))
+        cron = asyncio.create_task(_cron_dispatch(started))
+        await cron
+        release.set()
+        await turn
+
+        assert seen["attr"] == "sess-chat"  # the cross-wiring hazard is real
+        assert seen["captured"] == ""       # ...and the gate refuses it
+
+    @pytest.mark.asyncio
+    async def test_capture_survives_the_tool_call_task_boundary(self):
+        """Tool calls run under ``asyncio.gather``, which creates tasks.
+
+        Task creation COPIES the current context, so the turn id set by the
+        turn body is visible from inside a tool — if it were not, the gate
+        would silently disable the whole fix.
+        """
+        agent = self._turn_agent()
+        feature = TalonCoordinatorFeature(agent)
+
+        async def _tool_call():
+            return feature._origin_session_id()
+
+        async with agent._turn_lifecycle():
+            agent._active_session_id = "sess-live"
+            results = await asyncio.gather(_tool_call(), _tool_call())
+
+        assert results == ["sess-live", "sess-live"]
+
+    def test_non_string_session_is_not_captured(self):
+        """A stub/Mock agent exposes a non-string ``_active_session_id``; that
+        must never become a session id on the job record."""
+        feature = TalonCoordinatorFeature(_make_agent())
+        assert feature._origin_session_id() == ""
+
+
+class TestOriginSessionReachesTheWake:
+    """The captured origin travels job record → poll payload → wake envelope."""
+
+    @pytest.mark.asyncio
+    async def test_cli_job_record_persists_the_origin_across_restart(
+        self, tmp_path,
+    ):
+        """``_persist_jobs`` copies every field but ``process``, so the binding
+        survives the restart that would otherwise strand the wake."""
+        agent = _make_agent()
+        agent.storage_path = str(tmp_path / "kestrel_prime.db")
+        feature = TalonCoordinatorFeature(agent)
+        feature._jobs = {
+            "job-1": {
+                "method": "cli_background",
+                "status": "complete",
+                "origin_session_id": "sess-abc",
+            }
+        }
+        assert feature._persist_jobs() is True
+
+        reloaded = TalonCoordinatorFeature(agent)
+        assert reloaded._jobs["job-1"]["origin_session_id"] == "sess-abc"
+
+    @pytest.mark.asyncio
+    async def test_poll_payload_carries_the_origin(self):
+        feature = TalonCoordinatorFeature(_make_agent())
+        feature._reload_persisted_jobs = MagicMock()
+        feature._reap_cli_job = MagicMock(return_value=False)
+        feature._tail_job_log = MagicMock(return_value="")
+        feature._jobs = {
+            "job-1": {
+                "method": "cli_background",
+                "status": "complete",
+                "returncode": 0,
+                "origin_session_id": "sess-abc",
+            }
+        }
+
+        status = await TalonWaitable(feature).poll("job-1")
+        assert status.data["origin_session_id"] == "sess-abc"
+
+    @pytest.mark.asyncio
+    async def test_a2a_job_record_origin_is_read_when_explicitly_watched(self):
+        """An A2A job is not auto-woken, but an explicit
+        ``wait(talon:<task_id>, mode="signal")`` polls it through this same
+        provider — so the origin recorded on an A2A record is live, not dead."""
+        feature = TalonCoordinatorFeature(_make_agent())
+        feature._reload_persisted_jobs = MagicMock()
+        feature._reap_cli_job = MagicMock(return_value=False)
+        feature._tail_job_log = MagicMock(return_value="")
+        feature._reconcile_a2a_job = AsyncMock(return_value=False)
+        feature._discover_host_url = MagicMock(return_value=None)
+        feature._jobs = {
+            "task-1": {
+                "method": "a2a",
+                "status": "complete",
+                "origin_session_id": "sess-a2a",
+            }
+        }
+
+        status = await TalonWaitable(feature).poll("task-1")
+        assert status.data["origin_session_id"] == "sess-a2a"
+
+    @pytest.mark.asyncio
+    async def test_legacy_job_record_without_origin_stays_system_initiated(self):
+        """Job records dispatched before #2877 have no origin field; they must
+        keep waking into a fresh session rather than raising or inheriting."""
+        feature = TalonCoordinatorFeature(_make_agent())
+        feature._reload_persisted_jobs = MagicMock()
+        feature._reap_cli_job = MagicMock(return_value=False)
+        feature._tail_job_log = MagicMock(return_value="")
+        feature._jobs = {
+            "job-1": {
+                "method": "cli_background", "status": "failed", "returncode": 1,
+            }
+        }
+
+        status = await TalonWaitable(feature).poll("job-1")
+        assert status.data["origin_session_id"] == ""
