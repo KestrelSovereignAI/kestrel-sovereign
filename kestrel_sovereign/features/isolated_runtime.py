@@ -200,6 +200,24 @@ def _consume_late_lifecycle_task_outcome(task: asyncio.Task[Any]) -> None:
         pass
 
 
+def _create_host_owned_facade_task(
+    operation: Any, *, name: str
+) -> asyncio.Task[Any]:
+    """Attach any facade awaitable to one named host-owned task.
+
+    ``asyncio.create_task`` accepts coroutines only, whereas SDK facades are
+    permitted to return any awaitable, including a Future or a Task.  Awaiting
+    through this coroutine gives the host the same cancellation, timeout, and
+    outcome-consumption boundary for each of those forms, while retaining the
+    legacy immediate-return behavior accepted by ``_maybe_await``.
+    """
+
+    async def await_operation() -> Any:
+        return await _maybe_await(operation)
+
+    return asyncio.create_task(await_operation(), name=name)
+
+
 async def _await_task_until_complete(
     task: asyncio.Task[Any],
     *,
@@ -281,7 +299,7 @@ async def _await_owned_facade_lifecycle_operation(
     settle during the acknowledgement window and leave no task behind.
     """
 
-    task = asyncio.create_task(_maybe_await(operation), name=name)
+    task = _create_host_owned_facade_task(operation, name=name)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _FACADE_LIFECYCLE_OPERATION_TIMEOUT
     cancellation_args: tuple[Any, ...] | None = None
@@ -455,7 +473,7 @@ async def _await_owned_health_probe(
     sealed and honestly incomplete without blocking an agent-wide shutdown.
     """
 
-    task = asyncio.create_task(_maybe_await(operation), name=name)
+    task = _create_host_owned_facade_task(operation, name=name)
     on_started(task)
 
     def replay_parent_cancellation(exc: asyncio.CancelledError) -> NoReturn:
@@ -782,7 +800,7 @@ def _preflight_exact_host_ingress_json(value: Any) -> None:
     """
 
     remaining_bytes = MAX_HOST_INGRESS_PAYLOAD_BYTES
-    seen_containers: set[int] = set()
+    ancestor_containers: set[int] = set()
 
     def charge(byte_count: int) -> None:
         nonlocal remaining_bytes
@@ -858,29 +876,31 @@ def _preflight_exact_host_ingress_json(value: Any) -> None:
             raise TypeError("host ingress payload must be exact JSON")
 
         identity = id(candidate)
-        if identity in seen_containers:
-            raise TypeError("host ingress payload must not repeat a container")
-        seen_containers.add(identity)
+        if identity in ancestor_containers:
+            raise TypeError("host ingress payload must not contain a container cycle")
+        ancestor_containers.add(identity)
+        try:
+            if candidate_type is list:
+                charge(1)
+                for index, item in enumerate(candidate):
+                    if index:
+                        charge(1)
+                    visit(item, depth=depth + 1)
+                charge(1)
+                return
 
-        if candidate_type is list:
             charge(1)
-            for index, item in enumerate(candidate):
+            for index, (key, item) in enumerate(candidate.items()):
+                if type(key) is not str:
+                    raise TypeError("host ingress payload keys must be exact strings")
                 if index:
                     charge(1)
+                charge_string(key)
+                charge(1)
                 visit(item, depth=depth + 1)
             charge(1)
-            return
-
-        charge(1)
-        for index, (key, item) in enumerate(candidate.items()):
-            if type(key) is not str:
-                raise TypeError("host ingress payload keys must be exact strings")
-            if index:
-                charge(1)
-            charge_string(key)
-            charge(1)
-            visit(item, depth=depth + 1)
-        charge(1)
+        finally:
+            ancestor_containers.remove(identity)
 
     visit(value, depth=0)
 
@@ -895,11 +915,11 @@ def _copy_exact_host_ingress_json(value: Any) -> Any:
     dispatch.  Copy before calling the SDK validator and reject every
     subclass, including dictionary keys, so neither behavior is possible.
 
-    JSON has tree, not graph, semantics.  Reject every repeated container
-    identity (not only recursive ancestors) while copying: otherwise a compact
-    shared DAG can expand exponentially into the detached snapshot before the
-    SDK gets a chance to apply its encoded-size limit.  The traversal and depth
-    budgets are consumed before each output node is allocated.
+    JSON has tree, not graph, semantics.  Shared containers therefore become
+    independent copied branches; only a container already on the current
+    ancestor stack is a cycle.  The traversal and depth budgets are consumed
+    for every branch before each output node is allocated, preventing compact
+    alias DAGs from expanding without a bound.
     """
 
     # Do this before allocating a detached container or asking the SDK to
@@ -907,7 +927,7 @@ def _copy_exact_host_ingress_json(value: Any) -> Any:
     # reach ``json.dumps(..., ensure_ascii=True)`` just to discover its size.
     _preflight_exact_host_ingress_json(value)
 
-    seen_containers: set[int] = set()
+    ancestor_containers: set[int] = set()
     remaining_nodes = _HOST_INGRESS_SNAPSHOT_NODE_BUDGET
 
     def copy_value(candidate: Any, *, depth: int) -> Any:
@@ -926,22 +946,24 @@ def _copy_exact_host_ingress_json(value: Any) -> Any:
             raise TypeError("host ingress payload must be exact JSON")
 
         identity = id(candidate)
-        if identity in seen_containers:
-            raise TypeError("host ingress payload must not repeat a container")
-        seen_containers.add(identity)
+        if identity in ancestor_containers:
+            raise TypeError("host ingress payload must not contain a container cycle")
+        ancestor_containers.add(identity)
+        try:
+            if candidate_type is list:
+                copied_list: list[Any] = []
+                for item in candidate:
+                    copied_list.append(copy_value(item, depth=depth + 1))
+                return copied_list
 
-        if candidate_type is list:
-            copied_list: list[Any] = []
-            for item in candidate:
-                copied_list.append(copy_value(item, depth=depth + 1))
-            return copied_list
-
-        copied_dict: dict[str, Any] = {}
-        for key, item in candidate.items():
-            if type(key) is not str:
-                raise TypeError("host ingress payload keys must be exact strings")
-            copied_dict[key] = copy_value(item, depth=depth + 1)
-        return copied_dict
+            copied_dict: dict[str, Any] = {}
+            for key, item in candidate.items():
+                if type(key) is not str:
+                    raise TypeError("host ingress payload keys must be exact strings")
+                copied_dict[key] = copy_value(item, depth=depth + 1)
+            return copied_dict
+        finally:
+            ancestor_containers.remove(identity)
 
     snapshot = copy_value(value, depth=0)
     # The source container can be changed from another thread between the

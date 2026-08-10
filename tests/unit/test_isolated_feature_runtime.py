@@ -2,6 +2,7 @@
 
 import asyncio
 import gc
+import json
 import os
 import types
 import weakref
@@ -5816,10 +5817,54 @@ async def test_host_ingress_preflights_exact_json_size_before_sdk_serialization(
 
 
 @pytest.mark.asyncio
-async def test_host_ingress_rejects_repeated_alias_dag_before_snapshot_or_facade(
+async def test_host_ingress_accepts_shared_alias_dags_as_detached_json_trees(
     monkeypatch, tmp_path
 ):
-    """A compact shared graph cannot expand before SDK payload validation."""
+    """SDK-valid aliases are charged and copied independently per branch."""
+
+    client = _HostIngressClient(
+        ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
+    )
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: client
+    )
+    shared = {"items": ["first"]}
+    payload = {"left": shared, "right": shared}
+    validator_payloads = []
+    sdk_validator = isolated_runtime.validate_host_ingress_payload
+
+    def recording_validator(value):
+        validator_payloads.append(value)
+        return sdk_validator(value)
+
+    monkeypatch.setattr(isolated_runtime, "validate_host_ingress_payload", recording_validator)
+    try:
+        assert await feature.call_host_ingress("telegram-webhook", payload) == {
+            "accepted": True
+        }
+        dispatched = client.ingress_calls[0][1]
+        assert dispatched == payload
+        assert dispatched is not payload
+        assert dispatched["left"] is not dispatched["right"]
+        assert dispatched["left"]["items"] is not dispatched["right"]["items"]
+        assert json.dumps(dispatched, ensure_ascii=True, separators=(",", ":")) == json.dumps(
+            payload, ensure_ascii=True, separators=(",", ":")
+        )
+        shared["items"].append("source mutation")
+        assert dispatched == {
+            "left": {"items": ["first"]},
+            "right": {"items": ["first"]},
+        }
+        assert dispatched in validator_payloads
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_host_ingress_rejects_container_cycles_and_excessive_alias_expansion(
+    monkeypatch, tmp_path
+):
+    """Cycles and aliases that exceed the expanded JSON budget fail closed."""
 
     client = _HostIngressClient(
         ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
@@ -5832,22 +5877,24 @@ async def test_host_ingress_rejects_repeated_alias_dag_before_snapshot_or_facade
     def unexpected_validator(_value):
         nonlocal validator_called
         validator_called = True
-        raise AssertionError("repeated alias reached SDK validation")
+        raise AssertionError("invalid graph reached SDK validation")
 
-    # This has only thirteen source lists, but the old ancestor-only copy
-    # expanded it into 4,096 detached leaves before consulting the SDK.
-    shared: list[object] = []
-    for _ in range(12):
-        shared = [shared, shared]
-
-    monkeypatch.setattr(
-        isolated_runtime,
-        "validate_host_ingress_payload",
-        unexpected_validator,
-    )
+    monkeypatch.setattr(isolated_runtime, "validate_host_ingress_payload", unexpected_validator)
+    recursive_list = []
+    recursive_list.append(recursive_list)
+    recursive_dict = {}
+    recursive_dict["self"] = recursive_dict
+    expanded: list[object] = []
+    for _ in range(16):
+        expanded = [expanded, expanded]
     try:
-        with pytest.raises(HostIngressError, match="host ingress failed"):
-            await feature.call_host_ingress("telegram-webhook", {"tree": shared})
+        for invalid_payload in (
+            {"tree": recursive_list},
+            {"tree": recursive_dict},
+            {"tree": expanded},
+        ):
+            with pytest.raises(HostIngressError, match="host ingress failed"):
+                await feature.call_host_ingress("telegram-webhook", invalid_payload)
         assert validator_called is False
         assert client.ingress_calls == []
     finally:
@@ -7997,6 +8044,286 @@ async def test_cancelled_supervisor_uses_terminal_stop_before_draining_host_ingr
                 await ingress
         if not feature._stopping:
             await feature.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("awaitable_kind", ("future", "task"))
+async def test_owned_facade_lifecycle_accepts_completed_future_and_task(
+    awaitable_kind, monkeypatch
+):
+    """A valid facade awaitable always runs through the named host task."""
+
+    async def completed_task():
+        return "stopped"
+
+    loop = asyncio.get_running_loop()
+    if awaitable_kind == "future":
+        operation = loop.create_future()
+        operation.set_result("stopped")
+    else:
+        operation = asyncio.create_task(completed_task(), name="facade-stop-task")
+        await operation
+
+    class FutureReturningFacade:
+        def stop(self):
+            return operation
+
+    created_tasks = []
+    real_create = isolated_runtime._create_host_owned_facade_task
+
+    def capture_task(awaitable, *, name):
+        task = real_create(awaitable, name=name)
+        created_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(isolated_runtime, "_create_host_owned_facade_task", capture_task)
+    assert await isolated_runtime._await_owned_facade_lifecycle_operation(
+        FutureReturningFacade().stop(),
+        name="test-facade-stop-awaitable",
+        on_late_task=lambda _task: pytest.fail("completed facade must not detach"),
+    ) == "stopped"
+    assert [task.get_name() for task in created_tasks] == ["test-facade-stop-awaitable"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("awaitable_kind", ("future", "task"))
+async def test_owned_facade_lifecycle_cancellation_keeps_pending_future_and_task_owned(
+    awaitable_kind, monkeypatch
+):
+    """Caller cancellation waits for the host owner instead of detaching it."""
+
+    release = asyncio.Event()
+
+    async def pending_task():
+        await release.wait()
+        return "stopped"
+
+    loop = asyncio.get_running_loop()
+    operation = (
+        loop.create_future()
+        if awaitable_kind == "future"
+        else asyncio.create_task(pending_task(), name="facade-pending-stop-task")
+    )
+
+    class FutureReturningFacade:
+        def stop(self):
+            return operation
+
+    created_tasks = []
+    real_create = isolated_runtime._create_host_owned_facade_task
+
+    def capture_task(awaitable, *, name):
+        task = real_create(awaitable, name=name)
+        created_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(isolated_runtime, "_create_host_owned_facade_task", capture_task)
+    owner = asyncio.create_task(
+        isolated_runtime._await_owned_facade_lifecycle_operation(
+            FutureReturningFacade().stop(),
+            name="test-pending-facade-stop-awaitable",
+            on_late_task=lambda _task: pytest.fail("pending facade must settle"),
+        )
+    )
+    await asyncio.sleep(0)
+    owner.cancel("caller cancellation")
+    await asyncio.sleep(0)
+    assert owner.done() is False
+    if awaitable_kind == "future":
+        operation.set_result("stopped")
+    else:
+        release.set()
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await owner
+    assert cancelled.value.args == ("caller cancellation",)
+    assert created_tasks[0].get_name() == "test-pending-facade-stop-awaitable"
+
+
+@pytest.mark.asyncio
+async def test_owned_facade_lifecycle_timeout_retains_task_returned_by_facade(monkeypatch):
+    """A cancellation-resistant Task return remains attached to its host owner."""
+
+    cancellation_observed = asyncio.Event()
+    release = asyncio.Event()
+
+    async def pending_task():
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancellation_observed.set()
+
+    operation = asyncio.create_task(pending_task(), name="facade-hostile-stop-task")
+
+    class TaskReturningFacade:
+        def stop(self):
+            return operation
+
+    late_tasks = []
+    monkeypatch.setattr(isolated_runtime, "_FACADE_LIFECYCLE_OPERATION_TIMEOUT", 0.01)
+    monkeypatch.setattr(isolated_runtime, "_FACADE_LIFECYCLE_CANCELLATION_GRACE", 0.01)
+    try:
+        with pytest.raises(isolated_runtime._FacadeLifecycleOperationTimedOut):
+            await isolated_runtime._await_owned_facade_lifecycle_operation(
+                TaskReturningFacade().stop(),
+                name="test-hostile-facade-stop-task",
+                on_late_task=late_tasks.append,
+            )
+        assert cancellation_observed.is_set()
+        assert len(late_tasks) == 1
+        assert late_tasks[0].get_name() == "test-hostile-facade-stop-task"
+    finally:
+        release.set()
+        await asyncio.wait_for(late_tasks[0] if late_tasks else operation, timeout=1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("awaitable_kind", ("future", "task"))
+async def test_terminal_shutdown_owns_future_and_task_returned_by_facade_once(
+    awaitable_kind, monkeypatch, tmp_path
+):
+    """Terminal retirement never retries a successfully owned facade stop."""
+
+    async def completed_task():
+        return None
+
+    loop = asyncio.get_running_loop()
+    if awaitable_kind == "future":
+        operation = loop.create_future()
+        operation.set_result(None)
+    else:
+        operation = asyncio.create_task(completed_task(), name="terminal-facade-stop-task")
+        await operation
+
+    class FutureReturningStopClient(FakeIsolatedClient):
+        def __init__(self):
+            super().__init__()
+            self.stop_calls = 0
+
+        def stop(self):
+            self.stop_calls += 1
+            return operation
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    client = FutureReturningStopClient()
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    feature._client = client
+    await feature.shutdown()
+    await feature.shutdown()
+    assert client.stop_calls == 1
+    assert feature._terminal_retirement_clients == []
+    assert feature._terminal_lifecycle_tasks == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("awaitable_kind", ("future", "task"))
+async def test_owned_health_probe_accepts_completed_future_and_task(awaitable_kind):
+    """Completed facade probes are healthy rather than TypeError failures."""
+
+    async def completed_task():
+        return {"healthy": True}
+
+    loop = asyncio.get_running_loop()
+    if awaitable_kind == "future":
+        operation = loop.create_future()
+        operation.set_result({"healthy": True})
+    else:
+        operation = asyncio.create_task(completed_task(), name="facade-health-task")
+        await operation
+
+    class FutureReturningFacade:
+        def health(self):
+            return operation
+
+    started_tasks = []
+    assert await isolated_runtime._await_owned_health_probe(
+        FutureReturningFacade().health(),
+        name="test-facade-health-awaitable",
+        on_started=started_tasks.append,
+        on_late_task=lambda _task: pytest.fail("completed health must not detach"),
+    ) == {"healthy": True}
+    assert [task.get_name() for task in started_tasks] == ["test-facade-health-awaitable"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("awaitable_kind", ("future", "task"))
+async def test_owned_health_probe_accepts_pending_future_and_task(awaitable_kind):
+    """Pending valid facade probes settle normally through host ownership."""
+
+    release = asyncio.Event()
+
+    async def pending_task():
+        await release.wait()
+        return {"healthy": True}
+
+    loop = asyncio.get_running_loop()
+    operation = (
+        loop.create_future()
+        if awaitable_kind == "future"
+        else asyncio.create_task(pending_task(), name="facade-pending-health-task")
+    )
+
+    class FutureReturningFacade:
+        def health(self):
+            return operation
+
+    started_tasks = []
+    owner = asyncio.create_task(
+        isolated_runtime._await_owned_health_probe(
+            FutureReturningFacade().health(),
+            name="test-pending-facade-health-awaitable",
+            on_started=started_tasks.append,
+            on_late_task=lambda _task: pytest.fail("pending health must settle"),
+        )
+    )
+    await asyncio.sleep(0)
+    if awaitable_kind == "future":
+        operation.set_result({"healthy": True})
+    else:
+        release.set()
+    assert await owner == {"healthy": True}
+    assert started_tasks[0].get_name() == "test-pending-facade-health-awaitable"
+
+
+@pytest.mark.asyncio
+async def test_owned_health_probe_timeout_retains_task_returned_by_facade(monkeypatch):
+    """A timed-out Task-returning health facade cannot become an unowned probe."""
+
+    cancellation_observed = asyncio.Event()
+    release = asyncio.Event()
+
+    async def pending_task():
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancellation_observed.set()
+
+    operation = asyncio.create_task(pending_task(), name="facade-hostile-health-task")
+
+    class TaskReturningFacade:
+        def health(self):
+            return operation
+
+    late_tasks = []
+    monkeypatch.setattr(isolated_runtime, "_HEALTH_PROBE_TIMEOUT", 0.01)
+    monkeypatch.setattr(isolated_runtime, "_HEALTH_PROBE_CANCELLATION_GRACE", 0.01)
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await isolated_runtime._await_owned_health_probe(
+                TaskReturningFacade().health(),
+                name="test-hostile-facade-health-task",
+                on_started=lambda _task: None,
+                on_late_task=late_tasks.append,
+            )
+        assert cancellation_observed.is_set()
+        assert len(late_tasks) == 1
+        assert late_tasks[0].get_name() == "test-hostile-facade-health-task"
+    finally:
+        release.set()
+        await asyncio.wait_for(late_tasks[0] if late_tasks else operation, timeout=1)
 
 
 @pytest.mark.asyncio
