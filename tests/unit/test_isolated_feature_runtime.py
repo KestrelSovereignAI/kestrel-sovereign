@@ -1832,6 +1832,109 @@ async def test_external_ingress_resumes_after_cancelled_transition_rollback(monk
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resume_error", "expected_error"),
+    [
+        (RuntimeError("resume failed"), HostIngressError),
+        (asyncio.CancelledError("resume cancelled"), asyncio.CancelledError),
+    ],
+    ids=["failure", "cancellation"],
+)
+async def test_external_ingress_resume_failure_never_reports_config_success(
+    monkeypatch, tmp_path, resume_error, expected_error
+):
+    """A failed resume quarantines and remains the successful body's outcome."""
+
+    old_config = {"enabled": True, "revision": "old"}
+    next_config = {"enabled": True, "revision": "next"}
+
+    class ResumeFailingClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("external-ingress-quiesce", "external-ingress-resume")
+            )
+
+        async def call_host_ingress(self, name, payload=None):
+            if name == "external-ingress-quiesce":
+                return {"status": "ok", "http_status": 200, "state": "quiesced"}
+            assert name == "external-ingress-resume"
+            raise resume_error
+
+        async def prepare_config_transition(self, config):
+            assert config == next_config
+            return ConfigTransitionResult.applied()
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=ResumeFailingClient)
+    try:
+        await feature.persist_config(old_config)
+        await feature.initialize()
+
+        with pytest.raises(expected_error):
+            await feature.set_config(next_config)
+
+        assert feature._client is None
+        assert feature.get_tools() == []
+        assert feature._stopping is True
+        assert feature._traffic_gate.sealed is True
+        assert feature._host_config == next_config
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_external_ingress_resume_failure_preserves_active_transition_error(
+    monkeypatch, tmp_path
+):
+    """Resume cleanup cannot hide the transition error already being unwound."""
+
+    old_config = {"enabled": True, "revision": "old"}
+    rejected_config = {"enabled": True, "revision": "rejected"}
+
+    class BodyFailingClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("external-ingress-quiesce", "external-ingress-resume")
+            )
+
+        async def call_host_ingress(self, name, payload=None):
+            if name == "external-ingress-quiesce":
+                return {"status": "ok", "http_status": 200, "state": "quiesced"}
+            assert name == "external-ingress-resume"
+            raise RuntimeError("resume failed during unwind")
+
+        async def prepare_config_transition(self, config):
+            assert config == rejected_config
+            raise ConfigTransitionError("transition rejected")
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=BodyFailingClient)
+    try:
+        await feature.persist_config(old_config)
+        await feature.initialize()
+
+        with pytest.raises(ConfigTransitionError, match="transition rejected"):
+            await feature.set_config(rejected_config)
+
+        assert feature._client is None
+        assert feature._traffic_gate.sealed is True
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_transition_failure_clears_pending_config_when_promotion_fails(
     monkeypatch, tmp_path
 ):
@@ -3890,6 +3993,81 @@ async def test_replica_get_does_not_mask_stale_child_before_next_patch(
 
 
 @pytest.mark.asyncio
+async def test_stale_equal_config_reconciles_only_after_external_ingress_fence(
+    monkeypatch, tmp_path
+):
+    """A stale ``B -> B`` update fences old polling before replacing child A."""
+
+    old_config = {"enabled": True, "revision": "old"}
+    winner_config = {"enabled": True, "revision": "winner"}
+    storage = _CASStorage()
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+
+    winner_agent = Mock(did=_TEST_AGENT_DID, features={})
+    winner_agent.storage = storage
+    winner_agent.storage_path = str(tmp_path / "winner" / "kestrel_prime.db")
+    stale_agent = Mock(did=_TEST_AGENT_DID, features={})
+    stale_agent.storage = storage
+    stale_agent.storage_path = str(tmp_path / "stale" / "kestrel_prime.db")
+    stale_clients = []
+
+    class FencedStaleClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.quiesced = False
+            self.ingress_calls = []
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("external-ingress-quiesce", "external-ingress-resume")
+            )
+
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            if name == "external-ingress-quiesce":
+                assert stale._traffic_gate.closed is False
+                self.quiesced = True
+                return {"status": "ok", "http_status": 200, "state": "quiesced"}
+            raise AssertionError("a retired child must not be resumed")
+
+        async def stop(self):
+            if self is stale_clients[0]:
+                assert self.quiesced is True
+                assert stale._traffic_gate.closed is True
+            await super().stop()
+
+    def stale_factory(**kwargs):
+        client = FencedStaleClient(**kwargs)
+        stale_clients.append(client)
+        return client
+
+    winner = ProxyFeature(
+        winner_agent, _cfg_runtime(), client_factory=FakeIsolatedClient
+    )
+    stale = ProxyFeature(stale_agent, _cfg_runtime(), client_factory=stale_factory)
+    try:
+        await winner.persist_config(old_config)
+        await winner.initialize()
+        await stale.initialize()
+        stale_child = stale_clients[0]
+
+        await winner.set_config(winner_config)
+        # Stale's local applied identity remains A even though its stage reads
+        # durable B, which is exactly the prior no-op fast-path hole.
+        assert stale._host_config == old_config
+        await stale.set_config(winner_config)
+
+        assert stale_child.stopped is True
+        assert [call[0] for call in stale_child.ingress_calls] == [
+            "external-ingress-quiesce"
+        ]
+        assert stale._client is stale_clients[1]
+        assert stale_clients[1].kwargs["config"] == winner_config
+        assert stale._host_config == winner_config
+    finally:
+        await stale.shutdown()
+        await winner.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_ambiguous_promotion_reread_quarantine_cannot_publish_recovery_child(
     monkeypatch, tmp_path
 ):
@@ -5196,6 +5374,165 @@ async def test_reload_cancellation_after_old_stop_quarantines_publication(
             reload_task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await reload_task
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_channel_inbound_acknowledges_exact_source_only_after_host_delivery(
+    monkeypatch, tmp_path
+):
+    """A notification's producer waits for post-handler private acknowledgement."""
+
+    dedupe_key = "telegram:v2:bot:42:update:101"
+    delivery_started = asyncio.Event()
+    release_delivery = asyncio.Event()
+    acknowledgement_started = asyncio.Event()
+    release_acknowledgement = asyncio.Event()
+    delivered = []
+
+    class ChannelFeature:
+        async def handle_inbound(self, message):
+            delivery_started.set()
+            await release_delivery.wait()
+            delivered.append(message.id)
+
+    class AcknowledgingClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack",)
+            )
+            self.acknowledgements = []
+
+        async def call_host_ingress(self, name, payload=None):
+            self.acknowledgements.append((name, payload))
+            acknowledgement_started.set()
+            await release_acknowledgement.wait()
+            return {"status": "ok", "http_status": 200, "state": "acknowledged"}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": ChannelFeature()})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=AcknowledgingClient)
+    event_task = None
+    try:
+        await feature.initialize()
+        client = feature._client
+        event_task = asyncio.create_task(
+            client.event_handler(
+                {
+                    "type": "channel.inbound",
+                    "payload": {
+                        "message": {
+                            "channel_type": "telegram",
+                            "direction": "inbound",
+                            "sender": "555",
+                            "recipient": "42",
+                            "content": "hello",
+                            "id": dedupe_key,
+                            "metadata": {"dedupe_key": dedupe_key},
+                        },
+                        "_host_ingress_ack": {
+                            "name": "telegram-polling-ack",
+                            "payload": {"dedupe_key": dedupe_key},
+                        },
+                    },
+                }
+            )
+        )
+        await asyncio.wait_for(delivery_started.wait(), timeout=1)
+        assert not acknowledgement_started.is_set()
+
+        release_delivery.set()
+        await asyncio.wait_for(event_task, timeout=1)
+        await asyncio.wait_for(acknowledgement_started.wait(), timeout=1)
+        assert delivered == [dedupe_key]
+        assert client.acknowledgements == [
+            ("telegram-polling-ack", {"dedupe_key": dedupe_key})
+        ]
+        # The acknowledgement remains independently in-flight so an SDK event
+        # reader can return to consume its JSON-RPC response instead of waiting
+        # on that same response inline.
+        assert feature._event_ack_tasks
+        release_acknowledgement.set()
+        for _ in range(20):
+            if not feature._event_ack_tasks:
+                break
+            await asyncio.sleep(0)
+        assert not feature._event_ack_tasks
+    finally:
+        release_delivery.set()
+        release_acknowledgement.set()
+        if event_task is not None and not event_task.done():
+            await event_task
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_current_replacement_acknowledged_event_waits_for_reopened_gate(
+    monkeypatch, tmp_path
+):
+    """A replacement poller cannot lose its first update to Core's closed gate."""
+
+    dedupe_key = "telegram:v2:bot:42:update:102"
+    delivered = []
+    acknowledged = asyncio.Event()
+
+    class ChannelFeature:
+        async def handle_inbound(self, message):
+            delivered.append(message.id)
+
+    class AckClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack",)
+            )
+
+        async def call_host_ingress(self, name, payload=None):
+            assert (name, payload) == (
+                "telegram-polling-ack",
+                {"dedupe_key": dedupe_key},
+            )
+            acknowledged.set()
+            return {"status": "ok", "http_status": 200, "state": "acknowledged"}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": ChannelFeature()})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=AckClient)
+    try:
+        await feature.initialize()
+        await feature._close_traffic_gate()
+        await feature._client.event_handler(
+            {
+                "type": "channel.inbound",
+                "payload": {
+                    "message": {
+                        "channel_type": "telegram",
+                        "direction": "inbound",
+                        "sender": "555",
+                        "recipient": "42",
+                        "content": "first after replacement",
+                        "id": dedupe_key,
+                        "metadata": {"dedupe_key": dedupe_key},
+                    },
+                    "_host_ingress_ack": {
+                        "name": "telegram-polling-ack",
+                        "payload": {"dedupe_key": dedupe_key},
+                    },
+                },
+            }
+        )
+        assert delivered == []
+        assert not acknowledged.is_set()
+
+        await feature._reopen_traffic_gate()
+        await asyncio.wait_for(acknowledged.wait(), timeout=1)
+        assert delivered == [dedupe_key]
+    finally:
         await feature.shutdown()
 
 
