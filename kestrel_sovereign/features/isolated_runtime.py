@@ -898,6 +898,15 @@ async def _await_owned_health_probe(
         )
 
     settled = _facade_settlement_event(task)
+    cancellation_args: tuple[Any, ...] | None = None
+
+    def remember_parent_cancellation(exc: asyncio.CancelledError) -> None:
+        """Keep the first newly delivered parent cancellation payload."""
+
+        nonlocal cancellation_args
+
+        if cancellation_args is None and parent_cancellation_arrived():
+            cancellation_args = tuple(exc.args)
 
     def replay_parent_cancellation(cancellation_args: tuple[Any, ...]) -> NoReturn:
         """Raise cancellation without retaining a facade task in its traceback."""
@@ -925,26 +934,40 @@ async def _await_owned_health_probe(
         parent_cancellation_arrived = None
         raise asyncio.TimeoutError()
 
-    def hand_off_parent_cancellation(exc: asyncio.CancelledError) -> NoReturn:
-        """Fence the facade before replaying a newly delivered parent cancel."""
+    async def fence_parent_cancellation() -> None:
+        """Fence the facade and allow queued cooperative cancellation to settle.
+
+        A parent cancellation and a child's own cancellation can be queued in
+        the same loop turn.  Calling ``on_late_task`` synchronously from the
+        parent handler races the child's next cancellation checkpoint and
+        incorrectly detaches an operation which is already settling.  One
+        cooperative turn is enough to observe that acknowledgement; a child
+        that remains pending after it still transfers exact ownership before
+        this helper releases its parent.
+        """
 
         task.cancel()
+        if not task.done():
+            try:
+                await asyncio.sleep(0)
+            except asyncio.CancelledError as exc:
+                # A later cancellation must not replace the first payload,
+                # but its cumulative count remains on the parent task.
+                remember_parent_cancellation(exc)
         if task.done():
             _consume_late_lifecycle_task_outcome(task)
-        else:
-            on_late_task(task)
-        replay_parent_cancellation(tuple(exc.args))
+            return
+        on_late_task(task)
 
     async def receive_parent_delivery_after_settlement() -> None:
         """Observe a parent cancel accepted in the child's terminal turn."""
 
-        if not parent_cancellation_arrived():
+        if cancellation_args is not None or not parent_cancellation_arrived():
             return
         try:
             await asyncio.sleep(0)
         except asyncio.CancelledError as exc:
-            if parent_cancellation_arrived():
-                hand_off_parent_cancellation(exc)
+            remember_parent_cancellation(exc)
 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _HEALTH_PROBE_TIMEOUT
@@ -957,14 +980,18 @@ async def _await_owned_health_probe(
         try:
             await asyncio.wait_for(settled.wait(), timeout=remaining)
         except asyncio.CancelledError as exc:
-            if parent_cancellation_arrived():
-                hand_off_parent_cancellation(exc)
+            remember_parent_cancellation(exc)
+            if cancellation_args is not None:
+                break
         except asyncio.TimeoutError:
             timed_out = True
             break
 
     if not timed_out:
         await receive_parent_delivery_after_settlement()
+        if cancellation_args is not None:
+            await fence_parent_cancellation()
+            replay_parent_cancellation(cancellation_args)
         if task.cancelled():
             operation = None
             task = None
@@ -983,14 +1010,18 @@ async def _await_owned_health_probe(
         try:
             await asyncio.wait_for(settled.wait(), timeout=remaining)
         except asyncio.CancelledError as exc:
-            if parent_cancellation_arrived():
-                hand_off_parent_cancellation(exc)
+            remember_parent_cancellation(exc)
+            if cancellation_args is not None:
+                break
         except asyncio.TimeoutError:
             continue
 
     # A timeout-fenced child can settle in the same scheduling turn as a
     # parent cancellation.  The neutral event keeps the two outcomes separate.
     await receive_parent_delivery_after_settlement()
+    if cancellation_args is not None:
+        await fence_parent_cancellation()
+        replay_parent_cancellation(cancellation_args)
     _consume_late_lifecycle_task_outcome(task)
     raise_authoritative_timeout()
 
