@@ -279,16 +279,17 @@ manually.
 
 #### SDK 0.35 release cascade
 
-Core requires `kestrel-sovereign-sdk[tracing]>=0.35.0,<0.36`; the
+Core requires `kestrel-sovereign-sdk[tracing]>=0.35.1,<0.36`; the
 `observability` extra carries the same SDK line with `metrics`. This is a
-runtime contract for durable isolated execution and provider-neutral private
-inference leases, including bounded owner-scoped idle renewal, not a preference
-that a downstream package may relax. The Core-owned release-cascade contract is:
+runtime contract for durable isolated execution, provider-neutral private
+inference leases (including bounded owner-scoped idle renewal), and private
+host ingress. It is not a preference that a downstream package may relax. The
+Core-owned release-cascade contract is:
 
 | Downstream release gate | Required published SDK constraint before Core ships | Core assertion |
 |---|---|---|
-| Frinz | `kestrel-sovereign-sdk>=0.35.0,<0.36` | External prerequisite; Core does not claim Frinz has changed. |
-| Observability fleet | `kestrel-sovereign-sdk>=0.35.0,<0.36` | External prerequisite; Core does not claim observability has changed. |
+| Frinz | `kestrel-sovereign-sdk>=0.35.1,<0.36` | External prerequisite; Core does not claim Frinz has changed. |
+| Observability fleet | `kestrel-sovereign-sdk>=0.35.1,<0.36` | External prerequisite; Core does not claim observability has changed. |
 
 Verify the published Frinz and observability constraints and tests before the
 Core publish. Do not weaken Core's requirement to make an older sibling

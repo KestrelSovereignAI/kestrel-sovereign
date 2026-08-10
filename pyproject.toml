@@ -66,6 +66,9 @@ dependencies = [
     # 0.32.0 floor: capability-negotiated isolated tool execution context
     # required by durable scheduler dispatch (#2715). This also includes the
     # first-class typed parts on the ToolResult envelope (#2641).
+    # 0.35.1 floor: typed, capability-negotiated private host ingress for
+    # isolated services (#2755). The host must not emulate this through
+    # tools/call because ingress is deliberately unavailable to agent tools.
     # kestrel_sdk.tools.parts hosts the pending-parts buffer ContextVar that
     # agent/parts.py re-exports (emit_part's tool-result fallback), and
     # DynamicTool.execute attaches buffered/explicit parts to the serialized
@@ -76,7 +79,7 @@ dependencies = [
     # of pre-parts trees are also labeled 0.31.0, and uv's build cache (keyed
     # on source + version) served such a stale build during feature
     # reconciliation, repeatedly breaking the CLI with ModuleNotFoundError
-    # (2026-07-20/21 host incidents). Requiring 0.32.0 now makes both those
+    # (2026-07-20/21 host incidents). Requiring 0.35.1 now makes both those
     # pre-parts artifacts and pre-execution-context services unsatisfiable.
     # 0.34.0 floor: provider-neutral, owner-scoped private inference request,
     # quote, route, lifecycle, and entry-point contracts. Core consumes these
@@ -96,7 +99,7 @@ dependencies = [
     # Release cascade: Frinz and the observability fleet must publish/test
     # constraints that admit this line before Core is released. Do not weaken
     # Core's safety floor to make an older downstream resolver succeed.
-    "kestrel-sovereign-sdk[tracing]>=0.35.0,<0.36",
+    "kestrel-sovereign-sdk[tracing]>=0.35.1,<0.36",
     # Core web framework
     "fastapi==0.136.3",
     "uvicorn==0.48.0",
@@ -274,7 +277,7 @@ observability = [
     "opentelemetry-sdk>=1.20.0",
     "opentelemetry-instrumentation-fastapi>=0.41b0",
     "opentelemetry-exporter-otlp-proto-grpc>=1.20.0",
-    "kestrel-sovereign-sdk[metrics,tracing]>=0.35.0,<0.36",
+    "kestrel-sovereign-sdk[metrics,tracing]>=0.35.1,<0.36",
 ]
 # Host-supervised Arize Phoenix trace backend (OTel pivot, #2570). Installing
 # this extra is the ONLY step needed to get traces flowing: on host start the

@@ -19,22 +19,34 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import shutil
 import subprocess
+import weakref
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from importlib import metadata as importlib_metadata
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, NoReturn, Optional
 from uuid import uuid4
 
 from kestrel_sdk.channels import ChannelAdapter
 from kestrel_sdk.isolated_feature import (
     CONFIG_TRANSITION_APPLIED,
     ConfigTransitionResult,
+    HostIngressCapabilities,
+    HostIngressError,
+    HostIngressPayload,
+    HostIngressUnknownNameError,
+    HostIngressUnsupportedError,
+    MAX_HOST_INGRESS_PAYLOAD_BYTES,
+    ProtocolError,
+    validate_host_ingress_name,
+    validate_host_ingress_payload,
 )
 from kestrel_sdk.tools.base import AgentTool, ToolCategory, ToolParameter, ToolSchema
 
@@ -77,6 +89,60 @@ _PENDING_CONFIG_CLOCK_SKEW = timedelta(seconds=30)
 _PENDING_CLEANUP_WRITE_ATTEMPTS = 2
 _TERMINAL_TRAFFIC_ERROR = "isolated feature traffic is unavailable"
 
+# The locked SDK 0.35.1 has no public stop-budget export.  Its private
+# ``SupervisedIsolatedFeatureClient.stop()`` path observes a single facade's
+# lifecycle serially: two startup-settlement observations, eight child
+# retirement observations (spawn/startup, graceful shutdown, natural exit,
+# TERM, KILL, close, and the post-close process observation), and one retired
+# operation observation.  Every one uses its three-second phase limit.  Keep
+# this derivation named and adjacent to the SDK pin so an SDK lifecycle change
+# has one auditable host deadline to update rather than a misleading literal.
+#
+# A facade with more than one unresolved historical retirement is still fenced
+# after this one-child complete sequence.  That preserves whole-agent fair
+# share and leaves the exact facade owned for a later bounded retry instead of
+# making host cleanup unbounded.
+_SDK_STOP_PHASE_TIMEOUT = 3.0
+_SDK_STOP_STARTUP_SETTLEMENT_OBSERVATIONS = 2
+_SDK_STOP_RETIREMENT_OBSERVATIONS = 8
+_SDK_STOP_RETIRED_OPERATION_OBSERVATIONS = 1
+_SDK_SUBPROCESS_STOP_BUDGET = _SDK_STOP_PHASE_TIMEOUT * (
+    _SDK_STOP_STARTUP_SETTLEMENT_OBSERVATIONS
+    + _SDK_STOP_RETIREMENT_OBSERVATIONS
+    + _SDK_STOP_RETIRED_OPERATION_OBSERVATIONS
+)
+# Account for host task scheduling and the SDK's lock handoff independently of
+# the audited subprocess observations above.  Cancellation acknowledgement is
+# deliberately separate: a timed-out operation must first be asked to stop and
+# have its task outcome consumed before it is marked uncertain.  Tests shorten
+# both constants to exercise the fence without waiting for the production stop
+# budget.
+_FACADE_LIFECYCLE_SCHEDULING_ALLOWANCE = 3.0
+_FACADE_LIFECYCLE_OPERATION_TIMEOUT = (
+    _SDK_SUBPROCESS_STOP_BUDGET + _FACADE_LIFECYCLE_SCHEDULING_ALLOWANCE
+)
+_FACADE_LIFECYCLE_CANCELLATION_GRACE = 1.0
+# A health call is external facade work too.  Give a cancelled probe a short
+# acknowledgement window before retaining it as terminally incomplete work.
+# This intentionally shares the lifecycle-operation grace: both awaitables can
+# retain an SDK facade and must never be detached when they suppress cancel.
+_HEALTH_PROBE_CANCELLATION_GRACE = _FACADE_LIFECYCLE_CANCELLATION_GRACE
+# A stop result proves only that the facade has completed its process-retirement
+# contract.  It cannot prove that a legacy facade also completed every RPC it
+# admitted before reporting success.  Keep that second, host-side boundary
+# independently bounded; a timeout leaves the gate sealed and its exact drain
+# task owned for eventual observation.
+_TERMINAL_TRAFFIC_DRAIN_TIMEOUT = 3.0
+
+# KestrelAgent's fair-share ``wait_for`` owns the caller deadline.  Direct
+# feature callers retain the historical interruption contract: cancellation
+# waits through the terminal boundary.  The agent invokes the explicit wrapper
+# below so the proxy can hand its already-owned cleanup task back at that
+# deadline without cancelling a SDK coroutine which may hold a process handle.
+_AGENT_SHUTDOWN_DEADLINE_ACTIVE: ContextVar[bool] = ContextVar(
+    "isolated_agent_shutdown_deadline_active", default=False
+)
+
 # Isolated feature config used to share the in-process feature key
 # ``feature_config:<class-name>``. Graph-node IDs are globally unique even
 # though each AsyncGraphStore is tenant-bound, so fresh agents need a DID
@@ -113,10 +179,32 @@ class _TrafficGateClosedError(RuntimeError):
     """A non-waiting admission arrived during a finite transition."""
 
 
+class _TerminalLifecyclePermitRevoked(RuntimeError):
+    """A terminal transition superseded an initializer before it acquired ownership."""
+
+
+class _FacadeLifecycleOperationTimedOut(RuntimeError):
+    """An externally supplied lifecycle coroutine exceeded its ownership fence."""
+
+
+class _TerminalTrafficDrainTimedOut(RuntimeError):
+    """A sealed admitted call outlived terminal traffic-drain ownership."""
+
+
+def _consume_late_lifecycle_task_outcome(task: asyncio.Task[Any]) -> None:
+    """Consume a fenced task's eventual result without retaining its failure."""
+
+    try:
+        task.result()
+    except BaseException:  # noqa: BLE001 - terminal facade outcomes stay private
+        pass
+
+
 async def _await_task_until_complete(
     task: asyncio.Task[Any],
     *,
     preserve_cancellation: bool,
+    settle_on_cancellation: bool = True,
 ) -> Any:
     """Wait for a shielded task without letting a later cancellation orphan it.
 
@@ -124,9 +212,13 @@ async def _await_task_until_complete(
     its owner releases ``_reload_lock``.  ``Task.result()`` after completion is
     intentional: it avoids one final cancellation point after the task has
     already changed durable/client/gate state.
+    ``settle_on_cancellation=False`` is for a caller with an externally owned
+    deadline.  The task must already be retained by a durable object field;
+    the caller may then honour its deadline without cancelling a child that
+    owns a subprocess or an active traffic boundary.
     """
 
-    cancellation: asyncio.CancelledError | None = None
+    cancellation_args: tuple[Any, ...] | None = None
     while not task.done():
         try:
             await asyncio.shield(task)
@@ -135,7 +227,19 @@ async def _await_task_until_complete(
             # before it records its own SDK fence or cleanup outcome.
             if task.done() and task.cancelled():
                 break
-            cancellation = exc
+            if not settle_on_cancellation:
+                # The shared task remains attached to its owner (for example
+                # ``_terminal_cleanup_task``).  A caller with a smaller
+                # whole-agent budget can therefore move on without cancelling
+                # an SDK stop coroutine that may own the sole process handle.
+                raise
+            # Preserve the first cancellation only.  A caller can receive
+            # further cancellation requests while this shielded cleanup
+            # drains; letting a later request replace the original loses the
+            # cancellation which actually interrupted the lifecycle owner and
+            # retains an exception traceback longer than necessary.
+            if cancellation_args is None:
+                cancellation_args = tuple(exc.args)
             continue
     # A child cancellation is a result of the child operation, not an empty
     # successful result.  In particular, lifecycle callers must not mistake a
@@ -144,9 +248,305 @@ async def _await_task_until_complete(
     if task.cancelled():
         raise asyncio.CancelledError()
     result = task.result()
-    if cancellation is not None and not preserve_cancellation:
-        raise cancellation
+    if cancellation_args is not None and not preserve_cancellation:
+        raise asyncio.CancelledError(*cancellation_args)
     return result
+
+
+async def _await_owned_facade_lifecycle_operation(
+    operation: Awaitable[Any],
+    *,
+    name: str,
+    on_completed: Callable[[], None] | None = None,
+    on_timeout: Callable[[], None] | None = None,
+    on_late_task: Callable[[asyncio.Task[Any]], None],
+) -> Any:
+    """Own a facade operation without allowing it to hold lifecycle forever.
+
+    The SDK's subprocess ``stop()`` detaches its only process handle before it
+    awaits graceful termination.  Cancelling that exact coroutine therefore
+    cannot be repaired by a later ``stop()`` call: the later call sees no
+    process to kill.  Own the operation in a task and observe caller
+    cancellation outside facade code. A real SDK 0.35.1 stop receives its full
+    documented graceful/terminate/kill budget; a hostile legacy facade which
+    does not settle by then is cancelled, drained for a short acknowledgement
+    window, and reported as an *uncertain* outcome through ``on_timeout``.
+
+    A Python coroutine that actively suppresses every cancellation and keeps
+    running cannot be force-killed by asyncio. In that pathological case the
+    required ``on_late_task`` takes ownership *before* this helper can release
+    its caller.  The owner keeps the exact client sealed and refuses a second
+    ``stop()`` until the original coroutine has settled and its outcome is
+    consumed.  Cooperative awaitables (including ``asyncio.Event.wait``)
+    settle during the acknowledgement window and leave no task behind.
+    """
+
+    task = asyncio.create_task(_maybe_await(operation), name=name)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _FACADE_LIFECYCLE_OPERATION_TIMEOUT
+    cancellation_args: tuple[Any, ...] | None = None
+
+    def remember_cancellation(exc: asyncio.CancelledError) -> None:
+        nonlocal cancellation_args
+
+        if cancellation_args is None:
+            cancellation_args = tuple(exc.args)
+
+    def caller_cancellation_requested() -> bool:
+        """Distinguish a shielded child cancellation from this owner's cancel."""
+
+        caller = asyncio.current_task()
+        return caller is not None and caller.cancelling() > 0
+
+    def replay_remembered_cancellation() -> NoReturn:
+        """Raise the caller cancellation without retaining facade state."""
+
+        nonlocal operation, task, on_completed, on_timeout, on_late_task
+
+        # A CancelledError keeps this helper's traceback.  Clear every local
+        # which can lead back to a facade task, a bound facade callback, or an
+        # external coroutine before it becomes the public exception.
+        operation = None
+        task = None
+        on_completed = None
+        on_timeout = None
+        on_late_task = None
+        raise asyncio.CancelledError(*cancellation_args)
+
+    def raise_authoritative_timeout() -> NoReturn:
+        """Raise the host timeout without retaining a completed facade task."""
+
+        nonlocal operation, task, on_completed, on_timeout, on_late_task
+
+        # Like the cancellation path above, this public exception keeps this
+        # helper's traceback.  A cooperative task can raise a secret-bearing
+        # facade exception while acknowledging our own timeout cancellation;
+        # clear every route from that traceback back to the consumed task.
+        operation = None
+        task = None
+        on_completed = None
+        on_timeout = None
+        on_late_task = None
+        raise _FacadeLifecycleOperationTimedOut(
+            "isolated facade lifecycle operation exceeded its settlement budget"
+        )
+
+    while not task.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+        except asyncio.CancelledError as exc:
+            # ``shield(task)`` also raises CancelledError when *task* was
+            # cancelled.  Only a cancellation currently requested for this
+            # helper is authoritative at the host boundary; otherwise a
+            # facade's own cancellation remains the child outcome below.
+            if caller_cancellation_requested():
+                remember_cancellation(exc)
+            elif task.done() and task.cancelled():
+                break
+        except asyncio.TimeoutError:
+            break
+        except BaseException:  # noqa: BLE001 - facade outcome stays private after cancel
+            # The task can fail in the scheduling turn immediately after a
+            # caller cancellation was recorded.  Do not let that external
+            # exception replace the caller's authoritative interruption (or
+            # retain its traceback through the public CancelledError).
+            if cancellation_args is not None:
+                _consume_late_lifecycle_task_outcome(task)
+                # Leave this ``except`` before replaying cancellation: raising
+                # inside it would chain the facade exception as the public
+                # CancelledError's ``__context__``.
+                break
+            raise
+
+    if not task.done():
+        # Never deliver a parent cancellation into the real SDK operation.
+        # This is the explicit fencing cancellation after its full stop budget
+        # elapsed; even a facade which returns ``None`` after receiving it has
+        # an uncertain process outcome and must not be treated as success.
+        if on_timeout is not None:
+            on_timeout()
+        task.cancel()
+        acknowledgement_deadline = (
+            loop.time() + _FACADE_LIFECYCLE_CANCELLATION_GRACE
+        )
+        while not task.done():
+            remaining = acknowledgement_deadline - loop.time()
+            if remaining <= 0:
+                # The handoff is deliberately mandatory.  A timeout must not
+                # detach a still-running SDK stop coroutine: it may own the
+                # sole subprocess handle after its public facade has detached
+                # it.  Record that exact task before releasing this caller.
+                on_late_task(task)
+                if cancellation_args is not None:
+                    replay_remembered_cancellation()
+                raise_authoritative_timeout()
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+            except asyncio.CancelledError as exc:
+                # ``task.cancel()`` above deliberately causes this exact
+                # child-side acknowledgement.  It is not a parent
+                # cancellation and therefore must not replace the already
+                # authoritative timeout with CancelledError.
+                if caller_cancellation_requested():
+                    remember_cancellation(exc)
+                elif task.done() and task.cancelled():
+                    break
+            except asyncio.TimeoutError:
+                continue
+            except BaseException:  # noqa: BLE001 - timed-out facade outcome is private
+                # The timeout is the authoritative lifecycle outcome once we
+                # fenced the exact operation.  A late facade failure must not
+                # escape this acknowledgement window or become the context of
+                # the public timeout/cancellation.
+                _consume_late_lifecycle_task_outcome(task)
+                break
+
+        # Consume the post-fence terminal result even when a facade swallowed
+        # cancellation and returned success.  The timeout itself remains the
+        # authoritative lifecycle outcome.
+        _consume_late_lifecycle_task_outcome(task)
+        if cancellation_args is not None:
+            replay_remembered_cancellation()
+        raise_authoritative_timeout()
+
+    if cancellation_args is not None:
+        # A cancellation already observed by this owner is its public result.
+        # The facade task may have completed in the same scheduling turn, and
+        # may itself have failed with data from an external service.  Consume
+        # that private result before replaying the caller cancellation; do not
+        # let a late facade exception replace the interruption or attach its
+        # traceback to the cancellation that leaves this boundary.  A nominal
+        # success still invokes ``on_completed`` so callers retain exact-stop
+        # knowledge even though their own cancellation wins publicly.
+        try:
+            task.result()
+        except BaseException:  # noqa: BLE001 - facade outcome remains private
+            pass
+        else:
+            if on_completed is not None:
+                on_completed()
+        replay_remembered_cancellation()
+    if task.cancelled():
+        raise asyncio.CancelledError()
+    result = task.result()
+    if on_completed is not None:
+        on_completed()
+    return result
+
+
+async def _await_owned_health_probe(
+    operation: Awaitable[Any],
+    *,
+    name: str,
+    on_started: Callable[[asyncio.Task[Any]], None],
+    on_late_task: Callable[[asyncio.Task[Any]], None],
+) -> Any:
+    """Await one health probe without orphaning cancellation-resistant work.
+
+    ``asyncio.wait_for(coro, ...)`` creates an inner task implicitly.  When a
+    facade's ``health()`` suppresses its timeout or parent cancellation, that
+    task can outlive a cancelled supervisor while retaining the facade and its
+    credentials.  Explicitly own it instead.  A cooperative probe is still
+    cancelled at the health deadline; a hostile one is handed to the proxy
+    before this helper releases its supervisor so terminal cleanup can stay
+    sealed and honestly incomplete without blocking an agent-wide shutdown.
+    """
+
+    task = asyncio.create_task(_maybe_await(operation), name=name)
+    on_started(task)
+
+    def replay_parent_cancellation(exc: asyncio.CancelledError) -> NoReturn:
+        """Raise cancellation without retaining a facade task in its traceback."""
+
+        nonlocal operation, task, on_started, on_late_task
+
+        cancellation_args = tuple(exc.args)
+        operation = None
+        task = None
+        on_started = None
+        on_late_task = None
+        raise asyncio.CancelledError(*cancellation_args)
+
+    def raise_authoritative_timeout() -> NoReturn:
+        """Publish a neutral timeout after dropping the facade task reference."""
+
+        nonlocal operation, task, on_started, on_late_task
+
+        operation = None
+        task = None
+        on_started = None
+        on_late_task = None
+        raise asyncio.TimeoutError()
+
+    try:
+        return await asyncio.wait_for(
+            asyncio.shield(task), timeout=_HEALTH_PROBE_TIMEOUT
+        )
+    except asyncio.CancelledError as exc:
+        # Parent cancellation must not flow through the facade call: retain
+        # the exact task first if the facade refuses this explicit cancellation.
+        task.cancel()
+        if task.done():
+            _consume_late_lifecycle_task_outcome(task)
+        else:
+            on_late_task(task)
+        replay_parent_cancellation(exc)
+    except asyncio.TimeoutError:
+        task.cancel()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _HEALTH_PROBE_CANCELLATION_GRACE
+        while not task.done():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                on_late_task(task)
+                raise
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+            except asyncio.CancelledError as exc:
+                # ``shield(task)`` raises CancelledError when the probe
+                # acknowledges the timeout cancellation we sent above.  That
+                # is not the same as cancellation of this helper.  At their
+                # scheduling edge both can be true, so consult the owner
+                # first: otherwise a cancelled supervisor mistakes its own
+                # cancellation for a normal health timeout and restarts.
+                owner = asyncio.current_task()
+                if owner is not None and owner.cancelling():
+                    if task.done():
+                        _consume_late_lifecycle_task_outcome(task)
+                    else:
+                        on_late_task(task)
+                    replay_parent_cancellation(exc)
+                if task.done() and task.cancelled():
+                    # This is the probe acknowledging the cancellation we
+                    # issued for its timeout, not a new parent cancellation.
+                    # Preserve the original TimeoutError below so cooperative
+                    # wedged probes still follow the normal restart path.
+                    break
+                # A caller cancellation while acknowledging a timed-out probe
+                # follows the same ownership handoff as above, then preserves
+                # that caller's cancellation semantics.
+                if task.done():
+                    _consume_late_lifecycle_task_outcome(task)
+                else:
+                    on_late_task(task)
+                replay_parent_cancellation(exc)
+            except asyncio.TimeoutError:
+                continue
+            except BaseException:  # noqa: BLE001 - timeout acknowledgement is private
+                # A facade may catch the timeout cancellation and then raise
+                # an adapter/credential error.  The health deadline already
+                # decided the supervisor result, so consume that failure and
+                # publish only a neutral timeout.
+                _consume_late_lifecycle_task_outcome(task)
+                break
+
+        # The health timeout remains authoritative even if a facade catches
+        # cancellation and returns a nominally healthy value afterwards.
+        _consume_late_lifecycle_task_outcome(task)
+        raise_authoritative_timeout()
 
 
 class _TrafficGate:
@@ -186,21 +586,45 @@ class _TrafficGate:
             if self._sealed:
                 raise _TrafficGateTerminalError()
 
-    async def seal_and_drain(self) -> None:
-        """Make admission terminal before waiting for admitted calls to finish.
+    async def close(self) -> None:
+        """Stop admitting new work without waiting for existing work.
 
-        The state flip and notification occur under the same condition lock, so
-        waiters from a finite transition cannot be left asleep when quarantine
-        or shutdown becomes permanent.  Already admitted calls retain their
-        client until they return; the caller can then retire it safely.
+        Unhealthy-child recovery must first make the selected child unreachable
+        and then ask the SDK wrapper to terminate it.  Waiting for an admitted
+        RPC here would make that bounded terminate/kill path unreachable when
+        the RPC itself is wedged in the child.
         """
 
+        async with self._condition:
+            if self._sealed:
+                raise _TrafficGateTerminalError()
+            self._closed = True
+
+    async def seal(self) -> None:
+        """Make admission terminal without waiting for admitted calls.
+
+        Terminal cleanup must make the child unreachable before it tells the
+        SDK wrapper to stop it.  Waiting for active traffic first can deadlock
+        an ingress RPC whose child callback will never return: the bounded
+        wrapper termination path is precisely what makes that RPC terminal.
+        """
         async with self._condition:
             self._sealed = True
             self._closed = True
             self._condition.notify_all()
+
+    async def drain(self) -> None:
+        """Wait for work admitted before a close/seal boundary to finish."""
+
+        async with self._condition:
             while self._active:
                 await self._condition.wait()
+
+    async def seal_and_drain(self) -> None:
+        """Compatibility composition for callers that require both phases."""
+
+        await self.seal()
+        await self.drain()
 
     async def reopen(self) -> None:
         async with self._condition:
@@ -246,6 +670,409 @@ class _TrafficGate:
         finally:
             release = asyncio.create_task(self._release_admission())
             await _await_task_until_complete(release, preserve_cancellation=False)
+
+
+_HOST_INGRESS_SUCCESS = "success"
+_HOST_INGRESS_GENERIC_FAILURE = "generic-failure"
+_HOST_INGRESS_UNSUPPORTED = "unsupported"
+_HOST_INGRESS_UNKNOWN_NAME = "unknown-name"
+_HOST_INGRESS_TERMINAL = "terminal"
+_HOST_INGRESS_CANCELLED = "cancelled"
+
+# A valid JSON tree whose encoded form fits the SDK's 64 KiB wire limit can
+# contain at most this many nodes: a flat list of one-character JSON scalars
+# is the densest possible tree (one byte per scalar plus one separator per
+# sibling).  Keep the host-only snapshot bounded *before* allocating a copy.
+# The SDK remains the canonical validator for the exact encoded-size and
+# nesting limits below; this is solely a traversal/allocation safety fence.
+_HOST_INGRESS_SNAPSHOT_NODE_BUDGET = MAX_HOST_INGRESS_PAYLOAD_BYTES // 2
+_HOST_INGRESS_SNAPSHOT_DEPTH_BUDGET = 32
+
+
+@dataclass(frozen=True)
+class _HostIngressRequest:
+    """A detached, exact-JSON request safe to hand to an SDK facade."""
+
+    name: str
+    payload: HostIngressPayload = field(repr=False)
+
+
+@dataclass(frozen=True)
+class _HostIngressOutcome:
+    """A non-exceptional result from the private ingress worker.
+
+    Ingress boundary failures intentionally travel as data until the public
+    method has discarded its request/client locals.  Raising an SDK/facade
+    exception directly from a worker keeps its traceback (and its request
+    payload) reachable through the public error.
+    """
+
+    status: str
+    payload: HostIngressPayload = field(default=None, repr=False)
+
+
+@dataclass
+class _HostIngressOutcomeSlot:
+    """One-shot result handoff which keeps a worker task payload-free.
+
+    A completed ``asyncio.Task`` retains its return value. Host ingress can
+    carry credentials, so the worker returns ``None`` and hands its detached
+    result to the caller through this slot. The consumer clears the slot
+    before exposing either a public result or cancellation.
+    """
+
+    outcome: _HostIngressOutcome = field(
+        default_factory=lambda: _HostIngressOutcome(_HOST_INGRESS_GENERIC_FAILURE),
+        repr=False,
+    )
+
+    def take(self) -> _HostIngressOutcome:
+        outcome = self.outcome
+        self.outcome = _HostIngressOutcome(_HOST_INGRESS_GENERIC_FAILURE)
+        return outcome
+
+
+@dataclass
+class _TrackedFacadeLifecycleTask:
+    """Non-detached ownership for a cancellation-hostile facade operation."""
+
+    task: asyncio.Task[Any]
+    client_id: int
+    client_ref: weakref.ReferenceType[Any] | None
+
+
+@dataclass
+class _TerminalStopCompletionMarker:
+    """An exact stop-completion marker with safe non-weakref fallback.
+
+    Weak references avoid retaining ordinary SDK facades.  A custom facade
+    that cannot be weak-referenced is instead held only until its next
+    lifecycle disposition (terminal cleanup consumes it or restart revokes
+    it); identity, never an ``id`` cache, remains the proof.
+    """
+
+    weak_client: weakref.ReferenceType[Any] | None = None
+    strong_client: Any = field(default=None, repr=False)
+    # The supervisor registers its completion marker *before* awaiting stop.
+    # Terminal cleanup can then claim that in-flight completion instead of
+    # forgetting a marker which the callback later recreates after retirement.
+    completed: bool = False
+    terminal_retirement_claimed: bool = False
+
+    def client(self) -> Any:
+        return self.weak_client() if self.weak_client is not None else self.strong_client
+
+
+def _preflight_exact_host_ingress_json(value: Any) -> None:
+    """Account for the SDK's exact JSON bytes without serializing a payload.
+
+    ``validate_host_ingress_payload`` remains the wire contract and is called
+    below for every snapshot that reaches it.  Its canonical size check,
+    however, necessarily materializes ``json.dumps(..., ensure_ascii=True)``.
+    An untrusted exact string containing astral characters expands to twelve
+    ASCII bytes per code point there, and an oversized dict key is just as
+    capable of forcing that allocation.  Charge every emitted byte first so
+    the serializer is reached only for inputs already proven to fit.
+
+    This deliberately mirrors the SDK's compact separators and ASCII encoder:
+    container delimiters, commas, colons, scalar tokens, object keys, and JSON
+    escaping are all included.  Integer text is produced only after a
+    bit-length lower bound proves that it can be at most one bounded wire
+    payload; it is not a hidden unbounded serialization escape hatch.
+    """
+
+    remaining_bytes = MAX_HOST_INGRESS_PAYLOAD_BYTES
+    seen_containers: set[int] = set()
+
+    def charge(byte_count: int) -> None:
+        nonlocal remaining_bytes
+
+        remaining_bytes -= byte_count
+        if remaining_bytes < 0:
+            raise ProtocolError("host ingress payload exceeds the size limit")
+
+    def charge_string(candidate: str) -> None:
+        # JSON quotes surround every string, including object keys.
+        charge(2)
+        for character in candidate:
+            codepoint = ord(character)
+            if character == '"' or character == "\\":
+                charge(2)
+            elif codepoint <= 0x1F:
+                # The five short control escapes are the only non-six-byte
+                # escapes emitted by Python's JSON encoder.
+                if character in {"\b", "\t", "\n", "\f", "\r"}:
+                    charge(2)
+                else:
+                    charge(6)
+            elif codepoint <= 0x7F:
+                charge(1)
+            elif codepoint <= 0xFFFF:
+                charge(6)
+            else:
+                # ``ensure_ascii=True`` emits a surrogate pair for astral
+                # Unicode rather than the source code point itself.
+                charge(12)
+
+    def charge_integer(candidate: int) -> None:
+        # ``str()`` on an arbitrary integer is itself an allocation.  The
+        # lower bound below uses a deliberately low rational approximation of
+        # log10(2), so rejecting here cannot reject a valid wire payload.
+        bit_length = candidate.bit_length()
+        if candidate < 0:
+            charge(1)
+        if bit_length == 0:
+            charge(1)
+            return
+        minimum_digits = ((bit_length - 1) * 30102) // 100000 + 1
+        if minimum_digits > remaining_bytes:
+            raise ProtocolError("host ingress payload exceeds the size limit")
+        # Any integer that reaches this point is bounded to roughly one wire
+        # payload.  Preserve the SDK's exact decimal spelling rather than
+        # approximating a near-limit value incorrectly.
+        charge(len(str(candidate if candidate >= 0 else -candidate)))
+
+    def visit(candidate: Any, *, depth: int) -> None:
+        candidate_type = type(candidate)
+        if depth > _HOST_INGRESS_SNAPSHOT_DEPTH_BUDGET:
+            raise ProtocolError("host ingress payload exceeds the nesting limit")
+        if candidate_type is type(None):
+            charge(4)
+            return
+        if candidate_type is bool:
+            charge(4 if candidate else 5)
+            return
+        if candidate_type is int:
+            charge_integer(candidate)
+            return
+        if candidate_type is float:
+            if not math.isfinite(candidate):
+                raise ProtocolError("host ingress payload must be valid JSON")
+            # Python's compact JSON float path uses the finite float repr.
+            charge(len(repr(candidate)))
+            return
+        if candidate_type is str:
+            charge_string(candidate)
+            return
+        if candidate_type not in (list, dict):
+            raise TypeError("host ingress payload must be exact JSON")
+
+        identity = id(candidate)
+        if identity in seen_containers:
+            raise TypeError("host ingress payload must not repeat a container")
+        seen_containers.add(identity)
+
+        if candidate_type is list:
+            charge(1)
+            for index, item in enumerate(candidate):
+                if index:
+                    charge(1)
+                visit(item, depth=depth + 1)
+            charge(1)
+            return
+
+        charge(1)
+        for index, (key, item) in enumerate(candidate.items()):
+            if type(key) is not str:
+                raise TypeError("host ingress payload keys must be exact strings")
+            if index:
+                charge(1)
+            charge_string(key)
+            charge(1)
+            visit(item, depth=depth + 1)
+        charge(1)
+
+    visit(value, depth=0)
+
+
+def _copy_exact_host_ingress_json(value: Any) -> Any:
+    """Return a detached JSON snapshot made only of exact built-in objects.
+
+    The SDK validator intentionally accepts normal Python JSON-compatible
+    values and returns its input unchanged.  At this host trust boundary that
+    is insufficient: a ``dict``/``str`` subclass can run user code during
+    validation, and a mutable input can change between validation and RPC
+    dispatch.  Copy before calling the SDK validator and reject every
+    subclass, including dictionary keys, so neither behavior is possible.
+
+    JSON has tree, not graph, semantics.  Reject every repeated container
+    identity (not only recursive ancestors) while copying: otherwise a compact
+    shared DAG can expand exponentially into the detached snapshot before the
+    SDK gets a chance to apply its encoded-size limit.  The traversal and depth
+    budgets are consumed before each output node is allocated.
+    """
+
+    # Do this before allocating a detached container or asking the SDK to
+    # serialize.  In particular, a huge astral scalar or object key must never
+    # reach ``json.dumps(..., ensure_ascii=True)`` just to discover its size.
+    _preflight_exact_host_ingress_json(value)
+
+    seen_containers: set[int] = set()
+    remaining_nodes = _HOST_INGRESS_SNAPSHOT_NODE_BUDGET
+
+    def copy_value(candidate: Any, *, depth: int) -> Any:
+        nonlocal remaining_nodes
+
+        remaining_nodes -= 1
+        if remaining_nodes < 0:
+            raise TypeError("host ingress payload exceeds the snapshot budget")
+        if depth > _HOST_INGRESS_SNAPSHOT_DEPTH_BUDGET:
+            raise TypeError("host ingress payload exceeds the snapshot depth budget")
+
+        candidate_type = type(candidate)
+        if candidate_type in (type(None), bool, int, float, str):
+            return candidate
+        if candidate_type not in (list, dict):
+            raise TypeError("host ingress payload must be exact JSON")
+
+        identity = id(candidate)
+        if identity in seen_containers:
+            raise TypeError("host ingress payload must not repeat a container")
+        seen_containers.add(identity)
+
+        if candidate_type is list:
+            copied_list: list[Any] = []
+            for item in candidate:
+                copied_list.append(copy_value(item, depth=depth + 1))
+            return copied_list
+
+        copied_dict: dict[str, Any] = {}
+        for key, item in candidate.items():
+            if type(key) is not str:
+                raise TypeError("host ingress payload keys must be exact strings")
+            copied_dict[key] = copy_value(item, depth=depth + 1)
+        return copied_dict
+
+    snapshot = copy_value(value, depth=0)
+    # The source container can be changed from another thread between the
+    # first pass and the built-in copy loop.  Re-account the detached snapshot
+    # so the SDK still never performs an unbounded serialization allocation.
+    _preflight_exact_host_ingress_json(snapshot)
+    return snapshot
+
+
+def _snapshot_host_ingress_payload(value: Any) -> HostIngressPayload:
+    """Copy and retain the SDK's size, depth, and finite-float validation."""
+
+    snapshot = _copy_exact_host_ingress_json(value)
+    # Validate the detached graph, never a caller/client-owned value.  The SDK
+    # remains the canonical authority for JSON wire limits and finite floats.
+    validate_host_ingress_payload(snapshot)
+    return snapshot
+
+
+def _prepare_host_ingress_request(
+    name: Any, payload: Any
+) -> _HostIngressRequest | None:
+    """Validate/snapshot untrusted ingress arguments without raising outward."""
+
+    if type(name) is not str:
+        return None
+    try:
+        validated_name = validate_host_ingress_name(name)
+        return _HostIngressRequest(
+            name=validated_name,
+            payload=_snapshot_host_ingress_payload(payload),
+        )
+    except (
+        ProtocolError,
+        TypeError,
+        ValueError,
+        OverflowError,
+        RecursionError,
+        RuntimeError,
+    ):
+        # Input is untrusted and its representation can contain a webhook
+        # credential.  The public boundary turns every validation detail into
+        # the one generic error after it has cleared its own arguments.
+        return None
+
+
+def _consume_host_ingress_operation(
+    operation: asyncio.Task[Any],
+) -> bool:
+    """Consume a worker terminal exception and report whether it returned."""
+
+    if operation.cancelled():
+        return False
+    try:
+        operation.result()
+    except asyncio.CancelledError:
+        return False
+    except BaseException:  # noqa: BLE001 - consume every terminal worker failure
+        # ``result()`` is deliberately called even after ``shield`` observed
+        # the error: it consumes every terminal task exception so asyncio never
+        # reports an unhandled shield-future failure during caller cancellation.
+        return False
+    return True
+
+
+async def _wait_for_host_ingress_operation(
+    operation: asyncio.Task[Any],
+    outcome_slot: _HostIngressOutcomeSlot,
+) -> tuple[_HostIngressOutcome, tuple[Any, ...] | None]:
+    """Drain a shielded worker and remember only caller-originated cancel.
+
+    A child-side ``CancelledError`` propagates from the shielded worker without
+    marking the caller task as cancelling.  A cancellation directed at the
+    public caller does mark it, and must win even if the child later succeeds
+    or fails while we drain it.  Repeated cancellation is consumed here so the
+    traffic admission cannot be abandoned midway through cleanup.
+    """
+
+    caller = asyncio.current_task()
+    caller_cancel_args: tuple[Any, ...] | None = None
+    while not operation.done():
+        try:
+            await asyncio.shield(operation)
+        except asyncio.CancelledError as error:
+            if caller is not None and caller.cancelling():
+                if caller_cancel_args is None:
+                    caller_cancel_args = tuple(error.args)
+                continue
+            # The worker's child/RPC cancellation is a terminal worker result,
+            # not a cancellation request against this public caller.
+            break
+        except BaseException:  # noqa: BLE001 - discard worker traceback at boundary
+            # Always retrieve the terminal exception below rather than letting
+            # a task traceback become the public ingress traceback.
+            break
+    if _consume_host_ingress_operation(operation):
+        outcome = outcome_slot.take()
+    else:
+        # A task which failed outside the worker must not leave a result in a
+        # slot held by its public caller.
+        outcome_slot.take()
+        outcome = _HostIngressOutcome(_HOST_INGRESS_GENERIC_FAILURE)
+    if caller_cancel_args is not None:
+        # A completed worker can carry a successful response even though a
+        # caller cancellation won while its shield was being drained.  Never
+        # return that response through the public cancellation path: exception
+        # tracebacks retain every caller frame and could otherwise reach
+        # ``outcome.payload`` despite the dataclass's redacted repr.
+        outcome = _HostIngressOutcome(_HOST_INGRESS_CANCELLED)
+    return outcome, caller_cancel_args
+
+
+def _deliver_host_ingress_outcome(
+    outcome: _HostIngressOutcome,
+    caller_cancel_args: tuple[Any, ...] | None,
+) -> HostIngressPayload:
+    """Raise public errors from a frame that has no request/client locals."""
+
+    if caller_cancel_args is not None:
+        raise asyncio.CancelledError(*caller_cancel_args)
+    if outcome.status == _HOST_INGRESS_SUCCESS:
+        return outcome.payload
+    if outcome.status == _HOST_INGRESS_UNSUPPORTED:
+        raise HostIngressUnsupportedError("host ingress is not supported")
+    if outcome.status == _HOST_INGRESS_UNKNOWN_NAME:
+        raise HostIngressUnknownNameError("host ingress name is not available")
+    if outcome.status == _HOST_INGRESS_TERMINAL:
+        raise HostIngressError("host ingress is unavailable")
+    if outcome.status == _HOST_INGRESS_CANCELLED:
+        raise asyncio.CancelledError()
+    raise HostIngressError("host ingress failed")
 
 
 def _utc_now() -> datetime:
@@ -644,12 +1471,67 @@ class ProxyFeature(Feature):
         # caller cancellation cannot strand a second cleanup behind
         # ``_reload_lock`` after the first caller has unwound.
         self._terminal_cleanup_task: Optional[asyncio.Task[None]] = None
+        # Terminal retirement has a narrower ownership domain than a reload:
+        # an owner which already holds ``_reload_lock`` must be able to finish
+        # its terminal fence without waiting for a shared cleanup that is
+        # itself waiting for that lock.  This lock therefore serializes only
+        # exact-client ``stop()`` calls.  It is deliberately never held while
+        # awaiting ``_reload_lock``, gate drain, or a supervisor task; that
+        # ordering prevents a shutdown/supervisor lock cycle while ensuring
+        # two cleanup owners cannot stop the same facade concurrently.
+        self._terminal_retirement_lock = asyncio.Lock()
+        # A client is unpublished before terminal retirement starts.  If a
+        # non-SDK facade raises from ``stop()`` before it has actually
+        # terminated a wedged RPC, keeping only the public client slot would
+        # lose the sole retry/fencing handle.  Retain exact identities here
+        # until their stop path reports completion; they never become traffic
+        # visible again.
+        self._terminal_retirement_clients: list[Any] = []
+        # A facade that actively suppresses the timeout cancellation cannot be
+        # force-killed by asyncio. Keep that still-running task explicitly
+        # owned until its done callback consumes the outcome; this is a
+        # fail-closed fence, never detached background work.
+        self._terminal_lifecycle_tasks: list[_TrackedFacadeLifecycleTask] = []
+        # A health supervisor can complete an exact stop, then be cancelled in
+        # the narrow backoff window before it restarts that same facade.  Keep
+        # that completion ownership by identity so terminal cleanup unpublishes
+        # and drains the known-stopped facade without issuing a second stop.
+        # A completion marker proves that a supervisor already stopped this
+        # exact facade in its backoff window.  It is consumed before a later
+        # start or terminal cleanup.  Ordinary facades use weak markers;
+        # non-weakrefable facades use a short-lived exact strong marker rather
+        # than an ``id`` map that could confuse object-identity reuse.
+        self._terminal_stop_completed_client_markers: list[
+            _TerminalStopCompletionMarker
+        ] = []
+        # A dishonest legacy facade can report stop success while a previously
+        # admitted RPC never settles.  Keep the one sealed drain task owned so
+        # its eventual outcome is consumed; never claim terminal success or
+        # reopen/release the retained lifecycle state before then.
+        self._terminal_traffic_drain_task: Optional[asyncio.Task[None]] = None
+        # ``health()`` is also facade work.  The supervisor owns its exact task
+        # from creation, letting a concurrent terminal cleanup cancel/fence it
+        # before the supervisor itself runs its cancellation handler. A
+        # cancellation-resistant probe retains tenant credentials and request
+        # state until this completion callback consumes its outcome. One
+        # supervisor issues probes serially, hence one slot.
+        self._terminal_health_probe_task: Optional[asyncio.Task[Any]] = None
+        # A neutral cleanup task never exports an adapter/facade exception.
+        # Record only that its state transition became uncertain so an explicit
+        # caller cannot report success until a later clean attempt settles.
+        self._terminal_cleanup_uncertain = False
         # Shutdown and quarantine make the current enable cycle terminal.  A
         # durable config repair remains allowed while soft-disabled, but no
         # normal reconciliation may build or publish another child until an
         # explicit later ``initialize()`` begins a fresh cycle.
         self._terminal_lifecycle_latched = False
         self._stopping = False
+        # Every terminal request invalidates an initializer that has not yet
+        # acquired ``_reload_lock``.  A re-enable may clear only the terminal
+        # cycle it observed *after* cleanup; a shutdown racing in that queue
+        # must keep its newer seal rather than being overwritten by stale
+        # initialization state.
+        self._terminal_lifecycle_generation = 0
         # Coordinate ``set_config``'s reload with the health supervisor so they
         # never stop/start the client concurrently. ``_reloading`` skips probes
         # during a reload; ``_reload_lock`` serializes the actual stop/start of
@@ -967,8 +1849,28 @@ class ProxyFeature(Feature):
         published state before reporting *any* failure to the caller.
         """
 
+        # A prior terminal stop failure leaves the proxy sealed with a private
+        # retirement handle.  Do not begin a fresh enable cycle beside that
+        # still-live child: retry its bounded stop path first, or report the
+        # outstanding retirement failure honestly to the explicit initializer.
+        enable_generation = self._terminal_lifecycle_generation
+        if (
+            self._terminal_lifecycle_latched
+            or self._terminal_cleanup_task is not None
+            or self._terminal_retirement_clients
+            or self._has_running_terminal_health_probe_task()
+            or self._terminal_cleanup_uncertain
+        ):
+            # Initialization may retry a previously failed retirement, but it
+            # never does so as a non-terminal side path.  Revoking a fresh
+            # generation before joining the cleanup preserves the same
+            # synchronous ordering edge as shutdown/quarantine against another
+            # initializer queued on ``_reload_lock``.
+            enable_generation = self._latch_terminal_lifecycle()
+            await self._complete_terminal_cleanup()
+
         task = asyncio.create_task(
-            self._initialize_uninterrupted(),
+            self._initialize_uninterrupted(enable_generation),
             name=f"isolated-initialize:{self.name}",
         )
         try:
@@ -980,10 +1882,14 @@ class ProxyFeature(Feature):
             await self._quarantine_unreconciled_client()
             raise
 
-    async def _initialize_uninterrupted(self) -> None:
+    async def _initialize_uninterrupted(self, terminal_generation: int) -> None:
         """Build and publish a fresh child while holding lifecycle ownership."""
 
         async with self._reload_lock:
+            if terminal_generation != self._terminal_lifecycle_generation:
+                raise _TerminalLifecyclePermitRevoked(
+                    "isolated feature terminal lifecycle changed during initialize"
+                )
             # A completed shutdown/quarantine transaction belongs to the old
             # enable cycle.  A later explicit initialize gets a fresh terminal
             # transaction if this new cycle subsequently fails.
@@ -1019,6 +1925,21 @@ class ProxyFeature(Feature):
             self._assert_child_start_allowed()
             self._supervision_task = self._start_supervision()
 
+    def _latch_terminal_lifecycle(self) -> int:
+        """Record one terminal intent and revoke queued initialization permits.
+
+        Latching is synchronous by design: it is the ordering edge between a
+        terminal caller and an initializer waiting to acquire ``_reload_lock``.
+        Increment even when a prior terminal cycle is already latched, because
+        an explicit shutdown in that state is still newer than any permit a
+        re-enable captured from the older completed cycle.
+        """
+
+        self._terminal_lifecycle_generation += 1
+        self._terminal_lifecycle_latched = True
+        self._stopping = True
+        return self._terminal_lifecycle_generation
+
     async def _run_traffic_gate_operation(
         self,
         operation: Awaitable[None],
@@ -1046,6 +1967,14 @@ class ProxyFeature(Feature):
             name="close",
         )
 
+    async def _close_traffic_gate_admission(self) -> None:
+        """Close admission without draining an unhealthy child's RPCs."""
+
+        await self._run_traffic_gate_operation(
+            self._traffic_gate.close(),
+            name="close-admission",
+        )
+
     async def _reopen_traffic_gate(self) -> None:
         await self._run_traffic_gate_operation(
             self._traffic_gate.reopen(),
@@ -1054,9 +1983,36 @@ class ProxyFeature(Feature):
 
     async def _seal_traffic_gate(self) -> None:
         await self._run_traffic_gate_operation(
-            self._traffic_gate.seal_and_drain(),
+            self._traffic_gate.seal(),
             name="seal",
         )
+
+    async def _drain_traffic_gate(self) -> None:
+        """Bound terminal traffic drain without detaching its exact ownership."""
+
+        task = self._terminal_traffic_drain_task
+        if task is None:
+            task = asyncio.create_task(
+                self._traffic_gate.drain(),
+                name=f"isolated-traffic-drain:{self.name}",
+            )
+            self._terminal_traffic_drain_task = task
+
+            def release(completed_task: asyncio.Task[None]) -> None:
+                _consume_late_lifecycle_task_outcome(completed_task)
+                if self._terminal_traffic_drain_task is completed_task:
+                    self._terminal_traffic_drain_task = None
+
+            task.add_done_callback(release)
+
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task), timeout=_TERMINAL_TRAFFIC_DRAIN_TIMEOUT
+            )
+        except asyncio.TimeoutError as exc:
+            raise _TerminalTrafficDrainTimedOut(
+                "isolated feature traffic did not drain after stop"
+            ) from exc
 
     async def _reset_traffic_gate_after_initialize(self) -> None:
         await self._run_traffic_gate_operation(
@@ -1098,9 +2054,13 @@ class ProxyFeature(Feature):
             await self._register_event_handler(client)
         except BaseException:
             # A client whose event registration failed must not remain
-            # reachable through host tools while its caller unwinds.
-            self._unpublish_client(client)
-            await self._retire_detached_client(client)
+            # reachable through host tools while its caller unwinds.  Shutdown
+            # may already have unpublished and retired this exact client while
+            # registration was awaited; only the caller that actually removed
+            # it from publication owns this additional retirement attempt.
+            unpublished_client = self._unpublish_client(client)
+            if unpublished_client is client:
+                await self._retire_detached_client(unpublished_client)
             raise
         # Registration is an awaited post-publication operation.  Shutdown may
         # have latched while it was in flight and be waiting for this lifecycle
@@ -1185,17 +2145,368 @@ class ProxyFeature(Feature):
         self._tools = []
         return client
 
-    async def _retire_detached_client(self, client: Any) -> None:
-        """Stop a child which was never published to the host."""
+    async def _retire_detached_client(self, client: Any) -> bool:
+        """Attempt neutral retirement of a child which was never published.
 
+        Startup and registration failures still need the exact child handle if
+        a hostile facade raises before its RPC/process is truly terminal.  The
+        caller's original failure remains its own public result; this helper
+        only records whether a later terminal cleanup must retry the child.
+        """
+
+        self._retain_terminal_retirement_client(client)
+        return await self._retire_terminal_clients()
+
+    def _retain_terminal_retirement_client(self, client: Any) -> None:
+        """Keep one unpublished client reachable until terminal stop succeeds.
+
+        Identity, rather than equality, is the lifecycle fence: an application
+        facade may implement hostile or stateful equality, and terminal cleanup
+        must retry the exact selected client rather than whatever a later
+        lifecycle operation happens to publish.
+        """
+
+        if client is None:
+            return
+        if not any(
+            candidate is client for candidate in self._terminal_retirement_clients
+        ):
+            self._terminal_retirement_clients.append(client)
+
+    def _release_terminal_retirement_client(self, client: Any) -> None:
+        """Forget only the exact client whose terminal stop completed."""
+
+        self._terminal_retirement_clients = [
+            candidate
+            for candidate in self._terminal_retirement_clients
+            if candidate is not client
+        ]
+
+    def _new_terminal_stop_completion_marker(
+        self, client: Any
+    ) -> _TerminalStopCompletionMarker | None:
+        """Build one identity-safe supervisor stop-completion marker."""
+
+        if client is None:
+            return None
         try:
-            await _maybe_await(client.stop())
-        except BaseException:
-            logger.error(
-                "Isolated feature %s could not stop its detached client",
-                self.name,
+            return _TerminalStopCompletionMarker(weak_client=weakref.ref(client))
+        except TypeError:
+            # A non-weakrefable facade needs a strong reference only while its
+            # exact completion disposition is unresolved.  The marker is
+            # removed on restart, terminal retirement, or failed stop.
+            return _TerminalStopCompletionMarker(strong_client=client)
+
+    def _begin_terminal_stop_completion(
+        self, client: Any
+    ) -> _TerminalStopCompletionMarker | None:
+        """Register a supervisor stop before its completion callback can race."""
+
+        marker = self._new_terminal_stop_completion_marker(client)
+        if marker is not None:
+            self._terminal_stop_completed_client_markers.append(marker)
+        return marker
+
+    def _discard_terminal_stop_completion(
+        self, marker: _TerminalStopCompletionMarker | None
+    ) -> None:
+        """Drop one abandoned in-flight completion ownership record."""
+
+        if marker is None:
+            return
+        self._terminal_stop_completed_client_markers = [
+            candidate
+            for candidate in self._terminal_stop_completed_client_markers
+            if candidate is not marker
+        ]
+
+    def _fence_terminal_stop_completion_timeout(
+        self,
+        client: Any,
+        marker: _TerminalStopCompletionMarker | None,
+    ) -> None:
+        """Discard an abandoned completion record before fencing its facade."""
+
+        self._discard_terminal_stop_completion(marker)
+        self._fence_terminal_retirement_timeout(client)
+
+    def _mark_terminal_stop_completed(
+        self, marker_or_client: _TerminalStopCompletionMarker | Any,
+    ) -> None:
+        """Finish a registered stop, or record a direct completed stop for tests.
+
+        A registered marker is the only supervisor callback path.  If terminal
+        cleanup claimed it while stop was in flight, completion releases that
+        cleanup's retained exact client and disappears; it must not leave a
+        marker that could be consumed by a later reuse of the same facade.
+        """
+
+        if isinstance(marker_or_client, _TerminalStopCompletionMarker):
+            marker = marker_or_client
+            if not any(
+                candidate is marker
+                for candidate in self._terminal_stop_completed_client_markers
+            ):
+                return
+            client = marker.client()
+            if marker.terminal_retirement_claimed:
+                self._release_terminal_retirement_client(client)
+                self._discard_terminal_stop_completion(marker)
+                return
+            marker.completed = True
+            return
+
+        # Preserve the narrow direct helper used by focused identity tests.
+        # Production supervisor stops always use the registered path above.
+        client = marker_or_client
+        self._forget_terminal_stop_completion(client)
+        marker = self._new_terminal_stop_completion_marker(client)
+        if marker is not None:
+            marker.completed = True
+            self._terminal_stop_completed_client_markers.append(marker)
+
+    def _forget_terminal_stop_completion(
+        self,
+        client: Any,
+        *,
+        terminal_retirement: bool = False,
+    ) -> bool:
+        """Consume a completed stop or claim its in-flight terminal handoff.
+
+        A terminal caller that arrives while the supervisor owns ``stop()``
+        keeps the pending marker alive and retains the exact client.  The
+        callback then releases that retention rather than recreating a stale
+        completion marker after this cleanup pass has already consumed it.
+        Non-terminal restart paths revoke any pending/completed marker so it
+        cannot apply to a facade reused by a new lifecycle generation.
+        """
+
+        found = False
+        retained_markers: list[_TerminalStopCompletionMarker] = []
+        for marker in self._terminal_stop_completed_client_markers:
+            marked_client = marker.client()
+            if marked_client is None:
+                # Dead marker cannot identify any future object, including an
+                # object which happens to reuse its former id().
+                continue
+            if marked_client is not client:
+                retained_markers.append(marker)
+                continue
+            if marker.completed:
+                found = True
+                continue
+            if terminal_retirement:
+                marker.terminal_retirement_claimed = True
+                retained_markers.append(marker)
+            # A normal restart revokes an in-flight marker. Its callback may
+            # no longer affect this facade's next lifecycle generation.
+        self._terminal_stop_completed_client_markers = retained_markers
+        return found
+
+    def _fence_terminal_retirement_timeout(self, client: Any) -> None:
+        """Retain an exact facade whose bounded stop outcome is uncertain."""
+
+        self._retain_terminal_retirement_client(client)
+        self._terminal_cleanup_uncertain = True
+
+    def _retain_terminal_lifecycle_task(
+        self,
+        task: asyncio.Task[Any],
+        client: Any,
+    ) -> None:
+        """Own a still-running exact facade task until it is consumed.
+
+        The task is registered before its timeout caller is released. Its own
+        stop coroutine retains the exact client while running; this record
+        stores only a weak identity marker, avoiding a second secret-bearing
+        client reference while still preventing a concurrent retry.
+        """
+
+        if any(candidate.task is task for candidate in self._terminal_lifecycle_tasks):
+            return
+        try:
+            client_ref: weakref.ReferenceType[Any] | None = weakref.ref(client)
+        except TypeError:
+            client_ref = None
+        ownership = _TrackedFacadeLifecycleTask(task, id(client), client_ref)
+        self._terminal_lifecycle_tasks.append(ownership)
+
+        def release(completed_task: asyncio.Task[Any]) -> None:
+            _consume_late_lifecycle_task_outcome(completed_task)
+            self._terminal_lifecycle_tasks = [
+                candidate
+                for candidate in self._terminal_lifecycle_tasks
+                if candidate.task is not completed_task
+            ]
+
+        task.add_done_callback(release)
+
+    def _own_health_probe_task(self, task: asyncio.Task[Any]) -> None:
+        """Own one exact health task from creation until its outcome is consumed.
+
+        The task itself retains the exact facade while its bound ``health``
+        coroutine is running.  Retaining only the task avoids a second
+        credential-bearing facade reference, while the completion callback
+        consumes exceptions and drops that final reference promptly.
+        """
+
+        if task.done():
+            _consume_late_lifecycle_task_outcome(task)
+            return
+        if self._terminal_health_probe_task is task:
+            return
+        if self._terminal_health_probe_task is not None:
+            raise RuntimeError("isolated feature already owns a live health probe")
+        self._terminal_health_probe_task = task
+
+        def release(completed_task: asyncio.Task[Any]) -> None:
+            _consume_late_lifecycle_task_outcome(completed_task)
+            if self._terminal_health_probe_task is completed_task:
+                self._terminal_health_probe_task = None
+
+        task.add_done_callback(release)
+
+    def _retain_terminal_health_probe_task(self, task: asyncio.Task[Any]) -> None:
+        """Mark a still-running owned health task as terminally incomplete."""
+
+        self._own_health_probe_task(task)
+        if not task.done():
+            self._terminal_cleanup_uncertain = True
+
+    def _has_running_terminal_health_probe_task(self) -> bool:
+        """Return whether terminal state still owns an unsettled health call."""
+
+        task = self._terminal_health_probe_task
+        if task is None:
+            return False
+        if not task.done():
+            return True
+        _consume_late_lifecycle_task_outcome(task)
+        if self._terminal_health_probe_task is task:
+            self._terminal_health_probe_task = None
+        return False
+
+    async def _cancel_terminal_health_probe(self) -> bool:
+        """Request and boundedly acknowledge terminal health-probe cancellation.
+
+        This is deliberately outside reload and retirement locks. A direct
+        shutdown gets the same short cooperative acknowledgement afforded to
+        facade lifecycle work; an agent fair-share cancellation interrupts the
+        shared cleanup while the exact task remains attached to this proxy.
+        """
+
+        task = self._terminal_health_probe_task
+        if task is None:
+            return True
+        if task.done():
+            self._has_running_terminal_health_probe_task()
+            return True
+
+        task.cancel()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _HEALTH_PROBE_CANCELLATION_GRACE
+        while not task.done():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                self._terminal_cleanup_uncertain = True
+                return False
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+            except asyncio.CancelledError:
+                if task.done() and task.cancelled():
+                    break
+                self._terminal_cleanup_uncertain = True
+                raise
+            except asyncio.TimeoutError:
+                continue
+
+        self._has_running_terminal_health_probe_task()
+        return True
+
+    def _has_running_terminal_lifecycle_task(self, client: Any) -> bool:
+        """Whether a prior exact stop still owns this facade's process handle."""
+
+        running = False
+        retained_tasks: list[_TrackedFacadeLifecycleTask] = []
+        for ownership in self._terminal_lifecycle_tasks:
+            task = ownership.task
+            if task.done():
+                _consume_late_lifecycle_task_outcome(task)
+                continue
+            marked_client = (
+                ownership.client_ref() if ownership.client_ref is not None else None
             )
-            raise
+            # A weak marker gives exact identity. For a non-weakrefable facade,
+            # its still-running bound stop coroutine necessarily retains the
+            # object, so an equal id cannot yet be reused.
+            if marked_client is client or (
+                ownership.client_ref is None and ownership.client_id == id(client)
+            ):
+                running = True
+            retained_tasks.append(ownership)
+        self._terminal_lifecycle_tasks = retained_tasks
+        return running
+
+    async def _retire_terminal_clients(self) -> bool:
+        """Attempt exact retained-client retirement without public policy.
+
+        This is the only shared terminal ``stop()`` path.  It catches every
+        stop-side ``BaseException`` so the shared task never stores an
+        untrusted exception object or lets the first caller's reporting policy
+        choose another caller's result.  A failed stop leaves its exact handle
+        retained and returns ``False``; no caller may drain traffic from that
+        uncertain child.  A later cleanup attempt retries independently.
+        """
+
+        async with self._terminal_retirement_lock:
+            # A detached startup can retain another client while an existing
+            # stop is awaited.  Keep selecting from the live identity list so
+            # a successful pass cannot report retirement while that late exact
+            # handle is still waiting behind this lock.
+            while self._terminal_retirement_clients:
+                client = self._terminal_retirement_clients[0]
+                if self._has_running_terminal_lifecycle_task(client):
+                    # A timeout caller was released only after registering
+                    # this exact running stop. Retrying beside it could race
+                    # the facade's sole subprocess handle, so remain sealed
+                    # and require its completion before a fresh retry.
+                    self._terminal_cleanup_uncertain = True
+                    return False
+                try:
+                    await _await_owned_facade_lifecycle_operation(
+                        client.stop(),
+                        name=f"isolated-terminal-stop:{self.name}",
+                        on_completed=lambda client=client: self._release_terminal_retirement_client(
+                            client
+                        ),
+                        on_timeout=lambda client=client: self._fence_terminal_retirement_timeout(
+                            client
+                        ),
+                        on_late_task=lambda task, client=client: self._retain_terminal_lifecycle_task(
+                            task, client
+                        ),
+                    )
+                except asyncio.CancelledError:
+                    # The owned stop task has already reached its terminal
+                    # process state.  Let the caller replay its original
+                    # cancellation rather than rewriting it as a stop failure.
+                    raise
+                except _FacadeLifecycleOperationTimedOut:
+                    logger.error(
+                        "Isolated feature %s terminal stop exceeded its bounded "
+                        "facade lifecycle budget; the proxy remains sealed for retry",
+                        self.name,
+                    )
+                    return False
+                except BaseException:  # noqa: BLE001 - hostile stop can raise non-Exception
+                    self._terminal_cleanup_uncertain = True
+                    logger.error(
+                        "Isolated feature %s could not stop its terminal client; "
+                        "the proxy remains sealed for retry",
+                        self.name,
+                    )
+                    return False
+        return True
 
     async def reload(self) -> None:
         """Restart the isolated service so the current ``_host_config`` takes
@@ -1266,11 +2577,34 @@ class ProxyFeature(Feature):
         # stop failure gives terminal quarantine one last best-effort retirement
         # handle; it never restores its tools or channel bridge.
         previous_client = self._unpublish_client()
+        previous_stop_completed = False
         if previous_client is not None:
+            def remember_previous_stop() -> None:
+                nonlocal previous_stop_completed
+
+                previous_stop_completed = True
+
             try:
-                await _maybe_await(previous_client.stop())
+                await _await_owned_facade_lifecycle_operation(
+                    previous_client.stop(),
+                    name=f"isolated-replace-stop:{self.name}",
+                    on_completed=remember_previous_stop,
+                    on_timeout=lambda previous_client=previous_client: self._fence_terminal_retirement_timeout(
+                        previous_client
+                    ),
+                    on_late_task=lambda task, previous_client=previous_client: self._retain_terminal_lifecycle_task(
+                        task, previous_client
+                    ),
+                )
             except BaseException:
-                self._client = previous_client
+                # The helper replays caller cancellation after recording a
+                # successful exact stop.  Such a facade is irreversibly
+                # retired: restoring it would republish stale tools and the
+                # ensuing quarantine would issue a duplicate stop.  A failed
+                # or incomplete stop remains intentionally restorable so the
+                # terminal path keeps its exact retry handle.
+                if not previous_stop_completed:
+                    self._client = previous_client
                 raise
         await self._connect_client(
             config,
@@ -1280,9 +2614,47 @@ class ProxyFeature(Feature):
     async def shutdown(self):
         # Set the latch before scheduling the transaction so a health probe
         # cannot decide to restart the child in the tiny interval before seal.
-        self._terminal_lifecycle_latched = True
-        self._stopping = True
+        self._latch_terminal_lifecycle()
         await self._complete_terminal_cleanup()
+
+    def prepare_shutdown_with_agent_deadline(self) -> None:
+        """Synchronously establish terminal ownership for agent shutdown.
+
+        ``asyncio.wait_for(..., timeout=0)`` may cancel a coroutine before its
+        body runs.  The agent calls this synchronous preparation hook before
+        applying its fair-share timeout, so the terminal latch and one owned
+        cleanup task exist even when this proxy receives no execution slice.
+        """
+
+        self._latch_terminal_lifecycle()
+        self._terminal_cleanup_uncertain = False
+        task = self._terminal_cleanup_task
+        if task is None or task.done():
+            self._terminal_cleanup_task = asyncio.create_task(
+                self._terminal_cleanup_uninterrupted(lifecycle_lock_held=False),
+                name=f"isolated-terminal-cleanup:{self.name}",
+            )
+
+    async def shutdown_with_agent_deadline(self) -> None:
+        """Shutdown under KestrelAgent's bounded fair-share lifecycle owner.
+
+        The agent's ``wait_for`` remains the sole deadline authority.  If it
+        expires, ``_terminal_cleanup_task`` stays owned by this proxy and can
+        finish the SDK's documented subprocess retirement path independently;
+        the feature sweep can still continue to later features and its durable
+        tail without detaching that exact process handle.
+        """
+
+        # Direct callers retain the normal shutdown contract.  KestrelAgent
+        # has already prepared the shared task synchronously before it applies
+        # its fair-share timeout.
+        if self._terminal_cleanup_task is None:
+            self.prepare_shutdown_with_agent_deadline()
+        token = _AGENT_SHUTDOWN_DEADLINE_ACTIVE.set(True)
+        try:
+            await self._complete_terminal_cleanup()
+        finally:
+            _AGENT_SHUTDOWN_DEADLINE_ACTIVE.reset(token)
 
     async def _complete_terminal_cleanup(
         self,
@@ -1290,16 +2662,24 @@ class ProxyFeature(Feature):
         best_effort: bool = False,
         lifecycle_lock_held: bool = False,
     ) -> None:
-        """Finish terminal teardown before propagating caller cancellation.
+        """Finish neutral teardown, then apply this caller's own policy.
 
-        The task remains owned by this proxy while it waits on ``_reload_lock``.
-        Shielded waiting is intentional: a cancellation is returned only after
-        the gate is sealed, supervision is settled, and publication/retirement
-        have reached their final state.
+        The shared/owned task records only terminal state: exact retained
+        clients, publication fences, and gate state.  It never propagates a
+        facade ``stop()`` exception.  Once it settles, explicit lifecycle
+        callers independently reject incomplete retirement while best-effort
+        quarantine/supervisor callers preserve their original error or
+        cancellation.  The shared task remains owned if an external caller
+        reaches its deadline, so whole-agent shutdown can continue without
+        cancelling an SDK stop coroutine that owns a process handle.
         """
 
-        self._terminal_lifecycle_latched = True
-        self._stopping = True
+        # An explicit lifecycle caller is a new bounded retirement attempt. A
+        # best-effort supervisor/quarantine cleanup that just fenced a facade
+        # timeout must instead preserve uncertainty and return promptly.
+        if not best_effort:
+            self._terminal_cleanup_uncertain = False
+
         if lifecycle_lock_held:
             # A set-config/reload owner cannot await the shared terminal task:
             # that task may already be waiting behind this very lock (for
@@ -1310,68 +2690,182 @@ class ProxyFeature(Feature):
             # a lock cycle.
             task = asyncio.create_task(
                 self._terminal_cleanup_uninterrupted(
-                    best_effort=best_effort,
                     lifecycle_lock_held=True,
                 ),
                 name=f"isolated-terminal-cleanup-owned:{self.name}",
             )
+            # This owner-local task is not stored on the proxy.  It must drain
+            # through cancellation; only the shared task in the branch below
+            # can safely be handed back to KestrelAgent's deadline owner.
             await _await_task_until_complete(task, preserve_cancellation=False)
-            return
+        else:
+            task = self._terminal_cleanup_task
+            if task is None or task.done():
+                task = asyncio.create_task(
+                    self._terminal_cleanup_uninterrupted(
+                        lifecycle_lock_held=False,
+                    ),
+                    name=f"isolated-terminal-cleanup:{self.name}",
+                )
+                self._terminal_cleanup_task = task
+            try:
+                await _await_task_until_complete(
+                    task,
+                    preserve_cancellation=False,
+                    settle_on_cancellation=not _AGENT_SHUTDOWN_DEADLINE_ACTIVE.get(),
+                )
+            finally:
+                # A settled shared task has no policy-bearing result and must
+                # not become a stale lifecycle handle.  A later explicit call
+                # creates a fresh neutral attempt if any exact client remains.
+                if self._terminal_cleanup_task is task and task.done():
+                    self._terminal_cleanup_task = None
 
-        task = self._terminal_cleanup_task
-        if task is None or task.done():
-            task = asyncio.create_task(
-                self._terminal_cleanup_uninterrupted(
-                    best_effort=best_effort,
-                    lifecycle_lock_held=False,
-                ),
-                name=f"isolated-terminal-cleanup:{self.name}",
-            )
-            self._terminal_cleanup_task = task
-        await _await_task_until_complete(task, preserve_cancellation=False)
+        if not best_effort and (
+            self._terminal_cleanup_uncertain
+            or self._terminal_retirement_clients
+            or self._has_running_terminal_health_probe_task()
+            or self._traffic_gate._active
+            or self._terminal_traffic_drain_task is not None
+        ):
+            # Do not expose a hostile facade's message/type/traceback.  This
+            # fresh public lifecycle error says only that the sealed proxy has
+            # not reached a state in which success would be honest.
+            raise RuntimeError("isolated feature terminal retirement is incomplete")
 
     async def _terminal_cleanup_uninterrupted(
         self,
         *,
-        best_effort: bool,
         lifecycle_lock_held: bool,
     ) -> None:
-        """Seal, serialize, unpublish, and retire without caller interruption."""
+        """Run one shared cleanup attempt without exporting external failures.
 
-        self._stopping = True
+        A task stores its exception object and traceback until its consumer
+        retrieves it.  Terminal cleanup is a shared private task, so even an
+        unexpected facade/adapter/supervisor failure must become retained
+        lifecycle state rather than a secret-bearing task result.  The caller
+        decides whether that incomplete state is a public lifecycle failure.
+        """
+
+        try:
+            await self._terminal_cleanup_attempt(
+                lifecycle_lock_held=lifecycle_lock_held,
+            )
+        except BaseException:  # noqa: BLE001 - shared task must not retain facade failures
+            # If unpublication itself failed, the sealed public slot is still
+            # the only exact retry handle.  Retaining by identity is harmless
+            # when a prior phase already unpublished it.
+            self._retain_terminal_retirement_client(self._client)
+            self._terminal_cleanup_uncertain = True
+            logger.error(
+                "Isolated feature %s could not complete terminal cleanup; "
+                "the proxy remains sealed for retry",
+                self.name,
+            )
+
+    async def _terminal_cleanup_attempt(
+        self,
+        *,
+        lifecycle_lock_held: bool,
+    ) -> None:
+        """Seal, unpublish, stop, and drain without caller interruption.
+
+        A terminal operation differs from reload/config transitions: it must
+        not wait for healthy admitted work, because an admitted JSON-RPC call
+        can be permanently wedged in the child.  Seal first, detach the exact
+        published client, start its bounded SDK stop path, then drain the
+        terminal RPC before completing lifecycle serialization.
+        """
+
         # Seal before lifecycle ownership so finite-transition waiters become
         # terminal even while another reload currently holds the lock.
         await self._seal_traffic_gate()
-        async def unpublish_and_retire() -> None:
-            supervision_task = self._supervision_task
-            if supervision_task is not None:
-                self._supervision_task = None
-                if supervision_task is not asyncio.current_task():
-                    supervision_task.cancel()
-                    try:
-                        await supervision_task
-                    except asyncio.CancelledError:
-                        pass
 
-            client = self._unpublish_client()
-            if client is None:
-                return
-            try:
-                await _maybe_await(client.stop())
-            except BaseException:
-                if not best_effort:
-                    raise
-                logger.error(
-                    "Isolated feature %s could not stop its unreconciled client; "
-                    "the proxy has been quarantined",
-                    self.name,
-                )
+        supervision_task = self._supervision_task
+        if supervision_task is not None:
+            self._supervision_task = None
+            if supervision_task is not asyncio.current_task():
+                # Do not wait here: the supervisor may currently hold the
+                # reload lock while it drains the very RPC we must terminate.
+                supervision_task.cancel()
 
-        if lifecycle_lock_held:
-            await unpublish_and_retire()
+        # This is intentionally outside ``_reload_lock``. A finite transition
+        # can hold that lock while waiting for an admitted call; waiting behind
+        # it would recreate the seal-and-drain deadlock. The terminal latch and
+        # sealed gate fence publication, while unpublishing is synchronous.
+        client = self._unpublish_client()
+        already_stopped = self._forget_terminal_stop_completion(
+            client, terminal_retirement=True
+        )
+        if not already_stopped:
+            self._retain_terminal_retirement_client(client)
+        health_probe_running = self._has_running_terminal_health_probe_task()
+        if health_probe_running and not self._terminal_cleanup_uncertain:
+            health_probe_running = not await self._cancel_terminal_health_probe()
+        if self._terminal_cleanup_uncertain or health_probe_running:
+            # A bounded facade stop did not establish whether its child retired,
+            # or a cancellation-resistant health call still owns the facade.
+            # Keep the exact private handle and leave admitted RPCs undrained:
+            # waiting for them could recreate the very hang the stop fence
+            # avoided. A later explicit lifecycle call gets a fresh bounded
+            # retry; this terminal path reports no false success or reopen.
+            self._terminal_cleanup_uncertain = True
             return
-        async with self._reload_lock:
-            await unpublish_and_retire()
+        if not await self._retire_terminal_clients():
+            # Do not drain beneath a stop failure: a hostile facade can raise
+            # while its admitted RPC is still wedged.  The retained exact
+            # handle makes a later terminal attempt bounded and recoverable.
+            return
+
+        async def retire_late_publication() -> bool:
+            # A detached candidate checks the terminal latch before publish,
+            # but this final fence also covers a client published just before
+            # shutdown latched while its registration await was in flight.
+            late_client = self._unpublish_client()
+            if not self._forget_terminal_stop_completion(
+                late_client, terminal_retirement=True
+            ):
+                self._retain_terminal_retirement_client(late_client)
+            return await self._retire_terminal_clients()
+
+        # Keep the retirement lock out of every wait below.  A supervisor can
+        # hold ``_reload_lock`` while cancellation sends it through an owned
+        # cleanup; that owner may await this narrow stop lock.  This shared
+        # cleanup releases it before awaiting ``_reload_lock``, and both paths
+        # release it before gate drain or supervisor join, so there is no
+        # reload/retirement/drain cycle.
+        if lifecycle_lock_held:
+            late_retired = await retire_late_publication()
+        else:
+            async with self._reload_lock:
+                late_retired = await retire_late_publication()
+
+        if not late_retired:
+            return
+
+        # SDK stop owns the bounded shutdown/terminate/kill path. Only after
+        # every pre-existing and late-published client has completed stop may
+        # we *boundedly* wait for an admitted host call to release the gate.
+        # A legacy facade that lied about stop success leaves the sealed drain
+        # task attached and makes this attempt incomplete rather than hanging
+        # the whole-agent lifecycle or reporting false success.
+        await self._drain_traffic_gate()
+
+        if (
+            supervision_task is not None
+            and supervision_task is not asyncio.current_task()
+        ):
+            try:
+                await supervision_task
+            except asyncio.CancelledError:
+                pass
+        # A cancelled supervisor may have handed us a health task which keeps
+        # the old facade alive.  Do not report terminal completion or permit a
+        # re-enable until that exact task has settled and its callback consumed
+        # its outcome.  This check stays outside reload/retirement locks.
+        self._terminal_cleanup_uncertain = (
+            self._has_running_terminal_health_probe_task()
+        )
 
     def get_tools(self) -> List[AgentTool]:
         return list(self._tools)
@@ -1909,15 +3403,10 @@ class ProxyFeature(Feature):
             self._recover_fenced_transition_uninterrupted(transition),
             name=f"isolated-fenced-recovery:{self.name}",
         )
-        cancellation: asyncio.CancelledError | None = None
-        while not task.done():
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError as exc:
-                cancellation = exc
-                continue
         try:
-            await task
+            await _await_task_until_complete(task, preserve_cancellation=preserve_cancellation)
+        except asyncio.CancelledError:
+            raise
         except BaseException as recovery_error:
             self._fenced_recovery_failed = True
             # The uninterrupted body has already tried generation-scoped
@@ -1942,7 +3431,7 @@ class ProxyFeature(Feature):
             # implementation mutates its stop path unexpectedly.
             self._client = None
             self._tools = []
-            self._stopping = True
+            self._latch_terminal_lifecycle()
             if preserve_cancellation:
                 logger.error(
                     "Isolated feature %s fenced recovery failed; proxy was reconciled "
@@ -1951,8 +3440,6 @@ class ProxyFeature(Feature):
                 )
                 return
             raise recovery_error
-        if cancellation is not None and not preserve_cancellation:
-            raise cancellation
         self._fenced_recovery_failed = False
 
     async def _recover_fenced_transition_uninterrupted(
@@ -1968,14 +3455,31 @@ class ProxyFeature(Feature):
         """
 
         active_client = self._unpublish_client()
+        active_stop_completed = False
         try:
             if active_client is not None:
+                def remember_active_stop() -> None:
+                    nonlocal active_stop_completed
+
+                    active_stop_completed = True
+
                 try:
-                    await _maybe_await(active_client.stop())
+                    await _await_owned_facade_lifecycle_operation(
+                        active_client.stop(),
+                        name=f"isolated-fenced-recovery-stop:{self.name}",
+                        on_completed=remember_active_stop,
+                        on_timeout=lambda active_client=active_client: self._fence_terminal_retirement_timeout(
+                            active_client
+                        ),
+                        on_late_task=lambda task, active_client=active_client: self._retain_terminal_lifecycle_task(
+                            task, active_client
+                        ),
+                    )
                 except BaseException:
                     # Put it back only so the standard cleanup can retire or
                     # quarantine it.  It remains unpublished throughout.
-                    self._client = active_client
+                    if not active_stop_completed:
+                        self._client = active_client
                     raise
 
             promotion = await self._promote_config(transition)
@@ -1994,7 +3498,11 @@ class ProxyFeature(Feature):
         except BaseException:
             # A partially restored old client must be visible only to the
             # cleanup/quarantine path, never to traffic (the gate is closed).
-            if active_client is not None and self._client is None:
+            if (
+                active_client is not None
+                and not active_stop_completed
+                and self._client is None
+            ):
                 self._client = active_client
             # In particular, a failed old-client stop must not prevent the
             # generation's durable cleanup.  This happens before quarantine so
@@ -2063,8 +3571,7 @@ class ProxyFeature(Feature):
         # a cancellation delivered after seal cannot skip unpublication,
         # adapter removal, supervision cancellation, or best-effort retirement
         # while the task is still waiting on another lifecycle owner.
-        self._terminal_lifecycle_latched = True
-        self._stopping = True
+        self._latch_terminal_lifecycle()
         await self._complete_terminal_cleanup(
             best_effort=True,
             lifecycle_lock_held=lifecycle_lock_held,
@@ -3060,6 +4567,160 @@ class ProxyFeature(Feature):
                 caps = inner_caps
         return caps if isinstance(caps, dict) else {}
 
+    def _host_ingress_capabilities(self) -> HostIngressCapabilities | None:
+        """Return an immutable snapshot of this client's ingress contract.
+
+        Host ingress deliberately relies on the SDK's typed capability rather
+        than parsing its raw initialize metadata here.  That preserves one
+        validator for malformed/legacy metadata and, importantly, keeps this
+        proxy on the subprocess wrapper for the actual RPC.  Reaching through
+        to an inner client would bypass its process-lifecycle accounting.
+
+        The SDK dataclass is frozen but Python does not enforce its ``tuple``
+        annotation at runtime: a caller can construct it with a mutable list.
+        Also, subclasses can replace ``supports``.  Treat the public property
+        as an untrusted facade, then reconstruct only its exact immutable base
+        contract.  Callers must compare the returned snapshot's names directly
+        rather than invoke behavior on the facade object.
+        """
+
+        capabilities = getattr(self._client, "host_ingress_capabilities", None)
+        if type(capabilities) is not HostIngressCapabilities:
+            return None
+
+        names = capabilities.names
+        version = capabilities.version
+        # A valid SDK response always has these exact immutable runtime types:
+        # ``from_dict`` converts the wire list into a tuple, while version and
+        # names are ordinary built-in primitives.  Reject anything that could
+        # mutate after admission or execute user-defined behavior while we
+        # validate the negotiated contract.
+        if (
+            type(version) is not int
+            or type(names) is not tuple
+            or not all(type(name) is str for name in names)
+        ):
+            return None
+        try:
+            return HostIngressCapabilities(names=tuple(names), version=version)
+        except ProtocolError:
+            # Malformed values that reached a frozen dataclass through direct
+            # construction or mutation are indistinguishable from no support.
+            return None
+
+    async def _call_host_ingress_rpc(
+        self,
+        call: Callable[[str, HostIngressPayload], Any],
+        request: _HostIngressRequest,
+        outcome_slot: _HostIngressOutcomeSlot,
+    ) -> None:
+        """Run one RPC and place a detached outcome outside the worker task.
+
+        The operation is shielded by the public method. Returning failures as
+        data is intentional: even a freshly constructed ``HostIngressError``
+        would otherwise retain this coroutine's request, response, and bound
+        SDK method in its traceback.
+        """
+
+        try:
+            try:
+                result = await _maybe_await(call(request.name, request.payload))
+            except asyncio.CancelledError:
+                outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_CANCELLED)
+                return
+            except BaseException:  # noqa: BLE001 - external RPC boundary redaction
+                # The SDK/custom-client boundary is untrusted. Do not retain its
+                # exception object or its potentially secret-bearing message.
+                outcome_slot.outcome = _HostIngressOutcome(
+                    _HOST_INGRESS_GENERIC_FAILURE
+                )
+                return
+            try:
+                # A custom facade must not be able to return a mutable or subclass
+                # response into the HTTP integration layer. Revalidate the exact,
+                # detached snapshot even though the SDK validates its wire payload.
+                outcome_slot.outcome = _HostIngressOutcome(
+                    _HOST_INGRESS_SUCCESS,
+                    _snapshot_host_ingress_payload(result),
+                )
+            except asyncio.CancelledError:
+                outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_CANCELLED)
+            except BaseException:  # noqa: BLE001 - external response boundary redaction
+                outcome_slot.outcome = _HostIngressOutcome(
+                    _HOST_INGRESS_GENERIC_FAILURE
+                )
+        finally:
+            # This worker may survive a caller cancellation. Drop every
+            # request/client-adjacent reference as soon as the RPC settles;
+            # only the detached one-shot outcome may cross its boundary.
+            result = None
+            call = None
+            request = None
+            self = None
+
+    async def _run_host_ingress(
+        self,
+        request: _HostIngressRequest,
+        outcome_slot: _HostIngressOutcomeSlot,
+    ) -> None:
+        """Perform an already-snapshotted ingress call inside traffic admission."""
+
+        try:
+            async with self._traffic_gate.admit():
+                client = self._client
+                if client is None:
+                    outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_UNSUPPORTED)
+                    return
+
+                try:
+                    capabilities = self._host_ingress_capabilities()
+                except asyncio.CancelledError:
+                    outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_CANCELLED)
+                    return
+                except BaseException:  # noqa: BLE001 - untrusted capability facade
+                    outcome_slot.outcome = _HostIngressOutcome(
+                        _HOST_INGRESS_GENERIC_FAILURE
+                    )
+                    return
+                if capabilities is None:
+                    outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_UNSUPPORTED)
+                    return
+                if request.name not in capabilities.names:
+                    outcome_slot.outcome = _HostIngressOutcome(
+                        _HOST_INGRESS_UNKNOWN_NAME
+                    )
+                    return
+
+                try:
+                    call = getattr(client, "call_host_ingress", None)
+                except asyncio.CancelledError:
+                    outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_CANCELLED)
+                    return
+                except BaseException:  # noqa: BLE001 - untrusted descriptor boundary
+                    outcome_slot.outcome = _HostIngressOutcome(
+                        _HOST_INGRESS_GENERIC_FAILURE
+                    )
+                    return
+                if not callable(call):
+                    outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_UNSUPPORTED)
+                    return
+                await self._call_host_ingress_rpc(call, request, outcome_slot)
+        except _TrafficGateTerminalError:
+            outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_TERMINAL)
+        except asyncio.CancelledError:
+            # The public caller shields this worker, so a cancellation here is
+            # child/runtime-originated and must remain distinguishable from the
+            # caller cancellation handled by ``_wait_for_host_ingress_operation``.
+            outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_CANCELLED)
+        except BaseException:  # noqa: BLE001 - no internal traceback may escape
+            outcome_slot.outcome = _HostIngressOutcome(_HOST_INGRESS_GENERIC_FAILURE)
+        finally:
+            call = None
+            capabilities = None
+            client = None
+            request = None
+            self = None
+
     def _supports_tool_execution_context(self, context: Any) -> bool:
         """Whether the initialized service accepts this SDK context version.
 
@@ -3207,6 +4868,66 @@ class ProxyFeature(Feature):
                 "tool": name,
                 "success": False,
             }
+
+    async def call_host_ingress(
+        self,
+        name: str,
+        payload: HostIngressPayload = None,
+    ) -> HostIngressPayload:
+        """Invoke a negotiated private host-to-service ingress callback.
+
+        This is intentionally a host-only method: it does not create an
+        :class:`AgentTool`, appear in ``get_tools()``, or participate in an
+        agent/LLM tool description.  Its caller must have already resolved the
+        exact feature proxy for the target agent; this method never performs an
+        agent or feature lookup itself.
+
+        Capability validation and the RPC both occur under the same traffic
+        admission used by normal tools and channel events.  A reload or config
+        transition therefore drains an already admitted ingress call and holds
+        later calls until its new child is coherent; terminal shutdown rejects
+        new calls without touching a retired child.
+        """
+
+        # Snapshot synchronously, before scheduling the worker.  A caller can
+        # mutate an ordinary dict in the scheduling gap, so validating inside a
+        # task is still a TOCTOU bug even if the task later keeps traffic open.
+        request = _prepare_host_ingress_request(name, payload)
+        outcome = _HostIngressOutcome(_HOST_INGRESS_GENERIC_FAILURE)
+        caller_cancel_args: tuple[Any, ...] | None = None
+        operation: asyncio.Task[Any] | None = None
+        outcome_slot: _HostIngressOutcomeSlot | None = None
+        worker: Any = None
+        task_name = f"isolated-host-ingress:{self.name}"
+        if request is not None:
+            try:
+                outcome_slot = _HostIngressOutcomeSlot()
+                worker = self._run_host_ingress(request, outcome_slot)
+                operation = asyncio.create_task(worker, name=task_name)
+            except (RuntimeError, TypeError):
+                # Task construction is not a supported external failure mode,
+                # but it must not cause a request-bearing public traceback.
+                outcome = _HostIngressOutcome(_HOST_INGRESS_GENERIC_FAILURE)
+                if worker is not None:
+                    worker.close()
+
+        # The public error below is deliberately raised only after all frames
+        # that received untrusted input or facades have been scrubbed.  Function
+        # arguments themselves are traceback locals in CPython, so ``from
+        # None`` alone cannot provide this boundary.
+        name = None
+        payload = None
+        request = None
+        worker = None
+        self = None
+
+        if operation is not None and outcome_slot is not None:
+            outcome, caller_cancel_args = await _wait_for_host_ingress_operation(
+                operation, outcome_slot
+            )
+        operation = None
+        outcome_slot = None
+        return _deliver_host_ingress_outcome(outcome, caller_cancel_args)
 
     async def _call_isolated_tool_admitted(
         self,
@@ -3586,6 +5307,7 @@ class ProxyFeature(Feature):
         return asyncio.create_task(coro, name=name)
 
     async def _supervise(self) -> None:
+        terminal_unwind = False
         try:
             backoff = 1.0
             while not self._stopping:
@@ -3600,9 +5322,16 @@ class ProxyFeature(Feature):
                 # then "restart" the freshly launched client.
                 gen = self._reload_gen
                 try:
-                    health = await asyncio.wait_for(
-                        _maybe_await(self._client.health()),
-                        timeout=_HEALTH_PROBE_TIMEOUT,
+                    client = self._client
+                    if client is None:
+                        raise RuntimeError(
+                            "isolated feature client is unavailable during health probe"
+                        )
+                    health = await _await_owned_health_probe(
+                        client.health(),
+                        name=f"isolated-health-probe:{self.name}",
+                        on_started=self._own_health_probe_task,
+                        on_late_task=self._retain_terminal_health_probe_task,
                     )
                     healthy = self._is_healthy_response(health)
                     if healthy:
@@ -3618,6 +5347,16 @@ class ProxyFeature(Feature):
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Isolated feature %s health check failed: %s", self.name, exc)
 
+                if self._has_running_terminal_health_probe_task():
+                    # A stale probe still owns the old facade.  Restarting or
+                    # re-enabling beside it would preserve the exact leak this
+                    # supervisor exists to prevent, so terminally seal the
+                    # cycle.  Cleanup remains bounded: it records incomplete
+                    # ownership instead of waiting under lifecycle locks.
+                    terminal_unwind = True
+                    self._latch_terminal_lifecycle()
+                    await self._complete_terminal_cleanup(best_effort=True)
+                    break
                 if self._stopping:
                     break
                 # Serialize the restart against a concurrent reload, and re-check
@@ -3632,22 +5371,161 @@ class ProxyFeature(Feature):
                     # while an admitted tool is active must still run the final
                     # gate boundary below instead of leaving callers blocked.
                     gate_closed = True
+                    stop_completion: _TerminalStopCompletionMarker | None = None
                     try:
-                        await self._close_traffic_gate()
+                        # A health failure is not a finite reload.  Close new
+                        # admission, then let the selected wrapper's bounded
+                        # stop/terminate/kill path make its wedged RPC
+                        # terminal before we wait for gate drain.  Normal
+                        # reload/config transitions deliberately retain the
+                        # drain-before-retire order above.
+                        await self._close_traffic_gate_admission()
+                        client = self._client
+                        if client is None:
+                            raise RuntimeError(
+                                "isolated feature client is unavailable during "
+                                "health recovery"
+                            )
                         try:
-                            await _maybe_await(self._client.stop())
-                        except Exception:  # noqa: BLE001
-                            pass
+                            # A shutdown can seal/unpublish this same client
+                            # while the unhealthy supervisor is already in its
+                            # stop await.  Use the terminal retirement lock
+                            # even on the healthy-restart path so that race
+                            # cannot issue concurrent facade ``stop()`` calls.
+                            async with self._terminal_retirement_lock:
+                                # Shutdown can latch, unpublish this client,
+                                # and queue behind the narrow stop lock while
+                                # the supervisor is waiting to acquire it.
+                                # Revalidate after acquisition so the stale
+                                # recovery owner never stops the terminal
+                                # transaction's exact client.
+                                if not self._supervisor_owns_client_restart(client, gen):
+                                    backoff = 1.0
+                                    continue
+                                stop_completion = self._begin_terminal_stop_completion(
+                                    client
+                                )
+                                await _await_owned_facade_lifecycle_operation(
+                                    client.stop(),
+                                    name=f"isolated-supervisor-stop:{self.name}",
+                                    on_completed=lambda completion=stop_completion: self._mark_terminal_stop_completed(
+                                        completion
+                                    ),
+                                    on_timeout=lambda client=client, completion=stop_completion: self._fence_terminal_stop_completion_timeout(
+                                        client, completion
+                                    ),
+                                    on_late_task=lambda task, client=client: self._retain_terminal_lifecycle_task(
+                                        task, client
+                                    ),
+                                )
+                        except asyncio.CancelledError:
+                            # A real caller cancellation can arrive while a
+                            # facade stop itself fails/cancels.  Keep only a
+                            # callback-proven completion for terminal cleanup;
+                            # an uncompleted pending marker would otherwise
+                            # retain a non-weak facade after the retry path
+                            # has taken ownership of the exact client.
+                            if (
+                                stop_completion is not None
+                                and not stop_completion.completed
+                            ):
+                                self._discard_terminal_stop_completion(
+                                    stop_completion
+                                )
+                            raise
+                        except BaseException:  # noqa: BLE001 - fence hostile stop failures
+                            self._discard_terminal_stop_completion(stop_completion)
+                            # Never reopen traffic to a client whose stop
+                            # outcome is unknown.  The terminal transaction
+                            # keeps the exact private retry handle and, unlike
+                            # this recovery path, can safely report a failed
+                            # retirement to an explicit lifecycle caller.
+                            self._latch_terminal_lifecycle()
+                            self._retain_terminal_retirement_client(
+                                self._unpublish_client(client)
+                            )
+                            if self._supervision_task is asyncio.current_task():
+                                # The shared cleanup runs in its own task. If
+                                # it still sees this supervisor as tracked, it
+                                # would cancel and later join its own owner
+                                # while that owner awaits the cleanup task.
+                                self._supervision_task = None
+                            await self._complete_terminal_cleanup(
+                                best_effort=True,
+                                lifecycle_lock_held=True,
+                            )
+                            break
+                        try:
+                            await self._drain_traffic_gate()
+                        except _TerminalTrafficDrainTimedOut:
+                            # A facade can claim stop success while one of its
+                            # admitted RPCs remains wedged.  Latch terminal
+                            # intent before the recovery finalizer runs, so it
+                            # seals rather than briefly reopening admission to
+                            # that stopped facade.
+                            terminal_unwind = True
+                            self._latch_terminal_lifecycle()
+                            raise
+                        if not self._supervisor_owns_client_restart(client, gen):
+                            break
                         await asyncio.sleep(backoff)
+                        # Backoff deliberately yields to shutdown/reload.  A
+                        # restart decision made before it must not start a
+                        # client which has since become terminal or stale.
+                        if not self._supervisor_owns_client_restart(client, gen):
+                            break
                         try:
-                            await _maybe_await(self._client.start())
+                            # A fresh start can spawn another subprocess before
+                            # it reports failure, so the prior exact-stop
+                            # completion may no longer prove terminal safety.
+                            self._forget_terminal_stop_completion(client)
+                            await _await_owned_facade_lifecycle_operation(
+                                client.start(),
+                                name=f"isolated-supervisor-start:{self.name}",
+                                on_timeout=lambda client=client: self._fence_terminal_retirement_timeout(
+                                    client
+                                ),
+                                on_late_task=lambda task, client=client: self._retain_terminal_lifecycle_task(
+                                    task, client
+                                ),
+                            )
                             backoff = 1.0
+                        except _FacadeLifecycleOperationTimedOut:
+                            # A timed-out start can have spawned a child before
+                            # its facade stopped responding. It is terminally
+                            # uncertain just like a timed-out stop: remove it
+                            # from admission and retain its exact handle rather
+                            # than reopening traffic behind an unknown process.
+                            self._latch_terminal_lifecycle()
+                            self._retain_terminal_retirement_client(
+                                self._unpublish_client(client)
+                            )
+                            if self._supervision_task is asyncio.current_task():
+                                self._supervision_task = None
+                            await self._complete_terminal_cleanup(
+                                best_effort=True,
+                                lifecycle_lock_held=True,
+                            )
+                            break
                         except Exception as exc:  # noqa: BLE001
                             logger.warning("Isolated feature %s restart failed: %s", self.name, exc)
                             backoff = min(backoff * 2, 30.0)
+                    except asyncio.CancelledError:
+                        # This must happen before the gate finalizer.  Without
+                        # it, a cancellation during close-admission/recovery
+                        # sees ``_stopping`` still false below and briefly
+                        # reopens traffic before the outer terminal finally
+                        # latches it.
+                        terminal_unwind = True
+                        self._latch_terminal_lifecycle()
+                        raise
                     finally:
                         if gate_closed:
-                            if self._stopping:
+                            if (
+                                terminal_unwind
+                                or self._stopping
+                                or self._terminal_lifecycle_latched
+                            ):
                                 await self._seal_traffic_gate()
                             else:
                                 await self._reopen_traffic_gate()
@@ -3656,17 +5534,44 @@ class ProxyFeature(Feature):
             # background tasks) rather than stopped via shutdown(), make sure the
             # child process is still torn down so it can't outlive the agent.
             # This is terminal rather than a finite restart: release pending
-            # admissions with the stable fail-closed result before retirement.
-            if not self._stopping:
-                self._terminal_lifecycle_latched = True
-                self._stopping = True
-                await self._seal_traffic_gate()
-                client = self._unpublish_client()
-                if client is not None:
-                    try:
-                        await _maybe_await(client.stop())
-                    except Exception:  # noqa: BLE001
-                        pass
+            # admissions with the stable fail-closed result, ask the wrapper to
+            # terminate a wedged child, and only then drain the old RPC.
+            if terminal_unwind or not self._stopping:
+                if not terminal_unwind:
+                    self._latch_terminal_lifecycle()
+                if self._supervision_task is asyncio.current_task():
+                    # The shared terminal task may wait for a separately
+                    # cancelled supervisor. It must never wait for this task
+                    # while this task is waiting for that cleanup to finish.
+                    self._supervision_task = None
+                shared_cleanup = self._terminal_cleanup_task
+                if shared_cleanup is None or shared_cleanup.done():
+                    await self._complete_terminal_cleanup(
+                        best_effort=True,
+                    )
+                # A concurrently running shutdown cleanup may already be
+                # joining this cancelled supervisor after it fences the exact
+                # SDK stop. Awaiting it here would form a supervisor → cleanup
+                # → supervisor cycle. The external terminal owner continues to
+                # own that shared task; this supervisor can now finish its own
+                # cancellation path and let the join settle.
+
+    def _supervisor_owns_client_restart(self, client: Any, generation: int) -> bool:
+        """Return whether this health-recovery iteration still owns ``client``.
+
+        This predicate is intentionally reused on both sides of the recovery
+        backoff and immediately after terminal-stop lock acquisition.  The
+        reload lock serializes normal replacements, while shutdown can latch
+        and unpublish outside it to break a drain deadlock; both fences are
+        therefore required before the supervisor may touch a facade.
+        """
+
+        return (
+            not self._stopping
+            and not self._terminal_lifecycle_latched
+            and self._client is client
+            and self._reload_gen == generation
+        )
 
     @staticmethod
     def _is_healthy_response(health: Any) -> bool:

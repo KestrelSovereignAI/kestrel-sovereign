@@ -163,7 +163,7 @@ async def test_scheduler_context_crosses_real_sdk_json_rpc_and_is_revoked(
             get_tool_execution_context,
         )
     except ImportError:
-        pytest.skip("requires kestrel-sovereign-sdk 0.32.0 execution-context API")
+        pytest.skip("requires the kestrel-sovereign-sdk execution-context API")
 
     service = IsolatedFeatureService(name="execution-test", version="1.0.0")
     seen_async: list[tuple[dict[str, Any], Any]] = []
