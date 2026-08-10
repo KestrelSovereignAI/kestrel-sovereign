@@ -191,31 +191,170 @@ class _TerminalTrafficDrainTimedOut(RuntimeError):
     """A sealed admitted call outlived terminal traffic-drain ownership."""
 
 
-def _consume_late_lifecycle_task_outcome(task: asyncio.Task[Any]) -> None:
-    """Consume a fenced task's eventual result without retaining its failure."""
+class _CrossLoopFacadeOperationError(_FacadeLifecycleOperationTimedOut):
+    """A facade returned a Future owned by a different event loop."""
+
+
+class _HostOwnedFacadeOperation:
+    """The one canonical ownership record for a facade-returned operation.
+
+    A Task/Future returned by a facade is already an operation, not merely an
+    awaitable recipe.  The old adapter created an outer task which did not
+    begin awaiting that operation until the next scheduling turn.  Cancelling
+    the outer task in that gap orphaned the real operation.  This record claims
+    the original Future synchronously and directs every cancellation, outcome,
+    and late-retention decision to that original object.
+
+    Coroutines and immediate values retain their compatibility path: the named
+    host task *is* their operation.  A same-loop Future/Task additionally gets
+    a named observer task for diagnostics, but the Future remains authoritative
+    for ownership.  Cross-loop Futures cannot safely be awaited here; they are
+    retained and cancelled/observed through their owning loop, while callers
+    fail closed without starting a competing lifecycle operation.
+    """
+
+    def __init__(self, operation: Any, *, name: str) -> None:
+        self._name = name
+        self._host_loop = asyncio.get_running_loop()
+        self._source: asyncio.Future[Any] | None = None
+        self._source_loop: asyncio.AbstractEventLoop | None = None
+        self._host_task: asyncio.Task[Any] | None = None
+        self._foreign_loop = False
+        self._done_callbacks: list[Callable[["_HostOwnedFacadeOperation"], None]] = []
+
+        if isinstance(operation, asyncio.Future):
+            self._source = operation
+            self._source_loop = operation.get_loop()
+            self._foreign_loop = self._source_loop is not self._host_loop
+            if not self._foreign_loop:
+                self._host_task = asyncio.create_task(
+                    self._observe_source(operation), name=name
+                )
+                self._host_task.add_done_callback(_consume_late_lifecycle_task_outcome)
+            self._install_source_settlement_observer()
+            return
+
+        async def await_operation() -> Any:
+            return await _maybe_await(operation)
+
+        self._host_task = asyncio.create_task(await_operation(), name=name)
+        self._host_task.add_done_callback(self._notify_settled)
+
+    async def _observe_source(self, source: asyncio.Future[Any]) -> Any:
+        return await asyncio.shield(source)
+
+    @property
+    def foreign_loop(self) -> bool:
+        return self._foreign_loop
+
+    def get_name(self) -> str:
+        """Expose the historic task-like diagnostic name to ownership users."""
+
+        return self._name
+
+    def __await__(self):
+        """Keep task-like compatibility for internal late-operation owners."""
+
+        return self.wait().__await__()
+
+    def done(self) -> bool:
+        target = self._source if self._source is not None else self._host_task
+        return target is not None and target.done()
+
+    def cancelled(self) -> bool:
+        target = self._source if self._source is not None else self._host_task
+        return target is not None and target.cancelled()
+
+    def result(self) -> Any:
+        if self._foreign_loop:
+            raise _CrossLoopFacadeOperationError(
+                "isolated facade returned a Future owned by another event loop"
+            )
+        target = self._source if self._source is not None else self._host_task
+        if target is None:
+            raise RuntimeError("host-owned facade operation lost its completion target")
+        return target.result()
+
+    async def wait(self) -> Any:
+        return await self.shield()
+
+    def shield(self) -> asyncio.Future[Any]:
+        """Return the host-loop shield used by bounded ownership waits."""
+
+        if self._foreign_loop:
+            raise _CrossLoopFacadeOperationError(
+                "isolated facade returned a Future owned by another event loop"
+            )
+        target = self._source if self._source is not None else self._host_task
+        if target is None:
+            raise RuntimeError("host-owned facade operation lost its completion target")
+        return asyncio.shield(target)
+
+    def cancel(self) -> None:
+        """Cancel the real facade operation, including before an observer runs."""
+
+        target = self._source if self._source is not None else self._host_task
+        if target is None or target.done():
+            return
+        if self._foreign_loop:
+            source_loop = self._source_loop
+            if source_loop is None or source_loop.is_closed():
+                return
+            source_loop.call_soon_threadsafe(target.cancel)
+            return
+        target.cancel()
+
+    def add_done_callback(
+        self, callback: Callable[["_HostOwnedFacadeOperation"], None]
+    ) -> None:
+        """Run ``callback`` in the host loop after the authoritative settles."""
+
+        self._done_callbacks.append(callback)
+        if self.done():
+            self._host_loop.call_soon(callback, self)
+
+    def _install_source_settlement_observer(self) -> None:
+        source = self._source
+        if source is None:
+            return
+
+        def observed(_: asyncio.Future[Any]) -> None:
+            # A foreign Task must have its exception retrieved in its own loop
+            # before this record drops the last strong reference to it.
+            if self._foreign_loop:
+                _consume_late_lifecycle_task_outcome(source)
+            self._host_loop.call_soon_threadsafe(self._notify_settled)
+
+        if self._foreign_loop:
+            source_loop = self._source_loop
+            if source_loop is not None and not source_loop.is_closed():
+                source_loop.call_soon_threadsafe(source.add_done_callback, observed)
+        else:
+            source.add_done_callback(observed)
+
+    def _notify_settled(self, _: asyncio.Future[Any] | None = None) -> None:
+        callbacks, self._done_callbacks = self._done_callbacks, []
+        for callback in callbacks:
+            callback(self)
+
+
+def _consume_late_lifecycle_task_outcome(
+    operation: asyncio.Future[Any] | _HostOwnedFacadeOperation,
+) -> None:
+    """Consume a fenced operation's eventual result without retaining failure."""
 
     try:
-        task.result()
+        operation.result()
     except BaseException:  # noqa: BLE001 - terminal facade outcomes stay private
         pass
 
 
 def _create_host_owned_facade_task(
     operation: Any, *, name: str
-) -> asyncio.Task[Any]:
-    """Attach any facade awaitable to one named host-owned task.
+) -> _HostOwnedFacadeOperation:
+    """Synchronously establish canonical ownership of one facade operation."""
 
-    ``asyncio.create_task`` accepts coroutines only, whereas SDK facades are
-    permitted to return any awaitable, including a Future or a Task.  Awaiting
-    through this coroutine gives the host the same cancellation, timeout, and
-    outcome-consumption boundary for each of those forms, while retaining the
-    legacy immediate-return behavior accepted by ``_maybe_await``.
-    """
-
-    async def await_operation() -> Any:
-        return await _maybe_await(operation)
-
-    return asyncio.create_task(await_operation(), name=name)
+    return _HostOwnedFacadeOperation(operation, name=name)
 
 
 async def _await_task_until_complete(
@@ -272,12 +411,12 @@ async def _await_task_until_complete(
 
 
 async def _await_owned_facade_lifecycle_operation(
-    operation: Awaitable[Any],
+    operation: Any,
     *,
     name: str,
     on_completed: Callable[[], None] | None = None,
     on_timeout: Callable[[], None] | None = None,
-    on_late_task: Callable[[asyncio.Task[Any]], None],
+    on_late_task: Callable[[_HostOwnedFacadeOperation], None],
 ) -> Any:
     """Own a facade operation without allowing it to hold lifecycle forever.
 
@@ -300,6 +439,17 @@ async def _await_owned_facade_lifecycle_operation(
     """
 
     task = _create_host_owned_facade_task(operation, name=name)
+    if task.foreign_loop:
+        # The original Future is retained before this failure is visible.  Its
+        # owner records both the exact operation and the facade fence, so no
+        # retry can race a cross-loop stop/start which is still running.
+        if on_timeout is not None:
+            on_timeout()
+        on_late_task(task)
+        task.cancel()
+        raise _CrossLoopFacadeOperationError(
+            "isolated facade lifecycle Future belongs to another event loop"
+        )
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _FACADE_LIFECYCLE_OPERATION_TIMEOUT
     cancellation_args: tuple[Any, ...] | None = None
@@ -354,7 +504,7 @@ async def _await_owned_facade_lifecycle_operation(
         if remaining <= 0:
             break
         try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+            await asyncio.wait_for(task.shield(), timeout=remaining)
         except asyncio.CancelledError as exc:
             # ``shield(task)`` also raises CancelledError when *task* was
             # cancelled.  Only a cancellation currently requested for this
@@ -402,7 +552,7 @@ async def _await_owned_facade_lifecycle_operation(
                     replay_remembered_cancellation()
                 raise_authoritative_timeout()
             try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+                await asyncio.wait_for(task.shield(), timeout=remaining)
             except asyncio.CancelledError as exc:
                 # ``task.cancel()`` above deliberately causes this exact
                 # child-side acknowledgement.  It is not a parent
@@ -456,11 +606,11 @@ async def _await_owned_facade_lifecycle_operation(
 
 
 async def _await_owned_health_probe(
-    operation: Awaitable[Any],
+    operation: Any,
     *,
     name: str,
-    on_started: Callable[[asyncio.Task[Any]], None],
-    on_late_task: Callable[[asyncio.Task[Any]], None],
+    on_started: Callable[[_HostOwnedFacadeOperation], None],
+    on_late_task: Callable[[_HostOwnedFacadeOperation], None],
 ) -> Any:
     """Await one health probe without orphaning cancellation-resistant work.
 
@@ -475,6 +625,16 @@ async def _await_owned_health_probe(
 
     task = _create_host_owned_facade_task(operation, name=name)
     on_started(task)
+    if task.foreign_loop:
+        # Health must not treat a foreign-loop Future as an ordinary failed
+        # probe and restart beside it.  Retain it first, request cancellation
+        # through its owning loop, and let supervision terminally fence the
+        # facade while the settlement callback owns eventual release.
+        on_late_task(task)
+        task.cancel()
+        raise _CrossLoopFacadeOperationError(
+            "isolated facade health Future belongs to another event loop"
+        )
 
     def replay_parent_cancellation(exc: asyncio.CancelledError) -> NoReturn:
         """Raise cancellation without retaining a facade task in its traceback."""
@@ -501,7 +661,7 @@ async def _await_owned_health_probe(
 
     try:
         return await asyncio.wait_for(
-            asyncio.shield(task), timeout=_HEALTH_PROBE_TIMEOUT
+            task.shield(), timeout=_HEALTH_PROBE_TIMEOUT
         )
     except asyncio.CancelledError as exc:
         # Parent cancellation must not flow through the facade call: retain
@@ -522,7 +682,7 @@ async def _await_owned_health_probe(
                 on_late_task(task)
                 raise
             try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+                await asyncio.wait_for(task.shield(), timeout=remaining)
             except asyncio.CancelledError as exc:
                 # ``shield(task)`` raises CancelledError when the probe
                 # acknowledges the timeout cancellation we sent above.  That
@@ -536,6 +696,15 @@ async def _await_owned_health_probe(
                         _consume_late_lifecycle_task_outcome(task)
                     else:
                         on_late_task(task)
+                    # The shield can first deliver the child Task's own
+                    # cancellation (usually arg-less) even though the parent
+                    # cancellation is queued in the same turn.  Let that
+                    # queued parent interruption surface so its args, rather
+                    # than the child classification, remain public.
+                    try:
+                        await asyncio.sleep(0)
+                    except asyncio.CancelledError as parent_exc:
+                        replay_parent_cancellation(parent_exc)
                     replay_parent_cancellation(exc)
                 if task.done() and task.cancelled():
                     # This is the probe acknowledging the cancellation we
@@ -563,6 +732,19 @@ async def _await_owned_health_probe(
 
         # The health timeout remains authoritative even if a facade catches
         # cancellation and returns a nominally healthy value afterwards.
+        # ``wait_for(task.shield())`` cannot cancel the owned source.
+        # A facade can synchronously cancel this supervisor while acknowledging
+        # that timeout, after the final loop condition has observed the source
+        # as done.  Take one cancellation checkpoint before publishing timeout
+        # so that real parent cancellation still wins with its original args.
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError as exc:
+            if task.done():
+                _consume_late_lifecycle_task_outcome(task)
+            else:
+                on_late_task(task)
+            replay_parent_cancellation(exc)
         _consume_late_lifecycle_task_outcome(task)
         raise_authoritative_timeout()
 
@@ -754,7 +936,7 @@ class _HostIngressOutcomeSlot:
 class _TrackedFacadeLifecycleTask:
     """Non-detached ownership for a cancellation-hostile facade operation."""
 
-    task: asyncio.Task[Any]
+    task: _HostOwnedFacadeOperation
     client_id: int
     client_ref: weakref.ReferenceType[Any] | None
 
@@ -1537,7 +1719,7 @@ class ProxyFeature(Feature):
         # cancellation-resistant probe retains tenant credentials and request
         # state until this completion callback consumes its outcome. One
         # supervisor issues probes serially, hence one slot.
-        self._terminal_health_probe_task: Optional[asyncio.Task[Any]] = None
+        self._terminal_health_probe_task: Optional[_HostOwnedFacadeOperation] = None
         # A neutral cleanup task never exports an adapter/facade exception.
         # Record only that its state transition became uncertain so an explicit
         # caller cannot report success until a later clean attempt settles.
@@ -2333,7 +2515,7 @@ class ProxyFeature(Feature):
 
     def _retain_terminal_lifecycle_task(
         self,
-        task: asyncio.Task[Any],
+        task: _HostOwnedFacadeOperation,
         client: Any,
     ) -> None:
         """Own a still-running exact facade task until it is consumed.
@@ -2353,7 +2535,7 @@ class ProxyFeature(Feature):
         ownership = _TrackedFacadeLifecycleTask(task, id(client), client_ref)
         self._terminal_lifecycle_tasks.append(ownership)
 
-        def release(completed_task: asyncio.Task[Any]) -> None:
+        def release(completed_task: _HostOwnedFacadeOperation) -> None:
             _consume_late_lifecycle_task_outcome(completed_task)
             self._terminal_lifecycle_tasks = [
                 candidate
@@ -2363,7 +2545,7 @@ class ProxyFeature(Feature):
 
         task.add_done_callback(release)
 
-    def _own_health_probe_task(self, task: asyncio.Task[Any]) -> None:
+    def _own_health_probe_task(self, task: _HostOwnedFacadeOperation) -> None:
         """Own one exact health task from creation until its outcome is consumed.
 
         The task itself retains the exact facade while its bound ``health``
@@ -2381,14 +2563,14 @@ class ProxyFeature(Feature):
             raise RuntimeError("isolated feature already owns a live health probe")
         self._terminal_health_probe_task = task
 
-        def release(completed_task: asyncio.Task[Any]) -> None:
+        def release(completed_task: _HostOwnedFacadeOperation) -> None:
             _consume_late_lifecycle_task_outcome(completed_task)
             if self._terminal_health_probe_task is completed_task:
                 self._terminal_health_probe_task = None
 
         task.add_done_callback(release)
 
-    def _retain_terminal_health_probe_task(self, task: asyncio.Task[Any]) -> None:
+    def _retain_terminal_health_probe_task(self, task: _HostOwnedFacadeOperation) -> None:
         """Mark a still-running owned health task as terminally incomplete."""
 
         self._own_health_probe_task(task)
@@ -2433,7 +2615,7 @@ class ProxyFeature(Feature):
                 self._terminal_cleanup_uncertain = True
                 return False
             try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+                await asyncio.wait_for(task.shield(), timeout=remaining)
             except asyncio.CancelledError:
                 if task.done() and task.cancelled():
                     break

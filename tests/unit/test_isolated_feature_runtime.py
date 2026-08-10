@@ -4,6 +4,7 @@ import asyncio
 import gc
 import json
 import os
+import threading
 import types
 import weakref
 from datetime import datetime, timedelta, timezone
@@ -8324,6 +8325,221 @@ async def test_owned_health_probe_timeout_retains_task_returned_by_facade(monkey
     finally:
         release.set()
         await asyncio.wait_for(late_tasks[0] if late_tasks else operation, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_same_loop_health_parent_cancellation_claims_original_before_wrapper_runs():
+    """Health cancellation reaches the facade Task, never only an observer."""
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    cancellation_observed = asyncio.Event()
+
+    async def hostile_health():
+        started.set()
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancellation_observed.set()
+
+    original = asyncio.create_task(hostile_health(), name="facade-original-health")
+    started_tasks = []
+    late_tasks = []
+    owner = asyncio.create_task(
+        isolated_runtime._await_owned_health_probe(
+            original,
+            name="host-owned-prestart-health",
+            on_started=started_tasks.append,
+            on_late_task=late_tasks.append,
+        )
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        owner.cancel("health parent cancellation")
+        await asyncio.wait_for(cancellation_observed.wait(), timeout=1)
+
+        assert original.done() is False
+        assert len(started_tasks) == 1
+        assert late_tasks == started_tasks
+        assert late_tasks[0].get_name() == "host-owned-prestart-health"
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await asyncio.wait_for(owner, timeout=1)
+        assert cancelled.value.args == ("health parent cancellation",)
+    finally:
+        release.set()
+        if not original.done():
+            original.cancel()
+        await asyncio.gather(original, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cross_loop_health_task_fails_closed_and_consumes_late_error():
+    """A foreign health Task cannot trigger an ordinary retry while it runs."""
+
+    foreign_loop = asyncio.new_event_loop()
+    foreign_ready = threading.Event()
+    release_foreign = threading.Event()
+    cancellation_observed = threading.Event()
+    foreign_state = {}
+
+    class ForeignHealthError(RuntimeError):
+        pass
+
+    async def foreign_health():
+        while not release_foreign.is_set():
+            try:
+                await asyncio.sleep(0.001)
+            except asyncio.CancelledError:
+                cancellation_observed.set()
+        raise ForeignHealthError("FOREIGN-HEALTH-SECRET")
+
+    def run_foreign_loop():
+        asyncio.set_event_loop(foreign_loop)
+        task = foreign_loop.create_task(foreign_health(), name="foreign-facade-health")
+        foreign_state["task"] = task
+        foreign_ready.set()
+        try:
+            foreign_loop.run_until_complete(task)
+        except ForeignHealthError:
+            # The host observer has already retrieved this private outcome.
+            pass
+        finally:
+            foreign_loop.close()
+
+    foreign_thread = threading.Thread(target=run_foreign_loop)
+    foreign_thread.start()
+    assert foreign_ready.wait(timeout=1)
+
+    started_tasks = []
+    late_tasks = []
+    try:
+        with pytest.raises(isolated_runtime._CrossLoopFacadeOperationError):
+            await isolated_runtime._await_owned_health_probe(
+                foreign_state["task"],
+                name="host-owned-foreign-health",
+                on_started=started_tasks.append,
+                on_late_task=late_tasks.append,
+            )
+        assert late_tasks == started_tasks
+        assert len(late_tasks) == 1
+        assert late_tasks[0].foreign_loop is True
+        assert foreign_state["task"].done() is False
+        assert cancellation_observed.wait(timeout=1)
+
+        release_foreign.set()
+        await asyncio.wait_for(asyncio.to_thread(foreign_thread.join), timeout=1)
+        for _ in range(100):
+            if late_tasks[0].done():
+                break
+            await asyncio.sleep(0)
+        assert late_tasks[0].done() is True
+    finally:
+        release_foreign.set()
+        if foreign_thread.is_alive():
+            await asyncio.to_thread(foreign_thread.join)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nonweak_facade", (False, True))
+async def test_cross_loop_facade_task_is_retained_fenced_and_released_before_retry(
+    nonweak_facade, monkeypatch, tmp_path
+):
+    """A foreign stop Task is cancelled/observed in its loop and blocks retry."""
+
+    foreign_loop = asyncio.new_event_loop()
+    foreign_ready = threading.Event()
+    release_foreign = threading.Event()
+    cancellation_observed = threading.Event()
+    foreign_state = {}
+
+    async def foreign_stop():
+        while not release_foreign.is_set():
+            try:
+                await asyncio.sleep(0.001)
+            except asyncio.CancelledError:
+                cancellation_observed.set()
+
+    def run_foreign_loop():
+        asyncio.set_event_loop(foreign_loop)
+        task = foreign_loop.create_task(foreign_stop(), name="foreign-facade-stop")
+        foreign_state["task"] = task
+        foreign_ready.set()
+        foreign_loop.run_until_complete(task)
+        foreign_loop.close()
+
+    foreign_thread = threading.Thread(target=run_foreign_loop)
+    foreign_thread.start()
+    assert foreign_ready.wait(timeout=1)
+
+    if nonweak_facade:
+        class CrossLoopStopClient:
+            __slots__ = ("stop_calls", "stopped")
+
+            def __init__(self):
+                self.stop_calls = 0
+                self.stopped = False
+
+            def stop(self):
+                self.stop_calls += 1
+                if self.stop_calls == 1:
+                    return foreign_state["task"]
+                self.stopped = True
+                return None
+    else:
+        class CrossLoopStopClient(FakeIsolatedClient):
+            def __init__(self):
+                super().__init__()
+                self.stop_calls = 0
+
+            def stop(self):
+                self.stop_calls += 1
+                if self.stop_calls == 1:
+                    return foreign_state["task"]
+                self.stopped = True
+                return None
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    client = CrossLoopStopClient()
+    feature._client = client
+    try:
+        with pytest.raises(RuntimeError, match="terminal retirement is incomplete"):
+            await asyncio.wait_for(feature.shutdown(), timeout=1)
+        assert client.stop_calls == 1
+        assert len(feature._terminal_lifecycle_tasks) == 1
+        assert feature._terminal_lifecycle_tasks[0].task.foreign_loop is True
+        assert foreign_state["task"].done() is False
+        assert cancellation_observed.wait(timeout=1)
+
+        # A fresh terminal caller must not retry while the foreign operation
+        # still owns the facade's lifecycle handle.
+        with pytest.raises(RuntimeError, match="terminal retirement is incomplete"):
+            await asyncio.wait_for(feature.shutdown(), timeout=1)
+        assert client.stop_calls == 1
+
+        release_foreign.set()
+        await asyncio.wait_for(asyncio.to_thread(foreign_thread.join), timeout=1)
+        for _ in range(100):
+            if not feature._terminal_lifecycle_tasks:
+                break
+            await asyncio.sleep(0)
+        assert feature._terminal_lifecycle_tasks == []
+
+        await asyncio.wait_for(feature.shutdown(), timeout=1)
+        assert client.stop_calls == 2
+        assert client.stopped is True
+        assert feature._terminal_retirement_clients == []
+    finally:
+        release_foreign.set()
+        if foreign_thread.is_alive():
+            await asyncio.to_thread(foreign_thread.join)
+        if not feature._stopping:
+            await feature.shutdown()
 
 
 @pytest.mark.asyncio
