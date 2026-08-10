@@ -1,7 +1,12 @@
 """Tests for isolated feature runtime proxy behavior."""
 
 import asyncio
+import gc
+import json
 import os
+import threading
+import types
+import weakref
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,7 +14,15 @@ from unittest.mock import Mock
 
 import pytest
 
-from kestrel_sdk.isolated_feature import ConfigTransitionError, ConfigTransitionResult
+from kestrel_sdk.isolated_feature import (
+    ConfigTransitionError,
+    ConfigTransitionResult,
+    HostIngressCapabilities,
+    HostIngressError,
+    HostIngressUnknownNameError,
+    HostIngressUnsupportedError,
+    MAX_HOST_INGRESS_PAYLOAD_BYTES,
+)
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
 from kestrel_sovereign.features import isolated_runtime
@@ -228,6 +241,7 @@ async def test_scheduler_records_terminal_isolated_admission_as_failed(tmp_path,
     finally:
         if not feature._stopping:
             await feature.shutdown()
+
         await db.close()
 
 
@@ -1198,6 +1212,33 @@ def test_build_client_passes_stripped_env(monkeypatch, tmp_path):
 
     assert "env" in captured
     assert "PYTHONPATH" not in captured["env"]
+
+
+def test_venv_sdk_version_uses_canonical_isolated_child_env(monkeypatch, tmp_path):
+    """The version probe cannot resolve the host SDK through hostile env vars."""
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    venv = tmp_path / "feature-venv"
+    python = venv / "bin" / "python"
+    monkeypatch.setenv("PYTHONPATH", "/host/site-packages")
+    monkeypatch.setenv("PYTHONHOME", "/host/python")
+    monkeypatch.setenv("PYTHONSTARTUP", "/host/startup.py")
+    monkeypatch.setenv("VIRTUAL_ENV", "/host/venv")
+    captured = {}
+
+    def fake_run(*_args, **kwargs):
+        captured.update(kwargs)
+        return ir.subprocess.CompletedProcess([], 0, stdout="0.35.1\n")
+
+    monkeypatch.setattr(ir.subprocess, "run", fake_run)
+
+    assert ir._venv_sdk_version(python) == "0.35.1"
+    env = captured["env"]
+    assert "PYTHONPATH" not in env
+    assert "PYTHONHOME" not in env
+    assert "PYTHONSTARTUP" not in env
+    assert env["VIRTUAL_ENV"] == str(venv)
+    assert env["PATH"].split(os.pathsep)[0] == str(venv / "bin")
 
 
 def test_build_client_preserves_explicit_empty_config(tmp_path):
@@ -3833,8 +3874,13 @@ async def test_fenced_recovery_old_client_stop_error_cleans_owned_pending_and_qu
         assert "pending_config" not in properties
         assert feature._client is None
         assert feature._stopping is True
+        assert feature._terminal_retirement_clients
+        assert feature._traffic_gate.sealed is True
     finally:
-        await feature.shutdown()
+        with pytest.raises(
+            RuntimeError, match="isolated feature terminal retirement is incomplete"
+        ):
+            await feature.shutdown()
 
 
 @pytest.mark.asyncio
@@ -4221,14 +4267,17 @@ async def test_repeated_cancellation_during_terminal_seal_finishes_gate_boundary
         assert (await waiter)["error"] == "isolated feature traffic is unavailable"
         assert feature._traffic_gate.sealed is True
 
-        shutdown_task.cancel()
-        shutdown_task.cancel()
+        shutdown_task.cancel("first terminal cleanup cancellation")
+        await asyncio.sleep(0)
+        assert not shutdown_task.done()
+        shutdown_task.cancel("later terminal cleanup cancellation")
         await asyncio.sleep(0)
         assert not shutdown_task.done()
         release_active.set()
         await active
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError) as cancelled:
             await shutdown_task
+        assert cancelled.value.args == ("first terminal cleanup cancellation",)
         assert feature._traffic_gate.sealed is True
         assert feature._traffic_gate._active == 0
         with pytest.raises(RuntimeError, match="isolated feature traffic is unavailable"):
@@ -4693,6 +4742,78 @@ async def test_shutdown_during_event_registration_keeps_initialize_terminal(
 
 
 @pytest.mark.asyncio
+async def test_registration_failure_after_shutdown_retirement_does_not_stop_twice(
+    monkeypatch, tmp_path
+):
+    """Registration cleanup never reclaims a client terminal cleanup already owns."""
+
+    registration_started = asyncio.Event()
+    release_registration = asyncio.Event()
+    stop_finished = asyncio.Event()
+    clients = []
+
+    class RegistrationFailureClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.stop_calls = 0
+
+        async def set_event_handler(self, _handler):
+            registration_started.set()
+            await release_registration.wait()
+            raise RuntimeError("event registration failed")
+
+        async def stop(self):
+            self.stop_calls += 1
+            self.stopped = True
+            stop_finished.set()
+
+    def client_factory(**kwargs):
+        client = RegistrationFailureClient(**kwargs)
+        clients.append(client)
+        return client
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=client_factory)
+    initialize_task = shutdown_task = None
+    try:
+        initialize_task = asyncio.create_task(feature.initialize())
+        await asyncio.wait_for(registration_started.wait(), timeout=1)
+        client = clients[0]
+
+        # Shutdown wins publication ownership while registration remains
+        # blocked.  It has retired the exact client, but must wait for the
+        # initializer's reload lock before it can complete its final fence.
+        shutdown_task = asyncio.create_task(feature.shutdown())
+        await asyncio.wait_for(stop_finished.wait(), timeout=1)
+        assert feature._client is None
+        assert not shutdown_task.done()
+
+        release_registration.set()
+        with pytest.raises(RuntimeError, match="event registration failed"):
+            await asyncio.wait_for(initialize_task, timeout=1)
+        await asyncio.wait_for(shutdown_task, timeout=1)
+
+        assert client.stop_calls == 1
+        assert feature._client is None
+        assert feature._terminal_retirement_clients == []
+        assert feature._terminal_cleanup_task is None
+        assert feature._traffic_gate.sealed is True
+        assert feature._supervision_task is None
+    finally:
+        release_registration.set()
+        for task in (initialize_task, shutdown_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        if not feature._stopping:
+            await feature.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_initialize_gate_reset_failure_unpublishes_and_retires_child(monkeypatch, tmp_path):
     """A post-connect gate failure follows the same terminal cleanup path."""
 
@@ -4864,3 +4985,4939 @@ async def test_reload_cancellation_after_old_stop_quarantines_publication(
             with pytest.raises(asyncio.CancelledError):
                 await reload_task
         await feature.shutdown()
+
+
+class _HostIngressClient(FakeIsolatedClient):
+    """SDK-client double that advertises a typed private ingress contract."""
+
+    def __init__(self, *, ingress_capabilities=None, **kwargs):
+        super().__init__(**kwargs)
+        self.ingress_capabilities = ingress_capabilities
+        self.ingress_calls = []
+
+    @property
+    def host_ingress_capabilities(self):
+        return self.ingress_capabilities
+
+    async def call_host_ingress(self, name, payload=None):
+        self.ingress_calls.append((name, payload))
+        return {"accepted": True}
+
+
+async def _initialized_host_ingress_proxy(
+    monkeypatch, tmp_path, client_factory, *, agent=None
+):
+    agent = agent or Mock(did=_TEST_AGENT_DID, features={})
+    agent.features = getattr(agent, "features", {})
+    storage = _CASStorage()
+    storage.agent_id = agent.did
+    agent.storage = storage
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=client_factory)
+    await feature.initialize()
+    return feature, agent
+
+
+def _walk_exception_chain(error):
+    """Yield every exception recursively reachable through chaining links."""
+
+    pending = [error]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        pending.extend((current.__context__, current.__cause__))
+
+
+def _assert_host_ingress_error_is_detached(error, *, secret, external=None):
+    """A redacted public failure must retain no private exception graph."""
+
+    chain = list(_walk_exception_chain(error))
+    assert all(secret not in str(item) for item in chain)
+    assert all(secret not in repr(item) for item in chain)
+    assert all(type(item) is HostIngressError for item in chain)
+    if external is not None:
+        assert all(item is not external for item in chain)
+
+
+def _assert_host_ingress_tracebacks_are_secret_free(error, *, secret):
+    """Inspect every internal traceback frame on every chained error.
+
+    ``raise ... from None`` only changes formatting; exception context and
+    traceback locals remain directly reachable to debuggers/telemetry.  Keep
+    this intentionally stronger than a message-redaction assertion.
+    """
+
+    forbidden_frames = {"_call_host_ingress_rpc", "_run_host_ingress"}
+    for chained in _walk_exception_chain(error):
+        traceback = chained.__traceback__
+        while traceback is not None:
+            frame = traceback.tb_frame
+            if frame.f_code.co_filename == isolated_runtime.__file__:
+                assert frame.f_code.co_name not in forbidden_frames
+                assert secret not in repr(dict(frame.f_locals))
+            traceback = traceback.tb_next
+
+
+def _safe_traceback_references(value):
+    """Yield bounded, non-executing references for traceback graph checks.
+
+    Do not use ``repr()``, ordinary ``getattr()``, or application-defined
+    properties here: the adversarial values under test can make each of those
+    secret-bearing or executable.  Never expand modules, globals, or classes:
+    those are ambient process state rather than a public-error retention path.
+    Native runtime objects are different: a public traceback can retain an
+    operation task, and a done task can retain its secret-bearing result.  Walk
+    only their built-in, non-executing reference edges below.
+    """
+
+    value_type = type(value)
+    if value_type is dict:
+        yield from value.keys()
+        yield from value.values()
+        return
+    if value_type in (list, tuple, set, frozenset):
+        yield from value
+        return
+
+    if value_type in (asyncio.Task, asyncio.Future):
+        # Use the base Future descriptors, never a facade/subclass override.
+        # A completed operation owns both its result and exception internally;
+        # either can otherwise retain private response/client data.
+        try:
+            done = asyncio.Future.done(value)
+            cancelled = asyncio.Future.cancelled(value)
+        except (AttributeError, TypeError):
+            return
+        if done and not cancelled:
+            try:
+                yield asyncio.Future.result(value)
+            except BaseException as error:  # native task failure graph
+                yield error
+            try:
+                error = asyncio.Future.exception(value)
+            except BaseException as error:  # native task failure graph
+                yield error
+            else:
+                if error is not None:
+                    yield error
+        for attribute in ("_fut_waiter", "_callbacks"):
+            try:
+                reference = object.__getattribute__(value, attribute)
+            except (AttributeError, TypeError):
+                continue
+            if type(reference) in (list, tuple):
+                yield from reference
+            elif reference is not None:
+                yield reference
+        return
+
+    if value_type is types.CoroutineType:
+        for attribute in ("cr_frame", "cr_await"):
+            try:
+                reference = object.__getattribute__(value, attribute)
+            except (AttributeError, TypeError):
+                continue
+            if reference is not None:
+                yield reference
+        return
+
+    if value_type is types.GeneratorType:
+        for attribute in ("gi_frame", "gi_yieldfrom"):
+            try:
+                reference = object.__getattribute__(value, attribute)
+            except (AttributeError, TypeError):
+                continue
+            if reference is not None:
+                yield reference
+        return
+
+    if value_type is types.AsyncGeneratorType:
+        for attribute in ("ag_frame", "ag_await"):
+            try:
+                reference = object.__getattribute__(value, attribute)
+            except (AttributeError, TypeError):
+                continue
+            if reference is not None:
+                yield reference
+        return
+
+    if value_type is types.TracebackType:
+        yield value.tb_frame
+        if value.tb_next is not None:
+            yield value.tb_next
+        return
+
+    if value_type is types.FrameType:
+        # ``f_locals`` is a runtime mapping, not application code.  Do not
+        # inspect ``f_globals``: modules/global graphs are intentionally leaves.
+        namespace = value.f_locals
+        if type(namespace) is dict:
+            yield from namespace.values()
+        return
+
+    if issubclass(value_type, BaseException):
+        for attribute in ("args", "__cause__", "__context__", "__traceback__"):
+            try:
+                reference = object.__getattribute__(value, attribute)
+            except (AttributeError, TypeError):
+                continue
+            if reference is not None:
+                yield reference
+
+    if value_type is types.CellType:
+        try:
+            yield value.cell_contents
+        except ValueError:
+            pass
+        return
+
+    if value_type is types.FunctionType:
+        closure = object.__getattribute__(value, "__closure__")
+        if type(closure) is tuple:
+            yield from closure
+        return
+
+    if value_type in (types.MethodType, types.BuiltinMethodType):
+        try:
+            yield object.__getattribute__(value, "__self__")
+        except (AttributeError, TypeError):
+            pass
+        if value_type is types.MethodType:
+            yield object.__getattribute__(value, "__func__")
+        return
+
+    if isinstance(
+        value,
+        (
+            types.ModuleType,
+            types.BuiltinFunctionType,
+            type,
+            types.CodeType,
+        ),
+    ):
+        return
+
+    # Calling object.__getattribute__ bypasses an instance's hostile
+    # __getattribute__ implementation. A class that replaces __dict__ with a
+    # property is skipped rather than executed.
+    class_namespace = type.__getattribute__(value_type, "__dict__")
+    if isinstance(class_namespace.get("__dict__"), property):
+        return
+    try:
+        namespace = object.__getattribute__(value, "__dict__")
+    except (AttributeError, TypeError):
+        return
+    if type(namespace) is dict:
+        yield from namespace.keys()
+        yield from namespace.values()
+
+
+def _assert_runtime_traceback_locals_are_detached(
+    error, *, forbidden_values, operation=None
+):
+    """Assert public runtime frames retain no task or private input/output.
+
+    This direct check complements the graph traversal: if a future refactor
+    forgets to clear the local operation task before raising, fail immediately
+    rather than relying on a particular task implementation's result graph.
+    """
+
+    forbidden_ids = {id(value) for value in forbidden_values}
+    if operation is not None:
+        forbidden_ids.add(id(operation))
+    for chained in _walk_exception_chain(error):
+        traceback = chained.__traceback__
+        while traceback is not None:
+            frame = traceback.tb_frame
+            if frame.f_code.co_filename == isolated_runtime.__file__:
+                local_values = tuple(frame.f_locals.values())
+                assert not any(
+                    type(value) in (asyncio.Task, asyncio.Future)
+                    for value in local_values
+                )
+                assert not any(id(value) in forbidden_ids for value in local_values)
+            traceback = traceback.tb_next
+
+
+def _traceback_locals_reach_any(
+    error, forbidden_values, *, runtime_filename=isolated_runtime.__file__
+):
+    """Whether runtime traceback locals reach an exact forbidden object."""
+
+    forbidden_ids = {id(value) for value in forbidden_values}
+    pending = []
+    for chained in _walk_exception_chain(error):
+        traceback = chained.__traceback__
+        while traceback is not None:
+            frame = traceback.tb_frame
+            if frame.f_code.co_filename == runtime_filename:
+                pending.extend(frame.f_locals.values())
+            traceback = traceback.tb_next
+
+    seen = set()
+    while pending:
+        value = pending.pop()
+        identity = id(value)
+        if identity in forbidden_ids:
+            return True
+        if identity in seen:
+            continue
+        seen.add(identity)
+        # This limit is a circuit breaker, not a lossy global traversal: the
+        # leaf policy above excludes the objects that could otherwise explode.
+        assert len(seen) < 4096
+        pending.extend(_safe_traceback_references(value))
+    return False
+
+
+@pytest.mark.asyncio
+async def test_traceback_reachability_follows_done_operation_task_result():
+    """The cancellation guard reaches a secret retained only by a task result."""
+
+    response_secret = "TRACEBACK-TASK-RESULT-SECRET-2755"
+
+    async def raise_with_operation_local():
+        operation = asyncio.create_task(
+            asyncio.sleep(0, result={"response": response_secret})
+        )
+        await operation
+        raise RuntimeError("synthetic public failure")
+
+    with pytest.raises(RuntimeError) as raised:
+        await raise_with_operation_local()
+    assert _traceback_locals_reach_any(
+        raised.value,
+        (response_secret,),
+        runtime_filename=__file__,
+    )
+
+
+@pytest.mark.asyncio
+async def test_host_ingress_is_private_and_uses_the_negotiated_sdk_contract(
+    monkeypatch, tmp_path
+):
+    """Host ingress is callable without becoming an agent-visible tool."""
+
+    client = _HostIngressClient(
+        ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
+    )
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: client
+    )
+    try:
+        result = await feature.call_host_ingress(
+            "telegram-webhook", {"update_id": 7}
+        )
+
+        assert result == {"accepted": True}
+        assert client.ingress_calls == [("telegram-webhook", {"update_id": 7})]
+        # The service's ordinary tools remain the only agent/LLM tool surface.
+        assert [tool.name for tool in feature.get_tools()] == ["ping"]
+        assert all(
+            "telegram-webhook" not in tool.schema.description
+            for tool in feature.get_tools()
+        )
+        assert "telegram-webhook" not in feature.tool_description
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_host_ingress_uses_the_published_wrapper_not_its_inner_transport(
+    monkeypatch, tmp_path
+):
+    """A subprocess-style facade owns both capability passthrough and RPC."""
+
+    inner = _HostIngressClient(
+        ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
+    )
+
+    class Wrapper:
+        def __init__(self):
+            self.client = inner
+            self.wrapper_calls = []
+
+        @property
+        def host_ingress_capabilities(self):
+            return self.client.host_ingress_capabilities
+
+        async def call_host_ingress(self, name, payload=None):
+            self.wrapper_calls.append((name, payload))
+            return await self.client.call_host_ingress(name, payload)
+
+        def __getattr__(self, name):
+            return getattr(self.client, name)
+
+    wrapper = Wrapper()
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: wrapper
+    )
+    try:
+        assert await feature.call_host_ingress("telegram-webhook", {"id": 1}) == {
+            "accepted": True
+        }
+        assert wrapper.wrapper_calls == [("telegram-webhook", {"id": 1})]
+        assert inner.ingress_calls == [("telegram-webhook", {"id": 1})]
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("capabilities", "error_type"),
+    [
+        (None, HostIngressUnsupportedError),
+        ({"version": 1, "names": ["telegram-webhook"]}, HostIngressUnsupportedError),
+        (
+            HostIngressCapabilities(names=("other-webhook",)),
+            HostIngressUnknownNameError,
+        ),
+    ],
+)
+async def test_host_ingress_fails_closed_for_missing_malformed_or_unknown_capabilities(
+    monkeypatch, tmp_path, capabilities, error_type
+):
+    """No ingress RPC is emitted unless typed metadata names it exactly."""
+
+    client = _HostIngressClient(ingress_capabilities=capabilities)
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: client
+    )
+    try:
+        with pytest.raises(error_type) as raised:
+            await feature.call_host_ingress("telegram-webhook", {"update_id": 7})
+
+        assert type(raised.value) is error_type
+        assert client.ingress_calls == []
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_host_ingress_rejects_str_subclasses_before_capability_comparison(
+    monkeypatch, tmp_path
+):
+    """A hostile ``str`` subclass cannot equality-match an advertised name."""
+
+    class EqualToEverything(str):
+        def __eq__(self, other):
+            return True
+
+        def __hash__(self):
+            return hash(str(self))
+
+    client = _HostIngressClient(
+        ingress_capabilities=HostIngressCapabilities(names=("other-webhook",))
+    )
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: client
+    )
+    try:
+        with pytest.raises(HostIngressError) as raised:
+            await feature.call_host_ingress(
+                EqualToEverything("not-an-advertised-webhook"),
+                {"update_id": 7},
+            )
+
+        assert type(raised.value) is HostIngressError
+        assert str(raised.value) == "host ingress failed"
+        assert client.ingress_calls == []
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_host_ingress_rejects_mutable_and_malformed_capabilities(
+    monkeypatch, tmp_path
+):
+    """Frozen SDK dataclasses with mutable or corrupted fields fail closed."""
+
+    mutable_names = ["telegram-webhook"]
+    mutable = HostIngressCapabilities(names=mutable_names)
+    mutable_names.append("unexpected-webhook")
+    malformed = HostIngressCapabilities(names=("telegram-webhook",))
+    object.__setattr__(malformed, "version", 2)
+
+    for capabilities in (mutable, malformed):
+        client = _HostIngressClient(ingress_capabilities=capabilities)
+        feature, _ = await _initialized_host_ingress_proxy(
+            monkeypatch, tmp_path, lambda client=client, **_: client
+        )
+        try:
+            with pytest.raises(HostIngressUnsupportedError) as raised:
+                await feature.call_host_ingress("telegram-webhook", {"update_id": 7})
+
+            assert type(raised.value) is HostIngressUnsupportedError
+            assert client.ingress_calls == []
+        finally:
+            await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_host_ingress_rejects_subclass_with_overridden_supports(
+    monkeypatch, tmp_path
+):
+    """An untrusted capability subclass cannot grant an unadvertised name."""
+
+    class PermissiveCapabilities(HostIngressCapabilities):
+        def supports(self, name):
+            return True
+
+    client = _HostIngressClient(
+        ingress_capabilities=PermissiveCapabilities(names=("other-webhook",))
+    )
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: client
+    )
+    try:
+        with pytest.raises(HostIngressUnsupportedError) as raised:
+            await feature.call_host_ingress("telegram-webhook", {"update_id": 7})
+
+        assert type(raised.value) is HostIngressUnsupportedError
+        assert client.ingress_calls == []
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_host_ingress_does_not_resolve_or_fall_back_to_another_agents_proxy(
+    monkeypatch, tmp_path
+):
+    """The caller's already-resolved proxy is the only ingress authority."""
+
+    alice_client = _HostIngressClient(
+        ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
+    )
+    bob_client = _HostIngressClient(
+        ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
+    )
+    alice_agent = Mock(did="did:test:alice", features={})
+    bob_agent = Mock(did="did:test:bob", features={})
+    alice, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path / "alice", lambda **_: alice_client, agent=alice_agent
+    )
+    bob, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path / "bob", lambda **_: bob_client, agent=bob_agent
+    )
+    # An ambient registry-like reference must not influence a proxy call.
+    alice_agent.features["CompanionFeature"] = bob
+    try:
+        assert (
+            await alice.call_host_ingress("telegram-webhook", {"agent": "alice"})
+            == {"accepted": True}
+        )
+        assert alice_client.ingress_calls == [
+            ("telegram-webhook", {"agent": "alice"})
+        ]
+        assert bob_client.ingress_calls == []
+    finally:
+        await alice.shutdown()
+        await bob.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_host_ingress_redacts_invalid_payload_and_transport_failure(
+    monkeypatch, tmp_path, caplog
+):
+    """Host-only request/config/transport details never cross the proxy API."""
+
+    secret = "super-secret-webhook-token"
+    transport_external = RuntimeError(
+        f"stdio://private/{secret} config={{'token': '{secret}'}}"
+    )
+
+    class LeakyClient(_HostIngressClient):
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            raise transport_external
+
+    client = LeakyClient(
+        ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
+    )
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: client
+    )
+    try:
+        with (
+            caplog.at_level("WARNING", logger=isolated_runtime.__name__),
+            pytest.raises(HostIngressError) as transport_error,
+        ):
+            await feature.call_host_ingress("telegram-webhook", {"token": secret})
+        assert str(transport_error.value) == "host ingress failed"
+        _assert_host_ingress_error_is_detached(
+            transport_error.value,
+            secret=secret,
+            external=transport_external,
+        )
+        assert secret not in str(transport_error.value)
+        assert "stdio://" not in str(transport_error.value)
+        assert secret not in caplog.text
+
+        with pytest.raises(HostIngressError) as invalid_payload_error:
+            await feature.call_host_ingress("telegram-webhook", {"token": object()})
+        assert str(invalid_payload_error.value) == "host ingress failed"
+        _assert_host_ingress_error_is_detached(
+            invalid_payload_error.value,
+            secret=secret,
+        )
+        assert client.ingress_calls == [("telegram-webhook", {"token": secret})]
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_host_ingress_redacts_capability_getter_and_response_errors(
+    monkeypatch, tmp_path, caplog
+):
+    """HostIngressError from an external facade never bypasses redaction."""
+
+    secret = "super-secret-webhook-token"
+    getter_external = RuntimeError(f"private capability token={secret}")
+
+    class GetterErrorClient(_HostIngressClient):
+        @property
+        def host_ingress_capabilities(self):
+            raise getter_external
+
+    getter_client = GetterErrorClient()
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: getter_client
+    )
+    try:
+        caplog.clear()
+        with (
+            caplog.at_level("WARNING", logger=isolated_runtime.__name__),
+            pytest.raises(HostIngressError) as getter_error,
+        ):
+            await feature.call_host_ingress("telegram-webhook", {"update_id": 7})
+
+        assert type(getter_error.value) is HostIngressError
+        assert str(getter_error.value) == "host ingress failed"
+        _assert_host_ingress_error_is_detached(
+            getter_error.value,
+            secret=secret,
+            external=getter_external,
+        )
+        assert secret not in caplog.text
+        assert getter_client.ingress_calls == []
+    finally:
+        await feature.shutdown()
+
+    class SecretResponse:
+        def __repr__(self):
+            return secret
+
+    class InvalidResponseClient(_HostIngressClient):
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            return {"token": SecretResponse()}
+
+    response_client = InvalidResponseClient(
+        ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
+    )
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: response_client
+    )
+    try:
+        caplog.clear()
+        with (
+            caplog.at_level("WARNING", logger=isolated_runtime.__name__),
+            pytest.raises(HostIngressError) as response_error,
+        ):
+            await feature.call_host_ingress("telegram-webhook", {"update_id": 7})
+
+        assert type(response_error.value) is HostIngressError
+        assert str(response_error.value) == "host ingress failed"
+        _assert_host_ingress_error_is_detached(
+            response_error.value,
+            secret=secret,
+        )
+        assert secret not in caplog.text
+        assert response_client.ingress_calls == [
+            ("telegram-webhook", {"update_id": 7})
+        ]
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_host_ingress_uses_exact_detached_json_request_and_response_snapshots(
+    monkeypatch, tmp_path
+):
+    """Ingress cannot dispatch subclasses or observe post-validation mutation."""
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_request = {"outer": {"state": "before"}, "items": [1, 2]}
+    original_response = {"outer": {"accepted": True}, "items": [3, 4]}
+
+    class SnapshotClient(_HostIngressClient):
+        async def call_host_ingress(self, name, payload=None):
+            entered.set()
+            await release.wait()
+            self.ingress_calls.append((name, payload))
+            return original_response
+
+    client = SnapshotClient(
+        ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
+    )
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: client
+    )
+    call = None
+    try:
+        call = asyncio.create_task(
+            feature.call_host_ingress("telegram-webhook", original_request)
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1)
+
+        # The client has not consumed its argument yet. Mutating the original
+        # after admission must not rewrite the already-snapshotted RPC payload.
+        original_request["outer"]["state"] = "after"
+        original_request["items"].append(99)
+        release.set()
+        result = await call
+
+        assert client.ingress_calls == [
+            ("telegram-webhook", {"outer": {"state": "before"}, "items": [1, 2]})
+        ]
+        assert result == original_response
+        original_response["outer"]["accepted"] = False
+        original_response["items"].append(99)
+        assert result == {"outer": {"accepted": True}, "items": [3, 4]}
+
+        class DictSubclass(dict):
+            pass
+
+        class ListSubclass(list):
+            pass
+
+        class StringSubclass(str):
+            pass
+
+        invalid_payloads = (
+            DictSubclass({"token": "subclass"}),
+            {"items": ListSubclass([1])},
+            {"token": StringSubclass("subclass")},
+            {StringSubclass("token"): "subclass"},
+        )
+        for invalid_payload in invalid_payloads:
+            with pytest.raises(HostIngressError, match="host ingress failed"):
+                await feature.call_host_ingress("telegram-webhook", invalid_payload)
+        assert len(client.ingress_calls) == 1
+
+        class ResponseSubclassClient(_HostIngressClient):
+            async def call_host_ingress(self, name, payload=None):
+                self.ingress_calls.append((name, payload))
+                return {"token": StringSubclass("response-subclass")}
+
+        response_client = ResponseSubclassClient(
+            ingress_capabilities=HostIngressCapabilities(
+                names=("telegram-webhook",)
+            )
+        )
+        response_feature, _ = await _initialized_host_ingress_proxy(
+            monkeypatch, tmp_path / "response", lambda **_: response_client
+        )
+        try:
+            with pytest.raises(HostIngressError, match="host ingress failed"):
+                await response_feature.call_host_ingress(
+                    "telegram-webhook", {"update_id": 1}
+                )
+            assert response_client.ingress_calls == [
+                ("telegram-webhook", {"update_id": 1})
+            ]
+        finally:
+            await response_feature.shutdown()
+    finally:
+        release.set()
+        if call is not None and not call.done():
+            call.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await call
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_host_ingress_preflights_exact_json_size_before_sdk_serialization(
+    monkeypatch, tmp_path
+):
+    """Dense valid JSON reaches the SDK; oversized escaped values never do."""
+
+    # ``[0,0,...]`` is the densest non-empty JSON tree: 32,767 scalar leaves
+    # plus brackets/separators encode to 65,535 bytes, one below the SDK cap.
+    dense_payload = [0] * ((MAX_HOST_INGRESS_PAYLOAD_BYTES - 1) // 2)
+    dense_response = list(dense_payload)
+    oversized_astral = "\U0001f642" * (MAX_HOST_INGRESS_PAYLOAD_BYTES // 12 + 1)
+    validator_payloads = []
+    sdk_validator = isolated_runtime.validate_host_ingress_payload
+
+    def recording_validator(value):
+        validator_payloads.append(value)
+        return sdk_validator(value)
+
+    monkeypatch.setattr(
+        isolated_runtime,
+        "validate_host_ingress_payload",
+        recording_validator,
+    )
+
+    class DenseClient(_HostIngressClient):
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            return dense_response
+
+    client = DenseClient(
+        ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
+    )
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: client
+    )
+    try:
+        assert await feature.call_host_ingress("telegram-webhook", dense_payload) == dense_response
+        assert client.ingress_calls == [("telegram-webhook", dense_payload)]
+
+        # Both a scalar and a key exceed 64 KiB only after the SDK's required
+        # ASCII escaping.  They must fail before the SDK validator or facade
+        # can materialize/receive them.
+        validator_count = len(validator_payloads)
+        for oversized_request in (
+            {"payload": oversized_astral},
+            {oversized_astral: "payload"},
+        ):
+            with pytest.raises(HostIngressError, match="host ingress failed") as raised:
+                await feature.call_host_ingress("telegram-webhook", oversized_request)
+            _assert_host_ingress_error_is_detached(
+                raised.value,
+                secret=oversized_astral,
+            )
+            _assert_host_ingress_tracebacks_are_secret_free(
+                raised.value,
+                secret=oversized_astral,
+            )
+        assert len(validator_payloads) == validator_count
+        assert client.ingress_calls == [("telegram-webhook", dense_payload)]
+
+        class OversizedResponseClient(_HostIngressClient):
+            async def call_host_ingress(self, name, payload=None):
+                self.ingress_calls.append((name, payload))
+                return {"payload": oversized_astral}
+
+        response_client = OversizedResponseClient(
+            ingress_capabilities=HostIngressCapabilities(
+                names=("telegram-webhook",)
+            )
+        )
+        response_feature, _ = await _initialized_host_ingress_proxy(
+            monkeypatch, tmp_path / "response", lambda **_: response_client
+        )
+        try:
+            with pytest.raises(HostIngressError, match="host ingress failed") as raised:
+                await response_feature.call_host_ingress(
+                    "telegram-webhook", {"update_id": 1}
+                )
+            _assert_host_ingress_error_is_detached(
+                raised.value,
+                secret=oversized_astral,
+            )
+            _assert_host_ingress_tracebacks_are_secret_free(
+                raised.value,
+                secret=oversized_astral,
+            )
+            assert response_client.ingress_calls == [
+                ("telegram-webhook", {"update_id": 1})
+            ]
+            # The response reaches the host worker, but its oversized value
+            # never reaches the SDK validator's allocating serializer.
+            assert not any(
+                value == {"payload": oversized_astral}
+                for value in validator_payloads
+            )
+        finally:
+            await response_feature.shutdown()
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_host_ingress_accepts_shared_alias_dags_as_detached_json_trees(
+    monkeypatch, tmp_path
+):
+    """SDK-valid aliases are charged and copied independently per branch."""
+
+    client = _HostIngressClient(
+        ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
+    )
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: client
+    )
+    shared = {"items": ["first"]}
+    payload = {"left": shared, "right": shared}
+    validator_payloads = []
+    sdk_validator = isolated_runtime.validate_host_ingress_payload
+
+    def recording_validator(value):
+        validator_payloads.append(value)
+        return sdk_validator(value)
+
+    monkeypatch.setattr(isolated_runtime, "validate_host_ingress_payload", recording_validator)
+    try:
+        assert await feature.call_host_ingress("telegram-webhook", payload) == {
+            "accepted": True
+        }
+        dispatched = client.ingress_calls[0][1]
+        assert dispatched == payload
+        assert dispatched is not payload
+        assert dispatched["left"] is not dispatched["right"]
+        assert dispatched["left"]["items"] is not dispatched["right"]["items"]
+        assert json.dumps(dispatched, ensure_ascii=True, separators=(",", ":")) == json.dumps(
+            payload, ensure_ascii=True, separators=(",", ":")
+        )
+        shared["items"].append("source mutation")
+        assert dispatched == {
+            "left": {"items": ["first"]},
+            "right": {"items": ["first"]},
+        }
+        assert dispatched in validator_payloads
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_host_ingress_rejects_container_cycles_and_excessive_alias_expansion(
+    monkeypatch, tmp_path
+):
+    """Cycles and aliases that exceed the expanded JSON budget fail closed."""
+
+    client = _HostIngressClient(
+        ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
+    )
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: client
+    )
+    validator_called = False
+
+    def unexpected_validator(_value):
+        nonlocal validator_called
+        validator_called = True
+        raise AssertionError("invalid graph reached SDK validation")
+
+    monkeypatch.setattr(isolated_runtime, "validate_host_ingress_payload", unexpected_validator)
+    recursive_list = []
+    recursive_list.append(recursive_list)
+    recursive_dict = {}
+    recursive_dict["self"] = recursive_dict
+    expanded: list[object] = []
+    for _ in range(16):
+        expanded = [expanded, expanded]
+    try:
+        for invalid_payload in (
+            {"tree": recursive_list},
+            {"tree": recursive_dict},
+            {"tree": expanded},
+        ):
+            with pytest.raises(HostIngressError, match="host ingress failed"):
+                await feature.call_host_ingress("telegram-webhook", invalid_payload)
+        assert validator_called is False
+        assert client.ingress_calls == []
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_host_ingress_generic_failures_have_no_secret_traceback_locals(
+    monkeypatch, tmp_path
+):
+    """Validation/facade/RPC failures expose neither chains nor frame locals."""
+
+    secret = "TRACEBACK-ONLY-SECRET-2755"
+
+    class SecretValue:
+        def __repr__(self):
+            return secret
+
+    capability_error = RuntimeError(f"capability={secret}")
+    descriptor_error = RuntimeError(f"descriptor={secret}")
+    transport_error = RuntimeError(f"transport={secret}")
+
+    class GetterFailureClient(_HostIngressClient):
+        @property
+        def host_ingress_capabilities(self):
+            raise capability_error
+
+    class DescriptorFailureClient(_HostIngressClient):
+        @property
+        def call_host_ingress(self):
+            raise descriptor_error
+
+    class TransportFailureClient(_HostIngressClient):
+        async def call_host_ingress(self, name, payload=None):
+            raise transport_error
+
+    class ResponseFailureClient(_HostIngressClient):
+        async def call_host_ingress(self, name, payload=None):
+            return {"secret": SecretValue()}
+
+    clients_and_payloads = (
+        (
+            _HostIngressClient(
+                ingress_capabilities=HostIngressCapabilities(
+                    names=("telegram-webhook",)
+                )
+            ),
+            {"secret": SecretValue()},
+        ),
+        (GetterFailureClient(), {"secret": secret}),
+        (
+            DescriptorFailureClient(
+                ingress_capabilities=HostIngressCapabilities(
+                    names=("telegram-webhook",)
+                )
+            ),
+            {"secret": secret},
+        ),
+        (
+            TransportFailureClient(
+                ingress_capabilities=HostIngressCapabilities(
+                    names=("telegram-webhook",)
+                )
+            ),
+            {"secret": secret},
+        ),
+        (
+            ResponseFailureClient(
+                ingress_capabilities=HostIngressCapabilities(
+                    names=("telegram-webhook",)
+                )
+            ),
+            {"secret": secret},
+        ),
+    )
+
+    for index, (client, payload) in enumerate(clients_and_payloads):
+        feature, _ = await _initialized_host_ingress_proxy(
+            monkeypatch,
+            tmp_path / str(index),
+            lambda client=client, **_: client,
+        )
+        try:
+            with pytest.raises(HostIngressError) as raised:
+                await feature.call_host_ingress("telegram-webhook", payload)
+            assert type(raised.value) is HostIngressError
+            assert str(raised.value) == "host ingress failed"
+            _assert_host_ingress_error_is_detached(raised.value, secret=secret)
+            _assert_host_ingress_tracebacks_are_secret_free(
+                raised.value, secret=secret
+            )
+            _assert_runtime_traceback_locals_are_detached(
+                raised.value,
+                forbidden_values=(secret, client),
+            )
+        finally:
+            await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_caller_cancelled_host_ingress_discards_successful_secret_outcome(
+    monkeypatch, tmp_path
+):
+    """A cancellation traceback cannot reach a response that won the RPC race."""
+
+    request_secret = "HOST-INGRESS-REQUEST-SECRET-2755"
+    response_secret = "HOST-INGRESS-RESPONSE-SECRET-2755"
+    client_secret = "HOST-INGRESS-CLIENT-SECRET-2755"
+
+    class CancelAfterSuccessClient(_HostIngressClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.cancel_target = None
+            self.client_secret = client_secret
+
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            # Deliver cancellation after this task has reached its successful
+            # response path but before the public caller can return it.
+            self.cancel_target.cancel("first caller cancellation")
+            return {"response": response_secret}
+
+    client = CancelAfterSuccessClient(
+        ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
+    )
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: client
+    )
+    call = None
+    try:
+        call = asyncio.create_task(
+            feature.call_host_ingress(
+                "telegram-webhook", {"request": request_secret}
+            )
+        )
+        client.cancel_target = call
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await call
+
+        assert cancelled.value.args == ("first caller cancellation",)
+        assert client.ingress_calls == [
+            ("telegram-webhook", {"request": request_secret})
+        ]
+        assert not _traceback_locals_reach_any(
+            cancelled.value,
+            (request_secret, response_secret, client_secret, client),
+        )
+        _assert_runtime_traceback_locals_are_detached(
+            cancelled.value,
+            forbidden_values=(request_secret, response_secret, client_secret, client),
+            operation=call,
+        )
+    finally:
+        if call is not None and not call.done():
+            call.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await call
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_host_ingress_worker_tasks_drop_private_results_on_all_terminal_paths(
+    monkeypatch, tmp_path
+):
+    """Success, failure, and caller cancellation leave no payload in worker tasks."""
+
+    request_secret = "WORKER-REQUEST-SECRET-2755"
+    response_secret = "WORKER-RESPONSE-SECRET-2755"
+    delayed_started = asyncio.Event()
+    release_delayed = asyncio.Event()
+    worker_tasks = []
+
+    class TerminalPathClient(_HostIngressClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.mode = "success"
+            self.client_secret = "WORKER-CLIENT-SECRET-2755"
+
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            if self.mode == "failure":
+                raise RuntimeError(response_secret)
+            if self.mode == "delayed":
+                delayed_started.set()
+                await release_delayed.wait()
+            return {"response": response_secret}
+
+    client = TerminalPathClient(
+        ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
+    )
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: client
+    )
+    real_create_task = asyncio.create_task
+
+    def capture_host_ingress_worker(coro, *, name=None, **kwargs):
+        task = real_create_task(coro, name=name, **kwargs)
+        if name and name.startswith("isolated-host-ingress:"):
+            worker_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(
+        isolated_runtime.asyncio, "create_task", capture_host_ingress_worker
+    )
+    delayed_call = None
+    try:
+        assert await feature.call_host_ingress(
+            "telegram-webhook", {"request": request_secret}
+        ) == {"response": response_secret}
+
+        client.mode = "failure"
+        with pytest.raises(HostIngressError, match="host ingress failed") as failure:
+            await feature.call_host_ingress(
+                "telegram-webhook", {"request": request_secret}
+            )
+        _assert_host_ingress_error_is_detached(failure.value, secret=response_secret)
+
+        client.mode = "delayed"
+        delayed_call = real_create_task(
+            feature.call_host_ingress(
+                "telegram-webhook", {"request": request_secret}
+            )
+        )
+        await asyncio.wait_for(delayed_started.wait(), timeout=1)
+        delayed_call.cancel("private caller cancellation")
+        await asyncio.sleep(0)
+        assert delayed_call.done() is False
+        release_delayed.set()
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await delayed_call
+        assert cancelled.value.args == ("private caller cancellation",)
+
+        assert len(worker_tasks) == 3
+        for worker in worker_tasks:
+            assert worker.done()
+            assert worker.cancelled() is False
+            # The one-shot slot is consumed before delivery, so the task's
+            # native result cannot retain request, response, or client data.
+            assert worker.result() is None
+            assert worker.get_coro().cr_frame is None
+    finally:
+        release_delayed.set()
+        if delayed_call is not None and not delayed_call.done():
+            delayed_call.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await delayed_call
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_host_ingress_preserves_sdk_cancellation(monkeypatch, tmp_path):
+    """A child-side cancellation is never redacted as a host ingress error."""
+
+    class CancellingClient(_HostIngressClient):
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            raise asyncio.CancelledError()
+
+    client = CancellingClient(
+        ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
+    )
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: client
+    )
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await feature.call_host_ingress("telegram-webhook", {"update_id": 7})
+        assert client.ingress_calls == [("telegram-webhook", {"update_id": 7})]
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_host_ingress_cancellation_drains_remote_call_before_reload(
+    monkeypatch, tmp_path
+):
+    """Caller cancellation cannot release traffic beneath an active RPC."""
+
+    started = asyncio.Event()
+    blocker = asyncio.Event()
+    clients = []
+
+    class CancellableClient(_HostIngressClient):
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            if len(clients) == 1:
+                started.set()
+                await blocker.wait()
+            return {"client": len(clients)}
+
+    def client_factory(**kwargs):
+        client = CancellableClient(
+            ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",)),
+            **kwargs,
+        )
+        clients.append(client)
+        return client
+
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, client_factory
+    )
+    active = reload_task = None
+    try:
+        active = asyncio.create_task(
+            feature.call_host_ingress("telegram-webhook", {"sequence": 1})
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+        active.cancel()
+        await asyncio.sleep(0)
+        assert not active.done()
+
+        reload_task = asyncio.create_task(feature.reload())
+        for _ in range(100):
+            if feature._traffic_gate.closed:
+                break
+            await asyncio.sleep(0)
+        assert feature._traffic_gate.closed is True
+        assert not reload_task.done()
+        assert clients[0].stopped is False
+
+        blocker.set()
+        with pytest.raises(asyncio.CancelledError):
+            await active
+        await asyncio.wait_for(reload_task, timeout=1)
+        assert clients[0].stopped is True
+        assert await feature.call_host_ingress("telegram-webhook", {"sequence": 2}) == {
+            "client": 2
+        }
+    finally:
+        blocker.set()
+        if reload_task is not None and not reload_task.done():
+            reload_task.cancel()
+            try:
+                await reload_task
+            except asyncio.CancelledError:
+                pass
+        if active is not None and not active.done():
+            active.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await active
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_terminal_stop_failure_retains_exact_client_for_bounded_retry(
+    monkeypatch, tmp_path
+):
+    """A failed terminal stop neither loses its client handle nor drains forever."""
+
+    ingress_started = asyncio.Event()
+    terminate_ingress = asyncio.Event()
+
+    class TerminalStopFailure(BaseException):
+        pass
+
+    class FirstStopFailsClient(_HostIngressClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.stop_calls = 0
+
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            ingress_started.set()
+            await terminate_ingress.wait()
+            return {"accepted": True}
+
+        async def stop(self):
+            self.stop_calls += 1
+            if self.stop_calls == 1:
+                raise TerminalStopFailure("first terminal stop failed")
+            self.stopped = True
+            terminate_ingress.set()
+
+    client = FirstStopFailsClient(
+        ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
+    )
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: client
+    )
+    ingress = None
+    supervisor = feature._supervision_task
+    try:
+        assert supervisor is not None
+        ingress = asyncio.create_task(
+            feature.call_host_ingress("telegram-webhook", {"update_id": 7})
+        )
+        await asyncio.wait_for(ingress_started.wait(), timeout=1)
+
+        with pytest.raises(
+            RuntimeError, match="isolated feature terminal retirement is incomplete"
+        ) as raised:
+            await asyncio.wait_for(feature.shutdown(), timeout=1)
+        assert type(raised.value) is RuntimeError
+        assert "first terminal stop failed" not in str(raised.value)
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
+
+        assert feature._client is None
+        assert feature._terminal_retirement_clients == [client]
+        assert feature._traffic_gate.sealed is True
+        assert feature._traffic_gate._active == 1
+        assert ingress.done() is False
+
+        await asyncio.wait_for(feature.shutdown(), timeout=1)
+        assert await ingress == {"accepted": True}
+        assert client.stop_calls == 2
+        assert client.stopped is True
+        assert feature._terminal_retirement_clients == []
+        assert feature._traffic_gate._active == 0
+        assert feature._client is None
+        assert feature._supervision_task is None
+        assert feature._terminal_cleanup_task is None
+        assert supervisor.done() is True
+        assert supervisor.cancelled() is True
+    finally:
+        terminate_ingress.set()
+        if ingress is not None and not ingress.done():
+            ingress.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await ingress
+        if not feature._stopping:
+            await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_best_effort_terminal_cleanup_cannot_make_concurrent_shutdown_succeed(
+    monkeypatch, tmp_path
+):
+    """A cached best-effort stop never lends its policy to explicit shutdown."""
+
+    ingress_started = asyncio.Event()
+    stop_started = asyncio.Event()
+    release_first_stop = asyncio.Event()
+    terminate_ingress = asyncio.Event()
+
+    class HostileTerminalStop(BaseException):
+        pass
+
+    class ConcurrentStopClient(_HostIngressClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.stop_calls = 0
+            self.stops_in_flight = 0
+            self.maximum_stops_in_flight = 0
+
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            ingress_started.set()
+            await terminate_ingress.wait()
+            return {"accepted": True}
+
+        async def stop(self):
+            self.stop_calls += 1
+            self.stops_in_flight += 1
+            self.maximum_stops_in_flight = max(
+                self.maximum_stops_in_flight, self.stops_in_flight
+            )
+            try:
+                if self.stop_calls == 1:
+                    stop_started.set()
+                    await release_first_stop.wait()
+                    raise HostileTerminalStop("hostile terminal stop detail")
+                self.stopped = True
+                terminate_ingress.set()
+            finally:
+                self.stops_in_flight -= 1
+
+    client = ConcurrentStopClient(
+        ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
+    )
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: client
+    )
+    ingress = quarantine = shutdown_task = None
+    supervisor = feature._supervision_task
+    try:
+        assert supervisor is not None
+        ingress = asyncio.create_task(
+            feature.call_host_ingress("telegram-webhook", {"update_id": 7})
+        )
+        await asyncio.wait_for(ingress_started.wait(), timeout=1)
+
+        # Quarantine owns the cached shared task and is entitled to return to
+        # its originating lifecycle failure after its neutral attempt settles.
+        quarantine = asyncio.create_task(feature._quarantine_unreconciled_client())
+        await asyncio.wait_for(stop_started.wait(), timeout=1)
+        assert feature._terminal_cleanup_task is not None
+        assert not quarantine.done()
+
+        # An explicit shutdown joins the in-flight neutral work. It must make
+        # its own success decision once the hostile stop has settled.
+        shutdown_task = asyncio.create_task(feature.shutdown())
+        await asyncio.sleep(0)
+        assert not shutdown_task.done()
+        assert client.maximum_stops_in_flight == 1
+
+        release_first_stop.set()
+        await asyncio.wait_for(quarantine, timeout=1)
+        with pytest.raises(
+            RuntimeError, match="isolated feature terminal retirement is incomplete"
+        ) as raised:
+            await asyncio.wait_for(shutdown_task, timeout=1)
+        assert "hostile terminal stop detail" not in str(raised.value)
+        assert raised.value.__cause__ is None
+
+        # The exact facade is still retained and the old ingress is counted,
+        # but the sealed proxy makes it unreachable to all new host traffic.
+        assert client.stop_calls == 1
+        assert client.maximum_stops_in_flight == 1
+        assert feature._terminal_retirement_clients == [client]
+        assert feature._client is None
+        assert feature._traffic_gate.sealed is True
+        assert feature._traffic_gate._active == 1
+        assert not ingress.done()
+        with pytest.raises(HostIngressError, match="host ingress is unavailable"):
+            await feature.call_host_ingress("telegram-webhook", {"update_id": 8})
+
+        # A later explicit caller creates a fresh neutral attempt. It retries
+        # the exact retained facade, then may truthfully drain and finish.
+        await asyncio.wait_for(feature.shutdown(), timeout=1)
+        assert await ingress == {"accepted": True}
+        assert client.stop_calls == 2
+        assert client.maximum_stops_in_flight == 1
+        assert client.stopped is True
+        assert feature._terminal_retirement_clients == []
+        assert feature._traffic_gate._active == 0
+        assert feature._client is None
+        assert feature._supervision_task is None
+        assert feature._terminal_cleanup_task is None
+        assert supervisor.done() is True
+        assert supervisor.cancelled() is True
+    finally:
+        release_first_stop.set()
+        terminate_ingress.set()
+        for task in (shutdown_task, quarantine, ingress):
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        if not feature._stopping:
+            await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_initialize_reports_generic_failure_for_retained_terminal_client(
+    monkeypatch, tmp_path
+):
+    """Explicit initialize cannot start beside an unsuccessfully stopped child."""
+
+    stop_started = asyncio.Event()
+    release_first_stop = asyncio.Event()
+
+    class HostileTerminalStop(BaseException):
+        pass
+
+    class NeverStopsClient(_HostIngressClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.stop_calls = 0
+
+        async def stop(self):
+            self.stop_calls += 1
+            if self.stop_calls == 1:
+                stop_started.set()
+                await release_first_stop.wait()
+            raise HostileTerminalStop("terminal stop must remain private")
+
+    client = NeverStopsClient(
+        ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
+    )
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: client
+    )
+    quarantine = initialize_task = None
+    try:
+        quarantine = asyncio.create_task(feature._quarantine_unreconciled_client())
+        await asyncio.wait_for(stop_started.wait(), timeout=1)
+        initialize_task = asyncio.create_task(feature.initialize())
+        await asyncio.sleep(0)
+        assert not initialize_task.done()
+
+        release_first_stop.set()
+        await asyncio.wait_for(quarantine, timeout=1)
+        assert client.stop_calls == 1
+        assert feature._terminal_retirement_clients == [client]
+
+        with pytest.raises(
+            RuntimeError, match="isolated feature terminal retirement is incomplete"
+        ) as raised:
+            await asyncio.wait_for(initialize_task, timeout=1)
+        assert type(raised.value) is RuntimeError
+        assert "terminal stop must remain private" not in str(raised.value)
+        assert raised.value.__cause__ is None
+        assert client.stop_calls == 1
+        assert feature._terminal_retirement_clients == [client]
+        assert feature._client is None
+        assert feature._traffic_gate.sealed is True
+    finally:
+        release_first_stop.set()
+        for task in (initialize_task, quarantine):
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        with pytest.raises(
+            RuntimeError, match="isolated feature terminal retirement is incomplete"
+        ):
+            await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancellation_preserves_caller_cancel_after_hostile_stop(
+    monkeypatch, tmp_path
+):
+    """A caller cancellation wins over an incomplete neutral stop attempt."""
+
+    stop_started = asyncio.Event()
+    release_first_stop = asyncio.Event()
+
+    class HostileTerminalStop(BaseException):
+        pass
+
+    class CancelledStopClient(_HostIngressClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.stop_calls = 0
+
+        async def stop(self):
+            self.stop_calls += 1
+            if self.stop_calls == 1:
+                stop_started.set()
+                await release_first_stop.wait()
+                raise HostileTerminalStop("do not replace caller cancellation")
+            self.stopped = True
+
+    client = CancelledStopClient(
+        ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
+    )
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: client
+    )
+    shutdown_task = None
+    try:
+        shutdown_task = asyncio.create_task(feature.shutdown())
+        await asyncio.wait_for(stop_started.wait(), timeout=1)
+        shutdown_task.cancel("explicit shutdown cancellation")
+        await asyncio.sleep(0)
+        assert not shutdown_task.done()
+
+        release_first_stop.set()
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await asyncio.wait_for(shutdown_task, timeout=1)
+        assert cancelled.value.args == ("explicit shutdown cancellation",)
+        assert client.stop_calls == 1
+        assert feature._terminal_retirement_clients == [client]
+        assert feature._traffic_gate.sealed is True
+
+        await asyncio.wait_for(feature.shutdown(), timeout=1)
+        assert client.stop_calls == 2
+        assert client.stopped is True
+        assert feature._terminal_retirement_clients == []
+        assert feature._terminal_cleanup_task is None
+    finally:
+        release_first_stop.set()
+        if shutdown_task is not None and not shutdown_task.done():
+            shutdown_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await shutdown_task
+        if not feature._stopping:
+            await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_owned_terminal_cleanup_and_shutdown_serialize_exact_client_stop(
+    monkeypatch, tmp_path
+):
+    """A reload owner and shared shutdown never overlap one facade stop."""
+
+    first_stop_started = asyncio.Event()
+    release_first_stop = asyncio.Event()
+
+    class HostileTerminalStop(BaseException):
+        pass
+
+    class OwnedRaceClient(_HostIngressClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.stop_calls = 0
+            self.stops_in_flight = 0
+            self.maximum_stops_in_flight = 0
+
+        async def stop(self):
+            self.stop_calls += 1
+            self.stops_in_flight += 1
+            self.maximum_stops_in_flight = max(
+                self.maximum_stops_in_flight, self.stops_in_flight
+            )
+            try:
+                if self.stop_calls == 1:
+                    first_stop_started.set()
+                    await release_first_stop.wait()
+                if self.stop_calls < 3:
+                    raise HostileTerminalStop("owned cleanup stop failed")
+                self.stopped = True
+            finally:
+                self.stops_in_flight -= 1
+
+    client = OwnedRaceClient(
+        ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
+    )
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: client
+    )
+    owned = shutdown_task = None
+    lock_held = False
+    try:
+        await feature._reload_lock.acquire()
+        lock_held = True
+        owned = asyncio.create_task(
+            feature._quarantine_unreconciled_client(lifecycle_lock_held=True)
+        )
+        await asyncio.wait_for(first_stop_started.wait(), timeout=1)
+
+        # The shared shutdown begins while the owned cleanup still awaits its
+        # exact client's first stop. It must wait on retirement ownership,
+        # rather than start a second facade stop beside it.
+        shutdown_task = asyncio.create_task(feature.shutdown())
+        await asyncio.sleep(0)
+        assert client.maximum_stops_in_flight == 1
+        assert not shutdown_task.done()
+
+        release_first_stop.set()
+        await asyncio.wait_for(owned, timeout=1)
+        with pytest.raises(
+            RuntimeError, match="isolated feature terminal retirement is incomplete"
+        ):
+            await asyncio.wait_for(shutdown_task, timeout=1)
+        assert client.stop_calls == 2
+        assert client.maximum_stops_in_flight == 1
+        assert feature._terminal_retirement_clients == [client]
+        assert feature._traffic_gate.sealed is True
+
+        feature._reload_lock.release()
+        lock_held = False
+        await asyncio.wait_for(feature.shutdown(), timeout=1)
+        assert client.stop_calls == 3
+        assert client.maximum_stops_in_flight == 1
+        assert client.stopped is True
+        assert feature._terminal_retirement_clients == []
+        assert feature._terminal_cleanup_task is None
+    finally:
+        release_first_stop.set()
+        if lock_held:
+            feature._reload_lock.release()
+        for task in (shutdown_task, owned):
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        if not feature._stopping:
+            await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_host_ingress_waits_for_reload_then_uses_replacement_child(
+    monkeypatch, tmp_path
+):
+    """Reload drains a running ingress call before retiring its subprocess."""
+
+    active_started = asyncio.Event()
+    release_active = asyncio.Event()
+    clients = []
+
+    class BlockingClient(_HostIngressClient):
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            if payload == {"sequence": 1}:
+                active_started.set()
+                await release_active.wait()
+            return {"client": len(clients), "sequence": payload["sequence"]}
+
+    def client_factory(**kwargs):
+        client = BlockingClient(
+            ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",)),
+            **kwargs,
+        )
+        clients.append(client)
+        return client
+
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, client_factory
+    )
+    active = reload_task = queued = None
+    try:
+        active = asyncio.create_task(
+            feature.call_host_ingress("telegram-webhook", {"sequence": 1})
+        )
+        await asyncio.wait_for(active_started.wait(), timeout=1)
+        reload_task = asyncio.create_task(feature.reload())
+        for _ in range(100):
+            if feature._traffic_gate.closed:
+                break
+            await asyncio.sleep(0)
+        assert feature._traffic_gate.closed is True
+
+        queued = asyncio.create_task(
+            feature.call_host_ingress("telegram-webhook", {"sequence": 2})
+        )
+        await asyncio.sleep(0)
+        assert not queued.done()
+        assert clients[0].ingress_calls == [("telegram-webhook", {"sequence": 1})]
+
+        release_active.set()
+        assert await active == {"client": 1, "sequence": 1}
+        await reload_task
+        assert clients[0].stopped is True
+        assert await queued == {"client": 2, "sequence": 2}
+        assert clients[1].ingress_calls == [("telegram-webhook", {"sequence": 2})]
+    finally:
+        release_active.set()
+        for task in (queued, reload_task, active):
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_host_ingress_waits_for_config_transition_before_delivery(
+    monkeypatch, tmp_path
+):
+    """A config transition drains ingress before its lifecycle hook starts."""
+
+    active_started = asyncio.Event()
+    release_active = asyncio.Event()
+
+    class TransitionClient(_HostIngressClient):
+        supports_config_transition = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.prepared = []
+
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            if payload == {"sequence": 1}:
+                active_started.set()
+                await release_active.wait()
+            return {"sequence": payload["sequence"]}
+
+        async def prepare_config_transition(self, config):
+            self.prepared.append(dict(config))
+            return ConfigTransitionResult.applied()
+
+    client = TransitionClient(
+        ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
+    )
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: client
+    )
+    active = update = queued = None
+    try:
+        active = asyncio.create_task(
+            feature.call_host_ingress("telegram-webhook", {"sequence": 1})
+        )
+        await asyncio.wait_for(active_started.wait(), timeout=1)
+        update = asyncio.create_task(feature.set_config({"enabled": False}))
+        for _ in range(100):
+            if feature._traffic_gate.closed:
+                break
+            await asyncio.sleep(0)
+        assert feature._traffic_gate.closed is True
+        assert client.prepared == []
+
+        queued = asyncio.create_task(
+            feature.call_host_ingress("telegram-webhook", {"sequence": 2})
+        )
+        await asyncio.sleep(0)
+        assert not queued.done()
+
+        release_active.set()
+        assert await active == {"sequence": 1}
+        await update
+        assert client.prepared == [{"enabled": False}]
+        assert await queued == {"sequence": 2}
+        assert client.ingress_calls == [
+            ("telegram-webhook", {"sequence": 1}),
+            ("telegram-webhook", {"sequence": 2}),
+        ]
+    finally:
+        release_active.set()
+        for task in (queued, update, active):
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_host_ingress_shutdown_drains_active_call_and_rejects_new_work(
+    monkeypatch, tmp_path
+):
+    """Shutdown cannot stop a child while it serves an admitted ingress RPC."""
+
+    active_started = asyncio.Event()
+    release_active = asyncio.Event()
+
+    class BlockingClient(_HostIngressClient):
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            active_started.set()
+            await release_active.wait()
+            return {"accepted": True}
+
+    client = BlockingClient(
+        ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
+    )
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: client
+    )
+    active = shutdown_task = None
+    try:
+        active = asyncio.create_task(
+            feature.call_host_ingress("telegram-webhook", {"sequence": 1})
+        )
+        await asyncio.wait_for(active_started.wait(), timeout=1)
+        shutdown_task = asyncio.create_task(feature.shutdown())
+        for _ in range(100):
+            if feature._traffic_gate.sealed:
+                break
+            await asyncio.sleep(0)
+        assert feature._traffic_gate.sealed is True
+
+        with pytest.raises(HostIngressError, match="host ingress is unavailable"):
+            await feature.call_host_ingress("telegram-webhook", {"sequence": 2})
+        assert client.ingress_calls == [("telegram-webhook", {"sequence": 1})]
+        # Terminal cleanup stops the selected child before it drains the
+        # admitted ingress. A cooperative double still needs the explicit
+        # release below, but a production wrapper uses this stop to terminate
+        # a permanently wedged subprocess.
+        for _ in range(100):
+            if client.stopped:
+                break
+            await asyncio.sleep(0)
+        assert client.stopped is True
+        assert not shutdown_task.done()
+
+        release_active.set()
+        assert await active == {"accepted": True}
+        await shutdown_task
+        assert client.stopped is True
+    finally:
+        release_active.set()
+        for task in (shutdown_task, active):
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        if not feature._stopping:
+            await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_terminal_drain_timeout_keeps_dishonest_stop_sealed_and_owned(
+    monkeypatch, tmp_path
+):
+    """A stop that lies about a wedged RPC cannot hang or report success."""
+
+    active_started = asyncio.Event()
+    release_active = asyncio.Event()
+
+    class DishonestStopClient(_HostIngressClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.stop_calls = 0
+
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            active_started.set()
+            await release_active.wait()
+            return {"accepted": True}
+
+        async def stop(self):
+            # Deliberately claim success without settling the admitted RPC.
+            self.stop_calls += 1
+            self.stopped = True
+
+    client = DishonestStopClient(
+        ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
+    )
+    monkeypatch.setattr(isolated_runtime, "_TERMINAL_TRAFFIC_DRAIN_TIMEOUT", 0.02)
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: client
+    )
+    ingress = None
+    try:
+        ingress = asyncio.create_task(
+            feature.call_host_ingress("telegram-webhook", {"sequence": 1})
+        )
+        await asyncio.wait_for(active_started.wait(), timeout=1)
+
+        with pytest.raises(RuntimeError, match="terminal retirement is incomplete"):
+            await asyncio.wait_for(feature.shutdown(), timeout=1)
+
+        assert client.stop_calls == 1
+        assert feature._client is None
+        assert feature._traffic_gate.sealed is True
+        assert feature._traffic_gate._active == 1
+        assert feature._terminal_traffic_drain_task is not None
+        assert ingress.done() is False
+
+        release_active.set()
+        assert await ingress == {"accepted": True}
+        for _ in range(100):
+            if feature._terminal_traffic_drain_task is None:
+                break
+            await asyncio.sleep(0)
+        assert feature._terminal_traffic_drain_task is None
+
+        await asyncio.wait_for(feature.shutdown(), timeout=1)
+        assert feature._traffic_gate._active == 0
+        assert feature._traffic_gate.sealed is True
+    finally:
+        release_active.set()
+        if ingress is not None and not ingress.done():
+            ingress.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await ingress
+        if not feature._stopping:
+            await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_drain_timeout_seals_before_recovery_finalizer_reopens(
+    monkeypatch, tmp_path
+):
+    """A stopped facade cannot admit a queued ingress during drain-timeout unwind."""
+
+    unhealthy = asyncio.Event()
+    active_started = asyncio.Event()
+    release_active = asyncio.Event()
+
+    class DishonestStopClient(_HostIngressClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.stop_calls = 0
+
+        async def health(self):
+            await unhealthy.wait()
+            return False
+
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            if payload == {"sequence": 1}:
+                active_started.set()
+                await release_active.wait()
+            return {"sequence": payload["sequence"]}
+
+        async def stop(self):
+            # Claim success without interrupting the already admitted request.
+            self.stop_calls += 1
+            self.stopped = True
+
+    client = DishonestStopClient(
+        ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
+    )
+    real_sleep = asyncio.sleep
+
+    async def immediate_sleep(_delay):
+        await real_sleep(0)
+
+    monkeypatch.setattr(isolated_runtime.asyncio, "sleep", immediate_sleep)
+    monkeypatch.setattr(isolated_runtime, "_TERMINAL_TRAFFIC_DRAIN_TIMEOUT", 0.02)
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: client
+    )
+    active = queued = None
+    supervisor = feature._supervision_task
+    try:
+        assert supervisor is not None
+        active = asyncio.create_task(
+            feature.call_host_ingress("telegram-webhook", {"sequence": 1})
+        )
+        await asyncio.wait_for(active_started.wait(), timeout=1)
+        unhealthy.set()
+        for _ in range(100):
+            if feature._traffic_gate.closed:
+                break
+            await real_sleep(0)
+        assert feature._traffic_gate.closed is True
+
+        queued = asyncio.create_task(
+            feature.call_host_ingress("telegram-webhook", {"sequence": 2})
+        )
+        with pytest.raises(isolated_runtime._TerminalTrafficDrainTimedOut):
+            await asyncio.wait_for(supervisor, timeout=1)
+        with pytest.raises(HostIngressError, match="host ingress is unavailable"):
+            await asyncio.wait_for(queued, timeout=1)
+
+        assert client.stop_calls == 1
+        assert client.ingress_calls == [("telegram-webhook", {"sequence": 1})]
+        assert feature._traffic_gate.sealed is True
+        assert feature._traffic_gate.closed is True
+    finally:
+        release_active.set()
+        for task in (queued, active):
+            if task is not None and not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        for _ in range(100):
+            if feature._terminal_traffic_drain_task is None:
+                break
+            await real_sleep(0)
+        if feature._terminal_traffic_drain_task is None:
+            await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_revokes_initializer_waiting_for_reload_lock(monkeypatch, tmp_path):
+    """A shutdown queued before inner initialize owns the terminal generation."""
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    started_clients = []
+
+    def client_factory(**kwargs):
+        client = FakeIsolatedClient(**kwargs)
+        started_clients.append(client)
+        return client
+
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=client_factory)
+    initialize_task = shutdown_task = None
+    reload_lock_held = False
+    try:
+        await feature._reload_lock.acquire()
+        reload_lock_held = True
+        initialize_task = asyncio.create_task(feature.initialize())
+        await asyncio.sleep(0)
+
+        # The outer initialize has created its inner task, but that task has
+        # not yet acquired lifecycle ownership.  Shutdown now creates its
+        # cleanup transaction before the lock is released.
+        shutdown_task = asyncio.create_task(feature.shutdown())
+        for _ in range(100):
+            if feature._terminal_lifecycle_latched and feature._terminal_cleanup_task:
+                break
+            await asyncio.sleep(0)
+        assert feature._terminal_lifecycle_latched is True
+        assert feature._terminal_cleanup_task is not None
+
+        feature._reload_lock.release()
+        reload_lock_held = False
+        await asyncio.wait_for(shutdown_task, timeout=1)
+        with pytest.raises(
+            RuntimeError, match="terminal lifecycle changed during initialize"
+        ):
+            await asyncio.wait_for(initialize_task, timeout=1)
+
+        assert started_clients == []
+        assert feature._client is None
+        assert feature._supervision_task is None
+        assert feature._traffic_gate.sealed is True
+        assert feature._traffic_gate.closed is True
+    finally:
+        if reload_lock_held:
+            feature._reload_lock.release()
+        for task in (initialize_task, shutdown_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        if not feature._stopping:
+            await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_during_initialize_precleanup_revokes_enable_permit(
+    monkeypatch, tmp_path
+):
+    """A newer shutdown cannot be absorbed while re-enable retires old state."""
+
+    stop_started = asyncio.Event()
+    release_stop = asyncio.Event()
+    started_clients = []
+
+    class SlowRetirementClient(FakeIsolatedClient):
+        async def stop(self):
+            stop_started.set()
+            await release_stop.wait()
+            self.stopped = True
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+
+    def client_factory(**kwargs):
+        client = FakeIsolatedClient(**kwargs)
+        started_clients.append(client)
+        return client
+
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=client_factory)
+    retired_client = SlowRetirementClient()
+    feature._terminal_lifecycle_latched = True
+    feature._terminal_retirement_clients = [retired_client]
+    initialize_task = shutdown_task = None
+    try:
+        initialize_task = asyncio.create_task(feature.initialize())
+        await asyncio.wait_for(stop_started.wait(), timeout=1)
+
+        # This terminal request arrives after initialize has begun its old
+        # cleanup but before it may acquire the fresh-start ownership lock.
+        shutdown_task = asyncio.create_task(feature.shutdown())
+        await asyncio.sleep(0)
+        release_stop.set()
+
+        with pytest.raises(
+            RuntimeError, match="terminal lifecycle changed during initialize"
+        ):
+            await asyncio.wait_for(initialize_task, timeout=1)
+        await asyncio.wait_for(shutdown_task, timeout=1)
+
+        assert started_clients == []
+        assert feature._client is None
+        assert feature._traffic_gate.sealed is True
+    finally:
+        release_stop.set()
+        for task in (initialize_task, shutdown_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        if not feature._stopping:
+            await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_cancellation_seals_waiting_ingress_before_terminal_finally(
+    monkeypatch, tmp_path
+):
+    """A waiter cannot slip through recovery's cancellation-finally boundary."""
+
+    close_admission_entered = asyncio.Event()
+
+    class UnhealthyIngressClient(_HostIngressClient):
+        async def health(self):
+            return False
+
+    client = UnhealthyIngressClient(
+        ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
+    )
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    feature._client = client
+    real_sleep = asyncio.sleep
+
+    async def immediate_sleep(_delay):
+        await real_sleep(0)
+
+    original_close_admission = feature._close_traffic_gate_admission
+
+    async def block_after_close_admission():
+        await original_close_admission()
+        close_admission_entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(isolated_runtime.asyncio, "sleep", immediate_sleep)
+    monkeypatch.setattr(feature, "_close_traffic_gate_admission", block_after_close_admission)
+    supervisor = queued = None
+    try:
+        supervisor = asyncio.create_task(feature._supervise())
+        feature._supervision_task = supervisor
+        await asyncio.wait_for(close_admission_entered.wait(), timeout=1)
+        assert feature._traffic_gate.closed is True
+
+        queued = asyncio.create_task(
+            feature.call_host_ingress("telegram-webhook", {"update_id": 7})
+        )
+        await asyncio.sleep(0)
+        assert queued.done() is False
+
+        supervisor.cancel("close-admission cancellation")
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await asyncio.wait_for(supervisor, timeout=1)
+        assert cancelled.value.args == ("close-admission cancellation",)
+        with pytest.raises(HostIngressError, match="host ingress is unavailable"):
+            await asyncio.wait_for(queued, timeout=1)
+
+        assert client.ingress_calls == []
+        assert client.stopped is True
+        assert feature._client is None
+        assert feature._traffic_gate.sealed is True
+    finally:
+        for task in (queued, supervisor):
+            if task is not None and not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        if not feature._stopping:
+            await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_fenced_recovery_replays_first_of_repeated_cancellations(
+    monkeypatch, tmp_path
+):
+    """The shared recovery drain retains the caller's first cancellation args."""
+
+    recovery_started = asyncio.Event()
+    release_recovery = asyncio.Event()
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+
+    async def controlled_recovery(_transition):
+        recovery_started.set()
+        await release_recovery.wait()
+
+    monkeypatch.setattr(
+        feature,
+        "_recover_fenced_transition_uninterrupted",
+        controlled_recovery,
+    )
+    recovery = None
+    try:
+        recovery = asyncio.create_task(
+            feature._recover_fenced_transition(object(), RuntimeError("original"))
+        )
+        await asyncio.wait_for(recovery_started.wait(), timeout=1)
+        recovery.cancel("first recovery cancellation")
+        await asyncio.sleep(0)
+        recovery.cancel("second recovery cancellation")
+        release_recovery.set()
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await asyncio.wait_for(recovery, timeout=1)
+        assert cancelled.value.args == ("first recovery cancellation",)
+    finally:
+        release_recovery.set()
+        if recovery is not None and not recovery.done():
+            recovery.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await recovery
+
+
+@pytest.mark.asyncio
+async def test_supervisor_does_not_stop_terminal_client_after_retirement_lock_wait(
+    monkeypatch, tmp_path
+):
+    """Shutdown ownership won while a health restart waited for the stop lock."""
+
+    class UnhealthyClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.stop_calls = 0
+            self.start_calls = 0
+
+        async def health(self):
+            return False
+
+        async def stop(self):
+            self.stop_calls += 1
+            self.stopped = True
+
+        async def start(self):
+            self.start_calls += 1
+            self.started = True
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    client = UnhealthyClient()
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    feature._client = client
+    real_sleep = asyncio.sleep
+
+    async def immediate_sleep(_delay):
+        await real_sleep(0)
+
+    monkeypatch.setattr(isolated_runtime.asyncio, "sleep", immediate_sleep)
+    supervisor = shutdown_task = None
+    retirement_lock_held = False
+    try:
+        await feature._terminal_retirement_lock.acquire()
+        retirement_lock_held = True
+        supervisor = asyncio.create_task(feature._supervise())
+        for _ in range(100):
+            if feature._reload_lock.locked() and feature._traffic_gate.closed:
+                break
+            await real_sleep(0)
+        assert feature._reload_lock.locked()
+        assert feature._traffic_gate.closed is True
+
+        # Keep this manually-driven supervisor alive long enough to acquire
+        # the stop lock after shutdown has latched and unpublished the client.
+        feature._supervision_task = None
+        shutdown_task = asyncio.create_task(feature.shutdown())
+        for _ in range(100):
+            if feature._stopping and feature._client is None:
+                break
+            await real_sleep(0)
+        assert feature._stopping is True
+        assert feature._terminal_lifecycle_latched is True
+        assert feature._client is None
+
+        feature._terminal_retirement_lock.release()
+        retirement_lock_held = False
+        await asyncio.wait_for(supervisor, timeout=1)
+        await asyncio.wait_for(shutdown_task, timeout=1)
+
+        assert client.stop_calls == 1
+        assert client.start_calls == 0
+        assert feature._terminal_retirement_clients == []
+        assert feature._traffic_gate.sealed is True
+    finally:
+        if retirement_lock_held:
+            feature._terminal_retirement_lock.release()
+        for task in (supervisor, shutdown_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        if not feature._stopping:
+            await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_does_not_start_client_after_terminal_backoff_race(
+    monkeypatch, tmp_path
+):
+    """A terminal latch during supervisor backoff prevents the stale restart."""
+
+    backoff_started = asyncio.Event()
+    release_backoff = asyncio.Event()
+
+    class UnhealthyClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.stop_calls = 0
+            self.start_calls = 0
+
+        async def health(self):
+            return False
+
+        async def stop(self):
+            self.stop_calls += 1
+            self.stopped = True
+
+        async def start(self):
+            self.start_calls += 1
+            self.started = True
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    client = UnhealthyClient()
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    feature._client = client
+    real_sleep = asyncio.sleep
+    sleep_calls = 0
+
+    async def controlled_sleep(_delay):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 2:
+            backoff_started.set()
+            await release_backoff.wait()
+            return
+        await real_sleep(0)
+
+    monkeypatch.setattr(isolated_runtime.asyncio, "sleep", controlled_sleep)
+    supervisor = shutdown_task = None
+    try:
+        supervisor = asyncio.create_task(feature._supervise())
+        await asyncio.wait_for(backoff_started.wait(), timeout=1)
+        assert client.stop_calls == 1
+
+        # Shutdown can retire the stopped facade while the supervisor still
+        # owns the reload lock.  Do not cancel the manually-driven task: it
+        # must reach the immediate pre-start ownership revalidation itself.
+        feature._supervision_task = None
+        shutdown_task = asyncio.create_task(feature.shutdown())
+        for _ in range(100):
+            if feature._stopping and feature._client is None:
+                break
+            await real_sleep(0)
+        assert feature._stopping is True
+        assert feature._client is None
+
+        release_backoff.set()
+        await asyncio.wait_for(supervisor, timeout=1)
+        await asyncio.wait_for(shutdown_task, timeout=1)
+
+        # The supervisor had already stopped this exact facade before the
+        # terminal transaction unpublished it during backoff.
+        assert client.stop_calls == 1
+        assert client.start_calls == 0
+        assert feature._terminal_retirement_clients == []
+        assert feature._traffic_gate.sealed is True
+    finally:
+        release_backoff.set()
+        for task in (supervisor, shutdown_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        if not feature._stopping:
+            await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_cancellation_replays_original_args_after_exact_stop(
+    monkeypatch, tmp_path
+):
+    """Cancellation after an owned exact stop is replayed without a second stop."""
+
+    stop_started = asyncio.Event()
+    release_stop = asyncio.Event()
+
+    class SlowStoppingClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.stop_calls = 0
+            self.start_calls = 0
+
+        async def health(self):
+            return False
+
+        async def stop(self):
+            self.stop_calls += 1
+            if self.stop_calls == 1:
+                stop_started.set()
+                await release_stop.wait()
+            self.stopped = True
+
+        async def start(self):
+            self.start_calls += 1
+            self.started = True
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    client = SlowStoppingClient()
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    feature._client = client
+    real_sleep = asyncio.sleep
+
+    async def immediate_sleep(_delay):
+        await real_sleep(0)
+
+    monkeypatch.setattr(isolated_runtime.asyncio, "sleep", immediate_sleep)
+    supervisor = None
+    try:
+        supervisor = asyncio.create_task(feature._supervise())
+        feature._supervision_task = supervisor
+        await asyncio.wait_for(stop_started.wait(), timeout=1)
+        supervisor.cancel("agent shutdown cancellation")
+        await asyncio.sleep(0)
+        assert supervisor.done() is False
+        release_stop.set()
+
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await asyncio.wait_for(supervisor, timeout=1)
+        assert cancelled.value.args == ("agent shutdown cancellation",)
+        assert client.stop_calls == 1
+        assert client.start_calls == 0
+        assert feature._client is None
+        assert feature._terminal_retirement_clients == []
+        assert feature._terminal_stop_completed_client_markers == []
+        assert feature._traffic_gate.sealed is True
+    finally:
+        release_stop.set()
+        if supervisor is not None and not supervisor.done():
+            supervisor.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await supervisor
+        if not feature._stopping:
+            await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_fences_nonreturning_facade_stop_without_terminal_hang(
+    monkeypatch, tmp_path
+):
+    """A timed-out legacy stop is sealed and retained, never reported as success."""
+
+    stop_started = asyncio.Event()
+    cancellation_observed = asyncio.Event()
+    release_stop = asyncio.Event()
+
+    class TimeoutSuppressingClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.stop_calls = 0
+            self.start_calls = 0
+
+        async def health(self):
+            return False
+
+        async def stop(self):
+            self.stop_calls += 1
+            stop_started.set()
+            while not release_stop.is_set():
+                try:
+                    await release_stop.wait()
+                except asyncio.CancelledError:
+                    # A genuinely hostile facade can consume the timeout
+                    # cancellation and keep waiting. The proxy must still
+                    # return at its bounded fence with this task explicitly
+                    # owned, rather than orphaned in the event loop.
+                    cancellation_observed.set()
+            self.stopped = True
+
+        async def start(self):
+            self.start_calls += 1
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    client = TimeoutSuppressingClient()
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    feature._client = client
+    real_sleep = asyncio.sleep
+
+    async def immediate_sleep(_delay):
+        await real_sleep(0)
+
+    monkeypatch.setattr(isolated_runtime.asyncio, "sleep", immediate_sleep)
+    monkeypatch.setattr(isolated_runtime, "_FACADE_LIFECYCLE_OPERATION_TIMEOUT", 0.02)
+    monkeypatch.setattr(isolated_runtime, "_FACADE_LIFECYCLE_CANCELLATION_GRACE", 0.02)
+    supervisor = None
+    try:
+        supervisor = asyncio.create_task(feature._supervise())
+        feature._supervision_task = supervisor
+        await asyncio.wait_for(stop_started.wait(), timeout=1)
+        await asyncio.wait_for(supervisor, timeout=1)
+
+        assert cancellation_observed.is_set()
+        assert client.stop_calls == 1
+        assert client.start_calls == 0
+        assert feature._client is None
+        assert feature._terminal_retirement_clients == [client]
+        assert feature._terminal_cleanup_uncertain is True
+        assert len(feature._terminal_lifecycle_tasks) == 1
+        assert feature._traffic_gate.sealed is True
+        assert feature._terminal_lifecycle_tasks[0].task.get_name().startswith(
+            "isolated-supervisor-stop:"
+        )
+        with pytest.raises(HostIngressError, match="host ingress is unavailable"):
+            await feature.call_host_ingress("telegram-webhook", {"update_id": 7})
+
+        # The retained task's eventual outcome is consumed and released; it
+        # never becomes an orphaned background exception. Its first timeout
+        # remains uncertain, so an explicit cleanup still performs the one
+        # fresh exact retirement attempt before it can report success.
+        release_stop.set()
+        for _ in range(100):
+            if not feature._terminal_lifecycle_tasks:
+                break
+            await real_sleep(0)
+        assert feature._terminal_lifecycle_tasks == []
+        await asyncio.wait_for(feature.shutdown(), timeout=1)
+        assert client.stop_calls == 2
+        assert client.stopped is True
+        assert feature._terminal_retirement_clients == []
+        assert feature._terminal_lifecycle_tasks == []
+        assert feature._traffic_gate.sealed is True
+    finally:
+        release_stop.set()
+        if supervisor is not None and not supervisor.done():
+            supervisor.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await supervisor
+
+
+@pytest.mark.asyncio
+async def test_timed_out_terminal_stop_stays_owned_and_blocks_exact_retry(
+    monkeypatch, tmp_path
+):
+    """A bounded caller never detaches or races the still-running exact stop."""
+
+    stop_started = asyncio.Event()
+    cancellation_observed = asyncio.Event()
+    release_stop = asyncio.Event()
+
+    class CancellationHostileClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.stop_calls = 0
+            self.secret = "TERMINAL-STOP-SECRET-2755"
+
+        async def stop(self):
+            self.stop_calls += 1
+            if self.stop_calls == 1:
+                stop_started.set()
+                while not release_stop.is_set():
+                    try:
+                        await release_stop.wait()
+                    except asyncio.CancelledError:
+                        cancellation_observed.set()
+                return
+            self.stopped = True
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    monkeypatch.setattr(isolated_runtime, "_FACADE_LIFECYCLE_OPERATION_TIMEOUT", 0.01)
+    monkeypatch.setattr(isolated_runtime, "_FACADE_LIFECYCLE_CANCELLATION_GRACE", 0.01)
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    client = CancellationHostileClient()
+    feature._client = client
+    try:
+        with pytest.raises(RuntimeError, match="terminal retirement is incomplete"):
+            await asyncio.wait_for(feature.shutdown(), timeout=1)
+        await asyncio.wait_for(stop_started.wait(), timeout=1)
+        assert cancellation_observed.is_set()
+        assert client.stop_calls == 1
+        assert feature._terminal_retirement_clients == [client]
+        assert len(feature._terminal_lifecycle_tasks) == 1
+
+        # The still-running first stop owns this exact facade. A fresh caller
+        # remains fail-closed instead of starting a competing stop coroutine.
+        with pytest.raises(RuntimeError, match="terminal retirement is incomplete"):
+            await asyncio.wait_for(feature.shutdown(), timeout=1)
+        assert client.stop_calls == 1
+
+        release_stop.set()
+        for _ in range(100):
+            if not feature._terminal_lifecycle_tasks:
+                break
+            await asyncio.sleep(0)
+        assert feature._terminal_lifecycle_tasks == []
+
+        # The original timeout remains uncertain, so the first honest success
+        # path makes one fresh, serialized exact-client retirement attempt.
+        await asyncio.wait_for(feature.shutdown(), timeout=1)
+        assert client.stop_calls == 2
+        assert client.stopped is True
+        assert feature._terminal_retirement_clients == []
+    finally:
+        release_stop.set()
+        if not feature._stopping:
+            await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_resistant_health_probe_is_owned_until_terminal_retry(
+    monkeypatch, tmp_path
+):
+    """Shutdown never succeeds or re-enables beside a stale health coroutine."""
+
+    health_started = asyncio.Event()
+    cancellation_observed = asyncio.Event()
+    release_health = asyncio.Event()
+    started_clients = []
+
+    class CancellationResistantHealthClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.stop_calls = 0
+            self.credential = "HEALTH-PROBE-CREDENTIAL-2755"
+
+        async def health(self):
+            health_started.set()
+            while not release_health.is_set():
+                try:
+                    await release_health.wait()
+                except asyncio.CancelledError:
+                    cancellation_observed.set()
+            return True
+
+        async def stop(self):
+            self.stop_calls += 1
+            self.stopped = True
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    monkeypatch.setattr(isolated_runtime, "_HEALTH_PROBE_TIMEOUT", 0.5)
+    monkeypatch.setattr(isolated_runtime, "_HEALTH_PROBE_CANCELLATION_GRACE", 0.01)
+    client = CancellationResistantHealthClient()
+    client_ref = weakref.ref(client)
+
+    def factory(**kwargs):
+        replacement = FakeIsolatedClient(**kwargs)
+        started_clients.append(replacement)
+        return replacement
+
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=factory)
+    feature._client = client
+    real_sleep = asyncio.sleep
+
+    async def immediate_sleep(_delay):
+        await real_sleep(0)
+
+    monkeypatch.setattr(isolated_runtime.asyncio, "sleep", immediate_sleep)
+    supervisor = asyncio.create_task(feature._supervise())
+    feature._supervision_task = supervisor
+    try:
+        await asyncio.wait_for(health_started.wait(), timeout=1)
+
+        # Cancelling the supervisor through the direct shutdown path must not
+        # turn the still-running probe into an unowned task or false success.
+        with pytest.raises(RuntimeError, match="terminal retirement is incomplete"):
+            await asyncio.wait_for(feature.shutdown(), timeout=1)
+        await asyncio.wait_for(cancellation_observed.wait(), timeout=1)
+        probe = feature._terminal_health_probe_task
+        assert probe is not None and not probe.done()
+        assert probe.get_name().startswith("isolated-health-probe:")
+        assert client.stop_calls == 0
+        assert feature._client is None
+        assert feature._traffic_gate.sealed is True
+
+        # Explicit re-enable must first settle the exact old probe; it cannot
+        # construct a new facade alongside credentials retained by that task.
+        with pytest.raises(RuntimeError, match="terminal retirement is incomplete"):
+            await asyncio.wait_for(feature.initialize(), timeout=1)
+        assert started_clients == []
+
+        release_health.set()
+        for _ in range(100):
+            if feature._terminal_health_probe_task is None:
+                break
+            await real_sleep(0)
+        assert feature._terminal_health_probe_task is None
+
+        # Once the callback consumed the probe outcome, a fresh terminal retry
+        # can retire the exact facade and a later explicit initialize is safe.
+        await asyncio.wait_for(feature.shutdown(), timeout=1)
+        assert client.stop_calls == 1
+        await asyncio.wait_for(feature.initialize(), timeout=1)
+        assert len(started_clients) == 1
+        assert feature._client is started_clients[0]
+
+        await feature.shutdown()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(supervisor, timeout=1)
+        del probe
+        del client
+        gc.collect()
+        assert client_ref() is None
+    finally:
+        release_health.set()
+        if not supervisor.done():
+            supervisor.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await supervisor
+        if not feature._stopping:
+            await feature.shutdown()
+
+
+def test_terminal_stop_completion_marker_is_weak_and_drops_dead_identity(tmp_path):
+    """Stopped facades and their secrets are never retained by a completion mark."""
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    client = FakeIsolatedClient()
+    client.secret = "STOPPED-FACADE-SECRET-2755"
+    client_ref = weakref.ref(client)
+
+    feature._mark_terminal_stop_completed(client)
+    assert len(feature._terminal_stop_completed_client_markers) == 1
+    del client
+    gc.collect()
+
+    assert client_ref() is None
+    # A dead weak marker cannot match a later object, even if Python later
+    # reuses the old object's id(). Consuming it also removes the stale entry.
+    assert feature._forget_terminal_stop_completion(FakeIsolatedClient()) is False
+    assert feature._terminal_stop_completed_client_markers == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nonweakrefable", [False, True])
+async def test_terminal_cleanup_claims_inflight_supervisor_stop_completion_once(
+    tmp_path, nonweakrefable
+):
+    """A late supervisor callback cannot recreate a retired-cycle marker."""
+
+    stop_started = asyncio.Event()
+    release_stop = asyncio.Event()
+
+    if nonweakrefable:
+
+        class Client:
+            __slots__ = ("stop_calls", "secret")
+
+            def __init__(self):
+                self.stop_calls = 0
+                self.secret = "NONWEAK-STOP-SECRET-2755"
+
+            async def stop(self):
+                self.stop_calls += 1
+                stop_started.set()
+                await release_stop.wait()
+
+    else:
+
+        class Client:
+            def __init__(self):
+                self.stop_calls = 0
+                self.secret = "WEAK-STOP-SECRET-2755"
+
+            async def stop(self):
+                self.stop_calls += 1
+                stop_started.set()
+                await release_stop.wait()
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    client = Client()
+    marker = feature._begin_terminal_stop_completion(client)
+    assert marker is not None
+
+    async def supervisor_stop():
+        await client.stop()
+        feature._mark_terminal_stop_completed(marker)
+
+    owner = asyncio.create_task(supervisor_stop())
+    try:
+        await asyncio.wait_for(stop_started.wait(), timeout=1)
+        # This is the terminal-cleanup ordering: it has consumed no completed
+        # marker yet, so it claims the in-flight callback and retains the
+        # exact facade until that callback proves the one stop completed.
+        assert feature._forget_terminal_stop_completion(
+            client, terminal_retirement=True
+        ) is False
+        feature._retain_terminal_retirement_client(client)
+
+        release_stop.set()
+        await asyncio.wait_for(owner, timeout=1)
+
+        assert client.stop_calls == 1
+        assert feature._terminal_retirement_clients == []
+        assert feature._terminal_stop_completed_client_markers == []
+        # A later lifecycle reuse cannot consume the retired completion.
+        assert feature._forget_terminal_stop_completion(client) is False
+    finally:
+        release_stop.set()
+        if not owner.done():
+            owner.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await owner
+
+
+@pytest.mark.asyncio
+async def test_nonweakrefable_stop_marker_avoids_duplicate_stop_and_is_consumed(
+    monkeypatch, tmp_path
+):
+    """A supervisor-proven stop survives the shutdown/backoff race exactly once."""
+
+    class NonWeakrefableClient:
+        __slots__ = ("stop_calls", "stopped")
+
+        def __init__(self):
+            self.stop_calls = 1  # Supervisor already completed this exact stop.
+            self.stopped = True
+
+        async def stop(self):
+            self.stop_calls += 1
+            self.stopped = True
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    client = NonWeakrefableClient()
+    feature._client = client
+    feature._mark_terminal_stop_completed(client)
+    assert len(feature._terminal_stop_completed_client_markers) == 1
+
+    await feature.shutdown()
+
+    assert client.stop_calls == 1
+    assert feature._terminal_stop_completed_client_markers == []
+    assert feature._terminal_retirement_clients == []
+    assert feature._client is None
+
+
+@pytest.mark.asyncio
+async def test_unhealthy_supervisor_stops_wedged_host_ingress_before_draining(
+    monkeypatch, tmp_path
+):
+    """Health recovery reaches the wrapper stop path before gate drain."""
+
+    permit_unhealthy_probe = asyncio.Event()
+    ingress_started = asyncio.Event()
+    terminate_ingress = asyncio.Event()
+    restarted = asyncio.Event()
+
+    class WedgedIngressClient(_HostIngressClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.start_calls = 0
+            self.stop_calls = 0
+            self.active_when_stopped = None
+            self.active_when_restarted = None
+
+        async def start(self):
+            self.start_calls += 1
+            if self.start_calls > 1:
+                self.active_when_restarted = feature._traffic_gate._active
+                restarted.set()
+
+        async def health(self):
+            await permit_unhealthy_probe.wait()
+            return self.start_calls > 1
+
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            ingress_started.set()
+            await terminate_ingress.wait()
+            return {"accepted": True}
+
+        async def stop(self):
+            self.stop_calls += 1
+            self.stopped = True
+            self.active_when_stopped = feature._traffic_gate._active
+            terminate_ingress.set()
+
+    client = WedgedIngressClient(
+        ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
+    )
+    real_sleep = asyncio.sleep
+
+    async def immediate_sleep(_delay):
+        await real_sleep(0)
+
+    monkeypatch.setattr(isolated_runtime.asyncio, "sleep", immediate_sleep)
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: client
+    )
+    ingress = None
+    try:
+        ingress = asyncio.create_task(
+            feature.call_host_ingress("telegram-webhook", {"update_id": 7})
+        )
+        await asyncio.wait_for(ingress_started.wait(), timeout=1)
+        permit_unhealthy_probe.set()
+
+        await asyncio.wait_for(restarted.wait(), timeout=1)
+        assert await ingress == {"accepted": True}
+        assert client.stop_calls == 1
+        assert client.active_when_stopped == 1
+        assert client.active_when_restarted == 0
+        # The owned facade operation returns before the supervisor's matching
+        # gate-finally reopens admission; wait for that public boundary rather
+        # than treating the client-side start callback as a host-ready signal.
+        for _ in range(100):
+            if feature._traffic_gate.closed is False:
+                break
+            await real_sleep(0)
+        assert feature._traffic_gate.closed is False
+        assert feature._traffic_gate.sealed is False
+        assert feature._client is client
+    finally:
+        terminate_ingress.set()
+        if ingress is not None and not ingress.done():
+            ingress.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await ingress
+        if not feature._stopping:
+            await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_supervisor_uses_terminal_stop_before_draining_host_ingress(
+    monkeypatch, tmp_path
+):
+    """Agent-side supervisor cancellation composes through terminal cleanup."""
+
+    ingress_started = asyncio.Event()
+    terminate_ingress = asyncio.Event()
+
+    class WedgedIngressClient(_HostIngressClient):
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            ingress_started.set()
+            await terminate_ingress.wait()
+            return {"accepted": True}
+
+        async def stop(self):
+            self.stopped = True
+            terminate_ingress.set()
+
+    client = WedgedIngressClient(
+        ingress_capabilities=HostIngressCapabilities(names=("telegram-webhook",))
+    )
+    feature, _ = await _initialized_host_ingress_proxy(
+        monkeypatch, tmp_path, lambda **_: client
+    )
+    ingress = None
+    supervisor = feature._supervision_task
+    try:
+        assert supervisor is not None
+        ingress = asyncio.create_task(
+            feature.call_host_ingress("telegram-webhook", {"update_id": 7})
+        )
+        await asyncio.wait_for(ingress_started.wait(), timeout=1)
+        ingress.cancel("caller cancellation")
+        await asyncio.sleep(0)
+        assert ingress.done() is False
+        assert feature._traffic_gate._active == 1
+
+        supervisor.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(supervisor, timeout=1)
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await asyncio.wait_for(ingress, timeout=1)
+        assert cancelled.value.args == ("caller cancellation",)
+        assert client.stopped is True
+        assert feature._traffic_gate.sealed is True
+        assert feature._traffic_gate._active == 0
+        assert feature._client is None
+        assert feature._supervision_task is None
+    finally:
+        terminate_ingress.set()
+        if ingress is not None and not ingress.done():
+            ingress.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await ingress
+        if not feature._stopping:
+            await feature.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("awaitable_kind", ("future", "task"))
+async def test_owned_facade_lifecycle_accepts_completed_future_and_task(
+    awaitable_kind, monkeypatch
+):
+    """A valid facade awaitable always runs through the named host task."""
+
+    async def completed_task():
+        return "stopped"
+
+    loop = asyncio.get_running_loop()
+    if awaitable_kind == "future":
+        operation = loop.create_future()
+        operation.set_result("stopped")
+    else:
+        operation = asyncio.create_task(completed_task(), name="facade-stop-task")
+        await operation
+
+    class FutureReturningFacade:
+        def stop(self):
+            return operation
+
+    created_tasks = []
+    real_create = isolated_runtime._create_host_owned_facade_task
+
+    def capture_task(awaitable, *, name):
+        task = real_create(awaitable, name=name)
+        created_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(isolated_runtime, "_create_host_owned_facade_task", capture_task)
+    assert await isolated_runtime._await_owned_facade_lifecycle_operation(
+        FutureReturningFacade().stop(),
+        name="test-facade-stop-awaitable",
+        on_late_task=lambda _task: pytest.fail("completed facade must not detach"),
+    ) == "stopped"
+    assert [task.get_name() for task in created_tasks] == ["test-facade-stop-awaitable"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("awaitable_kind", ("future", "task"))
+async def test_owned_facade_lifecycle_cancellation_keeps_pending_future_and_task_owned(
+    awaitable_kind, monkeypatch
+):
+    """Caller cancellation waits for the host owner instead of detaching it."""
+
+    release = asyncio.Event()
+
+    async def pending_task():
+        await release.wait()
+        return "stopped"
+
+    loop = asyncio.get_running_loop()
+    operation = (
+        loop.create_future()
+        if awaitable_kind == "future"
+        else asyncio.create_task(pending_task(), name="facade-pending-stop-task")
+    )
+
+    class FutureReturningFacade:
+        def stop(self):
+            return operation
+
+    created_tasks = []
+    real_create = isolated_runtime._create_host_owned_facade_task
+
+    def capture_task(awaitable, *, name):
+        task = real_create(awaitable, name=name)
+        created_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(isolated_runtime, "_create_host_owned_facade_task", capture_task)
+    owner = asyncio.create_task(
+        isolated_runtime._await_owned_facade_lifecycle_operation(
+            FutureReturningFacade().stop(),
+            name="test-pending-facade-stop-awaitable",
+            on_late_task=lambda _task: pytest.fail("pending facade must settle"),
+        )
+    )
+    await asyncio.sleep(0)
+    owner.cancel("caller cancellation")
+    await asyncio.sleep(0)
+    assert owner.done() is False
+    if awaitable_kind == "future":
+        operation.set_result("stopped")
+    else:
+        release.set()
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await owner
+    assert cancelled.value.args == ("caller cancellation",)
+    assert created_tasks[0].get_name() == "test-pending-facade-stop-awaitable"
+
+
+@pytest.mark.asyncio
+async def test_owned_facade_lifecycle_timeout_retains_task_returned_by_facade(monkeypatch):
+    """A cancellation-resistant Task return remains attached to its host owner."""
+
+    cancellation_observed = asyncio.Event()
+    release = asyncio.Event()
+
+    async def pending_task():
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancellation_observed.set()
+
+    operation = asyncio.create_task(pending_task(), name="facade-hostile-stop-task")
+
+    class TaskReturningFacade:
+        def stop(self):
+            return operation
+
+    late_tasks = []
+    monkeypatch.setattr(isolated_runtime, "_FACADE_LIFECYCLE_OPERATION_TIMEOUT", 0.01)
+    monkeypatch.setattr(isolated_runtime, "_FACADE_LIFECYCLE_CANCELLATION_GRACE", 0.01)
+    try:
+        with pytest.raises(isolated_runtime._FacadeLifecycleOperationTimedOut):
+            await isolated_runtime._await_owned_facade_lifecycle_operation(
+                TaskReturningFacade().stop(),
+                name="test-hostile-facade-stop-task",
+                on_late_task=late_tasks.append,
+            )
+        assert cancellation_observed.is_set()
+        assert len(late_tasks) == 1
+        assert late_tasks[0].get_name() == "test-hostile-facade-stop-task"
+    finally:
+        release.set()
+        await asyncio.wait_for(late_tasks[0] if late_tasks else operation, timeout=1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("awaitable_kind", ("future", "task"))
+async def test_terminal_shutdown_owns_future_and_task_returned_by_facade_once(
+    awaitable_kind, monkeypatch, tmp_path
+):
+    """Terminal retirement never retries a successfully owned facade stop."""
+
+    async def completed_task():
+        return None
+
+    loop = asyncio.get_running_loop()
+    if awaitable_kind == "future":
+        operation = loop.create_future()
+        operation.set_result(None)
+    else:
+        operation = asyncio.create_task(completed_task(), name="terminal-facade-stop-task")
+        await operation
+
+    class FutureReturningStopClient(FakeIsolatedClient):
+        def __init__(self):
+            super().__init__()
+            self.stop_calls = 0
+
+        def stop(self):
+            self.stop_calls += 1
+            return operation
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    client = FutureReturningStopClient()
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    feature._client = client
+    await feature.shutdown()
+    await feature.shutdown()
+    assert client.stop_calls == 1
+    assert feature._terminal_retirement_clients == []
+    assert feature._terminal_lifecycle_tasks == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("awaitable_kind", ("future", "task"))
+async def test_owned_health_probe_accepts_completed_future_and_task(awaitable_kind):
+    """Completed facade probes are healthy rather than TypeError failures."""
+
+    async def completed_task():
+        return {"healthy": True}
+
+    loop = asyncio.get_running_loop()
+    if awaitable_kind == "future":
+        operation = loop.create_future()
+        operation.set_result({"healthy": True})
+    else:
+        operation = asyncio.create_task(completed_task(), name="facade-health-task")
+        await operation
+
+    class FutureReturningFacade:
+        def health(self):
+            return operation
+
+    started_tasks = []
+    assert await isolated_runtime._await_owned_health_probe(
+        FutureReturningFacade().health(),
+        name="test-facade-health-awaitable",
+        on_started=started_tasks.append,
+        on_late_task=lambda _task: pytest.fail("completed health must not detach"),
+    ) == {"healthy": True}
+    assert [task.get_name() for task in started_tasks] == ["test-facade-health-awaitable"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("awaitable_kind", ("future", "task"))
+async def test_owned_health_probe_accepts_pending_future_and_task(awaitable_kind):
+    """Pending valid facade probes settle normally through host ownership."""
+
+    release = asyncio.Event()
+
+    async def pending_task():
+        await release.wait()
+        return {"healthy": True}
+
+    loop = asyncio.get_running_loop()
+    operation = (
+        loop.create_future()
+        if awaitable_kind == "future"
+        else asyncio.create_task(pending_task(), name="facade-pending-health-task")
+    )
+
+    class FutureReturningFacade:
+        def health(self):
+            return operation
+
+    started_tasks = []
+    owner = asyncio.create_task(
+        isolated_runtime._await_owned_health_probe(
+            FutureReturningFacade().health(),
+            name="test-pending-facade-health-awaitable",
+            on_started=started_tasks.append,
+            on_late_task=lambda _task: pytest.fail("pending health must settle"),
+        )
+    )
+    await asyncio.sleep(0)
+    if awaitable_kind == "future":
+        operation.set_result({"healthy": True})
+    else:
+        release.set()
+    assert await owner == {"healthy": True}
+    assert started_tasks[0].get_name() == "test-pending-facade-health-awaitable"
+
+
+@pytest.mark.asyncio
+async def test_host_owned_facade_callbacks_deliver_each_registration_once():
+    """Settlement has one callback path across registration timing and reentry."""
+
+    loop = asyncio.get_running_loop()
+    source = loop.create_future()
+    operation = isolated_runtime._create_host_owned_facade_task(
+        source, name="callback-once"
+    )
+    delivered = []
+
+    def duplicate(completed):
+        delivered.append(("duplicate", completed))
+
+    def reentrant(completed):
+        delivered.append(("reentrant", completed))
+        completed.add_done_callback(lambda settled: delivered.append(("nested", settled)))
+
+    # Multiple registrations of the same callback retain asyncio's one-call
+    # per registration contract; none may be redelivered by _notify_settled.
+    operation.add_done_callback(duplicate)
+    operation.add_done_callback(duplicate)
+    operation.add_done_callback(reentrant)
+    source.set_result(None)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert [name for name, _ in delivered] == [
+        "duplicate",
+        "duplicate",
+        "reentrant",
+        "nested",
+    ]
+    assert all(completed is operation for _, completed in delivered)
+    assert operation._done_callbacks == []
+
+    # Registration after notification is queued once and not retained.
+    operation.add_done_callback(lambda completed: delivered.append(("post", completed)))
+    await asyncio.sleep(0)
+    assert [name for name, _ in delivered].count("post") == 1
+    assert operation._done_callbacks == []
+
+
+@pytest.mark.asyncio
+async def test_host_owned_facade_pre_settled_callback_is_not_delivered_twice():
+    """A source settled before facade construction still has one callback path."""
+
+    source = asyncio.get_running_loop().create_future()
+    source.set_result(None)
+    operation = isolated_runtime._create_host_owned_facade_task(
+        source, name="pre-settled-callback"
+    )
+    delivered = []
+    operation.add_done_callback(delivered.append)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert delivered == [operation]
+    assert operation._done_callbacks == []
+
+
+@pytest.mark.asyncio
+async def test_foreign_facade_stopped_or_closed_loop_remains_durably_fenced(
+    monkeypatch,
+):
+    """No cross-thread observer/cancel is queued onto stopped or closed loops."""
+
+    stopped_loop = asyncio.new_event_loop()
+    stopped_source = stopped_loop.create_future()
+    stopped_dispatches = []
+    monkeypatch.setattr(
+        stopped_loop,
+        "call_soon_threadsafe",
+        lambda *args: stopped_dispatches.append(args),
+    )
+    stopped = isolated_runtime._create_host_owned_facade_task(
+        stopped_source, name="stopped-foreign-facade"
+    )
+    stopped.cancel()
+    assert stopped.done() is False
+    assert stopped_dispatches == []
+
+    # Even a terminal Future stays fenced until its owner loop consumes it.
+    # Future subclasses may require that ``result()`` runs in that loop.
+    completed_source = stopped_loop.create_future()
+    completed_source.set_result(None)
+    completed = isolated_runtime._create_host_owned_facade_task(
+        completed_source, name="completed-stopped-foreign-facade"
+    )
+    completed.cancel()
+    assert completed.done() is False
+    assert completed.foreign_settlement_disposition is None
+    assert completed._source is completed_source
+    assert stopped_dispatches == []
+
+    closed_loop = asyncio.new_event_loop()
+    closed_source = closed_loop.create_future()
+    closed_loop.close()
+    closed = isolated_runtime._create_host_owned_facade_task(
+        closed_source, name="closed-foreign-facade"
+    )
+    closed.cancel()
+    assert closed.done() is False
+    stopped_loop.close()
+
+
+@pytest.mark.asyncio
+async def test_precompleted_foreign_future_is_consumed_only_by_owner_after_resume():
+    """A stopped pre-settled source fences, then settles on its owner thread."""
+
+    foreign_loop = asyncio.new_event_loop()
+    state = {"result_threads": []}
+    running = threading.Event()
+
+    class OwnerThreadFuture(asyncio.Future):
+        def result(self):
+            state["result_threads"].append(threading.get_ident())
+            assert threading.get_ident() == state["owner_thread"]
+            return super().result()
+
+    source = OwnerThreadFuture(loop=foreign_loop)
+    source.set_result("stopped")
+    operation = isolated_runtime._create_host_owned_facade_task(
+        source, name="precompleted-stopped-foreign-owner-thread"
+    )
+    notified = asyncio.Event()
+    operation.add_done_callback(lambda _completed: notified.set())
+    assert operation.done() is False
+    assert state["result_threads"] == []
+
+    def run_foreign_loop():
+        asyncio.set_event_loop(foreign_loop)
+        state["owner_thread"] = threading.get_ident()
+        running.set()
+        foreign_loop.run_forever()
+        foreign_loop.close()
+
+    foreign_thread = threading.Thread(target=run_foreign_loop)
+    foreign_thread.start()
+    assert running.wait(timeout=1)
+    try:
+        # Retrying the retained operation asks the now-running owner loop to
+        # acknowledge the exact source; it does not issue another facade call.
+        operation.cancel()
+        await asyncio.wait_for(notified.wait(), timeout=1)
+        assert operation.done() is True
+        assert operation.foreign_settlement_disposition == "succeeded"
+        assert state["result_threads"] == [state["owner_thread"]]
+    finally:
+        if foreign_thread.is_alive():
+            foreign_loop.call_soon_threadsafe(foreign_loop.stop)
+            await asyncio.to_thread(foreign_thread.join)
+
+
+@pytest.mark.asyncio
+async def test_terminal_retirement_retries_stopped_foreign_operation_after_owner_restarts(
+    monkeypatch, tmp_path
+):
+    """A retained foreign stop is retried on restart without another facade stop."""
+
+    foreign_loop = asyncio.new_event_loop()
+    foreign_running = threading.Event()
+    state = {"result_threads": []}
+
+    class OwnerThreadFuture(asyncio.Future):
+        def result(self):
+            state["result_threads"].append(threading.get_ident())
+            assert threading.get_ident() == state["owner_thread"]
+            return super().result()
+
+    foreign_stop = OwnerThreadFuture(loop=foreign_loop)
+
+    class CrossLoopStopClient(FakeIsolatedClient):
+        def __init__(self):
+            super().__init__()
+            self.stop_calls = 0
+            self.stopped = False
+
+        def stop(self):
+            self.stop_calls += 1
+            if self.stop_calls == 1:
+                return foreign_stop
+            self.stopped = True
+            return None
+
+    def run_foreign_loop():
+        asyncio.set_event_loop(foreign_loop)
+        state["owner_thread"] = threading.get_ident()
+        foreign_running.set()
+        foreign_loop.run_forever()
+        foreign_loop.close()
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    client = CrossLoopStopClient()
+    feature._retain_terminal_retirement_client(client)
+
+    foreign_thread = None
+    try:
+        # Initial retirement fences the exact source because its owner loop is
+        # stopped.  The source's result must not be consumed from this thread.
+        assert await feature._retire_terminal_clients() is False
+        assert client.stop_calls == 1
+        assert len(feature._terminal_lifecycle_tasks) == 1
+        operation = feature._terminal_lifecycle_tasks[0].task
+        assert operation.done() is False
+        assert state["result_threads"] == []
+
+        foreign_thread = threading.Thread(target=run_foreign_loop)
+        foreign_thread.start()
+        assert foreign_running.wait(timeout=1)
+
+        # The next cleanup retries cancellation plus observation on the same
+        # retained operation.  It remains fenced for this pass, never issuing
+        # a duplicate facade stop while owner-loop acknowledgement is pending.
+        assert await feature._retire_terminal_clients() is False
+        assert client.stop_calls == 1
+
+        for _ in range(100):
+            if not feature._terminal_lifecycle_tasks:
+                break
+            await asyncio.sleep(0)
+        assert feature._terminal_lifecycle_tasks == []
+        assert operation.foreign_settlement_disposition == "cancelled"
+        assert state["result_threads"] == [state["owner_thread"]]
+        assert feature._terminal_retirement_clients == [client]
+
+        # A cancelled foreign stop leaves the client fail-closed, but after
+        # acknowledgement a bounded later retirement may make the one retry.
+        assert await feature._retire_terminal_clients() is True
+        assert client.stop_calls == 2
+        assert client.stopped is True
+        assert feature._terminal_retirement_clients == []
+    finally:
+        if foreign_thread is not None and foreign_thread.is_alive():
+            foreign_loop.call_soon_threadsafe(foreign_loop.stop)
+            await asyncio.to_thread(foreign_thread.join)
+        elif not foreign_loop.is_closed():
+            foreign_loop.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ("result", "exception"))
+async def test_foreign_terminal_source_is_detached_when_host_delivery_is_stranded(
+    monkeypatch, caplog, outcome
+):
+    """A host callback failure cannot retain a foreign tenant terminal value."""
+
+    foreign_loop = asyncio.new_event_loop()
+    secret = "STRANDED-FOREIGN-TERMINAL-SECRET-2755"
+
+    class TenantValue:
+        pass
+
+    class TenantError(RuntimeError):
+        pass
+
+    source = foreign_loop.create_future()
+    value = TenantValue()
+    value.secret = secret
+    value_ref = weakref.ref(value)
+    operation = isolated_runtime._create_host_owned_facade_task(
+        source, name=f"stranded-foreign-{outcome}"
+    )
+    # The foreign owner loop is stopped, so construction cannot queue an
+    # observer. Model its eventual owner-loop consumption below while the host
+    # is already unable to accept the resulting callback.
+    monkeypatch.setattr(
+        operation._host_loop,
+        "call_soon_threadsafe",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("closing")),
+    )
+    if outcome == "result":
+        source.set_result(value)
+        error = None
+    else:
+        error = TenantError(secret)
+        error.value = value
+        source.set_exception(error)
+
+    # The owner-loop disposition is terminal, but the closing host loop cannot
+    # deliver its release callback. Detachment must precede that attempt.
+    operation._observe_foreign_source_settlement(source)
+
+    assert operation.done() is True
+    assert operation._source is None
+    del source, value, error
+    gc.collect()
+    assert value_ref() is None
+    assert secret not in caplog.text
+    foreign_loop.close()
+
+
+@pytest.mark.asyncio
+async def test_foreign_facade_dispatch_race_fails_closed_without_escaping(monkeypatch):
+    """A loop that closes between inspection and dispatch cannot lose ownership."""
+
+    foreign_loop = asyncio.new_event_loop()
+    source = foreign_loop.create_future()
+    original_is_running = foreign_loop.is_running
+    monkeypatch.setattr(foreign_loop, "is_running", lambda: True)
+    monkeypatch.setattr(
+        foreign_loop,
+        "call_soon_threadsafe",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("loop is closing")),
+    )
+    operation = isolated_runtime._create_host_owned_facade_task(
+        source, name="racing-foreign-facade"
+    )
+
+    operation.cancel()
+    assert operation.done() is False
+    monkeypatch.setattr(foreign_loop, "is_running", original_is_running)
+    foreign_loop.close()
+
+
+@pytest.mark.asyncio
+async def test_foreign_facade_owner_loop_consumes_secret_error_before_release(caplog):
+    """Foreign failure consumption happens in its owner loop with no warning leak."""
+
+    foreign_loop = asyncio.new_event_loop()
+    ready = threading.Event()
+    state = {}
+    secret = "FOREIGN-FACADE-SECRET-2755"
+
+    class ForeignFacadeError(RuntimeError):
+        pass
+
+    def run_foreign_loop():
+        asyncio.set_event_loop(foreign_loop)
+
+        def create_source():
+            state["source"] = foreign_loop.create_future()
+            ready.set()
+
+        foreign_loop.call_soon(create_source)
+        foreign_loop.run_forever()
+        foreign_loop.close()
+
+    foreign_thread = threading.Thread(target=run_foreign_loop)
+    foreign_thread.start()
+    assert ready.wait(timeout=1)
+    operation = isolated_runtime._create_host_owned_facade_task(
+        state["source"], name="foreign-secret-consumption"
+    )
+    notified = asyncio.Event()
+    operation.add_done_callback(lambda _completed: notified.set())
+
+    def fail_source():
+        state["source"].set_exception(ForeignFacadeError(secret))
+        foreign_loop.call_soon(foreign_loop.stop)
+
+    foreign_loop.call_soon_threadsafe(fail_source)
+    try:
+        await asyncio.wait_for(notified.wait(), timeout=1)
+        await asyncio.wait_for(asyncio.to_thread(foreign_thread.join), timeout=1)
+        assert operation.done() is True
+    finally:
+        if foreign_thread.is_alive():
+            foreign_loop.call_soon_threadsafe(foreign_loop.stop)
+            await asyncio.to_thread(foreign_thread.join)
+
+    state.clear()
+    del operation
+    gc.collect()
+    assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "expected_disposition"),
+    (("success", "succeeded"), ("error", "failed"), ("cancel", "cancelled")),
+)
+async def test_foreign_pre_settled_source_is_observed_before_owner_loop_stops(
+    outcome, expected_disposition, caplog
+):
+    """A pre-settled foreign source cannot strand its observer behind stop."""
+
+    foreign_loop = asyncio.new_event_loop()
+    ready = threading.Event()
+    state = {}
+    secret = "FOREIGN-PRESETTLED-SECRET-2755"
+
+    class ForeignPresettledError(RuntimeError):
+        pass
+
+    def run_foreign_loop():
+        asyncio.set_event_loop(foreign_loop)
+
+        def create_source():
+            source = foreign_loop.create_future()
+            if outcome == "success":
+                source.set_result({"secret": secret})
+            elif outcome == "error":
+                source.set_exception(ForeignPresettledError(secret))
+            else:
+                source.cancel()
+            state["source"] = source
+            ready.set()
+
+        foreign_loop.call_soon(create_source)
+        foreign_loop.run_forever()
+        foreign_loop.close()
+
+    foreign_thread = threading.Thread(target=run_foreign_loop)
+    foreign_thread.start()
+    assert ready.wait(timeout=1)
+    operation = isolated_runtime._create_host_owned_facade_task(
+        state["source"], name=f"foreign-pre-settled-{outcome}"
+    )
+    notified = asyncio.Event()
+    operation.add_done_callback(lambda _completed: notified.set())
+    # The observer registration is already queued ahead of this stop.  Its
+    # owner-loop inline path must consume a completed source in that same turn
+    # rather than enqueueing one more callback which this stop would strand.
+    foreign_loop.call_soon_threadsafe(foreign_loop.stop)
+    try:
+        await asyncio.wait_for(notified.wait(), timeout=1)
+        await asyncio.wait_for(asyncio.to_thread(foreign_thread.join), timeout=1)
+        assert operation.done() is True
+        assert operation.foreign_settlement_disposition == expected_disposition
+        assert state["source"]._log_traceback is False
+    finally:
+        if foreign_thread.is_alive():
+            foreign_loop.call_soon_threadsafe(foreign_loop.stop)
+            await asyncio.to_thread(foreign_thread.join)
+
+    state.clear()
+    del operation
+    gc.collect()
+    assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_owned_health_probe_child_cancellation_is_an_ordinary_failure():
+    """A self-cancelled facade health task must not cancel its supervisor."""
+
+    async def cancelled_health():
+        asyncio.current_task().cancel()
+        await asyncio.sleep(0)
+
+    with pytest.raises(RuntimeError, match="health probe was cancelled") as failed:
+        await isolated_runtime._await_owned_health_probe(
+            cancelled_health(),
+            name="self-cancelled-health",
+            on_started=lambda _task: None,
+            on_late_task=lambda _task: pytest.fail("settled child must not detach"),
+        )
+
+    assert failed.value.__context__ is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repeat", (False, True))
+async def test_lifecycle_argless_first_cancellation_preserves_count_without_redelivery(
+    repeat,
+):
+    """An arg-less first cancel is authoritative and leaves no synthetic wakeup."""
+
+    owner_ref = {}
+
+    async def child():
+        owner = owner_ref["owner"]
+        owner.cancel()
+        if repeat:
+            owner.cancel("later cancellation reason")
+        asyncio.current_task().cancel("child cancellation")
+        await asyncio.sleep(0)
+
+    async def owner():
+        task = asyncio.current_task()
+        try:
+            await isolated_runtime._await_owned_facade_lifecycle_operation(
+                child(),
+                name="argless-first-lifecycle-cancellation",
+                on_late_task=lambda _task: pytest.fail("child must settle promptly"),
+            )
+        except asyncio.CancelledError as cancelled:
+            args = cancelled.args
+            count = task.cancelling()
+            while task.cancelling():
+                task.uncancel()
+            await asyncio.sleep(0)
+            return args, count
+
+    owner_task = asyncio.create_task(owner())
+    owner_ref["owner"] = owner_task
+    args, count = await asyncio.wait_for(owner_task, timeout=1)
+    assert args == ()
+    assert count == (2 if repeat else 1)
+
+
+@pytest.mark.asyncio
+async def test_stale_cancellation_count_does_not_reclassify_self_cancelled_health():
+    """A caught historical cancel is not a parent cancel for a later probe."""
+
+    owner = asyncio.current_task()
+    owner.cancel("historical cancellation")
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.sleep(0)
+    assert owner.cancelling() == 1
+
+    async def self_cancelled_health():
+        asyncio.current_task().cancel()
+        await asyncio.sleep(0)
+
+    with pytest.raises(RuntimeError, match="health probe was cancelled"):
+        await isolated_runtime._await_owned_health_probe(
+            self_cancelled_health(),
+            name="stale-cancellation-health",
+            on_started=lambda _task: None,
+            on_late_task=lambda _task: pytest.fail("settled child must not detach"),
+        )
+
+    assert owner.cancelling() == 1
+    owner.uncancel()
+
+
+@pytest.mark.asyncio
+async def test_stale_cancellation_count_does_not_reclassify_lifecycle_success():
+    """Historical cancellation state cannot turn a settled facade into cancel."""
+
+    owner = asyncio.current_task()
+    owner.cancel("historical lifecycle cancellation")
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.sleep(0)
+    assert owner.cancelling() == 1
+
+    source = asyncio.get_running_loop().create_future()
+    source.set_result("stopped")
+    assert await isolated_runtime._await_owned_facade_lifecycle_operation(
+        source,
+        name="stale-cancellation-lifecycle-success",
+        on_late_task=lambda _task: pytest.fail("settled facade must not detach"),
+    ) == "stopped"
+    assert owner.cancelling() == 1
+    owner.uncancel()
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_stale_cancellation_count_does_not_reclassify_lifecycle_timeout_ack(
+    monkeypatch,
+):
+    """A historical count cannot replace the timeout during child acknowledgement."""
+
+    owner = asyncio.current_task()
+    owner.cancel("historical lifecycle cancellation")
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.sleep(0)
+    assert owner.cancelling() == 1
+
+    async def stop():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            return None
+
+    monkeypatch.setattr(isolated_runtime, "_FACADE_LIFECYCLE_OPERATION_TIMEOUT", 0.01)
+    monkeypatch.setattr(isolated_runtime, "_FACADE_LIFECYCLE_CANCELLATION_GRACE", 0.1)
+    with pytest.raises(isolated_runtime._FacadeLifecycleOperationTimedOut):
+        await isolated_runtime._await_owned_facade_lifecycle_operation(
+            stop(),
+            name="stale-cancellation-lifecycle-timeout-ack",
+            on_late_task=lambda _task: pytest.fail("stop should settle promptly"),
+        )
+    assert owner.cancelling() == 1
+    owner.uncancel()
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_terminal_health_failure_after_cancel_does_not_abort_retirement(
+    monkeypatch, tmp_path, caplog
+):
+    """A terminal probe's ordinary post-cancel error still permits one stop."""
+
+    probe_started = asyncio.Event()
+    secret = "TERMINAL-HEALTH-SECRET-2755"
+
+    async def health():
+        probe_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise RuntimeError(secret)
+
+    class CountingStopClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.stop_calls = 0
+
+        async def stop(self):
+            self.stop_calls += 1
+            self.stopped = True
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    client = CountingStopClient()
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    feature._client = client
+    probe = isolated_runtime._create_host_owned_facade_task(
+        health(), name="terminal-health-post-cancel-error"
+    )
+    feature._own_health_probe_task(probe)
+    await asyncio.wait_for(probe_started.wait(), timeout=1)
+
+    await asyncio.wait_for(feature.shutdown(), timeout=1)
+
+    assert client.stop_calls == 1
+    assert feature._terminal_health_probe_task is None
+    assert feature._terminal_retirement_clients == []
+    assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("child_cancels_first", (False, True))
+@pytest.mark.parametrize("cancel_count", (1, 2))
+async def test_lifecycle_parent_cancellation_payload_wins_same_turn_as_child(
+    child_cancels_first, cancel_count
+):
+    """A child CancelledError never supplies a same-turn parent reason."""
+
+    owner_ref = {}
+
+    async def child():
+        if child_cancels_first:
+            asyncio.current_task().cancel()
+        owner_ref["owner"].cancel("first parent cancellation")
+        if cancel_count == 2:
+            owner_ref["owner"].cancel("later parent cancellation")
+        if not child_cancels_first:
+            asyncio.current_task().cancel()
+        await asyncio.sleep(0)
+
+    owner = asyncio.create_task(
+        isolated_runtime._await_owned_facade_lifecycle_operation(
+            child(),
+            name="same-turn-parent-lifecycle-cancellation",
+            on_late_task=lambda _task: pytest.fail("child must settle promptly"),
+        )
+    )
+    owner_ref["owner"] = owner
+
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await asyncio.wait_for(owner, timeout=1)
+
+    assert cancelled.value.args == ("first parent cancellation",)
+    assert owner.cancelled() is True
+    assert owner.cancelling() == cancel_count
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("child_cancels_first", (False, True))
+@pytest.mark.parametrize("cancel_count", (1, 2))
+async def test_health_parent_cancellation_payload_wins_same_turn_as_child(
+    child_cancels_first, cancel_count
+):
+    """Health retains ordinary child classification absent an accepted parent."""
+
+    owner_ref = {}
+
+    async def child():
+        if child_cancels_first:
+            asyncio.current_task().cancel()
+        owner_ref["owner"].cancel("first health parent cancellation")
+        if cancel_count == 2:
+            owner_ref["owner"].cancel("later health parent cancellation")
+        if not child_cancels_first:
+            asyncio.current_task().cancel()
+        await asyncio.sleep(0)
+
+    owner = asyncio.create_task(
+        isolated_runtime._await_owned_health_probe(
+            child(),
+            name="same-turn-parent-health-cancellation",
+            on_started=lambda _task: None,
+            on_late_task=lambda _task: pytest.fail("child must settle promptly"),
+        )
+    )
+    owner_ref["owner"] = owner
+
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await asyncio.wait_for(owner, timeout=1)
+
+    assert cancelled.value.args == ("first health parent cancellation",)
+    assert owner.cancelled() is True
+    assert owner.cancelling() == cancel_count
+
+
+@pytest.mark.asyncio
+async def test_supervisor_restarts_after_child_cancelled_health_probe(monkeypatch, tmp_path):
+    """A child cancellation follows normal health recovery rather than terminal unwind."""
+
+    first_health = asyncio.Event()
+    restarted = asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    class ChildCancelledHealthClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.health_calls = 0
+            self.stop_calls = 0
+            self.start_calls = 0
+
+        async def health(self):
+            self.health_calls += 1
+            if self.health_calls == 1:
+                first_health.set()
+                asyncio.current_task().cancel()
+                await real_sleep(0)
+            return True
+
+        async def stop(self):
+            self.stop_calls += 1
+            self.stopped = True
+
+        async def start(self):
+            self.start_calls += 1
+            self.started = True
+            restarted.set()
+
+    async def immediate_sleep(_delay):
+        await real_sleep(0)
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    monkeypatch.setattr(isolated_runtime.asyncio, "sleep", immediate_sleep)
+    client = ChildCancelledHealthClient()
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    feature._client = client
+    supervisor = asyncio.create_task(feature._supervise())
+    feature._supervision_task = supervisor
+    try:
+        await asyncio.wait_for(first_health.wait(), timeout=1)
+        await asyncio.wait_for(restarted.wait(), timeout=1)
+        assert client.stop_calls == 1
+        assert client.start_calls == 1
+        assert feature._traffic_gate.sealed is False
+    finally:
+        feature._stopping = True
+        if not supervisor.done():
+            supervisor.cancel()
+        await asyncio.gather(supervisor, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_supervisor_logs_neutral_health_and_restart_failures(monkeypatch, tmp_path, caplog):
+    """Compatible facade failures never put tenant exception text in logs."""
+
+    health_attempted = asyncio.Event()
+    restart_attempted = asyncio.Event()
+    secret = "ISOLATED-FACADE-TENANT-SECRET-2755"
+    real_sleep = asyncio.sleep
+
+    class SecretFailingClient(FakeIsolatedClient):
+        def health(self):
+            health_attempted.set()
+            raise RuntimeError(secret)
+
+        async def stop(self):
+            return None
+
+        def start(self):
+            restart_attempted.set()
+            raise RuntimeError(secret)
+
+    async def immediate_sleep(_delay):
+        await real_sleep(0)
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    monkeypatch.setattr(isolated_runtime.asyncio, "sleep", immediate_sleep)
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    feature._client = SecretFailingClient()
+    supervisor = asyncio.create_task(feature._supervise())
+    feature._supervision_task = supervisor
+    try:
+        await asyncio.wait_for(health_attempted.wait(), timeout=1)
+        await asyncio.wait_for(restart_attempted.wait(), timeout=1)
+        assert "health check failed" in caplog.text
+        assert "restart failed" in caplog.text
+        assert secret not in caplog.text
+    finally:
+        feature._stopping = True
+        if not supervisor.done():
+            supervisor.cancel()
+        await asyncio.gather(supervisor, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_owned_health_probe_timeout_retains_task_returned_by_facade(monkeypatch):
+    """A timed-out Task-returning health facade cannot become an unowned probe."""
+
+    cancellation_observed = asyncio.Event()
+    release = asyncio.Event()
+
+    async def pending_task():
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancellation_observed.set()
+
+    operation = asyncio.create_task(pending_task(), name="facade-hostile-health-task")
+
+    class TaskReturningFacade:
+        def health(self):
+            return operation
+
+    late_tasks = []
+    monkeypatch.setattr(isolated_runtime, "_HEALTH_PROBE_TIMEOUT", 0.01)
+    monkeypatch.setattr(isolated_runtime, "_HEALTH_PROBE_CANCELLATION_GRACE", 0.01)
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await isolated_runtime._await_owned_health_probe(
+                TaskReturningFacade().health(),
+                name="test-hostile-facade-health-task",
+                on_started=lambda _task: None,
+                on_late_task=late_tasks.append,
+            )
+        assert cancellation_observed.is_set()
+        assert len(late_tasks) == 1
+        assert late_tasks[0].get_name() == "test-hostile-facade-health-task"
+    finally:
+        release.set()
+        await asyncio.wait_for(late_tasks[0] if late_tasks else operation, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_same_loop_health_parent_cancellation_claims_original_before_wrapper_runs():
+    """Health cancellation reaches the facade Task, never only an observer."""
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    cancellation_observed = asyncio.Event()
+
+    async def hostile_health():
+        started.set()
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancellation_observed.set()
+
+    original = asyncio.create_task(hostile_health(), name="facade-original-health")
+    started_tasks = []
+    late_tasks = []
+    owner = asyncio.create_task(
+        isolated_runtime._await_owned_health_probe(
+            original,
+            name="host-owned-prestart-health",
+            on_started=started_tasks.append,
+            on_late_task=late_tasks.append,
+        )
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        owner.cancel("health parent cancellation")
+        await asyncio.wait_for(cancellation_observed.wait(), timeout=1)
+
+        assert original.done() is False
+        assert len(started_tasks) == 1
+        assert late_tasks == started_tasks
+        assert late_tasks[0].get_name() == "host-owned-prestart-health"
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await asyncio.wait_for(owner, timeout=1)
+        assert cancelled.value.args == ("health parent cancellation",)
+    finally:
+        release.set()
+        if not original.done():
+            original.cancel()
+        await asyncio.gather(original, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cross_loop_health_task_fails_closed_and_consumes_late_error():
+    """A foreign health Task cannot trigger an ordinary retry while it runs."""
+
+    foreign_loop = asyncio.new_event_loop()
+    foreign_ready = threading.Event()
+    release_foreign = threading.Event()
+    cancellation_observed = threading.Event()
+    foreign_state = {}
+
+    class ForeignHealthError(RuntimeError):
+        pass
+
+    async def foreign_health():
+        while not release_foreign.is_set():
+            try:
+                await asyncio.sleep(0.001)
+            except asyncio.CancelledError:
+                cancellation_observed.set()
+        raise ForeignHealthError("FOREIGN-HEALTH-SECRET")
+
+    def run_foreign_loop():
+        asyncio.set_event_loop(foreign_loop)
+        task = foreign_loop.create_task(foreign_health(), name="foreign-facade-health")
+        foreign_state["task"] = task
+        foreign_ready.set()
+        try:
+            foreign_loop.run_until_complete(task)
+        except ForeignHealthError:
+            # The host observer has already retrieved this private outcome.
+            pass
+        finally:
+            foreign_loop.close()
+
+    foreign_thread = threading.Thread(target=run_foreign_loop)
+    foreign_thread.start()
+    assert foreign_ready.wait(timeout=1)
+
+    started_tasks = []
+    late_tasks = []
+    try:
+        with pytest.raises(isolated_runtime._CrossLoopFacadeOperationError):
+            await isolated_runtime._await_owned_health_probe(
+                foreign_state["task"],
+                name="host-owned-foreign-health",
+                on_started=started_tasks.append,
+                on_late_task=late_tasks.append,
+            )
+        assert late_tasks == started_tasks
+        assert len(late_tasks) == 1
+        assert late_tasks[0].foreign_loop is True
+        assert foreign_state["task"].done() is False
+        assert cancellation_observed.wait(timeout=1)
+
+        release_foreign.set()
+        await asyncio.wait_for(asyncio.to_thread(foreign_thread.join), timeout=1)
+        for _ in range(100):
+            if late_tasks[0].done():
+                break
+            await asyncio.sleep(0)
+        assert late_tasks[0].done() is True
+    finally:
+        release_foreign.set()
+        if foreign_thread.is_alive():
+            await asyncio.to_thread(foreign_thread.join)
+
+
+@pytest.mark.asyncio
+async def test_terminal_cleanup_never_stops_beside_unacknowledged_foreign_health(
+    monkeypatch, tmp_path
+):
+    """A cross-loop health fence remains terminally incomplete, never retried."""
+
+    foreign_loop = asyncio.new_event_loop()
+    foreign_probe = foreign_loop.create_future()
+
+    class StopCountingClient(FakeIsolatedClient):
+        def __init__(self):
+            super().__init__()
+            self.stop_calls = 0
+
+        async def stop(self):
+            self.stop_calls += 1
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    client = StopCountingClient()
+    feature._client = client
+    probe = isolated_runtime._create_host_owned_facade_task(
+        foreign_probe, name="unacknowledged-foreign-terminal-health"
+    )
+    feature._own_health_probe_task(probe)
+
+    try:
+        with pytest.raises(RuntimeError, match="terminal retirement is incomplete"):
+            await asyncio.wait_for(feature.shutdown(), timeout=1)
+        assert client.stop_calls == 0
+        assert feature._terminal_cleanup_uncertain is True
+        assert feature._terminal_health_probe_task is probe
+        assert probe.done() is False
+    finally:
+        foreign_loop.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nonweak_facade", (False, True))
+@pytest.mark.parametrize("foreign_outcome", ("success", "error", "cancel"))
+async def test_cross_loop_facade_task_is_retained_fenced_and_released_before_retry(
+    nonweak_facade, foreign_outcome, monkeypatch, tmp_path
+):
+    """Only a foreign success releases its exact retained stop ownership."""
+
+    foreign_loop = asyncio.new_event_loop()
+    foreign_ready = threading.Event()
+    release_foreign = threading.Event()
+    cancellation_observed = threading.Event()
+    foreign_state = {}
+
+    class ForeignStopError(RuntimeError):
+        pass
+
+    async def foreign_stop():
+        while not release_foreign.is_set():
+            try:
+                await asyncio.sleep(0.001)
+            except asyncio.CancelledError:
+                cancellation_observed.set()
+        if foreign_outcome == "error":
+            raise ForeignStopError("FOREIGN-STOP-SECRET-2755")
+        if foreign_outcome == "cancel":
+            raise asyncio.CancelledError()
+
+    def run_foreign_loop():
+        asyncio.set_event_loop(foreign_loop)
+        task = foreign_loop.create_task(foreign_stop(), name="foreign-facade-stop")
+        foreign_state["task"] = task
+        foreign_ready.set()
+        try:
+            foreign_loop.run_until_complete(task)
+        except (ForeignStopError, asyncio.CancelledError):
+            # The host's owner-loop observer has already consumed the private
+            # disposition; the loop runner only needs to terminate cleanly.
+            pass
+        finally:
+            foreign_loop.close()
+
+    foreign_thread = threading.Thread(target=run_foreign_loop)
+    foreign_thread.start()
+    assert foreign_ready.wait(timeout=1)
+
+    if nonweak_facade:
+        class CrossLoopStopClient:
+            __slots__ = ("stop_calls", "stopped")
+
+            def __init__(self):
+                self.stop_calls = 0
+                self.stopped = False
+
+            def stop(self):
+                self.stop_calls += 1
+                if self.stop_calls == 1:
+                    return foreign_state["task"]
+                self.stopped = True
+                return None
+    else:
+        class CrossLoopStopClient(FakeIsolatedClient):
+            def __init__(self):
+                super().__init__()
+                self.stop_calls = 0
+
+            def stop(self):
+                self.stop_calls += 1
+                if self.stop_calls == 1:
+                    return foreign_state["task"]
+                self.stopped = True
+                return None
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    client = CrossLoopStopClient()
+    feature._client = client
+    try:
+        with pytest.raises(RuntimeError, match="terminal retirement is incomplete"):
+            await asyncio.wait_for(feature.shutdown(), timeout=1)
+        assert client.stop_calls == 1
+        assert len(feature._terminal_lifecycle_tasks) == 1
+        assert feature._terminal_lifecycle_tasks[0].task.foreign_loop is True
+        assert foreign_state["task"].done() is False
+        assert cancellation_observed.wait(timeout=1)
+
+        # A fresh terminal caller must not retry while the foreign operation
+        # still owns the facade's lifecycle handle.
+        with pytest.raises(RuntimeError, match="terminal retirement is incomplete"):
+            await asyncio.wait_for(feature.shutdown(), timeout=1)
+        assert client.stop_calls == 1
+
+        release_foreign.set()
+        await asyncio.wait_for(asyncio.to_thread(foreign_thread.join), timeout=1)
+        for _ in range(100):
+            if not feature._terminal_lifecycle_tasks:
+                break
+            await asyncio.sleep(0)
+        assert feature._terminal_lifecycle_tasks == []
+
+        # A successful foreign source releases its exact retained client. A
+        # failed/cancelled source remains fail-closed, but only after its first
+        # source has settled may a later shutdown attempt a fresh ``stop()``.
+        await asyncio.wait_for(feature.shutdown(), timeout=1)
+        assert client.stop_calls == (1 if foreign_outcome == "success" else 2)
+        assert client.stopped is (foreign_outcome != "success")
+        assert feature._terminal_retirement_clients == []
+    finally:
+        release_foreign.set()
+        if foreign_thread.is_alive():
+            await asyncio.to_thread(foreign_thread.join)
+        if not feature._stopping:
+            await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_foreign_success_keeps_terminal_stop_owned_until_host_disposition_runs(
+    monkeypatch, tmp_path
+):
+    """A host cleanup between owner acknowledgement and callback cannot re-stop."""
+
+    foreign_loop = asyncio.new_event_loop()
+    foreign_stop = foreign_loop.create_future()
+
+    class DeferredForeignStopClient(FakeIsolatedClient):
+        def __init__(self):
+            super().__init__()
+            self.stop_calls = 0
+
+        def stop(self):
+            self.stop_calls += 1
+            if self.stop_calls == 1:
+                return foreign_stop
+            pytest.fail("terminal cleanup issued a duplicate foreign stop")
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    client = DeferredForeignStopClient()
+    feature._retain_terminal_retirement_client(client)
+
+    try:
+        with pytest.raises(isolated_runtime._CrossLoopFacadeOperationError):
+            await isolated_runtime._await_owned_facade_lifecycle_operation(
+                client.stop(),
+                name="foreign-success-host-disposition-gap",
+                on_completed=lambda: feature._release_terminal_retirement_client(client),
+                on_timeout=lambda: feature._fence_terminal_retirement_timeout(client),
+                on_late_task=lambda task: feature._retain_terminal_lifecycle_task(
+                    task, client
+                ),
+            )
+        operation = feature._terminal_lifecycle_tasks[0].task
+
+        # Model the source loop consuming its successful result just before
+        # the host handles its queued disposition callback.  No host turn is
+        # allowed between these two assertions.
+        foreign_stop.set_result(None)
+        operation._observe_foreign_source_settlement(foreign_stop)
+        assert operation.done() is True
+        assert operation.settlement_delivery_complete is False
+
+        assert await feature._retire_terminal_clients() is False
+        assert client.stop_calls == 1
+
+        for _ in range(4):
+            await asyncio.sleep(0)
+        assert feature._terminal_lifecycle_tasks == []
+        assert feature._terminal_retirement_clients == []
+        assert client.stop_calls == 1
+    finally:
+        foreign_loop.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_facade_stop_replays_cancellation_before_late_secret_error():
+    """A late facade error cannot replace a remembered caller cancellation."""
+
+    stop_started = asyncio.Event()
+    release_stop = asyncio.Event()
+
+    class SecretStopError(RuntimeError):
+        pass
+
+    async def stop():
+        stop_started.set()
+        await release_stop.wait()
+        # Keep the owner in its next shielded await while this facade fails.
+        # Without that scheduling edge, the owner can observe task.done() at
+        # the top of its loop and miss the path this test protects.
+        await asyncio.sleep(0)
+        raise SecretStopError("TENANT-STOP-SECRET")
+
+    owner = asyncio.create_task(
+        isolated_runtime._await_owned_facade_lifecycle_operation(
+            stop(),
+            name="test-late-secret-stop",
+            on_late_task=lambda _task: pytest.fail("stop should settle promptly"),
+        )
+    )
+    await asyncio.wait_for(stop_started.wait(), timeout=1)
+    owner.cancel("reload cancellation")
+    await asyncio.sleep(0)
+    assert owner.done() is False
+    release_stop.set()
+
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await asyncio.wait_for(owner, timeout=1)
+
+    assert cancelled.value.args == ("reload cancellation",)
+    assert "TENANT-STOP-SECRET" not in repr(cancelled.value)
+    assert cancelled.value.__context__ is None
+    _assert_runtime_traceback_locals_are_detached(
+        cancelled.value,
+        forbidden_values=(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_owned_facade_cancellation_traceback_drops_late_secret_result():
+    """Cancellation does not retain a completed facade task's result."""
+
+    stop_started = asyncio.Event()
+    release_stop = asyncio.Event()
+    secret_result = {"token": "TENANT-STOP-RESULT-SECRET"}
+
+    async def stop():
+        stop_started.set()
+        await release_stop.wait()
+        return secret_result
+
+    owner = asyncio.create_task(
+        isolated_runtime._await_owned_facade_lifecycle_operation(
+            stop(),
+            name="test-late-secret-stop-result",
+            on_late_task=lambda _task: pytest.fail("stop should settle promptly"),
+        )
+    )
+    await asyncio.wait_for(stop_started.wait(), timeout=1)
+    owner.cancel("reload result cancellation")
+    await asyncio.sleep(0)
+    release_stop.set()
+
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await asyncio.wait_for(owner, timeout=1)
+
+    assert cancelled.value.args == ("reload result cancellation",)
+    assert not _traceback_locals_reach_any(
+        cancelled.value,
+        (secret_result,),
+    )
+
+
+@pytest.mark.asyncio
+async def test_owned_facade_timeout_acknowledges_child_cancellation_as_timeout(
+    monkeypatch,
+):
+    """The helper's own task.cancel() never becomes a caller cancellation."""
+
+    stop_started = asyncio.Event()
+    secret = {"credential": "TIMED-OUT-STOP-SECRET-2755"}
+
+    async def stop():
+        stop_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            # The acknowledgement receives the child's cancellation first.
+            # A late secret failure must stay private behind the timeout.
+            await asyncio.sleep(0)
+            raise RuntimeError(secret)
+
+    monkeypatch.setattr(isolated_runtime, "_FACADE_LIFECYCLE_OPERATION_TIMEOUT", 0.01)
+    monkeypatch.setattr(isolated_runtime, "_FACADE_LIFECYCLE_CANCELLATION_GRACE", 0.1)
+    with pytest.raises(isolated_runtime._FacadeLifecycleOperationTimedOut) as timed_out:
+        await isolated_runtime._await_owned_facade_lifecycle_operation(
+            stop(),
+            name="test-child-cancellation-timeout",
+            on_late_task=lambda _task: pytest.fail("stop should settle promptly"),
+        )
+
+    assert stop_started.is_set()
+    assert "TIMED-OUT-STOP-SECRET-2755" not in repr(timed_out.value)
+    assert timed_out.value.__context__ is None
+    _assert_runtime_traceback_locals_are_detached(
+        timed_out.value,
+        forbidden_values=(secret,),
+    )
+
+
+def test_facade_lifecycle_timeout_covers_locked_sdk_stop_sequence():
+    """The host deadline tracks every sequential SDK 0.35.1 stop observation."""
+
+    assert isolated_runtime._SDK_SUBPROCESS_STOP_BUDGET == 33.0
+    assert isolated_runtime._FACADE_LIFECYCLE_OPERATION_TIMEOUT == 36.0
+
+
+@pytest.mark.asyncio
+async def test_health_timeout_acknowledgement_does_not_swallow_supervisor_cancellation(
+    monkeypatch, tmp_path
+):
+    """A cancellation concurrent with probe acknowledgement never restarts."""
+
+    health_started = asyncio.Event()
+    supervisor: asyncio.Task[None] | None = None
+
+    class TimeoutAcknowledgingClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.stop_calls = 0
+            self.start_calls = 0
+
+        async def health(self):
+            health_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                assert supervisor is not None
+                supervisor.cancel("supervisor health cancellation")
+                raise
+
+        async def stop(self):
+            self.stop_calls += 1
+            self.stopped = True
+
+        async def start(self):
+            self.start_calls += 1
+            self.started = True
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    monkeypatch.setattr(isolated_runtime, "_HEALTH_PROBE_TIMEOUT", 0.01)
+    client = TimeoutAcknowledgingClient()
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    feature._client = client
+    real_sleep = asyncio.sleep
+
+    async def immediate_sleep(_delay):
+        await real_sleep(0)
+
+    monkeypatch.setattr(isolated_runtime.asyncio, "sleep", immediate_sleep)
+    try:
+        supervisor = asyncio.create_task(feature._supervise())
+        feature._supervision_task = supervisor
+        await asyncio.wait_for(health_started.wait(), timeout=1)
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await asyncio.wait_for(supervisor, timeout=1)
+
+        assert cancelled.value.args == ("supervisor health cancellation",)
+        assert client.start_calls == 0
+        assert client.stop_calls == 1
+        assert feature._client is None
+        assert feature._traffic_gate.sealed is True
+    finally:
+        if supervisor is not None and not supervisor.done():
+            supervisor.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await supervisor
+        if not feature._stopping:
+            await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_health_timeout_acknowledgement_consumes_late_facade_secret(
+    monkeypatch,
+):
+    """A post-timeout health failure stays private behind TimeoutError."""
+
+    probe_started = asyncio.Event()
+    secret = {"credential": "TENANT-HEALTH-SECRET"}
+
+    async def health():
+        probe_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            # Force the helper to await the task after cancellation before it
+            # fails, rather than observing the completed task at loop entry.
+            await asyncio.sleep(0)
+            raise RuntimeError(secret)
+
+    monkeypatch.setattr(isolated_runtime, "_HEALTH_PROBE_TIMEOUT", 0.01)
+    monkeypatch.setattr(isolated_runtime, "_HEALTH_PROBE_CANCELLATION_GRACE", 0.1)
+    with pytest.raises(asyncio.TimeoutError) as timed_out:
+        await isolated_runtime._await_owned_health_probe(
+            health(),
+            name="test-late-secret-health",
+            on_started=lambda _task: None,
+            on_late_task=lambda _task: pytest.fail("health should settle promptly"),
+        )
+
+    assert probe_started.is_set()
+    assert "TENANT-HEALTH-SECRET" not in repr(timed_out.value)
+    _assert_runtime_traceback_locals_are_detached(
+        timed_out.value,
+        forbidden_values=(secret,),
+    )
+
+
+@pytest.mark.asyncio
+async def test_reload_cancellation_after_successful_stop_never_restores_or_retires_twice(
+    monkeypatch, tmp_path
+):
+    """Reload keeps a stop proven during cancellation out of quarantine retry."""
+
+    stop_started = asyncio.Event()
+    release_stop = asyncio.Event()
+
+    class SlowStopClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.stop_calls = 0
+
+        async def stop(self):
+            self.stop_calls += 1
+            stop_started.set()
+            await release_stop.wait()
+            self.stopped = True
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    client = SlowStopClient()
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    feature._client = client
+    reload_task = asyncio.create_task(feature.reload())
+    try:
+        await asyncio.wait_for(stop_started.wait(), timeout=1)
+        reload_task.cancel("reload stop cancellation")
+        await asyncio.sleep(0)
+        assert reload_task.done() is False
+        release_stop.set()
+
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await asyncio.wait_for(reload_task, timeout=1)
+
+        assert cancelled.value.args == ("reload stop cancellation",)
+        assert client.stop_calls == 1
+        assert feature._client is None
+        assert feature._terminal_retirement_clients == []
+        assert feature._traffic_gate.sealed is True
+    finally:
+        release_stop.set()
+        if not reload_task.done():
+            reload_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await reload_task
+        if not feature._stopping:
+            await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_fenced_recovery_later_failure_does_not_retry_successfully_stopped_facade(
+    monkeypatch, tmp_path
+):
+    """Fenced recovery quarantines later failure without a duplicate old stop."""
+
+    class CountingStopClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.stop_calls = 0
+
+        async def stop(self):
+            self.stop_calls += 1
+            self.stopped = True
+
+    async def promotion_failure(_transition):
+        raise RuntimeError("later promotion failure")
+
+    async def clear_pending(_transition):
+        return None
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    client = CountingStopClient()
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    feature._client = client
+    monkeypatch.setattr(feature, "_promote_config", promotion_failure)
+    monkeypatch.setattr(feature, "_clear_owned_pending_before_quarantine", clear_pending)
+    try:
+        with pytest.raises(RuntimeError, match="later promotion failure"):
+            await feature._recover_fenced_transition_uninterrupted(Mock())
+
+        assert client.stop_calls == 1
+        assert feature._client is None
+        assert feature._terminal_retirement_clients == []
+        assert feature._traffic_gate.sealed is True
+    finally:
+        if not feature._stopping:
+            await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_fenced_recovery_nonweak_facade_does_not_retry_successful_stop(
+    monkeypatch, tmp_path
+):
+    """The proven-stop fence is identity-safe for non-weakrefable facades."""
+
+    class NonWeakCountingStopClient:
+        __slots__ = ("stop_calls", "stopped")
+
+        def __init__(self):
+            self.stop_calls = 0
+            self.stopped = False
+
+        async def stop(self):
+            self.stop_calls += 1
+            self.stopped = True
+
+    async def promotion_failure(_transition):
+        raise RuntimeError("later promotion failure")
+
+    async def clear_pending(_transition):
+        return None
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    client = NonWeakCountingStopClient()
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    feature._client = client
+    monkeypatch.setattr(feature, "_promote_config", promotion_failure)
+    monkeypatch.setattr(feature, "_clear_owned_pending_before_quarantine", clear_pending)
+    try:
+        with pytest.raises(RuntimeError, match="later promotion failure"):
+            await feature._recover_fenced_transition_uninterrupted(Mock())
+
+        assert client.stop_calls == 1
+        assert feature._client is None
+        assert feature._terminal_retirement_clients == []
+        assert feature._traffic_gate.sealed is True
+    finally:
+        if not feature._stopping:
+            await feature.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nonweakrefable", [False, True])
+async def test_fenced_recovery_cancellation_does_not_restore_proven_stopped_facade(
+    monkeypatch, tmp_path, nonweakrefable
+):
+    """Cancellation after the exact stop settles cannot schedule a second stop."""
+
+    stop_started = asyncio.Event()
+    release_stop = asyncio.Event()
+
+    if nonweakrefable:
+
+        class SlowStopClient:
+            __slots__ = ("stop_calls", "stopped")
+
+            def __init__(self):
+                self.stop_calls = 0
+                self.stopped = False
+
+            async def stop(self):
+                self.stop_calls += 1
+                stop_started.set()
+                await release_stop.wait()
+                self.stopped = True
+
+    else:
+
+        class SlowStopClient(FakeIsolatedClient):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.stop_calls = 0
+
+            async def stop(self):
+                self.stop_calls += 1
+                stop_started.set()
+                await release_stop.wait()
+                self.stopped = True
+
+    async def clear_pending(_transition):
+        return None
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    client = SlowStopClient()
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    feature._client = client
+    monkeypatch.setattr(feature, "_clear_owned_pending_before_quarantine", clear_pending)
+    recovery = asyncio.create_task(
+        feature._recover_fenced_transition_uninterrupted(Mock())
+    )
+    try:
+        await asyncio.wait_for(stop_started.wait(), timeout=1)
+        recovery.cancel("fenced recovery cancellation")
+        await asyncio.sleep(0)
+        assert recovery.done() is False
+        release_stop.set()
+
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await asyncio.wait_for(recovery, timeout=1)
+
+        assert cancelled.value.args == ("fenced recovery cancellation",)
+        assert client.stop_calls == 1
+        assert feature._client is None
+        assert feature._terminal_retirement_clients == []
+        assert feature._traffic_gate.sealed is True
+    finally:
+        release_stop.set()
+        if not recovery.done():
+            recovery.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await recovery
+        if not feature._stopping:
+            await feature.shutdown()

@@ -6582,8 +6582,35 @@ Expected Duration: {expected_duration}
             for feature_name, feature in remaining_features:
                 per_feature = _step_budget()
                 try:
+                    # Some lifecycle owners (notably isolated SDK facades)
+                    # must keep an exact stop coroutine alive after this
+                    # fair-share deadline: it may own the only subprocess
+                    # handle.  The optional wrapper gives such a feature the
+                    # canonical agent-deadline signal, so it can retain that
+                    # task and return cancellation promptly instead of
+                    # consuming later features' and the durable tail's time.
+                    # Look on the class, not the instance: test doubles and
+                    # dynamic adapters can fabricate arbitrary attributes,
+                    # which must not be mistaken for this lifecycle contract.
+                    bounded_shutdown = getattr(
+                        type(feature), "shutdown_with_agent_deadline", None
+                    )
+                    prepare_bounded_shutdown = getattr(
+                        type(feature), "prepare_shutdown_with_agent_deadline", None
+                    )
+                    if callable(prepare_bounded_shutdown):
+                        # A zero fair share is still a terminal shutdown
+                        # request.  Establish isolated runtime ownership
+                        # before wait_for can cancel its coroutine prior to
+                        # the first instruction in its async body.
+                        feature.prepare_shutdown_with_agent_deadline()
+                    shutdown_operation = (
+                        feature.shutdown_with_agent_deadline()
+                        if callable(bounded_shutdown)
+                        else feature.shutdown()
+                    )
                     await asyncio.wait_for(
-                        feature.shutdown(), timeout=per_feature
+                        shutdown_operation, timeout=per_feature
                     )
                 except asyncio.TimeoutError:
                     logging.warning(

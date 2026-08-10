@@ -11,6 +11,7 @@ import contextlib
 import inspect
 import os
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from decimal import Decimal
@@ -26,6 +27,8 @@ from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.features import MandatoryFeatureReadinessError
 from kestrel_sovereign.features.base import Feature
+from kestrel_sovereign.features.isolated_runtime import ProxyFeature
+from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
 from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.features.privacy.feature import PrivacyTransitionDecision
@@ -2085,6 +2088,232 @@ class TestLifecycle:
         assert late_started.is_set()
         # ...nor the durable storage close.
         mock_storage.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_agent_shutdown_bounds_isolated_sdk_stop_without_detaching_it(
+        self, tmp_path
+    ):
+        """An isolated stop yields its fair share while retaining its sole handle."""
+
+        agent = KestrelAgent(
+            did="did:test:isolated-shutdown-budget",
+            storage_path=str(tmp_path / "test.db"),
+        )
+        stop_started = asyncio.Event()
+        release_stop = asyncio.Event()
+        late_started = asyncio.Event()
+
+        class SlowSdkFacade:
+            async def stop(self):
+                stop_started.set()
+                await release_stop.wait()
+
+        runtime = InstalledFeatureRuntime(
+            class_name="BudgetedIsolatedFeature",
+            entry_point="test.feature:BudgetedIsolatedFeature",
+            distribution="test-isolated-feature",
+            runtime="isolated-venv",
+            service="test-service",
+        )
+        isolated = ProxyFeature(agent, runtime)
+        isolated._client = SlowSdkFacade()
+
+        async def late_shutdown():
+            late_started.set()
+
+        late = MagicMock()
+        late.shutdown = late_shutdown
+        agent.features = {"BudgetedIsolatedFeature": isolated, "LateFeature": late}
+        agent.llm_service = None
+        agent.task_manager = None
+        storage = AsyncMock()
+        storage.close = AsyncMock()
+        agent.storage = storage
+
+        try:
+            with patch(
+                "kestrel_sovereign.kestrel_agent.KESTREL_AGENT_SHUTDOWN_TIMEOUT_S",
+                0.25,
+            ), patch(
+                "kestrel_sovereign.kestrel_agent.KESTREL_SHUTDOWN_DURABLE_RESERVE_S",
+                0.05,
+            ), patch(
+                "kestrel_sovereign.kestrel_agent.KESTREL_SHUTDOWN_TAIL_MIN_STEP_S",
+                0.01,
+            ):
+                await asyncio.wait_for(agent.shutdown(), timeout=1)
+
+            assert stop_started.is_set()
+            assert late_started.is_set()
+            assert storage.close.called
+            # The agent's fair-share timeout released the sweep, but it did
+            # not cancel/detach the SDK stop coroutine after it acquired the
+            # facade's only process handle.
+            assert isolated._terminal_cleanup_task is not None
+            assert not isolated._terminal_cleanup_task.done()
+        finally:
+            release_stop.set()
+            cleanup = isolated._terminal_cleanup_task
+            if cleanup is not None:
+                await asyncio.wait_for(asyncio.shield(cleanup), timeout=1)
+            await isolated.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_agent_zero_fair_share_still_owns_isolated_shutdown(self, tmp_path):
+        """A spent prefix budget cannot skip terminal isolated cleanup setup."""
+
+        agent = KestrelAgent(
+            did="did:test:isolated-zero-shutdown-budget",
+            storage_path=str(tmp_path / "test.db"),
+        )
+        stop_started = asyncio.Event()
+        release_stop = asyncio.Event()
+
+        class SlowSdkFacade:
+            async def stop(self):
+                stop_started.set()
+                await release_stop.wait()
+
+        runtime = InstalledFeatureRuntime(
+            class_name="ZeroBudgetIsolatedFeature",
+            entry_point="test.feature:ZeroBudgetIsolatedFeature",
+            distribution="test-isolated-feature",
+            runtime="isolated-venv",
+            service="test-service",
+        )
+        isolated = ProxyFeature(agent, runtime)
+        isolated._client = SlowSdkFacade()
+
+        async def consume_prefix_budget():
+            # A blocking legacy shutdown cannot be preempted by wait_for, so
+            # it makes the next fair share exactly zero when it returns.
+            time.sleep(0.03)
+
+        budget_consumer = MagicMock()
+        budget_consumer.shutdown = consume_prefix_budget
+        agent.features = {
+            "BudgetConsumer": budget_consumer,
+            "ZeroBudgetIsolatedFeature": isolated,
+        }
+        agent.llm_service = None
+        agent.task_manager = None
+        storage = AsyncMock()
+        storage.close = AsyncMock()
+        agent.storage = storage
+
+        try:
+            with patch(
+                "kestrel_sovereign.kestrel_agent.KESTREL_AGENT_SHUTDOWN_TIMEOUT_S",
+                0.04,
+            ), patch(
+                "kestrel_sovereign.kestrel_agent.KESTREL_SHUTDOWN_DURABLE_RESERVE_S",
+                0.02,
+            ), patch(
+                "kestrel_sovereign.kestrel_agent.KESTREL_SHUTDOWN_TAIL_MIN_STEP_S",
+                0.001,
+            ):
+                await asyncio.wait_for(agent.shutdown(), timeout=1)
+
+            await asyncio.wait_for(stop_started.wait(), timeout=1)
+            assert isolated._terminal_cleanup_task is not None
+            assert isolated._traffic_gate.sealed is True
+            assert isolated._client is None
+            assert storage.close.called
+        finally:
+            release_stop.set()
+            cleanup = isolated._terminal_cleanup_task
+            if cleanup is not None:
+                await asyncio.wait_for(asyncio.shield(cleanup), timeout=1)
+            await isolated.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_agent_shutdown_fair_share_owns_hostile_health_probe(self, tmp_path):
+        """A stale health probe cannot detach or starve later agent teardown."""
+
+        import kestrel_sovereign.features.isolated_runtime as isolated_runtime
+
+        agent = KestrelAgent(
+            did="did:test:isolated-health-shutdown-budget",
+            storage_path=str(tmp_path / "test.db"),
+        )
+        health_started = asyncio.Event()
+        release_health = asyncio.Event()
+        late_started = asyncio.Event()
+
+        class CancellationResistantHealthFacade:
+            async def health(self):
+                health_started.set()
+                while not release_health.is_set():
+                    try:
+                        await release_health.wait()
+                    except asyncio.CancelledError:
+                        pass
+
+            async def stop(self):
+                pass
+
+        runtime = InstalledFeatureRuntime(
+            class_name="BudgetedHealthFeature",
+            entry_point="test.feature:BudgetedHealthFeature",
+            distribution="test-isolated-feature",
+            runtime="isolated-venv",
+            service="test-service",
+        )
+        isolated = ProxyFeature(agent, runtime)
+        isolated._client = CancellationResistantHealthFacade()
+
+        async def late_shutdown():
+            late_started.set()
+
+        late = MagicMock()
+        late.shutdown = late_shutdown
+        agent.features = {"BudgetedHealthFeature": isolated, "LateFeature": late}
+        agent.llm_service = None
+        agent.task_manager = None
+        storage = AsyncMock()
+        storage.close = AsyncMock()
+        agent.storage = storage
+
+        real_sleep = asyncio.sleep
+
+        async def immediate_sleep(_delay, result=None):
+            await real_sleep(0)
+            return result
+
+        supervisor = None
+        try:
+            with patch.object(isolated_runtime.asyncio, "sleep", immediate_sleep):
+                supervisor = asyncio.create_task(isolated._supervise())
+                isolated._supervision_task = supervisor
+                await asyncio.wait_for(health_started.wait(), timeout=1)
+                with patch(
+                    "kestrel_sovereign.kestrel_agent.KESTREL_AGENT_SHUTDOWN_TIMEOUT_S",
+                    0.25,
+                ), patch(
+                    "kestrel_sovereign.kestrel_agent.KESTREL_SHUTDOWN_DURABLE_RESERVE_S",
+                    0.05,
+                ), patch(
+                    "kestrel_sovereign.kestrel_agent.KESTREL_SHUTDOWN_TAIL_MIN_STEP_S",
+                    0.01,
+                ):
+                    await asyncio.wait_for(agent.shutdown(), timeout=1)
+
+            assert late_started.is_set()
+            assert storage.close.called
+            assert isolated._terminal_health_probe_task is not None
+            assert not isolated._terminal_health_probe_task.done()
+            assert isolated._traffic_gate.sealed is True
+        finally:
+            release_health.set()
+            for _ in range(100):
+                if isolated._terminal_health_probe_task is None:
+                    break
+                await real_sleep(0)
+            if supervisor is not None and not supervisor.done():
+                supervisor.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await supervisor
+            await isolated.shutdown()
 
     @pytest.mark.asyncio
     async def test_hung_prefix_component_does_not_starve_later_feature(
