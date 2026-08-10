@@ -603,10 +603,21 @@ CREATE INDEX IF NOT EXISTS idx_pending_a2a_questions_sweep
 --                            the next tick does not re-fire the same transition
 --   - last_delivery_*        diagnostics plus retry accounting (attempts caps
 --                            the soft-fail retry loop, MAX_DELIVERY_ATTEMPTS)
+--   - last_surface_status    whether the delivered wake was actually SURFACED
+--                            to the user, kept distinct from whether it was
+--                            persisted: surfaced, unbound (no origin session,
+--                            so no window to render in), buffered (emitted but
+--                            no consumer connected yet), unsurfaced (the event
+--                            reached nobody) or unknown (unobservable).
+--                            Conflating the two is what let a stranded wake
+--                            report ok for months (#2877, #2922)
 --   - pending_signal_*       the two-phase harvest set: a signal we enqueued
 --                            but have not yet confirmed delivered, cleared on
 --                            harvest (record_delivery) so a restart that lost
---                            the in-memory task re-detects and retries
+--                            the in-memory task re-detects and retries.
+--                            pending_signal_session_id carries the origin
+--                            session the wake was bound to, so the NEXT tick
+--                            can still tell bound from unbound after a restart
 --   - watching               explicit watched-handle flag: the agent called
 --                            wait(target, mode="signal") to register a watch on
 --                            this (kind, handle). The reconciler polls watched
@@ -626,9 +637,11 @@ CREATE TABLE IF NOT EXISTS wait_signal_state (
     last_delivery_error TEXT,
     last_delivery_attempts INTEGER NOT NULL DEFAULT 0,
     last_delivery_attempt_at TIMESTAMP,
+    last_surface_status TEXT,
     pending_signal_id TEXT,
     pending_signaled_target TEXT,
     pending_signal_enqueued_at TIMESTAMP,
+    pending_signal_session_id TEXT,
     watching INTEGER NOT NULL DEFAULT 0,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (agent_id, kind, handle)
@@ -958,6 +971,19 @@ class AsyncDatabase:
         # later name reassignment cannot retarget an in-flight question.
         await self._migrate_add_column(
             "pending_a2a_questions", "recipient_agent_id", "TEXT DEFAULT NULL"
+        )
+        # #2922: the wait reconciler's ledger records whether a delivered wake
+        # was SURFACED, not only persisted, and needs the wake's origin session
+        # to survive the tick (and the restart) between enqueue and harvest.
+        # Idempotent — no-op on fresh databases, which get both columns from
+        # the CREATE TABLE above. Legacy rows read NULL: unknown binding,
+        # unknown visibility, which is the honest answer for a wake enqueued
+        # before either column existed.
+        await self._migrate_add_column(
+            "wait_signal_state", "last_surface_status", "TEXT DEFAULT NULL"
+        )
+        await self._migrate_add_column(
+            "wait_signal_state", "pending_signal_session_id", "TEXT DEFAULT NULL"
         )
         # Decay-aware forgetting (#1674): memory_episodes need a decay signal
         # before they can be deleted by importance rather than raw age. Stamp

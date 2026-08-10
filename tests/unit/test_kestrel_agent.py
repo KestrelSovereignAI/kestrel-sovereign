@@ -859,6 +859,93 @@ class TestEventSystem:
         assert drained[-1] == ("restart_status", {"n": cap + 24})
         assert drained[0] == ("restart_status", {"n": 25})
 
+    # -- Delivery receipts (#2922) ------------------------------------------
+    #
+    # emit_event deliberately never raises, so for years its return value said
+    # nothing and callers had to read "did not raise" as "the user saw it".
+    # Those are different facts, and conflating them let a wake nobody could
+    # see report itself delivered (#2877). The receipt reports the difference.
+
+    @pytest.mark.asyncio
+    async def test_emit_event_receipt_reports_accepted_listeners(self, tmp_path):
+        """A live listener that returns is the strongest in-process evidence
+        of visibility available."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        async def listener(event_type, data):
+            return None
+
+        agent.add_event_listener(listener)
+        receipt = await agent.emit_event("test_event", {"a": 1})
+
+        assert receipt.delivered is True
+        assert (receipt.listeners, receipt.accepted, receipt.failed) == (1, 1, 0)
+        assert receipt.buffered is False
+        assert receipt.event_type == "test_event"
+
+    @pytest.mark.asyncio
+    async def test_emit_event_receipt_reports_total_listener_failure(self, tmp_path):
+        """The case the return value used to hide: every consumer raised, the
+        failures were logged and swallowed, and emit_event returned exactly as
+        it does on success. The receipt is the only thing that can tell a
+        caller nothing was delivered."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        async def broken(event_type, data):
+            raise ConnectionError("sse client vanished")
+
+        agent.add_event_listener(broken)
+        receipt = await agent.emit_event("test_event", {"a": 1})
+
+        assert receipt.delivered is False, (
+            "a swallowed listener failure reported as delivered is #2877"
+        )
+        assert (receipt.listeners, receipt.accepted, receipt.failed) == (1, 0, 1)
+        assert receipt.buffered is False
+
+    @pytest.mark.asyncio
+    async def test_emit_event_receipt_reports_partial_delivery(self, tmp_path):
+        """One live consumer is enough for the person watching — and the other
+        one's failure is still counted, not hidden."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        async def broken(event_type, data):
+            raise ValueError("boom")
+
+        async def good(event_type, data):
+            return None
+
+        agent.add_event_listener(broken)
+        agent.add_event_listener(good)
+        receipt = await agent.emit_event("test_event", {"a": 1})
+
+        assert receipt.delivered is True
+        assert (receipt.listeners, receipt.accepted, receipt.failed) == (2, 1, 1)
+
+    @pytest.mark.asyncio
+    async def test_emit_event_receipt_reports_buffering(self, tmp_path):
+        """Nobody connected: buffered for replay. Deferred, not delivered —
+        and not a failure either."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        receipt = await agent.emit_event("restart_status", {"status": "done"})
+
+        assert receipt.buffered is True
+        assert receipt.delivered is False
+        assert (receipt.listeners, receipt.accepted, receipt.failed) == (0, 0, 0)
+
 
 # =============================================================================
 # Tests for Cancellation

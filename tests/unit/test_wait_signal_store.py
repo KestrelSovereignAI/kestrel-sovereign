@@ -91,10 +91,52 @@ async def test_record_delivery_locks_outcome_and_clears_pending(make_store):
     row = await store.get("talon", "job-1")
     assert row.last_signaled_outcome == "done"
     assert row.last_delivery_status == "ok"
-    # All three pending fields cleared.
+    # All four pending fields cleared.
     assert row.pending_signal_id is None
     assert row.pending_signaled_target is None
     assert row.pending_signal_enqueued_at is None
+    assert row.pending_signal_session_id is None
+
+
+@pytest.mark.asyncio
+async def test_pending_carries_the_origin_session_and_delivery_the_surface(
+    make_store,
+):
+    """Persisted and surfaced are separate recorded facts (#2922).
+
+    The origin session rides the PENDING row because the harvest happens on a
+    later tick — a restart in between must not erase whether the wake ever had
+    a window to appear in — and the surface verdict lands in its own column so
+    "written down" and "the user saw it" stay independently readable."""
+    store = await make_store()
+    await store.record_pending(
+        "talon", "job-1", signal_id="s1", target="done", attempts=1,
+        session_id="chat-sess-1",
+    )
+    row = await store.get("talon", "job-1")
+    assert row.pending_signal_session_id == "chat-sess-1"
+    assert row.last_surface_status is None, "nothing harvested yet"
+
+    await store.record_delivery(
+        "talon", "job-1",
+        delivery_status="ok", signaled_outcome="done",
+        surface_status="surfaced",
+    )
+    row = await store.get("talon", "job-1")
+    assert row.last_surface_status == "surfaced"
+    assert row.pending_signal_session_id is None
+
+
+@pytest.mark.asyncio
+async def test_unattended_pending_records_no_origin_session(make_store):
+    """Unattended (cron/CLI) work registers no session — stored as NULL, which
+    the reconciler reads as "nowhere to surface", not "unknown"."""
+    store = await make_store()
+    await store.record_pending(
+        "talon", "job-1", signal_id="s1", target="done", attempts=1,
+    )
+    row = await store.get("talon", "job-1")
+    assert row.pending_signal_session_id is None
 
 
 @pytest.mark.asyncio

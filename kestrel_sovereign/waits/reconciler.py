@@ -18,6 +18,10 @@ proven TWO-PHASE delivery semantics generically:
       checked at the top of the NEXT tick. Delivered/hard-fail lock the
       transition (``last_signaled_outcome`` set); soft-fail leaves it unset so
       the next tick re-detects + retries with a fresh attempt counter.
+      Persisted deliveries are additionally classified along a SECOND axis —
+      was the wake actually surfaced to the user (#2922) — because a turn
+      written into a session nobody is watching is not a delivery, and saying
+      it is was what hid #2877 for months.
 
   Phase 1 (detect + enqueue) — for each provider's active handle, poll it;
       if terminal and not already signaled (and not in flight), enqueue a
@@ -41,6 +45,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from kestrel_sdk.signals import Signal, SignalMode, Visibility
 from kestrel_sdk.tools import MonitorableWaitable, ToolResult
 
+from kestrel_sovereign.signals.dispatcher import (
+    SURFACE_BUFFERED as _EMIT_BUFFERED,
+    SURFACE_EMITTED as _EMIT_EMITTED,
+    SURFACE_NOT_EMITTED as _EMIT_NOT_EMITTED,
+    SURFACE_UNKNOWN as _EMIT_UNKNOWN,
+)
 from kestrel_sovereign.storage.async_wait_signal_store import WaitSignalStore
 
 logger = logging.getLogger(__name__)
@@ -52,8 +62,51 @@ logger = logging.getLogger(__name__)
 MAX_DELIVERY_ATTEMPTS = 10
 
 # Dispatcher result statuses, classified exactly as talon_monitor did.
-_DELIVERED_STATES = {"ok", "coalesced"}
+# PERSISTED means the dispatcher accepted the wake and wrote the turn down.
+# It does NOT mean anyone saw it — see the surface states below (#2922).
+_PERSISTED_STATES = {"ok", "coalesced"}
 _HARD_FAIL_STATES = {"dropped_validation", "dropped_cycle"}
+
+# Surface states — the second, independent axis of "delivered" (#2922).
+#
+# #2877 was invisible for months because one status carried both facts: a
+# wake whose turn was written into a freshly-minted session recorded ``ok``
+# while the person watching their chat window saw nothing. Persistence is
+# what the dispatcher can promise; visibility is what the user experiences.
+# They are recorded separately now, and a wake is only ``ok`` when both hold.
+SURFACE_SURFACED = "surfaced"      # a live consumer accepted the emit
+SURFACE_UNBOUND = "unbound"        # no origin session: nowhere to surface
+SURFACE_BUFFERED = "buffered"      # bound, but no consumer was connected yet
+SURFACE_UNSURFACED = "unsurfaced"  # bound + user-visible, but no emit landed
+SURFACE_UNKNOWN = "unknown"        # not observable — claim nothing either way
+# The wake never reached a persisted delivery (failed, dropped, lost), so
+# there is no visibility question to answer. Written anyway so the surface
+# column always describes the SAME harvest as the delivery column beside it,
+# rather than an earlier delivery's answer to a different question.
+SURFACE_NOT_DELIVERED = "not_delivered"
+
+# Suffix appended to the dispatcher status to form the composite
+# ``last_delivery_status``. Only a confirmed surfaced delivery keeps the bare
+# ``ok``/``coalesced``, so an operator (or a monitor) reading the ledger for
+# "ok" is reading "the user could see it", not "we wrote it down somewhere".
+_SURFACE_SUFFIX = {
+    SURFACE_SURFACED: "",
+    SURFACE_UNBOUND: "_unbound",
+    SURFACE_BUFFERED: "_buffered",
+    SURFACE_UNSURFACED: "_unsurfaced",
+    SURFACE_UNKNOWN: "_visibility_unknown",
+}
+
+# How the dispatcher's own emit vocabulary maps onto ours. It answers "did
+# the event reach a consumer"; we answer "could the user see the wake", which
+# additionally accounts for the binding. Anything absent from this map — a
+# newer dispatcher status we do not recognise — is UNKNOWN, never surfaced.
+_EMIT_STATUS_TO_SURFACE = {
+    _EMIT_EMITTED: SURFACE_SURFACED,
+    _EMIT_BUFFERED: SURFACE_BUFFERED,
+    _EMIT_NOT_EMITTED: SURFACE_UNSURFACED,
+    _EMIT_UNKNOWN: SURFACE_UNKNOWN,
+}
 
 
 class WaitReconciler:
@@ -124,8 +177,17 @@ class WaitReconciler:
     async def _reconcile_once(self) -> ToolResult:
         store = self._store
         transitions: List[Dict[str, Any]] = []
-        # delivered = dispatcher returned OK or COALESCED on a PRIOR enqueue.
-        signals_delivered = 0
+        # persisted = dispatcher returned OK or COALESCED on a PRIOR enqueue.
+        # That is the turn being written down, NOT the user seeing it, so the
+        # surface counters below break the same population down by visibility.
+        signals_persisted = 0
+        surface_counts: Dict[str, int] = {
+            SURFACE_SURFACED: 0,
+            SURFACE_UNBOUND: 0,
+            SURFACE_BUFFERED: 0,
+            SURFACE_UNSURFACED: 0,
+            SURFACE_UNKNOWN: 0,
+        }
         # hard_fail = permanent rejection (dropped_validation/cycle, cap).
         signals_hard_failed = 0
         # soft_fail = retriable (rate_limit/quiet_hours/failed/raised/lost).
@@ -157,6 +219,7 @@ class WaitReconciler:
                 await store.record_delivery(
                     kind, handle,
                     delivery_status="lost_at_restart",
+                    surface_status=SURFACE_NOT_DELIVERED,
                     attempt_at=now,
                 )
                 signals_soft_failed += 1
@@ -183,19 +246,43 @@ class WaitReconciler:
 
             self._pending_signal_tasks.pop((kind, handle), None)
 
-            if status_value in _DELIVERED_STATES:
-                # Lock the transition so we don't re-emit it.
+            if status_value in _PERSISTED_STATES:
+                # The wake was accepted and written down. Whether anyone SAW
+                # it is a separate question with its own answer (#2922) —
+                # resolve it before recording, and fold it into the delivery
+                # status so a bare "ok" cannot be read as "persisted only".
+                surface_status, surface_reason = self._resolve_surface_status(
+                    dispatcher, state, kind, handle,
+                )
+                delivery_status = status_value + _SURFACE_SUFFIX[surface_status]
+                # Lock the transition so we don't re-emit it. This holds for
+                # every surface state: an unsurfaced wake already ran its turn,
+                # so re-emitting would duplicate the work, not fix the
+                # visibility. The ledger records the gap for repair instead.
                 await store.record_delivery(
                     kind, handle,
-                    delivery_status=status_value,
+                    delivery_status=delivery_status,
                     delivery_error=delivery_error,
                     signaled_outcome=target,
+                    surface_status=surface_status,
                     attempt_at=now,
                 )
-                signals_delivered += 1
+                signals_persisted += 1
+                surface_counts[surface_status] += 1
+                if surface_status == SURFACE_UNSURFACED:
+                    logger.warning(
+                        "wait_reconcile: %s:%s woke session %s but its "
+                        "signal_completed event reached no consumer (%s) — "
+                        "the turn is persisted, not surfaced",
+                        kind, handle,
+                        (state.pending_signal_session_id if state else None),
+                        surface_reason,
+                    )
                 transitions.append({
                     "kind": kind, "handle": handle, "outcome": target,
-                    "delivery_status": status_value,
+                    "delivery_status": delivery_status,
+                    "surface_status": surface_status,
+                    "surface_reason": surface_reason,
                 })
             elif status_value in _HARD_FAIL_STATES:
                 # Permanent rejection — lock signaled to stop re-emit loops.
@@ -204,6 +291,7 @@ class WaitReconciler:
                     delivery_status=status_value,
                     delivery_error=delivery_error,
                     signaled_outcome=target,
+                    surface_status=SURFACE_NOT_DELIVERED,
                     attempt_at=now,
                 )
                 signals_hard_failed += 1
@@ -221,6 +309,7 @@ class WaitReconciler:
                     kind, handle,
                     delivery_status=status_value,
                     delivery_error=delivery_error,
+                    surface_status=SURFACE_NOT_DELIVERED,
                     attempt_at=now,
                 )
                 signals_soft_failed += 1
@@ -295,10 +384,22 @@ class WaitReconciler:
         signals_soft_failed += counters["signals_soft_failed"]
         signals_skipped_no_dispatcher += counters["signals_skipped_no_dispatcher"]
 
+        # The headline number is what the user could SEE, not what was
+        # written down: a reconcile that persisted five wakes and surfaced
+        # none of them must not read like five successes (#2922).
         parts = [
-            f"delivered={signals_delivered}",
+            f"surfaced={surface_counts[SURFACE_SURFACED]}",
+            f"persisted={signals_persisted}",
             f"enqueued={signals_enqueued}",
         ]
+        for state_name, label in (
+            (SURFACE_UNBOUND, "unbound"),
+            (SURFACE_BUFFERED, "buffered"),
+            (SURFACE_UNSURFACED, "unsurfaced"),
+            (SURFACE_UNKNOWN, "visibility_unknown"),
+        ):
+            if surface_counts[state_name]:
+                parts.append(f"{label}={surface_counts[state_name]}")
         if signals_hard_failed:
             parts.append(f"hard_failed={signals_hard_failed}")
         if signals_soft_failed:
@@ -314,10 +415,24 @@ class WaitReconciler:
             ),
             data={
                 "scanned": scanned,
-                # signals_emitted = deliveries CONFIRMED this tick (from a
-                # prior tick's enqueues). signals_enqueued = this tick's NEW
-                # emits awaiting confirmation.
-                "signals_emitted": signals_delivered,
+                # signals_persisted = deliveries CONFIRMED written this tick
+                # (from a prior tick's enqueues). signals_surfaced is the
+                # subset the user could actually see; the four counters
+                # below account for the rest, separately, because "nobody was
+                # connected" and "we cannot tell" are each a different claim
+                # from "it did not surface".
+                # signals_enqueued = this tick's NEW emits awaiting
+                # confirmation.
+                "signals_persisted": signals_persisted,
+                "signals_surfaced": surface_counts[SURFACE_SURFACED],
+                "signals_unbound": surface_counts[SURFACE_UNBOUND],
+                "signals_buffered": surface_counts[SURFACE_BUFFERED],
+                "signals_unsurfaced": surface_counts[SURFACE_UNSURFACED],
+                "signals_visibility_unknown": surface_counts[SURFACE_UNKNOWN],
+                # Retained name, corrected meaning: this always counted
+                # persisted harvests, never confirmed emits. Read
+                # signals_surfaced for the visibility number.
+                "signals_emitted": signals_persisted,
                 "signals_enqueued": signals_enqueued,
                 "signals_hard_failed": signals_hard_failed,
                 "signals_soft_failed": signals_soft_failed,
@@ -326,6 +441,79 @@ class WaitReconciler:
                 "transitions": transitions,
             },
         )
+
+    # ------------------------------------------------------------------
+
+    def _resolve_surface_status(
+        self,
+        dispatcher: Any,
+        state: Optional[Any],
+        kind: str,
+        handle: str,
+    ) -> Tuple[str, str]:
+        """Classify whether a persisted wake actually reached the user (#2922).
+
+        Returns ``(surface_status, reason)``. The five answers are deliberately
+        distinct claims:
+
+          * ``unbound``    — the wake carried no origin session, so it was
+            built INTERNAL and there is no chat window it could have appeared
+            in. Correct behavior for unattended (cron/CLI) work, and still not
+            a user-visible delivery.
+          * ``surfaced``   — the dispatcher confirms a live consumer ACCEPTED
+            the ``signal_completed`` event for this exact signal id.
+          * ``buffered``   — bound and emitted, but no consumer was connected;
+            the event sits in the replay buffer for the next one. Deferred,
+            not lost, and not yet seen.
+          * ``unsurfaced`` — the dispatcher affirmatively reports the event
+            reached nobody (the agent exposes no side channel, the emit
+            raised, or every connected consumer rejected it). The turn ran and
+            was persisted; the person watching saw nothing.
+          * ``unknown``    — we cannot observe it: the dispatcher exposes no
+            surface record at all, has none for this signal (restarted between
+            enqueue and harvest, aged out of its bounded window), or the
+            agent's ``emit_event`` returned no delivery receipt.
+
+        The last one is the point of the split. Asserting ``unsurfaced`` from
+        the ledger alone — "the row says we bound it, so the emit must have
+        failed" — would be the same species of unearned claim as the ``ok`` it
+        replaces, just pointing the other way (#2877 attempt-2 review P2). An
+        unobservable emit is reported as unobservable.
+        """
+        session_id = getattr(state, "pending_signal_session_id", None) if state else None
+        if not (session_id or "").strip():
+            return SURFACE_UNBOUND, "no origin session bound at dispatch"
+
+        lookup = getattr(dispatcher, "surface_record", None)
+        if not callable(lookup):
+            return (
+                SURFACE_UNKNOWN,
+                "dispatcher exposes no surface record",
+            )
+        signal_id = state.pending_signal_id if state else None
+        if not signal_id:
+            return SURFACE_UNKNOWN, "no pending signal id recorded"
+        try:
+            record = lookup(signal_id)
+        except Exception as exc:  # a broken probe must not fake either answer
+            logger.debug(
+                "surface_record(%r) raised for %s:%s: %s",
+                signal_id, kind, handle, exc,
+            )
+            return SURFACE_UNKNOWN, f"{type(exc).__name__}: {exc}"
+        if record is None:
+            return SURFACE_UNKNOWN, "no surface record for this signal"
+        reason = getattr(record, "reason", "") or ""
+        emit_status = getattr(record, "status", None)
+        surface = _EMIT_STATUS_TO_SURFACE.get(emit_status)
+        if surface is None:
+            # An unrecognised (older/newer) record shape. "We do not
+            # understand the answer" is not "the answer was yes".
+            return (
+                SURFACE_UNKNOWN,
+                reason or f"unrecognized surface record status: {emit_status!r}",
+            )
+        return surface, reason or emit_status
 
     # ------------------------------------------------------------------
 
@@ -387,6 +575,7 @@ class WaitReconciler:
                 kind, handle,
                 delivery_status="max_attempts_exceeded",
                 signaled_outcome=signaled_token,
+                surface_status=SURFACE_NOT_DELIVERED,
                 attempt_at=datetime.now(timezone.utc),
             )
             counters["signals_hard_failed"] += 1
@@ -417,6 +606,10 @@ class WaitReconciler:
             target=signaled_token,
             attempts=attempts,
             attempt_at=now,
+            # Durable, because the harvest is a LATER tick: the surface
+            # classification needs to know whether this wake ever had a window
+            # to appear in, and a restart in between erases in-memory state.
+            session_id=origin_session_id,
         )
 
         try:
@@ -431,6 +624,7 @@ class WaitReconciler:
                 kind, handle,
                 delivery_status="dispatcher_raised",
                 delivery_error=f"{type(e).__name__}: {e}",
+                surface_status=SURFACE_NOT_DELIVERED,
                 attempt_at=now,
             )
             counters["signals_soft_failed"] += 1

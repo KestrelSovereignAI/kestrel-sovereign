@@ -6,7 +6,46 @@ listener management, and background task notification queuing.
 """
 
 import logging
+from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
+
+
+@dataclass(frozen=True)
+class EventDeliveryReceipt:
+    """What actually happened to one ``emit_event`` call (#2922).
+
+    ``emit_event`` deliberately never raises — one broken SSE consumer must
+    not abort an agent turn — so for years its *return* said nothing and every
+    caller had to treat "did not raise" as "the user saw it". They are not the
+    same thing, and conflating them is how a stranded wake reported ``ok``
+    while the chat window stayed blank for months (#2877).
+
+    The receipt reports the three genuinely different outcomes:
+
+      * ``buffered``  — no consumer was connected, so the event went into the
+        replay buffer for the next one (``get_pending_events``). Nobody has
+        seen it yet; somebody still might.
+      * accepted      — at least one live consumer took the event without
+        raising. That is the strongest in-process evidence of visibility
+        available: the event is on its SSE queue.
+      * rejected      — every connected consumer raised. The failures were
+        logged and swallowed, exactly as before; now they are also *reported*.
+
+    ``accepted``/``failed`` count listeners, not bytes on a socket — a client
+    that disconnects after its queue accepts the event is beyond what any
+    in-process receipt can know.
+    """
+
+    event_type: str
+    listeners: int
+    accepted: int
+    failed: int
+    buffered: bool
+
+    @property
+    def delivered(self) -> bool:
+        """True when at least one live consumer accepted the event."""
+        return self.accepted > 0
 
 
 def describe_background_task(task) -> Tuple[str, str]:
@@ -115,7 +154,9 @@ class EventManagerMixin:
     # buffered events drop first once the cap is exceeded.
     _MAX_PENDING_EVENTS = 100
 
-    async def emit_event(self, event_type: str, data: Dict[str, Any]) -> None:
+    async def emit_event(
+        self, event_type: str, data: Dict[str, Any]
+    ) -> EventDeliveryReceipt:
         """
         Emit an event to all registered listeners (for SSE notifications).
 
@@ -128,20 +169,52 @@ class EventManagerMixin:
         stream. That is the one transition that straddles the restart, so
         losing it defeated the issue's primary acceptance criterion (#1551).
 
+        Listener failures are logged and swallowed — one wedged SSE consumer
+        must not abort the emitting turn — but the outcome is REPORTED in the
+        returned :class:`EventDeliveryReceipt` (#2922). Callers that need to
+        know whether anything actually reached a consumer (the signal
+        dispatcher's visibility record) read the receipt; callers that just
+        want the notification out ignore it, as they always have.
+
         Args:
             event_type: Type of event (e.g., 'approval_request')
             data: Event data to send
+
+        Returns:
+            The aggregate delivery outcome: buffered (no consumer), accepted
+            by N listeners, and/or rejected by M.
         """
-        if not self._event_listeners:
+        # Snapshot: a listener may unregister itself while being called.
+        listeners = list(self._event_listeners)
+        if not listeners:
             self._buffer_pending_event(event_type, data)
-            return
-        for listener in self._event_listeners:
+            return EventDeliveryReceipt(
+                event_type=event_type,
+                listeners=0,
+                accepted=0,
+                failed=0,
+                buffered=True,
+            )
+        accepted = 0
+        failed = 0
+        for listener in listeners:
             try:
                 await listener(event_type, data)
             except (TypeError, AttributeError, ConnectionError) as e:
+                failed += 1
                 logging.warning(f"Failed to emit event to listener: {e}")
             except Exception as e:
+                failed += 1
                 logging.warning(f"Failed to emit event to listener: {e}", exc_info=True)
+            else:
+                accepted += 1
+        return EventDeliveryReceipt(
+            event_type=event_type,
+            listeners=len(listeners),
+            accepted=accepted,
+            failed=failed,
+            buffered=False,
+        )
 
     def _buffer_pending_event(self, event_type: str, data: Dict[str, Any]) -> None:
         """Buffer an event emitted while no listener was connected.

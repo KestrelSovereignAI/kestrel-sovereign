@@ -84,12 +84,12 @@ import logging
 import os
 import secrets
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Coroutine, List, Optional, Protocol
+from typing import Any, Callable, Coroutine, List, Optional, Protocol, Tuple
 from zoneinfo import ZoneInfo
 
 from kestrel_sdk.signals import (
@@ -207,6 +207,58 @@ class SignalLogWriteFailure:
     signal_id: str
     error: str
     failed_at: datetime
+
+
+# Vocabulary for :class:`SignalSurfaceRecord.status` (#2922).  Four distinct
+# claims, because collapsing them to a bool is what produced the bug: a
+# missing answer read as "yes" is exactly the conflation being removed.
+SURFACE_EMITTED = "emitted"          # a live consumer accepted the event
+SURFACE_BUFFERED = "buffered"        # no consumer connected; queued for replay
+SURFACE_NOT_EMITTED = "not_emitted"  # definite: no channel, or all rejected
+SURFACE_UNKNOWN = "unknown"          # unobservable — claim nothing either way
+
+
+@dataclass(frozen=True)
+class SignalSurfaceRecord:
+    """Whether one dispatched signal's user-visible side channel actually
+    fired (#2922).
+
+    Persistence and visibility are different facts.  A COGNITION wake whose
+    turn was written to storage has been *persisted*; it has been *surfaced*
+    only if the ``signal_completed`` SSE event reached the agent's consumers,
+    which is what puts the turn in front of the person watching.  #2877 was
+    months of the two being conflated: the wake's own ledger read ``ok``
+    while the observer saw nothing.
+
+    ``status`` is the observed fact, from the vocabulary above; ``reason``
+    carries the detail (``internal_visibility`` — deliberately log-only;
+    ``no_emit_event`` — the agent exposes no side channel; ``emit_failed: …``
+    — the emit itself raised; ``rejected by all N listener(s)`` — every
+    connected consumer raised *inside* ``emit_event``, which swallows those
+    and returns as if nothing were wrong).  Recorded for INTERNAL signals too,
+    so "not surfaced by design" is distinguishable from "should have surfaced
+    and did not".
+
+    There is deliberately no ``emitted`` boolean.  Two of the four states are
+    neither yes nor no — an agent whose ``emit_event`` returns no delivery
+    receipt cannot confirm anything, and a buffered event is deferred rather
+    than delivered — and a bool would force both to masquerade as one of the
+    definite answers.  That masquerade is the bug.
+    """
+
+    signal_id: str
+    status: str
+    reason: str
+    at: datetime
+
+
+# How many recent dispatches keep an observable surface record.  Deliberately
+# in-memory and bounded: this answers "did the emit for the signal I just
+# enqueued fire?" for a caller harvesting its own dispatch (the wait
+# reconciler's next tick), not "what happened last week" — signal_log owns
+# the durable history.  A caller that finds no record must report visibility
+# as UNKNOWN rather than assume either answer.
+MAX_SURFACE_RECORDS = 512
 
 
 @dataclass(frozen=True)
@@ -444,6 +496,13 @@ class SignalDispatcher:
         # for why this is in-memory rather than persisted.
         self._log_write_failures = 0
         self._last_log_write_failure: Optional[SignalLogWriteFailure] = None
+        # Per-signal UI-emit observation (#2922), bounded FIFO. Written by
+        # ``_write_outcome_log`` — which ``dispatch_signal`` drains before it
+        # returns — so a caller that awaits its own dispatch can ask whether
+        # the turn was actually surfaced, not merely persisted.
+        self._surface_records: "OrderedDict[str, SignalSurfaceRecord]" = (
+            OrderedDict()
+        )
         # Keep outcome/audit persistence and pending-delivery persistence
         # distinct.  Existing embeddings/tests construct only SignalLogStore;
         # deriving the durable store from its backend preserves that seam while
@@ -2876,6 +2935,14 @@ class SignalDispatcher:
             error=f"{type(error).__name__}: {error}",
             failed_at=self._clock(),
         )
+        # The emit fires only after the log write commits, so a dropped row is
+        # also a definite non-emit.  Record it as one (#2922) rather than
+        # leaving the visibility question unanswerable for this signal.
+        self._record_surface(
+            signal_id,
+            SURFACE_NOT_EMITTED,
+            f"log_write_failed: {type(error).__name__}: {error}",
+        )
 
     @property
     def log_write_failure_count(self) -> int:
@@ -2891,6 +2958,37 @@ class SignalDispatcher:
     def last_log_write_failure(self) -> Optional["SignalLogWriteFailure"]:
         """The most recent dropped-row cause, or None if none have dropped."""
         return self._last_log_write_failure
+
+    def _record_surface(
+        self, signal_id: str, status: str, reason: str
+    ) -> None:
+        """Remember whether one signal's UI side channel fired (#2922)."""
+        self._surface_records[signal_id] = SignalSurfaceRecord(
+            signal_id=signal_id,
+            status=status,
+            reason=reason,
+            at=self._clock(),
+        )
+        self._surface_records.move_to_end(signal_id)
+        while len(self._surface_records) > MAX_SURFACE_RECORDS:
+            self._surface_records.popitem(last=False)
+
+    def surface_record(self, signal_id: str) -> Optional["SignalSurfaceRecord"]:
+        """Whether ``signal_id``'s ``signal_completed`` event reached a
+        consumer, if that is knowable.
+
+        Note what the record does NOT mean: ``SURFACE_EMITTED`` requires a
+        consumer to have ACCEPTED the event, per the receipt ``emit_event``
+        returned.  An emit that ran and reached nobody is
+        ``SURFACE_NOT_EMITTED``; an agent that returns no receipt is
+        ``SURFACE_UNKNOWN``.
+
+        ``None`` likewise means UNKNOWN — never dispatched here, still in
+        flight, or aged out of the bounded window — and callers must report it
+        as such. Treating an absent record as "surfaced" recreates exactly the
+        conflation this exists to end (#2922).
+        """
+        return self._surface_records.get(signal_id)
 
     async def _write_outcome_log(
         self,
@@ -2919,18 +3017,95 @@ class SignalDispatcher:
         # default to INTERNAL — none of them surprise-emit to the UI.
         # Sources opt in by constructing signals with an explicit
         # visibility argument.
+        #
+        # Every branch below records what actually happened (#2922). The
+        # dispatch contract drains this writer before returning its result, so
+        # a caller that awaits its own dispatch can read the emit outcome back
+        # via ``surface_record`` instead of inferring visibility from the fact
+        # that something was written down.
         if signal.visibility == Visibility.INTERNAL:
+            self._record_surface(
+                signal.id, SURFACE_NOT_EMITTED, "internal_visibility"
+            )
             return
         emit = getattr(self._agent, "emit_event", None)
         if emit is None:
+            self._record_surface(signal.id, SURFACE_NOT_EMITTED, "no_emit_event")
             return
         payload = _build_ui_event_payload(signal, result, result_summary)
         try:
-            await emit("signal_completed", payload)
-        except Exception:
+            receipt = await emit("signal_completed", payload)
+        except Exception as exc:
+            self._record_surface(
+                signal.id,
+                SURFACE_NOT_EMITTED,
+                f"emit_failed: {type(exc).__name__}: {exc}",
+            )
             logger.exception(
                 "Failed to emit signal_completed UI event for %s", signal.id
             )
+        else:
+            # A returning ``emit_event`` is NOT evidence of delivery: the
+            # production implementation catches every listener failure and
+            # returns normally, so "it did not raise" was true even when all
+            # SSE consumers rejected the event.  The receipt is the only
+            # thing that can distinguish those (#2922).
+            status, reason = _classify_emit_receipt(receipt)
+            self._record_surface(signal.id, status, reason)
+            if status == SURFACE_NOT_EMITTED:
+                logger.warning(
+                    "signal_completed for %s reached no consumer: %s",
+                    signal.id, reason,
+                )
+
+
+def _classify_emit_receipt(receipt: Any) -> Tuple[str, str]:
+    """Reduce an ``emit_event`` return value to a surface status (#2922).
+
+    ``EventManagerMixin.emit_event`` returns an
+    :class:`~kestrel_sovereign.agent.event_manager.EventDeliveryReceipt`
+    describing what actually happened to the event.  This reads it
+    structurally rather than by type, because the agent is a duck-typed seam:
+    hosts, embedded runtimes, feature proxies and test doubles all supply
+    their own ``emit_event``, and many predate the receipt entirely.
+
+    A value that is not receipt-shaped is UNKNOWN, never "emitted".  That is
+    the whole point: the old contract returned ``None`` on total failure just
+    as it did on success, so reading "no exception" as delivery is what let a
+    wake nobody could see report itself delivered.
+    """
+    if receipt is None:
+        return SURFACE_UNKNOWN, "emit_event returned no delivery receipt"
+    accepted = getattr(receipt, "accepted", None)
+    buffered = getattr(receipt, "buffered", None)
+    if accepted is None or buffered is None:
+        return (
+            SURFACE_UNKNOWN,
+            f"unrecognized emit_event receipt: {type(receipt).__name__}",
+        )
+    try:
+        accepted = int(accepted)
+        failed = int(getattr(receipt, "failed", 0) or 0)
+        listeners = int(getattr(receipt, "listeners", accepted + failed) or 0)
+    except (TypeError, ValueError):
+        return (
+            SURFACE_UNKNOWN,
+            f"unreadable emit_event receipt: {type(receipt).__name__}",
+        )
+    if accepted > 0:
+        reason = f"accepted by {accepted}/{listeners} listener(s)"
+        if failed:
+            # Partial delivery still surfaces — one live consumer is enough
+            # for the person watching — but the loss is named, not hidden.
+            reason += f"; {failed} rejected"
+        return SURFACE_EMITTED, reason
+    if buffered:
+        # Deferred, not lost: the replay buffer hands it to the next consumer
+        # that connects (``get_pending_events``). Nobody has seen it yet.
+        return SURFACE_BUFFERED, "buffered for replay: no consumer connected"
+    if failed:
+        return SURFACE_NOT_EMITTED, f"rejected by all {failed} listener(s)"
+    return SURFACE_NOT_EMITTED, "no consumer accepted the event"
 
 
 def _build_ui_event_payload(

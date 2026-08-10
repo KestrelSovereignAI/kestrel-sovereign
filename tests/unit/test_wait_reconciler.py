@@ -19,11 +19,14 @@ builder used to own:
   - no dispatcher → skipped, NOT marked signaled (#1510)
   - in-flight handle is not re-enqueued (#1528)
   - provider signal name routes the source; payload spreads WaitStatus.data
+  - persisted != surfaced: a delivery is only ``ok`` when the user could
+    actually see it (#2922)
 """
 
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -31,9 +34,20 @@ import pytest
 from kestrel_sdk.signals import Status
 from kestrel_sdk.tools import Outcome, WaitStatus
 
+from kestrel_sovereign.signals import (
+    SURFACE_BUFFERED as EMIT_BUFFERED,
+    SURFACE_EMITTED,
+    SURFACE_NOT_EMITTED,
+    SignalSurfaceRecord,
+)
 from kestrel_sovereign.waits.engine import WaitRegistry
 from kestrel_sovereign.waits.reconciler import (
     MAX_DELIVERY_ATTEMPTS,
+    SURFACE_BUFFERED,
+    SURFACE_SURFACED,
+    SURFACE_UNBOUND,
+    SURFACE_UNKNOWN,
+    SURFACE_UNSURFACED,
     WaitReconciler,
     run_wait_reconcile,
 )
@@ -52,6 +66,10 @@ class _CapturingDispatcher:
     The reconciler calls ``enqueue_signal`` (fire-and-forget) and harvests
     delivery outcomes via ``handle.task.result()`` on the NEXT tick. Default
     outcome is ``Status.OK``; ``pending=True`` keeps the task in flight.
+
+    Deliberately has NO ``surface_record``: it models an older/foreign
+    dispatcher that cannot say whether the UI emit fired, which the reconciler
+    must report as visibility-UNKNOWN rather than assume either way (#2922).
     """
 
     def __init__(self, status_override=None, error_override=None, pending=False):
@@ -87,6 +105,40 @@ class _CapturingDispatcher:
         if not self._pending:
             await task
         return SignalHandle(signal_id=signal.id, task=task)
+
+
+class _SurfacingDispatcher(_CapturingDispatcher):
+    """A dispatcher stand-in that also answers the VISIBILITY question.
+
+    The real :class:`SignalDispatcher` records, per signal, whether the
+    ``signal_completed`` emit fired and exposes it through ``surface_record``.
+    This double models that seam so the reconciler's classification can be
+    driven through every state cheaply; the end-to-end proof over the REAL
+    dispatcher lives in ``test_talon_wake_session_binding.py`` (a stub with no
+    emit at all is what let the original visibility gap pass its own test).
+
+    ``emit_status`` is the dispatcher's own vocabulary (whether the event
+    reached a consumer); ``known=False`` models a dispatcher that has no
+    record for the signal (restarted, or aged out of its bounded window).
+    """
+
+    def __init__(
+        self, *, emit_status=SURFACE_EMITTED, known=True, reason="", **kwargs
+    ):
+        super().__init__(**kwargs)
+        self._emit_status = emit_status
+        self._known = known
+        self._reason = reason or emit_status
+
+    def surface_record(self, signal_id):
+        if not self._known:
+            return None
+        return SignalSurfaceRecord(
+            signal_id=signal_id,
+            status=self._emit_status,
+            reason=self._reason,
+            at=datetime.now(timezone.utc),
+        )
 
 
 class _FakeProvider:
@@ -191,7 +243,10 @@ async def test_no_signal_for_pending_handles(make_agent):
 
 
 @pytest.mark.asyncio
-async def test_records_ok_as_delivered_and_locks_outcome(make_agent):
+async def test_records_persisted_delivery_and_locks_outcome(make_agent):
+    """A persisted delivery locks the transition. The status records BOTH
+    facts: the provider here has no origin session, so the wake had nowhere to
+    surface and is recorded ``ok_unbound``, not ``ok`` (#2922)."""
     provider = _FakeProvider()
     provider.set("h1", Outcome.DONE)
     dispatcher = _CapturingDispatcher()
@@ -206,13 +261,16 @@ async def test_records_ok_as_delivered_and_locks_outcome(make_agent):
     assert row.pending_signaled_target == "done"
 
     t2 = await rec.reconcile()
-    assert t2.data["signals_emitted"] == 1
+    assert t2.data["signals_persisted"] == 1
+    assert t2.data["signals_emitted"] == 1  # retained alias
+    assert t2.data["signals_surfaced"] == 0
     row = await rec._store.get("fake", "h1")
     assert row.last_signaled_outcome == "done"
-    assert row.last_delivery_status == "ok"
+    assert row.last_delivery_status == "ok_unbound"
+    assert row.last_surface_status == SURFACE_UNBOUND
     assert row.last_delivery_attempts == 1
     assert row.pending_signal_id is None
-    assert t2.data["transitions"][0]["delivery_status"] == "ok"
+    assert t2.data["transitions"][0]["delivery_status"] == "ok_unbound"
 
 
 @pytest.mark.asyncio
@@ -225,10 +283,10 @@ async def test_coalesced_counts_as_delivered(make_agent):
 
     await rec.reconcile()
     t = await rec.reconcile()
-    assert t.data["signals_emitted"] == 1
+    assert t.data["signals_persisted"] == 1
     row = await rec._store.get("fake", "h1")
     assert row.last_signaled_outcome == "done"
-    assert row.last_delivery_status == "coalesced"
+    assert row.last_delivery_status == "coalesced_unbound"
 
 
 @pytest.mark.asyncio
@@ -299,10 +357,10 @@ async def test_soft_fail_does_not_lock_and_retries_with_fresh_attempt(make_agent
     agent.dispatcher = _CapturingDispatcher()
     await rec.reconcile()
     harvest = await rec.reconcile()
-    assert harvest.data["signals_emitted"] == 1
+    assert harvest.data["signals_persisted"] == 1
     row = await rec._store.get("fake", "h1")
     assert row.last_signaled_outcome == "done"
-    assert row.last_delivery_status == "ok"
+    assert row.last_delivery_status == "ok_unbound"
 
 
 @pytest.mark.asyncio
@@ -821,3 +879,255 @@ async def test_watched_handle_also_binds_its_origin(make_agent):
 
     await rec.reconcile()
     assert dispatcher.signals[0].session_id == "chat-sess-9"
+
+
+# ---------------------------------------------------------------------------
+# #2922: delivery accounting splits "persisted" from "surfaced"
+#
+# #2921 bound the wake to its originating session and made a bound wake
+# USER_VISIBLE, but the ledger still recorded `ok` on dispatcher status alone
+# — the same self-report that made #2877 undiagnosable for months. A wake is
+# only `ok` when the user could actually see it; every other outcome names
+# WHICH half failed, and an unobservable emit is reported as unobservable
+# rather than asserted either way.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bound_and_surfaced_delivery_is_the_only_ok(make_agent):
+    """Both halves true — bound to a session AND the emit confirmed fired."""
+    provider = _OriginProvider(origins={"h1": "chat-sess-1"})
+    provider.set("h1", Outcome.DONE)
+    dispatcher = _SurfacingDispatcher()
+    rec = WaitReconciler(await make_agent(provider, dispatcher))
+
+    await rec.reconcile()
+    t = await rec.reconcile()
+
+    row = await rec._store.get("origin", "h1")
+    assert row.last_delivery_status == "ok"
+    assert row.last_surface_status == SURFACE_SURFACED
+    assert t.data["signals_surfaced"] == 1
+    assert t.data["signals_persisted"] == 1
+    assert t.data["transitions"][0]["surface_status"] == SURFACE_SURFACED
+
+
+@pytest.mark.asyncio
+async def test_unbound_wake_is_never_recorded_ok(make_agent):
+    """No resolvable origin session means no window the turn could appear in.
+    Correct for unattended work — and still not a user-visible delivery."""
+    provider = _OriginProvider(origins={})
+    provider.set("h1", Outcome.DONE)
+    dispatcher = _SurfacingDispatcher()
+    rec = WaitReconciler(await make_agent(provider, dispatcher))
+
+    await rec.reconcile()
+    t = await rec.reconcile()
+
+    row = await rec._store.get("origin", "h1")
+    assert row.last_delivery_status == "ok_unbound", (
+        "an origin-less wake reported as plain `ok` is the #2877 self-report"
+    )
+    assert row.last_surface_status == SURFACE_UNBOUND
+    assert t.data["signals_surfaced"] == 0
+    assert t.data["signals_unbound"] == 1
+
+
+@pytest.mark.asyncio
+async def test_bound_wake_whose_emit_never_fired_records_unsurfaced(make_agent):
+    """The turn ran and was persisted into the right session, but the SSE
+    emit did not happen — so the chat window stayed blank. Recorded as the
+    visibility failure it is, and NOT retried: the turn already ran."""
+    provider = _OriginProvider(origins={"h1": "chat-sess-1"})
+    provider.set("h1", Outcome.DONE)
+    dispatcher = _SurfacingDispatcher(
+        emit_status=SURFACE_NOT_EMITTED, reason="no_emit_event",
+    )
+    rec = WaitReconciler(await make_agent(provider, dispatcher))
+
+    await rec.reconcile()
+    t = await rec.reconcile()
+
+    row = await rec._store.get("origin", "h1")
+    assert row.last_delivery_status == "ok_unsurfaced"
+    assert row.last_surface_status == SURFACE_UNSURFACED
+    assert row.last_signaled_outcome == "done", "still locked — do not re-run"
+    assert t.data["signals_unsurfaced"] == 1
+    assert t.data["signals_surfaced"] == 0
+    assert t.data["transitions"][0]["surface_reason"] == "no_emit_event"
+
+    # And it does not loop: the next tick re-polls the same terminal handle
+    # and enqueues nothing.
+    t3 = await rec.reconcile()
+    assert t3.data["signals_enqueued"] == 0
+    assert len(dispatcher.signals) == 1
+
+
+@pytest.mark.asyncio
+async def test_emit_with_no_consumer_connected_records_buffered(make_agent):
+    """The event was emitted but nobody had a stream open, so the agent
+    buffered it for replay. Deferred is its own answer: scoring it ``ok``
+    overstates, scoring it ``unsurfaced`` cries wolf on every headless host."""
+    provider = _OriginProvider(origins={"h1": "chat-sess-1"})
+    provider.set("h1", Outcome.DONE)
+    dispatcher = _SurfacingDispatcher(emit_status=EMIT_BUFFERED)
+    rec = WaitReconciler(await make_agent(provider, dispatcher))
+
+    await rec.reconcile()
+    t = await rec.reconcile()
+
+    row = await rec._store.get("origin", "h1")
+    assert row.last_delivery_status == "ok_buffered"
+    assert row.last_surface_status == SURFACE_BUFFERED
+    assert t.data["signals_buffered"] == 1
+    assert t.data["signals_surfaced"] == 0
+    assert t.data["signals_unsurfaced"] == 0
+    assert "buffered=1" in t.confirmation
+
+
+@pytest.mark.asyncio
+async def test_unreadable_surface_record_is_unknown(make_agent):
+    """A record whose status we do not recognise (an older or newer
+    dispatcher) is unknown. "We cannot read the answer" is not "yes"."""
+    provider = _OriginProvider(origins={"h1": "chat-sess-1"})
+    provider.set("h1", Outcome.DONE)
+    dispatcher = _SurfacingDispatcher(emit_status="something_new")
+    rec = WaitReconciler(await make_agent(provider, dispatcher))
+
+    await rec.reconcile()
+    await rec.reconcile()
+
+    row = await rec._store.get("origin", "h1")
+    assert row.last_surface_status == SURFACE_UNKNOWN
+    assert row.last_delivery_status == "ok_visibility_unknown"
+
+
+@pytest.mark.asyncio
+async def test_unobservable_emit_is_reported_unknown_not_unsurfaced(make_agent):
+    """A dispatcher that cannot answer the visibility question gets
+    ``visibility_unknown``. Asserting ``unsurfaced`` from the ledger's own
+    contents would be the same unearned claim as ``ok``, pointing the other
+    way (#2877 attempt-2 review P2)."""
+    provider = _OriginProvider(origins={"h1": "chat-sess-1"})
+    provider.set("h1", Outcome.DONE)
+    dispatcher = _CapturingDispatcher()  # no surface_record at all
+    rec = WaitReconciler(await make_agent(provider, dispatcher))
+
+    await rec.reconcile()
+    t = await rec.reconcile()
+
+    row = await rec._store.get("origin", "h1")
+    assert row.last_delivery_status == "ok_visibility_unknown"
+    assert row.last_surface_status == SURFACE_UNKNOWN
+    assert t.data["signals_visibility_unknown"] == 1
+    assert t.data["signals_surfaced"] == 0
+    assert t.data["signals_unsurfaced"] == 0
+
+
+@pytest.mark.asyncio
+async def test_missing_surface_record_is_unknown(make_agent):
+    """Restarted between enqueue and harvest, or aged out of the dispatcher's
+    bounded window: no record is not evidence of no emit."""
+    provider = _OriginProvider(origins={"h1": "chat-sess-1"})
+    provider.set("h1", Outcome.DONE)
+    dispatcher = _SurfacingDispatcher(known=False)
+    rec = WaitReconciler(await make_agent(provider, dispatcher))
+
+    await rec.reconcile()
+    await rec.reconcile()
+
+    row = await rec._store.get("origin", "h1")
+    assert row.last_surface_status == SURFACE_UNKNOWN
+    assert row.last_delivery_status == "ok_visibility_unknown"
+
+
+@pytest.mark.asyncio
+async def test_broken_surface_probe_is_unknown_not_a_failure(make_agent):
+    """A dispatcher bug in the visibility probe must not become a delivery
+    verdict in either direction."""
+    provider = _OriginProvider(origins={"h1": "chat-sess-1"})
+    provider.set("h1", Outcome.DONE)
+    dispatcher = _SurfacingDispatcher()
+
+    def _boom(signal_id):
+        raise RuntimeError("record store unreadable")
+
+    dispatcher.surface_record = _boom
+    rec = WaitReconciler(await make_agent(provider, dispatcher))
+
+    await rec.reconcile()
+    await rec.reconcile()
+
+    row = await rec._store.get("origin", "h1")
+    assert row.last_surface_status == SURFACE_UNKNOWN
+    assert row.last_delivery_status == "ok_visibility_unknown"
+
+
+@pytest.mark.asyncio
+async def test_pending_row_carries_the_binding_for_the_next_tick(make_agent):
+    """The harvest is a LATER tick, so the origin binding is durable: without
+    it a restart in between makes "had nowhere to surface" indistinguishable
+    from "should have surfaced and did not"."""
+    provider = _OriginProvider(origins={"h1": "chat-sess-1"})
+    provider.set("h1", Outcome.DONE)
+    dispatcher = _SurfacingDispatcher(pending=True)
+    rec = WaitReconciler(await make_agent(provider, dispatcher))
+
+    await rec.reconcile()
+    row = await rec._store.get("origin", "h1")
+    assert row.pending_signal_session_id == "chat-sess-1"
+
+    dispatcher.release()
+    await asyncio.sleep(0)
+    await rec.reconcile()
+    row = await rec._store.get("origin", "h1")
+    assert row.pending_signal_session_id is None, "cleared with the harvest"
+    assert row.last_surface_status == SURFACE_SURFACED
+
+
+@pytest.mark.asyncio
+async def test_failed_delivery_does_not_leave_a_stale_surface_status(make_agent):
+    """The two columns always describe the same harvest: a delivery that
+    never persisted has no visibility answer, not the previous one's."""
+    provider = _OriginProvider(origins={"h1": "chat-sess-1"})
+    provider.set("h1", Outcome.DONE, data={"status": "done"})
+    dispatcher = _SurfacingDispatcher()
+    agent = await make_agent(provider, dispatcher)
+    rec = WaitReconciler(agent)
+
+    await rec.reconcile()
+    await rec.reconcile()
+    row = await rec._store.get("origin", "h1")
+    assert row.last_surface_status == SURFACE_SURFACED
+
+    # A corrected native status re-signals the same handle, this time into a
+    # dispatcher that hard-fails it.
+    provider.set("h1", Outcome.DONE, data={"status": "done_verified"})
+    agent.dispatcher = _SurfacingDispatcher(
+        status_override=Status.DROPPED_VALIDATION,
+        error_override="schema mismatch",
+    )
+    await rec.reconcile()
+    await rec.reconcile()
+
+    row = await rec._store.get("origin", "h1")
+    assert row.last_delivery_status == "dropped_validation"
+    assert row.last_surface_status == "not_delivered", (
+        "a stale `surfaced` next to a failed delivery is the conflation again"
+    )
+
+
+@pytest.mark.asyncio
+async def test_confirmation_leads_with_what_the_user_could_see(make_agent):
+    """The human-readable line reports surfaced first: a tick that persisted
+    a wake nobody saw must not read like a success."""
+    provider = _OriginProvider(origins={})
+    provider.set("h1", Outcome.DONE)
+    rec = WaitReconciler(await make_agent(provider, _SurfacingDispatcher()))
+
+    await rec.reconcile()
+    t = await rec.reconcile()
+
+    assert "surfaced=0" in t.confirmation
+    assert "persisted=1" in t.confirmation
+    assert "unbound=1" in t.confirmation

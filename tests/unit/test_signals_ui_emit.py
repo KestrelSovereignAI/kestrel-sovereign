@@ -37,7 +37,12 @@ from kestrel_sdk.signals import (
     Urgency,
     Visibility,
 )
+from kestrel_sovereign.agent.event_manager import EventManagerMixin
 from kestrel_sovereign.signals import (
+    SURFACE_BUFFERED,
+    SURFACE_EMITTED,
+    SURFACE_NOT_EMITTED,
+    SURFACE_UNKNOWN,
     OrderedLockManager,
     SignalDispatcher,
     SignalLogStore,
@@ -630,5 +635,357 @@ async def test_agent_without_emit_event_is_safe(tmp_path):
     if pending:
         await asyncio.gather(*pending, return_exceptions=True)
     # No assertion that emit happened — just that we didn't crash.
+
+    await backend.close()
+
+
+# ---------------------------------------------------------------------------
+# #2922: the dispatcher records WHETHER the emit reached a consumer
+#
+# "Persisted" and "surfaced" are different facts, and until the dispatcher
+# wrote the second one down nobody downstream could tell them apart — a wake
+# whose turn was written but never rendered reported success for months
+# (#2877). The subtle half is that ``emit_event`` never raises: the production
+# ``EventManagerMixin`` catches every listener failure and returns normally,
+# so "the call came back" was true even when all SSE consumers rejected the
+# event. Only the returned receipt distinguishes them, and an agent that
+# returns no receipt is UNKNOWN — never "it emitted".
+# ---------------------------------------------------------------------------
+
+
+class _MixinAgent(EventManagerMixin):
+    """An agent using the REAL production emit path.
+
+    Deliberately not a hand-written ``emit_event``: a double that appends to a
+    list and returns is exactly what hid the gap, because it fails in ways the
+    real mixin does not (and succeeds in ways it does not either — the mixin
+    buffers, swallows listener errors, and returns the same ``None`` for total
+    failure as for total success before #2922).
+    """
+
+    did = "did:test:mixin"
+
+    def __init__(self):
+        self._event_listeners = []
+        self._pending_task_notifications = []
+        self.background_tasks: list[asyncio.Task] = []
+
+    async def process_input(self, prompt: str):
+        return "ok"
+
+    def _track_background_task(self, coro, *, name: str):
+        task = asyncio.create_task(coro, name=name)
+        self.background_tasks.append(task)
+        return task
+
+
+@pytest.fixture
+async def mixin_components(tmp_path):
+    """The ``components`` rig, but over ``EventManagerMixin`` (#2922)."""
+    backend = SQLiteBackend(str(tmp_path / "ui_emit_mixin.db"))
+    await backend.connect()
+    store = SignalLogStore(backend)
+    await store.initialize()
+    registry = SourceRegistry()
+    agent = _MixinAgent()
+    dispatcher = SignalDispatcher(
+        agent=agent, registry=registry,
+        lock_manager=OrderedLockManager(), store=store,
+    )
+
+    async def _action_handler(payload):
+        return {"ran": payload}
+
+    registry.register(
+        SourceRegistration(
+            name="ui_test.action",
+            schema=lambda p: p,
+            default_mode=SignalMode.ACTION,
+            allowed_modes=frozenset({SignalMode.ACTION}),
+            handler=_action_handler,
+            log_redaction=_redaction(),
+            result_summary=_result_summary,
+        )
+    )
+    yield SimpleNamespace(agent=agent, dispatcher=dispatcher, backend=backend)
+    pending = [t for t in agent.background_tasks if not t.done()]
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_live_listener_records_surfaced(mixin_components):
+    """A connected consumer that accepts the event: the one case that is
+    genuine visibility, confirmed through the real mixin."""
+    c = mixin_components
+    seen = []
+
+    async def _listener(event_type, data):
+        seen.append((event_type, data))
+
+    c.agent.add_event_listener(_listener)
+    sig = _make_signal(
+        visibility=Visibility.USER_VISIBLE, target="did:test:mixin",
+    )
+    await c.dispatcher.dispatch_signal(sig)
+    await _drain(c.agent)
+
+    assert [e for e in seen if e[0] == "signal_completed"]
+    record = c.dispatcher.surface_record(sig.id)
+    assert record.status == SURFACE_EMITTED
+    assert "accepted by 1/1" in record.reason
+
+
+@pytest.mark.asyncio
+async def test_failing_listener_is_not_recorded_as_surfaced(mixin_components):
+    """THE regression from the #2922 review.
+
+    ``EventManagerMixin.emit_event`` logs and swallows listener failures and
+    returns normally, so a dispatcher that infers success from "no exception"
+    records ``emitted`` while every SSE forwarder failed — the exact false
+    positive this issue exists to remove. The failure is observed through the
+    real mixin, NOT by monkeypatching ``emit_event`` to raise.
+    """
+    c = mixin_components
+
+    async def _broken(event_type, data):
+        raise ConnectionError("sse client vanished")
+
+    c.agent.add_event_listener(_broken)
+    sig = _make_signal(
+        visibility=Visibility.USER_VISIBLE, target="did:test:mixin",
+    )
+    result = await c.dispatcher.dispatch_signal(sig)
+    assert result.status == Status.OK, "the dispatch itself still succeeds"
+    await _drain(c.agent)
+
+    record = c.dispatcher.surface_record(sig.id)
+    assert record.status == SURFACE_NOT_EMITTED, (
+        "a swallowed listener failure reported as surfaced is #2877 again"
+    )
+    assert "rejected by all 1 listener(s)" == record.reason
+
+
+@pytest.mark.asyncio
+async def test_partial_listener_failure_still_surfaces(mixin_components):
+    """One live consumer is enough for the person watching — and the loss of
+    the other is named rather than hidden."""
+    c = mixin_components
+    seen = []
+
+    async def _broken(event_type, data):
+        raise ConnectionError("sse client vanished")
+
+    async def _good(event_type, data):
+        seen.append(event_type)
+
+    c.agent.add_event_listener(_broken)
+    c.agent.add_event_listener(_good)
+    sig = _make_signal(
+        visibility=Visibility.USER_VISIBLE, target="did:test:mixin",
+    )
+    await c.dispatcher.dispatch_signal(sig)
+    await _drain(c.agent)
+
+    assert seen == ["signal_completed"]
+    record = c.dispatcher.surface_record(sig.id)
+    assert record.status == SURFACE_EMITTED
+    assert "1 rejected" in record.reason
+
+
+@pytest.mark.asyncio
+async def test_no_listener_records_buffered_not_surfaced(mixin_components):
+    """Nobody connected: the mixin buffers for replay to the next client.
+    Deferred is neither delivered nor lost, and is recorded as its own state
+    so a headless host does not read as a visibility defect."""
+    c = mixin_components
+    sig = _make_signal(
+        visibility=Visibility.USER_VISIBLE, target="did:test:mixin",
+    )
+    await c.dispatcher.dispatch_signal(sig)
+    await _drain(c.agent)
+
+    record = c.dispatcher.surface_record(sig.id)
+    assert record.status == SURFACE_BUFFERED
+    # And the event really is queued for the next consumer.
+    assert [e for e in c.agent.get_pending_events() if e[0] == "signal_completed"]
+
+
+@pytest.mark.asyncio
+async def test_receiptless_emit_event_is_unknown_not_surfaced(components):
+    """A legacy/foreign ``emit_event`` that returns ``None`` cannot confirm
+    anything. Reading its silence as success is the original bug."""
+    c = components
+    sig = _make_signal(visibility=Visibility.USER_VISIBLE)
+    await c.dispatcher.dispatch_signal(sig)
+    await _drain(c.agent)
+
+    assert len(c.agent.emitted) == 1, "the emit was still attempted"
+    record = c.dispatcher.surface_record(sig.id)
+    assert record.status == SURFACE_UNKNOWN
+    assert "no delivery receipt" in record.reason
+
+
+@pytest.mark.asyncio
+async def test_unrecognized_receipt_is_unknown(components):
+    """Same posture for a receipt shape we cannot read: unknown, not
+    surfaced."""
+    c = components
+
+    async def _odd(event_type, data):
+        return "delivered!"
+
+    c.agent.emit_event = _odd
+    sig = _make_signal(visibility=Visibility.USER_VISIBLE)
+    await c.dispatcher.dispatch_signal(sig)
+    await _drain(c.agent)
+
+    record = c.dispatcher.surface_record(sig.id)
+    assert record.status == SURFACE_UNKNOWN
+    assert "unrecognized" in record.reason
+
+
+@pytest.mark.asyncio
+async def test_internal_signal_records_a_deliberate_non_emit(components):
+    """INTERNAL is log-only by design. That is still "not surfaced", and
+    saying so distinguishes it from a user-visible signal that should have
+    rendered and did not."""
+    c = components
+    sig = _make_signal(visibility=Visibility.INTERNAL)
+    await c.dispatcher.dispatch_signal(sig)
+    await _drain(c.agent)
+
+    record = c.dispatcher.surface_record(sig.id)
+    assert record is not None
+    assert record.status == SURFACE_NOT_EMITTED
+    assert record.reason == "internal_visibility"
+
+
+@pytest.mark.asyncio
+async def test_emit_raising_is_recorded_as_a_non_emit(components):
+    """An ``emit_event`` that raises outright (not a listener failure — the
+    mixin swallows those) means nothing rendered."""
+    c = components
+
+    async def _boom(event_type, data):
+        raise RuntimeError("event bus gone")
+
+    c.agent.emit_event = _boom
+    sig = _make_signal(visibility=Visibility.USER_VISIBLE)
+    result = await c.dispatcher.dispatch_signal(sig)
+    assert result.status == Status.OK
+    await _drain(c.agent)
+
+    record = c.dispatcher.surface_record(sig.id)
+    assert record.status == SURFACE_NOT_EMITTED
+    assert "emit_failed" in record.reason
+    assert "RuntimeError" in record.reason
+
+
+@pytest.mark.asyncio
+async def test_log_write_failure_is_recorded_as_a_non_emit(
+    components, monkeypatch,
+):
+    """The emit fires only after the log write commits, so a dropped audit
+    row is a definite non-emit — not an unanswerable question."""
+    c = components
+
+    async def fail_append(*args, **kwargs):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(c.dispatcher._store, "append", fail_append)
+    sig = _make_signal(visibility=Visibility.USER_VISIBLE)
+    await c.dispatcher.dispatch_signal(sig)
+    await _drain(c.agent)
+
+    assert c.agent.emitted == []
+    record = c.dispatcher.surface_record(sig.id)
+    assert record.status == SURFACE_NOT_EMITTED
+    assert "log_write_failed" in record.reason
+
+
+@pytest.mark.asyncio
+async def test_unknown_signal_id_has_no_record(components):
+    """Absence is UNKNOWN. A caller that reads it as "emitted" rebuilds the
+    exact conflation this record exists to end."""
+    c = components
+    assert c.dispatcher.surface_record("never-dispatched") is None
+
+
+@pytest.mark.asyncio
+async def test_surface_records_are_bounded(components):
+    """In-memory diagnostics, not a second audit trail: the window is capped
+    and the oldest entries age out (aging out reads as UNKNOWN)."""
+    from kestrel_sovereign.signals import MAX_SURFACE_RECORDS
+
+    c = components
+    for i in range(MAX_SURFACE_RECORDS + 5):
+        c.dispatcher._record_surface(f"sig-{i}", SURFACE_EMITTED, "emitted")
+
+    assert len(c.dispatcher._surface_records) == MAX_SURFACE_RECORDS
+    assert c.dispatcher.surface_record("sig-0") is None
+    assert c.dispatcher.surface_record(f"sig-{MAX_SURFACE_RECORDS + 4}") is not None
+
+
+@pytest.mark.asyncio
+async def test_agent_without_emit_event_records_no_emit_event(tmp_path):
+    """The headless/CLI host: nothing crashes, nothing renders, and the
+    ledger can now say which."""
+
+    class _NoEmitAgent:
+        did = "did:test:no-emit"
+
+        def __init__(self):
+            self.background_tasks = []
+
+        async def process_input(self, prompt):
+            return "ok"
+
+        def _track_background_task(self, coro, *, name):
+            task = asyncio.create_task(coro, name=name)
+            self.background_tasks.append(task)
+            return task
+
+    backend = SQLiteBackend(str(tmp_path / "no_emit_record.db"))
+    await backend.connect()
+    store = SignalLogStore(backend)
+    await store.initialize()
+    registry = SourceRegistry()
+    agent = _NoEmitAgent()
+    dispatcher = SignalDispatcher(
+        agent=agent, registry=registry,
+        lock_manager=OrderedLockManager(), store=store,
+    )
+
+    async def _h(payload):
+        return None
+
+    registry.register(
+        SourceRegistration(
+            name="no_emit.record",
+            schema=lambda p: p,
+            default_mode=SignalMode.ACTION,
+            allowed_modes=frozenset({SignalMode.ACTION}),
+            handler=_h,
+            log_redaction=_redaction(),
+        )
+    )
+    sig = Signal(
+        source="no_emit.record",
+        kind="run",
+        mode=SignalMode.ACTION,
+        payload={},
+        target_agent=agent.did,
+        visibility=Visibility.USER_VISIBLE,
+    )
+    await dispatcher.dispatch_signal(sig)
+    pending = [t for t in agent.background_tasks if not t.done()]
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    record = dispatcher.surface_record(sig.id)
+    assert record.status == SURFACE_NOT_EMITTED
+    assert record.reason == "no_emit_event"
 
     await backend.close()

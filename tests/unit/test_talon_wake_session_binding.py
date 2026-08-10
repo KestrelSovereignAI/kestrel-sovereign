@@ -15,12 +15,23 @@ The reported failure had two halves, and fixing only one leaves the bug:
      the ``signal_completed`` SSE event — the open chat stayed blank until a
      manual refresh even once the turn landed in the correct session.
 
+  3. *Reported as delivered either way.* ``delivery_status`` measured
+     persistence — the turn was written somewhere — and read ``ok`` for both
+     failures above. A system that cannot tell "the user saw it" from "we
+     wrote it down" cannot report its own visibility bugs, which is why this
+     one survived for months (#2922).
+
 So these tests deliberately avoid stubbing the seam under test. The
 dispatcher, its source registry, the ``talon.job_complete`` registration and
 its on-disk prompt template, the wait reconciler, the ``TalonWaitable``
 provider and the coordinator's job registry are all REAL; only the agent is a
 double, and it records exactly the two things the user experiences — which
 session ``process_input`` was given, and what reached ``emit_event``.
+
+That last part is load-bearing for the ledger tests below: a dispatcher stub
+with no ``emit_event`` is exactly what let the original visibility gap pass
+its own end-to-end test, so the accounting is asserted against the real
+dispatcher's own record of whether the emit fired.
 """
 
 from __future__ import annotations
@@ -34,10 +45,12 @@ import pytest
 
 from kestrel_sdk.signals import Visibility
 from kestrel_sdk.tools.result import ToolResultStatus
+from kestrel_sovereign.agent.event_manager import EventManagerMixin
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.features.talon.coordinator import TalonCoordinatorFeature
 from kestrel_sovereign.features.talon.wait_provider import TalonWaitable
 from kestrel_sovereign.signals import (
+    SURFACE_EMITTED,
     OrderedLockManager,
     SignalDispatcher,
     SignalLogStore,
@@ -51,13 +64,21 @@ from kestrel_sovereign.waits.engine import WaitRegistry
 from kestrel_sovereign.waits.reconciler import WaitReconciler
 
 
-class _RecordingAgent:
+class _RecordingAgent(EventManagerMixin):
     """Minimal DispatcherAgent that records what the user would observe.
 
     ``process_input`` declares ``**kwargs`` so the dispatcher's signature
     inspection passes ``session_id`` through — the production
     ``KestrelAgent.process_input`` accepts it, and a double that did not
     would silently hide the very binding under test.
+
+    ``emit_event`` is inherited from the REAL
+    :class:`~kestrel_sovereign.agent.event_manager.EventManagerMixin`, with a
+    listener standing in for the browser's SSE stream (#2922). A hand-written
+    recorder cannot reproduce what the production path actually does: it
+    buffers when nobody is connected, and it catches and swallows listener
+    failures, returning normally either way. Stubbing that seam is what let a
+    wake nobody could see pass an end-to-end test.
     """
 
     did = "did:test:2877"
@@ -67,13 +88,17 @@ class _RecordingAgent:
         self.background_tasks: list[asyncio.Task] = []
         self.process_input_sessions: list[object] = []
         self.emitted: list[tuple[str, dict]] = []
+        self._event_listeners = []
+        self._pending_task_notifications = []
         self._response = response
+        self.add_event_listener(self._record_event)
 
     async def process_input(self, prompt: str, **kwargs):
         self.process_input_sessions.append(kwargs.get("session_id"))
         return self._response
 
-    async def emit_event(self, event_type: str, data: dict) -> None:
+    async def _record_event(self, event_type: str, data: dict) -> None:
+        """The connected browser: accepts the event onto its stream."""
         self.emitted.append((event_type, data))
 
     def _track_background_task(self, coro, *, name: str):
@@ -115,9 +140,83 @@ async def _drain(agent: _RecordingAgent) -> None:
         await asyncio.gather(*pending, return_exceptions=True)
 
 
+class _SilentAgent(_RecordingAgent):
+    """A host with no user-visible side channel at all.
+
+    Not a contrived double: an agent embedded in a CLI or a headless runner
+    has no SSE consumers, and ``_write_outcome_log`` reads ``emit_event`` with
+    ``getattr(..., None)`` — so a missing attribute and a None one take the
+    same branch. The wake still runs and still persists; nobody sees it. The
+    ledger has to say so.
+    """
+
+    emit_event = None
+
+
+class _BrokenStreamAgent(_RecordingAgent):
+    """A host WITH a side channel whose consumer is broken (#2922 review).
+
+    The nastiest shape of the bug, and the one a raising ``emit_event`` stub
+    cannot model: ``EventManagerMixin.emit_event`` catches the listener's
+    exception, logs it, and returns normally. Everything upstream looks
+    healthy — the signal dispatched, the turn ran, the row was written — and
+    the browser got nothing.
+    """
+
+    def __init__(self, response: str = "Attempt 4 dispatched."):
+        super().__init__(response)
+        self.remove_event_listener(self._record_event)
+        self.add_event_listener(self._broken_stream)
+
+    async def _broken_stream(self, event_type: str, data: dict) -> None:
+        raise ConnectionError("sse client vanished mid-stream")
+
+
+class _DisconnectedAgent(_RecordingAgent):
+    """A host whose user simply has no browser tab open right now (#2922).
+
+    The mixin buffers the event for replay to the next client, so this is
+    neither delivered nor lost — and must not be scored as either.
+    """
+
+    def __init__(self, response: str = "Attempt 4 dispatched."):
+        super().__init__(response)
+        self.remove_event_listener(self._record_event)
+
+
 @pytest.fixture
 async def rig(tmp_path, sqlite_database_factory):
     """A real dispatcher + real reconciler over a real Talon job registry."""
+    async for built in _build_rig(tmp_path, sqlite_database_factory, _RecordingAgent()):
+        yield built
+
+
+@pytest.fixture
+async def silent_rig(tmp_path, sqlite_database_factory):
+    """The same rig against a host that emits nothing (#2922)."""
+    async for built in _build_rig(tmp_path, sqlite_database_factory, _SilentAgent()):
+        yield built
+
+
+@pytest.fixture
+async def broken_rig(tmp_path, sqlite_database_factory):
+    """The same rig against a host whose SSE consumer raises (#2922)."""
+    async for built in _build_rig(
+        tmp_path, sqlite_database_factory, _BrokenStreamAgent()
+    ):
+        yield built
+
+
+@pytest.fixture
+async def disconnected_rig(tmp_path, sqlite_database_factory):
+    """The same rig against a host with no consumer connected (#2922)."""
+    async for built in _build_rig(
+        tmp_path, sqlite_database_factory, _DisconnectedAgent()
+    ):
+        yield built
+
+
+async def _build_rig(tmp_path, sqlite_database_factory, agent):
     backend = SQLiteBackend(str(tmp_path / "signal_log.db"))
     await backend.connect()
     store = SignalLogStore(backend)
@@ -125,7 +224,6 @@ async def rig(tmp_path, sqlite_database_factory):
 
     registry = SourceRegistry()
     registry.register(build_talon_job_complete_registration())
-    agent = _RecordingAgent()
     dispatcher = SignalDispatcher(
         agent=agent,
         registry=registry,
@@ -334,3 +432,157 @@ async def test_signal_envelope_is_schema_valid_and_bound(rig):
     assert sig.session_id == "chat-sess-4"
     assert sig.visibility == Visibility.USER_VISIBLE
     assert sig.payload["origin_session_id"] == "chat-sess-4"
+
+
+# ---------------------------------------------------------------------------
+# #2922: the ledger reports visibility, not just persistence
+#
+# The reconciler harvests a prior tick's enqueue, so each of these runs two
+# ticks against the REAL dispatcher and then reads the durable ledger row.
+# ---------------------------------------------------------------------------
+
+
+async def _tick_twice(rig, handle: str):
+    """Enqueue (tick 1), let the dispatch finish, harvest (tick 2)."""
+    await rig.reconciler.reconcile()
+    await _drain(rig.agent)
+    harvest = await rig.reconciler.reconcile()
+    return harvest, await rig.reconciler._store.get("talon", handle)
+
+
+@pytest.mark.asyncio
+async def test_ok_is_recorded_only_when_the_emit_actually_fired(rig):
+    """The bound, surfaced case — and the only one that earns a bare ``ok``.
+
+    The claim is checked against the same event the user's browser would have
+    received, through the production ``EventManagerMixin`` emit path, not
+    against the fact that a row was written."""
+    rig.feature._jobs["job-1"] = _finished_job("chat-sess-1")
+
+    harvest, row = await _tick_twice(rig, "job-1")
+
+    assert [e for e in rig.agent.emitted if e[0] == "signal_completed"]
+    assert row.last_delivery_status == "ok"
+    assert row.last_surface_status == "surfaced"
+    assert harvest.data["signals_surfaced"] == 1
+    assert harvest.data["signals_persisted"] == 1
+
+
+@pytest.mark.asyncio
+async def test_failing_sse_consumer_records_unsurfaced_not_ok(broken_rig):
+    """The review finding this test was added for.
+
+    ``EventManagerMixin.emit_event`` catches the listener's exception and
+    returns normally, so every upstream signal reads healthy: the dispatch
+    succeeded, the turn ran, the audit row was written. Only the delivery
+    receipt knows the browser got nothing — and if the ledger trusts "the
+    emit call returned" it records ``ok`` for a wake the user cannot see,
+    which is #2877 all over again.
+    """
+    broken_rig.feature._jobs["job-1"] = _finished_job("chat-sess-1")
+
+    harvest, row = await _tick_twice(broken_rig, "job-1")
+
+    assert broken_rig.agent.process_input_sessions == ["chat-sess-1"], (
+        "the turn still runs and still binds — only the surfacing failed"
+    )
+    assert broken_rig.agent.emitted == [], "the listener raised; nothing landed"
+    assert row.last_delivery_status == "ok_unsurfaced", (
+        "a swallowed SSE failure reported as `ok` is the exact false positive "
+        "this issue exists to remove"
+    )
+    assert row.last_surface_status == "unsurfaced"
+    assert "rejected by all 1 listener(s)" in (
+        harvest.data["transitions"][0]["surface_reason"]
+    )
+    assert harvest.data["signals_surfaced"] == 0
+    assert harvest.data["signals_unsurfaced"] == 1
+    assert harvest.data["signals_persisted"] == 1
+
+
+@pytest.mark.asyncio
+async def test_no_connected_consumer_records_buffered_not_ok(disconnected_rig):
+    """Nobody has the tab open: the mixin buffers for replay to the next
+    client. Deferred is neither seen nor lost, so it gets its own state rather
+    than being scored as a success or a defect."""
+    disconnected_rig.feature._jobs["job-1"] = _finished_job("chat-sess-1")
+
+    harvest, row = await _tick_twice(disconnected_rig, "job-1")
+
+    assert row.last_delivery_status == "ok_buffered"
+    assert row.last_surface_status == "buffered"
+    assert harvest.data["signals_buffered"] == 1
+    assert harvest.data["signals_surfaced"] == 0
+    # The event really is waiting for the next consumer to connect.
+    replayed = [
+        e for e in disconnected_rig.agent.get_pending_events()
+        if e[0] == "signal_completed"
+    ]
+    assert len(replayed) == 1
+
+
+@pytest.mark.asyncio
+async def test_host_that_emits_nothing_records_unsurfaced_not_ok(silent_rig):
+    """The regression this issue is named for: the turn ran, landed in the
+    right session, and was persisted — and the person watching saw nothing.
+
+    A stub dispatcher with no ``emit_event`` is precisely what let the
+    original gap pass its own end-to-end test, so here the REAL dispatcher
+    reports its own missing emit and the ledger records the visibility
+    failure instead of ``ok``."""
+    silent_rig.feature._jobs["job-1"] = _finished_job("chat-sess-1")
+
+    harvest, row = await _tick_twice(silent_rig, "job-1")
+
+    assert silent_rig.agent.process_input_sessions == ["chat-sess-1"], (
+        "the turn still runs and still binds — only the surfacing failed"
+    )
+    assert silent_rig.agent.emitted == []
+    assert row.last_delivery_status == "ok_unsurfaced"
+    assert row.last_surface_status == "unsurfaced"
+    assert harvest.data["transitions"][0]["surface_reason"] == "no_emit_event", (
+        "the recorded cause must name the missing side channel, not be "
+        "inferred from the row"
+    )
+    assert harvest.data["signals_surfaced"] == 0
+    assert harvest.data["signals_unsurfaced"] == 1
+    assert harvest.data["signals_persisted"] == 1, (
+        "still persisted — the two facts are recorded separately, not traded"
+    )
+
+
+@pytest.mark.asyncio
+async def test_unattended_wake_records_unbound_not_ok(rig):
+    """An unattended job wakes correctly into a fresh session and deliberately
+    does not emit. Correct behavior, still not a user-visible delivery."""
+    rig.feature._jobs["job-2"] = _finished_job("")
+
+    harvest, row = await _tick_twice(rig, "job-2")
+
+    assert rig.agent.process_input_sessions == [None]
+    assert [e for e in rig.agent.emitted if e[0] == "signal_completed"] == []
+    assert row.last_delivery_status == "ok_unbound"
+    assert row.last_surface_status == "unbound"
+    assert harvest.data["signals_unbound"] == 1
+    assert harvest.data["signals_surfaced"] == 0
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_surface_record_matches_what_the_agent_received(rig):
+    """The dispatcher's record is the reconciler's evidence, so it must track
+    the real emit rather than the intent to emit."""
+    rig.feature._jobs["job-1"] = _finished_job("chat-sess-1")
+
+    await rig.reconciler.reconcile()
+    await _drain(rig.agent)
+    row_before = await rig.reconciler._store.get("talon", "job-1")
+
+    dispatcher = rig.reconciler._agent.dispatcher
+    record = dispatcher.surface_record(row_before.pending_signal_id)
+    assert record is not None
+    assert record.status == SURFACE_EMITTED
+    emits = [e for e in rig.agent.emitted if e[0] == "signal_completed"]
+    assert len(emits) == 1
+    assert f"{len(emits)}/1 listener(s)" in record.reason
+    # An id the dispatcher never handled is UNKNOWN, not "did not emit".
+    assert dispatcher.surface_record("never-dispatched") is None

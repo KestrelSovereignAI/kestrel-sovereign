@@ -598,12 +598,15 @@
     },
     {
       "existing_code_refs": [
+        "kestrel_sovereign/agent/event_manager.py",
         "kestrel_sovereign/kestrel_agent.py",
         "kestrel_sovereign/signals/registry.py",
         "kestrel_sovereign/signals/sources",
         "server.py",
         "tests/unit/test_signals_no_raw_create_task.py",
-        "tests/unit/test_signals_stripe_source.py"
+        "tests/unit/test_signals_stripe_source.py",
+        "tests/unit/test_signals_ui_emit.py",
+        "tests/unit/test_talon_wake_session_binding.py"
       ],
       "findings": [
         "missing_code_refs"

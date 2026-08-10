@@ -464,6 +464,73 @@ Four rules:
    registration time; a captured origin that no completion path reads
    is worse than none, because it looks bound.
 
+### Persisted is not surfaced — report both (#2922)
+
+A wake that was written down and a wake the user saw are different
+facts, and for months the wait reconciler recorded only the first one
+under a name that read like the second: `delivery_status: ok` on
+dispatcher status alone. That is why #2877 was hard to diagnose — the
+system reported success while the observer saw nothing. A component
+that cannot distinguish "persisted" from "surfaced" cannot report its
+own visibility bugs.
+
+Getting this right needs a fact the emit path did not used to
+produce. `EventManagerMixin.emit_event` **never raises** — one wedged
+SSE consumer must not abort the emitting turn — so it caught every
+listener failure and returned the same `None` whether all consumers
+took the event or all of them rejected it. "The call came back" was
+therefore *not* evidence of anything, and a dispatcher that treated it
+as success recorded `surfaced` for a chat window that stayed blank.
+
+So `emit_event` now returns an `EventDeliveryReceipt`
+(`kestrel_sovereign/agent/event_manager.py`) reporting the three genuinely different
+outcomes — buffered (no consumer connected), accepted by N listeners,
+rejected by all of them — and the dispatcher records the result per
+signal at `SignalDispatcher.surface_record(signal_id)`. Every branch of
+the emit path writes one: `emitted`, `buffered`, `internal_visibility`,
+`no_emit_event`, `emit_failed: …`, `log_write_failed: …`, or `unknown`
+for an agent whose `emit_event` returns no receipt. The reconciler reads
+it back on its harvest tick and stores the two facts in separate columns
+of `wait_signal_state` — `last_delivery_status` (persistence) and
+`last_surface_status` (visibility):
+
+| `last_surface_status` | `last_delivery_status` | Meaning |
+|---|---|---|
+| `surfaced` | `ok` | Bound to a session AND a live consumer accepted the emit. The only bare `ok`. |
+| `unbound` | `ok_unbound` | No origin session, so the wake was INTERNAL by design and had no window to appear in. Correct for cron/CLI work; still not user-visible. |
+| `buffered` | `ok_buffered` | Bound and emitted, but no consumer was connected; the event waits in the replay buffer for the next one. Deferred, not lost. |
+| `unsurfaced` | `ok_unsurfaced` | Bound and USER_VISIBLE, but the event reached nobody — no side channel, the emit raised, or every connected consumer rejected it. The turn ran; nobody saw it. |
+| `unknown` | `ok_visibility_unknown` | Not observable — no surface record for that signal (restarted between enqueue and harvest, aged out of the bounded window), or an agent whose `emit_event` returns no receipt. |
+| `not_delivered` | the failure status | Never persisted, so there is no visibility question. Written anyway so both columns always describe the same harvest. |
+
+Three rules if you add another delivery ledger:
+
+1. **A call that returned is not a delivery.** Any "notify" API that
+   swallows downstream failures must *report* them in its return value,
+   or every caller downstream is forced to guess — and they will guess
+   "success".
+2. **Never infer visibility from your own records.** "The row says we
+   bound a session, so the emit must have failed" is the same unearned
+   claim as `ok`, pointing the other way. An unobservable emit is
+   reported `unknown`; absence of a record is not evidence of absence
+   of an emit.
+3. **Don't retry an unsurfaced wake.** The turn already ran — a re-emit
+   duplicates work rather than fixing visibility. Record the gap and
+   leave the transition locked.
+
+A `_visibility_unknown` reading is expected, not alarming, when the
+harvest crosses a restart, and `_buffered` is normal on a host whose
+operator has no tab open. A sustained `_unsurfaced` count is a real
+defect: something bound a wake to a session whose side channel is
+missing or broken.
+
+Test doubles are part of this contract. An agent double with a
+hand-written `emit_event` that appends to a list cannot exhibit the
+buffering or the swallowed-listener behavior that produced the bug, so
+visibility claims are tested against the real `EventManagerMixin` with
+real listeners (`tests/unit/test_signals_ui_emit.py`,
+`tests/unit/test_talon_wake_session_binding.py`).
+
 ### Cron expressions are the rate limit
 
 Cron sources (in `signals/sources/scheduler.py`) set
