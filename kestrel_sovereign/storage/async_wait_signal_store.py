@@ -9,7 +9,13 @@ one row per ``(agent_id, kind, handle)`` the reconciler has observed, tracking
     :class:`~kestrel_sdk.tools.Outcome` value we already delivered a signal
     for, so the next tick does not re-fire the same transition.
   - ``last_delivery_*`` — diagnostics + retry accounting; ``attempts`` caps
-    the soft-fail retry loop.
+    the soft-fail retry loop. ``last_delivery_status`` composes the dispatch
+    result with a VISIBILITY verdict (``ok_queued`` / ``ok_unsurfaced`` /
+    ``ok_unbound`` / ``ok_visibility_unknown``) rather than recording a bare
+    ``ok``, which used to mean only "persisted somewhere" while reading as
+    "the user saw it" (#2922).
+  - ``last_surface_status`` — the dispatcher's raw account of what the
+    ``signal_completed`` SSE emit did, backing the verdict above.
   - ``pending_signal_*`` — the two-phase harvest set: a signal we enqueued
     but have not yet confirmed delivered. ``record_pending`` sets them;
     ``record_delivery``/``clear_pending`` clear them.
@@ -79,6 +85,10 @@ class WaitSignalState:
     pending_signaled_target: Optional[str]
     pending_signal_enqueued_at: Optional[str]
     watching: int
+    # What the dispatcher observed of the wake's ``signal_completed`` SSE emit
+    # (#2922). ``None`` on rows written before the column existed and on
+    # outcomes that never reached an emit — genuinely unknown, not "fine".
+    last_surface_status: Optional[str] = None
 
 
 class WaitSignalStore:
@@ -110,7 +120,7 @@ class WaitSignalStore:
                    last_delivery_error, last_delivery_attempts,
                    last_delivery_attempt_at, pending_signal_id,
                    pending_signaled_target, pending_signal_enqueued_at,
-                   watching
+                   watching, last_surface_status
             FROM wait_signal_state
             WHERE agent_id = ? AND kind = ? AND handle = ?
             """,
@@ -129,7 +139,7 @@ class WaitSignalStore:
                    last_delivery_error, last_delivery_attempts,
                    last_delivery_attempt_at, pending_signal_id,
                    pending_signaled_target, pending_signal_enqueued_at,
-                   watching
+                   watching, last_surface_status
             FROM wait_signal_state
             WHERE agent_id = ? AND pending_signal_id IS NOT NULL
             """,
@@ -245,16 +255,23 @@ class WaitSignalStore:
         delivery_error: Optional[str] = None,
         signaled_outcome: Optional[str] = None,
         attempt_at: TimeArg = None,
+        surface_status: Optional[str] = None,
     ) -> None:
         """Record the outcome of a harvested delivery.
 
         Always sets ``last_delivery_status``/``last_delivery_error``/
-        ``last_delivery_attempt_at`` and ALWAYS clears the three
-        ``pending_signal_*`` fields (the harvest is done). When
+        ``last_delivery_attempt_at``/``last_surface_status`` and ALWAYS clears
+        the three ``pending_signal_*`` fields (the harvest is done). When
         ``signaled_outcome`` is not None it also locks
         ``last_signaled_outcome`` — callers pass it for delivered + hard-fail
         states (stop the loop) and OMIT it for soft-fails (so the next tick
         re-detects and retries).
+
+        ``surface_status`` is the dispatcher's raw account of what the
+        ``signal_completed`` emit did (#2922) — provenance for the visibility
+        verdict already composed into ``delivery_status``. It is written even
+        when ``None`` so a later, less-observable attempt cannot inherit an
+        earlier attempt's verdict and read as better than it was.
         """
         attempt_dt = _coerce_ts(attempt_at) or datetime.now(timezone.utc).replace(
             tzinfo=None
@@ -268,6 +285,7 @@ class WaitSignalStore:
                 """
                 UPDATE wait_signal_state
                 SET last_delivery_status = ?,
+                    last_surface_status = ?,
                     last_delivery_error = ?,
                     last_delivery_attempt_at = ?,
                     last_signaled_outcome = ?,
@@ -279,6 +297,7 @@ class WaitSignalStore:
                 """,
                 (
                     delivery_status,
+                    surface_status,
                     delivery_error,
                     attempt_dt,
                     signaled_outcome,
@@ -292,6 +311,7 @@ class WaitSignalStore:
                 """
                 UPDATE wait_signal_state
                 SET last_delivery_status = ?,
+                    last_surface_status = ?,
                     last_delivery_error = ?,
                     last_delivery_attempt_at = ?,
                     pending_signal_id = NULL,
@@ -302,6 +322,7 @@ class WaitSignalStore:
                 """,
                 (
                     delivery_status,
+                    surface_status,
                     delivery_error,
                     attempt_dt,
                     self._agent_id,
@@ -314,9 +335,9 @@ class WaitSignalStore:
                 """
                 INSERT INTO wait_signal_state
                     (agent_id, kind, handle, last_signaled_outcome,
-                     last_delivery_status, last_delivery_error,
-                     last_delivery_attempt_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                     last_delivery_status, last_surface_status,
+                     last_delivery_error, last_delivery_attempt_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     self._agent_id,
@@ -324,6 +345,7 @@ class WaitSignalStore:
                     handle,
                     signaled_outcome,
                     delivery_status,
+                    surface_status,
                     delivery_error,
                     attempt_dt,
                 ),
@@ -402,7 +424,7 @@ class WaitSignalStore:
                    last_delivery_error, last_delivery_attempts,
                    last_delivery_attempt_at, pending_signal_id,
                    pending_signaled_target, pending_signal_enqueued_at,
-                   watching
+                   watching, last_surface_status
             FROM wait_signal_state
             WHERE agent_id = ? AND watching = 1
                   AND last_signaled_outcome IS NULL
@@ -429,4 +451,5 @@ class WaitSignalStore:
             pending_signaled_target=str(r[8]) if r[8] is not None else None,
             pending_signal_enqueued_at=str(r[9]) if r[9] is not None else None,
             watching=int(r[10]) if r[10] is not None else 0,
+            last_surface_status=str(r[11]) if r[11] is not None else None,
         )

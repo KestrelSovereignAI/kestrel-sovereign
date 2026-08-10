@@ -420,10 +420,11 @@ session — "no session" means "mint one". For work the agent started
 from a chat turn, that stranded the wake outside the window the user
 was watching, so autonomous progress ran invisibly while
 `delivery_status` still read `ok` (#2877; #1809 is the same fix for
-restarts). Set `session_id` to the session that REGISTERED the work
-and the dispatcher resumes it.
+restarts, and #2922 is why that status can no longer read `ok` for a
+wake nobody saw — see rule 5). Set `session_id` to the session that
+REGISTERED the work and the dispatcher resumes it.
 
-Four rules:
+Five rules:
 
 1. **Bind AND surface.** `session_id` alone puts the turn in the right
    transcript but leaves it `INTERNAL`, so the dispatcher never emits
@@ -463,6 +464,32 @@ Four rules:
    turn is routed to the durable CLI rail instead. Choose the rail at
    registration time; a captured origin that no completion path reads
    is worse than none, because it looks bound.
+
+5. **Persisted is not surfaced — say which one you mean (#2922).**
+   `wait_signal_state.last_delivery_status` no longer records the bare
+   dispatcher status. It composes the dispatch result with a
+   *visibility* verdict, so there is no path that writes a bare `ok`:
+
+   | Recorded state | Meaning |
+   |---|---|
+   | `ok_queued` | The turn ran AND the `signal_completed` event was accepted by ≥1 live listener. |
+   | `ok_unsurfaced` | The turn ran; the emit demonstrably reached no consumer (buffered with nobody connected, every listener raised, the emit raised, no emitter). |
+   | `ok_unbound` | The turn ran; no origin session resolved, so the wake was `INTERNAL` and never had a window to surface into. |
+   | `ok_visibility_unknown` | The turn ran; the dispatcher reported no verdict (foreign dispatcher, receipt-less `emit_event`, record lost to a restart). |
+
+   `coalesced_*` mirrors the same four. The raw dispatcher observation
+   is kept alongside in `last_surface_status`.
+
+   **`queued` is the ceiling, and it is not a render.** It means the
+   event entered a server-side `asyncio.Queue`; `chat.js` still
+   discards a wake whose `session_id` is not the open pane's
+   conversation. No server-side state can prove a render, so nothing
+   here is named "surfaced" and anything unobserved is reported as
+   unknown rather than guessed in the flattering direction. The
+   producer side of this is
+   `EventManagerMixin.emit_event`, which now returns an
+   `EventDeliveryReceipt` (buffered / accepted / rejected) instead of
+   swallowing listener failures into a bare `None`.
 
 ### Cron expressions are the rate limit
 

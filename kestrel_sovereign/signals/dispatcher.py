@@ -84,7 +84,7 @@ import logging
 import os
 import secrets
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, time as dtime, timedelta, timezone
@@ -207,6 +207,109 @@ class SignalLogWriteFailure:
     signal_id: str
     error: str
     failed_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# UI surface accounting (#2922)
+# ---------------------------------------------------------------------------
+#
+# Persisting a turn and SURFACING it are different facts, and conflating them
+# is what made #2877 take months to diagnose: the wait reconciler read a
+# dispatch-level ``ok`` as "the user saw the wake" while the observer's chat
+# stayed blank. The dispatcher is the only component that watches the
+# ``signal_completed`` emit, so it records what it observed, per signal, and
+# the reconciler reads that instead of inferring visibility from the dispatch
+# status alone.
+#
+# The CEILING of what these verdicts can claim is deliberate. ``QUEUED`` means
+# at least one live listener took the event — for ``/notifications/sse`` that
+# is admission to a server-side ``asyncio.Queue``. The browser can still drop
+# it: ``chat.js`` discards a wake whose ``session_id`` is not the open pane's
+# conversation, and it requires a non-empty ``result_summary``. No server-side
+# state can prove a render, so none of these values says "surfaced" or "seen".
+# Anything the dispatcher could not observe is ``UNKNOWN``, never an optimistic
+# guess.
+
+# INTERNAL signal: no UI emit is attempted, by design.
+SURFACE_NOT_APPLICABLE = "not_applicable"
+# The agent exposes no ``emit_event`` at all (minimal/legacy stand-ins).
+SURFACE_NO_EMITTER = "no_emitter"
+# The emit call itself raised.
+SURFACE_EMIT_FAILED = "emit_failed"
+# No listener was connected; the event was buffered for replay on reconnect.
+SURFACE_BUFFERED = "buffered"
+# Every connected listener raised — the event reached no consumer.
+SURFACE_REJECTED = "rejected"
+# At least one listener accepted the event into its server-side queue. The
+# strongest verdict available, and still NOT proof that anything rendered.
+SURFACE_QUEUED = "queued"
+# ``emit_event`` returned no receipt (a stand-in predating #2922) — the
+# outcome is genuinely unobservable rather than assumed good.
+SURFACE_UNKNOWN = "unknown"
+
+# Verdicts that mean the event definitively reached no live consumer.
+SURFACE_UNSURFACED_STATES = frozenset(
+    {SURFACE_NO_EMITTER, SURFACE_EMIT_FAILED, SURFACE_BUFFERED, SURFACE_REJECTED}
+)
+
+
+@dataclass(frozen=True)
+class SignalSurfaceRecord:
+    """What the dispatcher observed of one signal's UI side-channel emit.
+
+    Public because the wait reconciler consumes it to distinguish "persisted"
+    from "reached a live consumer" in its delivery ledger (#2922).
+    """
+
+    signal_id: str
+    status: str
+    listeners: int = 0
+    accepted: int = 0
+    rejected: int = 0
+
+    @property
+    def reached_a_consumer(self) -> bool:
+        """True only for :data:`SURFACE_QUEUED` — server-side acceptance.
+
+        Never interpret this as "the user saw it"; see the module notes above.
+        """
+        return self.status == SURFACE_QUEUED
+
+    @property
+    def definitely_unsurfaced(self) -> bool:
+        """True when the emit demonstrably reached no live consumer."""
+        return self.status in SURFACE_UNSURFACED_STATES
+
+
+def _receipt_count(receipt: Any, field: str) -> int:
+    """Read one integer counter off an ``emit_event`` receipt, or 0."""
+    try:
+        return int(getattr(receipt, field, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def classify_event_receipt(receipt: Any) -> str:
+    """Map an ``emit_event`` return value onto a ``SURFACE_*`` verdict.
+
+    Structural rather than ``isinstance``-based: the agent is a protocol here,
+    and a host/feature stand-in may supply its own compatible receipt. A return
+    value that does not carry the receipt's counters is ``SURFACE_UNKNOWN`` —
+    a caller that cannot report delivery must not be credited with it.
+    """
+    if receipt is None:
+        return SURFACE_UNKNOWN
+    buffered = getattr(receipt, "buffered", None)
+    accepted = getattr(receipt, "accepted", None)
+    if buffered is None or accepted is None:
+        return SURFACE_UNKNOWN
+    if buffered:
+        return SURFACE_BUFFERED
+    try:
+        accepted_count = int(accepted)
+    except (TypeError, ValueError):
+        return SURFACE_UNKNOWN
+    return SURFACE_QUEUED if accepted_count > 0 else SURFACE_REJECTED
 
 
 @dataclass(frozen=True)
@@ -423,6 +526,12 @@ class SignalDispatcher:
     rejected at registration time if they declare it.
     """
 
+    # Cap on retained per-signal UI-emit verdicts (#2922). The only consumer
+    # reads a record on the reconciler tick after the one that enqueued it, so
+    # a small window is sufficient; bounding it keeps a long-lived host from
+    # accumulating one entry per signal forever.
+    _MAX_SURFACE_RECORDS = 512
+
     def __init__(
         self,
         *,
@@ -492,6 +601,14 @@ class SignalDispatcher:
         # cancelled-before-start reservation reconciled) before storage closes.
         self._outcome_log_tasks: set[asyncio.Task] = set()
         self._outcome_log_tasks_by_signal: dict[str, set[asyncio.Task]] = {}
+        # What the UI side-channel emit actually did, per signal (#2922).
+        # Deliberately in-memory and bounded: it is diagnostic provenance for
+        # the wait reconciler's next harvest, not a second audit trail, and an
+        # entry that did not survive a restart must read as UNKNOWN rather
+        # than resurrect as an optimistic verdict. ``dispatch_signal`` drains
+        # its own outcome writers before returning, so the record for a signal
+        # is always present by the time its handle resolves.
+        self._surface_records: "OrderedDict[str, SignalSurfaceRecord]" = OrderedDict()
         # This task owns teardown, rather than whichever public caller first
         # requested it.  Callers await it through ``shield`` so cancellation
         # of an agent's bounded shutdown wrapper cannot abandon a committed
@@ -2919,18 +3036,62 @@ class SignalDispatcher:
         # default to INTERNAL — none of them surprise-emit to the UI.
         # Sources opt in by constructing signals with an explicit
         # visibility argument.
+        #
+        # Every branch below records what it observed (#2922). A silent return
+        # would leave the wait reconciler to infer visibility from the dispatch
+        # status, which is exactly the "persisted therefore seen" conflation
+        # this accounting exists to break.
         if signal.visibility == Visibility.INTERNAL:
+            self._record_surface(signal.id, SURFACE_NOT_APPLICABLE)
             return
         emit = getattr(self._agent, "emit_event", None)
         if emit is None:
+            self._record_surface(signal.id, SURFACE_NO_EMITTER)
             return
         payload = _build_ui_event_payload(signal, result, result_summary)
         try:
-            await emit("signal_completed", payload)
+            receipt = await emit("signal_completed", payload)
         except Exception:
+            self._record_surface(signal.id, SURFACE_EMIT_FAILED)
             logger.exception(
                 "Failed to emit signal_completed UI event for %s", signal.id
             )
+            return
+        self._record_surface(
+            signal.id, classify_event_receipt(receipt), receipt=receipt
+        )
+
+    def _record_surface(
+        self, signal_id: str, status: str, *, receipt: Any = None
+    ) -> None:
+        """Record one signal's UI-emit verdict in the bounded surface ledger.
+
+        Counter coercion is defensive because ``receipt`` comes from the agent
+        protocol: bookkeeping about a delivery must never be the thing that
+        fails the outcome writer that already persisted the audit row.
+        """
+        record = SignalSurfaceRecord(
+            signal_id=signal_id,
+            status=status,
+            listeners=_receipt_count(receipt, "listeners"),
+            accepted=_receipt_count(receipt, "accepted"),
+            rejected=_receipt_count(receipt, "rejected"),
+        )
+        records = self._surface_records
+        records.pop(signal_id, None)
+        records[signal_id] = record
+        while len(records) > self._MAX_SURFACE_RECORDS:
+            records.popitem(last=False)
+
+    def surface_record(self, signal_id: str) -> Optional["SignalSurfaceRecord"]:
+        """What the UI side-channel emit did for ``signal_id``, if observed.
+
+        ``None`` means the dispatcher has no record — the signal never reached
+        the outcome writer, this process did not dispatch it, or the entry aged
+        out of the bounded ledger. Callers must treat ``None`` as *visibility
+        unknown* and never as either success or failure (#2922).
+        """
+        return self._surface_records.get(signal_id)
 
 
 def _build_ui_event_payload(
