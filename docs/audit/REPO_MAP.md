@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-08-09
-**Scope:** 2309 tracked files (1543 `.py`, 345 `.md`, 421 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-08-10
+**Scope:** 2310 tracked files (1544 `.py`, 345 `.md`, 421 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -165,7 +165,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/agent/operator_signals.py** — Operator-signal producer seam for turn-time LLM delivery.
   - `class OperatorSignalProducer`; `class OperatorNoticeLifecycle`; `class OperatorSignalEvent`; `class OperatorSignalBatch`; `class OperatorTurnInjectionResult`; `async def inject_operator_turn(agent, messages, context_result, session_id, …)`; `def supports_inline_system_for_next_route(llm_service)`; `def state_of_mind_snapshot(state)`
 - **kestrel_sovereign/agent/orchestrator_engine.py** — Orchestrator engine mixin for tool execution and response handling.
-  - `class IterationTracker`; `class ContextStats`; `class ToolNotRegisteredError`; `class OrchestratorEngineMixin`
+  - `def real_session_id(session_id)`; `class IterationTracker`; `class ContextStats`; `class ToolNotRegisteredError`; `class OrchestratorEngineMixin`
 - **kestrel_sovereign/agent/parts.py** — In-band typed-part emission for first-class console components (#1914).
   - `def part_collector()`; `def current_part_collector()`; `def bind_part_collector(collector)`; `def emit_part(part_type, data, part_id)`; `def sanitize_part(entry)`; `def drain_parts()`; `def build_part_sentinel(part)`
 - **kestrel_sovereign/agent/preturn_state.py** — Pre-turn state-load block (epic #1290, D3).
@@ -3410,6 +3410,8 @@ Repo entry points and standard project files.
   - `async def store()`; `async def test_canonicalize_maps_integer_marker_rowid_to_uuid(store)`; `async def test_canonicalize_leaves_non_marker_integer_alone(store)`; `async def test_add_conversation_relinks_integer_echo_to_uuid(store)`; `async def test_resolve_session_id_canonicalizes_explicit_integer(store)`; `async def test_continued_turns_load_under_canonical_uuid(store)`; `async def test_new_session_marker_mints_fresh_uuid_not_inherited(store)`; `async def test_canonicalize_skips_inherited_marker(store)`; `…`
 - **tests/unit/test_session_id_in_hooks.py** — Verify session_id is correctly threaded to hook calls during tool dispatch (#885).
   - `class TestSessionIdInHooks`
+- **tests/unit/test_session_id_span_attribution.py** — Session-id span attribution on the agent runtime's turn spans (issue #2916).
+  - `def span_exporter(monkeypatch)`; `class TestTurnSpansCarryTimelineSessionKey`; `class TestFeatureDispatchSpansCarrySession`; `class TestRealSessionId`
 - **tests/unit/test_session_id_threading.py** — Verify ``session_id`` threads from agent loop to LLMService callers (#821).
   - `class TestSignatures`; `class TestOrchestratorThreadsSessionId`
 - **tests/unit/test_session_log_talon.py** — Tests for Talon PR detection in Session Log collector.
