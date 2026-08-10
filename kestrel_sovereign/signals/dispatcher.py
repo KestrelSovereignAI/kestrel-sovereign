@@ -119,6 +119,7 @@ from kestrel_sovereign.signals.constitution_metrics import (
     record_echo_verified,
 )
 from kestrel_sovereign.signals.durable import (
+    ACKNOWLEDGED,
     FAILED,
     DurableConsumerRegistration,
     DurableDelivery,
@@ -723,6 +724,7 @@ class SignalDispatcher:
         *,
         source_event_id: Optional[str] = None,
         _durable_admission: asyncio.Future[DurableAdmissionResult] | None = None,
+        _durable_delivery_consumer_id: Optional[str] = None,
     ) -> SignalResult:
         """Awaits the full lifecycle. Used by callers that need the result
         (scheduler, heartbeat). Always returns a `SignalResult` — failures
@@ -750,6 +752,7 @@ class SignalDispatcher:
                         else getattr(signal, "source_event_id", None)
                     ),
                     durable_admission=_durable_admission,
+                    durable_delivery_consumer_id=_durable_delivery_consumer_id,
                 )
                 if (
                     _durable_admission is not None
@@ -828,6 +831,36 @@ class SignalDispatcher:
             durable_admission=durable_admission,
         )
 
+    async def enqueue_durable_cognition(
+        self,
+        signal: Signal,
+        *,
+        source_event_id: Optional[str],
+        consumer_id: str,
+    ) -> SignalDispatchHandle:
+        """Enqueue cursor-owning cognition behind one durable delivery lease.
+
+        Its admission receipt resolves only after this exact consumer delivery
+        is durably acknowledged, never merely when the event row is written.
+        """
+        durable_admission: asyncio.Future[DurableAdmissionResult] = (
+            asyncio.get_running_loop().create_future()
+        )
+        coro = self.dispatch_signal(
+            signal,
+            source_event_id=source_event_id,
+            _durable_admission=durable_admission,
+            _durable_delivery_consumer_id=consumer_id,
+        )
+        task = self._agent._track_background_task(
+            coro, name=f"durable_cognition:{consumer_id}:{signal.id}"
+        )
+        return SignalDispatchHandle(
+            signal_id=signal.id,
+            task=task,
+            durable_admission=durable_admission,
+        )
+
     async def initialize_durable_delivery(self) -> None:
         """Initialize the durable consumer ledger exactly once.
 
@@ -851,6 +884,7 @@ class SignalDispatcher:
                     # not carry a pre-wait timestamp into recovery: that could
                     # immediately classify an otherwise live owner as stale.
                     await self._recover_abandoned_initial_reservations()
+                    await self._recover_abandoned_leases()
                     self._durable_initialized = True
                     self._schedule_runtime_owner_heartbeat()
 
@@ -927,6 +961,37 @@ class SignalDispatcher:
                     handoff.initial_lease_token = None
                     return self._delivery_with_transient_handoff(delivery)
             return None
+
+    async def claim_durable_delivery_for_event(
+        self, *, consumer_id: str, event_id: str, executor_id: str
+    ) -> Optional[DurableDelivery]:
+        """Claim this consumer's delivery for exactly one persisted event."""
+        async with self._admit_durable_operation():
+            await self.initialize_durable_delivery()
+            self._discard_expired_transient_durable_handoffs()
+            delivery = await self._durable_store.claim_delivery_for_event(
+                agent_id=self._agent.did,
+                consumer_id=consumer_id,
+                event_id=event_id,
+                executor_id=executor_id,
+            )
+            return (
+                self._delivery_with_transient_handoff(delivery)
+                if delivery is not None
+                else None
+            )
+
+    async def get_durable_delivery_for_event(
+        self, *, consumer_id: str, event_id: str
+    ) -> Optional[DurableDelivery]:
+        """Read one consumer delivery without changing its ownership."""
+        async with self._admit_durable_operation():
+            await self.initialize_durable_delivery()
+            return await self._durable_store.get_delivery_for_event(
+                agent_id=self._agent.did,
+                consumer_id=consumer_id,
+                event_id=event_id,
+            )
 
     def _delivery_with_transient_handoff(
         self, delivery: DurableDelivery
@@ -1333,11 +1398,22 @@ class SignalDispatcher:
             # so such unactivated reservations eventually become marker-only
             # retry work without another process restart.
             await self._recover_abandoned_initial_reservations()
+            await self._recover_abandoned_leases()
 
     async def _recover_abandoned_initial_reservations(self) -> int:
         """Requeue stale foreign initial reservations for this tenant."""
         recovery_now = datetime.now(timezone.utc)
         return await self._durable_store.recover_abandoned_initial_reservations(
+            agent_id=self._agent.did,
+            recovering_owner_id=self._durable_delivery_owner,
+            stale_before=recovery_now - self._runtime_owner_stale_after,
+            now=recovery_now,
+        )
+
+    async def _recover_abandoned_leases(self) -> int:
+        """Requeue stopped/stale foreign leases before source redelivery."""
+        recovery_now = datetime.now(timezone.utc)
+        return await self._durable_store.recover_abandoned_leases(
             agent_id=self._agent.did,
             recovering_owner_id=self._durable_delivery_owner,
             stale_before=recovery_now - self._runtime_owner_stale_after,
@@ -1521,6 +1597,7 @@ class SignalDispatcher:
         *,
         source_event_id: Optional[str],
         durable_admission: asyncio.Future[DurableAdmissionResult] | None = None,
+        durable_delivery_consumer_id: Optional[str] = None,
     ) -> SignalResult:
         # Step 1: validation
         registration = self._registry.get(signal.source)
@@ -1804,7 +1881,11 @@ class SignalDispatcher:
                 error=f"Durable signal persistence failed: {type(exc).__name__}: {exc}",
                 registration=registration,
             )
-        if durable_admission is not None and not durable_admission.done():
+        if (
+            durable_admission is not None
+            and durable_delivery_consumer_id is None
+            and not durable_admission.done()
+        ):
             durable_admission.set_result(
                 DurableAdmissionResult(
                     (
@@ -1814,6 +1895,16 @@ class SignalDispatcher:
                     ),
                     signal.id,
                 )
+            )
+
+        if durable_delivery_consumer_id is not None:
+            return await self._route_durable_cognition_delivery(
+                signal,
+                registration,
+                start,
+                persisted_event_id=persisted.event_id,
+                consumer_id=durable_delivery_consumer_id,
+                durable_admission=durable_admission,
             )
 
         if not persisted.created:
@@ -1828,6 +1919,103 @@ class SignalDispatcher:
                 registration=registration,
             )
 
+        return await self._route_after_durable_persistence(
+            signal, registration, start
+        )
+
+    async def _route_durable_cognition_delivery(
+        self,
+        signal: Signal,
+        registration: SourceRegistration,
+        start: float,
+        *,
+        persisted_event_id: str,
+        consumer_id: str,
+        durable_admission: asyncio.Future[DurableAdmissionResult] | None,
+    ) -> SignalResult:
+        """Route cursor-owned work and ACK only its durable cognition lease."""
+        delivery = await self.claim_durable_delivery_for_event(
+            consumer_id=consumer_id,
+            event_id=persisted_event_id,
+            executor_id=self._durable_delivery_owner,
+        )
+        if delivery is None:
+            existing = await self.get_durable_delivery_for_event(
+                consumer_id=consumer_id,
+                event_id=persisted_event_id,
+            )
+            if existing is not None and existing.status == ACKNOWLEDGED:
+                if durable_admission is not None and not durable_admission.done():
+                    durable_admission.set_result(
+                        DurableAdmissionResult(
+                            DurableAdmissionDisposition.DUPLICATE, signal.id
+                        )
+                    )
+                return self._fail(
+                    signal,
+                    start,
+                    Status.COALESCED,
+                    error=(
+                        "Duplicate source event ID already acknowledged by "
+                        f"durable consumer {consumer_id}"
+                    ),
+                    registration=registration,
+                )
+            return self._fail(
+                signal,
+                start,
+                Status.FAILED,
+                error=(
+                    "Durable cognition delivery is unavailable; source must "
+                    "retry without advancing its cursor"
+                ),
+                registration=registration,
+            )
+
+        result = await self._route_after_durable_persistence(
+            signal, registration, start
+        )
+        if result.status is Status.OK:
+            acknowledged = await self.ack_durable_delivery(
+                consumer_id=consumer_id,
+                delivery_id=delivery.delivery_id,
+                lease_token=delivery.lease_token or "",
+            )
+            if acknowledged and durable_admission is not None and not durable_admission.done():
+                durable_admission.set_result(
+                    DurableAdmissionResult(
+                        DurableAdmissionDisposition.COMMITTED, signal.id
+                    )
+                )
+            # A cognition result without a delivery ACK is deliberately not
+            # admitted; the enclosing dispatch finalizer leaves the source
+            # retryable instead of advancing an external cursor.
+            return result
+
+        # Rate limits, quiet hours, coalescing, and cognition failures are
+        # recoverable for cursor-owning ingress. Validation/cycle refusal is a
+        # proven terminal no-op and may be acknowledged idempotently.
+        terminal = result.status in {Status.DROPPED_VALIDATION, Status.DROPPED_CYCLE}
+        await self.nack_durable_delivery(
+            consumer_id=consumer_id,
+            delivery_id=delivery.delivery_id,
+            lease_token=delivery.lease_token or "",
+            error=result.error or f"Cognition delivery returned {result.status.value}",
+            terminal=terminal,
+        )
+        if terminal and durable_admission is not None and not durable_admission.done():
+            durable_admission.set_result(
+                DurableAdmissionResult(DurableAdmissionDisposition.TERMINAL, signal.id)
+            )
+        return result
+
+    async def _route_after_durable_persistence(
+        self,
+        signal: Signal,
+        registration: SourceRegistration,
+        start: float,
+    ) -> SignalResult:
+        """Run the post-commit policy and cognition stages for a signal."""
         # Step 3: quiet-hours
         if self._in_quiet_hours(signal, registration.attention_policy):
             return self._fail(

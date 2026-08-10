@@ -35,6 +35,8 @@ from kestrel_sovereign.security.encryption import (
     get_fernet,
 )
 from kestrel_sovereign.signals.sources.channels import (
+    DURABLE_COGNITION_MARKER,
+    DURABLE_COGNITION_MARKER_VALUE,
     build_channel_message_registration,
     build_signal_for_channel_message,
 )
@@ -55,12 +57,14 @@ logger = logging.getLogger(__name__)
 # so channel content matches the conversation_history encryption
 # guarantee (#2096 / F112).
 CHANNEL_KEY_VERSION = 1
+_DURABLE_COGNITION_CONSUMER_ID = "core.channel-cognition-v1"
 
 
 class InboundAdmissionDisposition(str, Enum):
     """What the channel feature proved about one inbound message."""
 
     DURABLY_ADMITTED = "durably_admitted"
+    RETRYABLE = "retryable"
     LEGACY_ROUTED = "legacy_routed"
     REJECTED = "rejected"
 
@@ -165,7 +169,9 @@ class ChannelFeature(Feature):
 
         # Create the channel registry
         self.registry = ChannelRegistry()
+        self._durable_cognition_ready = False
         self._register_channel_signal_source()
+        await self._register_durable_cognition_consumer()
 
         # Create tables if DB is available
         if self._db:
@@ -200,6 +206,44 @@ class ChannelFeature(Feature):
         # Own the source we newly registered so shutdown / boot rollback
         # unregisters it (#2522 P2).
         self._own_signal_sources(outcome)
+
+    async def _register_durable_cognition_consumer(self) -> None:
+        """Register the restart-safe delivery behind ACK-bearing channels.
+
+        This registration is intentionally nonfatal for older/embedder
+        dispatchers.  In that compatibility case ingress retains its cursor
+        rather than claiming delivery was made durable.
+        """
+        dispatcher = getattr(self.agent, "dispatcher", None)
+        register = getattr(dispatcher, "register_durable_consumer", None)
+        agent_did = getattr(self.agent, "did", None)
+        if not callable(register) or not isinstance(agent_did, str) or not agent_did:
+            return
+        try:
+            from kestrel_sovereign.signals.durable import DurableConsumerRegistration
+
+            await register(
+                DurableConsumerRegistration(
+                    consumer_id=_DURABLE_COGNITION_CONSUMER_ID,
+                    source="channel.message",
+                    agent_id=agent_did,
+                    correlation_selector=(
+                        f"payload.{DURABLE_COGNITION_MARKER}="
+                        f"{DURABLE_COGNITION_MARKER_VALUE}"
+                    ),
+                    # Provider cursors are retryable until cognition is
+                    # acknowledged; bounded retries would turn outages into
+                    # irreversible loss.
+                    max_attempts=0,
+                )
+            )
+        except Exception:
+            logger.exception(
+                "Could not register durable channel cognition consumer; "
+                "ACK-bearing ingress will remain retryable"
+            )
+            return
+        self._durable_cognition_ready = True
 
     async def shutdown(self):
         """Disconnect all registered adapters."""
@@ -595,6 +639,7 @@ class ChannelFeature(Feature):
         await self._log_message(message, status="received")
 
         durable_admission = False
+        durable_cognition_attempted = False
         dispatcher = getattr(self.agent, "dispatcher", None)
         if dispatcher is not None:
             try:
@@ -602,12 +647,24 @@ class ChannelFeature(Feature):
                     message,
                     target_agent=getattr(self.agent, "did", self._agent_id),
                 )
-                # Provider retries reuse the channel message ID.  Pass it as
-                # the durable source-event key so a retry cannot wake a
-                # workflow consumer twice after process restart.
-                handle = await dispatcher.enqueue_signal(
-                    signal, source_event_id=message.id
+                # Provider retries reuse the channel message ID.  ACK-bearing
+                # transports use the durable cognition lease, so the callback
+                # becomes ACKable only after cognition itself is durably
+                # acknowledged rather than when its event envelope is written.
+                enqueue_durable_cognition = getattr(
+                    dispatcher, "enqueue_durable_cognition", None
                 )
+                if self._durable_cognition_ready and callable(enqueue_durable_cognition):
+                    durable_cognition_attempted = True
+                    handle = await enqueue_durable_cognition(
+                        signal,
+                        source_event_id=message.id,
+                        consumer_id=_DURABLE_COGNITION_CONSUMER_ID,
+                    )
+                else:
+                    handle = await dispatcher.enqueue_signal(
+                        signal, source_event_id=message.id
+                    )
                 wait_for_durable_admission = getattr(
                     handle, "wait_for_durable_admission", None
                 )
@@ -630,6 +687,12 @@ class ChannelFeature(Feature):
 
         if durable_admission:
             return InboundAdmission(InboundAdmissionDisposition.DURABLY_ADMITTED)
+
+        if durable_cognition_attempted:
+            # Do not send this message through the legacy in-memory router
+            # after its durable cognition path was rate-limited or failed.
+            # The external producer must retain its cursor and redeliver.
+            return InboundAdmission(InboundAdmissionDisposition.RETRYABLE)
 
         # A legacy adapter/router path remains available for hosts without the
         # dispatcher contract, but is deliberately not reported as a durable

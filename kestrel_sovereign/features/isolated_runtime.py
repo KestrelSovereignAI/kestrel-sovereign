@@ -3688,16 +3688,19 @@ class ProxyFeature(Feature):
                         self._raise_promotion_failure(promotion)
                     return
 
-                # Stop new data-plane admission *before* talking to the
-                # producer. The exact lifecycle RPC below bypasses this normal
-                # gate, so a slow outbound send cannot consume the lifecycle
-                # budget. Only after the producer confirms its pause do we
-                # drain work admitted before this boundary.
+                # Quiesce the exact external producer while Core admission is
+                # still open. A callback already written into the bridge may
+                # be waiting for Core's durable ACK; closing first deadlocks
+                # that callback with the producer quiesce wait. The exact
+                # lifecycle RPC remains identity-fenced and bypasses the
+                # normal data-plane gate, so it cannot admit new work.
                 external_ingress_quiesce = self._new_external_ingress_quiesce()
-                gate_closed = True
-                await self._close_traffic_gate_admission()
                 if external_ingress_quiesce is not None:
                     await self._quiesce_external_ingress(external_ingress_quiesce)
+                # Once the producer has confirmed its pause, close admission
+                # and drain every callback that crossed the prior boundary.
+                gate_closed = True
+                await self._close_traffic_gate_admission()
                 await self._drain_traffic_gate()
 
                 await self._reconcile_client_to_authoritative_config(
@@ -3871,6 +3874,16 @@ class ProxyFeature(Feature):
                 try:
                     if self._fenced_recovery_failed:
                         await self._quarantine_unreconciled_client(lifecycle_lock_held=True)
+                    # Cancellation can arrive while the exact producer is
+                    # quiescing, before the normal body reaches its Core gate
+                    # close. Once that lifecycle operation has started, this
+                    # finalizer owns the same close/drain -> resume/quarantine
+                    # boundary; otherwise a cancelled quiesce can strand the
+                    # external producer paused forever.
+                    if external_ingress_quiesce is not None and not gate_closed:
+                        gate_closed = True
+                        await self._close_traffic_gate_admission()
+                        await self._drain_traffic_gate()
                     if gate_closed:
                         await self._finalize_external_ingress_transition(
                             external_ingress_quiesce

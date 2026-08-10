@@ -6,13 +6,14 @@ import asyncio
 import json
 import time
 from contextlib import asynccontextmanager, suppress
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-
 from kestrel_sdk.signals import (
+    RateLimit,
     RedactionPolicy,
     Signal,
     SignalMode,
@@ -20,11 +21,13 @@ from kestrel_sdk.signals import (
     Status,
     Trust,
 )
+
 from kestrel_sovereign.signals import (
     ACKNOWLEDGED,
     FAILED,
     LEASED,
     RETRY,
+    DurableAdmissionDisposition,
     DurableConsumerRegistration,
     DurableSignalStore,
     OrderedLockManager,
@@ -33,6 +36,8 @@ from kestrel_sovereign.signals import (
     SourceRegistry,
 )
 from kestrel_sovereign.signals.sources.channels import (
+    DURABLE_COGNITION_MARKER,
+    DURABLE_COGNITION_MARKER_VALUE,
     build_channel_message_registration,
 )
 from kestrel_sovereign.storage.db import SQLiteBackend
@@ -50,7 +55,7 @@ class _Agent:
     def did(self) -> str:
         return self._did
 
-    async def process_input(self, prompt: str):  # pragma: no cover - ACTION only
+    async def process_input(self, prompt: str):
         return prompt
 
     def _get_privacy_transition_lock(self):
@@ -118,6 +123,46 @@ async def _close(backend, agent: _Agent) -> None:
     if pending:
         await asyncio.gather(*pending, return_exceptions=True)
     await backend.close()
+
+
+def _channel_signal(agent_id: str, message_id: str) -> Signal:
+    return Signal(
+        source="channel.message",
+        kind="inbound",
+        mode=SignalMode.COGNITION,
+        payload={
+            DURABLE_COGNITION_MARKER: DURABLE_COGNITION_MARKER_VALUE,
+            "message_id": message_id,
+            "channel_type": "telegram",
+            "sender": "555",
+            "recipient": "42",
+            "content": f"message {message_id}",
+            "metadata": {},
+        },
+        target_agent=agent_id,
+        dedupe_key=f"telegram:{message_id}",
+    )
+
+
+async def _channel_dispatcher(path, did: str, *, rate_limit: RateLimit | None = None):
+    backend = SQLiteBackend(str(path))
+    await backend.connect()
+    store = SignalLogStore(backend)
+    await store.initialize()
+    agent = _Agent(did)
+    registry = SourceRegistry()
+    registration = build_channel_message_registration()
+    if rate_limit is not None:
+        registration = replace(registration, rate_limit=rate_limit)
+    registry.register(registration)
+    dispatcher = SignalDispatcher(
+        agent=agent,
+        registry=registry,
+        lock_manager=OrderedLockManager(),
+        store=store,
+    )
+    await dispatcher.initialize_durable_delivery()
+    return backend, agent, dispatcher
 
 
 async def _assert_sync_shutdown_drained(
@@ -278,6 +323,164 @@ async def test_source_event_dedup_prevents_duplicate_delivery_and_side_effect(tm
     assert len(deliveries) == 1
     assert deliveries[0].event.event_id == first.signal_id
     await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_cursor_owned_cognition_rate_limit_stays_retryable_until_delivery_ack(tmp_path):
+    """A rate limit cannot turn a persisted Telegram update into a duplicate loss."""
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / "cursor-rate-limit.db",
+        "did:agent:one",
+        rate_limit=RateLimit(per_minute=1, per_hour=300),
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id="core.channel-cognition-v1",
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=0,
+    )
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+
+        first = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "first"),
+            source_event_id="telegram:update:first",
+            consumer_id=consumer.consumer_id,
+        )
+        assert (
+            await first.wait_for_durable_admission()
+        ).disposition is DurableAdmissionDisposition.COMMITTED
+        assert (await first.wait()).status is Status.OK
+
+        limited = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "limited"),
+            source_event_id="telegram:update:limited",
+            consumer_id=consumer.consumer_id,
+        )
+        assert (
+            await limited.wait_for_durable_admission()
+        ).disposition is DurableAdmissionDisposition.NOT_ADMITTED
+        assert (await limited.wait()).status is Status.DROPPED_RATE_LIMIT
+        limited_delivery = next(
+            delivery
+            for delivery in await dispatcher.list_durable_deliveries(
+                consumer_id=consumer.consumer_id
+            )
+            if delivery.event.source_event_id == "telegram:update:limited"
+        )
+        assert limited_delivery.status == RETRY
+        assert limited_delivery.max_attempts == 0
+
+        # Redelivery is the provider's normal retry. Reset test-only policy
+        # windows rather than sleeping, then prove the same source key gets a
+        # cognition ACK instead of an early duplicate receipt.
+        dispatcher._rate.reset()
+        dispatcher._coalescing.reset()
+        retried = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "limited"),
+            source_event_id="telegram:update:limited",
+            consumer_id=consumer.consumer_id,
+        )
+        assert (
+            await retried.wait_for_durable_admission()
+        ).disposition is DurableAdmissionDisposition.COMMITTED
+        assert (await retried.wait()).status is Status.OK
+        completed = next(
+            delivery
+            for delivery in await dispatcher.list_durable_deliveries(
+                consumer_id=consumer.consumer_id
+            )
+            if delivery.event.source_event_id == "telegram:update:limited"
+        )
+        assert completed.status == ACKNOWLEDGED
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_cursor_owned_cognition_recovers_after_restart_before_cognition_ack(tmp_path):
+    """A persisted but interrupted callback is redeliverable after restart."""
+    path = tmp_path / "cursor-restart.db"
+    backend_a, agent_a, dispatcher_a = await _channel_dispatcher(path, "did:agent:one")
+    consumer = DurableConsumerRegistration(
+        consumer_id="core.channel-cognition-v1",
+        source="channel.message",
+        agent_id=agent_a.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=0,
+    )
+    started = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    async def interrupted_cognition(_prompt: str):
+        started.set()
+        await never_finish.wait()
+
+    agent_a.process_input = interrupted_cognition
+    try:
+        await dispatcher_a.register_durable_consumer(consumer)
+        interrupted = await dispatcher_a.enqueue_durable_cognition(
+            _channel_signal(agent_a.did, "restart"),
+            source_event_id="telegram:update:restart",
+            consumer_id=consumer.consumer_id,
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+        leased = (await dispatcher_a.list_durable_deliveries())[0]
+        assert leased.status == LEASED
+
+        # Simulate a hard process loss after persistence and lease acquisition
+        # but before cognition returns. No graceful owner release or provider
+        # cursor receipt occurs; make the abandoned owner's durable heartbeat
+        # stale without a wall-clock sleep so restart recovery can prove the
+        # exact lease is safe to redeliver.
+        interrupted.task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await interrupted.task
+        assert (
+            await interrupted.wait_for_durable_admission()
+        ).disposition is DurableAdmissionDisposition.NOT_ADMITTED
+        stale_at = datetime.now(timezone.utc) - timedelta(minutes=3)
+        await backend_a.execute(
+            "UPDATE durable_signal_runtime_owners SET heartbeat_at = ? "
+            "WHERE agent_id = ? AND owner_id = ?",
+            (
+                dispatcher_a._durable_store.to_timestamp_param(stale_at),
+                agent_a.did,
+                dispatcher_a._durable_delivery_owner,
+            ),
+        )
+        if dispatcher_a._runtime_owner_heartbeat_timer is not None:
+            dispatcher_a._runtime_owner_heartbeat_timer.cancel()
+    finally:
+        await _close(backend_a, agent_a)
+
+    backend_b, agent_b, dispatcher_b = await _channel_dispatcher(path, "did:agent:one")
+    try:
+        assert (await dispatcher_b.list_durable_deliveries())[0].status == RETRY
+        await dispatcher_b.register_durable_consumer(consumer)
+        recovered = await dispatcher_b.enqueue_durable_cognition(
+            _channel_signal(agent_b.did, "restart"),
+            source_event_id="telegram:update:restart",
+            consumer_id=consumer.consumer_id,
+        )
+        assert (
+            await recovered.wait_for_durable_admission()
+        ).disposition is DurableAdmissionDisposition.COMMITTED
+        assert (await recovered.wait()).status is Status.OK
+        delivery = (await dispatcher_b.list_durable_deliveries())[0]
+        assert delivery.status == ACKNOWLEDGED
+        assert delivery.attempts == 2
+    finally:
+        await dispatcher_b.shutdown_durable_delivery()
+        await _close(backend_b, agent_b)
 
 
 @pytest.mark.asyncio

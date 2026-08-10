@@ -19,8 +19,12 @@ from kestrel_sdk.signals import (
     Visibility,
 )
 
-
 SOURCE_NAME = "channel.message"
+# A selector-visible marker limits the durable cognition consumer to new
+# cursor-owning ingress events.  It prevents registration during upgrade from
+# backfilling every historic channel row into a fresh cognition turn.
+DURABLE_COGNITION_MARKER = "_durable_cognition"
+DURABLE_COGNITION_MARKER_VALUE = "channel-v1"
 PROMPT_TEMPLATE = (
     Path(__file__).resolve().parents[2]
     / "prompts"
@@ -117,6 +121,7 @@ def build_signal_for_channel_message(
         kind="inbound",
         mode=SignalMode.COGNITION,
         payload={
+            DURABLE_COGNITION_MARKER: DURABLE_COGNITION_MARKER_VALUE,
             "message_id": message.id,
             "channel_type": message.channel_type,
             "sender": message.sender,
@@ -133,6 +138,8 @@ def build_signal_for_channel_message(
 
 
 __all__ = [
+    "DURABLE_COGNITION_MARKER",
+    "DURABLE_COGNITION_MARKER_VALUE",
     "PROMPT_TEMPLATE",
     "SOURCE_NAME",
     "build_channel_message_registration",

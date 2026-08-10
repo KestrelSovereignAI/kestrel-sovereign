@@ -1622,15 +1622,18 @@ async def test_supported_transition_failure_keeps_old_config_and_service(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_external_ingress_gate_closes_before_quiesce_and_replays_only_after_resume(
+async def test_external_ingress_quiesces_callback_while_admission_is_open_then_drains(
     monkeypatch, tmp_path
 ):
-    """Lifecycle bypass quiesces only after ordinary data admission is closed."""
+    """A real pending producer callback cannot deadlock Core's transition."""
 
     old_config = {"enabled": True, "revision": "old"}
     next_config = {"enabled": True, "revision": "next"}
     delivered = []
     clients = []
+    callback_started = asyncio.Event()
+    callback_finished = asyncio.Event()
+    release_callback = asyncio.Event()
 
     class QuiescingIngressClient(FakeIsolatedClient):
         supports_config_transition = True
@@ -1641,13 +1644,25 @@ async def test_external_ingress_gate_closes_before_quiesce_and_replays_only_afte
             self.pending_events = []
             self.ingress_calls = []
             self.host_ingress_capabilities = HostIngressCapabilities(
-                names=("external-ingress-quiesce", "external-ingress-resume")
+                names=(
+                    "telegram-polling-ack",
+                    "external-ingress-quiesce",
+                    "external-ingress-resume",
+                )
             )
 
         async def call_host_ingress(self, name, payload=None):
             self.ingress_calls.append((name, payload))
+            if name == "telegram-polling-ack":
+                callback_started.set()
+                await release_callback.wait()
+                callback_finished.set()
+                return {"status": "ok", "http_status": 200, "state": "acknowledged"}
             if name == "external-ingress-quiesce":
-                assert feature._traffic_gate.closed is True
+                # The provider quiesce waits for its actual callback to
+                # finish. Core must leave admission open for that wait.
+                assert feature._traffic_gate.closed is False
+                await callback_finished.wait()
                 self.quiesced = True
                 return {"status": "ok", "http_status": 200, "state": "quiesced"}
             assert name == "external-ingress-resume"
@@ -1668,10 +1683,8 @@ async def test_external_ingress_gate_closes_before_quiesce_and_replays_only_afte
 
         async def prepare_config_transition(self, config):
             assert config == next_config
-            # This is the exact interval Sol reproduced: Core has closed the
-            # old event gate but the config hook has not yet returned. The
-            # external producer holds the update instead of acknowledging and
-            # emitting it into a closed gate.
+            # Quiesce has now completed, so Core closes admission before the
+            # hook runs. New producer events are retained until resume.
             assert feature._traffic_gate.closed is True
             await self.emit_external_update(
                 {
@@ -1710,9 +1723,22 @@ async def test_external_ingress_gate_closes_before_quiesce_and_replays_only_afte
         await feature.initialize()
         feature._route_inbound = record  # type: ignore[method-assign]
 
-        await feature.set_config(next_config)
+        await clients[0].event_handler(
+            _acknowledged_telegram_event("telegram:v2:bot:42:update:early")
+        )
+        await asyncio.wait_for(callback_started.wait(), timeout=1)
 
-        assert [call[0] for call in clients[0].ingress_calls] == [
+        transition_task = asyncio.create_task(feature.set_config(next_config))
+        await asyncio.sleep(0)
+        assert not transition_task.done()
+        release_callback.set()
+        await asyncio.wait_for(transition_task, timeout=1)
+
+        assert [
+            call[0]
+            for call in clients[0].ingress_calls
+            if call[0].startswith("external-ingress-")
+        ] == [
             "external-ingress-quiesce",
             "external-ingress-resume",
         ]
@@ -1721,12 +1747,22 @@ async def test_external_ingress_gate_closes_before_quiesce_and_replays_only_afte
                 break
             await asyncio.sleep(0)
         assert delivered == [
+            {
+                "channel_type": "telegram",
+                "direction": "inbound",
+                "sender": "555",
+                "recipient": "42",
+                "content": "hello",
+                "id": "telegram:v2:bot:42:update:early",
+                "metadata": {"dedupe_key": "telegram:v2:bot:42:update:early"},
+            },
             {"id": "late-update", "metadata": {"dedupe_key": "late-update"}}
         ]
         assert clients[0].pending_events == []
         assert feature._traffic_gate.closed is False
         assert feature._host_config == next_config
     finally:
+        release_callback.set()
         await feature.shutdown()
 
 
@@ -4046,7 +4082,7 @@ async def test_stale_equal_config_reconciles_only_after_external_ingress_fence(
         async def call_host_ingress(self, name, payload=None):
             self.ingress_calls.append((name, payload))
             if name == "external-ingress-quiesce":
-                assert stale._traffic_gate.closed is True
+                assert stale._traffic_gate.closed is False
                 self.quiesced = True
                 return {"status": "ok", "http_status": 200, "state": "quiesced"}
             raise AssertionError("a retired child must not be resumed")

@@ -683,6 +683,42 @@ class TestChannelFeature:
         router.assert_awaited_once_with(message)
 
     @pytest.mark.asyncio
+    async def test_handle_inbound_keeps_cursor_retryable_when_durable_cognition_fails(self):
+        """The legacy router must not consume a rate-limited durable callback."""
+        db = _make_db()
+        agent = _make_agent(db=db)
+        agent.did = "did:test:channels"
+        agent.dispatcher = MagicMock()
+        agent.dispatcher.register_durable_consumer = AsyncMock()
+        handle = MagicMock()
+        handle.wait_for_durable_admission = AsyncMock(
+            return_value=DurableAdmissionResult(
+                disposition=DurableAdmissionDisposition.NOT_ADMITTED,
+                signal_id="signal-1",
+            )
+        )
+        agent.dispatcher.enqueue_durable_cognition = AsyncMock(return_value=handle)
+        feat = ChannelFeature(agent)
+        await feat.initialize()
+        router = AsyncMock()
+        feat.registry.set_inbound_router(router)
+        feat.registry.register(StubAdapter(channel="telegram"))
+
+        admission = await feat.handle_inbound(
+            ChannelMessage(
+                channel_type="telegram",
+                direction=MessageDirection.INBOUND,
+                sender="alice",
+                recipient="bot",
+                content="retry me",
+            )
+        )
+
+        assert admission.disposition is InboundAdmissionDisposition.RETRYABLE
+        agent.dispatcher.enqueue_durable_cognition.assert_awaited_once()
+        router.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_handle_inbound_blocked_sender(self, feature):
         router = AsyncMock()
         feature.registry.set_inbound_router(router)

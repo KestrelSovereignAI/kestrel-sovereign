@@ -27,7 +27,6 @@ from kestrel_sovereign.a2a.stores.unified.base import UnifiedStoreBase
 from kestrel_sovereign.signals.store import _json_default, _serialize_chain
 from kestrel_sovereign.storage.db.interface import DatabaseBackend
 
-
 PENDING = "pending"
 INITIAL_RESERVED = "initial_reserved"
 LEASED = "leased"
@@ -56,6 +55,9 @@ class DurableConsumerRegistration:
     source: str
     agent_id: str
     correlation_selector: Optional[str] = None
+    # Zero is intentional: a cursor-owning external producer must retain its
+    # event until this consumer has acknowledged it, rather than converting a
+    # transient outage into a terminal loss after an arbitrary retry budget.
     max_attempts: int = 5
     lease_seconds: int = 60
     active: bool = True
@@ -574,14 +576,14 @@ class DurableSignalStore(UnifiedStoreBase):
                 SELECT delivery_id FROM {self.DELIVERIES}
                 WHERE agent_id = ? AND consumer_id = ?
                   AND status IN ('{PENDING}', '{RETRY}')
-                  AND attempts < max_attempts
+                  AND (max_attempts = 0 OR attempts < max_attempts)
                   AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
                 ORDER BY created_at, delivery_id
                 LIMIT 1
             )
               AND agent_id = ? AND consumer_id = ?
               AND status IN ('{PENDING}', '{RETRY}')
-              AND attempts < max_attempts
+              AND (max_attempts = 0 OR attempts < max_attempts)
               AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
             """,
             (
@@ -595,6 +597,65 @@ class DurableSignalStore(UnifiedStoreBase):
                 self.to_timestamp_param(now),
                 agent_id,
                 consumer_id,
+                self.to_timestamp_param(now),
+            ),
+        )
+        if updated == 0:
+            return None
+        return await self._delivery_for_lease_locked(
+            agent_id=agent_id,
+            consumer_id=consumer_id,
+            lease_token=lease_token,
+        )
+
+    async def claim_delivery_for_event(
+        self,
+        *,
+        agent_id: str,
+        consumer_id: str,
+        event_id: str,
+        executor_id: str,
+        now: Optional[datetime] = None,
+    ) -> Optional[DurableDelivery]:
+        """Atomically claim this consumer's delivery for one persisted event.
+
+        Cursor-owning ingress must never let a concurrent callback claim an
+        unrelated pending event and then acknowledge the wrong provider
+        cursor.  This is the exact-event counterpart of ``claim_delivery``.
+        """
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("consumer_id", consumer_id)
+        self._require_nonempty("event_id", event_id)
+        self._require_nonempty("executor_id", executor_id)
+        now = _as_utc(now or self.now_utc())
+        consumer = await self._get_consumer(agent_id, consumer_id)
+        if consumer is None or not consumer[4]:
+            return None
+        await self._recover_expired_leases(
+            agent_id=agent_id, consumer_id=consumer_id, now=now
+        )
+        lease_token = secrets.token_urlsafe(24)
+        lease_expires_at = now + timedelta(seconds=int(consumer[3]))
+        updated = await self._backend.execute(
+            f"""
+            UPDATE {self.DELIVERIES}
+            SET status = ?, attempts = attempts + 1, lease_owner = ?,
+                lease_token = ?, lease_expires_at = ?, next_attempt_at = NULL,
+                updated_at = ?
+            WHERE agent_id = ? AND consumer_id = ? AND event_id = ?
+              AND status IN ('{PENDING}', '{RETRY}')
+              AND (max_attempts = 0 OR attempts < max_attempts)
+              AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+            """,
+            (
+                LEASED,
+                executor_id,
+                lease_token,
+                self.to_timestamp_param(lease_expires_at),
+                self.to_timestamp_param(now),
+                agent_id,
+                consumer_id,
+                event_id,
                 self.to_timestamp_param(now),
             ),
         )
@@ -960,6 +1021,78 @@ class DurableSignalStore(UnifiedStoreBase):
             )
         return released
 
+    async def recover_abandoned_leases(
+        self,
+        *,
+        agent_id: str,
+        recovering_owner_id: str,
+        stale_before: datetime,
+        now: Optional[datetime] = None,
+    ) -> int:
+        """Requeue foreign leases whose runtime owner is stopped or stale.
+
+        A normal lease can be committed before cognition begins.  On restart,
+        retaining that lease until its deadline would make a provider callback
+        look like a duplicate even though its cognition was never made safe.
+        Owner-aware recovery restores that delivery without disturbing a live
+        sibling dispatcher sharing the same tenant.
+        """
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("recovering_owner_id", recovering_owner_id)
+        stale_before = _as_utc(stale_before)
+        now = _as_utc(now or self.now_utc())
+        timestamp = self._timestamp_placeholder()
+        async with self._backend.transaction():
+            released = await self._backend.execute(
+                f"""
+                UPDATE {self.DELIVERIES}
+                SET status = CASE
+                        WHEN max_attempts > 0 AND attempts >= max_attempts THEN ?
+                        ELSE ?
+                    END,
+                    lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+                    next_attempt_at = CASE
+                        WHEN max_attempts > 0 AND attempts >= max_attempts THEN NULL
+                        ELSE {timestamp}
+                    END,
+                    last_error = 'lease owner unavailable before acknowledgement',
+                    terminal_at = CASE
+                        WHEN max_attempts > 0 AND attempts >= max_attempts
+                        THEN {timestamp} ELSE NULL
+                    END,
+                    updated_at = ?
+                WHERE agent_id = ? AND status = ? AND lease_owner <> ?
+                  AND (
+                      NOT EXISTS (
+                          SELECT 1 FROM {self.RUNTIME_OWNERS} owner
+                          WHERE owner.agent_id = {self.DELIVERIES}.agent_id
+                            AND owner.owner_id = {self.DELIVERIES}.lease_owner
+                      )
+                      OR EXISTS (
+                          SELECT 1 FROM {self.RUNTIME_OWNERS} owner
+                          WHERE owner.agent_id = {self.DELIVERIES}.agent_id
+                            AND owner.owner_id = {self.DELIVERIES}.lease_owner
+                            AND (
+                                owner.stopped_at IS NOT NULL
+                                OR owner.heartbeat_at < ?
+                            )
+                      )
+                  )
+                """,
+                (
+                    FAILED,
+                    RETRY,
+                    self.to_timestamp_param(now),
+                    self.to_timestamp_param(now),
+                    self.to_timestamp_param(now),
+                    agent_id,
+                    LEASED,
+                    recovering_owner_id,
+                    self.to_timestamp_param(stale_before),
+                ),
+            )
+        return released
+
     async def ack_delivery(
         self,
         *,
@@ -1009,9 +1142,9 @@ class DurableSignalStore(UnifiedStoreBase):
     ) -> Optional[DurableDelivery]:
         """Release a failed lease for retry or mark a terminal failure.
 
-        Retry is bounded by the delivery's persisted ``max_attempts``.  A
-        caller may request terminal failure earlier, but cannot request an
-        unbounded retry by passing a fresh policy on every invocation.
+        Retry is bounded by the delivery's persisted ``max_attempts`` unless
+        that value is zero, which intentionally means retry until an explicit
+        terminal failure or acknowledgement.
         """
         self._require_nonempty("error", error)
         if retry_delay.total_seconds() < 0:
@@ -1022,12 +1155,12 @@ class DurableSignalStore(UnifiedStoreBase):
         updated = await self._backend.execute(
             f"""
             UPDATE {self.DELIVERIES}
-            SET status = CASE WHEN ? OR attempts >= max_attempts THEN ? ELSE ? END,
+            SET status = CASE WHEN ? OR (max_attempts > 0 AND attempts >= max_attempts) THEN ? ELSE ? END,
                 lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
                 next_attempt_at = CASE
-                    WHEN ? OR attempts >= max_attempts THEN NULL ELSE {timestamp} END,
+                    WHEN ? OR (max_attempts > 0 AND attempts >= max_attempts) THEN NULL ELSE {timestamp} END,
                 last_error = ?,
-                terminal_at = CASE WHEN ? OR attempts >= max_attempts
+                terminal_at = CASE WHEN ? OR (max_attempts > 0 AND attempts >= max_attempts)
                     THEN {timestamp} ELSE NULL END,
                 updated_at = ?
             WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
@@ -1065,6 +1198,18 @@ class DurableSignalStore(UnifiedStoreBase):
                 "d.agent_id = ? AND d.consumer_id = ? AND d.delivery_id = ?"
             ),
             (agent_id, consumer_id, delivery_id),
+        )
+        return self._row_to_delivery(row) if row is not None else None
+
+    async def get_delivery_for_event(
+        self, *, agent_id: str, consumer_id: str, event_id: str
+    ) -> Optional[DurableDelivery]:
+        """Read one consumer delivery by its immutable persisted event ID."""
+        row = await self._backend.fetch_one(
+            self._delivery_select_sql(
+                "d.agent_id = ? AND d.consumer_id = ? AND d.event_id = ?"
+            ),
+            (agent_id, consumer_id, event_id),
         )
         return self._row_to_delivery(row) if row is not None else None
 
@@ -1145,9 +1290,9 @@ class DurableSignalStore(UnifiedStoreBase):
         if (
             not isinstance(registration.max_attempts, int)
             or isinstance(registration.max_attempts, bool)
-            or registration.max_attempts < 1
+            or registration.max_attempts < 0
         ):
-            raise ValueError("max_attempts must be >= 1")
+            raise ValueError("max_attempts must be >= 0")
         if (
             not isinstance(registration.lease_seconds, int)
             or isinstance(registration.lease_seconds, bool)
@@ -1328,12 +1473,12 @@ class DurableSignalStore(UnifiedStoreBase):
         await self._backend.execute(
             f"""
             UPDATE {self.DELIVERIES}
-            SET status = CASE WHEN attempts >= max_attempts THEN ? ELSE ? END,
+            SET status = CASE WHEN max_attempts > 0 AND attempts >= max_attempts THEN ? ELSE ? END,
                 lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
-                next_attempt_at = CASE WHEN attempts >= max_attempts
+                next_attempt_at = CASE WHEN max_attempts > 0 AND attempts >= max_attempts
                     THEN NULL ELSE {timestamp} END,
                 last_error = 'lease expired before acknowledgement',
-                terminal_at = CASE WHEN attempts >= max_attempts
+                terminal_at = CASE WHEN max_attempts > 0 AND attempts >= max_attempts
                     THEN {timestamp} ELSE NULL END,
                 updated_at = ?
             WHERE agent_id = ? AND consumer_id = ? AND status = ?
