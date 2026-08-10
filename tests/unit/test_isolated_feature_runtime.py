@@ -8458,6 +8458,58 @@ async def test_precompleted_foreign_failure_on_stopped_loop_is_consumed_without_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ("result", "exception"))
+async def test_foreign_terminal_source_is_detached_when_host_delivery_is_stranded(
+    monkeypatch, caplog, outcome
+):
+    """A host callback failure cannot retain a foreign tenant terminal value."""
+
+    foreign_loop = asyncio.new_event_loop()
+    secret = "STRANDED-FOREIGN-TERMINAL-SECRET-2755"
+
+    class TenantValue:
+        pass
+
+    class TenantError(RuntimeError):
+        pass
+
+    source = foreign_loop.create_future()
+    value = TenantValue()
+    value.secret = secret
+    value_ref = weakref.ref(value)
+    operation = isolated_runtime._create_host_owned_facade_task(
+        source, name=f"stranded-foreign-{outcome}"
+    )
+    # The foreign owner loop is stopped, so construction cannot queue an
+    # observer. Model its eventual owner-loop consumption below while the host
+    # is already unable to accept the resulting callback.
+    monkeypatch.setattr(
+        operation._host_loop,
+        "call_soon_threadsafe",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("closing")),
+    )
+    if outcome == "result":
+        source.set_result(value)
+        error = None
+    else:
+        error = TenantError(secret)
+        error.value = value
+        source.set_exception(error)
+
+    # The owner-loop disposition is terminal, but the closing host loop cannot
+    # deliver its release callback. Detachment must precede that attempt.
+    operation._observe_foreign_source_settlement(source)
+
+    assert operation.done() is True
+    assert operation._source is None
+    del source, value, error
+    gc.collect()
+    assert value_ref() is None
+    assert secret not in caplog.text
+    foreign_loop.close()
+
+
+@pytest.mark.asyncio
 async def test_foreign_facade_dispatch_race_fails_closed_without_escaping(monkeypatch):
     """A loop that closes between inspection and dispatch cannot lose ownership."""
 
@@ -8614,6 +8666,66 @@ async def test_owned_health_probe_child_cancellation_is_an_ordinary_failure():
         )
 
     assert failed.value.__context__ is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repeat", (False, True))
+async def test_health_cancellation_bridge_preserves_count_reason_without_latent_delivery(
+    repeat,
+):
+    """A replayed parent cancellation is not injected again after uncancel."""
+
+    async def owner():
+        task = asyncio.current_task()
+        try:
+            task.cancel("first accepted reason")
+            await asyncio.sleep(0)
+        except asyncio.CancelledError as cancelled:
+            if repeat:
+                # Run a second accepted request after the bridge has begun
+                # its event-loop checkpoint. It must not replace the first
+                # cancellation payload the public boundary replays.
+                asyncio.get_running_loop().call_soon(
+                    task.cancel, "later cancellation reason"
+                )
+            args = await isolated_runtime._capture_parent_cancellation_args(
+                cancelled
+            )
+            count = task.cancelling()
+            while task.cancelling():
+                task.uncancel()
+            await asyncio.sleep(0)
+            return args, count
+
+    args, count = await asyncio.wait_for(owner(), timeout=1)
+    assert args == ("first accepted reason",)
+    assert count == (2 if repeat else 1)
+
+
+@pytest.mark.asyncio
+async def test_stale_cancellation_count_does_not_reclassify_self_cancelled_health():
+    """A caught historical cancel is not a parent cancel for a later probe."""
+
+    owner = asyncio.current_task()
+    owner.cancel("historical cancellation")
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.sleep(0)
+    assert owner.cancelling() == 1
+
+    async def self_cancelled_health():
+        asyncio.current_task().cancel()
+        await asyncio.sleep(0)
+
+    with pytest.raises(RuntimeError, match="health probe was cancelled"):
+        await isolated_runtime._await_owned_health_probe(
+            self_cancelled_health(),
+            name="stale-cancellation-health",
+            on_started=lambda _task: None,
+            on_late_task=lambda _task: pytest.fail("settled child must not detach"),
+        )
+
+    assert owner.cancelling() == 1
+    owner.uncancel()
 
 
 @pytest.mark.asyncio
@@ -8786,6 +8898,51 @@ async def test_supervisor_restarts_after_child_cancelled_health_probe(monkeypatc
         assert client.stop_calls == 1
         assert client.start_calls == 1
         assert feature._traffic_gate.sealed is False
+    finally:
+        feature._stopping = True
+        if not supervisor.done():
+            supervisor.cancel()
+        await asyncio.gather(supervisor, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_supervisor_logs_neutral_health_and_restart_failures(monkeypatch, tmp_path, caplog):
+    """Compatible facade failures never put tenant exception text in logs."""
+
+    health_attempted = asyncio.Event()
+    restart_attempted = asyncio.Event()
+    secret = "ISOLATED-FACADE-TENANT-SECRET-2755"
+    real_sleep = asyncio.sleep
+
+    class SecretFailingClient(FakeIsolatedClient):
+        def health(self):
+            health_attempted.set()
+            raise RuntimeError(secret)
+
+        async def stop(self):
+            return None
+
+        def start(self):
+            restart_attempted.set()
+            raise RuntimeError(secret)
+
+    async def immediate_sleep(_delay):
+        await real_sleep(0)
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    monkeypatch.setattr(isolated_runtime.asyncio, "sleep", immediate_sleep)
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    feature._client = SecretFailingClient()
+    supervisor = asyncio.create_task(feature._supervise())
+    feature._supervision_task = supervisor
+    try:
+        await asyncio.wait_for(health_attempted.wait(), timeout=1)
+        await asyncio.wait_for(restart_attempted.wait(), timeout=1)
+        assert "health check failed" in caplog.text
+        assert "restart failed" in caplog.text
+        assert secret not in caplog.text
     finally:
         feature._stopping = True
         if not supervisor.done():
