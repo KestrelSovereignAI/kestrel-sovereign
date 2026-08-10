@@ -23,7 +23,7 @@ from kestrel_sovereign.setup.constitution_reanchor import ReanchorResult
 def restore_environ():
     """Restore ``os.environ`` wholesale.
 
-    ``_load_target_env`` mutates it with ``os.environ.setdefault``, which
+    ``load_project_env`` mutates it with ``os.environ.setdefault``, which
     ``monkeypatch`` does not track — a leaked ``KESTREL_DB_BACKEND`` would
     redirect every later test's storage.
     """

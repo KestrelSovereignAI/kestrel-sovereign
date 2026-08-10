@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from kestrel_sovereign import __version__
+from kestrel_sovereign.paths import load_project_env
 from kestrel_sovereign.multi_agent.config import (
     MultiAgentConfig,
     LocalAgentConfig,
@@ -80,31 +81,6 @@ def _get_project_dir() -> Path:
     return project_dir()
 
 
-def _load_target_env(project_dir: Path, *, exclude: tuple[str, ...] = ()) -> None:
-    """Load the resolved project home's ``.env`` into ``os.environ``.
-
-    Target-aware replacement for the import-time ``load_dotenv()`` that
-    ``inception_service`` used to run (which loaded the *current-directory*
-    ``.env`` and could seed the wrong ``KESTREL_DATA_KEY`` — #2468). Uses
-    python-dotenv's own parser (``dotenv_values``) — the same one the runtime
-    uses — and ``setdefault`` semantics so a genuinely-exported value stays
-    authoritative (equivalent to ``load_dotenv(override=False)``).
-
-    ``exclude`` names keys to skip. The data key is excluded when this runs
-    *before* custody resolution so that seeding the persisted value into
-    ``os.environ`` cannot mask an exported⇄persisted conflict (#2468).
-    """
-    env_path = project_dir / ".env"
-    if not env_path.exists():
-        return
-    from dotenv import dotenv_values
-
-    for key, value in dotenv_values(str(env_path)).items():
-        if value is None or key in exclude:
-            continue
-        os.environ.setdefault(key, value)
-
-
 def _apply_target_data_key_custody(project_dir: Path) -> Optional[str]:
     """Resolve the single effective ``KESTREL_DATA_KEY`` for this target home
     and make it authoritative in the process, mirroring the wizard ``keys`` step
@@ -132,7 +108,7 @@ def _apply_target_data_key_custody(project_dir: Path) -> Optional[str]:
         ensure_effective_data_key,
     )
 
-    _load_target_env(project_dir, exclude=(DATA_KEY_ENV,))
+    load_project_env(project_dir, exclude=(DATA_KEY_ENV,))
     _, conflict, _, _ = ensure_effective_data_key(
         project_dir / ".env", generate_if_missing=True
     )
@@ -409,6 +385,14 @@ def cmd_shell(args) -> int:
     for this agent; falls back to an in-process agent instance if not.
     """
     project_dir = _get_project_dir()
+    # The in-process fallback builds a whole agent here — its own LLMService,
+    # its own storage — so this command needs the home's environment, and it
+    # used to get it as a side effect of constructing that LLMService. That is
+    # exactly the accident #2896 removed. Without it `KESTREL_DATA_KEY` is
+    # absent (the key hierarchy has no `.env` fallback), the first encrypted
+    # read raises, and the shell reports a decryption problem for what is an
+    # env-loading regression.
+    load_project_env(project_dir)
     multi_agent = MultiAgentConfig.load(project_dir / MULTI_AGENT_CONFIG_FILENAME)
     local_agents = multi_agent.get_local_agents()
 
@@ -954,7 +938,7 @@ def cmd_constitution_reanchor(args) -> int:
     # with a stale exported key can still write a constitution blob the agent
     # cannot decrypt. That hazard predates this change; what changes is that
     # the key now gets loaded at all.
-    _load_target_env(project_dir)
+    load_project_env(project_dir)
 
     multi_agent = MultiAgentConfig.load(
         project_dir / MULTI_AGENT_CONFIG_FILENAME, auto_discover_fallback=False,
@@ -1095,7 +1079,7 @@ def cmd_constitution_anchor_overlay(args) -> int:
     # database this anchor lands in. The overlay hash is read by the runtime,
     # so writing the local file on a PostgreSQL host leaves every Amendment IX
     # grant in the overlay permanently denied while reporting success.
-    _load_target_env(project_dir)
+    load_project_env(project_dir)
 
     multi_agent = MultiAgentConfig.load(
         project_dir / MULTI_AGENT_CONFIG_FILENAME, auto_discover_fallback=False,
@@ -1369,7 +1353,7 @@ def cmd_setup(args) -> int:
     if not args.reset and flow is not Flow.CHECK:
         from kestrel_sovereign.setup.steps.keys import DATA_KEY_ENV
 
-        _load_target_env(project_dir, exclude=(DATA_KEY_ENV,))
+        load_project_env(project_dir, exclude=(DATA_KEY_ENV,))
 
     return run_wizard(ctx, only_step=args.step)
 

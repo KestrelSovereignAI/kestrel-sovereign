@@ -420,11 +420,10 @@ def _build_configured_genesis_auditor(project_dir: Path):
         # free of import-time/current-directory dotenv behavior (#2468).
         import os
 
-        from kestrel_sovereign.cli import _load_target_env
         from kestrel_sovereign.llm.service import LLMService
-        from kestrel_sovereign.paths import reset_cache
+        from kestrel_sovereign.paths import load_project_env, reset_cache
 
-        _load_target_env(project_dir)
+        load_project_env(project_dir)
         # LLMService resolves kestrel.toml during its synchronous constructor.
         # Pin that instant to the explicit create_agent target, then restore the
         # host environment before the first await so concurrent agents cannot

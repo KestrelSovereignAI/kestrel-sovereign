@@ -26,7 +26,6 @@ from kestrel_sdk.llm import ProviderCapabilities
 if TYPE_CHECKING:
     from kestrel_sovereign.storage.async_database import AsyncDatabase
     from .embedding_space import EmbeddingSpacePin, ParityResult
-from dotenv import load_dotenv
 from pydantic import BaseModel
 
 from .provider_registry import (
@@ -377,9 +376,25 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                          the process environment cannot name each agent's data
                          root and SQLite usage rows would otherwise all land in
                          one agent's database (#2769).
-        """
-        load_dotenv()
 
+        Reads the process environment; does not load it. ``load_dotenv()`` used
+        to be the first statement here, so constructing a service — lazily, on
+        RAG chunking, inception, embedding, per-agent boot — wrote a ``.env``
+        back into ``os.environ``. ``override=False`` made that look safe: it
+        protects keys that are *set*, and silently resurrects keys that were
+        deliberately *unset*, so "run without this variable" was unenforceable
+        for the rest of the process (#2896).
+
+        And the file was the wrong one. A bare ``load_dotenv()`` resolves via
+        ``find_dotenv()``, which walks up from *this module's own file* — so it
+        picked up whatever ``.env`` sits above the package (the repo root in a
+        source clone, anything above ``site-packages`` in a pip install), never
+        the home of the agent being constructed.
+
+        Environment loading belongs at a process entry point, once, against a
+        named home: :func:`kestrel_sovereign.paths.load_project_env`. Same rule
+        as #2468, which removed the equivalent call from ``inception_service``.
+        """
         # default_model is derived from first provider in provider_priority
         # (see provider_registry and endpoints/models.py)
         self.default_model = None  # Deprecated: use providers[0] instead
