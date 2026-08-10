@@ -219,3 +219,133 @@ test('SSE listener routes signal_completed end-to-end into the pane', async () =
 
     globalThis.EventSource = origES;
 });
+
+// The notification stream is pinned to the agent captured at connect time
+// (`notificationAgent`), NOT whatever pane is mounted now — so a test that
+// only mounts a pane would assert against a DIFFERENT pane than the handler
+// writes to, and its "nothing was painted" assertions would pass vacuously.
+// Rebind the stream to the freshly-mounted pane so the destination the
+// handler resolves is the one under test.
+function mountNotificationPane(name) {
+    const pane = mountFreshPane(name);
+    class SilentES {
+        constructor(_url) {}
+        addEventListener() {}
+        close() {}
+    }
+    const origES = globalThis.EventSource;
+    globalThis.EventSource = SilentES;
+    try {
+        connectNotifications();
+    } finally {
+        globalThis.EventSource = origES;
+    }
+    return pane;
+}
+
+test('mountNotificationPane binds the handler destination to the pane', async () => {
+    // Guards the guard: if this stops holding, every assertion below that
+    // expects NOTHING to be painted would pass for the wrong reason.
+    const pane = mountNotificationPane('wake-binding-selfcheck');
+    pane.sessionId = null;
+    await handleSignalCompleted(wakePayload({
+        signal_id: 'selfcheck-1',
+        result_summary: 'Self-check body.',
+    }));
+    assert.ok(pane.element.children.find(
+        (c) => c.classList && c.classList.contains('signal-wake-message')),
+        'the pane under test must be the handler destination');
+});
+
+// #2877: a wake can now be BOUND to the chat session that registered the
+// work (a Talon job completion resumes the session that dispatched it, as a
+// restart wake does since #1809). The notifications stream is pinned to the
+// agent, not to a session, so agent-pinning alone no longer picks the right
+// destination: if the pane has been switched to another conversation while
+// the job ran, painting the wake there shows a turn that is not in the
+// transcript the reader is looking at — and that reappears in the OTHER
+// conversation on reload.
+
+test('a session-bound wake paints into its own conversation', async () => {
+    const pane = mountNotificationPane('wake-session-match');
+    pane.sessionId = 'sess-A';
+    await handleSignalCompleted(wakePayload({
+        signal_id: 'bound-match-1',
+        session_id: 'sess-A',
+        result_summary: 'Talon job finished; dispatched attempt 4.',
+    }));
+
+    const wakeMsg = pane.element.children.find(
+        (c) => c.classList && c.classList.contains('signal-wake-message'));
+    assert.ok(wakeMsg, 'a wake bound to the displayed session must render');
+    assert.match(wakeMsg.querySelector('.message-content').innerHTML,
+        /dispatched attempt 4/);
+});
+
+test('a wake bound to another conversation is not painted here', async () => {
+    const pane = mountNotificationPane('wake-session-mismatch');
+    pane.sessionId = 'sess-B';
+    await handleSignalCompleted(wakePayload({
+        signal_id: 'bound-mismatch-1',
+        session_id: 'sess-A',
+        result_summary: 'Belongs to the other thread.',
+    }));
+
+    assert.equal(pane.element.children.length, 0,
+        'the wake persisted into sess-A; painting it into sess-B would show '
+        + 'a turn that is not in this transcript');
+});
+
+test('a session-less wake still renders (unattended cron/CLI work)', async () => {
+    const pane = mountNotificationPane('wake-session-none');
+    pane.sessionId = 'sess-B';
+    await handleSignalCompleted(wakePayload({
+        signal_id: 'unbound-1',
+        session_id: null,
+        result_summary: 'Unattended job finished.',
+    }));
+
+    const wakeMsg = pane.element.children.find(
+        (c) => c.classList && c.classList.contains('signal-wake-message'));
+    assert.ok(wakeMsg,
+        'an unattended wake has no originating conversation — the pre-#2877 '
+        + 'agent-pinned destination stays correct');
+});
+
+test('a bound wake renders when the pane has no conversation yet', async () => {
+    const pane = mountNotificationPane('wake-session-unbound-pane');
+    pane.sessionId = null;
+    await handleSignalCompleted(wakePayload({
+        signal_id: 'bound-nopane-1',
+        session_id: 'sess-A',
+        result_summary: 'Arrived before the pane bound a conversation.',
+    }));
+
+    assert.ok(pane.element.children.find(
+        (c) => c.classList && c.classList.contains('signal-wake-message')),
+        'an unbound pane has nothing to mismatch against — do not drop the wake');
+});
+
+test('a filtered wake is not consumed by the dedupe set', async () => {
+    // The mismatch check must run BEFORE the signal_id is recorded as
+    // rendered; otherwise switching back to the originating conversation
+    // (or a reconnect replay) would find the wake already "seen" and the
+    // turn would never paint anywhere.
+    const away = mountNotificationPane('wake-session-refilter');
+    away.sessionId = 'sess-B';
+    await handleSignalCompleted(wakePayload({
+        signal_id: 'refilter-1', session_id: 'sess-A',
+        result_summary: 'Deferred body.',
+    }));
+    assert.equal(away.element.children.length, 0);
+
+    const home = mountNotificationPane('wake-session-refilter-home');
+    home.sessionId = 'sess-A';
+    await handleSignalCompleted(wakePayload({
+        signal_id: 'refilter-1', session_id: 'sess-A',
+        result_summary: 'Deferred body.',
+    }));
+    assert.ok(home.element.children.find(
+        (c) => c.classList && c.classList.contains('signal-wake-message')),
+        'a wake dropped for a session mismatch must stay renderable');
+});

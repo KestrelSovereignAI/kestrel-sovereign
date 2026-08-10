@@ -109,6 +109,34 @@ class TalonWaitable:
             data=payload,
         )
 
+    async def origin_session_id(self, handle: str) -> Optional[str]:
+        """The chat session that dispatched job ``handle``, or ``None``.
+
+        The reconciler's TRUSTED routing channel (#2877): it lifts this onto
+        ``Signal.session_id`` so the terminal ``talon.job_complete`` wake
+        resumes the session the job was dispatched from instead of minting a
+        fresh one. Deliberately a provider method rather than a key in
+        :meth:`poll`'s ``WaitStatus.data`` — the reconciler spreads that dict
+        into the signal payload verbatim, and at least one sibling provider
+        (``A2AWaitable``) spreads *peer-returned* data into it, so a payload
+        key is caller-influenceable and must never be routing authority. This
+        read is local and provider-owned: the coordinator's own durable job
+        registry, written at dispatch.
+
+        ``None`` for an unknown job, for unattended (CLI/scheduler) dispatch,
+        and for job records written before #2877 — all of which keep waking
+        system-initiated in a fresh session, as before.
+        """
+        feature = self._feature
+        feature._reload_persisted_jobs()
+        info = feature._jobs.get(handle)
+        if not isinstance(info, dict):
+            return None
+        origin = info.get("origin_session_id")
+        if isinstance(origin, str) and origin.strip():
+            return origin.strip()
+        return None
+
     async def active_handles(self) -> List[str]:
         """Return the job ids the reconciler should poll for a wake.
 

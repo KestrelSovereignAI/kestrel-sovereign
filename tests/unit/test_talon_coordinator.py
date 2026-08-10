@@ -1,8 +1,10 @@
 """Tests for TalonCoordinatorFeature."""
 
+import asyncio
 import json
 import urllib.error
 import urllib.request
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 import pytest
@@ -10,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign._bounded_subprocess import BoundedProcessResult
+from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.features.talon.coordinator import TalonCoordinatorFeature
 from kestrel_sovereign.features.talon.verification import CommandExecution
 from kestrel_sovereign.features.talon.wait_provider import TalonWaitable
@@ -2346,6 +2349,7 @@ class TestVerifyPipelineCI:
         import kestrel_sovereign.signals.context as ctx
 
         sig = MagicMock()
+        sig.kind = "workflow.stage"
         sig.session_id = "run-1"
         monkeypatch.setattr(ctx, "get_current_signal", lambda: sig)
 
@@ -2385,6 +2389,7 @@ class TestVerifyPipelineCI:
         import kestrel_sovereign.signals.context as ctx
 
         sig = MagicMock()
+        sig.kind = "workflow.stage"
         sig.session_id = "run-42"
         monkeypatch.setattr(ctx, "get_current_signal", lambda: sig)
 
@@ -2393,3 +2398,326 @@ class TestVerifyPipelineCI:
         # A non-dispatched result records nothing.
         feature._record_pipeline_run_job({"dispatched": False, "job_id": "x"})
         assert "x" not in feature._pipeline_run_jobs.values()
+
+    @pytest.mark.asyncio
+    async def test_chat_session_signal_is_not_a_workflow_run_id(
+        self, monkeypatch
+    ):
+        """#2877: ``Signal.session_id`` is a CHAT session on every source but
+        ``workflow.stage``. A talon dispatch made from inside a
+        ``talon.job_complete`` wake turn (the multi-attempt loop this issue
+        reports) must NOT bind that chat session into the run→job map — a
+        later ``verify_pipeline_ci`` would then resolve a job for a run that
+        never dispatched one, the caller-influenceable binding #2303 made
+        fail closed. Same gate ``_observability_context`` already applies."""
+        feature = self._feature()
+        import kestrel_sovereign.signals.context as ctx
+
+        sig = MagicMock()
+        sig.kind = "inbound"  # a talon.job_complete wake, not a workflow stage
+        sig.session_id = "chat-session-abc"
+        monkeypatch.setattr(ctx, "get_current_signal", lambda: sig)
+
+        assert feature._current_workflow_run_id() is None
+        feature._record_pipeline_run_job({"dispatched": True, "job_id": "job-1"})
+        assert feature._pipeline_run_jobs == {}
+
+
+class _TurnAgent(TurnLifecycleMixin):
+    """An agent double with the REAL turn lifecycle.
+
+    Only the attributes the coordinator actually reads. The lifecycle is not
+    stubbed on purpose: the whole question in #2877 is what the turn
+    machinery does with the ContextVar and `_active_session_id` across task
+    boundaries, which a `_get_current_turn_id = lambda: "x"` double cannot
+    answer.
+    """
+
+    agent_name = "kestrel"
+    did = "did:test:2877"
+
+    def __init__(self, storage_path=None):
+        self._features = []
+        self._active_session_id = None
+        self._live_turn_id = None
+        if storage_path is not None:
+            self.storage_path = str(storage_path)
+
+
+@asynccontextmanager
+async def _chat_turn(agent, session_id):
+    """A turn exactly as production runs one: the lifecycle assigns the turn
+    id, the turn body assigns the session."""
+    async with agent._turn_lifecycle():
+        agent._active_session_id = session_id
+        yield
+
+
+class TestOriginSessionCapture:
+    """#2877: the chat session that dispatched a job is recorded on the job
+    record, so its completion wake resumes that session instead of minting a
+    fresh one and stranding the turn outside the user's visible thread.
+
+    The capture must be true to ONE task's ownership of the live turn.
+    `_active_session_id` is an agent-global attribute and `_CURRENT_TURN_ID`
+    is a ContextVar copied into child tasks, so each read on its own lies in a
+    different direction — see `_get_turn_bound_session_id`.
+    """
+
+    @pytest.mark.asyncio
+    async def test_captures_the_session_of_the_dispatching_turn(self):
+        agent = _TurnAgent()
+        feature = TalonCoordinatorFeature(agent)
+        async with _chat_turn(agent, "chat-sess-1"):
+            assert feature._origin_session_id() == "chat-sess-1"
+
+    @pytest.mark.asyncio
+    async def test_tool_call_in_a_child_task_still_captures(self):
+        """Tools run in tasks the turn creates and awaits; they inherit the
+        turn's context and the turn is still live, so they must capture. This
+        is the ordinary dispatch path — a check that only asked 'am I the same
+        task' would break every real claim."""
+        agent = _TurnAgent()
+        feature = TalonCoordinatorFeature(agent)
+
+        async def _tool():
+            return feature._origin_session_id()
+
+        async with _chat_turn(agent, "chat-sess-1"):
+            assert await asyncio.create_task(_tool()) == "chat-sess-1"
+
+    @pytest.mark.asyncio
+    async def test_unattended_dispatch_has_no_origin(self):
+        """CLI/scheduler dispatch runs outside any turn — the wake must stay
+        system-initiated (a fresh session), exactly as before #2877."""
+        agent = _TurnAgent()
+        feature = TalonCoordinatorFeature(agent)
+        assert feature._origin_session_id() == ""
+
+    @pytest.mark.asyncio
+    async def test_after_the_turn_exits_there_is_no_origin(self):
+        agent = _TurnAgent()
+        feature = TalonCoordinatorFeature(agent)
+        async with _chat_turn(agent, "chat-sess-1"):
+            pass
+        assert feature._origin_session_id() == ""
+
+    @pytest.mark.asyncio
+    async def test_session_less_turn_has_no_origin(self):
+        agent = _TurnAgent()
+        feature = TalonCoordinatorFeature(agent)
+        async with _chat_turn(agent, None):
+            assert feature._origin_session_id() == ""
+
+    @pytest.mark.asyncio
+    async def test_detached_task_never_captures_a_later_turns_session(self):
+        """The regression this class exists for.
+
+        A task detached from turn A keeps turn A's ContextVar copy forever —
+        including after A exits — so a truthy turn id proves nothing. If that
+        task dispatches while an unrelated chat turn B is live, reading the
+        agent-global `_active_session_id` hands it B's session: unattended
+        background work would then wake into a stranger's chat window and
+        paint a USER_VISIBLE turn there.
+        """
+        agent = _TurnAgent()
+        feature = TalonCoordinatorFeature(agent)
+        turn_b_running = asyncio.Event()
+        captured = {}
+
+        async def _detached():
+            # Outlives turn A; dispatches while turn B holds the agent.
+            await turn_b_running.wait()
+            captured["origin"] = feature._origin_session_id()
+            captured["turn_id"] = agent._get_current_turn_id()
+
+        async with _chat_turn(agent, "chat-A"):
+            detached = asyncio.create_task(_detached())
+
+        async with _chat_turn(agent, "chat-B"):
+            turn_b_running.set()
+            await detached
+
+        assert captured["turn_id"], (
+            "precondition: the detached task still reports turn A's id — that "
+            "inherited value is exactly why it cannot be trusted alone"
+        )
+        assert captured["origin"] == "", (
+            "a detached task must never capture the session of whatever turn "
+            "happens to be live when it runs"
+        )
+
+    def test_agent_without_the_accessor_degrades_to_unattended(self):
+        """Doubles and half-built agents have no turn lifecycle; they must
+        read as unattended rather than crashing the dispatch."""
+        agent = _make_agent()
+        del agent._get_turn_bound_session_id
+        assert TalonCoordinatorFeature(agent)._origin_session_id() == ""
+
+    def test_broken_accessor_degrades_to_unattended(self):
+        agent = _make_agent()
+
+        def _boom():
+            raise RuntimeError("no turn context")
+
+        agent._get_turn_bound_session_id = _boom
+        assert TalonCoordinatorFeature(agent)._origin_session_id() == ""
+
+    @pytest.mark.asyncio
+    async def test_a2a_job_record_carries_no_origin(self):
+        """The A2A rail cannot deliver a session-bound wake (the task lives on
+        the recipient; this row is in-memory and never enumerated for auto-wake),
+        so `talon_claim` keeps session-bound claims off it and an a2a job is
+        unattended by construction. A recorded-but-undeliverable origin would
+        read like a lost binding."""
+        agent = _TurnAgent()
+        feature = TalonCoordinatorFeature(agent)
+        with patch.object(
+            feature, "_discover_host_url", return_value="http://host",
+        ), patch("asyncio.to_thread", new=AsyncMock(return_value=b"{}")):
+            async with _chat_turn(agent, "chat-sess-2"):
+                result = await feature._dispatch_via_a2a("org/repo", 7)
+        assert result["dispatched"] is True
+        assert "origin_session_id" not in feature._jobs[result["task_id"]]
+
+    @pytest.mark.asyncio
+    async def test_persisted_registry_round_trips_the_origin(self, tmp_path):
+        """``_persist_jobs`` copies every field but ``process``, so the
+        binding survives a restart and the reloaded record still wakes into
+        the originating session."""
+        db = tmp_path / "kestrel_prime.db"
+        f1 = TalonCoordinatorFeature(_TurnAgent(storage_path=db))
+        f1._jobs = {
+            "job-1": {
+                "method": "cli_background", "status": "complete",
+                "origin_session_id": "chat-sess-3",
+            }
+        }
+        assert f1._persist_jobs() is True
+
+        f2 = TalonCoordinatorFeature(_TurnAgent(storage_path=db))
+        f2._reload_persisted_jobs()
+        assert f2._jobs["job-1"]["origin_session_id"] == "chat-sess-3"
+
+
+class TestSessionBoundClaimRail:
+    """#2877: a claim made from inside a chat turn takes the DURABLE rail.
+
+    A2A is the preferred route for a default claim, but it cannot deliver a
+    session-bound wake: the task is created on the recipient talon agent, the
+    sender's row is in-memory (``_persist_jobs`` skips a2a) and
+    ``TalonWaitable.active_handles`` never enumerates it, so nothing auto-wakes
+    the originating session. Routing the decision on the captured origin is
+    what makes the rest of the binding reachable from `talon_claim` at all.
+    """
+
+    @staticmethod
+    def _ready_workspace(tmp_path):
+        return {
+            "repo": "org/repo", "path": str(tmp_path / "org__repo"),
+            "exists": True, "is_git": True, "head": "main", "clean": True,
+            "last_fetch_at": None, "safe": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_claim_from_a_chat_turn_uses_the_cli_rail(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("KESTREL_TALON_WORKSPACE_ROOT", str(tmp_path))
+        monkeypatch.setenv("KESTREL_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+        agent = _TurnAgent(storage_path=tmp_path / "kestrel_prime.db")
+        feature = TalonCoordinatorFeature(agent)
+
+        with patch.object(feature, "_dispatch_via_a2a", new_callable=AsyncMock) as mock_a2a, \
+             patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg, \
+             patch.object(
+                 TalonCoordinatorFeature, "_workspace_state",
+                 return_value=self._ready_workspace(tmp_path),
+             ):
+            mock_bg.return_value = {
+                "dispatched": True, "method": "cli_background",
+                "job_id": "abc", "pid": 1234,
+            }
+            async with _chat_turn(agent, "chat-sess-1"):
+                result = await feature.talon_claim(repo="org/repo", issue=42)
+
+        assert result.status is ToolResultStatus.OK
+        assert result.data["method"] == "cli_background"
+        mock_a2a.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unattended_claim_still_prefers_a2a(self, tmp_path, monkeypatch):
+        """No chat session to strand — the preferred rail is unchanged."""
+        monkeypatch.setenv("KESTREL_HOME", str(tmp_path))
+        feature = TalonCoordinatorFeature(_TurnAgent())
+        with patch.object(feature, "_dispatch_via_a2a", new_callable=AsyncMock) as mock_a2a:
+            mock_a2a.return_value = {
+                "dispatched": True, "method": "a2a",
+                "task_id": "abc", "repo": "org/repo", "issue": 42,
+            }
+            result = await feature.talon_claim(repo="org/repo", issue=42)
+
+        assert result.data["method"] == "a2a"
+        mock_a2a.assert_awaited_once_with("org/repo", 42)
+
+
+class TestTalonWaitableOriginSession:
+    """The reconciler's TRUSTED routing channel (#2877).
+
+    Deliberately a provider method rather than a key in ``poll``'s
+    ``WaitStatus.data``: the reconciler spreads that dict into the signal
+    payload verbatim, and ``A2AWaitable`` spreads a *peer's* returned task
+    result into the same dict — so a payload key would let a remote peer
+    choose which local chat session a COGNITION wake resumes into.
+    """
+
+    @staticmethod
+    def _feature(jobs):
+        feature = TalonCoordinatorFeature(_make_agent())
+        feature._jobs = jobs
+        feature._reload_persisted_jobs = lambda: None
+        return feature
+
+    @pytest.mark.asyncio
+    async def test_returns_the_recorded_origin(self):
+        provider = TalonWaitable(
+            self._feature({"j1": {"origin_session_id": "chat-sess-1"}})
+        )
+        assert await provider.origin_session_id("j1") == "chat-sess-1"
+
+    @pytest.mark.asyncio
+    async def test_unknown_job_has_no_origin(self):
+        provider = TalonWaitable(self._feature({}))
+        assert await provider.origin_session_id("nope") is None
+
+    @pytest.mark.asyncio
+    async def test_pre_2877_job_record_has_no_origin(self):
+        """Records written before the field existed must keep waking
+        system-initiated rather than erroring the reconcile tick."""
+        provider = TalonWaitable(
+            self._feature({"j1": {"method": "cli_background"}})
+        )
+        assert await provider.origin_session_id("j1") is None
+
+    @pytest.mark.asyncio
+    async def test_blank_origin_is_not_a_binding(self):
+        provider = TalonWaitable(
+            self._feature({"j1": {"origin_session_id": "   "}})
+        )
+        assert await provider.origin_session_id("j1") is None
+
+    @pytest.mark.asyncio
+    async def test_poll_payload_does_not_carry_the_origin(self):
+        """The origin must not ride in WaitStatus.data — that dict is the
+        caller-influenceable surface the trusted method exists to avoid."""
+        feature = self._feature(
+            {"j1": {
+                "method": "cli_background", "status": "complete",
+                "origin_session_id": "chat-sess-1",
+            }}
+        )
+        feature._reap_cli_job = lambda info: False
+        feature._tail_job_log = lambda path, lines=20: ""
+        status = await TalonWaitable(feature).poll("j1")
+        assert "origin_session_id" not in status.data

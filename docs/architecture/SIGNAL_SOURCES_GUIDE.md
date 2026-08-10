@@ -413,6 +413,57 @@ included in the `signal_completed` SSE payload AND persisted to
 `signal_log.result_summary`. Consumers can render it inline. The raw
 artifact / action_result is NEVER on the wire.
 
+### Session-bound wakes (routing authority is local)
+
+A COGNITION wake with no `Signal.session_id` opens a *fresh* chat
+session — "no session" means "mint one". For work the agent started
+from a chat turn, that stranded the wake outside the window the user
+was watching, so autonomous progress ran invisibly while
+`delivery_status` still read `ok` (#2877; #1809 is the same fix for
+restarts). Set `session_id` to the session that REGISTERED the work
+and the dispatcher resumes it.
+
+Four rules:
+
+1. **Bind AND surface.** `session_id` alone puts the turn in the right
+   transcript but leaves it `INTERNAL`, so the dispatcher never emits
+   `signal_completed` and the open chat stays blank until a manual
+   refresh. A bound wake must also be `USER_VISIBLE` *and* register a
+   `result_summary` callback — the frontend requires both to paint it.
+   An unattended (session-less) wake stays `INTERNAL`: the
+   notifications stream is pinned to the agent, not to a session, so
+   emitting would paint a turn into whichever pane happens to be open.
+
+2. **Never take the session from caller-influenceable data.** The wait
+   reconciler resolves it through the provider's `origin_session_id(handle)`
+   method — a *local* lookup on the provider's own record, written when
+   the work was dispatched — and never from the `WaitStatus.data` it
+   spreads into the payload. `A2AWaitable` spreads a peer's returned
+   task result into that dict, so a payload key would let a remote peer
+   choose which local chat session a wake resumes into and, since a
+   bound wake renders `USER_VISIBLE`, get its text painted there. The
+   reconciler overwrites the payload's `origin_session_id` with the
+   resolved value so an untrusted one cannot even survive into the log.
+
+3. **Capture through the turn lifecycle, not `_active_session_id`.**
+   Use `agent._get_turn_bound_session_id()`. The attribute is
+   agent-global and the turn id is a ContextVar copied into child
+   tasks, so each read lies on its own: out-of-turn work (a cron tick)
+   sees whatever chat turn is concurrently in flight, and a task
+   detached from a finished turn still reports that turn's id forever.
+   The accessor requires the calling task to own the *live* turn, so
+   background work reads as unattended instead of hijacking a
+   stranger's window.
+
+4. **Don't register session-bound work on a rail that can't wake it.**
+   The binding is only as good as the completion path that carries it.
+   `talon_claim` prefers the A2A rail, but that rail creates the task
+   on the recipient agent and leaves the sender an in-memory row that
+   nothing enumerates for a wake — so a claim made from inside a chat
+   turn is routed to the durable CLI rail instead. Choose the rail at
+   registration time; a captured origin that no completion path reads
+   is worse than none, because it looks bound.
+
 ### Cron expressions are the rate limit
 
 Cron sources (in `signals/sources/scheduler.py`) set

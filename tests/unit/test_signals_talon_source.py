@@ -69,3 +69,33 @@ def test_schema_injects_defaults_for_prompt_template_placeholders():
         "log_path", "log_tail", "started_at", "completed_at",
     ):
         assert key in payload, f"schema should default-fill {key}"
+
+
+def test_schema_defaults_origin_session_id():
+    """#2877: the wake carries the chat session the job was dispatched from.
+
+    Defaulted rather than required so job records written before #2877 — and
+    every unattended CLI/scheduler dispatch, which legitimately has no
+    originating session — stay schema-valid and wake system-initiated.
+    """
+    reg = build_talon_job_complete_registration()
+    payload = reg.schema({"job_id": "abc", "status": "complete"})
+    assert payload["origin_session_id"] == ""
+    bound = reg.schema(
+        {"job_id": "abc", "status": "complete",
+         "origin_session_id": "chat-1"}
+    )
+    assert bound["origin_session_id"] == "chat-1"
+
+
+def test_registration_exposes_result_summary_for_live_render():
+    """#2877: a session-bound wake is built USER_VISIBLE, but the frontend's
+    ``handleSignalCompleted`` requires BOTH that and a non-empty
+    ``result_summary`` to paint the turn. Without this callback the rail
+    emitted metadata only and the wake stayed invisible until a manual
+    refresh even once it landed in the right session. Mirrors
+    restart.completed (#1809)."""
+    reg = build_talon_job_complete_registration()
+    assert reg.result_summary is not None
+    assert reg.result_summary("Attempt 4 dispatched.") == "Attempt 4 dispatched."
+    assert reg.result_summary(None) == ""

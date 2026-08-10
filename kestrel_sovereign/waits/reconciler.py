@@ -38,7 +38,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from kestrel_sdk.signals import Signal, SignalMode
+from kestrel_sdk.signals import Signal, SignalMode, Visibility
 from kestrel_sdk.tools import MonitorableWaitable, ToolResult
 
 from kestrel_sovereign.storage.async_wait_signal_store import WaitSignalStore
@@ -398,7 +398,11 @@ class WaitReconciler:
             return
 
         attempts = attempts_so_far + 1
-        signal = self._build_signal(provider, kind, handle, status, attempts)
+        origin_session_id = await _provider_origin_session(provider, handle)
+        signal = self._build_signal(
+            provider, kind, handle, status, attempts,
+            origin_session_id=origin_session_id,
+        )
 
         if dispatcher is None or not hasattr(dispatcher, "enqueue_signal"):
             # Without a dispatcher we have NOT woken anyone — don't record
@@ -474,6 +478,8 @@ class WaitReconciler:
         handle: str,
         status: Any,
         attempts: int,
+        *,
+        origin_session_id: Optional[str] = None,
     ) -> Signal:
         """Build a COGNITION signal envelope for a terminal transition.
 
@@ -482,6 +488,31 @@ class WaitReconciler:
         generic ``wait.complete`` source. The provider's WaitStatus.data is
         spread underneath the generic kind/handle/outcome/summary keys so
         kind-specific templates (talon's) still find their fields.
+
+        ``origin_session_id`` is the session that REGISTERED the work,
+        resolved by :func:`_provider_origin_session` from the provider's own
+        local record — never read out of ``status.data`` (#2877). It routes
+        the wake back into that chat window instead of opening a fresh
+        session for it. The spread payload's own ``origin_session_id`` key,
+        if a provider set one, is OVERWRITTEN with the resolved value so a
+        provider that forwards untrusted third-party data (``A2AWaitable``
+        spreads a peer's task result verbatim) cannot smuggle routing
+        authority through the payload, nor leave a misleading value in the
+        signal log.
+
+        Binding the session is only half of "the user can see it". A bound
+        wake is also built ``USER_VISIBLE`` so the dispatcher emits the
+        ``signal_completed`` SSE event after the turn logs; at the default
+        ``INTERNAL`` the dispatcher log-only's it and the open chat stays
+        blank until a manual refresh — the persisted-but-unsurfaced half of
+        the same bug. The rendered body comes from the source's
+        ``result_summary`` callback (the frontend requires BOTH), which
+        ``talon.job_complete`` and ``restart.completed`` supply.
+
+        An origin-less wake stays ``INTERNAL``: unattended cron/CLI dispatch
+        has no chat window to surface into, and the notifications SSE stream
+        is pinned to the agent rather than to a session, so emitting would
+        paint a turn into whichever pane happens to be open.
         """
         source = getattr(provider, "signal", None) or "wait.complete"
         payload: Dict[str, Any] = {
@@ -490,6 +521,7 @@ class WaitReconciler:
             "handle": handle,
             "outcome": status.outcome.value,
             "summary": status.summary,
+            "origin_session_id": origin_session_id or "",
         }
         target_agent = (
             getattr(self._agent, "did", None)
@@ -502,6 +534,12 @@ class WaitReconciler:
             mode=SignalMode.COGNITION,
             payload=payload,
             target_agent=str(target_agent),
+            session_id=origin_session_id or None,
+            visibility=(
+                Visibility.USER_VISIBLE
+                if origin_session_id
+                else Visibility.INTERNAL
+            ),
             # Unique per attempt so a retry after a soft failure isn't
             # swallowed by the dispatcher's coalescing window as COALESCED
             # against the prior failed attempt (talon_monitor codex round 1
@@ -570,6 +608,47 @@ async def _provider_owns_handle(provider: Any, handle: str) -> Optional[bool]:
     if result is None:
         return None
     return bool(result)
+
+
+async def _provider_origin_session(provider: Any, handle: str) -> Optional[str]:
+    """Ask ``provider`` which chat session registered ``handle`` (#2877).
+
+    The reconciler's ONLY trusted source for wake routing. Optional and
+    structural, exactly like ``owns_handle``: a provider that records the
+    dispatching session on its own local job/task record exposes
+    ``origin_session_id(handle)`` returning that session id, or ``None`` when
+    the work was registered unattended (CLI, cron, scheduler) or predates the
+    field. A provider with no such method returns ``None`` here.
+
+    Why a method and not a ``WaitStatus.data`` key: the reconciler spreads a
+    provider's poll data into the signal payload verbatim, and
+    :class:`~kestrel_sovereign.features.peers.wait_provider.A2AWaitable`
+    spreads a *peer's* returned task result into that same dict. A payload key
+    would therefore let a remote peer choose which local chat session a
+    COGNITION wake resumes into — and, since a bound wake is built
+    USER_VISIBLE, get its text painted into that window. Routing authority
+    stays with locally-owned provider state.
+
+    A provider bug is swallowed to ``None``: failing to resolve an origin must
+    degrade to the pre-#2877 behavior (a system-initiated wake), never block
+    the wake itself.
+    """
+    resolve = getattr(provider, "origin_session_id", None)
+    if not callable(resolve):
+        return None
+    try:
+        result = resolve(handle)
+        if asyncio.iscoroutine(result):
+            result = await result
+    except Exception as exc:  # provider bug — wake system-initiated instead
+        logger.debug(
+            "origin_session_id(%r) raised on provider %s: %s",
+            handle, getattr(provider, "kind", "?"), exc,
+        )
+        return None
+    if not isinstance(result, str) or not result.strip():
+        return None
+    return result.strip()
 
 
 async def register_wait_watch(agent: Any, ref: str) -> None:

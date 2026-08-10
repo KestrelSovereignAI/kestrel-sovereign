@@ -1178,6 +1178,13 @@ class KestrelAgent(
         # that must scope to the active conversation read it (read_attachment;
         # request_restart's origin-session capture, #1809). None = no turn.
         self._active_session_id: Optional[str] = None
+        # The turn id that currently HOLDS the turn lock, set/cleared by
+        # `_turn_lifecycle`. Pairs with the task-local `_CURRENT_TURN_ID`
+        # ContextVar so a caller can tell "I own the live turn" from "my task
+        # inherited a finished turn's context" — the check that keeps a
+        # detached task from reading a concurrent turn's `_active_session_id`
+        # (#2877). Read via `_get_turn_bound_session_id`, not directly.
+        self._live_turn_id: Optional[str] = None
 
         # TaskManager for A2A unified routing
         self.task_manager: Optional[TaskManager] = None

@@ -100,6 +100,43 @@ class TurnLifecycleMixin:
         """Return the current agent turn id for per-turn observability."""
         return _CURRENT_TURN_ID.get()
 
+    def _get_turn_bound_session_id(self) -> Optional[str]:
+        """The chat session of the turn the CALLING task belongs to, or None.
+
+        The one honest answer to "which chat window is this code running for",
+        and the only safe way to read `_active_session_id` (#2877). Neither
+        half is sufficient alone:
+
+        - `_active_session_id` is an agent-global attribute. Read on its own
+          from work that is NOT the live turn (a cron ACTION tick, a detached
+          background task), it returns whatever *concurrent* chat turn happens
+          to be in flight — cross-wiring unattended work into a stranger's
+          window.
+        - `_CURRENT_TURN_ID` is a ContextVar, and a ContextVar is COPIED into
+          child tasks at creation. A task detached from turn A therefore keeps
+          reporting turn A's id forever, including long after A exited. So a
+          truthy turn id does not mean "a turn is live", only "this task was
+          born inside one".
+
+        Pairing them closes both: `_live_turn_id` is the agent-scoped mirror of
+        *which turn holds the CONVERSATION lock right now*, so requiring the
+        task-local id to equal it means the caller owns the live turn and the
+        session it is reading is that turn's own. The detached task from turn A
+        sees `A != B` while turn B runs, and `None` after A ended — both fall
+        through to None, i.e. "no chat window", which callers treat as
+        system-initiated.
+
+        Returns None outside a turn, for a session-less turn, and for any task
+        that merely inherited a finished turn's context.
+        """
+        turn_id = _CURRENT_TURN_ID.get()
+        if not turn_id or turn_id != getattr(self, "_live_turn_id", None):
+            return None
+        session_id = getattr(self, "_active_session_id", None)
+        if isinstance(session_id, str) and session_id.strip():
+            return session_id.strip()
+        return None
+
     def _set_current_chain(
         self, chain: Optional[list[CausationFrame]]
     ) -> contextvars.Token:
@@ -158,10 +195,18 @@ class TurnLifecycleMixin:
         async with mgr.acquire({ResourceLock.CONVERSATION}, label=label):
             logger.info("turn_lifecycle: %s begin", label)
             token = _CURRENT_TURN_ID.set(turn_id)
+            # Agent-scoped mirror of "which turn is LIVE" — i.e. which one
+            # holds the CONVERSATION lock and therefore owns the value of
+            # `_active_session_id`. Set and cleared inside the lock, so at most
+            # one turn is ever live. `_get_turn_bound_session_id` compares it
+            # against the task-local id to tell a caller that owns the turn
+            # from one that merely inherited its ContextVar (#2877).
+            self._live_turn_id = turn_id
             try:
                 yield turn_id
             finally:
                 _CURRENT_TURN_ID.reset(token)
+                self._live_turn_id = None
                 # Clear the per-turn active session on exit so an out-of-turn
                 # caller (e.g. a CLI/system-filed request_restart after a chat
                 # turn) cannot read a stale session and misroute its wake into
