@@ -22,6 +22,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import weakref
@@ -78,6 +79,15 @@ _CONFIG_GENERATION_KEY = "_isolated_config_generation"
 _PENDING_GENERATION_KEY = "_isolated_pending_generation"
 _PENDING_OWNER_KEY = "_isolated_pending_owner"
 _PENDING_LEASE_EXPIRES_AT_KEY = "_isolated_pending_lease_expires_at"
+
+# Optional, capability-negotiated lifecycle callbacks for isolated services
+# that acknowledge external input independently of Core's stdio event path.
+# A service only advertises these names when it can stop its producer and reap
+# any in-flight callback before acknowledging quiescence. The opaque transition
+# id lets a later resume prove it belongs to this exact config attempt.
+_EXTERNAL_INGRESS_QUIESCE = "external-ingress-quiesce"
+_EXTERNAL_INGRESS_RESUME = "external-ingress-resume"
+_EXTERNAL_INGRESS_TRANSITION_TOKEN_BYTES = 32
 
 # A staged config must survive a short process pause, but it must not turn an
 # interrupted deploy or process death into a permanent write lock.  Readers
@@ -1597,6 +1607,14 @@ class _ConfigTransition:
     config_node_id: Optional[str] = None
     generation: Optional[str] = None
     owner: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class _ExternalIngressQuiesce:
+    """One acknowledged external-producer pause owned by a config transition."""
+
+    client: Any = field(repr=False)
+    transition_id: str = field(repr=False)
 
 
 @dataclass
@@ -3520,10 +3538,12 @@ class ProxyFeature(Feature):
                 )
                 return
             self._begin_reload()
-            # This intent marker deliberately precedes the await below. A
-            # cancelled close/drain has already made the gate finite-closed,
-            # so its finally must perform a cancellation-safe reopen or seal.
-            gate_closed = True
+            # The gate closes only after an opt-in external producer has
+            # acknowledged that it cannot emit another callback. A cancelled
+            # close/drain still needs the final reopen/seal below, but staging
+            # and producer quiescence deliberately happen while old traffic is
+            # still admissible.
+            gate_closed = False
             self._fenced_recovery_failed = False
             transition_attempted = False
             transition_succeeded = False
@@ -3532,13 +3552,8 @@ class ProxyFeature(Feature):
             transition_settled = False
             lifecycle_result: Optional[ConfigTransitionResult] = None
             local_authoritative = False
+            external_ingress_quiesce: _ExternalIngressQuiesce | None = None
             try:
-                # Admission must close before the candidate is staged, not just
-                # before a replacement.  A successful in-process hook may have
-                # adopted its candidate by the time it returns, so tools,
-                # channel sends, and inbound callbacks must all be drained
-                # before the hook begins.
-                await self._close_traffic_gate()
                 # A caller may invoke set_config after a failed startup or
                 # before normal initialization. Reload the authoritative
                 # durable value first; otherwise a partial PATCH could stage
@@ -3559,6 +3574,26 @@ class ProxyFeature(Feature):
                 # the post-reconciliation lease renewal below remains the
                 # final fence immediately before a live SDK hook.
                 await self._assert_staged_transition_authority(transition)
+                # An exact effective no-op has no resource handoff to protect.
+                # Commit the staged generation without briefly closing event
+                # admission or replacing a healthy external producer.
+                if transition.next_config == transition.active_config:
+                    promotion = await self._promote_config(transition)
+                    if not promotion.committed:
+                        await self._run_owned_transition_cleanup(
+                            transition,
+                            force=False,
+                            preserve_cancellation=False,
+                        )
+                        transition_settled = True
+                        self._raise_promotion_failure(promotion)
+                    transition_settled = True
+                    self._host_config = dict(transition.next_config)
+                    self._host_config_loaded = True
+                    local_authoritative = True
+                    if promotion.error is not None:
+                        self._raise_promotion_failure(promotion)
+                    return
                 await self._reconcile_client_to_authoritative_config(
                     transition.active_config,
                     force=False,
@@ -3580,6 +3615,17 @@ class ProxyFeature(Feature):
                     if promotion.error is not None:
                         self._raise_promotion_failure(promotion)
                     return
+
+                # This generic lifecycle handshake is intentionally before the
+                # Core gate closes. A conforming service has stopped/reaped its
+                # external producer before it returns; any callbacks already
+                # admitted below drain normally, and no later producer callback
+                # can fall into the old gate-closed drop interval.
+                external_ingress_quiesce = self._new_external_ingress_quiesce()
+                if external_ingress_quiesce is not None:
+                    await self._quiesce_external_ingress(external_ingress_quiesce)
+                gate_closed = True
+                await self._close_traffic_gate()
 
                 if self._supports_config_transition():
                     # Staging precedes local reconciliation so every replica
@@ -3731,6 +3777,28 @@ class ProxyFeature(Feature):
                             await self._seal_traffic_gate()
                         else:
                             await self._reopen_traffic_gate()
+                    # A restart owns a newly started child, which begins its
+                    # own producer normally. A failed or live-applied attempt
+                    # can retain the exact paused child, however; release it
+                    # only after the Core gate is open so its first callback
+                    # cannot be dropped by the transition boundary.
+                    if (
+                        external_ingress_quiesce is not None
+                        and not self._stopping
+                        and self._client is external_ingress_quiesce.client
+                    ):
+                        try:
+                            await self._resume_external_ingress(external_ingress_quiesce)
+                        except BaseException:  # noqa: BLE001 - a paused producer must not look healthy
+                            logger.error(
+                                "Isolated feature %s could not resume external ingress; "
+                                "quarantining the proxy",
+                                self.name,
+                            )
+                            self._latch_terminal_lifecycle()
+                            await self._quarantine_unreconciled_client(
+                                lifecycle_lock_held=True
+                            )
 
     async def _persist_terminal_config(
         self,
@@ -5052,6 +5120,105 @@ class ProxyFeature(Feature):
             self._client is not None
             and getattr(self._client, "supports_config_transition", False) is True
         )
+
+    def _new_external_ingress_quiesce(self) -> _ExternalIngressQuiesce | None:
+        """Return a capability-negotiated producer pause for this exact child.
+
+        The SDK 0.35.1 private host-ingress capability already supplies the
+        versioned, typed negotiation and bounded JSON transport this lifecycle
+        protocol needs. Legacy SDK/services simply do not advertise both names
+        and retain their established replacement behavior.
+        """
+
+        client = self._client
+        if client is None:
+            return None
+        capabilities = self._host_ingress_capabilities()
+        if capabilities is None or not {
+            _EXTERNAL_INGRESS_QUIESCE,
+            _EXTERNAL_INGRESS_RESUME,
+        }.issubset(capabilities.names):
+            return None
+        return _ExternalIngressQuiesce(
+            client=client,
+            transition_id=secrets.token_urlsafe(_EXTERNAL_INGRESS_TRANSITION_TOKEN_BYTES),
+        )
+
+    @staticmethod
+    def _is_external_ingress_lifecycle_ack(value: Any, *, state: str) -> bool:
+        """Accept only the small, deterministic lifecycle acknowledgment."""
+
+        if type(value) is not dict:
+            return False
+        allowed = {
+            "status",
+            "http_status",
+            "state",
+            "already_quiesced",
+            "already_resumed",
+        }
+        if not set(value).issubset(allowed):
+            return False
+        if (
+            value.get("status") != "ok"
+            or type(value.get("http_status")) is not int
+            or value.get("http_status") != 200
+            or value.get("state") != state
+        ):
+            return False
+        return all(
+            type(value[key]) is bool
+            for key in ("already_quiesced", "already_resumed")
+            if key in value
+        )
+
+    def _fence_external_ingress_lifecycle_timeout(self) -> None:
+        """Fail closed if a quiesce/resume RPC cannot settle within its budget."""
+
+        self._fenced_recovery_failed = True
+        self._latch_terminal_lifecycle()
+
+    async def _quiesce_external_ingress(
+        self, quiesce: _ExternalIngressQuiesce
+    ) -> None:
+        """Stop/reap an opt-in external producer before closing Core admission."""
+
+        if self._client is not quiesce.client:
+            raise RuntimeError("isolated feature changed before external ingress quiesce")
+        result = await _await_owned_facade_lifecycle_operation(
+            self.call_host_ingress(
+                _EXTERNAL_INGRESS_QUIESCE,
+                {"transition_id": quiesce.transition_id},
+            ),
+            name=f"isolated-external-ingress-quiesce:{self.name}",
+            on_timeout=self._fence_external_ingress_lifecycle_timeout,
+            on_late_task=lambda task, client=quiesce.client: self._retain_terminal_lifecycle_task(
+                task, client
+            ),
+        )
+        if not self._is_external_ingress_lifecycle_ack(result, state="quiesced"):
+            raise RuntimeError("isolated feature did not acknowledge external ingress quiesce")
+
+    async def _resume_external_ingress(
+        self, quiesce: _ExternalIngressQuiesce
+    ) -> None:
+        """Resume a failed/live-applied transition only after Core reopens its gate."""
+
+        if self._client is not quiesce.client:
+            return
+        result = await _await_owned_facade_lifecycle_operation(
+            self.call_host_ingress(
+                _EXTERNAL_INGRESS_RESUME,
+                {"transition_id": quiesce.transition_id},
+            ),
+            name=f"isolated-external-ingress-resume:{self.name}",
+            on_timeout=self._fence_external_ingress_lifecycle_timeout,
+            on_late_task=lambda task, client=quiesce.client: self._retain_terminal_lifecycle_task(
+                task, client
+            ),
+        )
+        if not self._is_external_ingress_lifecycle_ack(result, state="resumed"):
+            raise RuntimeError("isolated feature did not acknowledge external ingress resume")
 
     def _client_requires_replacement(self) -> bool:
         """Whether the SDK fenced the current child after an unknown outcome."""

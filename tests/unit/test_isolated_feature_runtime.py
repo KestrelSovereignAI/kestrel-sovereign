@@ -1620,6 +1620,218 @@ async def test_supported_transition_failure_keeps_old_config_and_service(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_external_ingress_quiesce_precedes_gate_close_and_replays_only_after_resume(
+    monkeypatch, tmp_path
+):
+    """An opted-in producer cannot emit into Core's former close-before-hook gap."""
+
+    old_config = {"enabled": True, "revision": "old"}
+    next_config = {"enabled": True, "revision": "next"}
+    delivered = []
+    clients = []
+
+    class QuiescingIngressClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.quiesced = False
+            self.pending_events = []
+            self.ingress_calls = []
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("external-ingress-quiesce", "external-ingress-resume")
+            )
+
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            if name == "external-ingress-quiesce":
+                assert feature._traffic_gate.closed is False
+                self.quiesced = True
+                return {"status": "ok", "http_status": 200, "state": "quiesced"}
+            assert name == "external-ingress-resume"
+            assert feature._traffic_gate.closed is False
+            self.quiesced = False
+            for event in self.pending_events:
+                await self.event_handler(event)
+            self.pending_events.clear()
+            return {"status": "ok", "http_status": 200, "state": "resumed"}
+
+        async def emit_external_update(self, event):
+            if self.quiesced:
+                self.pending_events.append(event)
+                return
+            await self.event_handler(event)
+
+        async def prepare_config_transition(self, config):
+            assert config == next_config
+            # This is the exact interval Sol reproduced: Core has closed the
+            # old event gate but the config hook has not yet returned. The
+            # external producer holds the update instead of acknowledging and
+            # emitting it into a closed gate.
+            assert feature._traffic_gate.closed is True
+            await self.emit_external_update(
+                {"type": "channel.inbound", "payload": {"id": "late-update"}}
+            )
+            return ConfigTransitionResult.applied()
+
+    def client_factory(**kwargs):
+        client = QuiescingIngressClient(**kwargs)
+        clients.append(client)
+        return client
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=client_factory)
+
+    async def record(event):
+        delivered.append(event)
+
+    try:
+        await feature.persist_config(old_config)
+        await feature.initialize()
+        feature._handle_event_admitted = record  # type: ignore[method-assign]
+
+        await feature.set_config(next_config)
+
+        assert [call[0] for call in clients[0].ingress_calls] == [
+            "external-ingress-quiesce",
+            "external-ingress-resume",
+        ]
+        assert delivered == [{"type": "channel.inbound", "payload": {"id": "late-update"}}]
+        assert clients[0].pending_events == []
+        assert feature._traffic_gate.closed is False
+        assert feature._host_config == next_config
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_external_ingress_resumes_after_failed_transition_rollback(monkeypatch, tmp_path):
+    """A failed staged transition reopens Core admission before resuming polling."""
+
+    old_config = {"enabled": True, "revision": "old"}
+    rejected_config = {"enabled": True, "revision": "rejected"}
+
+    class RollbackIngressClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.quiesced = False
+            self.ingress_calls = []
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("external-ingress-quiesce", "external-ingress-resume")
+            )
+
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            if name == "external-ingress-quiesce":
+                self.quiesced = True
+                return {"status": "ok", "http_status": 200, "state": "quiesced"}
+            assert name == "external-ingress-resume"
+            assert feature._traffic_gate.closed is False
+            self.quiesced = False
+            return {"status": "ok", "http_status": 200, "state": "resumed"}
+
+        async def prepare_config_transition(self, config):
+            assert self.quiesced is True
+            assert config == rejected_config
+            raise ConfigTransitionError("transition rejected")
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=RollbackIngressClient)
+    try:
+        await feature.persist_config(old_config)
+        await feature.initialize()
+        old_client = feature._client
+
+        with pytest.raises(ConfigTransitionError, match="transition rejected"):
+            await feature.set_config(rejected_config)
+
+        assert feature._client is old_client
+        assert old_client.quiesced is False
+        assert [call[0] for call in old_client.ingress_calls] == [
+            "external-ingress-quiesce",
+            "external-ingress-resume",
+        ]
+        assert feature._traffic_gate.closed is False
+        assert feature._host_config == old_config
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_external_ingress_resumes_after_cancelled_transition_rollback(monkeypatch, tmp_path):
+    """Cancellation during pre-gate quiesce releases the exact producer."""
+
+    old_config = {"enabled": True, "revision": "old"}
+    pending_config = {"enabled": True, "revision": "pending"}
+    quiesce_started = asyncio.Event()
+    release_quiesce = asyncio.Event()
+
+    class CancelledIngressClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.quiesced = False
+            self.ingress_calls = []
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("external-ingress-quiesce", "external-ingress-resume")
+            )
+
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            if name == "external-ingress-quiesce":
+                self.quiesced = True
+                quiesce_started.set()
+                await release_quiesce.wait()
+                return {"status": "ok", "http_status": 200, "state": "quiesced"}
+            assert name == "external-ingress-resume"
+            assert feature._traffic_gate.closed is False
+            self.quiesced = False
+            return {"status": "ok", "http_status": 200, "state": "resumed"}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=CancelledIngressClient)
+    update = None
+    try:
+        await feature.persist_config(old_config)
+        await feature.initialize()
+        client = feature._client
+
+        update = asyncio.create_task(feature.set_config(pending_config))
+        await asyncio.wait_for(quiesce_started.wait(), timeout=1)
+        update.cancel()
+        release_quiesce.set()
+        with pytest.raises(asyncio.CancelledError):
+            await update
+
+        assert feature._client is client
+        assert client.quiesced is False
+        assert [call[0] for call in client.ingress_calls] == [
+            "external-ingress-quiesce",
+            "external-ingress-resume",
+        ]
+        assert feature._traffic_gate.closed is False
+        assert feature._host_config == old_config
+    finally:
+        if update is not None and not update.done():
+            update.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await update
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_transition_failure_clears_pending_config_when_promotion_fails(
     monkeypatch, tmp_path
 ):

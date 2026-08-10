@@ -67,8 +67,10 @@ dependencies = [
     # required by durable scheduler dispatch (#2715). This also includes the
     # first-class typed parts on the ToolResult envelope (#2641).
     # 0.35.1 floor: typed, capability-negotiated private host ingress for
-    # isolated services (#2755). The host must not emulate this through
-    # tools/call because ingress is deliberately unavailable to agent tools.
+    # isolated services (#2755), including Core's generic pre-gate
+    # external-ingress quiesce/resume lifecycle. The host must not emulate
+    # this through tools/call because ingress is deliberately unavailable to
+    # agent tools.
     # kestrel_sdk.tools.parts hosts the pending-parts buffer ContextVar that
     # agent/parts.py re-exports (emit_part's tool-result fallback), and
     # DynamicTool.execute attaches buffered/explicit parts to the serialized
