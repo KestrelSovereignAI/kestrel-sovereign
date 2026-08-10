@@ -21,11 +21,11 @@ from kestrel_sovereign.features.scheduler.runner import (
 from kestrel_sovereign.identity.runtime_identity import IdentityReadinessError
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.knowledge import InferenceError, InferenceProfile, OntologyRef
-from kestrel_sovereign.multi_agent.agent_manager import (
-    AgentManager,
-    _AgentDIDLookupMode,
-    _get_agent_did,
+from kestrel_sovereign.identity.local_anchor import (
+    AgentDIDLookupMode,
+    read_anchor_agent_did,
 )
+from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
 from kestrel_sovereign.spawn.mandate import SpawnMandate
 from kestrel_sovereign.storage import AsyncStorage, GraphNode
@@ -98,7 +98,7 @@ class TestAgentManagerBasics:
 
         did_lookup = AsyncMock(return_value="did:pkh:cold")
         monkeypatch.setattr(
-            "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+            "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
             did_lookup,
         )
 
@@ -108,7 +108,7 @@ class TestAgentManagerBasics:
         assert mapping["did:pkh:cold"][0] == "Cold"
         did_lookup.assert_awaited_once_with(
             str(cold_dir),
-            mode=_AgentDIDLookupMode.COLD_READ_ONLY,
+            mode=AgentDIDLookupMode.COLD_READ_ONLY,
         )
 
     @pytest.mark.asyncio
@@ -132,7 +132,7 @@ class TestAgentManagerBasics:
         missing_identity = RuntimeError("identity database is not initialized")
         did_lookup = AsyncMock(side_effect=missing_identity)
         monkeypatch.setattr(
-            "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+            "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
             did_lookup,
         )
 
@@ -144,7 +144,7 @@ class TestAgentManagerBasics:
         ]
         did_lookup.assert_awaited_once_with(
             str(tmp_path / "unincepted"),
-            mode=_AgentDIDLookupMode.COLD_READ_ONLY,
+            mode=AgentDIDLookupMode.COLD_READ_ONLY,
         )
 
     @pytest.mark.asyncio
@@ -165,7 +165,7 @@ class TestAgentManagerBasics:
         )
         missing_identity = ValueError("local identity unavailable")
         monkeypatch.setattr(
-            "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+            "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
             AsyncMock(side_effect=missing_identity),
         )
 
@@ -194,7 +194,7 @@ class TestAgentManagerBasics:
         )
         did_lookup = AsyncMock(return_value="did:pkh:recovered")
         monkeypatch.setattr(
-            "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+            "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
             did_lookup,
         )
 
@@ -209,7 +209,7 @@ class TestAgentManagerBasics:
         )
         did_lookup.assert_awaited_once_with(
             str(tmp_path / "recovering"),
-            mode=_AgentDIDLookupMode.INITIALIZATION,
+            mode=AgentDIDLookupMode.INITIALIZATION,
         )
 
     @pytest.mark.asyncio
@@ -502,150 +502,6 @@ class TestAgentManagerBasics:
         assert manager.list_agents() == {}
         assert manager.get_agent_name("did:pkh:tenant-b") is None
         tenant_b_agent.shutdown.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_cold_did_lookup_missing_database_never_creates_identity_artifacts(
-        self, tmp_path,
-    ):
-        """Discovery of an unincepted cold config is a strictly read-only probe."""
-        cold_dir = tmp_path / "unincepted"
-        cold_dir.mkdir()
-
-        with pytest.raises(ValueError, match="No agent found"):
-            await _get_agent_did(str(cold_dir))
-
-        assert list(cold_dir.iterdir()) == []
-        assert not (cold_dir / "kestrel_prime.db").exists()
-        assert not (cold_dir / "kestrel_prime.db-wal").exists()
-        assert not (cold_dir / "kestrel_prime.db-shm").exists()
-
-    @pytest.mark.asyncio
-    async def test_cold_did_lookup_invalid_existing_database_never_writes_sidecars(
-        self, tmp_path,
-    ):
-        """A malformed identity is reported without schema/WAL side effects."""
-        cold_dir = tmp_path / "invalid"
-        cold_dir.mkdir()
-        db_path = cold_dir / "kestrel_prime.db"
-        connection = sqlite3.connect(db_path)
-        connection.execute("CREATE TABLE unrelated (value TEXT)")
-        connection.commit()
-        connection.close()
-        before = {
-            path.name: path.read_bytes()
-            for path in cold_dir.iterdir()
-        }
-
-        with pytest.raises(ValueError, match="Could not read local agent identity"):
-            await _get_agent_did(str(cold_dir))
-
-        after = {
-            path.name: path.read_bytes()
-            for path in cold_dir.iterdir()
-        }
-        assert after == before
-
-    @pytest.mark.asyncio
-    async def test_cold_did_lookup_refuses_uncheckpointed_wal_without_mutation(
-        self, tmp_path,
-    ):
-        """A cold identity probe must not ignore or materialize WAL state."""
-        cold_dir = tmp_path / "wal-pending"
-        cold_dir.mkdir()
-        db_path = cold_dir / "kestrel_prime.db"
-        connection = sqlite3.connect(db_path)
-        connection.execute(
-            "CREATE TABLE graph_nodes (node_id TEXT, node_type TEXT)"
-        )
-        connection.execute(
-            "INSERT INTO graph_nodes VALUES (?, 'agent')",
-            ("did:test:wal-pending",),
-        )
-        connection.commit()
-        connection.close()
-        wal_path = cold_dir / "kestrel_prime.db-wal"
-        wal_path.write_bytes(b"uncheckpointed identity state")
-        before = {
-            path.name: path.read_bytes()
-            for path in cold_dir.iterdir()
-        }
-
-        with pytest.raises(ValueError, match="WAL state is present"):
-            await _get_agent_did(str(cold_dir))
-
-        after = {
-            path.name: path.read_bytes()
-            for path in cold_dir.iterdir()
-        }
-        assert after == before
-
-    @pytest.mark.asyncio
-    async def test_initialization_did_lookup_recovers_existing_sqlite_wal(
-        self, tmp_path,
-    ):
-        """Normal startup can consume a crash-recovery WAL that cold probes refuse."""
-        agent_dir = tmp_path / "wal-recovery"
-        agent_dir.mkdir()
-        db_path = agent_dir / "kestrel_prime.db"
-        connection = sqlite3.connect(db_path)
-        try:
-            assert connection.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
-            connection.execute(
-                "CREATE TABLE graph_nodes (node_id TEXT, node_type TEXT)"
-            )
-            connection.execute(
-                "INSERT INTO graph_nodes VALUES (?, 'agent')",
-                ("did:test:wal-recovery",),
-            )
-            connection.commit()
-            assert (agent_dir / "kestrel_prime.db-wal").exists()
-
-            with pytest.raises(ValueError, match="WAL state is present"):
-                await _get_agent_did(str(agent_dir))
-
-            assert await _get_agent_did(
-                str(agent_dir),
-                mode=_AgentDIDLookupMode.INITIALIZATION,
-            ) == "did:test:wal-recovery"
-        finally:
-            connection.close()
-
-    @pytest.mark.asyncio
-    async def test_cold_did_lookup_stays_local_sqlite_with_postgres_environment(
-        self, monkeypatch, tmp_path,
-    ):
-        """A host DB default must not select a foreign shared identity."""
-        local_dir = tmp_path / "cold-agent"
-        local_dir.mkdir()
-        local_db = local_dir / "kestrel_prime.db"
-        local_did = "did:test:local-cold-agent"
-
-        storage = AsyncStorage(str(local_db), backend="sqlite")
-        await storage.initialize()
-        try:
-            await storage.graph.add_node(
-                GraphNode(local_did, "agent", "Local cold agent", {})
-            )
-        finally:
-            await storage.close()
-
-        before = {
-            path.name: path.read_bytes()
-            for path in local_dir.iterdir()
-        }
-        monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-        monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://foreign-host/fleet")
-
-        assert await _get_agent_did(str(local_dir)) == local_did
-        after = {
-            path.name: path.read_bytes()
-            for path in local_dir.iterdir()
-        }
-        # The successful normal path is as important as malformed/missing
-        # probes: it must not materialize or alter SQLite WAL/SHM sidecars.
-        assert after == before
-        assert "kestrel_prime.db-wal" not in after
-        assert "kestrel_prime.db-shm" not in after
 
     @pytest.mark.asyncio
     async def test_remove_agent(self):
@@ -1021,7 +877,7 @@ class TestAgentManagerBasics:
             "postgresql://scheduler-cold-test",
         )
         monkeypatch.setattr(
-            "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+            "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
             AsyncMock(return_value=agent_id),
         )
         monkeypatch.setattr(
@@ -1483,7 +1339,7 @@ class TestLoadFromConfig:
 
     @pytest.mark.asyncio
     @patch(
-        "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+        "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
         new_callable=AsyncMock,
     )
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
@@ -1504,13 +1360,13 @@ class TestLoadFromConfig:
 
         mock_get_did.assert_awaited_once_with(
             str(Path("/tmp/partial").resolve()),
-            mode=_AgentDIDLookupMode.INITIALIZATION,
+            mode=AgentDIDLookupMode.INITIALIZATION,
         )
         partial.shutdown.assert_awaited_once()
 
     @pytest.mark.asyncio
     @patch(
-        "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+        "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
         new_callable=AsyncMock,
     )
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
@@ -1541,7 +1397,7 @@ class TestLoadFromConfig:
 
     @pytest.mark.asyncio
     @patch(
-        "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+        "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
         new_callable=AsyncMock,
     )
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
@@ -1583,7 +1439,7 @@ class TestLoadFromConfig:
 
     @pytest.mark.asyncio
     @patch(
-        "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+        "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
         new_callable=AsyncMock,
     )
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
@@ -1635,7 +1491,7 @@ class TestLoadFromConfig:
 
     @pytest.mark.asyncio
     @patch(
-        "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+        "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
         new_callable=AsyncMock,
     )
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
@@ -1684,7 +1540,7 @@ class TestLoadFromConfig:
 
     @pytest.mark.asyncio
     @patch(
-        "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+        "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
         new_callable=AsyncMock,
     )
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
@@ -1722,7 +1578,7 @@ class TestLoadFromConfig:
 
     @pytest.mark.asyncio
     @patch(
-        "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+        "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
         new_callable=AsyncMock,
     )
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
@@ -1749,7 +1605,7 @@ class TestLoadFromConfig:
         assert mock_agent_cls.call_args.kwargs["identity_export_dir"] == agent_root
 
     @pytest.mark.asyncio
-    @patch("kestrel_sovereign.multi_agent.agent_manager._get_agent_did", new_callable=AsyncMock)
+    @patch("kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did", new_callable=AsyncMock)
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
     @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
     async def test_load_from_config_skips_non_autostart(
@@ -1778,7 +1634,7 @@ class TestLoadFromConfig:
         assert manager.get_agent("inactive") is None
 
     @pytest.mark.asyncio
-    @patch("kestrel_sovereign.multi_agent.agent_manager._get_agent_did", new_callable=AsyncMock)
+    @patch("kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did", new_callable=AsyncMock)
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
     @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
     async def test_load_from_config_handles_errors(
@@ -1800,7 +1656,7 @@ class TestLoadFromConfig:
         assert manager.get_agent("broken") is None
 
     @pytest.mark.asyncio
-    @patch("kestrel_sovereign.multi_agent.agent_manager._get_agent_did", new_callable=AsyncMock)
+    @patch("kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did", new_callable=AsyncMock)
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
     @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
     async def test_load_from_config_records_init_failures(
@@ -1857,7 +1713,7 @@ class TestLoadFromConfig:
 
     @pytest.mark.asyncio
     @patch(
-        "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+        "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
         new_callable=AsyncMock,
     )
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
@@ -1962,7 +1818,7 @@ class TestCreateAgent:
 
     @pytest.mark.asyncio
     @patch("kestrel_sovereign.inception_service.create_kestrel_identity_async", new_callable=AsyncMock)
-    @patch("kestrel_sovereign.multi_agent.agent_manager._get_agent_did", new_callable=AsyncMock)
+    @patch("kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did", new_callable=AsyncMock)
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
     @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
     async def test_create_agent_success(
@@ -1989,7 +1845,7 @@ class TestCreateAgent:
 
     @pytest.mark.asyncio
     @patch("kestrel_sovereign.inception_service.create_kestrel_identity_async", new_callable=AsyncMock)
-    @patch("kestrel_sovereign.multi_agent.agent_manager._get_agent_did", new_callable=AsyncMock)
+    @patch("kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did", new_callable=AsyncMock)
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
     @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
     async def test_create_agent_passes_parent_did(
@@ -2017,7 +1873,7 @@ class TestSpawnAgent:
 
     @pytest.mark.asyncio
     @patch("kestrel_sovereign.inception_service.create_kestrel_identity_async", new_callable=AsyncMock)
-    @patch("kestrel_sovereign.multi_agent.agent_manager._get_agent_did", new_callable=AsyncMock)
+    @patch("kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did", new_callable=AsyncMock)
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
     @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
     async def test_spawn_passes_parent_did_to_create(
@@ -2053,7 +1909,7 @@ class TestSpawnAgent:
 
     @pytest.mark.asyncio
     @patch("kestrel_sovereign.inception_service.create_kestrel_identity_async", new_callable=AsyncMock)
-    @patch("kestrel_sovereign.multi_agent.agent_manager._get_agent_did", new_callable=AsyncMock)
+    @patch("kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did", new_callable=AsyncMock)
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
     @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
     async def test_spawn_wires_mandate_features_into_child(
@@ -2095,7 +1951,7 @@ class TestSpawnAgent:
 
     @pytest.mark.asyncio
     @patch("kestrel_sovereign.inception_service.create_kestrel_identity_async", new_callable=AsyncMock)
-    @patch("kestrel_sovereign.multi_agent.agent_manager._get_agent_did", new_callable=AsyncMock)
+    @patch("kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did", new_callable=AsyncMock)
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
     @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
     async def test_spawn_without_features_loads_all(
@@ -2123,7 +1979,7 @@ class TestSpawnAgent:
 
     @pytest.mark.asyncio
     @patch("kestrel_sovereign.inception_service.create_kestrel_identity_async", new_callable=AsyncMock)
-    @patch("kestrel_sovereign.multi_agent.agent_manager._get_agent_did", new_callable=AsyncMock)
+    @patch("kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did", new_callable=AsyncMock)
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
     @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
     async def test_spawn_duplicate_name_raises(

@@ -214,24 +214,6 @@ def cmd_create(args) -> int:
     return 0
 
 
-def _get_agent_did(agent_dir: Path) -> Optional[str]:
-    """Read agent DID from the database without starting the full agent."""
-    db_path = agent_dir / "kestrel_prime.db"
-    if not db_path.exists():
-        return None
-    try:
-        import sqlite3
-        conn = sqlite3.connect(str(db_path))
-        cursor = conn.execute(
-            "SELECT node_id FROM nodes WHERE node_type = 'agent' LIMIT 1"
-        )
-        row = cursor.fetchone()
-        conn.close()
-        return row[0] if row else None
-    except Exception:
-        return None
-
-
 def _detect_running_agent_server(
     agent_name: str,
     agent_cfg: LocalAgentConfig,

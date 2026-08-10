@@ -195,9 +195,10 @@ async def resolve_reanchor_target(
     its agents on the local SQLite file, so refusing it would refuse a reanchor
     that ``main`` performs correctly, with no flag to override.
 
-    The DID comes from the local anchor through the same reader the host uses
-    (``agent_manager._get_agent_did``), which refuses a directory holding more
-    than one agent root rather than picking by incidental row order.
+    The DID comes from the local anchor through the same reader the host
+    uses (``identity.local_anchor.read_anchor_agent_did``), which refuses a
+    directory holding more than one agent root rather than picking by
+    incidental row order.
 
     Raises:
         ReanchorTargetError: Unsupported backend, or the anchor cannot name
@@ -229,9 +230,9 @@ async def resolve_reanchor_target(
     # reader rather than re-implementing one keeps identity resolution to a
     # single authority — duplicating it is how two tools come to disagree
     # about who an agent is.
-    from kestrel_sovereign.multi_agent.agent_manager import (
-        _AgentDIDLookupMode,
-        _get_agent_did,
+    from kestrel_sovereign.identity.local_anchor import (
+        AgentDIDLookupMode,
+        read_anchor_agent_did,
     )
 
     try:
@@ -244,8 +245,8 @@ async def resolve_reanchor_target(
         # for exactly the agents most likely to need it, to protect a
         # file-mtime property nothing depends on. Checkpointing preserves the
         # record; it only settles how it is stored.
-        agent_did = await _get_agent_did(
-            str(agent_dir), mode=_AgentDIDLookupMode.INITIALIZATION
+        agent_did = await read_anchor_agent_did(
+            str(agent_dir), mode=AgentDIDLookupMode.INITIALIZATION
         )
     except ValueError as exc:
         raise ReanchorTargetError(

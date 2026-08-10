@@ -1410,7 +1410,7 @@ async def test_live_postgres_runtime_create_spawn_execute_remove_and_failure_rol
             TestLLMService,
         )
         monkeypatch.setattr(
-            "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+            "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
             fake_get_agent_did,
         )
         monkeypatch.setattr(

@@ -224,7 +224,7 @@ def _make_local_anchor(agent_dir: Path, agent_did: str = AGENT_DID) -> bytes:
 
     Byte-equality after the run asserts the *record* is unchanged, not that
     the file was never opened. It always is: ``resolve_reanchor_target`` reads
-    this agent's DID out of it through ``_get_agent_did(..., INITIALIZATION)``,
+    this agent's DID out of it through ``read_anchor_agent_did(..., INITIALIZATION)``,
     which opens ``mode=rw`` on every backend so SQLite can replay a WAL. On a
     WAL anchor that checkpoints — the bytes change while the record does not.
     This fixture is journal-mode ``delete``, so byte-equality is reachable

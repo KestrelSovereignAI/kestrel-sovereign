@@ -38,7 +38,7 @@ def _write_anchor(path, *dids):
     """A ``kestrel_prime.db`` holding the given agent roots.
 
     Not an opaque stub: ``resolve_reanchor_target`` reads the DID out of this
-    file through the same reader the host uses (``_get_agent_did``), so the
+    file through the same reader the host uses (``read_anchor_agent_did``), so the
     fixture has to be the shape that reader accepts.
     """
     with sqlite3.connect(str(path)) as conn:
@@ -189,7 +189,7 @@ async def test_a_missing_anchor_refuses_on_postgres_too(agent_dir, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_two_agent_roots_in_one_anchor_refuse(agent_dir):
-    """``_get_agent_did`` refuses rather than picking by row order. Inheriting
+    """``read_anchor_agent_did`` refuses rather than picking by row order. Inheriting
     that refusal is the point of reusing it."""
     _write_anchor(agent_dir / "kestrel_prime.db", AGENT_DID, OTHER_DID)
 
