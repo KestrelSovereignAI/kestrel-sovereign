@@ -660,51 +660,14 @@ async def reanchor_constitution(
             error=str(exc),
         )
 
-    # A signed amendment artifact is content-addressed, so one fleet-wide
-    # artifact is ONE graph node id for every agent under it. On a shared
-    # PostgreSQL host the first agent to anchor it owns that node, and
-    # ``add_node`` refuses a foreign-owned node for anything but the
-    # constitution document — deliberately: the artifact node carries
-    # ``source_path``, which the privacy boundary does not treat as
-    # content-free, so sharing it would expose one tenant's operator paths to
-    # another. Detect it here rather than letting the write roll back with
-    # "Cannot overwrite a graph node owned by another agent", which names
-    # neither the artifact nor the way out.
-    try:
-        artifact_conflict = await _foreign_artifact_owner(
-            target, hashlib.sha256(amendment_artifact_bytes).hexdigest()
-        )
-    except Exception as exc:  # noqa: BLE001 — opening a connection can fail
-        # Same boundary as the anchor read. This opens its own connection to
-        # the runtime database, so a host that dropped between the two would
-        # otherwise escape as a traceback — the round-1 defect, on a path added
-        # after round 1 fixed it.
-        logger.exception(
-            "Could not check artifact ownership in %s", target.describe()
-        )
-        return _result(
-            old_hash=old_hash,
-            new_hash=new_hash,
-            error=(
-                f"Could not check this artifact against {target.describe()}: "
-                f"{exc!r}. Nothing was written."
-            ),
-        )
-    if artifact_conflict is not None:
-        return _result(
-            old_hash=old_hash,
-            new_hash=new_hash,
-            error=(
-                f"This signed amendment artifact is already anchored in "
-                f"{target.describe()} by {artifact_conflict}. A signed artifact "
-                f"is content-addressed, so one file is one record for the whole "
-                f"database, and it cannot yet be shared across agents on a "
-                f"PostgreSQL host (#2893). Sign a separate artifact for "
-                f"{agent_name} — the constitution hash is the same, so the "
-                f"authorization is unchanged — or reanchor this agent before "
-                f"the others."
-            ),
-        )
+    # The pre-write refusal that used to sit here is gone with #2893. It
+    # existed because a fleet-wide artifact is ONE content-addressed node id
+    # and ``add_node`` would not admit a foreign-owned one, so the second agent
+    # to anchor the same signed file failed mid-write; refusing early at least
+    # named the artifact and a workaround. The node now carries only fields
+    # derived from the artifact bytes, so two agents anchoring the same file
+    # co-own one identical row — the same rule the constitution document has
+    # always followed. There is nothing left to refuse.
 
     # The file-level backup is the OUTER safety net; the write transaction is
     # the inner one. A PostgreSQL runtime has no file to copy, and copying the
@@ -854,33 +817,6 @@ async def _read_agent_anchor(
         )
 
 
-async def _foreign_artifact_owner(
-    target: ReanchorTarget, artifact_hash: str
-) -> str | None:
-    """Return another agent's DID already owning this artifact node, or None.
-
-    Read-only and best-effort in one direction only: a missing owners table on
-    a very old database returns None and the write proceeds exactly as it does
-    today. It never returns a DID that is not really there, which is the
-    direction that matters — this decides whether to refuse.
-    """
-    async with target.open_storage() as storage:
-        try:
-            rows = await storage.db.fetchall(
-                "SELECT agent_id FROM graph_node_owners "
-                "WHERE node_id = ? AND agent_id <> ?",
-                (artifact_hash, target.agent_did),
-            )
-        except Exception:  # noqa: BLE001 — absence of the table is not a conflict
-            logger.debug(
-                "Could not inspect artifact node ownership for %s", artifact_hash,
-                exc_info=True,
-            )
-            return None
-    owners = sorted(row[0] for row in rows)
-    return owners[0] if owners else None
-
-
 async def _write_reanchor(
     *,
     target: ReanchorTarget,
@@ -986,16 +922,20 @@ async def _write_reanchor(
                     node_id=artifact_hash,
                     node_type="constitution_amendment_artifact",
                     label="Signed Constitution Reanchor Artifact",
+                    # Content-derived fields only. Every one of these is a
+                    # *signed* field of the artifact, so two agents anchoring
+                    # the same file compute the same node — which is what lets
+                    # a shared PostgreSQL hold one row for the fleet (#2893).
+                    # ``source_path``, ``anchored_at`` and ``verification`` are
+                    # per-agent and live on this agent's own
+                    # ``constitution_reanchor`` audit property below.
                     properties={
                         "hash": artifact_hash,
                         "type": "SignedConstitutionAmendment",
                         "artifact_type": amendment_artifact.get("artifact_type"),
                         "constitution_hash": new_hash,
                         "signer": amendment_verification.signer,
-                        "source_path": str(amendment_artifact_path),
                         "created_at": amendment_artifact.get("created_at"),
-                        "anchored_at": _now_iso(),
-                        "verification": amendment_verification.reason,
                     },
                 )
             )

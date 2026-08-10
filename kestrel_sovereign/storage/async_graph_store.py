@@ -18,6 +18,7 @@ produces a fixed-offset ``+00:00`` suffix, never a bare naive string).
 """
 import json
 import logging
+import re
 from datetime import datetime
 from enum import Enum
 from typing import Dict, Optional, List, Any
@@ -29,6 +30,20 @@ from .async_conversation_store import _rows_affected
 logger = logging.getLogger(__name__)
 
 _DELETE_ID_BATCH = 500
+
+#: A SHA-256 digest as this codebase writes them: lowercase hex, 64 chars.
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+def _is_tz_aware_iso(value: Any) -> bool:
+    """A timezone-qualified ISO timestamp, bounded in length."""
+    if not isinstance(value, str) or len(value) > 64:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
 
 
 def _is_shareable_constitution_properties(
@@ -45,13 +60,74 @@ def _is_shareable_constitution_properties(
     created_at = properties.get("created_at")
     if created_at is None:
         return True
-    if not isinstance(created_at, str) or len(created_at) > 64:
+    return _is_tz_aware_iso(created_at)
+
+
+def _accepted_amendment_artifact_types() -> frozenset:
+    """The ``artifact_type`` values a signed reanchor artifact may declare.
+
+    A closed set, because this field is admitted onto a row several tenants
+    share — and taken from the verifier's own constant rather than restated
+    here, so the two cannot drift. Imported lazily to keep the storage layer
+    import-light and free of a dependency on the constitution package.
+    """
+    from kestrel_sovereign.constitution.amendment_artifact import ARTIFACT_TYPE
+
+    return frozenset({ARTIFACT_TYPE})
+
+
+def _is_shareable_amendment_artifact_properties(
+    properties: Dict[str, Any], node_id: str
+) -> bool:
+    """Validate the bounded, content-derived metadata on a shared artifact node.
+
+    A Sovereign-signed reanchor artifact is content-addressed, so one file is
+    one node id for a whole PostgreSQL fleet — and every field admitted here is
+    fixed by the bytes that hash to that id: ``artifact_type``, ``signer``,
+    ``constitution_sha256`` and ``created_at`` are all *signed* fields of the
+    artifact (see ``canonical_amendment_bytes``). Two agents anchoring the same
+    file therefore compute the same properties, which is what makes the node
+    genuinely shareable rather than merely coincident.
+
+    What is deliberately **not** here is everything per-agent: ``source_path``
+    (an operator filesystem path), ``anchored_at`` (when *this* agent anchored
+    it) and ``verification`` (the result of checking the signature against
+    *this* agent's resolved trust root). Those live on the agent's own
+    ``constitution_reanchor`` audit property, which already records all three
+    (#2893). Putting them on a fleet-wide node was the defect: it made one
+    tenant's paths reachable from another's row, which is why
+    ``privacy_wrapper`` refused to treat this node type as content-free.
+    """
+    if set(properties) > {
+        "hash",
+        "type",
+        "artifact_type",
+        "constitution_hash",
+        "signer",
+        "created_at",
+    }:
         return False
-    try:
-        parsed = datetime.fromisoformat(created_at)
-    except ValueError:
+    if (
+        properties.get("hash") != node_id
+        or properties.get("type") != "SignedConstitutionAmendment"
+    ):
         return False
-    return parsed.tzinfo is not None
+    if properties.get("artifact_type") not in _accepted_amendment_artifact_types():
+        return False
+    constitution_hash = properties.get("constitution_hash")
+    if not isinstance(constitution_hash, str) or not _HEX64.fullmatch(
+        constitution_hash
+    ):
+        return False
+    signer = properties.get("signer")
+    if not isinstance(signer, str) or len(signer) > 256:
+        return False
+    if not signer.startswith("did:"):
+        return False
+    created_at = properties.get("created_at")
+    if created_at is None:
+        return True
+    return _is_tz_aware_iso(created_at)
 
 
 def _insert_owner_sql(db: AsyncDatabase, table: str, columns: str) -> str:
@@ -380,12 +456,31 @@ class AsyncGraphStore:
             existing_properties = (
                 json.loads(existing[2]) if existing and existing[2] else {}
             )
+            # Two content-addressed node types may be co-owned: the governing
+            # constitution document, and a Sovereign-signed reanchor artifact
+            # (#2893). Both are the same argument — the node id IS the hash of
+            # the bytes, so every tenant computes identical properties — and
+            # both are gated the same way: the writer must independently own
+            # the underlying blob, so co-ownership follows possession of the
+            # content rather than knowledge of a hash.
+            shared_shapes = {
+                ("document", "KESTREL_CONSTITUTION"): (
+                    _is_shareable_constitution_properties
+                ),
+                (
+                    "constitution_amendment_artifact",
+                    "Signed Constitution Reanchor Artifact",
+                ): _is_shareable_amendment_artifact_properties,
+            }
+            shape_key = (node.node_type, node.label)
+            is_shareable = shared_shapes.get(shape_key)
+
             owns_content_reference = False
             if (
                 existing
                 and owner
-                and existing[0] == "document"
-                and node.node_type == "document"
+                and is_shareable is not None
+                and existing[0] == node.node_type
                 and existing[1] == node.label
                 and existing_properties.get("hash") == node.node_id
                 and node.properties.get("hash") == node.node_id
@@ -398,16 +493,11 @@ class AsyncGraphStore:
                 owns_content_reference = file_owner is not None
             compatible_content_node = bool(
                 existing
-                and existing[0] == "document"
-                and node.node_type == "document"
-                and existing[1] == "KESTREL_CONSTITUTION"
-                and node.label == "KESTREL_CONSTITUTION"
-                and _is_shareable_constitution_properties(
-                    existing_properties, node.node_id
-                )
-                and _is_shareable_constitution_properties(
-                    node.properties, node.node_id
-                )
+                and is_shareable is not None
+                and existing[0] == node.node_type
+                and existing[1] == node.label
+                and is_shareable(existing_properties, node.node_id)
+                and is_shareable(node.properties, node.node_id)
                 and owns_content_reference
             )
             if (

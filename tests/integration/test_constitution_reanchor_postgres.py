@@ -484,27 +484,30 @@ async def test_overlay_anchor_touches_only_the_named_agent(pg, tmp_path):
         assert properties.get(OVERLAY_HASH_PROPERTY) == expected
 
 
-async def test_reusing_one_signed_artifact_across_agents_refuses_legibly(
+async def test_one_signed_artifact_governs_a_whole_fleet(
     pg, tmp_path, monkeypatch,
 ):
-    """A signed artifact is content-addressed, so one file is one graph node
-    for the whole database. The second agent cannot claim a node the first
-    owns — ``add_node`` allows a foreign-owned content node only for the
-    constitution document, and the artifact node carries ``source_path``,
-    which the privacy boundary does not treat as content-free.
+    """The Sovereign signs one authorization; every agent under it anchors.
 
-    That limitation is real (#2893). What must not happen is the operator
-    seeing an opaque mid-write rollback: the first agent's reanchor committed,
-    the second one's did not, and nothing said why or what to do.
+    A signed artifact is content-addressed, so on a shared PostgreSQL one file
+    is one ``graph_nodes`` row for the fleet. It used to be the *first* agent's
+    row: the node carried ``source_path``, ``anchored_at`` and ``verification``
+    — all per-agent — so ``add_node`` could not admit a second owner and the
+    second reanchor failed with "Cannot overwrite a graph node owned by another
+    agent". #2890 turned that into a legible pre-write refusal; #2893 removes
+    the need for one by putting only content-derived fields on the node.
+
+    Both agents end up governed by v2, and both own the one artifact row.
     """
     await _seed_runtime_agent(CONSTITUTION_V1, AGENT_DID)
-    other_v1 = await _seed_runtime_agent(CONSTITUTION_V1, OTHER_DID)
+    await _seed_runtime_agent(CONSTITUTION_V1, OTHER_DID)
     v2_hash = hashlib.sha256(CONSTITUTION_V2).hexdigest()
     constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
     constitution_path.write_bytes(CONSTITUTION_V2)
     import kestrel_sovereign.config as ks_config
     monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
     artifact_path, root_path = _write_authority_files(tmp_path, CONSTITUTION_V2)
+    artifact_hash = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
 
     results = {}
     for did, name in ((AGENT_DID, "First"), (OTHER_DID, "Second")):
@@ -521,19 +524,70 @@ async def test_reusing_one_signed_artifact_across_agents_refuses_legibly(
             runtime_dsn=POSTGRES_URL,
         )
 
-    assert results["First"].error is None, results["First"].error
+    for name in ("First", "Second"):
+        assert results[name].error is None, f"{name}: {results[name].error}"
+        assert results[name].reanchored is True
     assert await _runtime_state(pg, AGENT_DID) == (v2_hash, [v2_hash])
+    assert await _runtime_state(pg, OTHER_DID) == (v2_hash, [v2_hash])
 
-    refusal = results["Second"].error
-    assert refusal is not None
-    assert "already anchored" in refusal
-    assert AGENT_DID in refusal
-    assert "Sign a separate artifact" in refusal
-    assert "#2893" in refusal
-    # Refused before the write, not rolled back after a partial one.
-    assert "Cannot overwrite a graph node" not in refusal
-    assert results["Second"].backup_path is None
-    assert await _runtime_state(pg, OTHER_DID) == (other_v1, [other_v1])
+    # One row, two owners — not two rows, and not one tenant's row silently
+    # rewritten by the other.
+    rows = await pg.fetchall(
+        "SELECT properties FROM graph_nodes WHERE node_id = ?", (artifact_hash,)
+    )
+    assert len(rows) == 1
+    owners = await pg.fetchall(
+        "SELECT agent_id FROM graph_node_owners WHERE node_id = ?",
+        (artifact_hash,),
+    )
+    assert sorted(row[0] for row in owners) == sorted([AGENT_DID, OTHER_DID])
+
+    # And the row itself carries nothing per-agent — that is what made it
+    # shareable. Every field here is fixed by the artifact bytes.
+    properties = json.loads(rows[0][0]) if isinstance(rows[0][0], str) else rows[0][0]
+    assert set(properties) == {
+        "hash", "type", "artifact_type", "constitution_hash", "signer", "created_at",
+    }
+    assert "source_path" not in properties
+
+
+async def test_each_agent_still_records_its_own_anchoring(
+    pg, tmp_path, monkeypatch,
+):
+    """The per-agent facts did not vanish; they moved to where they belong.
+
+    ``source_path`` is an operator filesystem path and ``verification`` is the
+    result of checking the signature against *this* agent's resolved trust
+    root. Both are recorded on the agent's own ``constitution_reanchor``
+    property, which already carried them before #2893 — the node was
+    duplicating them onto a row the fleet shares.
+    """
+    await _seed_runtime_agent(CONSTITUTION_V1, AGENT_DID)
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V2)
+    import kestrel_sovereign.config as ks_config
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
+    artifact_path, root_path = _write_authority_files(tmp_path, CONSTITUTION_V2)
+    agent_dir = tmp_path / "agent_data" / "First"
+    _make_local_anchor(agent_dir, AGENT_DID)
+
+    result = await reanchor_constitution(
+        agent_name="First", agent_dir=agent_dir,
+        canonical_path=constitution_path, force=True,
+        amendment_artifact_path=artifact_path,
+        sovereign_trust_root_path=root_path,
+        runtime_backend="postgres", runtime_dsn=POSTGRES_URL,
+    )
+    assert result.error is None, result.error
+
+    rows = await pg.fetchall(
+        "SELECT properties FROM graph_nodes WHERE node_id = ?", (AGENT_DID,)
+    )
+    properties = json.loads(rows[0][0]) if isinstance(rows[0][0], str) else rows[0][0]
+    audit = properties["constitution_reanchor"]
+    assert audit["signed_artifact_path"] == str(artifact_path)
+    assert audit["signed_artifact_verification"]
+    assert audit["timestamp"]
 
 
 async def test_a_per_agent_artifact_reanchors_the_second_agent(

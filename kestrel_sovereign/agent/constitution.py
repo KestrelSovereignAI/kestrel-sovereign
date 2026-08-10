@@ -1658,16 +1658,18 @@ class ConstitutionMixin:
                     node_id=artifact_hash,
                     node_type="constitution_amendment_artifact",
                     label="Signed Constitution Reanchor Artifact",
+                    # Content-derived fields only — see the sibling writer in
+                    # ``setup/constitution_reanchor``. The per-agent facts
+                    # (``source_path``, when this agent anchored it, and the
+                    # verification against *this* agent's trust root) go to the
+                    # agent's ``constitution_reanchor`` audit property (#2893).
                     properties={
                         "hash": artifact_hash,
                         "type": "SignedConstitutionAmendment",
                         "artifact_type": amendment_artifact.get("artifact_type"),
                         "constitution_hash": stored_hash,
                         "signer": verification.signer,
-                        "source_path": artifact_path_used,
                         "created_at": amendment_artifact.get("created_at"),
-                        "anchored_at": self._get_timestamp(),
-                        "verification": verification.reason,
                     },
                 )
                 await self.storage.add_node(
