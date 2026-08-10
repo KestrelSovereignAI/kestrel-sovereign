@@ -949,8 +949,24 @@ class TalonCoordinatorFeature(Feature):
         # Every explicit flag therefore forces the CLI invocation, which
         # carries them all. Do NOT widen the A2A payload here — that is
         # the daemon team's side of the contract.
+        #
+        # A claim made from inside a chat turn is one more such control: the
+        # originating session is the routing information that lands the
+        # completion wake back in the user's own thread (#2877), and A2A cannot
+        # carry it. The A2A rail creates the task on the RECIPIENT talon agent;
+        # the sender keeps only an in-memory ``_jobs`` row that ``_persist_jobs``
+        # skips and ``TalonWaitable.active_handles`` never enumerates, so it
+        # produces no auto-wake at all — sender-side completion rides the
+        # sessionless, INTERNAL ``a2a.task_complete`` signal instead. Dispatching
+        # a session-bound claim there would strand the completion exactly as
+        # reported. So it goes down the durable CLI rail, which persists the
+        # origin with the job and wakes into that session. Same reasoning as the
+        # detached-dispatch suppression below, and it costs nothing when there
+        # is no session: unattended dispatch is unchanged.
+        origin_session_id = self._origin_session_id()
         use_a2a = (
-            resolved_backend == "claude"
+            not origin_session_id
+            and resolved_backend == "claude"
             and resolved_model == "opus"
             and resolved_auth_lane == "oauth"
             and backend is None
@@ -1278,6 +1294,20 @@ class TalonCoordinatorFeature(Feature):
         that run's signal context, so this is a stable key for pairing the CI
         verification with the job the run's own dispatch produced (#2303).
         Returns None outside a signal dispatch.
+
+        Gated on ``kind == "workflow.stage"`` — the SAME gate
+        :meth:`_observability_context` already applies to this identical
+        field. ``Signal.session_id`` only means "workflow run id" on a
+        workflow-stage envelope (the workflows runner sets
+        ``session_id=run.run_id``); on every other source it is a CHAT
+        session: ``restart.completed`` has carried the originating session
+        since #1809 and ``talon.job_complete`` does since #2877. Reading one
+        of those as a run id would bind a user's chat session into the
+        run→job map, so a later ``verify_pipeline_ci`` would resolve a job
+        for a run that never dispatched one — exactly the caller-influenceable
+        binding #2303 made fail closed. The multi-attempt loop in #2877
+        dispatches the next job from inside the previous job's wake turn, so
+        this is a live path, not a hypothetical one.
         """
         try:
             from kestrel_sovereign.signals.context import get_current_signal
@@ -1285,7 +1315,9 @@ class TalonCoordinatorFeature(Feature):
             signal = get_current_signal()
         except Exception:  # pragma: no cover - defensive import guard
             return None
-        run_id = getattr(signal, "session_id", None) if signal is not None else None
+        if signal is None or getattr(signal, "kind", None) != "workflow.stage":
+            return None
+        run_id = getattr(signal, "session_id", None)
         return run_id if isinstance(run_id, str) and run_id else None
 
     def _record_pipeline_run_job(self, dispatch: Any) -> None:
@@ -4103,6 +4135,46 @@ class TalonCoordinatorFeature(Feature):
                 ctx[OBSERVABILITY_STAGE_KEY] = stage
         return ctx
 
+    def _origin_session_id(self) -> str:
+        """The chat session this dispatch was made from, or ``""`` when none.
+
+        Stamped onto the job record so the terminal ``talon.job_complete``
+        wake resumes the session that dispatched the job instead of minting a
+        fresh one (#2877). Without it the wake became message 1 of a brand-new
+        session, so a multi-attempt autonomous loop walked away from the user's
+        thread one session per hop while ``delivery_status`` still read ``ok``.
+
+        Mirrors the restart coordinator's origin capture (#1809), but goes
+        through the turn lifecycle's
+        :meth:`~kestrel_sovereign.agent.turn_lifecycle.TurnLifecycleMixin._get_turn_bound_session_id`
+        rather than reading ``agent._active_session_id`` directly. That
+        attribute is agent-global and only meaningful to the task that owns the
+        live turn: a dispatch running outside a turn (a cron ACTION tick), or
+        from a task DETACHED from a turn that has since exited, would otherwise
+        read whichever *concurrent* chat turn happens to be in flight and
+        cross-wire unattended work into that user's window. Checking the
+        task-local turn id alone does not help — ContextVars are copied into
+        child tasks, so a detached task reports its birth turn forever. The
+        lifecycle owns both halves and compares them; see its docstring.
+
+        Empty for CLI/scheduler/unattended dispatch, and for any agent double
+        that does not implement the accessor → the wake stays system-initiated
+        in a fresh session, exactly as before.
+        """
+        agent = getattr(self, "agent", None)
+        if agent is None:
+            return ""
+        resolve = getattr(agent, "_get_turn_bound_session_id", None)
+        if not callable(resolve):
+            return ""
+        try:
+            session_id = resolve()
+        except Exception:  # pragma: no cover - defensive; stub agents
+            return ""
+        if isinstance(session_id, str) and session_id.strip():
+            return session_id.strip()
+        return ""
+
     @staticmethod
     def _stage_name_from_signal(signal: Any) -> Optional[str]:
         """Best-effort workflow stage name off a ``workflow.stage`` Signal.
@@ -4197,6 +4269,17 @@ class TalonCoordinatorFeature(Feature):
             self._jobs[task_id] = {
                 "repo": repo, "issue": issue_number,
                 "status": "dispatched", "method": "a2a",
+                # Deliberately NO origin_session_id (#2877). This rail cannot
+                # deliver a session-bound wake — the task is created on the
+                # recipient talon agent, this row is in-memory only
+                # (``_persist_jobs`` skips a2a jobs), and
+                # ``TalonWaitable.active_handles`` enumerates cli_background
+                # only, so nothing auto-wakes from here. ``talon_claim``
+                # therefore routes any claim made from inside a chat turn to the
+                # durable CLI rail, which means an a2a job is unattended by
+                # construction and the field would be a permanent "" that reads
+                # like a lost binding. Carrying the origin through A2A needs a
+                # sender-side completion subscription — a separate change.
             }
             return {
                 "dispatched": True, "method": "a2a",
@@ -4732,6 +4815,14 @@ class TalonCoordinatorFeature(Feature):
             "started_at": datetime.now(timezone.utc).isoformat(),
             "log_path": str(log_path),
             "exit_path": str(exit_path),
+            # The chat session that dispatched this job, so its completion wake
+            # resumes that session instead of opening a new one (#2877).
+            # Recorded here — the single CLI dispatch funnel — so claim, batch,
+            # iterate, and every workflow-stage source bind without per-caller
+            # wiring, exactly like the observability keys above. Empty for
+            # unattended dispatch. ``_persist_jobs`` copies every field but
+            # ``process``, so the binding survives a restart.
+            "origin_session_id": self._origin_session_id(),
             "process": proc,
         }
         if extra_meta:

@@ -300,6 +300,98 @@ async def test_clear_without_token_falls_back_safely():
 
 
 # ---------------------------------------------------------------------------
+# Turn-bound session resolution (#2877)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_turn_bound_session_is_the_live_turns_session():
+    agent = _StubAgent()
+    async with agent._turn_lifecycle():
+        agent._active_session_id = "chat-A"
+        assert agent._get_turn_bound_session_id() == "chat-A"
+
+
+@pytest.mark.asyncio
+async def test_no_turn_means_no_session():
+    """Out-of-turn work (a cron tick, a CLI-filed request) has no chat window,
+    even if a turn left a value behind."""
+    agent = _StubAgent()
+    assert agent._get_turn_bound_session_id() is None
+
+    async with agent._turn_lifecycle():
+        agent._active_session_id = "chat-A"
+    assert agent._get_turn_bound_session_id() is None
+
+
+@pytest.mark.asyncio
+async def test_child_task_of_the_live_turn_sees_the_session():
+    """Tools run in tasks the turn creates and awaits — they must still
+    resolve the turn's session, or every tool-side capture breaks."""
+    agent = _StubAgent()
+
+    async def tool():
+        return agent._get_turn_bound_session_id()
+
+    async with agent._turn_lifecycle():
+        agent._active_session_id = "chat-A"
+        assert await asyncio.create_task(tool()) == "chat-A"
+
+
+@pytest.mark.asyncio
+async def test_detached_task_does_not_inherit_a_later_turns_session():
+    """#2877 P1: a ContextVar is COPIED into child tasks, so a task detached
+    from turn A keeps reporting turn A's id after A exits. Pairing it with the
+    agent-global `_active_session_id` — as a naive capture does — hands that
+    task whatever turn is live *now*, cross-wiring background work into an
+    unrelated chat window. Ownership of the LIVE turn is the discriminator.
+    """
+    agent = _StubAgent()
+    turn_b_running = asyncio.Event()
+    seen: dict = {}
+
+    async def detached():
+        await turn_b_running.wait()
+        seen["turn_id"] = agent._get_current_turn_id()
+        seen["session"] = agent._get_turn_bound_session_id()
+        seen["agent_global"] = agent._active_session_id
+
+    async with agent._turn_lifecycle():
+        agent._active_session_id = "chat-A"
+        task = asyncio.create_task(detached())
+
+    async with agent._turn_lifecycle():
+        agent._active_session_id = "chat-B"
+        turn_b_running.set()
+        await task
+
+    assert seen["turn_id"], "precondition: the detached task still reports turn A"
+    assert seen["agent_global"] == "chat-B", "precondition: turn B owns the agent"
+    assert seen["session"] is None
+
+
+@pytest.mark.asyncio
+async def test_session_less_and_blank_sessions_resolve_to_none():
+    agent = _StubAgent()
+    async with agent._turn_lifecycle():
+        agent._active_session_id = None
+        assert agent._get_turn_bound_session_id() is None
+        agent._active_session_id = "   "
+        assert agent._get_turn_bound_session_id() is None
+
+
+@pytest.mark.asyncio
+async def test_live_turn_id_is_cleared_even_when_the_turn_raises():
+    agent = _StubAgent()
+    with pytest.raises(RuntimeError):
+        async with agent._turn_lifecycle():
+            agent._active_session_id = "chat-A"
+            raise RuntimeError("boom")
+    assert agent._live_turn_id is None
+    assert agent._get_turn_bound_session_id() is None
+
+
+# ---------------------------------------------------------------------------
 # Stall observability (#2770)
 # ---------------------------------------------------------------------------
 

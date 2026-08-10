@@ -2069,10 +2069,20 @@ const renderedWakeSignalIds = new Set();
  *     ACTION-mode side effects don't.
  *   - non-empty `result_summary` — metadata-only emits have nothing to
  *     paint (the body lives in chat history instead).
+ *   - `session_id` matches the destination pane's conversation, when the
+ *     wake declares one (#2877).
  *
  * The notifications SSE stream is pinned to the selected agent (same as
- * task notifications), so the visible pane is the correct destination —
- * no session_id matching required.
+ * task notifications), so the agent's pane is the correct destination.
+ * That is not sufficient on its own: a wake bound to an originating chat
+ * session (#2877 routes a Talon job completion back into the session that
+ * dispatched it, as #1809 does for restarts) persists into THAT
+ * conversation, and the pane may have been switched to another one while
+ * the job ran. Painting it there would show the reader a turn that is not
+ * in the transcript they are looking at — and that reappears in the other
+ * conversation on reload. A session-less wake (unattended cron/CLI work)
+ * still renders into the pane, the pre-#2877 behavior; so does one that
+ * arrives before the pane has bound a conversation.
  */
 export async function handleSignalCompleted(payload) {
     if (!payload || typeof payload !== 'object') return;
@@ -2081,13 +2091,18 @@ export async function handleSignalCompleted(payload) {
     const body = payload.result_summary;
     if (!body) return;
 
+    const paneObject = notificationPaneObject();
+    const paneSession = (paneObject && paneObject.sessionId) || null;
+    const wakeSession = payload.session_id || null;
+    if (wakeSession && paneSession && wakeSession !== paneSession) return;
+
     const sigId = payload.signal_id;
     if (sigId) {
         if (renderedWakeSignalIds.has(sigId)) return;
         renderedWakeSignalIds.add(sigId);
     }
 
-    const target = notificationPaneElement();
+    const target = (paneObject && paneObject.element) || notificationPaneElement();
     if (!target) return;
 
     const div = document.createElement('div');

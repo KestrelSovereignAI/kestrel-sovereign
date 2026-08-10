@@ -78,6 +78,12 @@ def _schema(payload: Dict[str, Any]) -> Dict[str, Any]:
     # Optional — older Talon builds won't populate it.
     payload.setdefault("test_evidence", "")
     payload.setdefault("ci_status", "")
+    # The chat session the job was dispatched from (#2877), captured on the
+    # job record at dispatch and lifted onto ``Signal.session_id`` by the
+    # reconciler so this wake resumes that session. Defaulted, not required:
+    # job records dispatched before #2877 — and every unattended dispatch —
+    # carry no origin, and those must stay valid and wake system-initiated.
+    payload.setdefault("origin_session_id", "")
     return payload
 
 
@@ -90,6 +96,26 @@ def _redact(payload: Dict[str, Any]) -> str:
         f"repo={payload.get('repo','?')} "
         f"issue={payload.get('issue','?')}"
     )
+
+
+def _talon_job_complete_result_summary(body: Any) -> str:
+    """Bounded inline body for the ``signal_completed`` UI side-channel (#2877).
+
+    For a COGNITION dispatch ``result.artifact`` is the agent's own response
+    string — the turn this job completion woke. Surfacing it here is what lets
+    the chat window that dispatched the job render that turn live: the
+    frontend's ``handleSignalCompleted`` requires BOTH a ``user_visible``
+    signal (the reconciler builds one for a session-bound wake) and a
+    non-empty ``result_summary``. With the callback absent this rail emitted
+    metadata only, so a wake stayed invisible until a manual refresh even once
+    it landed in the right session.
+
+    Mirrors restart.completed (#1809) and a2a.question_answered (#1522). The
+    store caps the returned text at ``MAX_RESULT_SUMMARY_BYTES``.
+    """
+    if body is None:
+        return ""
+    return body if isinstance(body, str) else str(body)
 
 
 def build_talon_job_complete_registration() -> SourceRegistration:
@@ -111,6 +137,12 @@ def build_talon_job_complete_registration() -> SourceRegistration:
         coalescing_window=timedelta(seconds=60),
         attention_policy=AttentionPolicy(),
         resources=frozenset(),
+        # Surface the woken turn's response on the signal_completed UI
+        # side-channel so the chat window that dispatched the job renders it
+        # live. Paired with the reconciler building a USER_VISIBLE signal for
+        # a session-bound wake (#2877); an unattended wake stays INTERNAL, and
+        # the dispatcher never reaches this callback's emit for those.
+        result_summary=_talon_job_complete_result_summary,
         # No self-loop concern: this is a local-only signal sourced
         # by the agent's own cron polling, not from a peer.
         allow_self_loops=False,
