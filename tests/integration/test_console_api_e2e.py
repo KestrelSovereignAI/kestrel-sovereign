@@ -294,13 +294,27 @@ class TestSovereigntyAPI:
         assert "exports" in data
         assert isinstance(data["exports"], list)
 
-    def test_export_creates_receipt(self, client: TestClient):
+    def test_export_creates_receipt(self, client: TestClient, monkeypatch):
         """POST to sovereignty export creates a receipt, encryption honoured.
 
         ``encrypt=True`` on the local tier used to be silently coerced to
         ``encrypted: False`` (#2872), so a 200 alone did not prove the export
         did what the caller asked. The reported flag is asserted too.
+
+        A master key is guaranteed here rather than inherited: the CI
+        integration job exports ``KESTREL_DATA_KEY``, so relying on the
+        ambient value would make this test pass on CI and 409 on a developer
+        machine without it. ``encrypt=True`` is only honourable with a key,
+        and this test is about honouring it — see
+        ``test_export_refuses_encryption_without_master_key`` for the no-key
+        path. An ambient key is preserved as-is rather than overwritten, so
+        this never swaps the key the agent booted with mid-test.
         """
+        monkeypatch.setenv(
+            "KESTREL_DATA_KEY",
+            os.environ.get("KESTREL_DATA_KEY") or "console-e2e-export-test-key",
+        )
+
         # Trigger export
         response = client.post(
             "/api/sovereignty/export",
