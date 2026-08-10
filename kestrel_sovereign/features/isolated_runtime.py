@@ -330,7 +330,9 @@ class _HostOwnedFacadeOperation:
             # the source loop.  A stopped/closing loop cannot acknowledge this
             # request, so leave the durable owner fenced instead of queuing
             # unbounded work or pretending cancellation was delivered.
-            self._dispatch_to_foreign_loop(self._cancel_source_in_owner_loop)
+            self._dispatch_to_foreign_loop(
+                self._cancel_and_observe_source_in_owner_loop
+            )
             return
         target.cancel()
 
@@ -403,6 +405,12 @@ class _HostOwnedFacadeOperation:
         if source is not None and not source.done():
             source.cancel()
 
+    def _cancel_and_observe_source_in_owner_loop(self) -> None:
+        """Retry a fenced cancellation and settlement acknowledgement together."""
+
+        self._cancel_source_in_owner_loop()
+        self._observe_foreign_source_in_owner_loop()
+
     def _observe_foreign_source_in_owner_loop(self) -> None:
         """Install or run foreign settlement observation in the source loop.
 
@@ -472,22 +480,13 @@ class _HostOwnedFacadeOperation:
                 pass
 
         if self._foreign_loop:
-            # A terminal asyncio Future has immutable result state.  Reading
-            # that state does not require another owner-loop turn, while
-            # ``add_done_callback`` would: an owner loop which has already
-            # stopped would otherwise strand the exact source forever.  Do
-            # this only after ``done()``; pending futures remain owner-loop
-            # owned and fail closed when dispatch cannot be acknowledged.
-            if source.done():
-                self._observe_foreign_source_settlement(source)
-            else:
-                # ``self`` holds the exact source before this fallible
-                # dispatch. A failed dispatch leaves the record deliberately
-                # unsettled for a durable lifecycle owner instead of leaking
-                # a RuntimeError before that owner can retain it.
-                self._dispatch_to_foreign_loop(
-                    self._observe_foreign_source_in_owner_loop
-                )
+            # ``Future.result()`` is an owner-loop operation even after a
+            # Future has settled: subclasses may enforce affinity or perform
+            # bookkeeping there.  Retain every foreign source until its owner
+            # runs this observer.  A stopped or closed loop therefore remains
+            # deliberately fenced instead of exposing tenant data or treating
+            # a pre-settled result as a completed lifecycle operation.
+            self._dispatch_to_foreign_loop(self._observe_foreign_source_in_owner_loop)
         else:
             source.add_done_callback(observed)
 
@@ -521,64 +520,21 @@ def _consume_late_lifecycle_task_outcome(
         pass
 
 
-async def _capture_parent_cancellation_args(
-    observed: asyncio.CancelledError,
-    *,
-    continue_cancellation_delivery: bool = False,
-    observed_is_parent: bool | None = None,
-) -> tuple[Any, ...]:
-    """Return the caller cancellation payload, not a child cancellation's.
+def _facade_settlement_event(operation: _HostOwnedFacadeOperation) -> asyncio.Event:
+    """Return a neutral host-loop signal for one facade operation settling.
 
-    A shielded child may settle with ``CancelledError`` in the same loop turn
-    that this owner receives ``Task.cancel(reason)``.  ``cancelling()`` proves
-    a request was accepted, but the exception delivered by ``shield`` can
-    still be the child error (usually arg-less).  Consume one pending counter
-    and take a cancellation checkpoint: if the parent's request has not yet
-    been injected, that checkpoint receives its real payload.  If it already
-    was injected, the observed exception is the parent's payload.  This also
-    retains Python's first-delivered semantics for repeated ``cancel()`` calls.
+    Awaiting a shielded facade Future can raise that Future's
+    ``CancelledError`` in the lifecycle owner.  An event carries settlement as
+    data instead, so a caught ``CancelledError`` while waiting is unambiguously
+    delivery to the lifecycle owner itself.
     """
 
-    owner = asyncio.current_task()
-    if owner is None or owner.cancelling() == 0:
-        return tuple(observed.args)
-    # ``uncancel`` is public asyncio API, but it removes one accepted request
-    # from ``cancelling()``.  The checkpoint below needs that temporary
-    # removal to receive a pending parent payload rather than a child
-    # CancelledError; restore it before returning so callers retain asyncio's
-    # observable cancellation-count contract.
-    owner.uncancel()
-    if observed_is_parent is None:
-        # A non-empty payload is the only public signal available to the
-        # bridge itself.  Callers which know the source of an empty child
-        # cancellation pass an explicit answer below.
-        observed_is_parent = bool(observed.args)
-    if observed_is_parent:
-        cancellation_args = tuple(observed.args)
+    settled = asyncio.Event()
+    if operation.done():
+        settled.set()
     else:
-        try:
-            await asyncio.sleep(0)
-        except asyncio.CancelledError as parent:
-            cancellation_args = tuple(parent.args)
-        else:
-            cancellation_args = tuple(observed.args)
-    # ``Task.cancel`` is the only public way to restore the count removed by
-    # ``uncancel``.  It also schedules another delivery.  Consume that exact
-    # restoration delivery here before returning the cancellation we captured:
-    # a caller that catches our replay, uncancels to zero, and awaits again
-    # must not receive a synthetic second cancellation.  This uses only public
-    # asyncio APIs and keeps the first accepted payload authoritative.
-    owner.cancel(*cancellation_args)
-    if continue_cancellation_delivery:
-        # A bounded lifecycle drain intentionally observes one more delivery
-        # while it settles an externally owned facade operation.  It never
-        # exposes that internal delivery to its caller.
-        return cancellation_args
-    try:
-        await asyncio.sleep(0)
-    except asyncio.CancelledError:
-        pass
-    return cancellation_args
+        operation.add_done_callback(lambda _completed: settled.set())
+    return settled
 
 
 def _create_host_owned_facade_task(
@@ -704,26 +660,46 @@ async def _await_owned_facade_lifecycle_operation(
         )
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _FACADE_LIFECYCLE_OPERATION_TIMEOUT
+    owner = asyncio.current_task()
+    # ``Task.cancelling()`` is cumulative.  A cancellation caught before this
+    # lifecycle operation was admitted is historical state, not a new request
+    # which may reclassify a facade result.
+    owner_cancellation_count = owner.cancelling() if owner is not None else 0
+    settled = _facade_settlement_event(task)
     cancellation_args: tuple[Any, ...] | None = None
 
-    async def remember_cancellation(exc: asyncio.CancelledError) -> None:
+    def parent_cancellation_arrived() -> bool:
+        current_owner = asyncio.current_task()
+        return (
+            current_owner is owner
+            and current_owner is not None
+            and current_owner.cancelling() > owner_cancellation_count
+        )
+
+    def remember_cancellation(exc: asyncio.CancelledError) -> None:
         nonlocal cancellation_args
 
-        if cancellation_args is None:
-            cancellation_args = await _capture_parent_cancellation_args(
-                exc, continue_cancellation_delivery=True
-            )
+        if cancellation_args is None and parent_cancellation_arrived():
+            # This exception came from waiting on a neutral settlement event,
+            # never from the facade operation.  Its args therefore preserve
+            # Python's first-delivered semantics, including an empty first
+            # cancellation followed by a later reason.
+            cancellation_args = tuple(exc.args)
 
-    def caller_cancellation_requested() -> bool:
-        """Distinguish a shielded child cancellation from this owner's cancel."""
+    async def observe_delivered_parent_cancellation() -> None:
+        """Receive a cancellation accepted as a child settled concurrently."""
 
-        caller = asyncio.current_task()
-        return caller is not None and caller.cancelling() > 0
+        if cancellation_args is not None or not parent_cancellation_arrived():
+            return
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError as exc:
+            remember_cancellation(exc)
 
     def replay_remembered_cancellation() -> NoReturn:
         """Raise the caller cancellation without retaining facade state."""
 
-        nonlocal operation, task, on_completed, on_timeout, on_late_task
+        nonlocal operation, task, on_completed, on_timeout, on_late_task, owner
 
         # A CancelledError keeps this helper's traceback.  Clear every local
         # which can lead back to a facade task, a bound facade callback, or an
@@ -733,12 +709,13 @@ async def _await_owned_facade_lifecycle_operation(
         on_completed = None
         on_timeout = None
         on_late_task = None
+        owner = None
         raise asyncio.CancelledError(*cancellation_args)
 
     def raise_authoritative_timeout() -> NoReturn:
         """Raise the host timeout without retaining a completed facade task."""
 
-        nonlocal operation, task, on_completed, on_timeout, on_late_task
+        nonlocal operation, task, on_completed, on_timeout, on_late_task, owner
 
         # Like the cancellation path above, this public exception keeps this
         # helper's traceback.  A cooperative task can raise a secret-bearing
@@ -749,6 +726,7 @@ async def _await_owned_facade_lifecycle_operation(
         on_completed = None
         on_timeout = None
         on_late_task = None
+        owner = None
         raise _FacadeLifecycleOperationTimedOut(
             "isolated facade lifecycle operation exceeded its settlement budget"
         )
@@ -758,16 +736,11 @@ async def _await_owned_facade_lifecycle_operation(
         if remaining <= 0:
             break
         try:
-            await asyncio.wait_for(task.shield(), timeout=remaining)
+            await asyncio.wait_for(settled.wait(), timeout=remaining)
         except asyncio.CancelledError as exc:
-            # ``shield(task)`` also raises CancelledError when *task* was
-            # cancelled.  Only a cancellation currently requested for this
-            # helper is authoritative at the host boundary; otherwise a
-            # facade's own cancellation remains the child outcome below.
-            if caller_cancellation_requested():
-                await remember_cancellation(exc)
-            elif task.done() and task.cancelled():
-                break
+            # ``settled`` reports child cancellation as data.  A caught
+            # cancellation can only be injected into this lifecycle owner.
+            remember_cancellation(exc)
         except asyncio.TimeoutError:
             break
         except BaseException:  # noqa: BLE001 - facade outcome stays private after cancel
@@ -806,16 +779,11 @@ async def _await_owned_facade_lifecycle_operation(
                     replay_remembered_cancellation()
                 raise_authoritative_timeout()
             try:
-                await asyncio.wait_for(task.shield(), timeout=remaining)
+                await asyncio.wait_for(settled.wait(), timeout=remaining)
             except asyncio.CancelledError as exc:
-                # ``task.cancel()`` above deliberately causes this exact
-                # child-side acknowledgement.  It is not a parent
-                # cancellation and therefore must not replace the already
-                # authoritative timeout with CancelledError.
-                if caller_cancellation_requested():
-                    await remember_cancellation(exc)
-                elif task.done() and task.cancelled():
-                    break
+                # The timeout fence cancels only ``task``.  It can set the
+                # event, but it cannot inject cancellation into this owner.
+                remember_cancellation(exc)
             except asyncio.TimeoutError:
                 continue
             except BaseException:  # noqa: BLE001 - timed-out facade outcome is private
@@ -830,18 +798,16 @@ async def _await_owned_facade_lifecycle_operation(
         # cancellation and returned success.  The timeout itself remains the
         # authoritative lifecycle outcome.
         _consume_late_lifecycle_task_outcome(task)
+        await observe_delivered_parent_cancellation()
         if cancellation_args is not None:
             replay_remembered_cancellation()
         raise_authoritative_timeout()
 
-    # A pre-settled source can skip the wait loop entirely.  Its child
-    # cancellation/success must not hide a parent request which was accepted
-    # in that same scheduling turn, so take the same owner-cancellation bridge
-    # before classifying the terminal child outcome.
-    if cancellation_args is None and caller_cancellation_requested():
-        cancellation_args = await _capture_parent_cancellation_args(
-            asyncio.CancelledError(), continue_cancellation_delivery=True
-        )
+    # A pre-settled source can skip the wait loop entirely.  If the owner was
+    # cancelled in the same scheduling turn, receive that delivery before
+    # classifying the child terminal state.  Historical cancellation counts do
+    # not pass this admission fence.
+    await observe_delivered_parent_cancellation()
 
     if cancellation_args is not None:
         # A cancellation already observed by this owner is its public result.
@@ -914,6 +880,8 @@ async def _await_owned_health_probe(
             "isolated facade health Future belongs to another event loop"
         )
 
+    settled = _facade_settlement_event(task)
+
     def replay_parent_cancellation(cancellation_args: tuple[Any, ...]) -> NoReturn:
         """Raise cancellation without retaining a facade task in its traceback."""
 
@@ -940,137 +908,74 @@ async def _await_owned_health_probe(
         parent_cancellation_arrived = None
         raise asyncio.TimeoutError()
 
-    child_cancelled = False
-    try:
-        return await asyncio.wait_for(
-            task.shield(), timeout=_HEALTH_PROBE_TIMEOUT
-        )
-    except asyncio.CancelledError as exc:
-        # A shielded child can cancel itself (or be returned already
-        # cancelled) without cancelling this supervisor.  That is an ordinary
-        # failed health probe, not a terminal supervisor interruption: raising
-        # CancelledError here would skip the restart policy entirely.
-        if task.done() and task.cancelled() and not parent_cancellation_arrived():
-            # ``Task.cancelling()`` is cumulative: a caller can catch and
-            # suppress an earlier cancellation without clearing its count.
-            # A later self-cancelled health Future is still a child outcome,
-            # not proof of a newly delivered parent interruption.
-            _consume_late_lifecycle_task_outcome(task)
-            child_cancelled = True
-        else:
-            # Parent cancellation must not flow through the facade call:
-            # retain the exact task first if the facade refuses this explicit
-            # cancellation.
-            task.cancel()
-            if task.done():
-                _consume_late_lifecycle_task_outcome(task)
-            else:
-                on_late_task(task)
-            replay_parent_cancellation(
-                await _capture_parent_cancellation_args(
-                    exc,
-                    observed_is_parent=(
-                        parent_cancellation_arrived() and bool(exc.args)
-                    ),
-                )
-            )
+    def hand_off_parent_cancellation(exc: asyncio.CancelledError) -> NoReturn:
+        """Fence the facade before replaying a newly delivered parent cancel."""
 
-    except asyncio.TimeoutError:
         task.cancel()
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + _HEALTH_PROBE_CANCELLATION_GRACE
-        while not task.done():
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                on_late_task(task)
-                raise
-            try:
-                await asyncio.wait_for(task.shield(), timeout=remaining)
-            except asyncio.CancelledError as exc:
-                # ``shield(task)`` raises CancelledError when the probe
-                # acknowledges the timeout cancellation we sent above.  That
-                # is not the same as cancellation of this helper.  At their
-                # scheduling edge both can be true, so consult the owner
-                # first: otherwise a cancelled supervisor mistakes its own
-                # cancellation for a normal health timeout and restarts.
-                if parent_cancellation_arrived():
-                    if task.done():
-                        _consume_late_lifecycle_task_outcome(task)
-                    else:
-                        on_late_task(task)
-                    replay_parent_cancellation(
-                        await _capture_parent_cancellation_args(
-                            exc,
-                            observed_is_parent=(
-                                parent_cancellation_arrived() and bool(exc.args)
-                            ),
-                        )
-                    )
-                if task.done() and task.cancelled():
-                    # This is the probe acknowledging the cancellation we
-                    # issued for its timeout, not a new parent cancellation.
-                    # Preserve the original TimeoutError below so cooperative
-                    # wedged probes still follow the normal restart path.
-                    break
-                # A caller cancellation while acknowledging a timed-out probe
-                # follows the same ownership handoff as above, then preserves
-                # that caller's cancellation semantics.
-                if task.done():
-                    _consume_late_lifecycle_task_outcome(task)
-                else:
-                    on_late_task(task)
-                replay_parent_cancellation(
-                    await _capture_parent_cancellation_args(
-                        exc,
-                        observed_is_parent=(
-                            parent_cancellation_arrived() and bool(exc.args)
-                        ),
-                    )
-                )
-            except asyncio.TimeoutError:
-                continue
-            except BaseException:  # noqa: BLE001 - timeout acknowledgement is private
-                # A facade may catch the timeout cancellation and then raise
-                # an adapter/credential error.  The health deadline already
-                # decided the supervisor result, so consume that failure and
-                # publish only a neutral timeout.
-                _consume_late_lifecycle_task_outcome(task)
-                break
+        if task.done():
+            _consume_late_lifecycle_task_outcome(task)
+        else:
+            on_late_task(task)
+        replay_parent_cancellation(tuple(exc.args))
 
-        # The health timeout remains authoritative even if a facade catches
-        # cancellation and returns a nominally healthy value afterwards.
-        # ``wait_for(task.shield())`` cannot cancel the owned source.
-        # A facade can synchronously cancel this supervisor while acknowledging
-        # that timeout, after the final loop condition has observed the source
-        # as done.  Take one cancellation checkpoint before publishing timeout
-        # so that real parent cancellation still wins with its original args.
+    async def receive_parent_delivery_after_settlement() -> None:
+        """Observe a parent cancel accepted in the child's terminal turn."""
+
+        if not parent_cancellation_arrived():
+            return
         try:
             await asyncio.sleep(0)
         except asyncio.CancelledError as exc:
-            if task.done():
-                _consume_late_lifecycle_task_outcome(task)
-            else:
-                on_late_task(task)
-            replay_parent_cancellation(
-                await _capture_parent_cancellation_args(
-                    exc,
-                    observed_is_parent=(
-                        parent_cancellation_arrived() and bool(exc.args)
-                    ),
-                )
-            )
-        _consume_late_lifecycle_task_outcome(task)
-        raise_authoritative_timeout()
+            if parent_cancellation_arrived():
+                hand_off_parent_cancellation(exc)
 
-    if child_cancelled:
-        # Raise after leaving the CancelledError handler so neither its
-        # traceback nor any facade state becomes context for the ordinary
-        # supervisor-visible probe failure.
-        operation = None
-        task = None
-        on_started = None
-        on_late_task = None
-        raise RuntimeError("isolated facade health probe was cancelled")
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _HEALTH_PROBE_TIMEOUT
+    timed_out = False
+    while not task.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            timed_out = True
+            break
+        try:
+            await asyncio.wait_for(settled.wait(), timeout=remaining)
+        except asyncio.CancelledError as exc:
+            if parent_cancellation_arrived():
+                hand_off_parent_cancellation(exc)
+        except asyncio.TimeoutError:
+            timed_out = True
+            break
+
+    if not timed_out:
+        await receive_parent_delivery_after_settlement()
+        if task.cancelled():
+            operation = None
+            task = None
+            on_started = None
+            on_late_task = None
+            raise RuntimeError("isolated facade health probe was cancelled")
+        return task.result()
+
+    task.cancel()
+    acknowledgement_deadline = loop.time() + _HEALTH_PROBE_CANCELLATION_GRACE
+    while not task.done():
+        remaining = acknowledgement_deadline - loop.time()
+        if remaining <= 0:
+            on_late_task(task)
+            raise asyncio.TimeoutError()
+        try:
+            await asyncio.wait_for(settled.wait(), timeout=remaining)
+        except asyncio.CancelledError as exc:
+            if parent_cancellation_arrived():
+                hand_off_parent_cancellation(exc)
+        except asyncio.TimeoutError:
+            continue
+
+    # A timeout-fenced child can settle in the same scheduling turn as a
+    # parent cancellation.  The neutral event keeps the two outcomes separate.
+    await receive_parent_delivery_after_settlement()
+    _consume_late_lifecycle_task_outcome(task)
+    raise_authoritative_timeout()
 
 
 class _TrafficGate:

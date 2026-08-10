@@ -8400,18 +8400,17 @@ async def test_foreign_facade_stopped_or_closed_loop_remains_durably_fenced(
     assert stopped.done() is False
     assert stopped_dispatches == []
 
-    # A terminal asyncio Future has immutable outcome state.  It is consumed
-    # immediately even though its owner loop is stopped, so this exact facade
-    # cannot remain retained forever waiting for a loop turn that will never
-    # happen.
+    # Even a terminal Future stays fenced until its owner loop consumes it.
+    # Future subclasses may require that ``result()`` runs in that loop.
     completed_source = stopped_loop.create_future()
     completed_source.set_result(None)
     completed = isolated_runtime._create_host_owned_facade_task(
         completed_source, name="completed-stopped-foreign-facade"
     )
     completed.cancel()
-    assert completed.done() is True
-    assert completed.foreign_settlement_disposition == "succeeded"
+    assert completed.done() is False
+    assert completed.foreign_settlement_disposition is None
+    assert completed._source is completed_source
     assert stopped_dispatches == []
 
     closed_loop = asyncio.new_event_loop()
@@ -8426,35 +8425,51 @@ async def test_foreign_facade_stopped_or_closed_loop_remains_durably_fenced(
 
 
 @pytest.mark.asyncio
-async def test_precompleted_foreign_failure_on_stopped_loop_is_consumed_without_restart(
-    caplog,
-):
-    """A stopped owner loop cannot strand a terminal secret-bearing Future."""
+async def test_precompleted_foreign_future_is_consumed_only_by_owner_after_resume():
+    """A stopped pre-settled source fences, then settles on its owner thread."""
 
     foreign_loop = asyncio.new_event_loop()
-    source = foreign_loop.create_future()
-    secret = "STOPPED-FOREIGN-FUTURE-SECRET-2755"
+    state = {"result_threads": []}
+    running = threading.Event()
 
-    class ForeignStoppedError(RuntimeError):
-        pass
+    class OwnerThreadFuture(asyncio.Future):
+        def result(self):
+            state["result_threads"].append(threading.get_ident())
+            assert threading.get_ident() == state["owner_thread"]
+            return super().result()
 
-    source.set_exception(ForeignStoppedError(secret))
+    source = OwnerThreadFuture(loop=foreign_loop)
+    source.set_result("stopped")
     operation = isolated_runtime._create_host_owned_facade_task(
-        source, name="precompleted-stopped-foreign-failure"
+        source, name="precompleted-stopped-foreign-owner-thread"
     )
     notified = asyncio.Event()
     operation.add_done_callback(lambda _completed: notified.set())
-    try:
-        await asyncio.wait_for(notified.wait(), timeout=1)
-        assert operation.done() is True
-        assert operation.foreign_settlement_disposition == "failed"
-        assert source._log_traceback is False
-    finally:
+    assert operation.done() is False
+    assert state["result_threads"] == []
+
+    def run_foreign_loop():
+        asyncio.set_event_loop(foreign_loop)
+        state["owner_thread"] = threading.get_ident()
+        running.set()
+        foreign_loop.run_forever()
         foreign_loop.close()
 
-    del operation
-    gc.collect()
-    assert secret not in caplog.text
+    foreign_thread = threading.Thread(target=run_foreign_loop)
+    foreign_thread.start()
+    assert running.wait(timeout=1)
+    try:
+        # Retrying the retained operation asks the now-running owner loop to
+        # acknowledge the exact source; it does not issue another facade call.
+        operation.cancel()
+        await asyncio.wait_for(notified.wait(), timeout=1)
+        assert operation.done() is True
+        assert operation.foreign_settlement_disposition == "succeeded"
+        assert state["result_threads"] == [state["owner_thread"]]
+    finally:
+        if foreign_thread.is_alive():
+            foreign_loop.call_soon_threadsafe(foreign_loop.stop)
+            await asyncio.to_thread(foreign_thread.join)
 
 
 @pytest.mark.asyncio
@@ -8670,35 +8685,41 @@ async def test_owned_health_probe_child_cancellation_is_an_ordinary_failure():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("repeat", (False, True))
-async def test_health_cancellation_bridge_preserves_count_reason_without_latent_delivery(
+async def test_lifecycle_argless_first_cancellation_preserves_count_without_redelivery(
     repeat,
 ):
-    """A replayed parent cancellation is not injected again after uncancel."""
+    """An arg-less first cancel is authoritative and leaves no synthetic wakeup."""
+
+    owner_ref = {}
+
+    async def child():
+        owner = owner_ref["owner"]
+        owner.cancel()
+        if repeat:
+            owner.cancel("later cancellation reason")
+        asyncio.current_task().cancel("child cancellation")
+        await asyncio.sleep(0)
 
     async def owner():
         task = asyncio.current_task()
         try:
-            task.cancel("first accepted reason")
-            await asyncio.sleep(0)
-        except asyncio.CancelledError as cancelled:
-            if repeat:
-                # Run a second accepted request after the bridge has begun
-                # its event-loop checkpoint. It must not replace the first
-                # cancellation payload the public boundary replays.
-                asyncio.get_running_loop().call_soon(
-                    task.cancel, "later cancellation reason"
-                )
-            args = await isolated_runtime._capture_parent_cancellation_args(
-                cancelled
+            await isolated_runtime._await_owned_facade_lifecycle_operation(
+                child(),
+                name="argless-first-lifecycle-cancellation",
+                on_late_task=lambda _task: pytest.fail("child must settle promptly"),
             )
+        except asyncio.CancelledError as cancelled:
+            args = cancelled.args
             count = task.cancelling()
             while task.cancelling():
                 task.uncancel()
             await asyncio.sleep(0)
             return args, count
 
-    args, count = await asyncio.wait_for(owner(), timeout=1)
-    assert args == ("first accepted reason",)
+    owner_task = asyncio.create_task(owner())
+    owner_ref["owner"] = owner_task
+    args, count = await asyncio.wait_for(owner_task, timeout=1)
+    assert args == ()
     assert count == (2 if repeat else 1)
 
 
@@ -8726,6 +8747,59 @@ async def test_stale_cancellation_count_does_not_reclassify_self_cancelled_healt
 
     assert owner.cancelling() == 1
     owner.uncancel()
+
+
+@pytest.mark.asyncio
+async def test_stale_cancellation_count_does_not_reclassify_lifecycle_success():
+    """Historical cancellation state cannot turn a settled facade into cancel."""
+
+    owner = asyncio.current_task()
+    owner.cancel("historical lifecycle cancellation")
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.sleep(0)
+    assert owner.cancelling() == 1
+
+    source = asyncio.get_running_loop().create_future()
+    source.set_result("stopped")
+    assert await isolated_runtime._await_owned_facade_lifecycle_operation(
+        source,
+        name="stale-cancellation-lifecycle-success",
+        on_late_task=lambda _task: pytest.fail("settled facade must not detach"),
+    ) == "stopped"
+    assert owner.cancelling() == 1
+    owner.uncancel()
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_stale_cancellation_count_does_not_reclassify_lifecycle_timeout_ack(
+    monkeypatch,
+):
+    """A historical count cannot replace the timeout during child acknowledgement."""
+
+    owner = asyncio.current_task()
+    owner.cancel("historical lifecycle cancellation")
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.sleep(0)
+    assert owner.cancelling() == 1
+
+    async def stop():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            return None
+
+    monkeypatch.setattr(isolated_runtime, "_FACADE_LIFECYCLE_OPERATION_TIMEOUT", 0.01)
+    monkeypatch.setattr(isolated_runtime, "_FACADE_LIFECYCLE_CANCELLATION_GRACE", 0.1)
+    with pytest.raises(isolated_runtime._FacadeLifecycleOperationTimedOut):
+        await isolated_runtime._await_owned_facade_lifecycle_operation(
+            stop(),
+            name="stale-cancellation-lifecycle-timeout-ack",
+            on_late_task=lambda _task: pytest.fail("stop should settle promptly"),
+        )
+    assert owner.cancelling() == 1
+    owner.uncancel()
+    await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio
