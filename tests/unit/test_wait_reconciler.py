@@ -19,6 +19,15 @@ builder used to own:
   - no dispatcher → skipped, NOT marked signaled (#1510)
   - in-flight handle is not re-enqueued (#1528)
   - provider signal name routes the source; payload spreads WaitStatus.data
+
+``last_delivery_status`` composes the dispatch result with a VISIBILITY
+verdict since #2922, so the expectations here read ``ok_unbound`` /
+``ok_visibility_unknown`` rather than a bare ``ok``. ``_CapturingDispatcher``
+is deliberately left as a bare stub with no surface ledger — it is the
+"visibility is unobservable" case, and the tests assert the reconciler SAYS so
+instead of assuming success. The observable cases are covered against a real
+dispatcher and a real event manager in
+``tests/unit/test_wake_visibility_accounting.py``.
 """
 
 from __future__ import annotations
@@ -191,7 +200,7 @@ async def test_no_signal_for_pending_handles(make_agent):
 
 
 @pytest.mark.asyncio
-async def test_records_ok_as_delivered_and_locks_outcome(make_agent):
+async def test_records_ok_as_persisted_and_locks_outcome(make_agent):
     provider = _FakeProvider()
     provider.set("h1", Outcome.DONE)
     dispatcher = _CapturingDispatcher()
@@ -206,17 +215,24 @@ async def test_records_ok_as_delivered_and_locks_outcome(make_agent):
     assert row.pending_signaled_target == "done"
 
     t2 = await rec.reconcile()
-    assert t2.data["signals_emitted"] == 1
+    assert t2.data["signals_persisted"] == 1
+    assert t2.data["signals_emitted"] == 1, "back-compat alias for persisted"
     row = await rec._store.get("fake", "h1")
     assert row.last_signaled_outcome == "done"
-    assert row.last_delivery_status == "ok"
     assert row.last_delivery_attempts == 1
     assert row.pending_signal_id is None
-    assert t2.data["transitions"][0]["delivery_status"] == "ok"
+    # ``_FakeProvider`` exposes no ``origin_session_id``, so the wake is
+    # unattended and was built INTERNAL — persisted, never surfaced. Recording
+    # a bare ``ok`` here is the #2922 bug.
+    assert row.last_delivery_status == "ok_unbound"
+    assert t2.data["transitions"][0]["delivery_status"] == "ok_unbound"
+    assert t2.data["transitions"][0]["dispatch_status"] == "ok"
+    assert t2.data["signals_unbound"] == 1
+    assert t2.data["signals_queued"] == 0
 
 
 @pytest.mark.asyncio
-async def test_coalesced_counts_as_delivered(make_agent):
+async def test_coalesced_counts_as_persisted(make_agent):
     provider = _FakeProvider()
     provider.set("h1", Outcome.DONE)
     dispatcher = _CapturingDispatcher(status_override=Status.COALESCED)
@@ -225,10 +241,10 @@ async def test_coalesced_counts_as_delivered(make_agent):
 
     await rec.reconcile()
     t = await rec.reconcile()
-    assert t.data["signals_emitted"] == 1
+    assert t.data["signals_persisted"] == 1
     row = await rec._store.get("fake", "h1")
     assert row.last_signaled_outcome == "done"
-    assert row.last_delivery_status == "coalesced"
+    assert row.last_delivery_status == "coalesced_unbound"
 
 
 @pytest.mark.asyncio
@@ -299,10 +315,10 @@ async def test_soft_fail_does_not_lock_and_retries_with_fresh_attempt(make_agent
     agent.dispatcher = _CapturingDispatcher()
     await rec.reconcile()
     harvest = await rec.reconcile()
-    assert harvest.data["signals_emitted"] == 1
+    assert harvest.data["signals_persisted"] == 1
     row = await rec._store.get("fake", "h1")
     assert row.last_signaled_outcome == "done"
-    assert row.last_delivery_status == "ok"
+    assert row.last_delivery_status == "ok_unbound"
 
 
 @pytest.mark.asyncio
